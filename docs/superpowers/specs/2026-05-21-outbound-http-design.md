@@ -4,7 +4,7 @@
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). The current tree has *since* gained further work the spec has not fully reconciled: typed config-push (`run_config_push_typed`), pluggable introspection routes, and expanded CI. PR #269 introduces the multi-store manifest (`ManifestStores { config, kv, secrets }`), the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, the expanded `AdapterAction` (`AuthLogin` / `AuthLogout` / `AuthStatus` / `Build` / `Deploy` / `Serve`), separate `Adapter::provision(..)` and config-validation hooks, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the new `examples/app-demo/crates/app-demo-cli` integration crate.
-> **Current checkout (post-#269):** the CLI surface is now the #269 shape — `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`, `AdapterAction::{AuthLogin/Logout/Status, Build, Deploy, Serve}`, and the `edgezero_cli::adapter::execute(..)` dispatcher; `dev` is gone. **Known gap (see the implementation plan's decisions register):** the §3.5.3 / §5.4 / §7 CLI gate rows still name `run_config_push` / `run_config_validate` as the gate sites, but in the merged tree `run_config_push` is a stub that errors (real writes go through `run_config_push_typed`), `ConfigValidateArgs` has no `adapter` field, and the adapter-selecting `run_config_diff_typed` is un-gated. Those rows must be re-pointed at the typed entry points before implementation (locked resolution: gate the typed paths by command CLASS — `config diff` and `auth *` are **exempt** — and evaluate `config validate` against all configured adapters). Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of the CLI surface and lands either way.
+> **Current checkout (post-#269):** the CLI surface is now the #269 shape — `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`, `AdapterAction::{AuthLogin/Logout/Status, Build, Deploy, Serve}`, and the `edgezero_cli::adapter::execute(..)` dispatcher; `dev` is gone. **The CLI gate rows are now reconciled with this surface** (§3.5.3 is authoritative): gating is by command **class** — `build`/`serve`/`deploy`/`provision`/`config push`/`config validate`/`demo` are gated; **`config diff` and `auth *` are exempt** (read-only / credential). The gates target the **typed** entry points (`run_config_push_typed`; the bundled `run_config_push` is a v1 stub that errors), `config validate` is adapter-less (`ConfigValidateArgs` has no `adapter` field) and loops every configured adapter behind a **shared inner op** both its bundled and typed entries call, and `demo` reads the manifest baked in by `app!`. Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of the CLI surface and lands either way.
 > **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape (showing both the pre-#269 and PR-#269 forms), §5.4 capability test rows mentioning `demo` / `auth` / `provision` / `config push|validate`, and the §7 `edgezero-cli` migration bullet. Earlier appendices that quote `handle_build` / `handle_serve` / `handle_deploy` / `handle_dev` / `edgezero dev` are the round-1–43 historical resolution journal and remain accurate against the current checkout. **Appendix AR is the round-44 rebase snapshot and is now superseded by Appendices AS / AT / AU / AV / AW / AX / AY / AZ** (rounds 44–51): AR still describes the gate as "a single `Adapter::execute` dispatch point" — that wording was corrected to "four pre-dispatch gates" in AS, then to "five gate sites" in AU. Treat AR as round-44 history; the §3.5.3 + §7 active text is authoritative.
 
 ## 1. Overview
@@ -1201,11 +1201,20 @@ pub fn dispatch_budget(
             .then(|| saturating(DEFAULT_NO_DEADLINE_BUDGET));
 
     // (3) Effective deadline = min of the candidates (always at least one).
+    // NOTE: no `.expect(..)` — `clippy::expect_used` is DENIED in production code
+    // (the workspace denies the whole `restriction` group; the test exemption in
+    // clippy.toml does not apply here). The "unreachable by construction" case
+    // becomes an explicit invariant error instead of a panic, which is also the
+    // §3.4.3 rule that adapter/core boundaries never crash the host.
     let deadline = [from_timeout, from_caller, from_default_only]
         .into_iter()
         .flatten()
-        .min_by_key(|d| d.instant())
-        .expect("at least one candidate by construction");
+        .min_by_key(Deadline::instant)
+        .ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!(
+                "dispatch_budget: no deadline candidate — invariant violated (adapter bug)"
+            ))
+        })?;
 
     // (4) Duration is derived from the chosen deadline and the same now snapshot
     //     — never `Deadline::after(duration)`, which would re-anchor to a *later*
@@ -1307,14 +1316,27 @@ and the synthetic absolute deadline both apply when no deadline is set, identica
 every other adapter) and derives the host timeouts via the named helper:
 
 ```rust
+// Lint contract: the workspace DENIES `clippy::restriction`, so `as_conversions`
+// and `arithmetic_side_effects` are hard errors — no `as` casts, no bare `+`/`-`/`/`.
+// Use `Duration::as_millis` (already integer-ms), saturating/checked arithmetic, and
+// `u64::try_from` instead of `as u64`.
 fn fastly_timeout_ms(budget: &DispatchBudget) -> u64 {
     // True ceil-to-ms — never floor a sub-ms remainder away (round 20).
+    // `as_millis()` floors, so add 1 when there is a sub-ms remainder.
+    let nanos = budget.duration.subsec_nanos();
+    let has_remainder = !nanos.is_multiple_of(1_000_000);
+    let ceil_ms = budget
+        .duration
+        .as_millis()
+        .saturating_add(u128::from(has_remainder))
+        .max(1);
+
     // The DEADLINE_FAR_FUTURE clamp keeps this below Fastly's 2^32 ms ceiling
-    // (round 24); we still assert it explicitly because a bug elsewhere
-    // shouldn't crash the host.
-    let ms = ((budget.duration.as_nanos() + 999_999) / 1_000_000).max(1);
-    debug_assert!(ms < (u32::MAX as u128), "fastly_timeout_ms exceeds u32::MAX ms");
-    ms.min(u32::MAX as u128 - 1) as u64
+    // (round 24). Clamp defensively, then convert fallibly — a bug elsewhere must
+    // not crash the host, and `u32::MAX as u128` is not available under the lint.
+    let ceiling = u128::from(u32::MAX).saturating_sub(1);
+    let clamped = ceil_ms.min(ceiling);
+    u64::try_from(clamped).unwrap_or(u64::from(u32::MAX).saturating_sub(1))
 }
 
 // `dispatch_budget` always takes an explicit `now` (round 23). Single `send`
@@ -2625,12 +2647,28 @@ pub trait Hooks {
     /// Default `None` for hand-written `Hooks` impls that never ran the macro.
     fn manifest_json() -> Option<&'static str> { None }
 
-    /// Parsed + finalized, cached view of the above. See notes on why this
-    /// delegates to a PUBLIC core parser and holds a per-impl `OnceLock`.
+    /// Parsed + finalized, cached view of the above.
+    ///
+    /// **The default MUST be `None` — it must NOT hold a cache.** A `static` declared
+    /// inside a trait default method body is **one item shared by every implementor**,
+    /// not one per `Self` (items in generic fns are not monomorphized — Rust Reference).
+    /// A caching default would therefore let the FIRST app to call `manifest()`
+    /// populate the value every OTHER app reads — capability checks against the wrong
+    /// manifest. Proven: two impls relying on such a default both returned the first
+    /// impl's value. The cache lives in each **macro-generated impl** instead (below),
+    /// where the `static` is a distinct item per impl.
+    fn manifest() -> Option<&'static Manifest> { None }
+}
+
+// What `app!` GENERATES per app — each impl gets its OWN `manifest()` fn, hence its
+// OWN `static`, hence a genuinely per-app cache:
+impl Hooks for MyApp {
+    fn manifest_json() -> Option<&'static str> { Some(r#"{…baked…}"#) }
     fn manifest() -> Option<&'static Manifest> {
-        static CACHE: OnceLock<Option<Manifest>> = OnceLock::new();          // per-impl
+        static CACHE: OnceLock<Option<Manifest>> = OnceLock::new();   // per-IMPL: distinct item
         CACHE.get_or_init(|| Manifest::from_baked_json(Self::manifest_json()?)).as_ref()
     }
+    // …routes/stores/etc…
 }
 
 // edgezero-core/src/manifest.rs — the accessor CANNOT parse+finalize itself, because
@@ -2663,11 +2701,17 @@ impl Manifest {
   half-built `Manifest`. Hence `from_baked_json` calls `finalize()` — and hence it must
   live in **core** (only core can call the `pub(crate)` `finalize`), not in the generated
   downstream impl.
-- **Ownership / lifetime:** the JSON is a `&'static str` in the binary; the `OnceLock` is
-  a **function-local `static` inside the generated `manifest()`**, so it is naturally
-  **per-impl** (each `App`'s `manifest()` has its own) and the parse cost is paid once per
-  process — verified to compile and be per-impl. A single core-global `OnceLock` would
-  **not** be per-impl and is rejected.
+- **Ownership / lifetime — the cache MUST live in the generated impl, never in the trait
+  default.** The JSON is a `&'static str` in the binary. The `OnceLock` is a
+  function-local `static` inside **each generated `manifest()`**; because every impl
+  emits its own `manifest()` fn, each gets a **distinct** `static` — a genuine per-app
+  cache, parse paid once per process. **A `static` in the trait DEFAULT body is shared
+  by all implementors** (items inside generic fns are not monomorphized), so a caching
+  default would serve app A's manifest to app B. This was **empirically proven** with two
+  impls relying on such a default: both returned the first one's value. Hence the default
+  is `None`, and a single core-global `OnceLock` is likewise rejected. *(This is a second,
+  independent reason the macro must emit `manifest()` explicitly — beyond the denied
+  `clippy::missing_trait_methods`.)*
 - **Failure mode:** `from_baked_json` returning `None` on parse failure is an
   adapter/macro contract bug. `manifest()` returning `None` (hand-written `Hooks`, no
   macro) means *no capability contract*, and `ensure_capabilities` short-circuits `Ok(())`
@@ -3402,7 +3446,7 @@ async fn send_all(
        refusing to silently swap settings")`. The previous-round wording reused
        the cached backend by name alone, which would have silently bound a new
        request to whichever identity got cached first — that bug is fixed by the
-       explicit identity comparison here. Drop the lock. §5.4 has a row that
+       explicit identity comparison here. Release the borrow. §5.4 has a row that
        exercises this path via an injectable hash collision under the `test-utils` feature
        (**not** `#[cfg(test)]` — see §5.5 *Executable test seams*).
   3. Otherwise (name is absent), call `Backend::builder(..).finish()` **with the
@@ -3436,28 +3480,48 @@ async fn send_all(
      NameInUse for a name not in this adapter's collision map; the SDK does
      not expose the externally-registered backend's properties, so we cannot
      prove identity match — refusing to dispatch to a backend with possibly
-     mismatched TLS / timeout / SNI configuration")`. Drop the lock.
+     mismatched TLS / timeout / SNI configuration")`. Release the borrow.
 
      The alternative — falling back to `Backend::from_str(name)` and trusting
      the external registration — is exactly the "you should be careful to only
      use this capability in situations in which you are 100% sure that this
      name will always lead to the same place" caveat that Fastly's docs
      attach to `from_str`. Since EdgeZero owns the `ez_{sha256_128(identity)}`
-     naming scheme, a `NameInUse` on a name we didn't register can only mean
-     an unrelated component picked the same hashed name (vanishingly unlikely
-     given the 128-bit identity space) or our session is sharing a Fastly
-     edge dictionary with another EdgeZero deployment that uses a different
-     identity tuple — neither case is safe to silently inherit.
-  6. On any other `Backend::builder` error, **map to `EdgeError::bad_gateway`** —
-     these are service/backend setup failures (dynamic backends disabled on the
-     service per §4.3 "Service prerequisite," DNS resolution failure for the
-     target, TLS misconfiguration, or any other Fastly-side rejection that
-     reaches the guest). Specifically:
+     naming scheme, a `NameInUse` for a name **absent from this session's map**
+     can only mean one of: (a) a **static service backend** is configured with
+     that name (the SDK's uniqueness rule spans static + dynamic within the
+     session), or (b) another component **in this same session** registered it,
+     or (c) a SHA-256-128 collision (vanishingly unlikely given the 128-bit
+     identity space). None is safe to silently inherit.
+
+     > Note: it canNOT mean "a prior session registered it." Dynamic-backend
+     > names are **scoped to the session** and may overlap freely across
+     > sessions/instances — a fresh session starts with a clean namespace. An
+     > earlier draft attributed the collision to a prior session / another
+     > EdgeZero deployment sharing an edge dictionary; that is not how the
+     > lifetime works. This matters for the session-scoped cache above: the map
+     > and the host's name registry share **exactly** the same lifetime (the
+     > session), which is precisely why the map is a reliable mirror of it — and
+     > why a *per-request* map was not.
+  6. On any other `Backend::builder(..).finish()` error — i.e. a
+     **`BackendCreationError`** — **map to `EdgeError::bad_gateway`**. These are
+     backend *registration* failures only: dynamic backends disabled on the service
+     (`Disallowed` — see the dedicated diagnostic below), or an invalid/rejected
+     backend configuration. Specifically:
      `Err(EdgeError::bad_gateway(format!("Fastly dynamic backend setup failed: {e}")))`.
+
+     > **DNS / TLS / connect failures do NOT occur at this stage.** The SDK separates
+     > **`BackendCreationError`** (registering a backend — this step) from
+     > **`SendErrorCause`** (actually performing the exchange). Registration does not
+     > resolve DNS or complete a TLS handshake; those happen on **send**, and are
+     > mapped by the send-stage `SendErrorCause` table below. An earlier draft listed
+     > "DNS resolution failure / TLS misconfiguration" here — that is wrong, and it
+     > made the corresponding §5.4 test unwritable (a fake *builder* cannot produce a
+     > DNS branch). Test the two stages against their own error types.
      `EdgeError::internal` is reserved for **adapter contract bugs** — invariant
      violations the adapter itself should have prevented (the unfilled-slot case
      in the harvest loop, the `BATCH_DISPATCH_SLACK_MAX` overshoot, this
-     section's `NameInUse` external-registration case). Drop the lock.
+     section's `NameInUse` external-registration case). Release the borrow.
 
   **Backend *creation* errors are not the transport errors.** The list above covers
   `Backend::builder(..).finish()` — i.e. *registering* a dynamic backend. **DNS, TLS,
@@ -3470,11 +3534,18 @@ async fn send_all(
 
   | Fastly `SendErrorCause` | EdgeError | Status |
   | --- | --- | --- |
-  | **Timeout** causes (connect / first-byte / between-bytes timer fired) | `gateway_timeout` | **504** |
-  | DNS resolution failure | `bad_gateway` | 502 |
+  | **Any TIMEOUT cause** — connect / first-byte / between-bytes timer fired, **and `DnsTimeout`** | `gateway_timeout` | **504** |
+  | DNS **resolution failure** (NXDOMAIN / no answer — *not* a timeout) | `bad_gateway` | 502 |
   | TLS / certificate failure | `bad_gateway` | 502 |
   | Connection refused / reset / other transport failure | `bad_gateway` | 502 |
   | Any other `SendErrorCause` | `bad_gateway` | 502 |
+
+  **`DnsTimeout` is 504, not 502** — the one genuinely ambiguous cause. It names DNS
+  (transport-shaped, which reads 502) but it **is a fired timer**, and the whole point
+  of the 502/504 split is that a fan-out caller retries a *timeout* differently from an
+  *unreachable* upstream. Classify by **"did a timer fire?"**, not by which subsystem
+  reported it. A DNS answer of "no such host" is 502; a DNS lookup that ran out of time
+  is 504.
 
   Rationale: a fired host timer is a **deadline** outcome (504) and must be
   distinguishable from an upstream that was unreachable (502) — the fan-out caller
@@ -3584,9 +3655,15 @@ async fn send_all(
       returns `gateway_timeout`.
 
     Net: the capability matrix entry `streamed-upload-deadlines = BestEffort` for
-    Fastly reflects the worst phase (source-stream yield). The risk section (§8)
-    spells out the two-phase decomposition so apps don't assume the BoundedCooperative
-    write-side bound covers source stalls.
+    Fastly reflects **both** phases — **source-stream yield AND host write are each
+    unbounded** on the guest side. There is **no** `BoundedCooperative` write-side
+    bound: `between_bytes_timeout` is documented as **receive-side only** (it bounds the
+    gap between bytes *received from origin*) and does **not** bound guest-to-origin
+    writes. (An earlier draft claimed the write phase was `BoundedCooperative` via
+    `between-bytes-timeout` and that only source-yield was the "worst phase" — both are
+    wrong; footnote 2 and §8 risk 7 are correct.) The only adapter-side bound on either
+    phase is the cooperative `budget.deadline.is_expired()` check **between** chunks, at
+    the two points described above.
   - **Response phase: host timeouts are *not* adjustable mid-flight.** The Fastly
     SDK sets connect / first-byte / between-bytes timeouts once before `send_async`
     (§3.3.4) and does not expose post-dispatch mutation. For
@@ -4040,7 +4117,9 @@ async fn send_all_runs_requests_concurrently() {
 | Fastly mixed-budget `send_all` to the **same host**: slots with `50 ms` and `3 s` budgets create **distinct** dynamic backends (identity tuple includes `budget_ms`); the 50 ms slot's host timeout is not silently inherited by the 3 s slot or vice versa. **Asserts the Fastly identity tuple** — Tier 1's mock has no dynamic-backend abstraction; Tier 2 (Fastly contract crate) inspects the registered-backend map and Tier 3 (Viceroy) observes the wall-clock divergence | — | yes | yes |
 | `RequestContext::into_request()` after `body_bytes` poison: returns `Err(stored_err)`, not `Ok(Request<Body::empty()>)` — a permissive proxy-forward cannot mask a stricter middleware's poisoned read | yes | — | — |
 | Fastly + `outbound-http = required`: `ensure_capabilities` emits the dynamic-backends informational log | yes | — | — |
-| Fastly `Backend::builder().finish()` returns a non-`NameInUse` error (dynamic backends disabled on the service; DNS resolution failure; TLS misconfiguration; any other Fastly-side rejection reaching the guest): adapter maps to **`EdgeError::bad_gateway(..)` (502)**, NOT `internal`. Tests cover each branch via a host-side fake / Viceroy harness | — | yes | yes |
+| **Fastly stage 1 — `BackendCreationError` (registration).** `Backend::builder().finish()` returns a non-`NameInUse` creation error (dynamic backends `Disallowed` on the service; invalid/rejected backend config): adapter maps to **`bad_gateway` (502)**, NOT `internal`; the `Disallowed` branch carries the dedicated "enable dynamic backends" diagnostic (§4.3). **Only creation errors are asserted here** — a fake *builder* cannot produce DNS/TLS/connect branches, which do not occur at registration (see the stage-2 row) | — | yes | yes |
+| **Fastly stage 2 — `SendErrorCause` (the exchange).** DNS resolution failure, TLS/certificate failure, connection refused/reset, and any other transport cause → **`bad_gateway` (502)**; **timeout causes** (connect / first-byte / between-bytes timer fired) → **`gateway_timeout` (504)**. `internal` is **never** correct for a send-stage failure. Asserted against the `SendErrorCause` variants (host-side fake / Viceroy), **not** against the builder. Table-drive one case per cause so the 502-vs-504 split is pinned | — | yes | yes |
+| **`DnsTimeout` is a TIMEOUT cause → 504, not 502** (§4.3 send-stage table). Explicit row because it is the one ambiguous cause: it names DNS (transport, 502-ish) but *is* a fired timer, and the fan-out caller retries timeouts differently from unreachable upstreams. Pinned so the mapping cannot drift | — | yes | yes |
 | Fastly `EdgeError::internal` is reserved for **adapter contract bugs only** — not service/backend setup failures. The test inspects the error chain for each Fastly `Err` and asserts that `internal` appears only for: (a) `BATCH_DISPATCH_SLACK_MAX` overshoot, (b) `NameInUse` external-registration collision, (c) the unfilled-slot harvest invariant. Every other Fastly error path is `bad_gateway`, `gateway_timeout`, or `bad_request` | — | yes | yes |
 | `Deadline::after(Duration::MAX)` clamps to `DEADLINE_FAR_FUTURE = 7 days` (round 24, down from 365 d to stay under Fastly's u32-ms ceiling); subsequent `dispatch_budget` round-trip still produces a usable budget; no panic | yes | — | — |
 | Inbound body `form_within(max)` over-cap → 400; cache + poison behaviour identical to `body_bytes` / `json_within` | yes | yes | — |
@@ -4063,7 +4142,7 @@ async fn send_all_runs_requests_concurrently() {
 | `send_all` shared-`now` snapshot: a homogeneous-budget Fastly fan-out batch to one host creates **exactly one** dynamic backend (per the §4.3 identity guarantee); replacing `batch_now` with per-slot `Instant::now()` in a test fork creates distinct backends, catching the drift bug. **Asserts Fastly-specific identity tuple including `budget_ms`** — Tier 1's `MockOutboundClient` has no dynamic-backend abstraction, so this row is Tier 2 (Fastly contract crate) + Tier 3 (Viceroy) only | — | yes | yes |
 | Outbound `Host` header includes the explicit port for non-default-port URIs: `http://localhost:3000` → `Host: localhost:3000`; `https://example.com:8443` → `Host: example.com:8443`; `https://example.com` → `Host: example.com` (no port). Adapters never copy `host` from the inbound `req.headers()` | yes | yes | yes |
 | **Core URI canonicalization → four-value split (Tier 1 half).** The four accessors `backend_target()` / `host_authority()` / `sni_hostname()` / `cert_host()` are tested in `crates/edgezero-core/src/outbound.rs` `#[cfg(test)]` against a matrix of inputs, with per-scheme expectations (no adapter dependency). **HTTPS DNS-host inputs** (`https://example.com`, `https://example.com:443`, `https://example.com:8443`): `backend_target() == "example.com:443"` / `"example.com:443"` / `"example.com:8443"`; `host_authority() == "example.com"` / `"example.com"` / `"example.com:8443"`; `sni_hostname() == Some("example.com")` on all three; `cert_host() == Some("example.com")` on all three. **HTTPS IP-literal inputs** (`https://127.0.0.1`, `https://[::1]:8443`): `sni_hostname() == None` (RFC 6066 §3); `cert_host() == Some("127.0.0.1")` / `Some("::1")` (bracket-stripped). **HTTP DNS-host inputs** (`http://example.com`, `http://example.com:80`, `http://example.com:8443`): `backend_target() == "example.com:80"` / `"example.com:80"` / `"example.com:8443"`; `host_authority() == "example.com"` / `"example.com"` / `"example.com:8443"`; `sni_hostname() == None` (no TLS, no SNI); `cert_host() == None` (no TLS, no certificate). The HTTPS-only `cert_host()` `Some` is the canonical reason an adapter calls `.disable_ssl()` vs `.enable_ssl()` / `.check_certificate(..)`. This is the core-side guarantee the Fastly row below assumes | yes | — | — |
-| **Fastly adapter consumes the four canonical accessors, DNS-name HTTPS path (Tier 2 / Tier 3 half).** For a DNS-name HTTPS host where `req.sni_hostname()` returns `Some(sni)` and `req.cert_host()` returns `Some(cert)`, Fastly dynamic backend construction calls `Backend::builder(name, req.backend_target()).override_host(req.host_authority()).sni_hostname(sni).check_certificate(cert)` (with `sni == cert` because both accessors return the same host string for the DNS-name case). For HTTP (`req.cert_host()` returns `None`), it calls `Backend::builder(name, req.backend_target()).override_host(req.host_authority()).disable_ssl()`. A Tier 2 test (`crates/edgezero-adapter-fastly/tests/contract.rs`, no network — inspects the registered-backend map produced by `FastlyOutboundClient`) and a Tier 3 test (Viceroy round-trip) build `https://example.com:8443` and `http://example.com:8443` and assert: connection target = `example.com:8443` on both; Host = `example.com:8443` on both; SSL enabled with SNI = cert = `example.com` on the first, disabled on the second; identity hashes differ (distinct backends). **DNS-name HTTPS only** — IP-literal HTTPS (where `sni_hostname()` is `None` but `cert_host()` is `Some(ip)`) is the dedicated "Fastly HTTPS to IP literals" row below, which asserts the **distinct** behaviour of skipping `.sni_hostname(..)` while still passing `cert_host()` to `.check_certificate(..)`. **Adapter-specific** — Tier 1's mock has no `Backend::builder` analogue | — | yes | yes |
+| **Fastly adapter consumes the four canonical accessors, DNS-name HTTPS path (Tier 2 / Tier 3 half).** For a DNS-name HTTPS host where `req.sni_hostname()` returns `Some(sni)` and `req.cert_host()` returns `Some(cert)`, Fastly dynamic backend construction calls `Backend::builder(name, req.backend_target()).override_host(req.host_authority()).sni_hostname(sni).check_certificate(cert)` (with `sni == cert` because both accessors return the same host string for the DNS-name case). For HTTP (`req.cert_host()` returns `None`), it calls `Backend::builder(name, req.backend_target()).override_host(req.host_authority()).disable_ssl()`. A Tier 2 test (`crates/edgezero-adapter-fastly/tests/contract.rs`, no network — asserts against the **recording `BackendBuilder`** seam, §5.5: `Backend` is opaque and its getters do **not** round-trip `sni_hostname` / `check_certificate` / `override_host`, so inspecting the registered-backend map **cannot** prove these builder calls; map inspection is reserved for identity/reuse assertions) and a Tier 3 test (Viceroy round-trip) build `https://example.com:8443` and `http://example.com:8443` and assert: connection target = `example.com:8443` on both; Host = `example.com:8443` on both; SSL enabled with SNI = cert = `example.com` on the first, disabled on the second; identity hashes differ (distinct backends). **DNS-name HTTPS only** — IP-literal HTTPS (where `sni_hostname()` is `None` but `cert_host()` is `Some(ip)`) is the dedicated "Fastly HTTPS to IP literals" row below, which asserts the **distinct** behaviour of skipping `.sni_hostname(..)` while still passing `cert_host()` to `.check_certificate(..)`. **Adapter-specific** — Tier 1's mock has no `Backend::builder` analogue | — | yes | yes |
 | URI canonicalization — **core accessor half (Tier 1):** `OutboundRequest::get("https://example.com")` and `OutboundRequest::get("https://example.com:443")` produce identical `backend_target()` / `host_authority()` / `cert_host()` / `sni_hostname()` outputs (`"example.com:443"`, `"example.com"`, `Some("example.com")`, `Some("example.com")` respectively). `http://example.com:80` likewise normalises against `http://example.com`. Explicit non-default ports (`:8443`) are preserved in `backend_target()` and `host_authority()` but stripped from `cert_host()` / `sni_hostname()`. Asserted in `crates/edgezero-core/src/outbound.rs` `#[cfg(test)]` — no adapter | yes | — | — |
 | URI canonicalization — **Fastly backend identity half (Tier 2 / Tier 3):** building the canonical inputs above through the Fastly adapter yields **one dynamic backend** per canonical tuple — the identity hash collapses `https://example.com` and `https://example.com:443` into the same `Backend` entry in the registered-backend map. Tier 2 inspects the map; Tier 3 (Viceroy) observes the single backend across both URI spellings | — | yes | yes |
 | URI scheme + host case normalisation — **core accessor half (Tier 1):** `OutboundRequest::get("https://EXAMPLE.com")`, `OutboundRequest::get("HTTPS://example.com")`, and `OutboundRequest::get("https://example.com")` produce identical `uri().host()`, `uri().scheme()`, `backend_target()`, `host_authority()`, and `cert_host()` outputs (all lowercase). Path / query are case-preserving (fragments are rejected upstream — round 29). Asserted in core | yes | — | — |
@@ -4180,11 +4259,10 @@ command string changed with PR #269, which has since merged to main:
   --target wasm32-wasip2 --features spin` — Spin SDK 6 / wasip2. This is the
   gate this spec is written against.
 - **Historical (pre-#269):** `cargo check -p edgezero-adapter-spin --target
-  wasm32-wasip1 --features spin` — the SDK 5 / wasip1 form. `CLAUDE.md` and some
-  `.github/workflows/*.yml` snippets still quote this stale `wasm32-wasip1`
-  triple in places; leaving it there would silently break the Spin build, so the
-  quote refresh to `wasm32-wasip2` is a required follow-up (§7 "Project meta";
-  §8 risk 10).
+  wasm32-wasip1 --features spin` — the SDK 5 / wasip1 form. **This refresh is already
+  done** — `CLAUDE.md` quotes the wasip2 form and lists Spin as `wasm32-wasip2`
+  (verified in-tree); the surviving `wasm32-wasip1` mentions are Fastly's and are
+  correct. No follow-up work (§8 risk 10 is closed).
 
 The other four gates are unaffected and apply identically.
 
@@ -4605,10 +4683,14 @@ change lands here whether intended or not)*
   triples; the stale quote lives in prose/snippet form (§5.5, §8 risk 10).
 
 **`CLAUDE.md`**
-- refresh the Spin gate command and the Compilation-Targets table from
-  `wasm32-wasip1` to `wasm32-wasip2` so contributors don't paste the pre-#269 triple
-  (§5.5, §8 risk 10). No `§3`/`§4` design change — the spec references
-  `spin_sdk::http::send` symbolically, which is SDK-6-compatible.
+- **Spin wasip2 quote refresh: ALREADY DONE — no action.** Gate 5 and the
+  Compilation-Targets table already use `wasm32-wasip2` (verified in-tree).
+- **Amend the no-network test rule** (§5): today it forbids "tests that require a
+  network connection" **unqualified**, which this spec's blocking Axum Tier 3 loopback
+  mock origin would violate. Qualify it: "network" means the **public internet**; a
+  loopback / `127.0.0.1` mock origin on an ephemeral port is permitted (no external
+  connectivity, no credentials). This is a **deliverable of this change**, not an
+  assumption.
 
 ## 8. Open questions / risks
 
@@ -4672,16 +4754,14 @@ change lands here whether intended or not)*
    configuration field, or a per-adapter config knob on `FastlyOutboundClient`.
    Each option has a memory-model and capability impact, so it's left **deferred**
    pending a real use case.
-10. **CLAUDE.md / CI command-quote refresh for Spin SDK 6 + wasip2.** PR #269
-    bumps the Spin adapter to `spin-sdk = "6"` and the target triple to
-    `wasm32-wasip2`; the project `CLAUDE.md` and `.github/workflows/*.yml`
-    snippets still quote `cargo check -p edgezero-adapter-spin --target
-    wasm32-wasip1 --features spin` in several places. The spec itself doesn't
-    pin a target triple (it references `spin_sdk::http::send` symbolically,
-    which is SDK-6-compatible), so no §3 / §4 / §5 change is needed — but the
-    CI gate quotes and the CLAUDE.md table need a follow-up refresh so
-    contributors don't paste the old triple. Tracked here so the spec rebase
-    appendix (Appendix AR) has a one-line forward pointer.
+10. **~~CLAUDE.md / CI command-quote refresh for Spin SDK 6 + wasip2.~~ RESOLVED —
+    no action required.** This risk is **closed**: `CLAUDE.md` already quotes
+    `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`
+    (gate 5) and its Compilation-Targets table already lists Spin as
+    `wasm32-wasip2` (verified in-tree). The remaining `wasm32-wasip1` references
+    are **Fastly's**, which are correct. Retained only so this numbered list stays
+    stable; **do not schedule this work** — an earlier draft asked for a refresh
+    that has since landed.
 11. **Per-batch transient-memory cap against adversarial chunking.** §3.4.1's
     `sizeof(current_chunk)` term is source-controlled — an upstream peer that
     yields one large `Bytes` produces a transient resident footprint equal to
@@ -5006,7 +5086,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | --- | --- |
 | Streamed response decompression was underspecified | §3.4.1: explicit **streaming-decompressor design** — each WASM adapter wraps the platform raw byte stream with an incremental decoder (`flate2::read::GzDecoder` for gzip, `brotli::Decompressor` for brotli) configured chunk-at-a-time, counts decompressed bytes against the cap, and strips `content-encoding` / `content-length` at construction. Lazy passthrough + decompressed-byte caps + correct header stripping all hold simultaneously. Axum buffers anyway, so a non-streaming decoder is fine there |
 | `budget_ms` was floored, not ceiled | §4.3: identity tuple uses **true ceil-to-ms** — `((duration.as_nanos() + 999_999) / 1_000_000).max(1)`. A 1.9 ms budget no longer becomes 1 ms. The same ceiled value is what's fed into the host timeouts, so the identity tuple and the actual host configuration always match. The §3.3.4 "host timeouts = `budget.duration`" wording is documented as shorthand for ceil-to-ms; the body-phase `budget.deadline.is_expired()` check still uses the exact original `Deadline` |
-| Fastly backend collision map wasn't implementable | §4.3: the field is `Mutex<HashMap<String, (BackendIdentity, Backend)>>` — interior mutability with `Send + Sync`. The map stores the registered `Backend` handle so subsequent calls skip a fresh host call. **The lock is not held across host calls**: build the backend first, then insert under the lock; on concurrent duplicate-with-same-identity the extra handle is discarded; on duplicate-with-different-identity the adapter fails closed |
+| Fastly backend collision map wasn't implementable | §4.3: the field is `Mutex<HashMap<String, (BackendIdentity, Backend)>>` — interior mutability with `Send + Sync`. The map stores the registered `Backend` handle so subsequent calls skip a fresh host call. **The lock is not held across host calls**: build the backend first, then insert under the lock; on concurrent duplicate-with-same-identity the extra handle is discarded; on duplicate-with-different-identity the adapter fails closed. **[SUPERSEDED — the map is NOT a field on the client and uses no `Mutex`: it is a session-scoped `thread_local!` `RefCell` (a per-request client field would start empty each request and fail closed on `NameInUse`; the guest is single-threaded so no lock is needed). See §4.3 *Cache ownership*.]** |
 | Stalled streamed-upload test row overclaimed uniform behaviour | §5.4 row split into two: **host-write phase** stops at `budget.deadline` on every adapter (Axum/CF/Spin platform timer; Fastly host between-bytes-timeout); **source-pull phase** preempts on Axum/CF/Spin but **cannot preempt on Fastly** (BestEffort per `streamed-upload-deadlines`). No false uniform claim |
 | `BestEffort` definition was timing-specific but covers Axum's deterministic-buffer case | §3.5.1: `CapabilitySupport::BestEffort` doc broadened — "available with a documented limitation; can be timing (unbounded cooperative) **or functional** (deterministic behaviour differs from `Native`, e.g. Axum buffers a body that other adapters stream)." CLI error text in §3.5.3 mirrors the broadened meaning |
 | Older appendices contained superseded claims | Added the "Appendix index — historical, not normative" note before Appendix A: the round-by-round appendices are a paper trail; the authoritative content is §1–§8, and active sections win when an older appendix entry disagrees. No per-entry retroactive edits — the index disclaimer covers the whole history |
@@ -5175,7 +5255,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | Review finding | Resolution |
 | --- | --- |
 | Sub-4 ms exception stale in §3.3.4 prose, capability footnote 1, and the test row | §3.3.4: "shifts to ≤ 2 ms past deadline" replaced with the precise sub-4 ms bound (`total_ms + BATCH_DISPATCH_SLACK_MAX + ms_rounding`, ≤ ~28 ms). §3.5.2 footnote 1 now explicitly scopes its numbers to "common-case `total_ms ≥ 4`" and points at §4.3's two branches. §5.4 phase-split test row also annotated "common case, `total_ms ≥ 4`" with a cross-reference to the existing sub-4 ms row |
-| Backend cache protocol had undefined `Building` / `Failed` / condvar state | §4.3 rewritten — the protocol is just `Mutex<HashMap<String, (BackendIdentity, Backend)>>` plus "hold the outer lock through `Backend::builder().finish()`." Removed the `BackendSlot::Building` enum, the unwritten condvar storage, and the unwritten `Failed` notification. Holding the lock through the host call makes the race the round-34 review found structurally impossible without any additional state machine |
+| Backend cache protocol had undefined `Building` / `Failed` / condvar state | §4.3 rewritten — the protocol is just `Mutex<HashMap<String, (BackendIdentity, Backend)>>` plus "hold the outer lock through `Backend::builder().finish()`." Removed the `BackendSlot::Building` enum, the unwritten condvar storage, and the unwritten `Failed` notification. Holding the lock through the host call makes the race the round-34 review found structurally impossible without any additional state machine. **[SUPERSEDED — no `Mutex`/lock: the map is a session-scoped `thread_local!` `RefCell`; the "race" is moot on a single-threaded guest. See §4.3 *Cache ownership*.]** |
 | Appendix bookkeeping: index said A–AH but file had AI | Index updated to "A–AI (and counting)". Self-pointer to the last `## Appendix` heading remains the canonical answer |
 
 ## Appendix AK — Review round 37 resolutions
