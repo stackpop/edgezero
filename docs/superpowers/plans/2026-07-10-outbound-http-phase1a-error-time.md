@@ -14,7 +14,7 @@
 - **Colocated tests** (`#[cfg(test)]` same file); async tests use `futures::executor::block_on`.
 - **Verbatim constants:** `DEFAULT_NO_DEADLINE_BUDGET = 30 s`, `DEADLINE_FAR_FUTURE = 7 days`, `BATCH_DISPATCH_SLACK_MAX = 25 ms`.
 - **CI gates must stay green:** `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets`; `cargo check --workspace --all-targets --features "fastly cloudflare spin"`; `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`.
-- **Verified against the tree (HEAD 970f1f6):** `EdgeError` today has variants `BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`. The new arms below must be added to **eight** exhaustive matches — **five in `impl`**: `inner()` (error.rs:87), `kind_str()` (:110), `message()` (:125), `status()` (:180), `IntoResponse`'s `field_path_opt` (:221) — **and three in the test module** (:281, :335, :369), each a `match err { ConfigOutOfDate {..} => .. , <all others> => panic!(..) }` with **no `_` wildcard**. Also **three** per-variant matrix tests must gain rows for both new variants: `kind_strings_per_variant` (:502), `retry_after_only_on_config_out_of_date` (:549 — 502/504 must NOT carry `Retry-After`), and `field_path_only_on_config_out_of_date` (:569). `web-time` presence is confirmed in Task 0.
+- **Verified against the tree (HEAD 970f1f6):** `EdgeError` today has variants `BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`. The new arms below must be added to **eight** exhaustive matches — **five in `impl`**: `inner()` (error.rs:87), `kind_str()` (:110), `message()` (:125), `status()` (:180), `IntoResponse`'s `field_path_opt` (:221) — **and three in the test module** (:281, :335, :369), each a `match err { ConfigOutOfDate {..} => .. , <all others> => panic!(..) }` with **no `_` wildcard**. Also **three** per-variant tests must gain rows (only `kind_strings_per_variant` is exhaustive; the other two are subset checks) for both new variants: `kind_strings_per_variant` (:502), `retry_after_only_on_config_out_of_date` (:549 — 502/504 must NOT carry `Retry-After`), and `field_path_only_on_config_out_of_date` (:569). `web-time` presence is confirmed in Task 0.
 - **`cargo test` accepts only ONE positional filter** — `cargo test -p X a b` fails with `unexpected argument 'b'` (verified). Use a single common substring or two separate commands.
 - **The Clippy gate is STRICT — read this before writing any code.** The root `Cargo.toml` sets `restriction = { level = "deny", priority = -1 }`, and the following are **not** allow-listed, so they are hard errors in **production** code:
   - `missing_inline_in_public_items` → **every public fn needs `#[inline]`** (error.rs already carries 14).
@@ -83,11 +83,11 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
     ] {
         let response = err.into_response().expect("response");
         assert_eq!(response.status().as_u16(), code);
-        let v = parse_body(response); // existing helper: reads body -> serde_json::Value
-        assert_eq!(v["error"]["status"], code);
-        assert_eq!(v["error"]["kind"], serde_json::Value::from(kind));
-        assert_eq!(v["error"]["message"], serde_json::Value::from(msg));
-        assert!(v["error"].get("field_path").is_none(), "502/504 carry no field_path");
+        let body_json = parse_body(response); // existing helper -> serde_json::Value
+        assert_eq!(body_json["error"]["status"], code);
+        assert_eq!(body_json["error"]["kind"], serde_json::Value::from(kind));
+        assert_eq!(body_json["error"]["message"], serde_json::Value::from(msg));
+        assert!(body_json["error"].get("field_path").is_none(), "502/504 carry no field_path");
     }
 }
 ```
@@ -103,8 +103,8 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
 Resulting order: `BadGateway, BadRequest, ConfigOutOfDate, GatewayTimeout, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`.
 
 ```rust
-    /// Upstream/transport failure at the adapter boundary (DNS/TLS/connect/
-    /// unreachable, or a non-timeout send failure). HTTP 502.
+    /// Upstream or transport failure (DNS, TLS, connect, unreachable, or a
+    /// non-timeout send failure). HTTP 502.
     #[error("{message}")]
     BadGateway { message: String },
     /// A wall-clock deadline or per-request timeout fired. HTTP 504.
@@ -143,23 +143,23 @@ If it reports `E0004 non-exhaustive patterns` anywhere, add the two arms at that
 
 - [ ] **Step 7: Extend ALL THREE existing per-variant matrix tests**
 
-There are **three** existing per-variant matrices in `error.rs`; the new variants belong in all three, or the matrices silently stop being exhaustive:
+There are **three** existing per-variant tests in `error.rs`. Only `kind_strings_per_variant` is an *exhaustive* matrix (one row per variant); the other two are **subset** checks (they assert a property for a handful of variants). The new variants belong in all three — the two subset checks need the 502/504 rows so the new variants are actually covered, even though those tests were never exhaustive:
 
-**(a) `kind_strings_per_variant` (:502)** — uses `assert_kind!($err, $expected_kind:literal, $expected_status:literal)`, and existing rows pass **suffixed** status literals (`assert_kind!(EdgeError::bad_request("x"), "bad_request", 400_u16);`). Match that form:
+**(a) `kind_strings_per_variant` (:502) — the exhaustive matrix** — uses `assert_kind!($err, $expected_kind:literal, $expected_status:literal)`, and existing rows pass **suffixed** status literals (`assert_kind!(EdgeError::bad_request("x"), "bad_request", 400_u16);`). Match that form:
 
 ```rust
         assert_kind!(EdgeError::bad_gateway("x"), "bad_gateway", 502_u16);
         assert_kind!(EdgeError::gateway_timeout("x"), "gateway_timeout", 504_u16);
 ```
 
-**(b) `retry_after_only_on_config_out_of_date` (:549)** — asserts **only** `ConfigOutOfDate` emits `Retry-After: 60`. 502/504 must **not**, so add:
+**(b) `retry_after_only_on_config_out_of_date` (:549) — a subset check, not exhaustive** — asserts **only** `ConfigOutOfDate` emits `Retry-After: 60`. 502/504 must **not**, so add:
 
 ```rust
         assert_retry_after!(EdgeError::bad_gateway("x"), false);
         assert_retry_after!(EdgeError::gateway_timeout("x"), false);
 ```
 
-**(c) `field_path_only_on_config_out_of_date` (:569)** — asserts `field_path` is absent for non-`ConfigOutOfDate` variants. Add the same two assertions for `bad_gateway` / `gateway_timeout` in that test's existing style (this overlaps the JSON-shape test in Step 1 — keep both; the matrix is the exhaustive per-variant guard, the Step 1 test is the focused contract).
+**(c) `field_path_only_on_config_out_of_date` (:569) — a subset check** (today it only exercises `BadRequest` + `ConfigOutOfDate`) — asserts `field_path` is absent for non-`ConfigOutOfDate` variants. Add the same two assertions for `bad_gateway` / `gateway_timeout` in that test's existing style (this overlaps the JSON-shape test in Step 1 — keep both; the matrix is the exhaustive per-variant guard, the Step 1 test is the focused contract).
 
 - [ ] **Step 8: Run the new + matrix tests to verify they pass**
 
@@ -226,9 +226,9 @@ mod tests {
 
     #[test]
     fn deadline_exactly_now_is_expired() {
-        // THE equality boundary: deadline instant == now. Spec §3.3.2 says
-        // `deadline <= now` is expired. `checked_duration_since` returns Some(ZERO)
-        // here, so a naive impl would wrongly report NOT expired.
+        // The equality boundary: deadline instant == now. `deadline <= now` is
+        // expired, but `checked_duration_since` returns Some(ZERO) here, so a naive
+        // impl would wrongly report NOT expired.
         let base = Instant::now();
         let at_now = Deadline::at_instant(base);
         assert_eq!(at_now.remaining_at(base), None, "zero remaining is expired, not Some(0)");
@@ -289,32 +289,19 @@ Prepend to `crates/edgezero-core/src/time.rs` (above `#[cfg(test)]`):
 ```rust
 use web_time::Instant;
 
-// ITEM ORDER IS ALPHABETICAL — `clippy::arbitrary_source_item_ordering` is a denied
-// restriction lint (this is also why the existing `error.rs` methods are alphabetized).
-
-/// Max adapter overhead tolerated between the `send_all` `batch_now` snapshot and SDK
-/// timer arming before a slot fails closed. §3.3.4 / §4.3.
+/// Max adapter overhead tolerated before a fan-out slot fails closed.
 pub const BATCH_DISPATCH_SLACK_MAX: Duration = Duration::from_millis(25);
-
-/// Hard clamp on any caller-supplied duration so `Deadline::after` cannot panic on a
-/// pathological `Duration::MAX`. 7 days — below Fastly's u32-ms ceiling, above any
-/// realistic budget. §3.3.1.
-/// NOTE: `from_hours(168)`, NOT `from_secs(7 * 24 * 60 * 60)` — the latter trips
-/// `clippy::duration_suboptimal_units` (pedantic), and CI runs clippy with `-D warnings`.
+/// Hard clamp on any caller-supplied duration, so construction cannot panic.
 pub const DEADLINE_FAR_FUTURE: Duration = Duration::from_hours(168);
-
-/// Budget for an outbound request that specifies neither timeout nor deadline. §3.3.1.
+/// Budget applied when a request sets neither a timeout nor a deadline.
 pub const DEFAULT_NO_DEADLINE_BUDGET: Duration = Duration::from_secs(30);
 
-/// An absolute, `Copy` wall-clock deadline, shared across a fan-out batch so every slot
-/// honours the same cap. §3.3.1. A deadline at-or-before `now` is **expired**.
+/// An absolute, copyable wall-clock deadline. A deadline at or before now is expired.
 #[derive(Debug, Clone, Copy)]
 pub struct Deadline(Instant);
 
 impl Deadline {
-    /// `now + min(duration, DEADLINE_FAR_FUTURE)`. Never panics: the clamped add uses
-    /// saturating `checked_add(..).unwrap_or(now)`, so a defensive overflow yields an
-    /// already-expired deadline rather than panicking.
+    /// Returns a deadline `now + min(duration, DEADLINE_FAR_FUTURE)`; never panics.
     #[inline]
     #[must_use]
     pub fn after(duration: Duration) -> Self {
@@ -323,44 +310,38 @@ impl Deadline {
         Deadline(now.checked_add(clamped).unwrap_or(now))
     }
 
-    /// Construct from an absolute instant (used by `dispatch_budget` in Phase 1b).
+    /// Constructs a deadline from an absolute instant.
     #[inline]
     #[must_use]
     pub fn at_instant(instant: Instant) -> Self {
         Deadline(instant)
     }
 
-    /// The absolute deadline instant.
+    /// Returns the absolute deadline instant.
     #[inline]
     #[must_use]
     pub fn instant(&self) -> Instant {
         self.0
     }
 
-    /// `true` once the deadline instant is at-or-before now.
+    /// Returns `true` once the deadline instant is at or before now.
     #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
         self.is_expired_at(Instant::now())
     }
 
-    /// Pure core of `is_expired`, parameterised on `now` for exact testing.
     fn is_expired_at(&self, now: Instant) -> bool {
         self.remaining_at(now).is_none()
     }
 
-    /// Remaining time, or `None` once the deadline is reached or passed.
+    /// Returns the remaining time, or `None` once the deadline is reached or passed.
     #[inline]
     #[must_use]
     pub fn remaining(&self) -> Option<Duration> {
         self.remaining_at(Instant::now())
     }
 
-    /// Pure core of `remaining`, parameterised on `now` so tests pin the comparison to
-    /// one explicit instant. `None` once reached **or passed** — equality counts as
-    /// passed (spec §3.3.2 `deadline <= now`). `checked_duration_since` returns
-    /// `Some(ZERO)` at equality, so the zero case is filtered explicitly; this also
-    /// keeps the arithmetic `checked_*` (bare `-` trips `arithmetic_side_effects`).
     fn remaining_at(&self, now: Instant) -> Option<Duration> {
         self.0
             .checked_duration_since(now)
