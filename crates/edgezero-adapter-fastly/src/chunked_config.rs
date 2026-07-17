@@ -243,8 +243,12 @@ where
 
     // --- Path 1: direct BlobEnvelope ---
     if let Ok(envelope) = serde_json::from_str::<BlobEnvelope>(&root_value) {
-        envelope.verify().map_err(|err| {
-            format!("BlobEnvelope at key `{root_key}` failed integrity check: {err}")
+        // Redacted: `verify()`'s message names the stored hashes, which are
+        // config-controlled strings that may hold anything.
+        envelope.verify().map_err(|_err| {
+            format!(
+                "BlobEnvelope at key `{root_key}` failed its integrity check (details redacted)"
+            )
         })?;
         return Ok(root_value);
     }
@@ -253,15 +257,17 @@ where
     let pointer: FastlyChunkPointer = serde_json::from_str(&root_value).map_err(|err| {
         format!(
             "value at key `{root_key}` is neither a valid BlobEnvelope nor a valid \
-             chunk pointer: {err}"
+             chunk pointer ({})",
+            redact_json_err(&err)
         )
     })?;
 
     if pointer.edgezero_kind != POINTER_KIND {
+        // The stored `edgezero_kind` is not echoed: it is a value-controlled
+        // string on a path whose diagnostics are logged.
         return Err(format!(
-            "chunk pointer at `{root_key}` has unknown edgezero_kind \
-             `{}`; expected `{POINTER_KIND}`",
-            pointer.edgezero_kind
+            "chunk pointer at `{root_key}` has an unknown `edgezero_kind` (value redacted); \
+             expected `{POINTER_KIND}`"
         ));
     }
     if pointer.version != 1 {
@@ -273,33 +279,33 @@ where
     }
 
     // Fetch, verify, and concatenate all chunks.
-    let mut reconstructed = String::with_capacity(pointer.envelope_len);
-    for chunk_ref in &pointer.chunks {
+    //
+    // NOT `with_capacity(pointer.envelope_len)`: that length is untrusted stored
+    // metadata, and this runs in the edge guest. A pointer declaring `usize::MAX`
+    // would abort the worker on a capacity overflow before any of the checks
+    // below could reject it. Grow from the bytes we actually fetch instead.
+    let mut reconstructed = String::new();
+    for (position, chunk_ref) in pointer.chunks.iter().enumerate() {
         let chunk_value = fetch(&chunk_ref.key)?.ok_or_else(|| {
-            format!(
-                "missing chunk `{}` referenced by pointer at `{root_key}`",
-                chunk_ref.key
-            )
+            format!("missing chunk {position} referenced by pointer at `{root_key}`")
         })?;
 
         // Verify length.
         if chunk_value.len() != chunk_ref.len {
             return Err(format!(
-                "chunk `{}` (referenced by `{root_key}`) has length {} but pointer \
+                "chunk {position} (referenced by `{root_key}`) has length {} but the pointer \
                  records {}",
-                chunk_ref.key,
                 chunk_value.len(),
                 chunk_ref.len,
             ));
         }
 
-        // Verify SHA.
-        let actual_sha = sha256_hex(chunk_value.as_bytes());
-        if actual_sha != chunk_ref.sha256 {
+        // Verify SHA. Neither hash is echoed: the expected one comes from the
+        // stored pointer, so it is value-controlled.
+        if sha256_hex(chunk_value.as_bytes()) != chunk_ref.sha256 {
             return Err(format!(
-                "chunk `{}` (referenced by `{root_key}`) SHA mismatch: \
-                 expected `{}`, got `{actual_sha}`",
-                chunk_ref.key, chunk_ref.sha256,
+                "chunk {position} (referenced by `{root_key}`) does not match the SHA-256 the \
+                 pointer records for it (hashes redacted)"
             ));
         }
 
@@ -396,7 +402,9 @@ pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>,
 /// `serde_json::Error`'s `Display` embeds the input that failed to parse, and
 /// these diagnostics are logged verbatim. Stored app config may hold secrets, so
 /// only the position and category ever escape.
-#[cfg(any(feature = "cli", test))]
+///
+/// Unconditional: the runtime resolver needs it too. A guest reading a malformed
+/// pointer must not log the value either — that path runs on every request.
 fn redact_json_err(err: &serde_json::Error) -> String {
     use serde_json::error::Category;
 
@@ -418,7 +426,18 @@ fn redact_json_err(err: &serde_json::Error) -> String {
 ///
 /// Checks, in order: non-empty; every key canonical for this root; a SINGLE
 /// generation matching `envelope_sha256`; indexes exactly `0..n-1`, each once,
-/// in order; and `sum(len) == envelope_len`.
+/// in order; per-chunk lengths within what the writer emits; and
+/// `sum(len) == envelope_len`, computed with CHECKED arithmetic.
+///
+/// **Diagnostics name a chunk's POSITION, never its key.** `chunks[].key` is
+/// pointer-controlled and, on this path, not yet validated -- a malformed
+/// pointer can carry any string at all there (`prod-db-password=hunter2`), and
+/// these messages are logged verbatim.
+///
+/// **Lengths are untrusted input.** They are attacker-supplied `usize`s that
+/// later size allocations, so they are bounded against what the writer can
+/// actually emit and summed with `checked_add`. Saturating arithmetic would let
+/// a metadata-consistent pointer declare `usize::MAX` and survive validation.
 #[cfg(any(feature = "cli", test))]
 fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Result<(), String> {
     let bad =
@@ -437,17 +456,15 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
         // the same validator that gates deletion.
         let Some((generation, index)) = chunk_key_parts(root_key, &chunk_ref.key) else {
             return Err(bad(&format!(
-                "references a non-canonical chunk key `{}`",
-                chunk_ref.key
+                "references a non-canonical chunk key at position {position}"
             )));
         };
         // One pointer names exactly one generation. A mixed list means some
         // other generation's chunks are being reported as this one's.
         if generation != pointer.envelope_sha256 {
             return Err(bad(&format!(
-                "references chunk key `{}`, which belongs to a different generation than the \
-                 pointer's own `envelope_sha256`",
-                chunk_ref.key
+                "references a chunk at position {position} belonging to a different generation \
+                 than the pointer's own `envelope_sha256`"
             )));
         }
         // Indexes are dense, unique and ordered: 0, 1, ... n-1. This is what
@@ -455,18 +472,28 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
         // would silently shrink the live set.
         if index != position {
             return Err(bad(&format!(
-                "references chunk key `{}` at position {position}, but a chunk list must be \
-                 indexed 0..n-1 with no gaps, duplicates or reordering",
-                chunk_ref.key
+                "references chunk index {index} at position {position}, but a chunk list must be \
+                 indexed 0..n-1 with no gaps, duplicates or reordering"
             )));
         }
         if chunk_ref.len == 0 {
             return Err(bad(&format!(
-                "references chunk key `{}` with a zero length",
-                chunk_ref.key
+                "references a zero-length chunk at position {position}"
             )));
         }
-        total_len = total_len.saturating_add(chunk_ref.len);
+        // The writer never emits a chunk larger than its payload target, so a
+        // bigger one is not ours -- and this is what stops an absurd declared
+        // length ever reaching an allocation.
+        if chunk_ref.len > CHUNK_PAYLOAD_TARGET {
+            return Err(bad(&format!(
+                "references a chunk at position {position} declaring {} bytes, more than the \
+                 {CHUNK_PAYLOAD_TARGET}-byte maximum this writer emits",
+                chunk_ref.len
+            )));
+        }
+        total_len = total_len.checked_add(chunk_ref.len).ok_or_else(|| {
+            bad("declares chunk lengths that overflow when summed (not a real envelope)")
+        })?;
     }
 
     // The parts must add up to the whole. If they don't, the pointer does not
@@ -474,6 +501,15 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
     if total_len != pointer.envelope_len {
         return Err(bad(&format!(
             "declares `envelope_len` {} but its chunk lengths sum to {total_len}",
+            pointer.envelope_len
+        )));
+    }
+    // We only chunk what does not fit directly, so a pointer describing an
+    // envelope that WOULD have fit is not one we wrote.
+    if pointer.envelope_len <= FASTLY_CONFIG_ENTRY_LIMIT {
+        return Err(bad(&format!(
+            "declares an envelope of {} bytes, which fits the {FASTLY_CONFIG_ENTRY_LIMIT}-byte \
+             entry limit and so would never have been chunked by this writer",
             pointer.envelope_len
         )));
     }
@@ -567,20 +603,26 @@ pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue,
     Ok(GcRootValue::Direct)
 }
 
-/// Prove that `assembled` really is the generation named by `generation_sha`.
+/// Check that `assembled` really is the generation named by `generation_sha`.
 ///
-/// **This is the only thing on the GC path that constitutes proof.** A chunk key
-/// embeds the SHA-256 of the WHOLE envelope it belongs to, so a chunk set is
-/// self-proving: reassemble it and the hash either matches the content-address
-/// or it does not. Nothing an inconsistent store can say about lengths, indexes
-/// or counts survives this check, and nothing outside our writer can pass it
-/// without a preimage attack on SHA-256.
+/// A chunk key embeds the SHA-256 of the WHOLE envelope it belongs to, so
+/// reassembling a chunk set either reproduces the content-address its own keys
+/// name, or it does not. Nothing an inconsistent store says about lengths,
+/// indexes or counts survives this.
+///
+/// **This is a consistency check, NOT proof of authorship — do not mistake it
+/// for one.** Content-addressing is not a signature: anyone can pick an envelope
+/// E, compute `H = sha256(E)`, and store the pieces under `H`. No preimage
+/// attack is involved, so passing here says the bytes are internally consistent,
+/// not that `EdgeZero` wrote them. Callers deciding to DELETE must additionally
+/// require the entries to be byte-identical to this writer's own output — see
+/// `prove_generation` in `cli.rs`.
 ///
 /// Used for BOTH destructive decisions:
 /// - a live pointer's chunks must reconstruct the envelope it claims (else its
 ///   chunk list is not the true live set);
-/// - a delete candidate's generation must reconstruct a real envelope (else we
-///   cannot prove we wrote it, and must not delete it).
+/// - a delete candidate's generation must reconstruct a real envelope (a
+///   necessary, but not sufficient, condition for reclaiming it).
 #[cfg(any(feature = "cli", test))]
 pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Result<(), String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -992,6 +1034,51 @@ mod tests {
         gc_verify_generation(&generation, &whole).expect("the real generation must verify");
     }
 
+    /// PR #314 round-8 [P1]: `chunks[].key` is pointer-controlled and NOT yet
+    /// validated where we report it, so a malformed pointer can smuggle a secret
+    /// into a log line. Diagnostics must name a position, never the key.
+    #[test]
+    fn pointer_key_does_not_leak_into_diagnostics() {
+        const SENTINEL: &str = "prod-db-password=hunter2";
+        let root = "app_config";
+        let malformed = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{SENTINEL}","len":10,"sha256":"x"}}],"data_sha256":"","envelope_len":10,"envelope_sha256":"{}"}}"#,
+            "a".repeat(64)
+        );
+        let err = prior_chunk_keys(root, &malformed).expect_err("must warn");
+        assert!(
+            !err.contains(SENTINEL),
+            "a pointer-controlled key must never reach a diagnostic: {err}"
+        );
+    }
+
+    /// PR #314 round-8 [P2]: `envelope_len` and the per-chunk lengths are
+    /// untrusted `usize`s that later size allocations. Saturating arithmetic let
+    /// a metadata-consistent pointer declare `usize::MAX` and pass validation,
+    /// which then reached `String::with_capacity` and aborted the process.
+    #[test]
+    fn absurd_pointer_lengths_are_rejected_before_allocating() {
+        let root = "app_config";
+        let sha = "a".repeat(64);
+        let huge = usize::MAX;
+        let overflowing = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":{huge},"sha256":"x"}},{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.1","len":{huge},"sha256":"y"}}],"data_sha256":"","envelope_len":{huge},"envelope_sha256":"{sha}"}}"#
+        );
+        assert!(
+            prior_chunk_keys(root, &overflowing).is_err(),
+            "chunk lengths that overflow when summed must be rejected"
+        );
+
+        // A single absurd chunk: no overflow, but far beyond what we emit.
+        let oversized = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":{huge},"sha256":"x"}}],"data_sha256":"","envelope_len":{huge},"envelope_sha256":"{sha}"}}"#
+        );
+        assert!(
+            prior_chunk_keys(root, &oversized).is_err(),
+            "a chunk larger than the writer's payload target must be rejected"
+        );
+    }
+
     // ---- helpers ----
 
     /// Build a valid `BlobEnvelope` JSON string of approximately `target_len`
@@ -1213,12 +1300,20 @@ mod tests {
         })
         .expect_err("corrupt chunk must error");
         assert!(
-            err.contains("SHA mismatch") || err.contains("sha") || err.contains("mismatch"),
-            "error must mention hash mismatch: {err}"
+            err.contains("does not match the SHA-256"),
+            "error must say what failed: {err}"
+        );
+        // Round 8 [P1]: the diagnostic identifies the chunk by POSITION, not by
+        // key. The key comes from the stored pointer, so echoing it would let a
+        // malformed pointer smuggle a secret into a log line. Same for the
+        // hashes it records.
+        assert!(
+            err.contains("chunk 0"),
+            "error must locate the failing chunk by position: {err}"
         );
         assert!(
-            err.contains(&first_chunk_key),
-            "error must name the failing chunk key: {err}"
+            !err.contains(&first_chunk_key),
+            "a pointer-controlled key must not be echoed into a log line: {err}"
         );
     }
 
@@ -1248,13 +1343,14 @@ mod tests {
             }
         })
         .expect_err("length-mismatched chunk must error");
+        assert!(err.contains("length"), "error must mention length: {err}");
         assert!(
-            err.contains("length") || err.contains("len"),
-            "error must mention length: {err}"
+            err.contains("chunk 0"),
+            "error must locate the failing chunk by position: {err}"
         );
         assert!(
-            err.contains(&first_chunk_key),
-            "error must name the failing chunk key: {err}"
+            !err.contains(&first_chunk_key),
+            "a pointer-controlled key must not be echoed into a log line: {err}"
         );
     }
 

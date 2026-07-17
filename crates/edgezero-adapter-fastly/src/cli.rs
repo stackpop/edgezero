@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
@@ -152,13 +153,28 @@ enum ConfigStoreLookup {
 /// `plan_gc_reclamation` (which owns every safety guard); consumed by
 /// `gc_fastly_config_store` (which reports and deletes).
 struct GcPlan {
-    doomed: Vec<(String, u64)>,
+    /// Whole generations to reclaim, each a list of `(key, age_secs)`. Grouped,
+    /// not flat: a generation is provable only as a UNIT (see
+    /// `prove_generation`), so deleting part of one destroys the very evidence
+    /// that licenses deleting the rest.
+    doomed: Vec<Vec<(String, u64)>>,
     live_count: usize,
     retained_recent: usize,
     roots: usize,
     /// Chunk-shaped entries we could NOT prove our writer produced, so left
     /// untouched. Surfaced so an operator can see we declined to judge them.
     unprovable: usize,
+}
+
+/// What one pass of `config gc`'s delete loop actually did.
+struct GcDeleteOutcome {
+    /// Entries removed.
+    deleted: usize,
+    /// Keys whose delete returned non-zero.
+    failed: Vec<String>,
+    /// Keys left behind in a generation that was already part-deleted, so they
+    /// can never be proved (and therefore never reclaimed) again.
+    stranded: Vec<String>,
 }
 
 /// One `config-store-entry list` item.
@@ -1459,8 +1475,9 @@ fn gc_fastly_config_store(
         unprovable,
     } = plan;
 
+    let doomed_count: usize = doomed.iter().map(Vec::len).sum();
     let mut out = vec![format!(
-        "fastly config-store `{store_name}` (id={resolved_id}): {} entries, {roots} root(s), {live_count} live chunk(s), {} orphan(s) older than {older_than_secs}s, {retained_recent} orphan(s) too recent",
+        "fastly config-store `{store_name}` (id={resolved_id}): {} entries, {roots} root(s), {live_count} live chunk(s), {doomed_count} orphan(s) in {} generation(s) older than {older_than_secs}s, {retained_recent} orphan(s) too recent",
         items.len(),
         doomed.len(),
     )];
@@ -1469,52 +1486,122 @@ fn gc_fastly_config_store(
         // prove our writer produced them, so we left them alone. Say so, or the
         // summary reads as "everything reclaimable was reclaimed".
         out.push(format!(
-            "  {unprovable} chunk-shaped entr(ies) left untouched: could not prove EdgeZero wrote them (they do not reassemble to the generation their keys name)"
+            "  {unprovable} chunk-shaped entr(ies) left untouched: they are not byte-identical to what this writer would produce (wrong content-address, a split this writer would not choose, an incomplete generation, or a count it would never emit), so EdgeZero cannot claim them"
         ));
     }
-    if doomed.is_empty() {
+    if doomed_count == 0 {
         out.push("nothing to reclaim".to_owned());
         return Ok(out);
     }
-    for (key, age) in &doomed {
+    for (key, age) in doomed.iter().flatten() {
         let verb = if dry_run { "would delete" } else { "deleting" };
         out.push(format!("  {verb} `{key}` (age {age}s)"));
     }
     if dry_run {
         out.push(format!(
-            "dry-run: {} orphan chunk(s) would be deleted; re-run with --yes to apply",
-            doomed.len()
+            "dry-run: {doomed_count} orphan chunk(s) would be deleted; re-run with --yes to apply"
         ));
         return Ok(out);
     }
-    let mut deleted = 0_usize;
-    let mut failed: Vec<String> = Vec::new();
-    for (key, _) in &doomed {
-        match delete_config_store_entry(&resolved_id, key) {
-            Ok(()) => deleted = deleted.saturating_add(1),
-            Err(err) => {
-                out.push(format!("  FAILED to delete `{key}` ({err})"));
-                failed.push(key.clone());
+
+    let GcDeleteOutcome {
+        deleted,
+        failed,
+        stranded,
+    } = execute_gc_deletes(&resolved_id, &doomed, &mut out);
+    out.push(format!(
+        "reclaimed {deleted} of {doomed_count} orphan chunk entries"
+    ));
+    if failed.is_empty() {
+        return Ok(out);
+    }
+    // Partial/total failure must be a non-zero exit so automation can see it.
+    let mut diagnostic = format!(
+        "{}\nconfig gc: {} of {doomed_count} deletes FAILED ({})",
+        out.join("\n"),
+        failed.len(),
+        failed.join(", ")
+    );
+    if stranded.is_empty() {
+        diagnostic.push_str(
+            ". Every affected generation was left whole, so re-running `config gc` will retry them.",
+        );
+    } else {
+        // Be honest: these cannot be reclaimed by a re-run, ever.
+        let recovery = stranded
+            .iter()
+            .map(|key| {
+                format!(
+                    "  fastly config-store-entry delete --store-id={resolved_id} --key={key} --auto-yes"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        write!(
+            diagnostic,
+            ".\nWARNING: {} entr(ies) are now an INCOMPLETE generation because a sibling was \
+             already deleted before the failure: {}. `config gc` proves a generation by \
+             reassembling it, so it can no longer prove these and will never reclaim them -- \
+             re-running will NOT help. They are inert (no pointer references them). Remove them \
+             by hand once you are satisfied they are unreferenced:\n{recovery}",
+            stranded.len(),
+            stranded.join(", "),
+        )
+        .map_err(|err| format!("failed to format the gc diagnostic: {err}"))?;
+    }
+    Err(diagnostic)
+}
+
+/// Delete each doomed generation, stopping a generation at its FIRST failure.
+///
+/// A generation is provable only as a whole (`prove_generation` reassembles it),
+/// so a half-deleted one can never be proved again: the next run sees a fragment,
+/// cannot verify it, and correctly refuses to touch it — forever. Ploughing on
+/// after a failure is therefore the one thing that turns a retryable error into
+/// permanent, unreclaimable litter.
+///
+/// Stopping on first failure means the common case (a generation whose FIRST
+/// delete fails — auth, network, a vanished store) leaves that generation whole
+/// and genuinely retryable. Only a failure PART-WAY through strands one, and the
+/// caller reports those explicitly rather than pretending a re-run fixes them.
+/// Generations are independent, so a failure in one does not stop the others.
+fn execute_gc_deletes(
+    resolved_id: &str,
+    doomed: &[Vec<(String, u64)>],
+    out: &mut Vec<String>,
+) -> GcDeleteOutcome {
+    let mut outcome = GcDeleteOutcome {
+        deleted: 0,
+        failed: Vec::new(),
+        stranded: Vec::new(),
+    };
+    for generation in doomed {
+        let mut deleted_here: Vec<&str> = Vec::new();
+        for (key, _) in generation {
+            match delete_config_store_entry(resolved_id, key) {
+                Ok(()) => {
+                    outcome.deleted = outcome.deleted.saturating_add(1);
+                    deleted_here.push(key.as_str());
+                }
+                Err(err) => {
+                    out.push(format!("  FAILED to delete `{key}` ({err})"));
+                    outcome.failed.push(key.clone());
+                    if !deleted_here.is_empty() {
+                        // A sibling is already gone: what remains is a fragment
+                        // no future run can prove.
+                        outcome.stranded.extend(
+                            generation
+                                .iter()
+                                .map(|(survivor, _)| survivor.clone())
+                                .filter(|survivor| !deleted_here.contains(&survivor.as_str())),
+                        );
+                    }
+                    break; // stop THIS generation; the others are independent
+                }
             }
         }
     }
-    out.push(format!(
-        "reclaimed {deleted} of {} orphan chunk entries",
-        doomed.len()
-    ));
-    if failed.is_empty() {
-        Ok(out)
-    } else {
-        // Partial/total failure must be a non-zero exit so automation can see it.
-        // Continue-then-fail: we attempted every delete first.
-        Err(format!(
-            "{}\nconfig gc: {} of {} deletes FAILED ({}); re-run to retry",
-            out.join("\n"),
-            failed.len(),
-            doomed.len(),
-            failed.join(", ")
-        ))
-    }
+    outcome
 }
 
 /// The reclamation plan for one store: which orphan chunk entries to delete, and
@@ -1615,11 +1702,11 @@ fn plan_gc_reclamation(
         groups.entry((root, generation)).or_default().push(item);
     }
 
-    let mut doomed: Vec<(String, u64)> = Vec::new();
+    let mut doomed: Vec<Vec<(String, u64)>> = Vec::new();
     let mut retained_recent = 0_usize;
     let mut unprovable = 0_usize;
     for ((root, generation), group) in groups {
-        if prove_generation(&generation, &group).is_err() {
+        if prove_generation(root, &generation, &group).is_err() {
             // We cannot prove we wrote this, so we do not touch it. It may be an
             // ordinary entry that merely LOOKS like a chunk key (a store can
             // predate this feature or be shared, and push-time reserved-key
@@ -1656,10 +1743,16 @@ fn plan_gc_reclamation(
             retained_recent = retained_recent.saturating_add(group.len());
             continue;
         }
-        for item in group {
-            let age = now.saturating_sub(*created_by_key.get(item.item_key.as_str()).unwrap_or(&0));
-            doomed.push((item.item_key.clone(), age));
-        }
+        doomed.push(
+            group
+                .iter()
+                .map(|item| {
+                    let age = now
+                        .saturating_sub(*created_by_key.get(item.item_key.as_str()).unwrap_or(&0));
+                    (item.item_key.clone(), age)
+                })
+                .collect(),
+        );
     }
 
     Ok(GcPlan {
@@ -1682,7 +1775,11 @@ fn assemble_pointer_chunks(
     pointer: &GcPointer,
     value_by_key: &HashMap<&str, &str>,
 ) -> Result<String, String> {
-    let mut assembled = String::with_capacity(pointer.envelope_len);
+    // NOT `with_capacity(pointer.envelope_len)`: that length is untrusted stored
+    // metadata. `validate_pointer_chunks` bounds it, but this is a destructive
+    // path -- do not reserve from a number the store supplied when growing from
+    // the bytes we actually read costs nothing.
+    let mut assembled = String::new();
     for chunk in &pointer.chunks {
         let Some(value) = value_by_key.get(chunk.key.as_str()) else {
             return Err(format!(
@@ -1721,24 +1818,39 @@ fn assemble_pointer_chunks(
     Ok(assembled)
 }
 
-/// Can we PROVE this candidate generation is one our writer produced?
+/// Is this candidate generation byte-identical to what THIS writer would have
+/// produced for the bytes it contains?
 ///
-/// This is the whole basis for deleting anything. `group` is every listed entry
-/// sharing one `(root, generation)`. It is writer-produced iff:
+/// The gate on every delete. `group` is every listed entry sharing one
+/// `(root, generation)`.
 ///
-/// - there are at least two chunks (an oversized envelope always splits into
-///   >= 2, so a lone "chunk" is never something we wrote);
-/// - the indexes are dense `0..n-1` (a gap means this is not a whole generation,
-///   and we must not delete a fragment of one);
-/// - the values concatenated in index order hash to the generation the keys name.
+/// **What this proves, precisely.** We reassemble the group in index order and
+/// re-run `prepare_fastly_config_entries` over the result. If the writer, given
+/// those exact bytes, would emit exactly these keys and these values, the entries
+/// are indistinguishable from our own output: same direct-vs-chunked threshold,
+/// same UTF-8-safe 7 000-byte boundaries, same content-addressed keys, same
+/// count. A lone chunk fails automatically (an envelope small enough to store
+/// directly round-trips to a single ROOT-keyed entry, and a large one to >= 2
+/// chunks), as does any set split at boundaries we would not choose.
 ///
-/// Nothing else passes without a SHA-256 preimage, so an ordinary entry that
-/// merely looks like a chunk key — plain text, unrelated JSON, someone's real
-/// config — can never be mistaken for ours.
-fn prove_generation(generation: &str, group: &[&ConfigStoreItem]) -> Result<(), String> {
-    if group.len() < 2 {
-        return Err("a chunked envelope always splits into at least two chunks".to_owned());
-    }
+/// **What this does NOT prove: authorship.** Content-addressing is not a
+/// signature. A foreign writer can pick envelope E, compute `H = sha256(E)`,
+/// split E exactly as we would, and store the parts under our reserved
+/// `.__edgezero_chunks.` namespace; that group is byte-identical to ours and we
+/// will reclaim it. No preimage attack is needed, and no check over the stored
+/// bytes alone can separate the two — telling them apart needs trusted
+/// generation metadata or an authenticated marker, and the store offers neither
+/// (any writer with store access could forge either).
+///
+/// We accept that residual: the namespace is reserved by convention, push-time
+/// validation rejects logical keys inside it, and anything passing this gate is
+/// a faithful reproduction of our format. The spec documents it as a limitation
+/// rather than claiming a guarantee we cannot make.
+fn prove_generation(
+    root: &str,
+    generation: &str,
+    group: &[&ConfigStoreItem],
+) -> Result<(), String> {
     let mut ordered: Vec<(usize, &str)> = Vec::with_capacity(group.len());
     for item in group {
         let index = item
@@ -1756,8 +1868,66 @@ fn prove_generation(generation: &str, group: &[&ConfigStoreItem]) -> Result<(), 
             ));
         }
     }
-    let assembled: String = ordered.into_iter().map(|(_, value)| value).collect();
-    gc_verify_generation(generation, &assembled)
+    let assembled: String = ordered.iter().map(|&(_, value)| value).collect();
+
+    // 1. The bytes must be the generation the keys name, and a real envelope.
+    gc_verify_generation(generation, &assembled)?;
+
+    // 2. ...and the writer, given those bytes, must produce EXACTLY these
+    //    entries. This is what pins the split boundaries and the chunked-vs-
+    //    direct threshold, so a set assembled by anything that does not
+    //    reproduce our writer's output byte-for-byte is left alone.
+    let expected = prepare_fastly_config_entries(root, &assembled)
+        .map_err(|err| format!("this writer could not re-derive the generation ({err})"))?;
+    let Some(expected_chunks) = expected.get(..expected.len().saturating_sub(1)) else {
+        return Err("this writer produced no chunk entries for these bytes".to_owned());
+    };
+    if expected_chunks.is_empty() {
+        // The envelope fits directly, so the writer would never have chunked it:
+        // whatever these entries are, they are not ours.
+        return Err(
+            "these bytes fit the entry limit, so this writer would have stored them directly \
+             rather than in chunks"
+                .to_owned(),
+        );
+    }
+    if expected_chunks.len() != ordered.len() {
+        return Err(format!(
+            "this writer would split these bytes into {} chunk(s), not {}",
+            expected_chunks.len(),
+            ordered.len()
+        ));
+    }
+    for ((expected_key, expected_value), item) in
+        expected_chunks.iter().zip(group_in_index_order(group))
+    {
+        if *expected_key != item.item_key {
+            return Err(format!(
+                "this writer would not have produced the key `{}`",
+                item.item_key
+            ));
+        }
+        if *expected_value != item.item_value {
+            return Err(format!(
+                "the stored value of `{}` is not the chunk this writer would have written at that \
+                 index",
+                item.item_key
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `group` sorted by chunk index, so it lines up with the writer's output order.
+fn group_in_index_order<'item>(group: &[&'item ConfigStoreItem]) -> Vec<&'item ConfigStoreItem> {
+    let mut ordered: Vec<&ConfigStoreItem> = group.to_vec();
+    ordered.sort_by_key(|item| {
+        item.item_key
+            .rsplit_once('.')
+            .and_then(|(_, index)| index.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
+    ordered
 }
 
 /// Is this key a chunk key of ANY root? (`config gc` scans the whole store, so
@@ -4339,8 +4509,14 @@ echo 'unexpected' >&2; exit 1
             panic!("corrupt chunk must error")
         };
         assert!(
-            err.contains("SHA mismatch") || err.contains("mismatch"),
-            "error must mention hash mismatch: {err}"
+            err.contains("does not match the SHA-256"),
+            "error must say what failed: {err}"
+        );
+        // Round 8 [P1]: identified by POSITION, and neither hash echoed -- the
+        // expected one comes from the stored pointer, so it is value-controlled.
+        assert!(
+            err.contains("chunk 0"),
+            "error must locate the failing chunk by position: {err}"
         );
     }
 
@@ -4806,6 +4982,166 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// PR #314 round-8 [P2]: a delete that fails on a generation's FIRST key
+    /// leaves that generation whole -- so it stays provable and a re-run really
+    /// does retry it. The old loop ploughed on through the siblings, which is
+    /// what turned a retryable error into permanent litter.
+    #[cfg(unix)]
+    #[test]
+    fn gc_first_delete_failure_leaves_the_generation_whole_and_retryable() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 2, "need a multi-chunk generation");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        // The FIRST chunk of the doomed generation fails to delete.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&dead_chunks[0]),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete is a failure");
+        assert!(
+            err.contains("re-running `config gc` will retry"),
+            "a whole generation is genuinely retryable and should say so: {err}"
+        );
+        assert!(
+            !err.contains("WARNING"),
+            "nothing was stranded, so there must be no manual-recovery warning: {err}"
+        );
+        // The siblings must NOT have been deleted -- that is what keeps the
+        // generation provable next time.
+        for key in dead_chunks.iter().skip(1) {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "after the first failure this generation must be left alone, or its survivors \
+                 become an unprovable fragment: `{key}`"
+            );
+        }
+    }
+
+    /// PR #314 round-8 [P2]: if a delete fails PART-WAY through a generation, the
+    /// survivors are an incomplete generation that `prove_generation` can never
+    /// verify again -- so `gc` will never reclaim them. Claiming "re-run to
+    /// retry" there was false. Say plainly that recovery is manual.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reports_stranded_survivors_as_manual_recovery() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // Padded to >= 3 chunks so a mid-generation failure leaves survivors.
+        let live = gen_envelope("live");
+        let dead = gen_envelope_padded("dead", 20_000);
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 3, "need >= 3 chunks");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        // The SECOND chunk fails: the first is already gone by then.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&dead_chunks[1]),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete is a failure");
+        assert!(
+            err.contains("INCOMPLETE generation") && err.contains("re-running will NOT help"),
+            "a stranded fragment must not be described as retryable: {err}"
+        );
+        // It must name the survivors and how to remove them by hand.
+        for key in dead_chunks.iter().skip(2) {
+            assert!(
+                err.contains(key.as_str()),
+                "the operator needs the exact surviving keys: `{key}` missing from: {err}"
+            );
+        }
+        assert!(
+            err.contains("fastly config-store-entry delete"),
+            "give the operator the recovery command: {err}"
+        );
+        // And we stopped rather than deleting the rest.
+        for key in dead_chunks.iter().skip(2) {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "deletion must stop at the first failure in a generation: `{key}`"
+            );
+        }
+    }
+
+    /// PR #314 round-8 [P1]: a FOREIGN writer needs NO preimage to satisfy a
+    /// content-address. Pick envelope E, compute H = sha256(E), split E however
+    /// you like, store the parts as `<root>.__edgezero_chunks.H.0` / `.1`. Under
+    /// hash-only checking that group "proved" itself and was deleted.
+    ///
+    /// The round-trip closes it: the writer, given those same bytes, must emit
+    /// exactly these keys and values. A split at boundaries we would never
+    /// choose is not our output, so it is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn gc_never_reclaims_a_foreign_content_addressed_group() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+
+        // A foreign writer's data: a valid envelope, content-addressed under our
+        // reserved namespace, but split at ITS OWN boundary (not our 7 000-byte
+        // UTF-8-safe one). Everything hashes correctly -- no preimage needed.
+        let foreign = gen_envelope_padded("foreign-tool", 20_000);
+        let generation = sha256_hex(foreign.as_bytes());
+        let (head, tail) = foreign.split_at(1_234);
+        let foreign_keys = [
+            format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{generation}.0"),
+            format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{generation}.1"),
+        ];
+        listing.push((
+            foreign_keys[0].clone(),
+            stamp_secs_ago(31_536_000),
+            head.to_owned(),
+        ));
+        listing.push((
+            foreign_keys[1].clone(),
+            stamp_secs_ago(31_536_000),
+            tail.to_owned(),
+        ));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &foreign_keys {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a group this writer would never have produced must not be reclaimed, however \
+                 well it hashes: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
     /// PR #314 round-6/7 [P1]: an entry can be chunk-SHAPED without being a chunk
     /// -- a store may predate this feature or be shared, and push-time
     /// reserved-key rejection cannot protect what already exists. Deleting one
@@ -4858,10 +5194,14 @@ echo 'unexpected' >&2; exit 1
                 "an entry we cannot prove we wrote must never be deleted: `{key}`; log:\n{log}"
             );
         }
-        // Left untouched must not mean silently ignored.
+        // Left untouched must not mean silently ignored. The wording must not
+        // over-claim either: these two entries fail for DIFFERENT reasons (a
+        // wrong content-address vs a count this writer never emits), so the
+        // summary says "not byte-identical to what this writer would produce"
+        // rather than naming one specific check.
         assert!(
             out.iter()
-                .any(|line| line.contains("could not prove EdgeZero wrote them")),
+                .any(|line| line.contains("not byte-identical to what this writer would produce")),
             "the summary must report what it declined to judge; out: {out:?}"
         );
         // ...and a genuine orphan generation is still reclaimed, so one foreign

@@ -353,10 +353,20 @@ unsafe. So:
 
 `config gc` fails closed: an unreadable, paginated, or duplicate-keyed
 listing; a root it cannot classify; a pointer whose chunk list is internally
-inconsistent; an unreadable timestamp; a live pointer referencing a key absent
-from the listing; or an entry whose key looks like a chunk but whose value is a
-root — all abort with **nothing deleted**. It never deletes a chunk a live
-pointer references, however old, and never deletes a root.
+inconsistent or that does not reconstruct the envelope it claims; an unreadable
+timestamp; or a live pointer referencing a key absent from the listing — all
+abort with **nothing deleted**. It never deletes a chunk a live pointer
+references, however old, and never deletes a root.
+
+It also **only deletes entries that are byte-identical to what `config push`
+itself would have written** for the bytes they contain — same split boundaries,
+same content-addressed keys, same count. Anything else in the chunk namespace
+(plain text, another tool's data, a half-written generation) is **left untouched
+and reported**, not deleted and not fatal — one foreign entry does not block
+reclaiming the rest of the store. Note this is a format check, not a proof of
+authorship: another writer that reproduced `config push`'s exact output under the
+`.__edgezero_chunks.` namespace would be indistinguishable, and would be
+reclaimed. Do not store unrelated data under that reserved namespace.
 
 ```bash
 # Dry run FIRST — previews every orphan and its age, deletes nothing.
@@ -367,9 +377,15 @@ edgezero config gc --adapter fastly --older-than 7d --yes
 ```
 
 **Exit codes:** `0` on success. Non-zero on any fail-closed refusal (nothing
-deleted) and non-zero if any delete failed — every delete is attempted, then
-the command reports the failed keys, so automation detects a partial pass. A
-failed delete is inert; re-run to retry.
+deleted) and non-zero if any delete failed, so automation detects a partial pass.
+
+Deletion works one generation at a time and **stops a generation at its first
+failure**, which normally leaves it whole and a re-run retries it. If a delete
+fails _part-way_ through a generation, the survivors become an incomplete
+generation that `gc` can no longer verify — it will never reclaim them, so
+**re-running will not help**. The command names those keys and prints the
+`fastly config-store-entry delete` commands to remove them by hand. They are
+inert in the meantime: no pointer references them.
 
 ### edgezero provision
 

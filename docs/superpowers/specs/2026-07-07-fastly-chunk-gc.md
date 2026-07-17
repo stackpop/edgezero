@@ -136,8 +136,10 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 6. **`config gc` requires no concurrent `config push`.** No CAS means it cannot
    atomically observe-and-delete; the operator serialises it against pushes.
 
-7. **A delete failure is a non-zero exit.** All deletes are attempted; if any
-   fail, the command exits non-zero naming them, so automation can detect it.
+7. **A delete failure is a non-zero exit.** Independent generations are all
+   attempted; deletion STOPS within a generation at its first failure (see
+   invariant 11). If any delete fails, the command exits non-zero naming them, so
+   automation can detect it.
 
 8. **Local eager pruning is safe and stays.** One file, read at Viceroy startup:
    no propagation window, no POPs.
@@ -146,18 +148,38 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
    push, so it can never fail one.
 
 10. **A root is never deleted, whatever its key looks like.** Key shape alone
-    does not prove an entry is ours; the value must not be root-like. Push-time
-    reserved-key rejection cannot protect entries that already exist.
+    does not prove an entry is ours; the entries must round-trip to this
+    writer's exact output. Push-time reserved-key rejection cannot protect
+    entries that already exist.
 
-11. **A failed delete is always a failure.** There is no "already gone" stderr
+11. **A generation is deleted whole or not at all, and a failure stops it.** A
+    generation is provable only as a unit, so a half-deleted one can never be
+    proved again. Deletion therefore stops at a generation's first failure: the
+    common case leaves it whole and genuinely retryable. A failure PART-WAY
+    through strands the survivors permanently — `gc` will never reclaim them —
+    so the command names them and the manual delete commands, and does NOT
+    pretend a re-run helps.
+
+12. **A failed delete is always a failure.** There is no "already gone" stderr
     special case: `not found`/`404` text cannot distinguish a missing key from a
     missing store, an auth failure or a 500, and reporting those as reclamation
     is worse than a retry. Retries are free — `gc` re-lists, so a key that is
     genuinely gone never becomes a candidate again.
 
-12. **A diagnostic never quotes a stored value.** `serde_json`'s `Display`
-    embeds the offending input, and app config may hold credentials; parse
-    failures report position and category only.
+13. **A diagnostic never quotes a stored value — on ANY path.** `serde_json`'s
+    `Display` embeds the offending input; `BlobEnvelope::verify` names the stored
+    hashes; and `chunks[].key` is pointer-controlled and unvalidated where it is
+    reported. All are config- or attacker-supplied strings that may hold
+    credentials, and these lines are logged verbatim. Diagnostics carry a chunk's
+    POSITION and an error CATEGORY, never a stored string. This binds the runtime
+    read path as much as GC.
+
+14. **Untrusted metadata never sizes an allocation.** `envelope_len` and the
+    per-chunk lengths come from the store. They are bounded against what the
+    writer emits and summed with checked arithmetic, and no buffer is reserved
+    from them — a pointer declaring `usize::MAX` would otherwise abort the
+    process (including the edge guest, on the read path) before any check could
+    reject it.
 
 ## Two further invariants (PR #314 review)
 
@@ -249,13 +271,32 @@ Dry-run by default; deletes only with `--yes`.
    to `envelope_len`. A pointer that parses but under-reports its chunks would
    silently shrink the live set.
 
-3. **Never delete a root, whatever its key looks like.** Entries are grouped by
-   key shape, which is only trustworthy for a store we wrote. A store may predate
-   this feature or be shared, and push-time reserved-key rejection cannot protect
-   entries that already exist — so an ordinary root may sit at a chunk-shaped key.
-   Before deleting a candidate, confirm its **value** is not root-like (a complete
-   envelope or a pointer); an oversized envelope always splits into ≥ 2 pieces, so
-   no genuine chunk value is ever either. A root-like value aborts the run.
+3. **Delete only what is byte-identical to this writer's own output.** Entries
+   are grouped by key shape, which is only trustworthy for a store we wrote. A
+   store may predate this feature or be shared, and push-time reserved-key
+   rejection cannot protect entries that already exist — so an ordinary root, or
+   another tool's data, may sit at a chunk-shaped key.
+
+   A candidate generation is reclaimable only if re-running
+   `prepare_fastly_config_entries` over its reassembled bytes yields **exactly**
+   those keys and values: same direct-vs-chunked threshold, same UTF-8-safe
+   7 000-byte boundaries, same content-addressed keys, same count. A group that
+   fails is **left untouched and reported** — not fatal, because one foreign
+   entry must not block reclaiming the rest of the store forever.
+
+   > **Content-addressing is NOT proof of authorship, and this spec does not
+   > claim it is.** Hashing is not a signature: a foreign writer can pick
+   > envelope E, compute `H = sha256(E)`, split E exactly as we would, and store
+   > the parts under our reserved namespace. No preimage attack is involved, and
+   > that group is byte-identical to ours — we cannot distinguish it and we will
+   > reclaim it. Separating the two would need trusted generation metadata or an
+   > authenticated marker, and this store offers neither (any writer with store
+   > access could forge either, and there is nowhere to keep a key). **The
+   > property we actually guarantee is: we never delete an entry that is not a
+   > faithful reproduction of our own writer's output for the bytes it holds.**
+   > The residual is accepted because the `.__edgezero_chunks.` namespace is
+   > reserved by convention and push-time validation rejects logical keys inside
+   > it.
 
 4. **Duplicate keys fail closed.** A key is unique in a config store, so
    duplicate rows mean the listing is not one consistent view of it; last-row-wins
@@ -392,10 +433,15 @@ live = union over roots of:
     -> if chunked: reassemble its chunks from the listing and CHECK the bytes
        hash to envelope_sha256, else abort      # metadata alone is not proof
 doomed = whole GENERATIONS of non-live chunk entries that
-    (a) reassemble to the content-address their own keys name  # proves we wrote them
+    (a) reassemble to the content-address their own keys name, AND round-trip
+        through prepare_fastly_config_entries to EXACTLY these keys+values
+        # i.e. byte-identical to this writer's own output -- NOT proof of
+        # authorship; see the note in the invariants section
     (b) clear --older-than by BOTH their own age and their root's live-config age
-    # a generation we cannot prove is left UNTOUCHED and reported, never deleted
-delete doomed        # fails closed on any unclassifiable/unreadable state
+    # a generation that does not round-trip is left UNTOUCHED and reported
+delete doomed        # whole generations only; STOP a generation at its first
+                     # failure (a half-deleted generation can never be proved
+                     # again, so ploughing on strands its survivors for good)
 ```
 
 ## Local path (`push_config_entries_local` / `write_fastly_local_config_store`)
@@ -501,11 +547,14 @@ in the `cli.rs` test module.
 - **Dry-run** names every key + age it would delete, and deletes nothing.
 - **Fails closed on an unreadable `created_at`** — aborts, deletes nothing.
 - **Fails closed on an unclassifiable root** — aborts, deletes nothing.
-- **Never deletes an entry it cannot prove EdgeZero wrote** — a candidate
-  generation must reassemble to the content-address its own keys name, and must
-  have >= 2 chunks (our writer never emits a one-chunk generation). An entry that
-  is merely chunk-SHAPED — plain text, unrelated JSON, someone's real config at a
-  chunk-shaped key — is left untouched and reported, never deleted.
+- **Never deletes an entry that is not byte-identical to this writer's own
+  output** — a candidate generation must reassemble to the content-address its
+  keys name AND round-trip through `prepare_fastly_config_entries` to exactly
+  those keys and values (which pins the split boundaries, the chunked-vs-direct
+  threshold, and the count — a lone "chunk" can never pass). An entry that is
+  merely chunk-SHAPED — plain text, unrelated JSON, someone's real config, or
+  another tool's content-addressed data — is left untouched and reported, never
+  deleted. This is NOT a proof of authorship; see §"Reclamation algorithm".
 - **Fails closed when a live pointer under-reports its chunks** — a pointer that
   drops a chunk ref AND restates `envelope_len` to match passes every metadata
   check, so its chunks are reassembled and hashed against `envelope_sha256`.
@@ -518,8 +567,15 @@ in the `cli.rs` test module.
 - **Every failed delete is a failure.** There is no "already gone" stderr special
   case: `not found`/`404` text cannot distinguish a missing key from a missing
   store, an auth failure or a 500, and reporting those as reclamation is worse
-  than a retry. Retries are free — `gc` re-lists, so a key that is genuinely gone
-  never becomes a candidate again.
+  than a retry.
+- **Deletion stops at a generation's first failure**, so the generation stays
+  whole and provable and a re-run really does retry it. Retrying is free — `gc`
+  re-lists, so a key that is genuinely gone never becomes a candidate again.
+- **A failure part-way through a generation strands its survivors, and `gc` says
+  so.** They are an incomplete generation that can never be proved again, so `gc`
+  will never reclaim them; the command names them and prints the manual delete
+  commands rather than claiming a re-run will help. They are inert — no pointer
+  references them.
 
 ### Local (`push_config_entries_local` / `write_fastly_local_config_store`)
 
