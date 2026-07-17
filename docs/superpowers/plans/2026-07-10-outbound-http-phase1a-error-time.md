@@ -14,7 +14,7 @@
 - **Colocated tests** (`#[cfg(test)]` same file); async tests use `futures::executor::block_on`.
 - **Verbatim constants:** `DEFAULT_NO_DEADLINE_BUDGET = 30 s`, `DEADLINE_FAR_FUTURE = 7 days`, `BATCH_DISPATCH_SLACK_MAX = 25 ms`.
 - **CI gates must stay green:** `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets`; `cargo check --workspace --all-targets --features "fastly cloudflare spin"`; `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`.
-- **Verified against the tree (HEAD 970f1f6):** `EdgeError` today has variants `BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`. The new arms below must be added to **eight** exhaustive matches — **five in `impl`**: `inner()` (error.rs:87), `kind_str()` (:110), `message()` (:125), `status()` (:180), `IntoResponse`'s `field_path_opt` (:221) — **and three in the test module** (:281, :335, :369), each a `match err { ConfigOutOfDate {..} => .. , <all others> => panic!(..) }` with **no `_` wildcard**. Also the matrix test `kind_strings_per_variant` (:502) must gain rows for both new variants. `web-time` presence is confirmed in Task 0.
+- **Verified against the tree (HEAD 970f1f6):** `EdgeError` today has variants `BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`. The new arms below must be added to **eight** exhaustive matches — **five in `impl`**: `inner()` (error.rs:87), `kind_str()` (:110), `message()` (:125), `status()` (:180), `IntoResponse`'s `field_path_opt` (:221) — **and three in the test module** (:281, :335, :369), each a `match err { ConfigOutOfDate {..} => .. , <all others> => panic!(..) }` with **no `_` wildcard**. Also **three** per-variant matrix tests must gain rows for both new variants: `kind_strings_per_variant` (:502), `retry_after_only_on_config_out_of_date` (:549 — 502/504 must NOT carry `Retry-After`), and `field_path_only_on_config_out_of_date` (:569). `web-time` presence is confirmed in Task 0.
 - **`cargo test` accepts only ONE positional filter** — `cargo test -p X a b` fails with `unexpected argument 'b'` (verified). Use a single common substring or two separate commands.
 - **The Clippy gate is STRICT — read this before writing any code.** The root `Cargo.toml` sets `restriction = { level = "deny", priority = -1 }`, and the following are **not** allow-listed, so they are hard errors in **production** code:
   - `missing_inline_in_public_items` → **every public fn needs `#[inline]`** (error.rs already carries 14).
@@ -52,7 +52,7 @@ web-time = { workspace = true }
 ### Task 1: `EdgeError::BadGateway` (502) + `GatewayTimeout` (504)
 
 **Files:**
-- Modify: `crates/edgezero-core/src/error.rs` (enum + constructors + 8 match sites + matrix test)
+- Modify: `crates/edgezero-core/src/error.rs` (enum + constructors + 8 match sites + **3** matrix tests)
 - Test: `crates/edgezero-core/src/error.rs` (colocated `#[cfg(test)]`)
 
 **Interfaces:**
@@ -141,18 +141,29 @@ Resulting order: `BadGateway, BadRequest, ConfigOutOfDate, GatewayTimeout, Inter
 Run: `cargo build -p edgezero-core --tests`
 If it reports `E0004 non-exhaustive patterns` anywhere, add the two arms at that exact site (the compiler prints the file:line). Repeat until it builds. Expected end state: builds clean.
 
-- [ ] **Step 7: Extend the matrix test `kind_strings_per_variant` (error.rs:502)**
+- [ ] **Step 7: Extend ALL THREE existing per-variant matrix tests**
 
-That test uses an `assert_kind!($err, $expected_kind:literal, $expected_status:literal)` macro per variant, and the existing rows pass **suffixed** status literals (e.g. `assert_kind!(EdgeError::bad_request("x"), "bad_request", 400_u16);`). Match that form exactly — add two invocations inside it:
+There are **three** existing per-variant matrices in `error.rs`; the new variants belong in all three, or the matrices silently stop being exhaustive:
+
+**(a) `kind_strings_per_variant` (:502)** — uses `assert_kind!($err, $expected_kind:literal, $expected_status:literal)`, and existing rows pass **suffixed** status literals (`assert_kind!(EdgeError::bad_request("x"), "bad_request", 400_u16);`). Match that form:
 
 ```rust
         assert_kind!(EdgeError::bad_gateway("x"), "bad_gateway", 502_u16);
         assert_kind!(EdgeError::gateway_timeout("x"), "gateway_timeout", 504_u16);
 ```
 
+**(b) `retry_after_only_on_config_out_of_date` (:549)** — asserts **only** `ConfigOutOfDate` emits `Retry-After: 60`. 502/504 must **not**, so add:
+
+```rust
+        assert_retry_after!(EdgeError::bad_gateway("x"), false);
+        assert_retry_after!(EdgeError::gateway_timeout("x"), false);
+```
+
+**(c) `field_path_only_on_config_out_of_date` (:569)** — asserts `field_path` is absent for non-`ConfigOutOfDate` variants. Add the same two assertions for `bad_gateway` / `gateway_timeout` in that test's existing style (this overlaps the JSON-shape test in Step 1 — keep both; the matrix is the exhaustive per-variant guard, the Step 1 test is the focused contract).
+
 - [ ] **Step 8: Run the new + matrix tests to verify they pass**
 
-Run: `cargo test -p edgezero-core bad_gateway` then `cargo test -p edgezero-core kind_strings_per_variant`
+Run: `cargo test -p edgezero-core bad_gateway`, then `cargo test -p edgezero-core kind_strings_per_variant`, then `cargo test -p edgezero-core only_on_config_out_of_date` (one filter matches both the retry_after_* and field_path_* matrices).
 Expected: PASS.
 
 - [ ] **Step 9: Format, lint, full-crate test**
