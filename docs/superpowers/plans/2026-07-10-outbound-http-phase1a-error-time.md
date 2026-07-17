@@ -16,6 +16,12 @@
 - **CI gates must stay green:** `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets`; `cargo check --workspace --all-targets --features "fastly cloudflare spin"`; `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`.
 - **Verified against the tree (HEAD 970f1f6):** `EdgeError` today has variants `BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`. The new arms below must be added to **eight** exhaustive matches — **five in `impl`**: `inner()` (error.rs:87), `kind_str()` (:110), `message()` (:125), `status()` (:180), `IntoResponse`'s `field_path_opt` (:221) — **and three in the test module** (:281, :335, :369), each a `match err { ConfigOutOfDate {..} => .. , <all others> => panic!(..) }` with **no `_` wildcard**. Also the matrix test `kind_strings_per_variant` (:502) must gain rows for both new variants. `web-time` presence is confirmed in Task 0.
 - **`cargo test` accepts only ONE positional filter** — `cargo test -p X a b` fails with `unexpected argument 'b'` (verified). Use a single common substring or two separate commands.
+- **The Clippy gate is STRICT — read this before writing any code.** The root `Cargo.toml` sets `restriction = { level = "deny", priority = -1 }`, and the following are **not** allow-listed, so they are hard errors in **production** code:
+  - `missing_inline_in_public_items` → **every public fn needs `#[inline]`** (error.rs already carries 14).
+  - `min_ident_chars` → no single-char idents (`d` → `duration`).
+  - `arithmetic_side_effects` → **no bare `+` / `-`** on `Instant`/`Duration`; use `checked_add` / `checked_duration_since`.
+  - `expect_used`, `unwrap_used`, `as_conversions` → forbidden in production; use `?`/`ok_or`/`From`/`TryFrom`.
+  - **In TESTS**, the root `clippy.toml` sets `allow-expect-in-tests = true`, `allow-unwrap-in-tests = true`, `allow-panic-in-tests = true`, `allow-indexing-slicing-in-tests = true` — so `.expect(..)` in tests is fine. **`arithmetic_side_effects` is NOT test-exempt**, which is why the tests below use `checked_add(..).expect("no overflow")` rather than `base + dur`.
 
 ---
 
@@ -185,55 +191,57 @@ mod tests {
         assert_eq!(BATCH_DISPATCH_SLACK_MAX, Duration::from_millis(25));
     }
 
-    // Deterministic: build from an explicit past/now/future instant, not a
-    // tolerance window over Instant::now().
+    // EXACT + deterministic: every assertion pins BOTH the deadline instant and the
+    // `now` it is compared against, via the pure `*_at(now)` helpers. No wall-clock
+    // tolerance windows, no assumption about how fast the test resumes.
+
     #[test]
     fn deadline_before_now_is_expired() {
         let base = Instant::now();
-        let past = Deadline::at_instant(base.checked_sub(Duration::from_secs(1)).unwrap_or(base));
-        assert!(past.is_expired());
-        assert_eq!(past.remaining(), None);
+        let past = Deadline::at_instant(base);
+        let now = base.checked_add(Duration::from_secs(1)).expect("no overflow");
+        assert!(past.is_expired_at(now));
+        assert_eq!(past.remaining_at(now), None);
     }
 
     #[test]
     fn deadline_exactly_now_is_expired() {
-        // Equality must count as expired (spec: deadline <= now). Use an instant
-        // strictly in the past-or-equal boundary: `base` captured, then asserted
-        // against a later `now` inside is_expired(), so `base <= now` holds.
+        // THE equality boundary: deadline instant == now. Spec §3.3.2 says
+        // `deadline <= now` is expired. `checked_duration_since` returns Some(ZERO)
+        // here, so a naive impl would wrongly report NOT expired.
         let base = Instant::now();
         let at_now = Deadline::at_instant(base);
-        // By the time is_expired() reads Instant::now(), it is >= base, so expired.
-        assert!(at_now.is_expired(), "a deadline at-or-before now is expired");
+        assert_eq!(at_now.remaining_at(base), None, "zero remaining is expired, not Some(0)");
+        assert!(at_now.is_expired_at(base), "a deadline exactly at now is expired");
     }
 
     #[test]
-    fn deadline_in_future_has_positive_remaining() {
+    fn deadline_in_future_has_exact_remaining() {
         let base = Instant::now();
-        let future = Deadline::at_instant(base + Duration::from_secs(3600));
-        assert!(!future.is_expired());
-        let r = future.remaining().expect("future deadline has remaining");
-        // Bounded by explicit instants: remaining is in (elapsed-since-base .. 3600s].
-        assert!(r <= Duration::from_secs(3600));
-        assert!(r > Duration::from_secs(3599)); // at most ~1s can have elapsed in-test
+        let future = Deadline::at_instant(base.checked_add(Duration::from_secs(60)).expect("no overflow"));
+        assert!(!future.is_expired_at(base));
+        // EXACT equality — both instants are explicit, so there is no elapsed-time slop.
+        assert_eq!(future.remaining_at(base), Some(Duration::from_secs(60)));
     }
 
     #[test]
     fn after_clamps_duration_max_to_far_future() {
-        // Prove the 7-DAY CLAMP, not merely "some positive deadline".
+        // Prove the 7-DAY CLAMP via bounds on the resulting INSTANT (no second
+        // now()-snapshot to race against).
         let before = Instant::now();
-        let d = Deadline::after(Duration::MAX);
+        let deadline = Deadline::after(Duration::MAX);
         let after = Instant::now();
-        assert!(!d.is_expired());
-        let r = d.remaining().expect("clamped deadline is in the future");
-        // now + 7d was computed between `before` and `after`; so remaining must be
-        // within [FAR_FUTURE - (after-before) - slack, FAR_FUTURE].
-        assert!(r <= DEADLINE_FAR_FUTURE, "never exceeds the clamp");
-        assert!(r > DEADLINE_FAR_FUTURE - (after - before) - Duration::from_millis(50));
+        // `after()` computed `t0 + FAR_FUTURE` for some t0 in [before, after],
+        // so the instant must land within [before+FAR_FUTURE, after+FAR_FUTURE].
+        let lower = before.checked_add(DEADLINE_FAR_FUTURE).expect("no overflow");
+        let upper = after.checked_add(DEADLINE_FAR_FUTURE).expect("no overflow");
+        assert!(deadline.instant() >= lower, "clamped below the 7-day bound");
+        assert!(deadline.instant() <= upper, "Duration::MAX was NOT clamped to 7 days");
     }
 
     #[test]
     fn instant_round_trips() {
-        let base = Instant::now() + Duration::from_secs(10);
+        let base = Instant::now().checked_add(Duration::from_secs(10)).expect("no overflow");
         assert_eq!(Deadline::at_instant(base).instant(), base);
     }
 }
@@ -248,6 +256,15 @@ Expected: FAIL to compile (`cannot find value DEFAULT_NO_DEADLINE_BUDGET`, `cann
 - [ ] **Step 3: Implement constants + `Deadline`**
 
 Prepend to `crates/edgezero-core/src/time.rs` (above `#[cfg(test)]`):
+
+> **This code is written to pass the repo's strict Clippy gate.** The workspace sets
+> `restriction = { level = "deny", priority = -1 }` (root `Cargo.toml`), and **none** of
+> `missing_inline_in_public_items`, `min_ident_chars`, `arithmetic_side_effects`,
+> `expect_used`, or `as_conversions` is allow-listed. Therefore: every public method
+> carries **`#[inline]`** (matching the 14 existing `#[inline]`s in `error.rs`); no
+> single-char idents (`d` → `duration`); and **no bare `-`/`+`** — all arithmetic is
+> `checked_*`. The private `*_at(now)` helpers additionally make the logic **pure and
+> deterministically testable** (no hidden `Instant::now()` inside the assertion).
 
 ```rust
 use web_time::Instant;
@@ -270,42 +287,57 @@ pub const BATCH_DISPATCH_SLACK_MAX: Duration = Duration::from_millis(25);
 pub struct Deadline(Instant);
 
 impl Deadline {
-    /// `now + min(d, DEADLINE_FAR_FUTURE)`. Never panics: the clamped add uses
+    /// `now + min(duration, DEADLINE_FAR_FUTURE)`. Never panics: the clamped add uses
     /// saturating `checked_add(..).unwrap_or(now)`, so a defensive overflow yields an
     /// already-expired deadline rather than panicking.
+    #[inline]
     #[must_use]
-    pub fn after(d: Duration) -> Self {
+    pub fn after(duration: Duration) -> Self {
         let now = Instant::now();
-        let clamped = d.min(DEADLINE_FAR_FUTURE);
+        let clamped = duration.min(DEADLINE_FAR_FUTURE);
         Deadline(now.checked_add(clamped).unwrap_or(now))
     }
 
+    #[inline]
     #[must_use]
     pub fn at_instant(instant: Instant) -> Self {
         Deadline(instant)
     }
 
+    #[inline]
     #[must_use]
     pub fn instant(&self) -> Instant {
         self.0
     }
 
-    /// Remaining time, or `None` once the deadline is reached **or passed** (equality
-    /// counts as passed — spec §3.3.2 `deadline <= now`).
+    /// Pure core of `remaining`, parameterised on `now` so tests can pin the comparison
+    /// to one explicit instant. `None` once the deadline is reached **or passed**
+    /// (equality counts as passed — spec §3.3.2 `deadline <= now`).
+    /// `checked_duration_since` returns `Some(ZERO)` at equality, so the zero case is
+    /// filtered explicitly; this also keeps the arithmetic `checked_*`.
+    fn remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.0
+            .checked_duration_since(now)
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    /// Pure core of `is_expired`.
+    fn is_expired_at(&self, now: Instant) -> bool {
+        self.remaining_at(now).is_none()
+    }
+
+    /// Remaining time, or `None` once the deadline is reached or passed.
+    #[inline]
     #[must_use]
     pub fn remaining(&self) -> Option<Duration> {
-        let now = Instant::now();
-        if self.0 <= now {
-            None
-        } else {
-            Some(self.0 - now)
-        }
+        self.remaining_at(Instant::now())
     }
 
     /// `true` once the deadline instant is at-or-before now.
+    #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.0 <= Instant::now()
+        self.is_expired_at(Instant::now())
     }
 }
 ```
