@@ -406,8 +406,13 @@ impl Adapter for FastlyCliAdapter {
             // remediation alongside the populate-keys hint.
             let post_create_note =
                 resource_link_note(&fastly_path, runtime_env_kind, runtime_env_name)?;
+            // NB: this store is what the ACTIVE (production) service reads. The
+            // example must never point it at a staging key — following that would
+            // make production serve staged config. Staged versions get their own
+            // selector via `edgezero_runtime_env_staging`, wired automatically by
+            // a staged deploy; nothing here should be edited to stage config.
             let mut line = format!(
-                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store); appended setup tables to {}\n  Populate per-environment override keys with:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=app_config_staging --upsert",
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  It already selects each store's default key, so no edit is needed for a normal setup.\n  To point PRODUCTION at a different key (e.g. a renamed store), and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by `{RUNTIME_ENV_STAGING_STORE}`, which a staged deploy links automatically.",
                 fastly_path.display()
             );
             if let Some(note) = post_create_note {
@@ -1244,21 +1249,27 @@ fn provision_staging_selector_store(
         return Ok(());
     }
 
-    if setup_block_present(fastly_path, kind, RUNTIME_ENV_STAGING_STORE)? {
-        return Ok(());
-    }
-
-    let staging_id = if let Ok(id) = resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE) {
-        id
+    // Resolve the staging store, (re)creating it if the account has none —
+    // repairing a remotely-deleted store, which the deploy-time error tells the
+    // operator to do by re-running provision.
+    let (staging_id, created) = if let Ok(id) =
+        resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE)
+    {
+        (id, false)
     } else {
         create_fastly_store(kind, RUNTIME_ENV_STAGING_STORE)?;
-        resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE).map_err(|err| {
-            format!(
-                "created fastly {kind}-store `{RUNTIME_ENV_STAGING_STORE}` but could not resolve its id: {err}"
-            )
-        })?
+        let id = resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE).map_err(|err| {
+                format!(
+                    "created fastly {kind}-store `{RUNTIME_ENV_STAGING_STORE}` but could not resolve its id: {err}"
+                )
+            })?;
+        (id, true)
     };
 
+    // Upsert a selector entry for EVERY declared config store, on EVERY provision
+    // — not gated on the `[setup]` marker. A store added after the first provision
+    // would otherwise never get a `<id>_staging` selector and silently fall back
+    // to its production key on staged versions. `--upsert` makes this idempotent.
     for store in stores.config {
         create_config_store_entry(
             &staging_id,
@@ -1266,9 +1277,16 @@ fn provision_staging_selector_store(
             &format!("{}_staging", store.logical),
         )?;
     }
-    append_fastly_setup(fastly_path, kind, RUNTIME_ENV_STAGING_STORE)?;
+    // The `[setup]` block is a local marker only; keep it present (idempotently)
+    // so tooling can see the store was provisioned.
+    if !setup_block_present(fastly_path, kind, RUNTIME_ENV_STAGING_STORE)? {
+        append_fastly_setup(fastly_path, kind, RUNTIME_ENV_STAGING_STORE)?;
+    }
     out.push(format!(
-        "created fastly {kind}-store `{RUNTIME_ENV_STAGING_STORE}` (id={staging_id}); staged deploys link it as `{RUNTIME_ENV_STORE}` so they read `<id>_staging` config"
+        "{verb} fastly {kind}-store `{RUNTIME_ENV_STAGING_STORE}` (id={staging_id}); reconciled {n} selector entr{plural}. Staged deploys link it as `{RUNTIME_ENV_STORE}` so they read `<id>_staging` config",
+        verb = if created { "created" } else { "reconciled" },
+        n = stores.config.len(),
+        plural = if stores.config.len() == 1 { "y" } else { "ies" },
     ));
     Ok(())
 }
@@ -1739,12 +1757,6 @@ fn is_healthy_status(code: u16) -> bool {
     (200..400).contains(&code)
 }
 
-/// The version to activate when rolling a production service back from
-/// `version`. `None` when there is no earlier version (`version <= 1`).
-fn previous_version(version: u64) -> Option<u64> {
-    (version > 1).then(|| version.saturating_sub(1))
-}
-
 /// Digits immediately following `marker` in `lower` (a lowercased
 /// haystack), for the LAST occurrence of `marker`. The number must be
 /// terminated by `terminator` — so a partial/confusable match (e.g. a
@@ -1814,6 +1826,48 @@ fn parse_canonical_version_line(lower: &str) -> Option<u64> {
 /// Parse `fastly service-version list --json` (or the Fastly API
 /// `/service/<id>/version` array) for the `number` of the `active`
 /// version.
+/// The version a production rollback should activate: the highest version below
+/// `current` that was actually live.
+///
+/// `current - 1` is NOT that version. Versions are a monotonic counter over every
+/// draft, staged, and activated version alike, so the predecessor number is
+/// frequently a version that never served production traffic. Two ways that
+/// bites, both of which this filters out:
+///
+/// * **Staged versions.** With production v5, staged v6, production v7, rolling
+///   back v7 by arithmetic activates v6 — publishing staged code AND, since a
+///   staged draft is re-linked to the staging config selector, staged config.
+/// * **Untouched drafts.** Fastly locks a version when it is activated, so an
+///   UNLOCKED version below `current` was never live and must not be promoted.
+///   When the field is absent (schema drift) we do not exclude on it, rather
+///   than reject every candidate and make rollback unusable.
+///
+/// Returns `None` when nothing below `current` qualifies — the caller must fail
+/// rather than guess.
+fn resolve_rollback_target(json: &str, current: u64) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let array = value
+        .as_array()
+        .or_else(|| value.get("items").and_then(serde_json::Value::as_array))?;
+
+    array
+        .iter()
+        .filter_map(|entry| {
+            let number = entry.get("number").and_then(serde_json::Value::as_u64)?;
+            if number >= current {
+                return None;
+            }
+            if entry.get("staged").and_then(serde_json::Value::as_bool) == Some(true) {
+                return None;
+            }
+            if entry.get("locked").and_then(serde_json::Value::as_bool) == Some(false) {
+                return None;
+            }
+            Some(number)
+        })
+        .max()
+}
+
 fn parse_active_version(json: &str) -> Option<u64> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     value.as_array()?.iter().find_map(|entry| {
@@ -2288,9 +2342,25 @@ fn relink_runtime_env_for_staging(
     version: u64,
     manifest_dir: &Path,
 ) -> Result<(), String> {
+    // An app that declares no config stores has no selector to stage, so
+    // `provision` creates no staging store — and staging is still perfectly
+    // meaningful for it (staged CODE, no config to isolate). Requiring the store
+    // unconditionally would break `stage: true` for exactly those apps.
+    //
+    // Distinguish "nothing to stage" from "should be staged but isn't set up":
+    // if the PRODUCTION selector store is absent too, this app never provisioned
+    // a runtime-override store at all, so there is no config selection to
+    // isolate and the relink is a no-op.
+    if resolve_remote_config_store_id(RUNTIME_ENV_STORE).is_err() {
+        log::info!(
+            "no `{RUNTIME_ENV_STORE}` store on this account: the app selects no config at runtime, so staged version {version} has no config selector to isolate"
+        );
+        return Ok(());
+    }
+
     let staging_store_id = resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE).map_err(|err| {
         format!(
-            "staged deploy needs the `{RUNTIME_ENV_STAGING_STORE}` config store, which holds the selector pointing at your staged config. Without it the staged version would read PRODUCTION config, so this deploy is refused.\n  Run `edgezero provision --adapter fastly` to create it.\n  underlying error: {err}"
+            "staged deploy needs the `{RUNTIME_ENV_STAGING_STORE}` config store, which holds the selector pointing at your staged config. This app HAS a `{RUNTIME_ENV_STORE}` store, so without the staging twin the staged version would read PRODUCTION config -- this deploy is refused rather than serve it.\n  Run `edgezero provision --adapter fastly` to create it.\n  underlying error: {err}"
         )
     })?;
 
@@ -2469,11 +2539,18 @@ fn rollback(args: &[String]) -> Result<(), String> {
             "[edgezero] deactivated staged version {version} on Fastly service {service_id}"
         );
     } else {
-        // Production rollback re-activates the previous version.
-        // Fastly's activate endpoint requires `PUT` (not `POST`).
-        let previous = previous_version(version).ok_or_else(|| {
-            format!("cannot roll back version {version}: no previous version exists")
+        // Production rollback re-activates the version that was previously LIVE
+        // — resolved from the service's version list, never `version - 1`. The
+        // predecessor number is often a staged version or an untouched draft, and
+        // activating one of those publishes code (and staged config) that was
+        // never production.
+        let list = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
+        let previous = resolve_rollback_target(&list, version).ok_or_else(|| {
+            format!(
+                "cannot roll back version {version}: no previously-live version below it (a staged version or an untouched draft is not a rollback target). Activate the intended version explicitly."
+            )
         })?;
+        // Fastly's activate endpoint requires `PUT` (not `POST`).
         fastly_api_put(
             &format!("/service/{service_id}/version/{previous}/activate"),
             &token,
@@ -2857,11 +2934,48 @@ mod tests {
     }
 
     #[test]
-    fn previous_version_computes_predecessor() {
-        assert_eq!(previous_version(42), Some(41));
-        assert_eq!(previous_version(2), Some(1));
-        assert_eq!(previous_version(1), None);
-        assert_eq!(previous_version(0), None);
+    fn resolve_rollback_target_skips_staged_and_untouched_versions() {
+        // The reported break: production v5, staged v6, production v7. Rolling
+        // back v7 by arithmetic picks v6 -- publishing staged code and, since a
+        // staged draft is re-linked to the staging selector, staged config.
+        let json = r#"[
+            {"number":7,"active":true,"locked":true},
+            {"number":6,"staged":true,"locked":true},
+            {"number":5,"locked":true}
+        ]"#;
+        assert_eq!(resolve_rollback_target(json, 7), Some(5));
+
+        // An untouched draft was never live: Fastly locks a version on
+        // activation, so an unlocked one below current is not a target.
+        let with_draft = r#"[
+            {"number":7,"active":true,"locked":true},
+            {"number":6,"locked":false},
+            {"number":5,"locked":true}
+        ]"#;
+        assert_eq!(resolve_rollback_target(with_draft, 7), Some(5));
+
+        // Ordinary case: the immediate predecessor, when it really was live.
+        let simple = r#"[{"number":2,"active":true,"locked":true},{"number":1,"locked":true}]"#;
+        assert_eq!(resolve_rollback_target(simple, 2), Some(1));
+
+        // Nothing below qualifies -> None, so the caller fails instead of guessing.
+        let only_staged =
+            r#"[{"number":2,"active":true,"locked":true},{"number":1,"staged":true}]"#;
+        assert_eq!(resolve_rollback_target(only_staged, 2), None);
+        assert_eq!(
+            resolve_rollback_target(r#"[{"number":1,"locked":true}]"#, 1),
+            None
+        );
+
+        // Schema drift: an absent `locked` must not disqualify every candidate
+        // and make rollback unusable.
+        let no_locked = r#"[{"number":2,"active":true},{"number":1}]"#;
+        assert_eq!(resolve_rollback_target(no_locked, 2), Some(1));
+
+        // Tolerates the {"items": [...]} envelope, like the other lookups.
+        let enveloped = r#"{"items":[{"number":2,"locked":true},{"number":1,"locked":true}]}"#;
+        assert_eq!(resolve_rollback_target(enveloped, 2), Some(1));
+        assert_eq!(resolve_rollback_target("not json", 2), None);
     }
 
     #[test]
@@ -5116,7 +5230,7 @@ build = \"cargo build --release\"
              if [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  \
                printf '%s\\n' '{update_stdout}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
-               printf '%s\\n' '[{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging\"}}]'\n\
+               printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging\"}}]'\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[{{\"id\":\"LINK1\",\"name\":\"edgezero_runtime_env\"}}]'\n\
              fi\n\
@@ -5312,6 +5426,42 @@ build = \"cargo build --release\"
 
     #[cfg(unix)]
     #[test]
+    fn deploy_staged_works_for_an_app_that_selects_no_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // An app declaring no config stores has no runtime-override store, so
+        // `provision` creates no staging twin — and staging is still meaningful
+        // for it (staged CODE, no config to isolate). Requiring the staging store
+        // unconditionally broke `stage: true` for exactly these apps.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("fastly");
+        // No config stores at all on the account.
+        fs::write(
+            &script_path,
+            "#!/bin/sh\nif [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  printf '%s\\n' 'SUCCESS: Updated package (service SVC1, version 7)'\nelif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\\n' '[]'\nfi\nexit 0\n",
+        )
+        .expect("write fake");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        let _path = PathPrepend::new(dir.path());
+
+        let app = tempdir().expect("app dir");
+        fs::write(app.path().join("fastly.toml"), "name = \"app\"\n").expect("write fastly.toml");
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+
+        deploy_staged(&[
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+            "--manifest-path".to_owned(),
+            app.path().join("fastly.toml").display().to_string(),
+        ])
+        .expect("an app with no config selection must still be stageable");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deploy_staged_fails_closed_when_the_staging_selector_store_is_missing() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -5323,7 +5473,7 @@ build = \"cargo build --release\"
         // `config-store list` returns no staging store.
         fs::write(
             &script_path,
-            "#!/bin/sh\nif [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  printf '%s\\n' 'SUCCESS: Updated package (service SVC1, version 7)'\nelif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\\n' '[]'\nfi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  printf '%s\\n' 'SUCCESS: Updated package (service SVC1, version 7)'\nelif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\\n' '[{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}]'\nfi\nexit 0\n",
         )
         .expect("write fake");
         let mut perms = fs::metadata(&script_path).expect("meta").permissions();

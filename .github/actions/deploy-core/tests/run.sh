@@ -289,9 +289,34 @@ EOF
     else
       fail "download-app-cli did not surface the expected metadata"
     fi
+    # The ABSOLUTE path output is what lets callers dodge PATH shadowing.
+    if grep -qx "app-cli-path=$WORK_DIR/tools/bin/myapp-cli" "$output_file"; then
+      pass "emits the absolute app-cli-path"
+    else
+      fail "download-app-cli did not emit app-cli-path"
+    fi
   else
     fail "download-app-cli failed to execute"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# resolve_app_cli — invoke the absolute path, so a `fastly`-named app CLI is not
+# shadowed by the provider CLI the install step prepends to PATH.
+# ---------------------------------------------------------------------------
+test_resolve_app_cli() {
+  section "app-cli resolution (PATH shadowing)"
+  local resolved
+  resolved=$(EDGEZERO__APP__CLI__PATH=/opt/tools/bin/fastly EDGEZERO__APP__CLI__BIN=fastly \
+    bash -c "source '$CORE_SCRIPTS/common.sh'; resolve_app_cli")
+  assert_equals "prefers the absolute path when set" "/opt/tools/bin/fastly" "$resolved"
+
+  resolved=$(EDGEZERO__APP__CLI__BIN=myapp-cli \
+    bash -c "source '$CORE_SCRIPTS/common.sh'; resolve_app_cli")
+  assert_equals "falls back to the bare name when no path is given" "myapp-cli" "$resolved"
+
+  assert_fails "fails when neither is set" \
+    bash -c "source '$CORE_SCRIPTS/common.sh'; resolve_app_cli"
 }
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1041,7 @@ main() {
   test_run_cli_argv
   test_provider_env_boundary
   test_download_cli_metadata
+  test_resolve_app_cli
   test_fastly_versions
   test_cleanup_confinement
   test_action_env_scrub

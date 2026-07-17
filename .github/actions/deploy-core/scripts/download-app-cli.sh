@@ -80,6 +80,10 @@ main() {
 
   notice "using app CLI '$cli_bin' v$cli_version from artifact"
   append_output app-cli-bin "$cli_bin"
+  # The ABSOLUTE path, so callers invoke this exact binary rather than resolving
+  # the bare name through PATH. The provider CLI install prepends its own dir, so
+  # an app CLI legitimately named `fastly` would otherwise be shadowed by it.
+  append_output app-cli-path "$cli_path"
   append_output app-cli-version "$cli_version"
   append_env EDGEZERO__ACTION__TOOL_ROOT "$tool_root"
 }

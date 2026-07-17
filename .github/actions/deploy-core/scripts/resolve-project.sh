@@ -143,6 +143,17 @@ main() {
   else
     manifest_path=""
     manifest_summary="EdgeZero default discovery"
+    # Default discovery is NOT unconfined. The CLI runs from the app dir and
+    # defaults to `edgezero.toml` there; a committed symlink named `edgezero.toml`
+    # could point outside the app repository, and its manifest deploy command
+    # would run with provider credentials. If that file exists, it must resolve
+    # inside the app repository — the same rule as an explicit manifest.
+    if [[ -e "$app_dir/edgezero.toml" ]]; then
+      local default_manifest
+      default_manifest=$(canonical_path "$app_dir/edgezero.toml")
+      is_under "$git_root" "$default_manifest" ||
+        fail "the default 'edgezero.toml' in '$app_rel' resolves outside the application repository ($git_root) — refusing to run a manifest that escapes it"
+    fi
   fi
 
   # Source revision + dirty-source guard (git_root resolved above).

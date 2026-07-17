@@ -179,6 +179,19 @@ main() {
   package_json=$(jq -c --arg p "$cli_package" '.packages[] | select(.name == $p)' <<<"$metadata")
   [[ -n "$package_json" ]] || fail "app-cli-package '$cli_package' was not found in the application workspace"
 
+  # The Cargo WORKSPACE must live inside the application's repository.
+  #
+  # It is the workspace root that owns the lockfile and the resolved dependency
+  # graph the artifact is built from. `cargo metadata` climbs to whatever
+  # workspace encloses the app dir, so an enclosing deployer workspace would
+  # otherwise control the deps of a CLI built from the app's source — the same
+  # boundary violation as the package check below, but for the whole build.
+  local workspace_root workspace_real
+  workspace_root=$(jq -r '.workspace_root' <<<"$metadata")
+  workspace_real=$(canonical_path "$workspace_root")
+  is_under "$app_boundary" "$workspace_real" ||
+    fail "the Cargo workspace root ($workspace_real) is outside the application at $app_boundary; an enclosing workspace would control the lockfile and dependencies the CLI is built from"
+
   # The package must live inside the APPLICATION's repository.
   #
   # `cargo metadata` resolves through whatever workspace encloses the app dir,

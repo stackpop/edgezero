@@ -156,6 +156,7 @@ runs:
       shell: bash
       env:
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
+        EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
         EDGEZERO__CONFIG_PUSH__STORE: ${{ inputs.store }}

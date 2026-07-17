@@ -216,3 +216,20 @@ read_bool_line() {
   local key="$1" log="$2"
   grep -oE "^${key}=(true|false)\$" "$log" | tail -n 1 | cut -d= -f2 || true
 }
+
+# The app CLI to invoke — the ABSOLUTE path the download step resolved, when
+# available, else the bare name.
+#
+# Bare-name resolution goes through PATH, and the provider CLI install prepends
+# its own directory: an app CLI legitimately named `fastly` would then resolve to
+# the provider's `fastly`, not the app's. Invoking the absolute path is immune to
+# PATH ordering. `EDGEZERO__APP__CLI__PATH` comes from download-app-cli.sh's
+# `app-cli-path` output.
+resolve_app_cli() {
+  local path="${EDGEZERO__APP__CLI__PATH:-}"
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s\n' "${EDGEZERO__APP__CLI__BIN:?EDGEZERO__APP__CLI__PATH or EDGEZERO__APP__CLI__BIN is required}"
+  fi
+}

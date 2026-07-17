@@ -21,7 +21,8 @@ set -euo pipefail
 # are rejected rather than read.
 #
 # Reads (env):
-#   EDGEZERO__APP__CLI__BIN               required  app CLI binary to invoke
+#   EDGEZERO__APP__CLI__PATH              optional  absolute path to the app CLI (preferred; avoids PATH shadowing)
+#   EDGEZERO__APP__CLI__BIN               optional  app CLI name, used when __PATH is unset
 #   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
 #   EDGEZERO__PROJECT__WORKING_DIRECTORY  required  app dir, relative to github.workspace
 #   GITHUB_WORKSPACE                      required  confinement root
@@ -54,7 +55,8 @@ confine_to_app() {
 }
 
 main() {
-  local cli_bin="${EDGEZERO__APP__CLI__BIN:?EDGEZERO__APP__CLI__BIN is required}"
+  local cli_bin
+  cli_bin=$(resolve_app_cli)
   local working_directory="${EDGEZERO__PROJECT__WORKING_DIRECTORY:?EDGEZERO__PROJECT__WORKING_DIRECTORY is required}"
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local deploy_to="${EDGEZERO__DEPLOY__TO:-production}"
@@ -79,7 +81,17 @@ main() {
   app_dir=$(canonical_path "$workspace/$working_directory")
   is_under "$workspace_real" "$app_dir" ||
     fail "input 'working-directory' must resolve inside github.workspace"
-  if [[ -n "$manifest" ]]; then manifest=$(confine_to_app "$manifest" "$app_dir" manifest); fi
+  if [[ -n "$manifest" ]]; then
+    manifest=$(confine_to_app "$manifest" "$app_dir" manifest)
+  elif [[ -e "$app_dir/edgezero.toml" ]]; then
+    # Default discovery is confined too: the CLI reads `edgezero.toml` from the
+    # app dir, and a committed symlink there could point its deploy/store config
+    # outside the app while this step holds provider credentials.
+    local default_manifest
+    default_manifest=$(canonical_path "$app_dir/edgezero.toml")
+    is_under "$app_dir" "$default_manifest" ||
+      fail "the default 'edgezero.toml' resolves outside the application directory — refusing to read a manifest that escapes it"
+  fi
   if [[ -n "$app_config" ]]; then app_config=$(confine_to_app "$app_config" "$app_dir" app-config); fi
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the

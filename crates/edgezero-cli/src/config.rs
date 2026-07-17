@@ -311,16 +311,10 @@ where
         push_ctx: &push_ctx,
     };
 
-    // Build envelope.
-    // Honour --key override (5.4): if the caller supplied an explicit key,
-    // use it; otherwise fall back to the manifest's resolved logical store id.
-    // `--staging` (5.5) then writes the `<key>_staging` variant in the same store.
-    let key = resolve_config_key(
-        args.key
-            .clone()
-            .unwrap_or_else(|| ctx.store.logical.clone()),
-        args.staging,
-    );
+    // Build envelope. `--key` overrides the manifest's resolved logical store id;
+    // `--staging` instead targets the `<logical>_staging` variant the staging
+    // selector points at. The two are mutually exclusive.
+    let key = resolve_config_key(args.key.as_deref(), &ctx.store.logical, args.staging)?;
     let body = build_config_envelope::<C>(&typed)?;
     let local_envelope: BlobEnvelope =
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
@@ -484,9 +478,8 @@ where
     let env_config = EnvConfig::from_env();
     let platform = env_config.store_name("config", &logical);
     let store = ResolvedStoreId::new(logical.clone(), platform);
-    // `--staging` (5.5) diffs the `<key>_staging` variant, matching what
-    // `config push --staging` would write.
-    let key = resolve_config_key(args.key.clone().unwrap_or(logical), args.staging);
+    // Diff exactly what `config push` would write, `--staging` included.
+    let key = resolve_config_key(args.key.as_deref(), &logical, args.staging)?;
 
     // Resolve adapter paths for the read call.
     let manifest_root = ctx
@@ -1113,18 +1106,30 @@ fn resolve_adapter_push_ctx(
     }
 }
 
-/// Derive the config-store key a push or diff targets. When `staging` is set,
-/// the config is written under (or diffed against) the `<base>_staging` variant
-/// in the SAME store — never the production key the live service reads. Fastly
-/// config stores are not versioned like staged service versions, so a different
-/// key is what isolates staged config. This mirrors the runtime-override store
-/// the Fastly adapter scaffolds, whose selector key chooses `app_config` vs
-/// `app_config_staging`.
-fn resolve_config_key(base: String, staging: bool) -> String {
-    if staging {
-        format!("{base}_staging")
-    } else {
-        base
+/// Derive the config-store key a push or diff targets.
+///
+/// `--staging` writes (or diffs) the `<logical>_staging` variant in the SAME
+/// store — never the production key the live service reads. Fastly config stores
+/// are not versioned like staged service versions, so a different key is what
+/// isolates staged config.
+///
+/// `--key` and `--staging` are mutually exclusive, and that is not a style
+/// choice. The staging key is not merely a name we write: `provision` puts
+/// `<logical>_staging` into the staging selector store, and that selector is what
+/// a staged version READS. An explicit key would be written to a key nothing
+/// selects — a push that silently goes nowhere. Refuse instead.
+fn resolve_config_key(
+    explicit: Option<&str>,
+    logical: &str,
+    staging: bool,
+) -> Result<String, String> {
+    match (explicit, staging) {
+        (Some(key), true) => Err(format!(
+            "`--key {key}` cannot be combined with `--staging`. The staging key is derived from the store's logical id (`{logical}_staging`) because that is what the staging selector store — written by `provision` — points a staged version at. An explicit key would be written to a key nothing reads.\n  Push the staged config without `--key`, or push to `--key {key}` without `--staging` and point the selector at it yourself."
+        )),
+        (Some(key), false) => Ok(key.to_owned()),
+        (None, false) => Ok(logical.to_owned()),
+        (None, true) => Ok(format!("{logical}_staging")),
     }
 }
 
@@ -1848,22 +1853,29 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     }
 
     #[test]
-    fn staging_key_suffixes_only_when_staging() {
-        // Production: the key is untouched (base key, or an explicit --key).
+    fn resolve_config_key_covers_key_and_staging_combinations() {
+        // Production: the logical id, or an explicit --key verbatim.
         assert_eq!(
-            resolve_config_key("app_config".to_owned(), false),
+            resolve_config_key(None, "app_config", false).unwrap(),
             "app_config"
         );
-        assert_eq!(resolve_config_key("custom".to_owned(), false), "custom");
-        // Staging: the same store, the `<key>_staging` variant.
         assert_eq!(
-            resolve_config_key("app_config".to_owned(), true),
+            resolve_config_key(Some("custom"), "app_config", false).unwrap(),
+            "custom"
+        );
+        // Staging: the `<logical>_staging` variant the selector store points at.
+        assert_eq!(
+            resolve_config_key(None, "app_config", true).unwrap(),
             "app_config_staging"
         );
-        // --key composes with --staging (the override is suffixed, not ignored).
-        assert_eq!(
-            resolve_config_key("custom".to_owned(), true),
-            "custom_staging"
+        // --key + --staging is REFUSED: an explicit staging key would be written
+        // to a key the staging selector never points at, so nothing would read
+        // it. A silent no-op is worse than an error.
+        let err = resolve_config_key(Some("custom"), "app_config", true)
+            .expect_err("--key with --staging must be rejected");
+        assert!(
+            err.contains("--staging") && err.contains("app_config_staging"),
+            "the error must explain the derivation: {err}"
         );
     }
 

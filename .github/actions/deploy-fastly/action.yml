@@ -98,9 +98,6 @@ runs:
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: |
-        # An empty artifact name makes actions/download-artifact fetch EVERY artifact
-        # in the run, so the CLI we execute with credentials would be arbitrary.
-        [[ "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT}" == "true" ]] || { echo "::error::missing required input 'app-cli-artifact'"; exit 1; }
         # GitHub does not enforce `required: true` on composite inputs. An empty
         # artifact name makes actions/download-artifact fetch EVERY artifact in
         # the run, so the CLI we then execute with credentials would be arbitrary.
@@ -272,6 +269,7 @@ runs:
       shell: bash
       env:
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
+        EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__ADAPTER: fastly
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory'] }}
         EDGEZERO__PROJECT__MANIFEST_PATH: ${{ steps.resolve.outputs['manifest'] }}
@@ -300,6 +298,7 @@ runs:
       shell: bash
       env:
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
+        EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__ADAPTER: fastly
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory'] }}
         EDGEZERO__PROJECT__MANIFEST_PATH: ${{ steps.resolve.outputs['manifest'] }}

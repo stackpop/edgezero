@@ -8,7 +8,8 @@ set -euo pipefail
 # rolled anything back.
 #
 # Reads (env):
-#   EDGEZERO__APP__CLI__BIN               required  app CLI binary to invoke
+#   EDGEZERO__APP__CLI__PATH              optional  absolute path to the app CLI (preferred; avoids PATH shadowing)
+#   EDGEZERO__APP__CLI__BIN               optional  app CLI name, used when __PATH is unset
 #   EDGEZERO__LIFECYCLE__SERVICE_ID       required  Fastly service id
 #   EDGEZERO__LIFECYCLE__VERSION          required  the current (bad) version to roll back from
 #   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
@@ -35,7 +36,7 @@ validate_inputs() {
 main() {
   validate_inputs
 
-  local argv=("$EDGEZERO__APP__CLI__BIN" rollback --adapter fastly --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID" --version "$EDGEZERO__LIFECYCLE__VERSION")
+  local argv=("$(resolve_app_cli)" rollback --adapter fastly --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID" --version "$EDGEZERO__LIFECYCLE__VERSION")
   if [[ "$EDGEZERO__DEPLOY__TO" == "staging" ]]; then
     argv+=(--staging)
   fi
