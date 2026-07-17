@@ -232,6 +232,12 @@ pub(super) fn provision(
 ) -> Result<ProvisionOutcome, String> {
     use toml_edit::DocumentMut;
 
+    // `build_dev_vars_lines` upper-cases each logical id into an
+    // `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME` line; ids differing
+    // only by case would collapse onto one variable and `env_file`'s
+    // dedup would silently drop the loser. Reject before any write.
+    stores.reject_case_colliding_logical_ids()?;
+
     let wrangler_rel = adapter_manifest_path.unwrap_or("wrangler.toml");
     let wrangler_path = manifest_root.join(wrangler_rel);
     if !wrangler_path.exists() {

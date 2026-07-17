@@ -156,6 +156,58 @@ pub struct ProvisionStores<'stores> {
     pub secrets: &'stores [ResolvedStoreId],
 }
 
+impl ProvisionStores<'_> {
+    /// Reject two logical ids of the same kind that differ only by
+    /// ASCII case.
+    ///
+    /// Adapters that write line-oriented local files (Cloudflare's
+    /// `.dev.vars`, Fastly's `.env`) emit one
+    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME="<platform>"` line
+    /// per store, upper-casing the logical id. That derivation is
+    /// lossy: `[stores.kv.myStore]` and `[stores.kv.MYSTORE]` are two
+    /// distinct manifest entries (TOML keys are case-sensitive) that
+    /// both emit `EDGEZERO__STORES__KV__MYSTORE__NAME`. `env_file`'s
+    /// key-normalised dedup then keeps the FIRST line and silently
+    /// drops the second, so the second store resolves to the first
+    /// store's platform name at runtime -- reads and writes land in
+    /// the wrong store with no error anywhere (PR #287 review round 9,
+    /// blocking #5).
+    ///
+    /// Kind is part of the env name, so ids only collide within a
+    /// kind: a `config` and a `kv` store may share a logical id.
+    ///
+    /// # Errors
+    /// Returns an error naming both colliding ids and their kind.
+    #[inline]
+    pub fn reject_case_colliding_logical_ids(&self) -> Result<(), String> {
+        for (kind, stores) in [
+            ("CONFIG", self.config),
+            ("KV", self.kv),
+            ("SECRETS", self.secrets),
+        ] {
+            let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+            for store in stores {
+                let upper = store.logical.to_ascii_uppercase();
+                if let Some(prev) = seen.insert(upper.clone(), store.logical.as_str())
+                    && prev != store.logical
+                {
+                    return Err(format!(
+                        "[stores.{kind_lower}] declares both `{prev}` and `{this}`, which differ \
+                         only by case. `provision --local` writes one \
+                         `EDGEZERO__STORES__{kind}__{upper}__NAME` line per store, upper-casing \
+                         the logical id, so both would target the same variable and one store \
+                         would silently resolve to the other's platform name. Rename one so the \
+                         ids differ by more than case.",
+                        kind_lower = kind.to_ascii_lowercase(),
+                        this = store.logical,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Context passed to [`Adapter::push_config_entries`] and
 /// [`Adapter::push_config_entries_local`] carrying already-resolved
 /// `config push` overlay values.
@@ -682,6 +734,74 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex};
+
+    fn ids(logicals: &[&str]) -> Vec<ResolvedStoreId> {
+        logicals
+            .iter()
+            .map(|logical| ResolvedStoreId::from_logical(*logical))
+            .collect()
+    }
+
+    #[test]
+    fn case_collision_check_passes_for_distinct_ids() {
+        let kv = ids(&["sessions", "cache"]);
+        ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect("distinct ids must pass");
+    }
+
+    /// Regression (PR #287 review round 9, blocking #5): both ids
+    /// upper-case to `EDGEZERO__STORES__KV__MYSTORE__NAME`, so the
+    /// env-file dedup would keep one line and silently point the
+    /// other store at the wrong platform name.
+    #[test]
+    fn case_collision_check_rejects_ids_differing_only_by_case() {
+        let kv = ids(&["myStore", "MYSTORE"]);
+        let err = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect_err("ids differing only by case must be rejected");
+        assert!(
+            err.contains("myStore") && err.contains("MYSTORE") && err.contains("stores.kv"),
+            "error names both ids and the kind: {err}"
+        );
+    }
+
+    /// The kind is part of the derived variable name, so the SAME
+    /// logical id under two different kinds does not collide.
+    #[test]
+    fn case_collision_check_allows_same_id_across_kinds() {
+        let kv = ids(&["shared"]);
+        let config = ids(&["shared"]);
+        ProvisionStores {
+            config: &config,
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect("kind is part of the env name, so cross-kind reuse is fine");
+    }
+
+    /// An id repeated verbatim within a kind is not a case collision
+    /// -- same id, same variable, same platform name.
+    #[test]
+    fn case_collision_check_allows_exact_duplicate_id() {
+        let kv = ids(&["sessions", "sessions"]);
+        ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect("an exact duplicate is not a case collision");
+    }
 
     static FIRST: TestAdapter = TestAdapter {
         hit_value: 1,

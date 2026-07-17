@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
 
+use crate::path_safety::reject_symlink_components;
+
 /// Guard object representing an active advisory lock. Drop it to
 /// release; the OS will also release automatically on process exit.
 #[must_use = "the lock is released when this guard is dropped -- bind it to a `_lock` variable that lives for the critical section"]
@@ -57,13 +59,26 @@ impl ProvisionLock {
     /// diagnose disk-full / permission issues.
     pub(crate) fn acquire(manifest_root: &Path) -> Result<Self, String> {
         let dot_edgezero = manifest_root.join(".edgezero");
+        let path = dot_edgezero.join("provision.lock");
+        // Reject a symlinked `.edgezero/` or `provision.lock` BEFORE
+        // creating or opening anything (PR #287 review round 9,
+        // blocking #1). `.edgezero/` is gitignored, so a hostile or
+        // careless tree can carry either link without it showing up in
+        // review: `OpenOptions::create(true).write(true)` follows a
+        // symlinked final component and CREATES the target if the link
+        // dangles, so we would take an flock on -- and hold a writable
+        // descriptor to -- a file outside the project tree.
+        reject_symlink_components(
+            manifest_root,
+            &path,
+            "the provision lock path `<project>/.edgezero/provision.lock`",
+        )?;
         fs::create_dir_all(&dot_edgezero).map_err(|err| {
             format!(
                 "failed to create {} for provision lock: {err}",
                 dot_edgezero.display()
             )
         })?;
-        let path = dot_edgezero.join("provision.lock");
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -131,6 +146,58 @@ mod tests {
             lock.path().parent().and_then(Path::file_name) == Some(OsStr::new(".edgezero")),
             "lockfile must sit inside .edgezero/: {}",
             lock.path().display()
+        );
+    }
+
+    /// Regression (PR #287 review round 9, blocking #1): `.edgezero/`
+    /// is gitignored, so a symlinked one never shows up in review.
+    /// `create_dir_all` + `OpenOptions::create` would follow it and we
+    /// would hold a writable descriptor outside the project tree.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_a_symlinked_dot_edgezero_dir() {
+        use std::fs::create_dir_all;
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        create_dir_all(&root).expect("mkdir project");
+        create_dir_all(&outside).expect("mkdir outside");
+        symlink(&outside, root.join(".edgezero")).expect("symlink");
+
+        // `expect_err` would need `ProvisionLock: Debug`; the guard
+        // wraps a live descriptor and has no reason to derive it.
+        let Err(err) = ProvisionLock::acquire(&root) else {
+            panic!("symlinked .edgezero must be refused")
+        };
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !outside.join("provision.lock").exists(),
+            "the refused acquire must not have created a lockfile outside the project"
+        );
+    }
+
+    /// The lockfile itself is the other half: a symlinked
+    /// `provision.lock` inside a legitimate `.edgezero/` would have
+    /// `OpenOptions::create(true).write(true)` create/open the target.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_a_symlinked_lockfile() {
+        use std::fs::create_dir_all;
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("project");
+        create_dir_all(root.join(".edgezero")).expect("mkdir .edgezero");
+        let victim = temp.path().join("victim");
+        symlink(&victim, root.join(".edgezero/provision.lock")).expect("symlink");
+
+        let Err(err) = ProvisionLock::acquire(&root) else {
+            panic!("symlinked provision.lock must be refused")
+        };
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !victim.exists(),
+            "the refused acquire must not have created the link target"
         );
     }
 

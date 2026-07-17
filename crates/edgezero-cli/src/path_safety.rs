@@ -277,9 +277,15 @@ fn is_windows_drive_prefixed(raw: &str) -> bool {
 /// still reports `is_symlink() == true`, so we catch dangling
 /// links too.
 ///
-/// `label` identifies the offending manifest field for the error
-/// message ("`[adapters.<name>.adapter].manifest`" or ".crate").
-fn reject_symlink_components(start: &Path, candidate: &Path, label: &str) -> Result<(), String> {
+/// `label` identifies the offending path for the error message --
+/// a manifest field ("`[adapters.<name>.adapter].manifest`" or
+/// ".crate") or a CLI-owned local-state path (the provision lock,
+/// the `.edgezero/` staging root).
+pub(crate) fn reject_symlink_components(
+    start: &Path,
+    candidate: &Path,
+    label: &str,
+) -> Result<(), String> {
     let mut walk = start.to_path_buf();
     for comp in candidate
         .strip_prefix(start)
@@ -291,8 +297,8 @@ fn reject_symlink_components(start: &Path, candidate: &Path, label: &str) -> Res
             Ok(md) if md.file_type().is_symlink() => {
                 return Err(format!(
                     "{label} resolves through a symlink at `{}`; \
-                     symlinks in manifest-declared paths would let an adapter's \
-                     `fs::write` follow the link off the project tree. Replace the \
+                     a symlink here would let EdgeZero's `fs::write` follow the link \
+                     off the project tree. Replace the \
                      symlink with a regular directory (or a symlink to a path INSIDE \
                      the project root — the guard walks each component individually)",
                     walk.display()

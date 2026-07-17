@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::path::Path;
 
 /// Schema-version header prepended to every provision-written
@@ -50,6 +51,7 @@ pub fn append_lines_dedup_with_header(
     new_lines: &[String],
     dry_run: bool,
 ) -> Result<(), String> {
+    reject_symlinked_target(path)?;
     let mut existing = String::new();
     if path.exists() {
         existing =
@@ -136,6 +138,50 @@ pub fn append_lines_dedup_with_header(
     Ok(())
 }
 
+/// Reject a target whose final component is a symlink.
+///
+/// `.env` / `.dev.vars` / `.edgezero/.env` are written with
+/// `fs::write`, which FOLLOWS a symlinked final component and
+/// truncates the link's target. An operator (or a hostile tree
+/// fetched by CI) that plants `.env -> ~/.ssh/authorized_keys`
+/// would have provision write attacker-chosen `KEY=value` lines
+/// into that file -- and `set_restrictive_mode` then chmods the
+/// *victim's* file to 0600, because `fs::set_permissions` follows
+/// links too. Both writes land outside the project tree entirely.
+///
+/// `symlink_metadata` does not follow links, so a dangling symlink
+/// (`is_symlink() == true`, target missing) is caught as well --
+/// which matters, since `fs::write` through a dangling link happily
+/// CREATES the target.
+///
+/// Scope: this guards the final component only. Symlink safety for
+/// the parent chain belongs to the caller that resolves the path
+/// against the project root -- see `edgezero-cli`'s `path_safety`,
+/// which walks the manifest-declared `.crate` / `.manifest`
+/// components. This helper is a generic writer and has no project
+/// root to bound a walk against.
+fn reject_symlinked_target(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => Err(format!(
+            "refusing to write `{}`: it is a symlink. Provision writes this file with \
+             `fs::write`, which would follow the link and overwrite its target (and chmod \
+             that target to 0600) -- both outside the project tree. Replace the symlink \
+             with a regular file",
+            path.display()
+        )),
+        // Not a symlink, or does not exist yet (the common
+        // first-provision case): nothing to reject.
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        // Anything else (permission denied on the parent, etc.) is
+        // surfaced rather than silently treated as "safe".
+        Err(err) => Err(format!(
+            "failed to inspect `{}` for symlink safety: {err}",
+            path.display()
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn set_restrictive_mode(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -174,6 +220,48 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Regression (PR #287 review round 9, blocking #1): a symlinked
+    /// `.env` let provision write THROUGH the link and clobber a file
+    /// outside the project tree, then chmod that victim to 0600.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlinked_target() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim-outside-project");
+        fs::write(&victim, "OPERATOR DATA\n").unwrap();
+        let link = dir.path().join(".env");
+        symlink(&victim, &link).unwrap();
+
+        let err = append_lines_dedup(&link, &["INJECTED=value".to_owned()], false)
+            .expect_err("a symlinked env-file target must be refused");
+        assert!(err.contains("is a symlink"), "{err}");
+
+        // The load-bearing assertion: the link target is untouched.
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "OPERATOR DATA\n");
+    }
+
+    /// A DANGLING symlink is the nastier case: `fs::write` through it
+    /// CREATES the target, so "the target doesn't exist" is not a
+    /// reason to allow the write.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("does-not-exist-yet");
+        let link = dir.path().join(".env");
+        symlink(&victim, &link).unwrap();
+
+        let err = append_lines_dedup(&link, &["INJECTED=value".to_owned()], false)
+            .expect_err("a dangling symlink target must be refused");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            !victim.exists(),
+            "the refused write must not have created the link target"
+        );
+    }
 
     #[test]
     fn appends_new_lines_and_skips_existing_keys() {

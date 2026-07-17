@@ -32,6 +32,12 @@ pub(super) fn provision(
 ) -> Result<ProvisionOutcome, String> {
     use toml_edit::DocumentMut;
 
+    // The `.env` writer upper-cases each logical id into an
+    // `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME` line; ids differing
+    // only by case would collapse onto one variable and `env_file`'s
+    // dedup would silently drop the loser. Reject before any write.
+    stores.reject_case_colliding_logical_ids()?;
+
     let fastly_rel = adapter_manifest_path.unwrap_or("fastly.toml");
     let fastly_path = manifest_root.join(fastly_rel);
     if !fastly_path.exists() {

@@ -24,7 +24,9 @@ use crate::config::{
 };
 use crate::copy_tree::copy_dir_recursive;
 use crate::ensure_adapter_defined;
-use crate::path_safety::{assert_provision_paths_contained, assert_provision_paths_safe};
+use crate::path_safety::{
+    assert_provision_paths_contained, assert_provision_paths_safe, reject_symlink_components,
+};
 use crate::provision_lock::ProvisionLock;
 use edgezero_adapter::AdapterDeployedState;
 use edgezero_adapter::registry::{
@@ -1420,6 +1422,17 @@ where
     // case must still yield a mountable dir.
     let dot_edgezero = project_root.join(".edgezero");
     let staged_dot = staged_root.join(".edgezero");
+    // `copy_dir_recursive` skips symlinked entries INSIDE the tree it
+    // walks, but it cannot vet the root it is handed: `.exists()`
+    // follows links, so a symlinked `.edgezero` would have us walk and
+    // copy whatever it points at (e.g. `~/.aws`) into the staging dir
+    // that the dry-run then surfaces to the operator (PR #287 review
+    // round 9, blocking #1).
+    reject_symlink_components(
+        project_root,
+        &dot_edgezero,
+        "the local-state directory `<project>/.edgezero`",
+    )?;
     if dot_edgezero.exists() {
         copy_dir_recursive(&dot_edgezero, &staged_dot)
             .map_err(|err| format!("failed to stage .edgezero/: {err}"))?;

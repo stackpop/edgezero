@@ -146,19 +146,21 @@ pub(super) enum ConfigStoreLookup {
 // spin requires them (variable-name regex, `[component.*]`
 // discovery, flat-namespace collision). The trait surface is typed
 // generically so any future adapter with similar constraints can
-// override — but fastly has no equivalent platform requirements,
-// so the no-op impls below match the trait defaults:
+// override:
 //
 // - `validate_app_config_keys`: Fastly Config Store keys accept
 //   alphanumeric + `-` / `_` / `.` up to 256 chars. Any reasonable
-//   Rust struct field name passes; no regex check needed.
+//   Rust struct field name passes; no regex check needed — no-op.
 // - `validate_adapter_manifest`: would require shelling out to
 //   `fastly compute validate` at validate-time. We keep
 //   `config validate` pure-Rust so it stays fast and
-//   tool-independent.
-// - `validate_typed_secrets`: Fastly's KV / Config / Secret
-//   stores are independent namespaces — no spin-style flat-
-//   namespace collision risk to detect.
+//   tool-independent — no-op.
+// - `validate_typed_secrets`: IS implemented. Fastly's KV / Config
+//   / Secret stores are independent namespaces, so there is no
+//   spin-style flat-namespace collision on the CLOUD path. The
+//   LOCAL path has its own: `provision --local` derives each
+//   secret's Viceroy env var as `key.to_ascii_uppercase()`, which
+//   is lossy — see the impl for the collision this rejects.
 impl Adapter for FastlyCliAdapter {
     fn deployed_fields(&self) -> &'static [&'static str] {
         &["service_id"]
@@ -220,10 +222,45 @@ impl Adapter for FastlyCliAdapter {
         Ok(())
     }
 
-    // Fastly Secret Store keys share Config Store's naming rules;
-    // no adapter-specific canonicalisation collision check.
-    #[inline]
-    fn validate_typed_secrets(&self, _entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+    // Fastly Secret Store keys share Config Store's naming rules, so
+    // the key itself needs no canonicalisation check. The LOCAL path
+    // does: `provision --local` writes each key into `fastly.toml` as
+    // `{ key = "<key>", env = "<KEY>" }`, where the env name is
+    // `key.to_ascii_uppercase()` -- Viceroy sources the secret's value
+    // from that variable. Uppercasing is lossy, so two distinct keys
+    // that differ only in case (`api_token` / `API_TOKEN`) produce two
+    // separate secret-store rows that BOTH read `$API_TOKEN`, and the
+    // two secrets silently resolve to the same value at runtime
+    // (PR #287 review round 9, blocking #5). Reject at validation
+    // rather than let a wrong secret be served.
+    fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        use std::collections::HashMap;
+        // Uppercased env name -> (key that claimed it, its field).
+        // Two entries sharing a key_value are fine even across stores:
+        // same key, same env, same value -- that is the intended
+        // "one secret referenced twice" shape. Only a DIFFERING
+        // key_value under the same env name is ambiguous.
+        let mut seen: HashMap<String, (&str, &str)> = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let env_name = entry.key_value.to_ascii_uppercase();
+            match seen.get(&env_name) {
+                Some((prev_key, prev_field)) if *prev_key != entry.key_value => {
+                    return Err(format!(
+                        "`#[secret]` fields `{prev_field}` (key `{prev_key}`) and `{this_field}` \
+                         (key `{this_key}`) both map to the Viceroy environment variable \
+                         `{env_name}` in `fastly.toml` -- `provision --local` derives it by \
+                         upper-casing the key, so both secrets would read the same value. Pick \
+                         keys that differ by more than case.",
+                        this_field = entry.field_name,
+                        this_key = entry.key_value,
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(env_name, (entry.key_value, entry.field_name.as_str()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -406,4 +443,64 @@ pub(crate) fn path_mutation_guard() -> &'static PathMutationMutex<()> {
     use std::sync::OnceLock;
     static GUARD: OnceLock<PathMutationMutex<()>> = OnceLock::new();
     GUARD.get_or_init(|| PathMutationMutex::new(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FastlyCliAdapter;
+    use edgezero_adapter::{Adapter as _, TypedSecretEntry};
+
+    #[test]
+    fn validate_typed_secrets_passes_with_no_collision() {
+        FastlyCliAdapter
+            .validate_typed_secrets(&[
+                TypedSecretEntry::new("default", "field_a", "api_token"),
+                TypedSecretEntry::new("default", "field_b", "db_password"),
+            ])
+            .expect("distinct keys must pass");
+    }
+
+    /// The same key referenced from two stores is the intended
+    /// "one secret, two references" shape: same key, same env, same
+    /// value. It must NOT be reported as a collision.
+    #[test]
+    fn validate_typed_secrets_allows_same_key_across_two_stores() {
+        FastlyCliAdapter
+            .validate_typed_secrets(&[
+                TypedSecretEntry::new("store_a", "field_a", "api_token"),
+                TypedSecretEntry::new("store_b", "field_b", "api_token"),
+            ])
+            .expect("an identical key in two stores shares one env var by design");
+    }
+
+    /// Regression (PR #287 review round 9, blocking #5): keys
+    /// differing only in case both upper-case to `API_TOKEN`, so
+    /// `fastly.toml` gets two secret-store rows reading the same
+    /// Viceroy env var and the two secrets silently share a value.
+    #[test]
+    fn validate_typed_secrets_rejects_keys_differing_only_by_case() {
+        let err = FastlyCliAdapter
+            .validate_typed_secrets(&[
+                TypedSecretEntry::new("default", "lower_field", "api_token"),
+                TypedSecretEntry::new("default", "upper_field", "API_TOKEN"),
+            ])
+            .expect_err("keys differing only by case must collide on the derived env var");
+        assert!(
+            err.contains("API_TOKEN") && err.contains("lower_field") && err.contains("upper_field"),
+            "error names the shared env var and BOTH fields: {err}"
+        );
+    }
+
+    /// The collision is on the derived env var, not the store, so it
+    /// must be caught across stores too.
+    #[test]
+    fn validate_typed_secrets_rejects_case_collision_across_stores() {
+        let err = FastlyCliAdapter
+            .validate_typed_secrets(&[
+                TypedSecretEntry::new("store_a", "lower_field", "api_token"),
+                TypedSecretEntry::new("store_b", "upper_field", "Api_Token"),
+            ])
+            .expect_err("case collision must be caught across stores");
+        assert!(err.contains("API_TOKEN"), "{err}");
+    }
 }
