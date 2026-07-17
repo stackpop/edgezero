@@ -97,16 +97,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: |
-        # GitHub does not enforce `required: true` on composite inputs. An empty
-        # artifact name makes actions/download-artifact fetch EVERY artifact in
-        # the run, so the CLI we then execute with credentials would be arbitrary.
-        [[ "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT}" == "true" ]] || { echo "::error::missing required input 'app-cli-artifact'"; exit 1; }
-        [[ "${EDGEZERO__FASTLY__API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
-        [[ -n "${EDGEZERO__FASTLY__SERVICE_ID}" ]] || { echo "::error::missing required input 'fastly-service-id'"; exit 1; }
-        [[ "${EDGEZERO__FASTLY__SERVICE_ID}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::input 'fastly-service-id' must match ^[A-Za-z0-9_-]+$"; exit 1; }
-        # validate-inputs.sh also rejects a non-boolean 'stage' before any deploy.
-        "$GITHUB_ACTION_PATH/../deploy-core/scripts/validate-inputs.sh"
+      run: $GITHUB_ACTION_PATH/scripts/validate.sh
 
     - name: Download CLI artifact
       uses: actions/download-artifact@v4

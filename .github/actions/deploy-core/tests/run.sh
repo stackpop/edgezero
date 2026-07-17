@@ -301,6 +301,56 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# wrapper validate.sh — the per-wrapper input validation (now scripts, not inline
+# YAML, so it is shellcheck'd AND testable). GitHub does not enforce
+# `required: true`, so these guards are the real gate.
+# ---------------------------------------------------------------------------
+test_wrapper_validate() {
+  section "wrapper validate.sh"
+
+  # deploy-fastly: artifact + token presence, service-id format, then it delegates
+  # to the real engine validate-inputs.sh — so the success case runs end to end
+  # (the engine needs a supported runner + adapter).
+  local dfl="$ACTIONS_DIR/deploy-fastly/scripts/validate.sh"
+  run_dfl() {
+    env EDGEZERO__APP__CLI__ARTIFACT_PRESENT="${A:-true}" \
+      EDGEZERO__FASTLY__API_TOKEN_PRESENT="${T:-true}" \
+      EDGEZERO__FASTLY__SERVICE_ID="${S-svc_1}" \
+      EDGEZERO__ADAPTER=fastly EDGEZERO__RUNNER__OS=Linux EDGEZERO__RUNNER__ARCH=X64 \
+      EDGEZERO__ACTION__STATE_DIR="$WORK_DIR/dfl-state" \
+      GITHUB_OUTPUT="$WORK_DIR/dfl-out.txt" \
+      bash "$dfl"
+  }
+  assert_succeeds "deploy-fastly: well-formed inputs pass" run_dfl
+  A=false assert_fails "deploy-fastly: missing artifact is rejected" run_dfl
+  T=false assert_fails "deploy-fastly: missing token (by presence) is rejected" run_dfl
+  S='bad id!' assert_fails "deploy-fastly: malformed service-id is rejected" run_dfl
+  S='' assert_fails "deploy-fastly: empty service-id is rejected" run_dfl
+
+  # config-push-fastly: artifact + token presence, deploy-to fail-closed.
+  local cpf="$ACTIONS_DIR/config-push-fastly/scripts/validate.sh"
+  run_cpf() {
+    env EDGEZERO__APP__CLI__ARTIFACT_PRESENT="${A:-true}" \
+      EDGEZERO__FASTLY__API_TOKEN_PRESENT="${T:-true}" \
+      EDGEZERO__DEPLOY__TO="${D:-production}" bash "$cpf"
+  }
+  assert_succeeds "config-push: production passes" run_cpf
+  D=staging assert_succeeds "config-push: staging passes" run_cpf
+  D=Staging assert_fails "config-push: a deploy-to typo is rejected (no silent prod)" run_cpf
+  A=false assert_fails "config-push: missing artifact is rejected" run_cpf
+
+  # healthcheck + rollback: artifact presence only.
+  local hc="$ACTIONS_DIR/healthcheck-fastly/scripts/validate.sh"
+  assert_succeeds "healthcheck: present artifact passes" \
+    env EDGEZERO__APP__CLI__ARTIFACT_PRESENT=true bash "$hc"
+  assert_fails "healthcheck: missing artifact is rejected" \
+    env EDGEZERO__APP__CLI__ARTIFACT_PRESENT=false bash "$hc"
+  local rb="$ACTIONS_DIR/rollback-fastly/scripts/validate.sh"
+  assert_fails "rollback: missing artifact is rejected" \
+    env EDGEZERO__APP__CLI__ARTIFACT_PRESENT=false bash "$rb"
+}
+
+# ---------------------------------------------------------------------------
 # resolve_app_cli — invoke the absolute path, so a `fastly`-named app CLI is not
 # shadowed by the provider CLI the install step prepends to PATH.
 # ---------------------------------------------------------------------------
@@ -1041,6 +1091,7 @@ main() {
   test_run_cli_argv
   test_provider_env_boundary
   test_download_cli_metadata
+  test_wrapper_validate
   test_resolve_app_cli
   test_fastly_versions
   test_cleanup_confinement

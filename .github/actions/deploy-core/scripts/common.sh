@@ -177,6 +177,14 @@ require_input_matching() {
   [[ "$value" =~ $pattern ]] || fail "input '$name' must match $pattern"
 }
 
+# For a required input whose VALUE must not reach this step (a credential): the
+# wrapper passes a precomputed `<input> != '' && 'true' || 'false'` flag, and we
+# assert presence without ever seeing the secret.
+require_present() {
+  local name="$1" present="$2"
+  [[ "$present" == "true" ]] || fail "missing required input '$name'"
+}
+
 # The Fastly provider tooling and its pinned release binary are Linux x86-64
 # only. Fail with a clear message rather than a confusing exec error later.
 require_linux_x86_64() {
