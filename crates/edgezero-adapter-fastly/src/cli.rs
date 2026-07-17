@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -8,8 +8,9 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    CHUNK_KEY_INFIX, chunk_key_generation, gc_classify_root, gc_reject_root_like_chunk,
-    prepare_fastly_config_entries, prior_chunk_keys, resolve_fastly_config_value,
+    CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, gc_classify_root,
+    gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
+    resolve_fastly_config_value, sha256_hex,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -155,6 +156,9 @@ struct GcPlan {
     live_count: usize,
     retained_recent: usize,
     roots: usize,
+    /// Chunk-shaped entries we could NOT prove our writer produced, so left
+    /// untouched. Surfaced so an operator can see we declined to judge them.
+    unprovable: usize,
 }
 
 /// One `config-store-entry list` item.
@@ -1452,6 +1456,7 @@ fn gc_fastly_config_store(
         live_count,
         retained_recent,
         roots,
+        unprovable,
     } = plan;
 
     let mut out = vec![format!(
@@ -1459,6 +1464,14 @@ fn gc_fastly_config_store(
         items.len(),
         doomed.len(),
     )];
+    if unprovable > 0 {
+        // NEVER silent: these entries look like chunk keys but we could not
+        // prove our writer produced them, so we left them alone. Say so, or the
+        // summary reads as "everything reclaimable was reclaimed".
+        out.push(format!(
+            "  {unprovable} chunk-shaped entr(ies) left untouched: could not prove EdgeZero wrote them (they do not reassemble to the generation their keys name)"
+        ));
+    }
     if doomed.is_empty() {
         out.push("nothing to reclaim".to_owned());
         return Ok(out);
@@ -1508,43 +1521,19 @@ fn gc_fastly_config_store(
 /// the counts for the summary line. Deriving it is where every safety guard
 /// lives, so it is fail-closed throughout — any unreadable/incomplete state
 /// returns `Err` and the caller deletes nothing.
+///
+/// The organising idea is that **content-addressing makes a chunk set
+/// self-proving**: a chunk key embeds the SHA-256 of the whole envelope it
+/// belongs to, so reassembling a generation either reproduces the
+/// content-address its own keys name, or it does not. Every destructive decision
+/// here rests on that hash — never on what the store's metadata claims about
+/// itself, which is exactly what an inconsistent store gets wrong.
 fn plan_gc_reclamation(
     items: &[ConfigStoreItem],
     now: u64,
     older_than_secs: u64,
 ) -> Result<GcPlan, String> {
-    // LIVE chunk keys = those named by any root pointer currently in the store.
-    // A root is any entry that is not itself a chunk key.
-    let mut live: HashSet<String> = HashSet::new();
-    let mut roots = 0_usize;
-    for item in items {
-        if chunk_key_generation_any(&item.item_key).is_some() {
-            continue; // a chunk, not a root
-        }
-        roots = roots.saturating_add(1);
-        // gc_classify_root (NOT prior_chunk_keys): on this destructive path an
-        // empty/truncated/unrelated value must FAIL, not read as "references
-        // nothing" -- that would make its live chunks look orphaned.
-        match gc_classify_root(&item.item_key, &item.item_value) {
-            Ok(keys) => live.extend(keys),
-            Err(err) => {
-                return Err(format!(
-                    "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
-                    item.item_key
-                ));
-            }
-        }
-    }
-
-    // COMPLETENESS GUARD (fail closed). Every chunk key a LIVE pointer
-    // references MUST appear in the listing. If one is missing, the listing is
-    // incomplete -- e.g. `config-store-entry list` paginated and we only saw a
-    // page, so a root we DIDN'T see could reference a chunk we're about to
-    // delete -- or the store is already inconsistent. Either way we cannot
-    // safely decide what is orphaned, so we delete nothing. (Since a store with
-    // many roots has many live chunks, any real truncation almost certainly
-    // drops one and trips this, which is why it also guards the harder
-    // missing-root case in practice.)
+    let mut value_by_key: HashMap<&str, &str> = HashMap::with_capacity(items.len());
     let mut created_by_key: HashMap<&str, u64> = HashMap::with_capacity(items.len());
     for item in items {
         let Some(created) = parse_rfc3339_secs(&item.created_at) else {
@@ -1556,39 +1545,48 @@ fn plan_gc_reclamation(
             ));
         };
         created_by_key.insert(item.item_key.as_str(), created);
-    }
-    if let Some(key) = live
-        .iter()
-        .find(|key| !created_by_key.contains_key(key.as_str()))
-    {
-        return Err(format!(
-            "refusing to reclaim: a live pointer references `{key}`, which is absent from the \
-             store listing (the listing may be incomplete/paginated, or the store is already \
-             inconsistent); nothing was deleted"
-        ));
+        value_by_key.insert(item.item_key.as_str(), item.item_value.as_str());
     }
 
-    // BEST-EFFORT DEFENCE IN DEPTH -- NOT AN INDEPENDENT SAFETY PROOF.
-    //
-    // The only sound basis for deleting a chunk is the operator's `--older-than`
-    // assertion (spec 4): they know when they last changed this config; Fastly
-    // records no pointer-supersession time and offers no CAS to synthesise one
-    // (see the design history -- three automatic clocks were built and each was
-    // demolished). This heuristic does NOT replace that assertion.
-    //
-    // What it does: approximate when each root's CURRENT config went live as the
-    // newest creation time among its live chunks. When the live value IS a
-    // chunked generation, that time is a real lower bound on when the root's
-    // orphans were superseded, so it catches the "A superseded seconds ago,
-    // chunks months old" case that killed design 3 -- a case the chunk's own age
-    // cannot see.
-    //
-    // Where it is blind: a root whose live value is DIRECT (or that is gone) has
-    // no live chunks, so no signal at all; and a re-push that reuses an existing
-    // content-address creates no new chunk, so the newest live `created_at` can
-    // predate the transition. It is therefore only ever applied as an ADDITIONAL
-    // restriction on top of the chunk's own age -- never as a substitute for it,
-    // and never as a reason to relax the operator's window.
+    // ---- 1. LIVE set: what the roots currently reference, PROVEN ----
+    let mut live: HashSet<String> = HashSet::new();
+    let mut roots = 0_usize;
+    for item in items {
+        if chunk_key_generation_any(&item.item_key).is_some() {
+            continue; // a chunk-shaped key, not a root
+        }
+        roots = roots.saturating_add(1);
+        // gc_classify_root (NOT prior_chunk_keys): on this destructive path an
+        // empty/truncated/unrelated value must FAIL, not read as "references
+        // nothing" -- that would make its live chunks look orphaned.
+        let classified = gc_classify_root(&item.item_key, &item.item_value).map_err(|err| {
+            format!(
+                "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
+                item.item_key
+            )
+        })?;
+        let GcRootValue::Chunked(pointer) = classified else {
+            continue; // A direct envelope references no chunks.
+        };
+        // The pointer's METADATA is self-consistent by here. That is not proof
+        // that it honestly describes its generation: a pointer can drop its last
+        // chunk ref AND restate `envelope_len` as the remaining sum, and every
+        // metadata check still passes while the dropped chunk silently leaves
+        // the live set and becomes deletable. So reassemble what it references
+        // and hold the bytes against its content-address.
+        let assembled = assemble_pointer_chunks(&item.item_key, &pointer, &value_by_key)?;
+        gc_verify_generation(&pointer.envelope_sha256, &assembled).map_err(|err| {
+            format!(
+                "refusing to reclaim: root `{}` names a chunk set that does not reconstruct the \
+                 envelope it claims ({err}). Its chunk list is therefore not a trustworthy live \
+                 set, and treating it as one could delete a live chunk. Nothing was deleted.",
+                item.item_key
+            )
+        })?;
+        live.extend(pointer.chunks.into_iter().map(|chunk| chunk.key));
+    }
+
+    // ---- 2. Per-root live-config age (best-effort; see the guard below) ----
     let root_live_since: HashMap<&str, u64> = live.iter().fold(HashMap::new(), |mut acc, key| {
         if let Some((root, _)) = key.split_once(CHUNK_KEY_INFIX) {
             let created = *created_by_key.get(key.as_str()).unwrap_or(&0);
@@ -1598,49 +1596,70 @@ fn plan_gc_reclamation(
         acc
     });
 
-    // Candidates: canonical chunk entries not referenced by any live pointer,
-    // whose root's config has been stable at least the operator's window.
-    let mut doomed: Vec<(String, u64)> = Vec::new();
-    let mut retained_recent = 0_usize;
+    // ---- 3. Candidates, grouped by GENERATION and proven writer-produced ----
+    // A per-key decision cannot be safe: an entry is only ours if the whole
+    // generation it belongs to reassembles to the content-address its keys name.
+    // So group first, prove second, and delete whole generations or none -- a
+    // partial delete would leave a corrupt generation behind.
+    let mut groups: BTreeMap<(&str, String), Vec<&ConfigStoreItem>> = BTreeMap::new();
     for item in items {
-        if chunk_key_generation_any(&item.item_key).is_none() {
-            continue;
-        }
         if live.contains(&item.item_key) {
             continue;
         }
-        // The key SHAPE says "chunk", but only the VALUE can confirm it. A store
-        // may predate this feature or be shared, and push-time reserved-key
-        // rejection cannot protect entries that already exist -- so an ordinary
-        // root could be sitting at a chunk-shaped key. Deleting it would destroy
-        // live config, so a root-like value aborts the run.
-        gc_reject_root_like_chunk(&item.item_key, &item.item_value)
-            .map_err(|err| format!("refusing to reclaim: {err}; nothing was deleted"))?;
-        let created = *created_by_key.get(item.item_key.as_str()).unwrap_or(&0);
-        let age = now.saturating_sub(created);
-        // BOTH ages must clear the operator's window; neither substitutes for
-        // the other, so we take the more restrictive (the MINIMUM age).
-        //
-        // - The chunk's OWN age is mandatory: a chunk written seconds ago is
-        //   inside the propagation window whatever its root looks like (e.g. a
-        //   concurrent push wrote it and has not committed its pointer yet), so
-        //   an old-looking root must never license deleting it.
-        // - The root's live-config age (when known) is an EXTRA restriction: it
-        //   catches an old chunk superseded recently, which its own age cannot.
-        //
-        // A root with no live chunked generation contributes no signal, and the
-        // chunk's own age plus `--older-than` stands alone.
-        let live_since_age = item
-            .item_key
-            .split_once(CHUNK_KEY_INFIX)
-            .and_then(|(root, _)| root_live_since.get(root))
-            .map(|live_since| now.saturating_sub(*live_since));
-        let effective_age = live_since_age.map_or(age, |live_age| age.min(live_age));
-        if effective_age < older_than_secs {
-            retained_recent = retained_recent.saturating_add(1);
+        let Some((root, _)) = item.item_key.split_once(CHUNK_KEY_INFIX) else {
+            continue; // a root
+        };
+        let Some(generation) = chunk_key_generation(root, &item.item_key) else {
+            continue; // chunk-shaped but NOT canonical => never a key we emit
+        };
+        groups.entry((root, generation)).or_default().push(item);
+    }
+
+    let mut doomed: Vec<(String, u64)> = Vec::new();
+    let mut retained_recent = 0_usize;
+    let mut unprovable = 0_usize;
+    for ((root, generation), group) in groups {
+        if prove_generation(&generation, &group).is_err() {
+            // We cannot prove we wrote this, so we do not touch it. It may be an
+            // ordinary entry that merely LOOKS like a chunk key (a store can
+            // predate this feature or be shared, and push-time reserved-key
+            // rejection cannot protect what already exists), or a half-written
+            // generation. Skipped rather than fatal: one foreign entry must not
+            // block reclamation of the store forever. Reported in the summary.
+            unprovable = unprovable.saturating_add(group.len());
             continue;
         }
-        doomed.push((item.item_key.clone(), age));
+
+        // Age the generation as a UNIT, by its youngest member: deleting a
+        // generation is one decision, so its most restrictive age governs.
+        let group_age = group
+            .iter()
+            .map(|item| {
+                now.saturating_sub(*created_by_key.get(item.item_key.as_str()).unwrap_or(&0))
+            })
+            .min()
+            .unwrap_or(0);
+        // BOTH ages must clear the operator's window; neither substitutes for
+        // the other, so take the more restrictive (the MINIMUM).
+        //
+        // - The chunks' OWN age is mandatory: a generation written seconds ago
+        //   is inside the propagation window whatever its root looks like (e.g.
+        //   a concurrent push wrote it and has not committed its pointer yet),
+        //   so an old-looking root must never license deleting it.
+        // - The root's live-config age (when known) is an EXTRA restriction: it
+        //   catches an old generation superseded recently, which its own age
+        //   cannot see.
+        let effective_age = root_live_since.get(root).map_or(group_age, |live_since| {
+            group_age.min(now.saturating_sub(*live_since))
+        });
+        if effective_age < older_than_secs {
+            retained_recent = retained_recent.saturating_add(group.len());
+            continue;
+        }
+        for item in group {
+            let age = now.saturating_sub(*created_by_key.get(item.item_key.as_str()).unwrap_or(&0));
+            doomed.push((item.item_key.clone(), age));
+        }
     }
 
     Ok(GcPlan {
@@ -1648,7 +1667,97 @@ fn plan_gc_reclamation(
         live_count: live.len(),
         retained_recent,
         roots,
+        unprovable,
     })
+}
+
+/// Reassemble the chunks a live pointer references, in index order, checking each
+/// against the pointer's own per-chunk `len`/`sha256` along the way.
+///
+/// Fails closed when a referenced key is absent from the listing. This subsumes
+/// the old standalone completeness guard: an incomplete or paginated listing
+/// cannot produce the bytes, so it can never reach a passing verification.
+fn assemble_pointer_chunks(
+    root_key: &str,
+    pointer: &GcPointer,
+    value_by_key: &HashMap<&str, &str>,
+) -> Result<String, String> {
+    let mut assembled = String::with_capacity(pointer.envelope_len);
+    for chunk in &pointer.chunks {
+        let Some(value) = value_by_key.get(chunk.key.as_str()) else {
+            return Err(format!(
+                "refusing to reclaim: root `{root_key}` references `{}`, which is absent from the \
+                 store listing (the listing may be incomplete/paginated, or the store is already \
+                 inconsistent); nothing was deleted",
+                chunk.key
+            ));
+        };
+        if value.len() != chunk.len {
+            return Err(format!(
+                "refusing to reclaim: root `{root_key}` says `{}` is {} bytes but the store holds \
+                 {}; nothing was deleted",
+                chunk.key,
+                chunk.len,
+                value.len()
+            ));
+        }
+        if sha256_hex(value.as_bytes()) != chunk.sha256 {
+            return Err(format!(
+                "refusing to reclaim: the stored value of `{}` does not match the SHA-256 that \
+                 root `{root_key}` records for it; nothing was deleted",
+                chunk.key
+            ));
+        }
+        assembled.push_str(value);
+    }
+    if assembled.len() != pointer.envelope_len {
+        return Err(format!(
+            "refusing to reclaim: root `{root_key}` declares an envelope of {} bytes but its \
+             chunks reassemble to {}; nothing was deleted",
+            pointer.envelope_len,
+            assembled.len()
+        ));
+    }
+    Ok(assembled)
+}
+
+/// Can we PROVE this candidate generation is one our writer produced?
+///
+/// This is the whole basis for deleting anything. `group` is every listed entry
+/// sharing one `(root, generation)`. It is writer-produced iff:
+///
+/// - there are at least two chunks (an oversized envelope always splits into
+///   >= 2, so a lone "chunk" is never something we wrote);
+/// - the indexes are dense `0..n-1` (a gap means this is not a whole generation,
+///   and we must not delete a fragment of one);
+/// - the values concatenated in index order hash to the generation the keys name.
+///
+/// Nothing else passes without a SHA-256 preimage, so an ordinary entry that
+/// merely looks like a chunk key — plain text, unrelated JSON, someone's real
+/// config — can never be mistaken for ours.
+fn prove_generation(generation: &str, group: &[&ConfigStoreItem]) -> Result<(), String> {
+    if group.len() < 2 {
+        return Err("a chunked envelope always splits into at least two chunks".to_owned());
+    }
+    let mut ordered: Vec<(usize, &str)> = Vec::with_capacity(group.len());
+    for item in group {
+        let index = item
+            .item_key
+            .rsplit_once('.')
+            .and_then(|(_, index)| index.parse::<usize>().ok())
+            .ok_or_else(|| format!("`{}` has no readable index", item.item_key))?;
+        ordered.push((index, item.item_value.as_str()));
+    }
+    ordered.sort_by_key(|&(index, _)| index);
+    for (position, &(index, _)) in ordered.iter().enumerate() {
+        if index != position {
+            return Err(format!(
+                "indexes are not dense 0..n-1 (found {index} at position {position})"
+            ));
+        }
+    }
+    let assembled: String = ordered.into_iter().map(|(_, value)| value).collect();
+    gc_verify_generation(generation, &assembled)
 }
 
 /// Is this key a chunk key of ANY root? (`config gc` scans the whole store, so
@@ -3584,7 +3693,14 @@ echo 'unexpected' >&2; exit 1
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
-    /// Every chunk key of `envelope` as the listing would return it.
+    /// Every chunk of `envelope` as the listing would return it: REAL keys and
+    /// REAL payload bytes.
+    ///
+    /// The values are not decorative. `config gc` proves a generation is ours by
+    /// reassembling it and hashing the result against the content-address its
+    /// keys name, so a placeholder value would (correctly) fail verification and
+    /// never be reclaimed. Fixtures must be honest for these tests to mean
+    /// anything.
     #[cfg(unix)]
     fn listed_generation(
         root_key: &str,
@@ -3595,7 +3711,7 @@ echo 'unexpected' >&2; exit 1
         let stamp = stamp_secs_ago(secs_ago);
         chunks
             .into_iter()
-            .map(|key| (key, stamp.clone(), "CHUNK-PAYLOAD".to_owned()))
+            .map(|(key, value)| (key, stamp.clone(), value))
             .collect()
     }
 
@@ -3605,6 +3721,18 @@ echo 'unexpected' >&2; exit 1
     fn listed_root(root_key: &str, envelope: &str, secs_ago: u64) -> (String, String, String) {
         let (_, pointer) = chunked_parts(root_key, envelope);
         (root_key.to_owned(), stamp_secs_ago(secs_ago), pointer)
+    }
+
+    /// A chunked envelope with a distinct payload per tag, padded to `pad`
+    /// characters so a caller can force a given number of chunks (7 000 bytes
+    /// each).
+    #[cfg(unix)]
+    fn gen_envelope_padded(tag: &str, pad: usize) -> String {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let data = json!({ tag: "x".repeat(pad) });
+        serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".to_owned()))
+            .expect("envelope")
     }
 
     /// A chunked envelope with a distinct payload per tag.
@@ -3618,16 +3746,20 @@ echo 'unexpected' >&2; exit 1
             .expect("envelope")
     }
 
-    /// Split a chunked envelope into (chunk keys, root pointer value).
+    /// Split a chunked envelope into (chunk `(key, value)` pairs, root pointer).
     #[cfg(unix)]
-    fn chunked_parts(root_key: &str, envelope: &str) -> (Vec<String>, String) {
+    fn chunked_parts(root_key: &str, envelope: &str) -> (Vec<(String, String)>, String) {
         let entries = prepare_fastly_config_entries(root_key, envelope).expect("expand");
         let (_, pointer) = entries.last().expect("pointer").clone();
-        let chunk_keys = entries[..entries.len().saturating_sub(1)]
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect();
-        (chunk_keys, pointer)
+        let chunks = entries[..entries.len().saturating_sub(1)].to_vec();
+        (chunks, pointer)
+    }
+
+    /// Just the chunk KEYS of a generation (for delete assertions).
+    #[cfg(unix)]
+    fn chunk_keys_of(root_key: &str, envelope: &str) -> Vec<String> {
+        let (chunks, _) = chunked_parts(root_key, envelope);
+        chunks.into_iter().map(|(key, _)| key).collect()
     }
 
     #[cfg(unix)]
@@ -4482,7 +4614,7 @@ echo 'unexpected' >&2; exit 1
         let oplog = dir.path().join("ops.log");
 
         let live = gen_envelope("live");
-        let (live_chunks, _) = chunked_parts(TEST_CONFIG_ID, &live);
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
         // The live generation is ANCIENT, but it is referenced by the root.
         let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
         listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
@@ -4510,8 +4642,8 @@ echo 'unexpected' >&2; exit 1
 
         let live = gen_envelope("live");
         let dead = gen_envelope("dead");
-        let (live_chunks, _) = chunked_parts(TEST_CONFIG_ID, &live);
-        let (dead_chunks, _) = chunked_parts(TEST_CONFIG_ID, &dead);
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
 
         // The live config has been stable for 2 days; the operator asserts a 1-day
         // window. So everything superseded (<= when live went live, i.e. >= 2
@@ -4551,7 +4683,7 @@ echo 'unexpected' >&2; exit 1
 
         let live = gen_envelope("live");
         let prior = gen_envelope("prior");
-        let (prior_chunks, _) = chunked_parts(TEST_CONFIG_ID, &prior);
+        let prior_chunks = chunk_keys_of(TEST_CONFIG_ID, &prior);
 
         // Live config went live 30s ago; the prior generation's chunks are a year
         // old but were superseded only 30s ago -> POPs may still serve them.
@@ -4574,13 +4706,75 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 round-6 [P1]: entries are classified as chunks by KEY SHAPE, but
-    /// a store may predate this feature (or be shared): an ordinary root can
-    /// already sit at a chunk-shaped key, and push-time reserved-key rejection
-    /// cannot protect what already exists. Deleting it would destroy live config.
+    /// PR #314 round-7 [P1], at the GC level: a live root whose pointer drops its
+    /// last chunk ref AND restates `envelope_len` as the remaining sum passes
+    /// every metadata check. The dropped chunk is then absent from the live set
+    /// and looks like a deletable orphan -- while the config still needs it.
+    ///
+    /// Guards the PLANNER's content verification (a unit test on
+    /// `gc_verify_generation` alone does not prove the planner calls it).
     #[cfg(unix)]
     #[test]
-    fn gc_fails_closed_on_root_like_value_at_chunk_shaped_key() {
+    fn gc_fails_closed_when_a_live_pointer_underreports_its_chunks() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // Padded so the generation is >= 3 chunks: this case needs a ref to
+        // drop that still leaves a plausible multi-chunk set behind.
+        let live = gen_envelope_padded("live", 20_000);
+        let (chunks, pointer_json) = chunked_parts(TEST_CONFIG_ID, &live);
+        assert!(chunks.len() >= 3, "need >= 3 chunks for this case");
+
+        // Doctor the pointer: drop the last ref, restate envelope_len to match
+        // the survivors. Generation, indexes, per-chunk lens and the sum all
+        // still agree -- only the CONTENT does not.
+        let mut pointer: serde_json::Value = serde_json::from_str(&pointer_json).expect("parse");
+        let refs = pointer
+            .get_mut("chunks")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("chunks array");
+        refs.pop().expect("drop the last chunk ref");
+        let surviving_len: u64 = refs
+            .iter()
+            .filter_map(|chunk| chunk.get("len").and_then(serde_json::Value::as_u64))
+            .sum();
+        pointer["envelope_len"] = serde_json::json!(surviving_len);
+        let doctored = serde_json::to_string(&pointer).expect("serialise");
+
+        // The store still physically holds ALL the chunks, including the one the
+        // doctored pointer no longer names.
+        let orphaned_by_omission = chunks.last().expect("last chunk").0.clone();
+        let stamp = stamp_secs_ago(999_999);
+        let mut listing = vec![(TEST_CONFIG_ID.to_owned(), stamp.clone(), doctored)];
+        for (key, value) in chunks {
+            listing.push((key, stamp.clone(), value));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
+        assert!(
+            err.contains("does not reconstruct the envelope it claims"),
+            "expected a content-address mismatch on the live pointer, got: {err}"
+        );
+        assert!(
+            !oplog_has(&oplog, &format!("delete {orphaned_by_omission}")),
+            "a chunk the live config still needs must never be deleted because its pointer \
+             under-reported it: `{orphaned_by_omission}`"
+        );
+    }
+
+    /// PR #314 round-7 [P1]: a LONE entry whose value hashes to the generation
+    /// its own key names would otherwise "prove" itself and be deleted. But our
+    /// writer never emits a one-chunk generation (an oversized envelope always
+    /// splits into >= 2), so a group of one is never ours -- it is a root-like
+    /// value sitting at a chunk-shaped key. This is the case a pure hash check
+    /// cannot catch on its own.
+    #[cfg(unix)]
+    #[test]
+    fn gc_never_reclaims_a_lone_self_consistent_chunk() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
@@ -4589,10 +4783,11 @@ echo 'unexpected' >&2; exit 1
         let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
         listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
 
-        // A pre-existing entry: chunk-shaped key, but its value is a complete
-        // config envelope -- i.e. somebody's root. Old enough to be "eligible".
-        let squatter_key = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "b".repeat(64));
+        // A complete envelope stored at a chunk-shaped key whose generation IS
+        // that envelope's own SHA -- so it reassembles to its content-address.
         let squatter_value = gen_envelope("someones-real-config");
+        let self_sha = sha256_hex(squatter_value.as_bytes());
+        let squatter_key = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{self_sha}.0");
         listing.push((
             squatter_key.clone(),
             stamp_secs_ago(31_536_000),
@@ -4602,21 +4797,81 @@ echo 'unexpected' >&2; exit 1
         let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
 
-        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
-        assert!(
-            err.contains("refusing to reclaim") && err.contains("destroy live config"),
-            "expected a refusal naming the root-like value, got: {err}"
-        );
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
         assert!(
             !oplog_has(&oplog, &format!("delete {squatter_key}")),
-            "an entry whose VALUE is a root must never be deleted, whatever its key looks like"
+            "a one-chunk 'generation' is never something this writer emitted, so it must not be \
+             reclaimed even though it hashes to its own key: `{squatter_key}`; log:\n{log}"
         );
+    }
+
+    /// PR #314 round-6/7 [P1]: an entry can be chunk-SHAPED without being a chunk
+    /// -- a store may predate this feature or be shared, and push-time
+    /// reserved-key rejection cannot protect what already exists. Deleting one
+    /// would destroy live config.
+    ///
+    /// Round 7: proof is CONTENT, not shape. A candidate generation is ours only
+    /// if it reassembles to the content-address its own keys name. Unprovable
+    /// entries are left UNTOUCHED and reported -- not fatal, because one foreign
+    /// entry must not block reclaiming the rest of the store forever.
+    #[cfg(unix)]
+    #[test]
+    fn gc_leaves_unprovable_chunk_shaped_entries_untouched() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+        // A real orphan generation: provable, old -> must still be reclaimed.
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        // Pre-existing entries at chunk-shaped keys that we did NOT write: one
+        // holding somebody's real config envelope, one holding plain text.
+        // Both are old enough to look "eligible" on age alone.
+        let envelope_squatter = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "b".repeat(64));
+        let text_squatter = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "c".repeat(64));
+        listing.push((
+            envelope_squatter.clone(),
+            stamp_secs_ago(31_536_000),
+            gen_envelope("someones-real-config"),
+        ));
+        listing.push((
+            text_squatter.clone(),
+            stamp_secs_ago(31_536_000),
+            "just some plain text".to_owned(),
+        ));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+
+        for key in [&envelope_squatter, &text_squatter] {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "an entry we cannot prove we wrote must never be deleted: `{key}`; log:\n{log}"
+            );
+        }
+        // Left untouched must not mean silently ignored.
         assert!(
-            !fs::read_to_string(&oplog)
-                .unwrap_or_default()
-                .contains("delete "),
-            "a fail-closed run deletes nothing at all"
+            out.iter()
+                .any(|line| line.contains("could not prove EdgeZero wrote them")),
+            "the summary must report what it declined to judge; out: {out:?}"
         );
+        // ...and a genuine orphan generation is still reclaimed, so one foreign
+        // entry does not block the store.
+        for key in &dead_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "a provable orphan generation must still be reclaimed: `{key}`; log:\n{log}"
+            );
+        }
     }
 
     /// PR #314 round-6 [P2]: a key is unique in a config store, so duplicate rows
@@ -4701,7 +4956,8 @@ echo 'unexpected' >&2; exit 1
         let oplog = dir.path().join("ops.log");
 
         let live = gen_envelope("live");
-        let (live_chunks, pointer) = chunked_parts(TEST_CONFIG_ID, &live);
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
+        let (_, pointer) = chunked_parts(TEST_CONFIG_ID, &live);
         // A write that landed half-way: a valid PREFIX of the real pointer that
         // is no longer valid JSON. (Chars, not a byte slice -- never split a
         // codepoint.)
@@ -4780,7 +5036,7 @@ echo 'unexpected' >&2; exit 1
         let oplog = dir.path().join("ops.log");
 
         let live = gen_envelope("live");
-        let (live_chunks, _) = chunked_parts(TEST_CONFIG_ID, &live);
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
         let mut listing = vec![(
             TEST_CONFIG_ID.to_owned(),
             stamp_secs_ago(999_999),
@@ -4817,7 +5073,7 @@ echo 'unexpected' >&2; exit 1
 
         let live = gen_envelope("live");
         let fresh = gen_envelope("fresh");
-        let (fresh_chunks, _) = chunked_parts(TEST_CONFIG_ID, &fresh);
+        let fresh_chunks = chunk_keys_of(TEST_CONFIG_ID, &fresh);
 
         // The root's live config has been stable for a year -- so the live-config
         // clock alone would happily reclaim. But these chunks were written 10s
@@ -4850,7 +5106,7 @@ echo 'unexpected' >&2; exit 1
 
         let live = gen_envelope("live");
         let dead = gen_envelope("dead");
-        let (dead_chunks, _) = chunked_parts(TEST_CONFIG_ID, &dead);
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
 
         let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
         listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
@@ -4888,7 +5144,7 @@ echo 'unexpected' >&2; exit 1
         let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 3_600)];
         listing.extend(listed_generation(TEST_CONFIG_ID, &live, 3_600));
         // An orphan whose timestamp is garbage.
-        let (dead_chunks, _) = chunked_parts(TEST_CONFIG_ID, &dead);
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
         for key in dead_chunks {
             listing.push((key, "not-a-timestamp".to_owned(), "X".to_owned()));
         }
@@ -4990,7 +5246,7 @@ echo 'unexpected' >&2; exit 1
 
         let live = gen_envelope("live");
         let dead = gen_envelope("dead");
-        let (dead_chunks, _) = chunked_parts(TEST_CONFIG_ID, &dead);
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
         let fail_key = dead_chunks.first().expect("a chunk").clone();
 
         let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
@@ -5535,10 +5791,7 @@ echo 'unexpected' >&2; exit 1
         // app_config gen X, then a chunked sibling, then app_config gen Z.
         push("app_config", make("x1"));
         push("app_config_staging", make("staging"));
-        let staging_chunks = {
-            let (chunks, _) = chunked_parts("app_config_staging", &make("staging"));
-            chunks
-        };
+        let staging_chunks = chunk_keys_of("app_config_staging", &make("staging"));
         push("app_config", make("z2")); // GCs app_config's gen-X chunks
 
         let after = fs::read_to_string(&fastly_toml).expect("read");

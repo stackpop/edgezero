@@ -331,7 +331,7 @@ edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--store <id>` — logical config-store id to reclaim. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
 - `--older-than <dur>` — **your safety assertion** (see below). Accepts `7d`, `24h`, `90m`, `30s`, or a bare number of seconds.
-- `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the manifest.
+- `--no-env` — ignore `EDGEZERO__STORES__CONFIG__<ID>__NAME`, so the logical store id `<ID>` is used as the physical store name. This is **not** the app-config overlay that `validate`/`push`/`diff` mean by `--no-env` — `gc` never loads your typed app config. Because that variable is normally what maps a logical id onto the real store, `--no-env` **changes which store is swept**, and this command deletes. Check the store id `gc` reports before passing `--yes`.
 - `--yes` — actually delete. **Without it, `config gc` is a dry run** that names every key and age it would delete and deletes nothing.
 
 **`--older-than` is an assertion only you can make, and it covers the whole

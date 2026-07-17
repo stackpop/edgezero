@@ -163,8 +163,8 @@ cannot be used as a supersession clock.
   ages), fail-closed on truncated-root-pointer / empty-root-value /
   enveloped-(paginated)-listing / unclassifiable-root / malformed-listing-entry /
   unreadable-timestamp, non-canonical-not-deleted (fails closed), delete argv
-  shape, narrow absent-key match (store/auth/500 must surface), delete-failure
-  non-zero exit, list-path redaction.
+  shape, delete-failure non-zero exit (every failed delete is a failure — no
+  stderr special case), list-path redaction.
 - [x] CLI gating tests: `--yes` requires `--older-than`; `--yes --older-than 0`
   rejected; dry-run allows a missing threshold. Scaffold test asserts a generated
   project wires `Gc(ConfigGcArgs)` → `edgezero_cli::run_config_gc` (verified live

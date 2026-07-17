@@ -61,12 +61,39 @@ struct FastlyChunkRef {
     sha256: String,
 }
 
+/// A chunk reference from a validated pointer, for `config gc`.
+#[cfg(any(feature = "cli", test))]
+pub(crate) struct GcChunkRef {
+    pub key: String,
+    pub len: usize,
+    pub sha256: String,
+}
+
+/// A validated v1 pointer's contents, for `config gc`.
+#[cfg(any(feature = "cli", test))]
+pub(crate) struct GcPointer {
+    /// Validated: non-empty, one generation, dense `0..n-1` in order.
+    pub chunks: Vec<GcChunkRef>,
+    pub envelope_len: usize,
+    pub envelope_sha256: String,
+}
+
+/// What a root's value IS, once classified for `config gc`.
+#[cfg(any(feature = "cli", test))]
+pub(crate) enum GcRootValue {
+    /// A valid v1 chunk pointer. Its METADATA is validated; its CONTENT must
+    /// still be verified against the store -- see [`gc_verify_generation`].
+    Chunked(GcPointer),
+    /// A valid, integrity-checked envelope stored inline. References no chunks.
+    Direct,
+}
+
 // ---------------------------------------------------------------------------
 // Public helpers
 // ---------------------------------------------------------------------------
 
 /// Compute the lowercase-hex SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -459,15 +486,22 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
 /// the push path and treats unrelated/empty JSON as "references nothing"), this
 /// accepts ONLY:
 ///
-/// - a valid, integrity-checked direct `BlobEnvelope` → `Ok(vec![])` (no chunks);
-/// - a valid v1 chunk pointer → `Ok(<canonical chunk keys>)`.
+/// - a valid, integrity-checked direct `BlobEnvelope` → `Direct`;
+/// - a valid v1 chunk pointer → `Chunked` (metadata validated).
 ///
 /// Anything else — an empty string, a truncated/partial value, unrelated JSON,
 /// or a pointer that fails validation — is `Err`. A root we cannot classify has
 /// unknown references, so we must reclaim NOTHING rather than treat its live
 /// chunks as orphaned.
+///
+/// **Metadata is not proof.** A `Chunked` result says the pointer is
+/// self-consistent, NOT that it honestly describes its generation: a pointer can
+/// drop its last chunk ref AND restate `envelope_len` as the remaining sum, and
+/// every metadata check still passes while the dropped chunk silently leaves the
+/// live set. Callers MUST reconstruct the referenced chunks and put them through
+/// [`gc_verify_generation`] before trusting the live set.
 #[cfg(any(feature = "cli", test))]
-pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<Vec<String>, String> {
+pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue, String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
     if raw.trim().is_empty() {
@@ -475,78 +509,104 @@ pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<Vec<String>,
             "root `{root_key}` has an empty value; refusing to reclaim (cannot tell what it references)"
         ));
     }
+    // Every diagnostic below is REDACTED: serde's Display quotes the offending
+    // input, `verify()`'s names the stored hashes, and BOTH are attacker- or
+    // config-controlled strings that may hold credentials.
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|err| {
-        format!("root `{root_key}` is not valid JSON ({err}); refusing to reclaim")
+        format!(
+            "root `{root_key}` is not valid JSON ({}); refusing to reclaim",
+            redact_json_err(&err)
+        )
     })?;
     if value
         .get("edgezero_kind")
         .and_then(serde_json::Value::as_str)
         == Some(POINTER_KIND)
     {
-        // A chunk pointer: prior_chunk_keys validates + returns its canonical keys.
-        return prior_chunk_keys(root_key, raw);
+        let pointer: FastlyChunkPointer = serde_json::from_value(value).map_err(|err| {
+            format!(
+                "root `{root_key}` is a chunk pointer but is malformed ({}); refusing to reclaim",
+                redact_json_err(&err)
+            )
+        })?;
+        if pointer.version != 1 {
+            return Err(format!(
+                "root `{root_key}` chunk pointer has unsupported version {}; refusing to reclaim",
+                pointer.version
+            ));
+        }
+        validate_pointer_chunks(root_key, &pointer)?;
+        return Ok(GcRootValue::Chunked(GcPointer {
+            chunks: pointer
+                .chunks
+                .into_iter()
+                .map(|chunk| GcChunkRef {
+                    key: chunk.key,
+                    len: chunk.len,
+                    sha256: chunk.sha256,
+                })
+                .collect(),
+            envelope_len: pointer.envelope_len,
+            envelope_sha256: pointer.envelope_sha256,
+        }));
     }
     // Otherwise it must be a valid, integrity-checked direct envelope.
     let envelope: BlobEnvelope = serde_json::from_value(value).map_err(|err| {
         format!(
-            "root `{root_key}` is neither a valid chunk pointer nor a valid config envelope ({err}); refusing to reclaim"
+            "root `{root_key}` is neither a valid chunk pointer nor a valid config envelope ({}); \
+             refusing to reclaim",
+            redact_json_err(&err)
         )
     })?;
-    envelope.verify().map_err(|err| {
+    envelope.verify().map_err(|_err| {
         format!(
-            "root `{root_key}` envelope failed its integrity check ({err}); refusing to reclaim"
+            "root `{root_key}` envelope failed its integrity check (details redacted -- the \
+             stored hashes are config-controlled); refusing to reclaim"
         )
     })?;
-    Ok(Vec::new())
+    Ok(GcRootValue::Direct)
 }
 
-/// Is this delete candidate's VALUE actually a root's value?
+/// Prove that `assembled` really is the generation named by `generation_sha`.
 ///
-/// Reclamation classifies entries by KEY SHAPE alone, which is safe only for a
-/// store we wrote. A store may predate this feature (or be shared), and nothing
-/// stopped an operator creating an ordinary entry literally named
-/// `app.__edgezero_chunks.<64-hex>.0`. Push-time reserved-key rejection guards
-/// only NEW writes; it cannot protect what is already there. Deleting such an
-/// entry would destroy live config -- the exact opposite of this feature's
-/// never-delete-a-root invariant.
+/// **This is the only thing on the GC path that constitutes proof.** A chunk key
+/// embeds the SHA-256 of the WHOLE envelope it belongs to, so a chunk set is
+/// self-proving: reassemble it and the hash either matches the content-address
+/// or it does not. Nothing an inconsistent store can say about lengths, indexes
+/// or counts survives this check, and nothing outside our writer can pass it
+/// without a preimage attack on SHA-256.
 ///
-/// So before deleting, prove the value looks like a chunk PAYLOAD and not a
-/// root. A chunk payload is a raw fragment of an envelope's JSON: an oversized
-/// envelope always splits into >= 2 pieces, so no chunk value is ever a complete
-/// envelope or a pointer. If it parses as either, the entry is not ours to
-/// delete.
-///
-/// Returns `Err` (fail closed) when the value is root-like; `Ok(())` when it is
-/// a plausible chunk payload.
+/// Used for BOTH destructive decisions:
+/// - a live pointer's chunks must reconstruct the envelope it claims (else its
+///   chunk list is not the true live set);
+/// - a delete candidate's generation must reconstruct a real envelope (else we
+///   cannot prove we wrote it, and must not delete it).
 #[cfg(any(feature = "cli", test))]
-pub(crate) fn gc_reject_root_like_chunk(key: &str, raw: &str) -> Result<(), String> {
+pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Result<(), String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        // Not JSON at all => a fragment, exactly as expected. (A chunk payload
-        // is usually an incomplete slice of JSON and so unparseable.)
-        return Ok(());
-    };
-    if value
-        .get("edgezero_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some(POINTER_KIND)
-    {
+    let actual = sha256_hex(assembled.as_bytes());
+    if actual != generation_sha {
         return Err(format!(
-            "entry `{key}` has a chunk-shaped key but its value is a chunk POINTER, so it is a \
-             root, not a chunk. Refusing to reclaim: deleting it would destroy live config"
+            "the chunk set reassembles to SHA-256 `{actual}`, which is not the generation its own \
+             keys name (`{generation_sha}`), so these chunks are not the generation they claim"
         ));
     }
-    if let Ok(envelope) = serde_json::from_value::<BlobEnvelope>(value)
-        && envelope.verify().is_ok()
-    {
-        return Err(format!(
-            "entry `{key}` has a chunk-shaped key but its value is a complete, valid config \
-             envelope, so it is a root, not a chunk (a chunked envelope always splits into \
-             two or more partial pieces). Refusing to reclaim: deleting it would destroy \
-             live config"
-        ));
-    }
+    // Content-addressing already proves authorship; parsing proves the bytes are
+    // a config envelope rather than an unrelated blob that happens to hash right
+    // (which SHA-256 makes infeasible anyway -- this is belt and braces).
+    let envelope: BlobEnvelope = serde_json::from_str(assembled).map_err(|err| {
+        format!(
+            "the chunk set reassembles to its content-address but does not parse as a config \
+             envelope ({})",
+            redact_json_err(&err)
+        )
+    })?;
+    envelope.verify().map_err(|_err| {
+        "the chunk set reassembles to a config envelope that fails its own integrity check \
+         (details redacted -- the stored hashes are config-controlled)"
+            .to_owned()
+    })?;
     Ok(())
 }
 
@@ -664,21 +724,49 @@ mod tests {
     fn gc_classify_root_accepts_a_real_pointer() {
         let root = "app_config";
         let (pointer_json, pointer) = pointer_fixture(root);
-        let keys = gc_classify_root(root, &pointer_json).expect("a real pointer must classify");
-        assert_eq!(keys.len(), pointer.chunks.len());
+        let classified =
+            gc_classify_root(root, &pointer_json).expect("a real pointer must classify");
+        let GcRootValue::Chunked(gc_pointer) = classified else {
+            panic!("a pointer value must classify as Chunked");
+        };
         assert!(
-            keys.len() >= 2,
+            gc_pointer.chunks.len() >= 2,
             "an oversized envelope always splits into >= 2"
         );
+        // The classifier must carry the pointer's refs VERBATIM: `config gc`
+        // checks each stored chunk against these `len`/`sha256` values before
+        // reassembling, so a lossy or reordered mapping here would silently
+        // weaken every downstream content check.
+        assert_eq!(gc_pointer.envelope_len, pointer.envelope_len);
+        assert_eq!(gc_pointer.envelope_sha256, pointer.envelope_sha256);
+        assert_eq!(gc_pointer.chunks.len(), pointer.chunks.len());
+        for (got, want) in gc_pointer.chunks.iter().zip(pointer.chunks.iter()) {
+            assert_eq!(got.key, want.key);
+            assert_eq!(got.len, want.len);
+            assert_eq!(got.sha256, want.sha256);
+        }
+        // ...and those refs actually describe the stored chunks.
+        let entries =
+            prepare_fastly_config_entries(root, &make_envelope_json(20_000)).expect("expand");
+        for (chunk, (_, value)) in gc_pointer.chunks.iter().zip(entries.iter()) {
+            assert_eq!(chunk.len, value.len(), "ref len must match the real chunk");
+            assert_eq!(
+                chunk.sha256,
+                sha256_hex(value.as_bytes()),
+                "ref sha256 must match the real chunk"
+            );
+        }
     }
 
     /// A direct envelope is a root that references no chunks.
     #[test]
     fn gc_classify_root_accepts_a_direct_envelope() {
         let envelope = make_envelope_json(200);
-        assert_eq!(
-            gc_classify_root("app_config", &envelope).expect("a valid envelope must classify"),
-            Vec::<String>::new()
+        let classified =
+            gc_classify_root("app_config", &envelope).expect("a valid envelope must classify");
+        assert!(
+            matches!(classified, GcRootValue::Direct),
+            "an inline envelope must classify as Direct (it references no chunks)"
         );
     }
 
@@ -772,36 +860,6 @@ mod tests {
             .expect("the unmutated fixture must still classify");
     }
 
-    /// PR #314 round-6 [P1]: an entry whose KEY looks like a chunk but whose
-    /// VALUE is a root must never be deleted. Push-time reserved-key rejection
-    /// cannot protect entries that already exist in a store.
-    #[test]
-    fn gc_rejects_root_like_values_at_chunk_shaped_keys() {
-        let root = "app_config";
-        let sha = "a".repeat(64);
-        let key = format!("{root}{CHUNK_KEY_INFIX}{sha}.0");
-
-        // A complete direct envelope sitting at a chunk-shaped key.
-        let envelope = make_envelope_json(200);
-        assert!(
-            gc_reject_root_like_chunk(&key, &envelope).is_err(),
-            "a complete envelope at a chunk-shaped key is a ROOT; deleting it destroys live config"
-        );
-        // A chunk pointer sitting at a chunk-shaped key.
-        let (pointer_json, _) = pointer_fixture(root);
-        assert!(
-            gc_reject_root_like_chunk(&key, &pointer_json).is_err(),
-            "a pointer at a chunk-shaped key is a ROOT; deleting it destroys live config"
-        );
-        // A real chunk payload is a partial fragment -> allowed.
-        let big = make_envelope_json(20_000);
-        let entries = prepare_fastly_config_entries(root, &big).expect("expand");
-        assert!(
-            gc_reject_root_like_chunk(&entries[0].0, &entries[0].1).is_ok(),
-            "a genuine chunk payload must remain reclaimable"
-        );
-    }
-
     /// PR #314 round-6 [P2]: a parse diagnostic must never quote the stored
     /// value -- app config may hold credentials and these lines are logged.
     #[test]
@@ -813,9 +871,12 @@ mod tests {
         let malformed = format!(
             r#"{{"edgezero_kind":"{POINTER_KIND}","version":"{SENTINEL}","chunks":[],"data_sha256":"","envelope_len":0,"envelope_sha256":""}}"#
         );
+        let Err(gc_err) = gc_classify_root(root, &malformed) else {
+            panic!("a malformed pointer must fail closed on the gc path");
+        };
         for err in [
             prior_chunk_keys(root, &malformed).expect_err("must warn"),
-            gc_classify_root(root, &malformed).expect_err("must fail closed"),
+            gc_err,
         ] {
             assert!(
                 !err.contains(SENTINEL),
@@ -845,6 +906,90 @@ mod tests {
             len: chunk.len,
             sha256: chunk.sha256.clone(),
         }
+    }
+
+    /// Round-7 [P1]: a COORDINATED partial pointer -- drop the last chunk ref AND
+    /// restate `envelope_len` as the remaining sum. Generation, indexes, lengths
+    /// and the sum all agree; only the CONTENT disagrees. Metadata validation
+    /// cannot see it, so the dropped chunk would silently leave the live set and
+    /// become deletable. Only reassembling and hashing catches this.
+    #[test]
+    fn coordinated_partial_pointer_fails_content_verification() {
+        let root = "app_config";
+        let envelope = make_envelope_json(20_000);
+        let entries = prepare_fastly_config_entries(root, &envelope).expect("expand");
+        let (_, pointer_json) = entries.last().expect("pointer").clone();
+        let mut pointer: FastlyChunkPointer = serde_json::from_str(&pointer_json).unwrap();
+        assert!(pointer.chunks.len() >= 3, "need >= 3 chunks for this case");
+
+        let dropped = pointer.chunks.pop().expect("last chunk");
+        pointer.envelope_len = pointer.chunks.iter().map(|chunk| chunk.len).sum();
+        let doctored = serde_json::to_string(&pointer).expect("serialise");
+
+        // METADATA validation passes -- that is the whole point of the attack.
+        let classified = gc_classify_root(root, &doctored)
+            .expect("the doctored pointer is metadata-consistent by construction");
+        let GcRootValue::Chunked(gc_pointer) = classified else {
+            panic!("expected a chunked root");
+        };
+        assert!(
+            !gc_pointer
+                .chunks
+                .iter()
+                .any(|chunk| chunk.key == dropped.key),
+            "fixture check: the dropped chunk is absent from the pointer's list"
+        );
+
+        // CONTENT verification is what rejects it: the surviving chunks cannot
+        // hash to the envelope the generation names.
+        let assembled: String = entries[..entries.len().saturating_sub(2)]
+            .iter()
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let err = gc_verify_generation(&gc_pointer.envelope_sha256, &assembled)
+            .expect_err("a partial chunk set must not verify as its generation");
+        assert!(
+            err.contains("not the generation they claim"),
+            "expected a content-address mismatch, got: {err}"
+        );
+
+        // And the honest, complete set still verifies -- so the assertion above
+        // is rejecting the omission, not something incidental.
+        let whole: String = entries[..entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(_, value)| value.as_str())
+            .collect();
+        gc_verify_generation(&gc_pointer.envelope_sha256, &whole)
+            .expect("the complete chunk set must verify");
+    }
+
+    /// Round-7 [P1]: an entry that merely LOOKS like a chunk key is not a chunk.
+    /// Only reassembling to the content-address the key names proves authorship,
+    /// and nothing but our writer can produce that without a SHA-256 preimage.
+    #[test]
+    fn only_a_real_generation_verifies() {
+        let root = "app_config";
+        let envelope = make_envelope_json(20_000);
+        let entries = prepare_fastly_config_entries(root, &envelope).expect("expand");
+        let generation = chunk_key_generation(root, &entries[0].0).expect("canonical key");
+
+        for (label, value) in [
+            ("plain text", "just some plain text"),
+            ("unrelated json", r#"{"some":"value"}"#),
+            ("someone's real config", make_envelope_json(200).as_str()),
+        ] {
+            assert!(
+                gc_verify_generation(&generation, value).is_err(),
+                "a {label} value must never verify as a generation we wrote"
+            );
+        }
+
+        // The genuine article does verify.
+        let whole: String = entries[..entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(_, value)| value.as_str())
+            .collect();
+        gc_verify_generation(&generation, &whole).expect("the real generation must verify");
     }
 
     // ---- helpers ----

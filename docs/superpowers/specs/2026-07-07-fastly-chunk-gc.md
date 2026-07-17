@@ -342,8 +342,19 @@ supplies `--older-than` is the one who knows a deploy is not in flight.
 
 ## `prior_chunk_keys` helper (`chunked_config.rs`)
 
-Load-bearing in both paths: it yields the chunk keys a pointer **references**,
+**Local push path only.** It yields the chunk keys a pointer **references**,
 validated and prefix-scoped to that root.
+
+> **`config gc` deliberately does NOT use it** — see §"Reclamation algorithm".
+> Its `Ok(vec![])`-for-unrecognised-values contract is right for a push (nothing
+> to prune) and dangerous for a delete (it would read as "references nothing" and
+> orphan a root's live chunks). GC uses `gc_classify_root` + content verification.
+>
+> The asymmetry is safe in the direction it fails: local pruning computes
+> `prior − new`, so an under-reporting pointer prunes **less** (leaks, which is
+> inert) rather than deleting something live. GC computes the live set, where the
+> same under-reporting would delete a live chunk — which is why only GC pays for
+> full content verification.
 
 - `Ok(keys)` — a valid v1 chunk pointer.
 - `Ok(vec![])` — a direct `BlobEnvelope`, absent, or not pointer-shaped (silent).
@@ -375,8 +386,15 @@ commit expanded (chunks first, pointer last).  NO deletes.
 prune (prior_chunk_keys - new_keys) inside the same fastly.toml rewrite
 
 # --- config gc (operator) ---
-list -> live = union of prior_chunk_keys(root, root_value) over all roots
-doomed = chunk entries not in live, older than --older-than
+list                 # bare array, non-empty fields, no duplicate keys, else abort
+live = union over roots of:
+    gc_classify_root(root, root_value)          # valid envelope | valid pointer, else abort
+    -> if chunked: reassemble its chunks from the listing and CHECK the bytes
+       hash to envelope_sha256, else abort      # metadata alone is not proof
+doomed = whole GENERATIONS of non-live chunk entries that
+    (a) reassemble to the content-address their own keys name  # proves we wrote them
+    (b) clear --older-than by BOTH their own age and their root's live-config age
+    # a generation we cannot prove is left UNTOUCHED and reported, never deleted
 delete doomed        # fails closed on any unclassifiable/unreadable state
 ```
 
@@ -483,18 +501,25 @@ in the `cli.rs` test module.
 - **Dry-run** names every key + age it would delete, and deletes nothing.
 - **Fails closed on an unreadable `created_at`** — aborts, deletes nothing.
 - **Fails closed on an unclassifiable root** — aborts, deletes nothing.
-- **Fails closed on a root-like value at a chunk-shaped key** — never deletes a
-  root, whatever its key looks like.
+- **Never deletes an entry it cannot prove EdgeZero wrote** — a candidate
+  generation must reassemble to the content-address its own keys name, and must
+  have >= 2 chunks (our writer never emits a one-chunk generation). An entry that
+  is merely chunk-SHAPED — plain text, unrelated JSON, someone's real config at a
+  chunk-shaped key — is left untouched and reported, never deleted.
+- **Fails closed when a live pointer under-reports its chunks** — a pointer that
+  drops a chunk ref AND restates `envelope_len` to match passes every metadata
+  check, so its chunks are reassembled and hashed against `envelope_sha256`.
 - **Fails closed on a pointer whose chunk list is internally inconsistent** —
   an empty list, a gap/duplicate/reordering in the indexes, a mixed generation,
   or lengths that do not sum to `envelope_len`.
 - **Fails closed on duplicate listing keys** — the listing is not one consistent
   view of the store.
 - Delete argv passes `--key` + `--auto-yes` and **never** `--all`.
-- **A failed delete only reads as success when the CLI says THIS key is already
-  gone** (so a re-run after a partial pass is idempotent). Store-level, auth, and
-  server failures surface — a bare `not found`/`404` scan of stderr would report
-  "reclaimed" for a run that deleted nothing.
+- **Every failed delete is a failure.** There is no "already gone" stderr special
+  case: `not found`/`404` text cannot distinguish a missing key from a missing
+  store, an auth failure or a 500, and reporting those as reclamation is worse
+  than a retry. Retries are free — `gc` re-lists, so a key that is genuinely gone
+  never becomes a candidate again.
 
 ### Local (`push_config_entries_local` / `write_fastly_local_config_store`)
 

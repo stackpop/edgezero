@@ -116,12 +116,16 @@ pub struct ConfigGcArgs {
     /// Path to `edgezero.toml`.
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
-    /// Do not overlay `EDGEZERO__*` environment variables when resolving which
-    /// PHYSICAL store to sweep. `gc` never loads the typed app config, so this
-    /// is not about app-config overlays: `EDGEZERO__STORES__CONFIG__<ID>` maps
-    /// a logical store id to a platform store name, and `--no-env` ignores that
-    /// mapping, falling back to the logical id. On a destructive command that
-    /// changes WHICH STORE IS SWEPT — check the reported store id before `--yes`.
+    /// Ignore `EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which
+    /// PHYSICAL store to sweep, so the logical id `<ID>` is used as the physical
+    /// store name instead.
+    ///
+    /// This is NOT the app-config overlay the other `config` subcommands mean by
+    /// `--no-env` — `gc` never loads your typed app config. On a DESTRUCTIVE
+    /// command it selects a DIFFERENT TARGET: if that variable is what maps your
+    /// logical id onto the real store, `--no-env` points `gc` at a different
+    /// store (or one that does not exist). Check the store id `gc` reports before
+    /// passing `--yes`.
     #[arg(long)]
     pub no_env: bool,
     /// Only reclaim entries older than this. This is YOUR SAFETY ASSERTION,
