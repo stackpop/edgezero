@@ -233,7 +233,18 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
     let outcome = match (args.local, args.dry_run) {
         (false, dry_run) => {
             // Cloud: no synthesis. Validate + build stores against the
-            // real worktree, dispatch with mode=Cloud, deployed=None.
+            // real worktree, dispatch with mode=Cloud.
+            //
+            // `deployed` IS threaded here (it used to be hard-coded
+            // `None` -- PR #287 review round 9, blocking #2). Cloud
+            // adapters read durable ids back out of their gitignored
+            // adapter manifest (fastly.toml's `service_id`) and return
+            // them in `ProvisionOutcome.deployed`, which the writeback
+            // below `insert`s unconditionally into TRACKED
+            // edgezero.toml. Without the tracked block to compare
+            // against, an adapter could not tell a first-time capture
+            // from a stale per-machine file silently replacing the
+            // team's committed id -- so it always did the latter.
             let dispatch = DispatchContext {
                 adapter,
                 adapter_cfg,
@@ -243,7 +254,7 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
             validate_and_dispatch(
                 &dispatch,
                 manifest,
-                None,
+                deployed.as_ref(),
                 adapter_registry::ProvisionMode::Cloud,
                 dry_run,
             )?
