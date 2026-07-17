@@ -14,7 +14,9 @@ set -euo pipefail
 #     action-owned passthrough arg.
 #   * The staged upload must clone the active version.
 #
-# Reads (env): FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION.
+# Reads (env):
+#   FAKE_CALL_LOG                         required  the fake fastly/curl call log
+#   EDGEZERO__TEST__STAGED_VERSION        required  the version the staged deploy produced
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh

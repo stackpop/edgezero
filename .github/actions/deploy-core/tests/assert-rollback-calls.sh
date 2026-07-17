@@ -8,7 +8,10 @@ set -euo pipefail
 #   * Staging rollback hit `/deactivate`, which deactivates the LIVE version.
 #     Undoing a stage is `/deactivate/staging`.
 #
-# Reads (env): FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION, EDGEZERO__TEST__ROLLED_BACK_TO.
+# Reads (env):
+#   FAKE_CALL_LOG                         required  the fake fastly/curl call log
+#   EDGEZERO__TEST__STAGED_VERSION        required  the version the staged deploy produced
+#   EDGEZERO__TEST__ROLLED_BACK_TO        required  the production rollback's rolled-back-to output
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh

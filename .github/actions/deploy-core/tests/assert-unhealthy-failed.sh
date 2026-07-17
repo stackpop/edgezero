@@ -7,7 +7,9 @@ set -euo pipefail
 # probe lets the action succeed, no caller would ever roll back — so this is the
 # single most important contract in the lifecycle.
 #
-# Reads (env): EDGEZERO__TEST__OUTCOME (the step's outcome), EDGEZERO__TEST__HEALTHY (its output).
+# Reads (env):
+#   EDGEZERO__TEST__OUTCOME               required  the healthcheck step's outcome (success/failure)
+#   EDGEZERO__TEST__HEALTHY               required  the healthcheck step's healthy output
 
 main() {
   local outcome="${EDGEZERO__TEST__OUTCOME:?EDGEZERO__TEST__OUTCOME is required}"
