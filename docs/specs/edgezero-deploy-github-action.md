@@ -444,16 +444,43 @@ means the **same config store, a different key**:
 - **Staging** writes under the staging variant of that key — `<key>_staging` —
   in the **same** store.
 
-This mirrors the runtime-override store the Fastly adapter already scaffolds
-(`provision` emits a store whose `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`
-entry selects `app_config` vs `app_config_staging`). The service reads whichever
-key that override selects, so pushing staging config never touches the key the
-production service is reading. The CLI gains a `config push --staging` flag (the
-same `--staging` verb `deploy`/`healthcheck`/`rollback` already use); the wrapper
-exposes it as `deploy-to: production | staging`, validated exactly and
-fail-closed like the lifecycle actions.
+The CLI gains a `config push --staging` flag (the same `--staging` verb
+`deploy`/`healthcheck`/`rollback` already use); the wrapper exposes it as
+`deploy-to: production | staging`, validated exactly and fail-closed like the
+lifecycle actions.
 
-#### 5.5.2 Inputs / outputs
+#### 5.5.2 What makes a staged version _read_ the staged key
+
+Writing `<key>_staging` is only half of it. The runtime picks its config key from
+the `EDGEZERO__STORES__CONFIG__<ID>__KEY` entry of a config store it opens by the
+name `edgezero_runtime_env`. A staged deploy clones the active version, and **a
+clone inherits its resource links** — so on its own, a staged version opens the
+same selector store as production and reads production's key. Flipping that
+shared store's selector is not an answer either: it would redirect production
+too.
+
+Fastly resource links are **per-version**, and a link's `name` is an overridable
+alias. That is the seam:
+
+- `provision` creates a second store, `edgezero_runtime_env_staging`, whose
+  selector points each declared config store at `<id>_staging`.
+- A staged deploy, while the draft is still editable, drops the inherited
+  `edgezero_runtime_env` link and links the **staging store** under that same
+  name. The runtime opens `edgezero_runtime_env` and gets the staging selector;
+  the active version is untouched.
+
+So the pieces compose:
+
+| Version        | `edgezero_runtime_env` resolves to | Config key read      |
+| -------------- | ---------------------------------- | -------------------- |
+| active (prod)  | `edgezero_runtime_env`             | `app_config`         |
+| staged (draft) | `edgezero_runtime_env_staging`     | `app_config_staging` |
+
+A staged deploy **fails closed** when the staging selector store is absent: a
+version that silently served production config would be worse than a refused
+deploy. Run `provision` to create it.
+
+#### 5.5.3 Inputs / outputs
 
 | Input               | Required | Default       | Meaning                                                         |
 | ------------------- | -------- | ------------- | --------------------------------------------------------------- |

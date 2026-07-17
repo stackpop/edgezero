@@ -220,9 +220,16 @@ and `store` (the logical store id, when supplied).
 **Staging config is the same store, a different key.** Fastly config stores are
 not versioned like staged service versions, so `deploy-to: staging` writes your
 config under `<key>_staging` alongside the production key — never overwriting what
-the live service reads. Which key the service reads is decided separately by the
-runtime-override store (`edgezero provision` scaffolds it). A typo like
-`deploy-to: Staging` is rejected up front, never silently pushed to production.
+the live service reads.
+
+What makes a _staged version_ actually read that key is the other half: a staged
+deploy re-points its own `edgezero_runtime_env` link at the
+`edgezero_runtime_env_staging` selector store, which `provision` creates. Fastly
+resource links are per-version, so the staged version reads `<key>_staging` while
+production keeps reading `<key>`. **Run `provision` before your first staged
+deploy** — without that store a staged deploy fails closed rather than silently
+serving production config. A typo like `deploy-to: Staging` is likewise rejected
+up front, never silently pushed to production.
 
 ## Strict lifecycle values (fail closed)
 
