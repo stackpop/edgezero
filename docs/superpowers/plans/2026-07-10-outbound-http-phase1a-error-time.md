@@ -21,6 +21,9 @@
   - `min_ident_chars` → no single-char idents (`d` → `duration`).
   - `arithmetic_side_effects` → **no bare `+` / `-`** on `Instant`/`Duration`; use `checked_add` / `checked_duration_since`.
   - `expect_used`, `unwrap_used`, `as_conversions` → forbidden in production; use `?`/`ok_or`/`From`/`TryFrom`.
+  - **`arbitrary_source_item_ordering`** → **items must be ALPHABETICAL** — consts, enum **variants**, and impl fns alike (verified). This is why `error.rs`'s variants and methods are already alphabetized. Insert new items **in place**; never append.
+  - **`duration_suboptimal_units`** (pedantic; CI runs `-D warnings`, so it *fails the build*) → use the largest readable unit: `Duration::from_hours(168)` not `from_secs(7*24*60*60)`; `Duration::from_mins(1)` not `from_secs(60)`.
+  - **Verified end-to-end:** this exact `Deadline` code + these constants compile **clean** under the repo's full lint table (`restriction = deny` + `pedantic` + the real allow-list). `std_instead_of_core`/`std_instead_of_alloc` **are** allow-listed, so `use std::time::Duration;` is fine.
   - **In TESTS**, the root `clippy.toml` sets `allow-expect-in-tests = true`, `allow-unwrap-in-tests = true`, `allow-panic-in-tests = true`, `allow-indexing-slicing-in-tests = true` — so `.expect(..)` in tests is fine. **`arithmetic_side_effects` is NOT test-exempt**, which is why the tests below use `checked_add(..).expect("no overflow")` rather than `base + dur`.
 
 ---
@@ -91,7 +94,13 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
 
 - [ ] **Step 2: Run to verify it fails** — Run: `cargo test -p edgezero-core bad_gateway` (single filter — matches both `bad_gateway_*` test fns) — Expected: FAIL to compile (`no variant or associated item named bad_gateway`).
 
-- [ ] **Step 3: Add the two variants** in `pub enum EdgeError` (after `Validation`):
+- [ ] **Step 3: Add the two variants** in `pub enum EdgeError` — **ALPHABETICALLY, not appended.**
+
+`clippy::arbitrary_source_item_ordering` is a denied restriction lint and it **does police enum-variant order** (verified: appending `BadGateway` after `Validation` errors with *"incorrect ordering of items (must be alphabetically ordered)"*). The existing variants are already alphabetical (`BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`), so insert **in place**:
+- `BadGateway` goes **before** `BadRequest` (BadG < BadR),
+- `GatewayTimeout` goes **between** `ConfigOutOfDate` and `Internal` (C < G < I).
+
+Resulting order: `BadGateway, BadRequest, ConfigOutOfDate, GatewayTimeout, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`.
 
 ```rust
     /// Upstream/transport failure at the adapter boundary (DNS/TLS/connect/
@@ -103,7 +112,7 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
     GatewayTimeout { message: String },
 ```
 
-- [ ] **Step 4: Add the constructors** in `impl EdgeError`:
+- [ ] **Step 4: Add the constructors** in `impl EdgeError` — **also alphabetically** (the impl's fns are already ordered `bad_request, config_out_of_date, config_out_of_date_from_serde, inner, internal, kind_str, message, status, validation`): put `bad_gateway` **before** `bad_request`, and `gateway_timeout` **between** `config_out_of_date_from_serde` and `inner`.
 
 ```rust
     #[inline]
@@ -170,7 +179,7 @@ git commit -m "feat(core): add EdgeError::BadGateway (502) + GatewayTimeout (504
 **Interfaces:**
 - Produces (for Phase 1b `dispatch_budget` + all adapters): `Deadline` (`Copy`), `Deadline::after(Duration) -> Self`, `::at_instant(web_time::Instant) -> Self`, `::instant(&self) -> web_time::Instant`, `::remaining(&self) -> Option<Duration>`, `::is_expired(&self) -> bool`; consts `DEFAULT_NO_DEADLINE_BUDGET` (30 s), `DEADLINE_FAR_FUTURE` (7 days), `BATCH_DISPATCH_SLACK_MAX` (25 ms). **`DispatchBudget` ships in Phase 1b with `dispatch_budget`.**
 
-**Deadline semantics (matches spec §3.3.2 `deadline <= now => expired`):** a deadline whose instant is **exactly now** is **expired** — `is_expired()` is `true` and `remaining()` is `None` at equality, not `Some(0)`. A naive `checked_duration_since(now).is_none()` gets this wrong (it returns `Some(ZERO)` at equality), so the impl below compares instants directly.
+**Deadline semantics (matches spec §3.3.2 `deadline <= now => expired`):** a deadline whose instant is **exactly now** is **expired** — `is_expired()` is `true` and `remaining()` is `None` at equality, not `Some(0)`. A naive `checked_duration_since(now).is_none()` gets this wrong (it returns `Some(ZERO)` at equality), so the impl below uses `checked_duration_since(..).filter(|r| !r.is_zero())` — the zero case is filtered explicitly.
 
 - [ ] **Step 1: Write the failing tests (deterministic — bounded by explicit instants, no wall-clock tolerance windows)**
 
@@ -187,7 +196,7 @@ mod tests {
     #[test]
     fn constants_have_exact_values() {
         assert_eq!(DEFAULT_NO_DEADLINE_BUDGET, Duration::from_secs(30));
-        assert_eq!(DEADLINE_FAR_FUTURE, Duration::from_secs(7 * 24 * 60 * 60));
+        assert_eq!(DEADLINE_FAR_FUTURE, Duration::from_hours(168));
         assert_eq!(BATCH_DISPATCH_SLACK_MAX, Duration::from_millis(25));
     }
 
@@ -218,10 +227,10 @@ mod tests {
     #[test]
     fn deadline_in_future_has_exact_remaining() {
         let base = Instant::now();
-        let future = Deadline::at_instant(base.checked_add(Duration::from_secs(60)).expect("no overflow"));
+        let future = Deadline::at_instant(base.checked_add(Duration::from_mins(1)).expect("no overflow"));
         assert!(!future.is_expired_at(base));
         // EXACT equality — both instants are explicit, so there is no elapsed-time slop.
-        assert_eq!(future.remaining_at(base), Some(Duration::from_secs(60)));
+        assert_eq!(future.remaining_at(base), Some(Duration::from_mins(1)));
     }
 
     #[test]
@@ -269,17 +278,22 @@ Prepend to `crates/edgezero-core/src/time.rs` (above `#[cfg(test)]`):
 ```rust
 use web_time::Instant;
 
-/// Budget for an outbound request that specifies neither timeout nor deadline. §3.3.1.
-pub const DEFAULT_NO_DEADLINE_BUDGET: Duration = Duration::from_secs(30);
-
-/// Hard clamp on any caller-supplied duration so `Deadline::after` cannot panic on a
-/// pathological `Duration::MAX`. 7 days — below Fastly's u32-ms ceiling, above any
-/// realistic budget. §3.3.1.
-pub const DEADLINE_FAR_FUTURE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+// ITEM ORDER IS ALPHABETICAL — `clippy::arbitrary_source_item_ordering` is a denied
+// restriction lint (this is also why the existing `error.rs` methods are alphabetized).
 
 /// Max adapter overhead tolerated between the `send_all` `batch_now` snapshot and SDK
 /// timer arming before a slot fails closed. §3.3.4 / §4.3.
 pub const BATCH_DISPATCH_SLACK_MAX: Duration = Duration::from_millis(25);
+
+/// Hard clamp on any caller-supplied duration so `Deadline::after` cannot panic on a
+/// pathological `Duration::MAX`. 7 days — below Fastly's u32-ms ceiling, above any
+/// realistic budget. §3.3.1.
+/// NOTE: `from_hours(168)`, NOT `from_secs(7 * 24 * 60 * 60)` — the latter trips
+/// `clippy::duration_suboptimal_units` (pedantic), and CI runs clippy with `-D warnings`.
+pub const DEADLINE_FAR_FUTURE: Duration = Duration::from_hours(168);
+
+/// Budget for an outbound request that specifies neither timeout nor deadline. §3.3.1.
+pub const DEFAULT_NO_DEADLINE_BUDGET: Duration = Duration::from_secs(30);
 
 /// An absolute, `Copy` wall-clock deadline, shared across a fan-out batch so every slot
 /// honours the same cap. §3.3.1. A deadline at-or-before `now` is **expired**.
@@ -298,30 +312,28 @@ impl Deadline {
         Deadline(now.checked_add(clamped).unwrap_or(now))
     }
 
+    /// Construct from an absolute instant (used by `dispatch_budget` in Phase 1b).
     #[inline]
     #[must_use]
     pub fn at_instant(instant: Instant) -> Self {
         Deadline(instant)
     }
 
+    /// The absolute deadline instant.
     #[inline]
     #[must_use]
     pub fn instant(&self) -> Instant {
         self.0
     }
 
-    /// Pure core of `remaining`, parameterised on `now` so tests can pin the comparison
-    /// to one explicit instant. `None` once the deadline is reached **or passed**
-    /// (equality counts as passed — spec §3.3.2 `deadline <= now`).
-    /// `checked_duration_since` returns `Some(ZERO)` at equality, so the zero case is
-    /// filtered explicitly; this also keeps the arithmetic `checked_*`.
-    fn remaining_at(&self, now: Instant) -> Option<Duration> {
-        self.0
-            .checked_duration_since(now)
-            .filter(|remaining| !remaining.is_zero())
+    /// `true` once the deadline instant is at-or-before now.
+    #[inline]
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(Instant::now())
     }
 
-    /// Pure core of `is_expired`.
+    /// Pure core of `is_expired`, parameterised on `now` for exact testing.
     fn is_expired_at(&self, now: Instant) -> bool {
         self.remaining_at(now).is_none()
     }
@@ -333,11 +345,15 @@ impl Deadline {
         self.remaining_at(Instant::now())
     }
 
-    /// `true` once the deadline instant is at-or-before now.
-    #[inline]
-    #[must_use]
-    pub fn is_expired(&self) -> bool {
-        self.is_expired_at(Instant::now())
+    /// Pure core of `remaining`, parameterised on `now` so tests pin the comparison to
+    /// one explicit instant. `None` once reached **or passed** — equality counts as
+    /// passed (spec §3.3.2 `deadline <= now`). `checked_duration_since` returns
+    /// `Some(ZERO)` at equality, so the zero case is filtered explicitly; this also
+    /// keeps the arithmetic `checked_*` (bare `-` trips `arithmetic_side_effects`).
+    fn remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.0
+            .checked_duration_since(now)
+            .filter(|remaining| !remaining.is_zero())
     }
 }
 ```
