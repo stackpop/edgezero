@@ -53,7 +53,10 @@ case "\${1:-} \${2:-}" in
   # Both the app's config store and the STAGING SELECTOR store a staged deploy
   # re-links its draft to. Without the latter, deploy_staged fails closed rather
   # than stage a version that would serve production config.
-  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging"}]' ;;
+  # An app WITH config selection: the app config store, the production selector
+  # store (so the staged deploy relinks rather than skipping), and its staging
+  # twin (the store the relink points at).
+  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging"}]' ;;
   # A cloned draft inherits the active version's links; the staged deploy drops
   # this one and re-links the staging store under the same name.
   "resource-link list") echo '[{"id":"LINK_ENV","name":"edgezero_runtime_env"}]' ;;
