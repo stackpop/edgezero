@@ -121,34 +121,50 @@ main() {
   is_under "$workspace_real" "$app_dir" || fail "input 'working-directory' must resolve inside github.workspace"
   app_rel=$(relative_to "$workspace_real" "$app_dir")
 
-  # Optional explicit manifest.
+  # Git root: source revision + dirty-source guard. Resolved BEFORE the manifest
+  # so it can bound it — github.workspace is too loose a boundary. In the
+  # separate-repository layout the deployer repo IS the workspace, so a manifest
+  # like `../deployer/edgezero.toml` would be "inside github.workspace" yet come
+  # from a different repository than the source-revision we report.
+  local git_root source_revision
+  git_root=$(git -C "$app_dir" rev-parse --show-toplevel 2>/dev/null || true)
+  [[ -n "$git_root" ]] || fail "working-directory '$app_rel' is not inside a Git repository"
+  git_root=$(canonical_path "$git_root")
+  is_under "$workspace_real" "$git_root" || fail "application Git root must resolve inside github.workspace"
+
+  # Optional explicit manifest, confined to the application repository.
   local manifest_path manifest_summary
   if [[ -n "$manifest" ]]; then
     [[ -f "$app_dir/$manifest" ]] || fail "manifest '$app_rel/$manifest' does not exist or is not a regular file"
     manifest_path=$(canonical_path "$app_dir/$manifest")
-    is_under "$workspace_real" "$manifest_path" || fail "input 'manifest' must resolve inside github.workspace"
+    is_under "$git_root" "$manifest_path" ||
+      fail "input 'manifest' must resolve inside the application repository ($git_root); '$manifest' escapes it"
     manifest_summary=$(relative_to "$workspace_real" "$manifest_path")
   else
     manifest_path=""
     manifest_summary="EdgeZero default discovery"
   fi
 
-  # Git root: source revision + dirty-source guard.
-  local git_root source_revision
-  git_root=$(git -C "$app_dir" rev-parse --show-toplevel 2>/dev/null || true)
-  [[ -n "$git_root" ]] || fail "working-directory '$app_rel' is not inside a Git repository"
-  git_root=$(canonical_path "$git_root")
-  is_under "$workspace_real" "$git_root" || fail "application Git root must resolve inside github.workspace"
+  # Source revision + dirty-source guard (git_root resolved above).
+  local source_revision
   source_revision=$(git -C "$git_root" rev-parse HEAD)
   assert_committed_source "$git_root" "$app_rel"
 
   # Cargo workspace root: lockfile + target/ + cache.
+  #
+  # It may legitimately sit ABOVE the app dir (a monorepo app in `apps/api/`
+  # keyed on the repo-root workspace), but never above the app's REPOSITORY:
+  # `cargo locate-project --workspace` climbs until it finds a workspace root, so
+  # in the separate-repository layout it can escape into the deployer's workspace
+  # and we would build and cache code that `source-revision` does not describe.
   local cargo_ws_manifest cargo_ws_root lockfile lock_hash target_dir
   if ! cargo_ws_manifest=$(cd "$app_dir" && cargo locate-project --workspace --message-format plain 2>/dev/null); then
     cargo_ws_manifest=""
   fi
   [[ -n "$cargo_ws_manifest" ]] || fail "could not locate the Cargo workspace root from '$app_rel'"
   cargo_ws_root=$(canonical_path "$(dirname "$cargo_ws_manifest")")
+  is_under "$git_root" "$cargo_ws_root" ||
+    fail "the Cargo workspace root ($cargo_ws_root) is outside the application repository ($git_root); refusing to build code that 'source-revision' does not describe"
   lockfile="$cargo_ws_root/Cargo.lock"
   if [[ "$cache" == "true" && ! -f "$lockfile" ]]; then
     fail "cache is enabled but Cargo.lock was not found at the Cargo workspace root ($cargo_ws_root); exact-key caching requires Cargo.lock"

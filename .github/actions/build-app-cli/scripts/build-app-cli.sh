@@ -166,6 +166,11 @@ main() {
   rust_toolchain=$(resolve_rust_toolchain "$rust_toolchain_input" "$app_dir" "$workspace_real" "$action_root")
   rustup toolchain install "$rust_toolchain" --profile minimal
 
+  # The application repository boundary — the same one the toolchain search stops
+  # at. Falls back to github.workspace when the app dir is not a Git checkout.
+  local app_boundary
+  app_boundary=$(resolve_search_boundary "$app_dir" "$workspace_real")
+
   # Require a committed lockfile and validate the package + binary target.
   cd "$app_dir"
   local metadata package_json
@@ -173,6 +178,19 @@ main() {
     fail "cargo metadata --locked failed; ensure Cargo.lock is present and up to date"
   package_json=$(jq -c --arg p "$cli_package" '.packages[] | select(.name == $p)' <<<"$metadata")
   [[ -n "$package_json" ]] || fail "app-cli-package '$cli_package' was not found in the application workspace"
+
+  # The package must live inside the APPLICATION's repository.
+  #
+  # `cargo metadata` resolves through whatever workspace encloses the app dir,
+  # which in the separate-repository layout can be the DEPLOYER's workspace. The
+  # app is supposed to own the CLI that deploys it, so a package resolved from
+  # outside the app's Git root would compile code that `source-revision` never
+  # describes. Bound it at the same boundary the toolchain search uses.
+  local pkg_manifest pkg_real
+  pkg_manifest=$(jq -r '.manifest_path' <<<"$package_json")
+  pkg_real=$(canonical_path "$pkg_manifest")
+  is_under "$app_boundary" "$pkg_real" ||
+    fail "app-cli-package '$cli_package' resolves to $pkg_real, outside the application at $app_boundary; the app must own the CLI that deploys it"
 
   [[ -n "$cli_bin" ]] || cli_bin="$cli_package"
   local has_bin cli_version

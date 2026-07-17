@@ -829,6 +829,86 @@ action_step_scripts() {
 # The duplicate-env-key case is not hypothetical: a bad edit on this branch
 # defined the same key twice in one step, which YAML resolves silently to the
 # last value.
+# ---------------------------------------------------------------------------
+# resolve-project.sh — the app REPOSITORY is the boundary, not github.workspace
+# ---------------------------------------------------------------------------
+# In the separate-repository layout the deployer repo IS github.workspace, so
+# "inside the workspace" is not a boundary at all: a `../deployer/edgezero.toml`
+# manifest, or a Cargo workspace root that `cargo locate-project` climbs into,
+# would build code that `source-revision` never describes.
+
+# Build a deployer-repo-at-the-workspace-root layout with the app checked out
+# beneath it as its OWN repository. $1 is the workspace dir; when $2 is
+# "capture", the deployer's Cargo workspace lists the app as a member — which is
+# how `cargo locate-project --workspace` climbs out of the app repository.
+make_boundary_fixture() {
+  local ws="$1" mode="${2:-independent}"
+  mkdir -p "$ws/app/src" "$ws/deployer"
+  printf 'name = "deployer-manifest"\n' >"$ws/deployer/edgezero.toml"
+
+  if [[ "$mode" == "capture" ]]; then
+    printf '[workspace]\nmembers = ["app"]\nresolver = "2"\n' >"$ws/Cargo.toml"
+    # A member of the parent workspace: no [workspace] of its own.
+    printf '[package]\nname = "bnd-fixture"\nversion = "0.1.0"\nedition = "2021"\n' >"$ws/app/Cargo.toml"
+  else
+    # Its own workspace root, so cargo stops inside the app repository.
+    printf '[package]\nname = "bnd-fixture"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n' >"$ws/app/Cargo.toml"
+  fi
+
+  echo 'fn main() {}' >"$ws/app/src/main.rs"
+  printf 'version = 3\n' >"$ws/app/Cargo.lock"
+  printf 'name = "app-manifest"\n' >"$ws/app/edgezero.toml"
+
+  git -C "$ws" init -q
+  git -C "$ws" config user.email t@t.invalid
+  git -C "$ws" config user.name t
+  git -C "$ws" add -A && git -C "$ws" commit -qm deployer
+  git -C "$ws/app" init -q
+  git -C "$ws/app" config user.email t@t.invalid
+  git -C "$ws/app" config user.name t
+  git -C "$ws/app" add -A && git -C "$ws/app" commit -qm app
+}
+
+run_resolve_in() {
+  local ws="$1"
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
+    GITHUB_WORKSPACE="$ws" GITHUB_OUTPUT="$WORK_DIR/boundary-out.txt" \
+    RUNNER_OS=Linux RUNNER_ARCH=X64 \
+    EDGEZERO__ACTION__ROOT="$REPO_ROOT" \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    EDGEZERO__PROJECT__RUST_TOOLCHAIN=1.95.0 \
+    EDGEZERO__PROJECT__TARGET=wasm32-wasip1 \
+    EDGEZERO__PROJECT__MANIFEST="${BND_MANIFEST:-}" \
+    bash "$CORE_SCRIPTS/resolve-project.sh"
+}
+
+test_app_repo_boundary() {
+  section "app repository boundary"
+  local ok="$WORK_DIR/bnd-ok"
+  mkdir -p "$ok"
+  git -C "$ok" init -q 2>/dev/null || return 0
+  rm -rf "$ok"
+  mkdir -p "$ok"
+  make_boundary_fixture "$ok" independent
+
+  # The boundary must not over-reject a legitimate app.
+  assert_succeeds "an app that owns its workspace resolves" run_resolve_in "$ok"
+  BND_MANIFEST=edgezero.toml \
+    assert_succeeds "the app's own manifest is accepted" run_resolve_in "$ok"
+
+  # Inside github.workspace, but a different repository than source-revision names.
+  BND_MANIFEST=../deployer/edgezero.toml \
+    assert_fails "a manifest in the deployer repo is rejected" run_resolve_in "$ok"
+
+  # The deployer's workspace claims the app, so cargo resolves the workspace root
+  # OUT of the app repository — we would build and cache the deployer's tree.
+  local cap="$WORK_DIR/bnd-capture"
+  mkdir -p "$cap"
+  make_boundary_fixture "$cap" capture
+  assert_fails "a Cargo workspace root outside the app repository is rejected" \
+    run_resolve_in "$cap"
+}
+
 test_action_metadata() {
   section "action metadata"
   local action bad=0
@@ -947,6 +1027,7 @@ main() {
   test_exit_propagation
   test_dirty_source_guard
   test_cache_key
+  test_app_repo_boundary
   test_action_metadata
   test_action_output_contracts
 
