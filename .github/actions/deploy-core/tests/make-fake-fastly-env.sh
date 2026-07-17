@@ -96,7 +96,16 @@ if [[ "$*" == *"--config"* ]]; then
     exit 0
   fi
   printf 'GET %s\n' "$url" >>"$FAKE_CALL_LOG"
-  # Fastly returns a SINGULAR `staging_ip` string per domain object.
+  # The service-version list, for production rollback target resolution. TWO
+  # staged versions sit above the active one on purpose: v42 and v41 are both
+  # staged, v40 is the previously-live version. `version - 1` (= 41) would be a
+  # STAGED version — the exact Critical this guards — so only resolution (highest
+  # non-staged below 42 = v40) is correct.
+  if [[ "$url" == */version ]]; then
+    printf '[{"number":42,"staged":true,"locked":true},{"number":41,"staged":true,"locked":true},{"number":40,"active":true,"locked":true}]\n'
+    exit 0
+  fi
+  # Domain lookup: Fastly returns a SINGULAR `staging_ip` string per domain.
   printf '[{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n'
   exit 0
 fi
