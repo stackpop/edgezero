@@ -55,7 +55,9 @@ pub use config::{
 pub use provision::run_provision;
 
 #[cfg(feature = "cli")]
-use args::{BuildArgs, DeployArgs, HealthcheckArgs, NewArgs, RollbackArgs, ServeArgs};
+use args::{
+    ActiveVersionArgs, BuildArgs, DeployArgs, HealthcheckArgs, NewArgs, RollbackArgs, ServeArgs,
+};
 #[cfg(feature = "cli")]
 use edgezero_core::manifest::ManifestLoader;
 #[cfg(feature = "cli")]
@@ -408,12 +410,48 @@ pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
     ];
     if args.staging {
         passthrough.push("--staging".to_owned());
+    } else if let Some(target) = args.rollback_to.as_deref() {
+        // Production activates an EXPLICIT target — Fastly has no field to infer
+        // a previously-live version from a staged one, so the caller passes the
+        // version captured before the superseding deploy.
+        passthrough.push("--rollback-to".to_owned());
+        passthrough.push(target.to_owned());
+    } else {
+        return Err(
+            "a production rollback requires --rollback-to (the version to re-activate). Fastly \
+             exposes no metadata to infer it, so it must be captured before the deploy that \
+             superseded it -- use `deploy`'s `previous-version` output. Pass --staging to \
+             deactivate a staged version instead."
+                .to_owned(),
+        );
     }
     adapter::execute(
         &args.adapter,
         adapter::Action::Rollback,
         manifest.as_ref(),
         &passthrough,
+    )
+}
+
+/// Resolve and print the currently-active service version as `version=<N>`.
+///
+/// Captured BEFORE a deploy so it can be threaded to a later production
+/// rollback — Fastly's version list has no field to infer a previously-live
+/// version afterward.
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be loaded, the adapter is not
+/// configured, or the active version cannot be resolved.
+#[inline]
+pub fn run_active_version(args: &ActiveVersionArgs) -> Result<(), String> {
+    let manifest = load_manifest_optional()?;
+    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    adapter::execute(
+        &args.adapter,
+        adapter::Action::EmitVersion,
+        manifest.as_ref(),
+        &["--service-id".to_owned(), args.service_id.clone()],
     )
 }
 

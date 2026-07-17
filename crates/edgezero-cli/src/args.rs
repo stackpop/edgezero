@@ -19,6 +19,11 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Resolve and print the currently-active service version
+    /// (`version=<N>`). Used to capture a production rollback target
+    /// BEFORE a deploy supersedes it, since Fastly exposes no metadata to
+    /// infer it afterward.
+    ActiveVersion(ActiveVersionArgs),
     /// Sign in / out / status against the adapter's native CLI
     /// (`wrangler` / `fastly` / `spin`). `EdgeZero` stores no
     /// credentials itself — `auth` just delegates.
@@ -273,17 +278,35 @@ pub struct RollbackArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
+    /// Production only: the version to re-activate. Fastly exposes no
+    /// metadata to tell a previously-live version from a staged one, so
+    /// the rollback target CANNOT be inferred; it is captured before the
+    /// deploy that superseded it (see `deploy`'s `previous-version`) and
+    /// passed here. Required for a production rollback; ignored for staging.
+    #[arg(long)]
+    pub rollback_to: Option<String>,
     /// Platform service id to roll back. Required.
     #[arg(long, required = true)]
     pub service_id: String,
     /// Roll back the staged version (deactivate) instead of the
-    /// production version (activate previous).
+    /// production version (activate `--rollback-to`).
     #[arg(long)]
     pub staging: bool,
-    /// Reference version: production activates `<version> - 1`;
-    /// staging deactivates `<version>`. Required.
+    /// The current (bad) version. Staging deactivates it. Required.
     #[arg(long, required = true)]
     pub version: String,
+}
+
+/// Arguments for the `active-version` command.
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct ActiveVersionArgs {
+    /// Target adapter name.
+    #[arg(long = "adapter", required = true)]
+    pub adapter: String,
+    /// Platform service id whose active version to resolve. Required.
+    #[arg(long, required = true)]
+    pub service_id: String,
 }
 
 /// Output format for `config diff`.

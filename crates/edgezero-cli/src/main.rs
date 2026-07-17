@@ -32,6 +32,7 @@ fn main() {
         #[cfg(feature = "demo-example")]
         Command::Demo => edgezero_cli::run_demo(),
         Command::Healthcheck(cmd_args) => edgezero_cli::run_healthcheck(&cmd_args),
+        Command::ActiveVersion(cmd_args) => edgezero_cli::run_active_version(&cmd_args),
         Command::New(cmd_args) => edgezero_cli::run_new(&cmd_args),
         Command::Rollback(cmd_args) => edgezero_cli::run_rollback(&cmd_args),
         Command::Provision(cmd_args) => edgezero_cli::run_provision(&cmd_args),

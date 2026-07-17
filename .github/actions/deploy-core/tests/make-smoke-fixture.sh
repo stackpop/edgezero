@@ -62,7 +62,7 @@ TOML
 //! contract config-push-fastly depends on: only an app-owned CLI has the
 //! app-config struct, so only it can push typed config.
 use clap::{Parser, Subcommand};
-use edgezero_cli::args::{ConfigPushArgs, DeployArgs, HealthcheckArgs, RollbackArgs};
+use edgezero_cli::args::{ActiveVersionArgs, ConfigPushArgs, DeployArgs, HealthcheckArgs, RollbackArgs};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
@@ -86,6 +86,7 @@ enum Cmd {
     Config(ConfigCmd),
     Deploy(DeployArgs),
     Healthcheck(HealthcheckArgs),
+    ActiveVersion(ActiveVersionArgs),
     Rollback(RollbackArgs),
 }
 
@@ -102,6 +103,7 @@ fn main() {
         }
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
         Cmd::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
+        Cmd::ActiveVersion(args) => edgezero_cli::run_active_version(&args),
         Cmd::Rollback(args) => edgezero_cli::run_rollback(&args),
     };
     if let Err(err) = result {

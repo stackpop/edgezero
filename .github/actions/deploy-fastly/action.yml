@@ -48,6 +48,9 @@ outputs:
   fastly-version:
     description: Fastly service version deployed (production) or staged.
     value: ${{ steps.deploy.outputs['fastly-version'] }}
+  previous-version:
+    description: "Production only: the version active BEFORE this deploy — the rollback target. Empty on a first-ever deploy. Wire it to rollback-fastly's rollback-to."
+    value: ${{ steps.capture.outputs['previous-version'] }}
   source-revision:
     description: Git revision deployed from working-directory.
     value: ${{ steps.resolve.outputs['source-revision'] }}
@@ -283,6 +286,37 @@ runs:
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/run-app-cli.sh build
+
+    # Production only: read the version active BEFORE we deploy — the rollback
+    # target. Fastly cannot tell it apart from a staged version afterward, so it
+    # must be captured now. Skipped for a staged deploy (staging rollback
+    # deactivates the staged version; there is nothing to activate back to).
+    - name: Capture rollback target
+      id: capture
+      if: ${{ inputs.stage != 'true' }}
+      shell: bash
+      env:
+        EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
+        EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
+        EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        # Only the typed token reaches the CLI; blank every inherited alias.
+        FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/scripts/capture-previous.sh
 
     - name: Deploy
       id: deploy

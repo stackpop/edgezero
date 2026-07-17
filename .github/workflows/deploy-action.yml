@@ -325,6 +325,9 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           deploy-to: production
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          # Fastly cannot infer the previously-live version, so the caller passes
+          # it explicitly (a real caller wires deploy-fastly's `previous-version`).
+          rollback-to: "40"
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
 
@@ -333,3 +336,24 @@ jobs:
           EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
           EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.prod-rollback.outputs['rolled-back-to'] }}
         run: .github/actions/deploy-core/tests/assert-rollback-calls.sh
+
+      # A production rollback with NO rollback-to must fail closed rather than
+      # guess a target — Fastly cannot infer the previously-live version.
+      - name: Production rollback without a target must fail
+        id: rollback-no-target
+        continue-on-error: true
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: production
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+
+      - name: Assert the targetless production rollback was refused
+        env:
+          EDGEZERO__TEST__OUTCOME: ${{ steps.rollback-no-target.outcome }}
+        run: |
+          [[ "${EDGEZERO__TEST__OUTCOME}" == "failure" ]] ||
+            { echo "::error::a production rollback with no rollback-to must fail, got '${EDGEZERO__TEST__OUTCOME}'"; exit 1; }
+          echo "targetless production rollback correctly refused"

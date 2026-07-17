@@ -12,6 +12,7 @@ set -euo pipefail
 #   EDGEZERO__APP__CLI__BIN               optional  app CLI name, used when __PATH is unset
 #   EDGEZERO__LIFECYCLE__SERVICE_ID       required  Fastly service id
 #   EDGEZERO__LIFECYCLE__VERSION          required  the current (bad) version to roll back from
+#   EDGEZERO__LIFECYCLE__ROLLBACK_TO      required (production)  the version to re-activate
 #   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 # Writes (outputs):
@@ -28,7 +29,12 @@ validate_inputs() {
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   # A typo in deploy-to must never silently roll back production.
   case "${EDGEZERO__DEPLOY__TO:-}" in
-    production | staging) ;;
+    production)
+      # Fastly cannot infer the previously-live version, so production requires
+      # an explicit target (wired from deploy-fastly's previous-version output).
+      require_input_matching rollback-to "${EDGEZERO__LIFECYCLE__ROLLBACK_TO:-}" '^[0-9]+$'
+      ;;
+    staging) ;;
     *) fail "input 'deploy-to' must be 'production' or 'staging' (got '${EDGEZERO__DEPLOY__TO:-}')" ;;
   esac
 }
@@ -39,6 +45,8 @@ main() {
   local argv=("$(resolve_app_cli)" rollback --adapter fastly --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID" --version "$EDGEZERO__LIFECYCLE__VERSION")
   if [[ "$EDGEZERO__DEPLOY__TO" == "staging" ]]; then
     argv+=(--staging)
+  else
+    argv+=(--rollback-to "$EDGEZERO__LIFECYCLE__ROLLBACK_TO")
   fi
 
   new_private_log

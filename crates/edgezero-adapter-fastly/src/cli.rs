@@ -1826,48 +1826,6 @@ fn parse_canonical_version_line(lower: &str) -> Option<u64> {
 /// Parse `fastly service-version list --json` (or the Fastly API
 /// `/service/<id>/version` array) for the `number` of the `active`
 /// version.
-/// The version a production rollback should activate: the highest version below
-/// `current` that was actually live.
-///
-/// `current - 1` is NOT that version. Versions are a monotonic counter over every
-/// draft, staged, and activated version alike, so the predecessor number is
-/// frequently a version that never served production traffic. Two ways that
-/// bites, both of which this filters out:
-///
-/// * **Staged versions.** With production v5, staged v6, production v7, rolling
-///   back v7 by arithmetic activates v6 — publishing staged code AND, since a
-///   staged draft is re-linked to the staging config selector, staged config.
-/// * **Untouched drafts.** Fastly locks a version when it is activated, so an
-///   UNLOCKED version below `current` was never live and must not be promoted.
-///   When the field is absent (schema drift) we do not exclude on it, rather
-///   than reject every candidate and make rollback unusable.
-///
-/// Returns `None` when nothing below `current` qualifies — the caller must fail
-/// rather than guess.
-fn resolve_rollback_target(json: &str, current: u64) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let array = value
-        .as_array()
-        .or_else(|| value.get("items").and_then(serde_json::Value::as_array))?;
-
-    array
-        .iter()
-        .filter_map(|entry| {
-            let number = entry.get("number").and_then(serde_json::Value::as_u64)?;
-            if number >= current {
-                return None;
-            }
-            if entry.get("staged").and_then(serde_json::Value::as_bool) == Some(true) {
-                return None;
-            }
-            if entry.get("locked").and_then(serde_json::Value::as_bool) == Some(false) {
-                return None;
-            }
-            Some(number)
-        })
-        .max()
-}
-
 fn parse_active_version(json: &str) -> Option<u64> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     value.as_array()?.iter().find_map(|entry| {
@@ -2539,17 +2497,16 @@ fn rollback(args: &[String]) -> Result<(), String> {
             "[edgezero] deactivated staged version {version} on Fastly service {service_id}"
         );
     } else {
-        // Production rollback re-activates the version that was previously LIVE
-        // — resolved from the service's version list, never `version - 1`. The
-        // predecessor number is often a staged version or an untouched draft, and
-        // activating one of those publishes code (and staged config) that was
-        // never production.
-        let list = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
-        let previous = resolve_rollback_target(&list, version).ok_or_else(|| {
-            format!(
-                "cannot roll back version {version}: no previously-live version below it (a staged version or an untouched draft is not a rollback target). Activate the intended version explicitly."
-            )
-        })?;
+        // Production rollback re-activates an EXPLICIT target. Fastly's version
+        // list has no field distinguishing a previously-live version from a
+        // staged one (`staging`/`deployed` are documented "Unused"; `locked`
+        // only means "not editable"), so the target cannot be inferred — it is
+        // captured before the superseding deploy and passed in as --rollback-to.
+        let previous = arg_value(args, "--rollback-to")
+            .and_then(|raw| validate_version_str(raw).ok())
+            .ok_or_else(|| {
+                "production rollback requires a valid --rollback-to version".to_owned()
+            })?;
         // Fastly's activate endpoint requires `PUT` (not `POST`).
         fastly_api_put(
             &format!("/service/{service_id}/version/{previous}/activate"),
@@ -2931,51 +2888,6 @@ mod tests {
         assert!(!is_healthy_status(400));
         assert!(!is_healthy_status(500));
         assert!(!is_healthy_status(199));
-    }
-
-    #[test]
-    fn resolve_rollback_target_skips_staged_and_untouched_versions() {
-        // The reported break: production v5, staged v6, production v7. Rolling
-        // back v7 by arithmetic picks v6 -- publishing staged code and, since a
-        // staged draft is re-linked to the staging selector, staged config.
-        let json = r#"[
-            {"number":7,"active":true,"locked":true},
-            {"number":6,"staged":true,"locked":true},
-            {"number":5,"locked":true}
-        ]"#;
-        assert_eq!(resolve_rollback_target(json, 7), Some(5));
-
-        // An untouched draft was never live: Fastly locks a version on
-        // activation, so an unlocked one below current is not a target.
-        let with_draft = r#"[
-            {"number":7,"active":true,"locked":true},
-            {"number":6,"locked":false},
-            {"number":5,"locked":true}
-        ]"#;
-        assert_eq!(resolve_rollback_target(with_draft, 7), Some(5));
-
-        // Ordinary case: the immediate predecessor, when it really was live.
-        let simple = r#"[{"number":2,"active":true,"locked":true},{"number":1,"locked":true}]"#;
-        assert_eq!(resolve_rollback_target(simple, 2), Some(1));
-
-        // Nothing below qualifies -> None, so the caller fails instead of guessing.
-        let only_staged =
-            r#"[{"number":2,"active":true,"locked":true},{"number":1,"staged":true}]"#;
-        assert_eq!(resolve_rollback_target(only_staged, 2), None);
-        assert_eq!(
-            resolve_rollback_target(r#"[{"number":1,"locked":true}]"#, 1),
-            None
-        );
-
-        // Schema drift: an absent `locked` must not disqualify every candidate
-        // and make rollback unusable.
-        let no_locked = r#"[{"number":2,"active":true},{"number":1}]"#;
-        assert_eq!(resolve_rollback_target(no_locked, 2), Some(1));
-
-        // Tolerates the {"items": [...]} envelope, like the other lookups.
-        let enveloped = r#"{"items":[{"number":2,"locked":true},{"number":1,"locked":true}]}"#;
-        assert_eq!(resolve_rollback_target(enveloped, 2), Some(1));
-        assert_eq!(resolve_rollback_target("not json", 2), None);
     }
 
     #[test]

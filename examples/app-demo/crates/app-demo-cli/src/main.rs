@@ -13,8 +13,8 @@
 use app_demo_core::config::AppDemoConfig;
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs,
-    ProvisionArgs, ServeArgs,
+    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs,
+    DeployArgs, HealthcheckArgs, NewArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
 use edgezero_cli::DiffExit;
 
@@ -35,8 +35,18 @@ enum Cmd {
     /// Inspect or mutate the typed `app-demo.toml` app config.
     #[command(subcommand)]
     Config(AppDemoConfigCmd),
-    /// Deploy to a target edge.
+    /// Deploy to a target edge (supports `--stage` for a staged draft).
     Deploy(DeployArgs),
+    /// Probe a deployed/staged version's health (Fastly staging
+    /// lifecycle). Exits non-zero when unhealthy after retries.
+    Healthcheck(HealthcheckArgs),
+    /// Resolve and print the currently-active service version
+    /// (`version=<N>`) — capture a production rollback target before a
+    /// deploy supersedes it.
+    ActiveVersion(ActiveVersionArgs),
+    /// Roll a service back: production activates `--rollback-to`; staging
+    /// deactivates the staged version.
+    Rollback(RollbackArgs),
     /// Create a new `EdgeZero` app skeleton.
     New(NewArgs),
     /// Create the platform resources backing the declared
@@ -94,6 +104,9 @@ fn main() {
             edgezero_cli::run_config_validate_typed::<AppDemoConfig>(&args)
         }
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Cmd::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
+        Cmd::ActiveVersion(args) => edgezero_cli::run_active_version(&args),
+        Cmd::Rollback(args) => edgezero_cli::run_rollback(&args),
         Cmd::New(args) => edgezero_cli::run_new(&args),
         Cmd::Provision(args) => edgezero_cli::run_provision(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),

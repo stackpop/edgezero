@@ -5,7 +5,7 @@ set -euo pipefail
 # call log the assertions read back.
 #
 # The fakes mirror the REAL contracts the adapter depends on, so the smoke test
-# regression-tests the defects a review found:
+# exercises the exact call shapes that matter:
 #   * `fastly compute update` must NOT receive --comment (it has no such flag);
 #     the comment goes through `fastly service-version update` BEFORE
 #     `service-version stage`.
@@ -48,14 +48,10 @@ case "\${1:-} \${2:-}" in
   "compute deploy") echo "SUCCESS: Deployed package (service dummy-service, version 43)" ;;
   "service-version update") echo "Updated version comment" ;;
   "service-version stage") echo "Staged version" ;;
-  # config push resolves the store id by name from this list, reads the current
-  # entry to diff against, then upserts one entry per physical key.
-  # Both the app's config store and the STAGING SELECTOR store a staged deploy
-  # re-links its draft to. Without the latter, deploy_staged fails closed rather
-  # than stage a version that would serve production config.
   # An app WITH config selection: the app config store, the production selector
-  # store (so the staged deploy relinks rather than skipping), and its staging
-  # twin (the store the relink points at).
+  # store edgezero_runtime_env (so a staged deploy relinks rather than skipping),
+  # and its staging twin (the store the relink points at). config push resolves a
+  # store id by name from this list, reads the current entry to diff, then upserts.
   "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging"}]' ;;
   # A cloned draft inherits the active version's links; the staged deploy drops
   # this one and re-links the staging store under the same name.
@@ -98,9 +94,8 @@ if [[ "$*" == *"--config"* ]]; then
   printf 'GET %s\n' "$url" >>"$FAKE_CALL_LOG"
   # The service-version list, for production rollback target resolution. TWO
   # staged versions sit above the active one on purpose: v42 and v41 are both
-  # staged, v40 is the previously-live version. `version - 1` (= 41) would be a
-  # STAGED version — the exact Critical this guards — so only resolution (highest
-  # non-staged below 42 = v40) is correct.
+  # staged, v40 is the previously-live version, so a caller passing rollback-to=40
+  # rolls back to a real production version rather than a staged one.
   if [[ "$url" == */version ]]; then
     printf '[{"number":42,"staged":true,"locked":true},{"number":41,"staged":true,"locked":true},{"number":40,"active":true,"locked":true}]\n'
     exit 0

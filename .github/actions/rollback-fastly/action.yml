@@ -18,6 +18,10 @@ inputs:
   fastly-version:
     description: The current (bad) Fastly version to roll back from.
     required: true
+  rollback-to:
+    description: "Production only: the version to re-activate. Fastly cannot infer it, so wire it from deploy-fastly's previous-version output. Required when deploy-to is production; ignored for staging."
+    required: false
+    default: ""
   deploy-to:
     description: Deployment target, 'production' or 'staging'.
     required: false
@@ -96,6 +100,7 @@ runs:
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__LIFECYCLE__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         EDGEZERO__LIFECYCLE__VERSION: ${{ inputs['fastly-version'] }}
+        EDGEZERO__LIFECYCLE__ROLLBACK_TO: ${{ inputs['rollback-to'] }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
         # Only the typed token reaches the CLI; blank any inherited alias.
         FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}

@@ -3,16 +3,13 @@ set -euo pipefail
 
 # Asserts the exact Fastly call sequence a STAGED deploy through the
 # deploy-fastly wrapper must produce, and that the staged version threaded out
-# of the action.
-#
-# Regression test for real defects a review found:
-#   * `--comment` was forwarded to `fastly compute update`, which has no such
-#     flag, so the upload failed. It must be applied via
-#     `fastly service-version update --comment` BEFORE the version is staged.
-#   * A manifest-command deploy never received `--non-interactive` and could
-#     block on a TTY prompt in CI. The wrapper now supplies it as an
-#     action-owned passthrough arg.
-#   * The staged upload must clone the active version.
+# of the action:
+#   * `--comment` must NOT reach `fastly compute update` (it has no such flag);
+#     it is applied via `fastly service-version update --comment` BEFORE the
+#     version is staged.
+#   * `--non-interactive` is supplied as an action-owned passthrough arg, so a
+#     manifest-command deploy cannot block on a TTY prompt in CI.
+#   * The staged upload clones the active version.
 #
 # Reads (env):
 #   FAKE_CALL_LOG                         required  the fake fastly/curl call log
