@@ -48,8 +48,15 @@ validate_inputs() {
 main() {
   validate_inputs
 
+  local cli_bin
+  cli_bin=$(resolve_app_cli)
+  # Absolutize a relative CLI path before cd, then run from the app dir so the
+  # CLI's manifest load is correct in a monorepo.
+  case "$cli_bin" in /*) ;; *) [[ -e "$cli_bin" ]] && cli_bin=$(canonical_path "$cli_bin") ;; esac
+  enter_app_dir "${EDGEZERO__PROJECT__WORKING_DIRECTORY:-.}"
+
   local argv=(
-    "$(resolve_app_cli)" healthcheck
+    "$cli_bin" healthcheck
     --adapter fastly
     --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID"
     --version "$EDGEZERO__LIFECYCLE__VERSION"

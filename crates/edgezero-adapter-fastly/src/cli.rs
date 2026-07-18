@@ -124,8 +124,11 @@ const FASTLY_INSTALL_HINT: &str = "install the Fastly CLI (https://www.fastly.co
 /// here (see `env_config_from_runtime_dictionary` in lib.rs).
 const RUNTIME_ENV_STORE: &str = "edgezero_runtime_env";
 
-/// The staging twin of [`RUNTIME_ENV_STORE`], holding the selector that points
-/// at the `<key>_staging` config.
+/// Base name of the staging twin of [`RUNTIME_ENV_STORE`]. The actual store is
+/// named PER SERVICE — [`staging_selector_store_name`] appends the service id —
+/// because Fastly config stores are account-wide, versionless resources: a
+/// single shared twin would let a staged deploy of service B destructively
+/// overwrite the selectors a staged version of service A is reading.
 ///
 /// A staged deploy clones the active version, and a clone inherits its resource
 /// links — so without a second store the staged version reads production's
@@ -133,7 +136,7 @@ const RUNTIME_ENV_STORE: &str = "edgezero_runtime_env";
 /// per-version and carry an overridable NAME, so the staged draft links THIS
 /// store under the name `edgezero_runtime_env`. The runtime opens that name and
 /// gets staged config; the active version is untouched.
-const RUNTIME_ENV_STAGING_STORE: &str = "edgezero_runtime_env_staging";
+const RUNTIME_ENV_STAGING_STORE_PREFIX: &str = "edgezero_runtime_env_staging";
 
 /// Env var carrying the Fastly API token (read by the Fastly CLI and
 /// forwarded to the Fastly API via the `Fastly-Key` header). Part of
@@ -412,7 +415,7 @@ impl Adapter for FastlyCliAdapter {
             // selector via `edgezero_runtime_env_staging`, wired automatically by
             // a staged deploy; nothing here should be edited to stage config.
             let mut line = format!(
-                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  It already selects each store's default key, so no edit is needed for a normal setup.\n  To point PRODUCTION at a different key (e.g. a renamed store), and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by `{RUNTIME_ENV_STAGING_STORE}`, which a staged deploy links automatically.",
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  It already selects each store's default key, so no edit is needed for a normal setup.\n  To point PRODUCTION at a different key (e.g. a renamed store), and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
                 fastly_path.display()
             );
             if let Some(note) = post_create_note {
@@ -1313,37 +1316,46 @@ fn staging_entries_from_production(
 /// this store end to end (it is never linked on the ACTIVE version), so it does
 /// not depend on `provision` having created it first. Fails closed on a lookup
 /// FAILURE rather than blindly creating a duplicate.
-fn ensure_staging_selector_store() -> Result<String, String> {
-    match classify_remote_config_store(RUNTIME_ENV_STAGING_STORE)? {
+/// The per-service staging twin store name — the base prefix plus the service
+/// id, so concurrent staged deploys of different services on one account never
+/// clobber each other's selectors.
+fn staging_selector_store_name(service_id: &str) -> String {
+    format!("{RUNTIME_ENV_STAGING_STORE_PREFIX}_{service_id}")
+}
+
+fn ensure_staging_selector_store(store_name: &str) -> Result<String, String> {
+    match classify_remote_config_store(store_name)? {
         ConfigStoreLookup::Found(id) => Ok(id),
         ConfigStoreLookup::NotFound => {
-            create_fastly_store("config", RUNTIME_ENV_STAGING_STORE)?;
-            resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE).map_err(|err| {
+            create_fastly_store("config", store_name)?;
+            resolve_remote_config_store_id(store_name).map_err(|err| {
                 format!(
-                    "created fastly config-store `{RUNTIME_ENV_STAGING_STORE}` but could not resolve its id: {err}"
+                    "created fastly config-store `{store_name}` but could not resolve its id: {err}"
                 )
             })
         }
         ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
-            "could not parse `fastly config-store list --json` while resolving `{RUNTIME_ENV_STAGING_STORE}`: {detail}.\n  Refusing to stage. Pin a known-compatible fastly CLI version and retry."
+            "could not parse `fastly config-store list --json` while resolving `{store_name}`: {detail}.\n  Refusing to stage. Pin a known-compatible fastly CLI version and retry."
         )),
     }
 }
 
-/// Reconcile the staging twin so it MIRRORS production's runtime overrides with
-/// only the config selectors redirected to `<logical>_staging`.
+/// Reconcile the staging twin so it MIRRORS production's runtime overrides
+/// (`production`) with only the config selectors redirected to
+/// `<logical>_staging`.
 ///
 /// Deletes twin entries production no longer has (so a removed override does not
 /// linger and diverge staging from production), then upserts the full desired
-/// set. Runs while the staged draft is still editable, before the relink.
+/// set. Runs while the staged draft is still editable, before the relink. When
+/// production has NO override store, `production` is empty and the twin holds
+/// only the derived staging selectors — staging is still isolated.
 fn mirror_production_to_staging(
-    production_id: &str,
+    production: &[(String, String)],
     staging_id: &str,
     config_logical_ids: &[String],
     cwd: &Path,
 ) -> Result<(), String> {
-    let production = read_config_store_entries(production_id, cwd)?;
-    let desired = staging_entries_from_production(&production, config_logical_ids);
+    let desired = staging_entries_from_production(production, config_logical_ids);
 
     let current = read_config_store_entries(staging_id, cwd)?;
     for (key, _) in &current {
@@ -1909,13 +1921,25 @@ fn parse_canonical_version_line(lower: &str) -> Option<u64> {
 /// Parse `fastly service-version list --json` (or the Fastly API
 /// `/service/<id>/version` array) for the `number` of the `active`
 /// version.
-fn parse_active_version(json: &str) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    value.as_array()?.iter().find_map(|entry| {
+/// Resolve the active version from a Fastly version-list JSON.
+///
+/// `Ok(Some(n))` — a version is active. `Ok(None)` — the list parsed but NO
+/// version is active (a first-ever deploy; the caller records an empty rollback
+/// target and proceeds). `Err(_)` — the payload could not be parsed as a version
+/// list at all (schema drift / a truncated body), which is an OPERATIONAL
+/// failure the caller must not silently treat as "no active version".
+fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|err| format!("failed to parse the Fastly version list as JSON: {err}"))?;
+    let array = value.as_array().ok_or_else(|| {
+        "the Fastly version list was not a JSON array; the API may have changed its schema"
+            .to_owned()
+    })?;
+    Ok(array.iter().find_map(|entry| {
         (entry.get("active").and_then(serde_json::Value::as_bool) == Some(true))
             .then(|| entry.get("number").and_then(serde_json::Value::as_u64))
             .flatten()
-    })
+    }))
 }
 
 /// First staging IP found in a Fastly
@@ -2411,20 +2435,17 @@ fn relink_runtime_env_for_staging(
         return Ok(());
     }
 
-    // Classify the PRODUCTION runtime-override store. Fail CLOSED on a lookup
-    // FAILURE (CLI missing / non-zero exit / schema drift) — treating "couldn't
-    // tell" as "no store" would stage a version that silently reads production
-    // config. A genuine `NotFound` means the app never provisioned a
-    // runtime-override store (no adapter/logging/config overrides at all), so
-    // there is nothing to isolate and the relink is a no-op.
-    let production_id = match classify_remote_config_store(RUNTIME_ENV_STORE)? {
-        ConfigStoreLookup::Found(id) => id,
-        ConfigStoreLookup::NotFound => {
-            log::info!(
-                "no `{RUNTIME_ENV_STORE}` store on this account: the app selects no config at runtime, so staged version {version} has no config selector to isolate"
-            );
-            return Ok(());
-        }
+    // Read the PRODUCTION runtime-override entries to mirror. Fail CLOSED on a
+    // lookup FAILURE (CLI missing / non-zero exit / schema drift) — treating
+    // "couldn't tell" as "no store" would stage a version that silently reads
+    // production config. A genuine `NotFound` is NOT a no-op here: the app
+    // DECLARES config (checked above), so the staged version must still be
+    // isolated. There is simply nothing to mirror — the twin gets only the
+    // derived `<logical>_staging` selectors, and the staged draft is relinked to
+    // it so it reads staged config while production keeps its default key.
+    let production = match classify_remote_config_store(RUNTIME_ENV_STORE)? {
+        ConfigStoreLookup::Found(id) => read_config_store_entries(&id, manifest_dir)?,
+        ConfigStoreLookup::NotFound => Vec::new(),
         ConfigStoreLookup::SchemaDrift(detail) => {
             return Err(format!(
                 "could not parse `fastly config-store list --json` while resolving `{RUNTIME_ENV_STORE}` for a staged deploy: {detail}.\n  Refusing to stage rather than risk serving PRODUCTION config. Pin a known-compatible fastly CLI version and retry."
@@ -2432,13 +2453,14 @@ fn relink_runtime_env_for_staging(
         }
     };
 
-    // Mirror production's runtime overrides into the staging twin, overriding
-    // only the config selectors to `<logical>_staging`, then point THIS draft at
-    // the twin. Create the twin on demand so a staged deploy never depends on a
-    // prior provision having created it.
-    let staging_store_id = ensure_staging_selector_store()?;
+    // Mirror production's runtime overrides into the PER-SERVICE staging twin,
+    // overriding only the config selectors to `<logical>_staging`, then point
+    // THIS draft at the twin. Create the twin on demand so a staged deploy never
+    // depends on a prior provision having created it.
+    let staging_store_name = staging_selector_store_name(service_id);
+    let staging_store_id = ensure_staging_selector_store(&staging_store_name)?;
     mirror_production_to_staging(
-        &production_id,
+        &production,
         &staging_store_id,
         config_logical_ids,
         manifest_dir,
@@ -2484,23 +2506,35 @@ fn relink_runtime_env_for_staging(
         manifest_dir,
     )?;
 
-    log::info!(
-        "staged version {version} now reads `{RUNTIME_ENV_STAGING_STORE}` for its config selector"
-    );
+    log::info!("staged version {version} now reads `{staging_store_name}` for its config selector");
     Ok(())
 }
 
-/// Production companion to `deploy`: resolve the active
-/// service version via the Fastly API and emit `version=<N>`.
+/// Production companion to `deploy`: resolve the active service version via the
+/// Fastly API and emit it as a `version=<N>` line.
+///
+/// Distinguishes "confirmed no active version" from an operational failure: a
+/// service with no active version yet (a first-ever deploy) is NOT an error — it
+/// emits an empty `version=` line and succeeds, so the caller records an empty
+/// rollback target. Only a real failure (API/auth error, or a version list that
+/// cannot be parsed) returns `Err`, so the caller can fail closed instead of
+/// silently proceeding without a rollback target.
 fn emit_active_version(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     let token = require_token()?;
     let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
-    let version = parse_active_version(&json).ok_or_else(|| {
-        format!("could not resolve the active version for service {service_id} from the Fastly API")
-    })?;
-    log::info!("version={version}");
+    if let Some(version) = resolve_active_version(&json)? {
+        log::info!("version={version}");
+    } else {
+        // Confirmed no active version (first-ever deploy). Emit an explicit
+        // empty line so the caller records an empty rollback target and succeeds
+        // — distinct from a failure, which returns `Err` above.
+        log::info!("version=");
+        log::info!(
+            "service {service_id} has no active version yet; emitting an empty rollback target"
+        );
+    }
     Ok(())
 }
 
@@ -3077,13 +3111,24 @@ mod tests {
             {"number": 2, "active": true},
             {"number": 3, "active": false}
         ]"#;
-        assert_eq!(parse_active_version(json), Some(2));
+        assert_eq!(resolve_active_version(json), Ok(Some(2)));
     }
 
     #[test]
     fn parse_active_version_none_when_no_active() {
+        // A parsed list with no active version is `Ok(None)` — confirmed
+        // no active version (first deploy), NOT an operational failure.
         let json = r#"[{"number": 1, "active": false}]"#;
-        assert_eq!(parse_active_version(json), None);
+        assert_eq!(resolve_active_version(json), Ok(None));
+    }
+
+    #[test]
+    fn resolve_active_version_errors_on_unparseable_payload() {
+        // A truncated / non-array body is an operational failure, distinct from
+        // "no active version" — the caller must fail closed, not record empty.
+        resolve_active_version("not json").expect_err("non-JSON must be an operational error");
+        resolve_active_version(r#"{"error":"unauthorized"}"#)
+            .expect_err("a non-array body must be an operational error");
     }
 
     #[test]
@@ -5257,7 +5302,7 @@ build = \"cargo build --release\"
              if [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  \
                printf '%s\\n' '{update_stdout}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
-               printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging\"}}]'\n\
+               printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                case \"$*\" in\n    \
                  *--store-id=ENVSEL1*) printf '%s\\n' '[{{\"item_key\":\"EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL\",\"item_value\":\"debug\"}}]' ;;\n    \
@@ -5600,7 +5645,7 @@ build = \"cargo build --release\"
                : > '{marker}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
                if [ -f '{marker}' ]; then\n    \
-                 printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging\"}}]'\n  \
+                 printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n  \
                else\n    \
                  printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}}]'\n  \
                fi\n\
@@ -5635,8 +5680,81 @@ build = \"cargo build --release\"
         let argv = fs::read_to_string(&record).unwrap_or_default();
         assert!(
             argv.lines()
-                .any(|line| line == "config-store create --name=edgezero_runtime_env_staging"),
-            "the twin must be created on demand: {argv}"
+                .any(|line| line == "config-store create --name=edgezero_runtime_env_staging_SVC1"),
+            "the per-service twin must be created on demand: {argv}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_staged_isolates_when_config_declared_but_prod_store_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // The app DECLARES config but has no `edgezero_runtime_env` store (never
+        // provisioned an override store — production reads its default key). A
+        // staged deploy must NOT silently inherit production config: it creates
+        // the per-service twin, writes the `<logical>_staging` selector, and
+        // relinks the draft to it. There is nothing to mirror (no production
+        // entries), but staging is still isolated.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let record = dir.path().join("argv.log");
+        let marker = dir.path().join("twin-created");
+        let script_path = dir.path().join("fastly");
+        // No `edgezero_runtime_env` ever; the twin appears only after create.
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{record}'\n\
+             if [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               printf '%s\\n' 'SUCCESS: Updated package (service SVC1, version 7)'\n\
+             elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"create\" ]; then\n  \
+               : > '{marker}'\n\
+             elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
+               if [ -f '{marker}' ]; then\n    \
+                 printf '%s\\n' '[{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n  \
+               else\n    \
+                 printf '%s\\n' '[]'\n  \
+               fi\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
+               printf '%s\\n' '[]'\n\
+             elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
+               printf '%s\\n' '[]'\n\
+             fi\n\
+             exit 0\n",
+            record = record.display(),
+            marker = marker.display(),
+        );
+        fs::write(&script_path, script).expect("write fake");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        let _path = PathPrepend::new(dir.path());
+
+        let app = tempdir().expect("app dir");
+        fs::write(app.path().join("fastly.toml"), "name = \"app\"\n").expect("write fastly.toml");
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+
+        deploy_staged(&[
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+            "--manifest-path".to_owned(),
+            app.path().join("fastly.toml").display().to_string(),
+            "--edgezero-staging-config=app_config".to_owned(),
+        ])
+        .expect("must isolate staging even with no production override store");
+
+        let argv = fs::read_to_string(&record).unwrap_or_default();
+        assert!(
+            argv.lines().any(|line| line.starts_with(
+                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+            )),
+            "the staging selector must be written even with no production store: {argv}"
+        );
+        assert!(
+            argv.lines().any(|line| line.starts_with(
+                "resource-link create --service-id=SVC1 --version=7 --resource-id=STAGEID1 --name=edgezero_runtime_env"
+            )),
+            "the draft must be relinked to the staging twin: {argv}"
         );
     }
 

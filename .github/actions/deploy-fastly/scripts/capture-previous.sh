@@ -15,9 +15,16 @@ set -euo pipefail
 # previous version and the output is left empty — the caller simply has no
 # production rollback target, which is correct.
 #
+# The CLI distinguishes "confirmed no active version" (exit 0, empty version)
+# from an operational failure (non-zero exit: API/auth error, unparseable list).
+# A non-zero exit is NOT tolerated: proceeding to deploy without knowing the
+# rollback target would leave production with no way back. Only the genuine
+# first-deploy case yields an empty target.
+#
 # Reads (env):
 #   EDGEZERO__APP__CLI__PATH / _BIN        required  the app CLI (via resolve_app_cli)
 #   EDGEZERO__FASTLY__SERVICE_ID           required  the Fastly service id
+#   EDGEZERO__PROJECT__WORKING_DIRECTORY   optional  app dir (monorepo manifest resolution)
 #   FASTLY_API_TOKEN                       required  provider token (Fastly's own convention)
 # Writes (outputs):
 #   previous-version                       the active version before this deploy (may be empty)
@@ -33,11 +40,21 @@ main() {
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_cmd "$cli_bin"
 
+  # Resolve the app CLI to an absolute path BEFORE cd (it may be a workspace-
+  # relative path), then run from the app dir so its manifest load is correct.
+  case "$cli_bin" in /*) ;; *) [[ -e "$cli_bin" ]] && cli_bin=$(canonical_path "$cli_bin") ;; esac
+  enter_app_dir "${EDGEZERO__PROJECT__WORKING_DIRECTORY:-.}"
+
   new_private_log
-  # A first-ever deploy has no active version; that is not a failure, just an
-  # empty rollback target. So a non-zero exit here is tolerated and yields "".
+  # Fail CLOSED on an operational failure: the CLI exits 0 for "no active version"
+  # (first deploy) and non-zero only for a real failure. Capture the CLI's exit
+  # (pipefail makes it the pipeline status; tee exits 0).
+  local rc=0
   "$cli_bin" active-version --adapter fastly --service-id "$service_id" \
-    2>&1 | tee "$LIFECYCLE_LOG" || true
+    2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail_with "$rc" "could not determine the active version (CLI exit $rc); refusing to deploy without a captured rollback target. A first-ever deploy (no active version) exits 0 with an empty target — a non-zero exit means an API/auth/parse failure."
+  fi
 
   local previous
   previous=$(read_numeric_line version "$LIFECYCLE_LOG")

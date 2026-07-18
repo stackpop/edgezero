@@ -52,7 +52,7 @@ case "\${1:-} \${2:-}" in
   # store edgezero_runtime_env (so a staged deploy relinks rather than skipping),
   # and its staging twin (the store the relink points at). config push resolves a
   # store id by name from this list, reads the current entry to diff, then upserts.
-  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging"}]' ;;
+  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging_dummy-service"}]' ;;
   # A cloned draft inherits the active version's links; the staged deploy drops
   # this one and re-links the staging store under the same name.
   "resource-link list") echo '[{"id":"LINK_ENV","name":"edgezero_runtime_env"}]' ;;
