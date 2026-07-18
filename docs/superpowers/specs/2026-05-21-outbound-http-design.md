@@ -129,8 +129,8 @@ pub trait OutboundHttpClient: Send + Sync {
  /// **`Streamed` mode:** `Ok(resp)` means headers completed. Body-phase
  /// failures surface later, when the caller consumes `resp.body`:
  /// - **Read errors / decompression failures / deadline expiry** during
- /// chunk reads come from the deadline-aware stream wrapper (,
- /// "Streamed-response wrapping") as `Err(EdgeError::..)` chunks.
+ /// chunk reads come from the deadline-aware stream wrapper
+ /// as `Err(EdgeError::..)` chunks.
  /// - **Over-cap** only fires when the consumer uses a bounded helper
  /// (`OutboundResponse::into_bytes_bounded(max)`, `into_bytes_bounded_until`,
  /// `json_bounded[_until]`) — the streaming decoder itself does **not**
@@ -218,7 +218,7 @@ pub trait OutboundHttpClient: Send + Sync {
  /// monopolised harvest — even when its own `budget.deadline` would
  /// have covered its body in isolation. Apps that require cross-slot
  /// isolation declare the capability required and get a hard build
- /// failure on Fastly per
+ /// failure on Fastly
  ///
  /// Per-slot `Ok`/`Err` semantics: since preflight rejects streamed bodies AND
  /// streamed responses, every surviving slot is Buffered on both sides, so the
@@ -405,7 +405,7 @@ impl OutboundRequest {
  /// grammar).
  /// 2. `std::str::from_utf8(value.as_ref).is_err` → reject with
  /// `EdgeError::bad_request("header value is not valid UTF-8: <name>")`
- /// (the EdgeZero rule per).
+ /// (the EdgeZero rule).
  /// 3. `HeaderValue::from_bytes(value.as_ref)` — applies the **HTTP
  /// header-value byte rule** (visible ASCII + obs-text; rejects
  /// control bytes like `\n`, `\0` that would enable header injection).
@@ -444,7 +444,7 @@ impl OutboundRequest {
     pub fn stream_response(self) -> Self;                   // sets Streamed
 
  /// Cap on the **request** body when it is a `Body::Stream` — see
- ////// EdgeZero's core `Body::Stream` is `LocalBoxStream`
+ /// EdgeZero's core `Body::Stream` is `LocalBoxStream`
  /// (WASM-friendly, not `Send + 'static`), so adapters cannot hand it
  /// directly to a SDK that requires `Send` streams (notably reqwest
  /// without its `stream` feature). The contract is therefore: streamed
@@ -506,7 +506,7 @@ impl OutboundRequest {
  /// SNI hostname — what an HTTPS adapter passes to its TLS stack's
  /// SNI setter (Fastly's `.sni_hostname(..)`, Spin/CF's underlying
  /// TLS config, etc.). Port-stripped, bracket-stripped for IPv6.
- /// **Returns `None` for IP-literal hosts** (IPv4 and IPv6) per
+ /// **Returns `None` for IP-literal hosts** (IPv4 and IPv6)
  /// RFC 6066, which forbids SNI for IP literals. Adapters call
  /// the TLS-stack SNI setter only when this returns `Some`; for `None`
  /// the SNI extension is omitted from the ClientHello. **Adapters
@@ -584,8 +584,8 @@ pub struct OutboundResponse {
 impl OutboundResponse {
  /// Adapter-facing constructor. Adapters build the response from the
  /// platform SDK's reply: status, normalized headers (decompression
- /// strips `content-encoding`/`content-length` per; non-UTF-8
- /// values are dropped per), and the body (`Body::Once` in
+ /// strips `content-encoding`/`content-length`; non-UTF-8
+ /// values are dropped), and the body (`Body::Once` in
  /// `Buffered` mode after the adapter has drained and capped, or a
  /// `Body::Stream` wrapped with the deadline-aware wrapper described
  /// in `into_bytes_bounded_until` for `Streamed` mode).
@@ -609,7 +609,7 @@ impl OutboundResponse {
  /// path for streamed responses recommended by `send_all`'s rustdoc.
  /// Returns the underlying `Body` so app code can iterate `Body::Stream` chunks
  /// directly (the wrapper installed at response construction time still
- /// enforces `dispatch_budget(req).deadline` per) or extract the
+ /// enforces `dispatch_budget(req).deadline`) or extract the
  /// `Body::Once` `Bytes` if the adapter buffered. This is distinct from the
  /// adapter-facing `into_parts(self) -> (StatusCode, HeaderMap, Body)`
  /// destructure used inside response converters; apps that need just the
@@ -617,7 +617,7 @@ impl OutboundResponse {
  /// On `Streamed` mode with single `send`, this is the canonical orchestration
  /// path: drive `send` concurrently across N requests via `futures::join_all`
  /// on Axum/CF/Spin, then iterate each response's `into_body` stream in
- /// parallel — no `send_all` (which is buffered-only by design,).
+ /// parallel — no `send_all` (which is buffered-only by design).
     pub fn into_body(self) -> Body;
 
  /// Buffer the body with a decompressed-byte cap. Works for both `Once`
@@ -626,9 +626,9 @@ impl OutboundResponse {
  /// This is NOT a thin wrapper over `Body::into_bytes_bounded` — that
  /// helper maps over-limit to `bad_request` (400), correct for inbound
  /// bodies but wrong for an over-large upstream response. This method
- /// performs its own bounded drain (pre-append checked accounting per
+ /// performs its own bounded drain (pre-append checked accounting
  ///) and maps to `bad_gateway` (502). On adapters that decompress
- ///, the cap is enforced against decompressed output here too.
+ /// the cap is enforced against decompressed output here too.
  ///
  /// **Effective-budget deadline is already honoured on a streamed body.**
  /// Per, adapters with platform timers (Axum/CF/Spin) wrap
@@ -656,7 +656,7 @@ impl OutboundResponse {
  /// post-return check for `Body::Once`) is what fires. Real-time
  /// preemption is the *wrapper's* job (the adapter installs a
  /// deadline-aware stream bounded by `dispatch_budget(req).deadline` at
- /// response construction time, per); the helper only catches the
+ /// response construction time); the helper only catches the
  /// **tighter `until`** case at yield boundaries.
  ///
  /// Concretely, if the wrapper still has 500 ms and the caller passes
@@ -673,7 +673,7 @@ impl OutboundResponse {
  /// Works on both `Body::Once` and `Body::Stream`:
  ///
  /// - **`Body::Once` (already buffered)**: the helper checks
- /// `until_deadline.is_expired` **at entry**, before doing anything
+ /// `until_deadline.is_expired()` **at entry**, before doing anything
  /// else, and returns `gateway_timeout` if expired. Otherwise it
  /// checks the buffered length against `max` — under cap → `Ok(bytes)`;
  /// over cap → `bad_gateway`. **Precedence: expired deadline beats
@@ -683,7 +683,7 @@ impl OutboundResponse {
  /// makes single `send` + `Body::Once` callers see consistent
  /// `gateway_timeout` semantics whether their response arrived
  /// already-buffered or streamed.
- /// - **`Body::Stream`**: the helper checks `until_deadline.is_expired`
+ /// - **`Body::Stream`**: the helper checks `until_deadline.is_expired()`
  /// **both before issuing each blocking body read and again after it
  /// returns** — including the EOF read. Returns
  /// `Err(EdgeError::gateway_timeout(..))` (504) on the first expired
@@ -698,7 +698,7 @@ impl OutboundResponse {
  /// before and after each underlying read including EOF for
  /// `Body::Stream`). **"Whichever fires first" is at yield boundaries
  /// only**: the wrapper's error chunk arrives in real time (timer-backed
- /// on Axum / CF / Spin; bounded-cooperative on Fastly per); the
+ /// on Axum / CF / Spin; bounded-cooperative on Fastly); the
  /// helper's `until_deadline` fires at the next check site. If the
  /// caller's `until_deadline` is tighter and the next underlying read
  /// returns promptly, the helper fires first; if the next underlying
@@ -740,9 +740,9 @@ impl OutboundResponse {
  /// timer-backed preemption.
  /// - **Fastly** — no guest async timer, but the adapter still
  /// wraps the streamed response body with a **cooperative
- /// deadline-aware stream** that checks `budget.deadline.is_expired`
+ /// deadline-aware stream** that checks `budget.deadline.is_expired()`
  /// **both before issuing the underlying body read and again after it
- /// returns** (including the read that discovers EOF, per) and
+ /// returns** (including the read that discovers EOF) and
  /// emits a `gateway_timeout` error chunk past the deadline instead
  /// of `Ok(chunk)` or stream-end. This makes `into_bytes_bounded`,
  /// `into_response` passthrough, and any other consumer of the
@@ -786,7 +786,7 @@ impl OutboundResponse {
  /// enforcement is the wrapper's job** — adapters with platform timers
  /// (Axum / CF / Spin) install a deadline-aware stream bounded by
  /// `dispatch_budget(req).deadline` at response construction time
- ///, so the **request budget** is enforced in real time on
+ /// so the **request budget** is enforced in real time on
  /// those three; Fastly is `BoundedCooperative` on the request budget
  ///. The `deadline` argument here only adds the cooperative
  /// post-read tighten; it does not get its own wrapper. Apps that need
@@ -804,7 +804,7 @@ impl OutboundResponse {
  /// move, so double-consumption of the body is prevented at compile time. The
  /// `Result` mirrors those methods' signatures for uniformity and reserves a
  /// single `Err(EdgeError::internal(..))` path for an adapter-invariant violation
- /// (reserved to `internal` per) — never a network/status condition.
+ /// (reserved to `internal`) — never a network/status condition.
     pub fn into_response(self) -> Result<Response, EdgeError>;
 }
 ```
@@ -1384,10 +1384,10 @@ let budget = dispatch_budget(req, now)?;
 // between_ms = total_ms [body-phase ceiling unchanged]
 // Sub-4 ms degenerate case: both = total_ms (sum = 2*total_ms, documented).
 // SSL configuration also lives on BackendBuilder: `use_ssl` defaults to false, so
-// HTTPS targets MUST opt in explicitly with .enable_ssl and configure SNI +
+// HTTPS targets MUST opt in explicitly with .enable_ssl() and configure SNI +
 // certificate verification (per the existing pattern at
 // crates/edgezero-adapter-fastly/src/proxy.rs:120). HTTP targets opt out via
-// .disable_ssl.
+// .disable_ssl().
 //
 // Four canonicalized values come from the OutboundRequest accessors ( —
 // adapters MUST consume these, never re-derive from `req.uri`):
@@ -1759,7 +1759,7 @@ impl RequestContext {
  /// Over-limit yields `Err(EdgeError::bad_request(..))` (400).
  ///
  /// **Takes `&self`** — `RequestContext` carries an internal body cache
- /// (an `unsync::OnceCell<Bytes>` style cell; single-threaded per
+ /// (an `unsync::OnceCell<Bytes>` style cell; single-threaded
  /// request, no `tokio` dep). This is deliberate so that existing
  /// `FromRequest` extractors that take `&RequestContext` (e.g. `Json`,
  /// `ValidatedJson`) can call it without a trait-signature breaking
@@ -2138,7 +2138,7 @@ pub enum Capability {
  // **active body-drain phase** of each slot —
  // a slot's active drain still honours the
  // single-slot bound (≤ one between-bytes-
- // timeout overshoot per gap on Fastly per
+ // timeout overshoot per gap on Fastly
  //). The **cross-slot harvest delay**
  // (slot k waiting behind earlier slots'
  // drains in Fastly Buffered mode) is *not*
@@ -2207,7 +2207,7 @@ pub enum CapabilitySupport {
  /// Real enforcement with a precisely documented, deterministic bound on any
  /// deviation. Used for timing-related degradations (e.g. Fastly
  /// outbound-deadlines body phase — overshoot ≤ one between-bytes-timeout
- /// interval,).
+ /// interval).
     BoundedCooperative,
  /// Available but with a documented limitation that the matrix footnotes
  /// describe. The limitation can be timing-related (unbounded cooperative
@@ -2306,7 +2306,7 @@ pub struct ManifestOutboundCapability {
 /// wildcard subdomain (`*.example.com`), bare host with port (`x:8443`),
 /// IPv6 (`https://[::1]`), and mixed `"*"` + host.
 // Takes the INNER Vec — `validator` applies a custom function on `Option<T>` to the
-// contained value only, so `None` (field absent → https-only default,) is a
+// contained value only, so `None` (field absent → https-only default) is a
 // no-op and never fails validation. Signature matches the `Option<Vec<String>>` field.
 fn validate_outbound_hosts(hosts: &[String]) -> Result<(), ValidationError>;
 
