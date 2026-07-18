@@ -716,6 +716,38 @@ mod tests {
         );
     }
 
+    /// Push-after-provision: `config push --local` writes config into
+    /// `.edgezero/local-config-<id>.json` and must leave the
+    /// provision-written secret file (`.edgezero/.env`) byte-for-byte
+    /// intact.
+    #[test]
+    fn push_after_provision_preserves_dotenv_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("mkdir .edgezero");
+        let env_path = local_dir.join(".env");
+        let seeded = "demo_api_token=real-secret-value\n";
+        fs::write(&env_path, seeded).expect("seed .env");
+
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &[("app_config".to_owned(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+
+        assert_eq!(
+            fs::read_to_string(&env_path).expect("read .env"),
+            seeded,
+            "config push must not touch the provision-written .env secret file"
+        );
+    }
+
     /// A symlinked local-config file must be refused before push
     /// reads through it and the write clobbers the link's target.
     #[cfg(unix)]

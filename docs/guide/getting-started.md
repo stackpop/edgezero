@@ -55,8 +55,10 @@ baseline local manifest (`axum.toml`, `wrangler.toml`, `fastly.toml`,
 ::: tip Adapter manifests are gitignored
 The generated `.gitignore` excludes `axum.toml`, `wrangler.toml`,
 `fastly.toml`, `spin.toml`, `runtime-config.toml`, `.dev.vars`, `.env`,
-and `.edgezero/` — teammates regenerate them by running
-`my-app-cli provision --adapter <name> --local` after cloning. All five
+and `.edgezero/` — teammates regenerate them after cloning by running
+`cargo run -p my-app-cli -- provision --adapter <name> --local` (the
+project CLI isn't installed on a fresh clone, so build-and-run it from
+source). All five
 per-adapter manifests are treated the same: they carry per-machine ids,
 operator-set defaults, or generated bindings, so the source of truth
 lives in `edgezero.toml` (which stays tracked) and the adapter manifest

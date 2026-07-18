@@ -179,7 +179,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
 }
 
 /// Lock-agnostic body of [`run_provision`]. Callers MUST hold the
-/// `.edgezero-provision.lock` before invoking (see
+/// `.edgezero/provision.lock` before invoking (see
 /// [`acquire_provision_lock`]). Extracted so `run_provision_typed`
 /// can hold a single lock across the base run + typed writeback +
 /// deployed merge, without `run_provision`'s inner acquisition

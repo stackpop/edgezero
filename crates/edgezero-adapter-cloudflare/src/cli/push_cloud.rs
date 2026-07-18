@@ -533,6 +533,41 @@ mod tests {
         );
     }
 
+    /// Push-after-provision: `config push --local` seeds the local KV
+    /// store via `wrangler kv bulk put`; it must leave the
+    /// provision-written `.dev.vars` (which carries the operator's real
+    /// secret values) byte-for-byte intact.
+    #[cfg(unix)]
+    #[test]
+    fn push_after_provision_preserves_dev_vars_secret() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let dev_vars = project_dir.path().join(".dev.vars");
+        let seeded = "demo_api_token=\"real-secret-value\"\n";
+        fs::write(&dev_vars, seeded).expect("seed .dev.vars");
+        let fake = fake_wrangler_returning("", "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        CloudflareCliAdapter
+            .push_config_entries_local(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "hello".to_owned())],
+                &AdapterPushContext::new().with_local(true),
+                false,
+            )
+            .expect("push --local succeeds with fake wrangler");
+
+        assert_eq!(
+            fs::read_to_string(&dev_vars).expect("read .dev.vars"),
+            seeded,
+            "config push --local must not touch the operator's .dev.vars secrets"
+        );
+    }
+
     // ---------- read_config_entry / read_config_entry_local (fake wrangler) ----------
 
     #[cfg(unix)]

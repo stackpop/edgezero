@@ -917,6 +917,39 @@ mod tests {
         );
     }
 
+    /// Push-after-provision: `config push --local` writes config into
+    /// the local KV `SQLite` db; it must leave the provision-written Spin
+    /// `.env` (next to spin.toml) byte-for-byte intact.
+    #[test]
+    fn push_after_provision_preserves_dotenv_secret() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        let env_path = dir.path().join(".env");
+        let seeded = "SPIN_VARIABLE_DEMO_API_TOKEN=real-secret-value\n";
+        fs::write(&env_path, seeded).expect("seed .env");
+
+        // Use the `default` label Spin auto-provides, so the push needs
+        // no `[key_value_store.<label>]` stanza in runtime-config.toml
+        // -- this test is about the `.env` file, not label wiring.
+        SpinCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store("default", "default"),
+                &entries_two(),
+                &AdapterPushContext::new().with_local(true),
+                false,
+            )
+            .expect("push succeeds");
+
+        assert_eq!(
+            fs::read_to_string(&env_path).expect("read .env"),
+            seeded,
+            "config push --local (SQLite) must not touch Spin's .env secret file"
+        );
+    }
+
     #[test]
     fn dispatch_push_local_forces_sqlite_even_when_runtime_config_declares_redis() {
         // F1 (blocker): `--local` MUST bypass runtime-config backend

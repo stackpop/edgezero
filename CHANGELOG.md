@@ -103,4 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were renamed to `provision_typed_local_re_run_preserves_*` —
   their bodies never invoked `push_config_entries` and the prior
   name misled readers looking for real push→provision coverage.
-  Real push→provision integration coverage is still an open gap.
+  Real push→provision coverage now exists as
+  `push_after_provision_preserves_*` in each adapter (Axum/Cloudflare/
+  Fastly/Spin): each seeds an operator secret into the provision-written
+  file, runs `config push --local`, and asserts that file is untouched.

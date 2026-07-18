@@ -6,7 +6,10 @@ command you'll use day-to-day: `auth`, `provision`, `config validate`, `config p
 documents each command exhaustively — this page tells the story of how they fit
 together.
 
-The full command surface in your generated `myapp-cli`:
+The full command surface in your generated `myapp-cli` (on a fresh
+checkout the binary isn't installed — invoke it from source with
+`cargo run -p myapp-cli -- <command>`, or `cargo install --path
+crates/myapp-cli` first):
 
 ```bash
 myapp-cli build       # cargo build for a target adapter

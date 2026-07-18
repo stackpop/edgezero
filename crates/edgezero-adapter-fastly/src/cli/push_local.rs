@@ -334,6 +334,62 @@ mod tests {
         assert_eq!(value, envelope_json, "roundtrip value matches");
     }
 
+    /// Push-after-provision: `config push --local` writes config into
+    /// `[local_server.config_stores.*]`; it must leave the operator's
+    /// hand-edited `[[local_server.secret_stores.<id>]]` entry (real
+    /// `env` mapping) untouched.
+    #[test]
+    fn push_after_provision_preserves_secret_store_entry() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "name = \"demo\"\n\n[[local_server.secret_stores.default]]\nkey = \"api_token\"\nenv = \"REAL_ENV_MAPPING\"\n",
+        )
+        .expect("write");
+
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            json!({"hello": "world"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+
+        let after = fs::read_to_string(&path).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        let arr = doc["local_server"]["secret_stores"]["default"]
+            .as_array_of_tables()
+            .expect("secret_stores.default preserved");
+        assert_eq!(
+            arr.len(),
+            1,
+            "operator's secret entry still present: {after}"
+        );
+        let row = arr.get(0).expect("row");
+        assert_eq!(
+            row.get("key").and_then(|item| item.as_str()),
+            Some("api_token")
+        );
+        assert_eq!(
+            row.get("env").and_then(|item| item.as_str()),
+            Some("REAL_ENV_MAPPING"),
+            "config push must not disturb the operator's secret_store env mapping: {after}"
+        );
+    }
+
     #[test]
     fn read_local_requires_adapter_manifest_path() {
         let dir = tempdir().expect("tempdir");
