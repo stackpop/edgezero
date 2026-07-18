@@ -27,6 +27,10 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Resolve and print the currently-active service version
+    /// (`version=<N>`) — capture a production rollback target before a
+    /// deploy supersedes it.
+    ActiveVersion(ActiveVersionArgs),
     /// Sign in / out / status against the adapter's native CLI
     /// (`wrangler` / `fastly` / `spin`). See spec.
     Auth(AuthArgs),
@@ -40,18 +44,14 @@ enum Cmd {
     /// Probe a deployed/staged version's health (Fastly staging
     /// lifecycle). Exits non-zero when unhealthy after retries.
     Healthcheck(HealthcheckArgs),
-    /// Resolve and print the currently-active service version
-    /// (`version=<N>`) — capture a production rollback target before a
-    /// deploy supersedes it.
-    ActiveVersion(ActiveVersionArgs),
-    /// Roll a service back: production activates `--rollback-to`; staging
-    /// deactivates the staged version.
-    Rollback(RollbackArgs),
     /// Create a new `EdgeZero` app skeleton.
     New(NewArgs),
     /// Create the platform resources backing the declared
     /// `[stores.<kind>].ids`.
     Provision(ProvisionArgs),
+    /// Roll a service back: production activates `--rollback-to`; staging
+    /// deactivates the staged version.
+    Rollback(RollbackArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
 }
