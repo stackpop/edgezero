@@ -156,7 +156,10 @@ Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`
 | `stage`             | No       | `false`         | Deploy to a staged draft version instead of activating.         |
 | `cache`             | No       | `false`         | Exact-key Cargo-workspace `target/` caching.                    |
 
-Outputs: `fastly-version`, `source-revision`, `app-cli-version`.
+Outputs: `fastly-version`, `source-revision`, `app-cli-version`, and (production
+only) `previous-version` — the version that was active _before_ this deploy.
+Thread `previous-version` into `rollback-fastly`'s `rollback-to` so a later
+rollback has a real target (Fastly cannot infer one — see `rollback-fastly`).
 
 The action always adds `--non-interactive` to the deploy itself, so a deploy
 declared as an `edgezero.toml` command (`[adapters.fastly.commands] deploy =
@@ -185,16 +188,24 @@ your rollback on the step failing (`if: failure()`), not on the `healthy` output
 
 ### `rollback-fastly`
 
-| Input               | Required | Default         | Meaning                                                                            |
-| ------------------- | -------- | --------------- | ---------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                               |
-| `fastly-api-token`  | Yes      | —               | Fastly API token.                                                                  |
-| `fastly-service-id` | Yes      | —               | Service to roll back.                                                              |
-| `fastly-version`    | Yes      | —               | The current (bad) version to roll back **from**.                                   |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                   |
-| `deploy-to`         | No       | `production`    | `production` activates the previous version; `staging` deactivates the staged one. |
+| Input               | Required | Default         | Meaning                                                                                                                                                               |
+| ------------------- | -------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                                                                                  |
+| `fastly-api-token`  | Yes      | —               | Fastly API token.                                                                                                                                                     |
+| `fastly-service-id` | Yes      | —               | Service to roll back.                                                                                                                                                 |
+| `fastly-version`    | Yes      | —               | The current (bad) version to roll back **from**.                                                                                                                      |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                                                                                      |
+| `rollback-to`       | No\*     | empty           | **Production only:** the version to re-activate. Wire it from `deploy-fastly`'s `previous-version` output. Required for `deploy-to: production`; ignored for staging. |
+| `deploy-to`         | No       | `production`    | `production` activates `rollback-to`; `staging` deactivates the staged one.                                                                                           |
 
 Outputs: `rolled-back-to` (production only — the version that was activated).
+
+\* Fastly's version metadata cannot distinguish a previously-live version from a
+staged draft, so a production rollback **cannot infer its target** — you must
+supply it. Capture it at deploy time: `deploy-fastly` emits `previous-version`
+(the version active _before_ that deploy), which you thread straight into
+`rollback-to`. A production rollback with no `rollback-to` fails closed rather
+than guess a version.
 
 ### `config-push-fastly`
 
@@ -311,7 +322,36 @@ carry no orchestration policy of their own.
 - `healthcheck-fastly` resolves the staged version's Fastly staging IP and probes
   it, retrying and exiting non-zero when unhealthy.
 - `rollback-fastly` deactivates the staged version (or, for `deploy-to:
-production`, activates the previous version).
+production`, activates `rollback-to`).
+
+### Production rollback needs an explicit target
+
+A production version, once superseded, cannot be told apart from a staged draft
+in Fastly's version metadata — so a production rollback **cannot infer** what to
+re-activate. Capture the target at deploy time and thread it through:
+
+```yaml
+- id: deploy
+  uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+  with:
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+
+# ... run your production health checks here ...
+
+- if: failure() && steps.deploy.outputs.previous-version != ''
+  uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
+  with:
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+    fastly-version: ${{ steps.deploy.outputs.fastly-version }}
+    rollback-to: ${{ steps.deploy.outputs.previous-version }}
+```
+
+`previous-version` is empty on a first-ever deploy (there is nothing to roll back
+to), which is why the rollback step guards on it.
 
 ## Build behavior and caching
 

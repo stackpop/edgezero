@@ -325,12 +325,12 @@ subcommands.
 
 The capability is scaffolded into the CLI, not reproduced in action shell:
 
-| App-CLI invocation                                                                            | Fastly operations the adapter performs                                                                                                                              |
-| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<cli> deploy --adapter fastly --service-id <id>` (production, existing)                      | `fastly compute deploy` → builds, uploads, **activates**; emits the activated version.                                                                              |
-| `<cli> deploy --adapter fastly --service-id <id> --stage`                                     | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version. |
-| `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --domain <d> [--staging]` | Production: `curl` the domain. Staging: resolve `staging_ips` for `<v>` on `<id>` via the Fastly API, then `curl --connect-to` that IP; emits healthy/status.       |
-| `<cli> rollback --adapter fastly --service-id <id> --version <v> [--staging]`                 | Production: activate `<v> - 1` on `<id>`. Staging: deactivate the staged `<v>` on `<id>`.                                                                           |
+| App-CLI invocation                                                                                | Fastly operations the adapter performs                                                                                                                              |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<cli> deploy --adapter fastly --service-id <id>` (production, existing)                          | `fastly compute deploy` → builds, uploads, **activates**; emits the activated version.                                                                              |
+| `<cli> deploy --adapter fastly --service-id <id> --stage`                                         | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version. |
+| `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --domain <d> [--staging]`     | Production: `curl` the domain. Staging: resolve `staging_ips` for `<v>` on `<id>` via the Fastly API, then `curl --connect-to` that IP; emits healthy/status.       |
+| `<cli> rollback --adapter fastly --service-id <id> --version <v> [--rollback-to <p>] [--staging]` | Production: activate `<p>` on `<id>` (required — Fastly cannot infer the previous version). Staging: deactivate the staged `<v>` on `<id>`.                         |
 
 Every Fastly subcommand takes `--service-id <id>` (the service the operation
 targets) and reads `FASTLY_API_TOKEN` from the environment. The app CLI (built by
@@ -345,6 +345,12 @@ Fastly path emits the service version. The app CLI prints it in a parseable form
 (e.g. a `version=<N>` line or `--output` file); `deploy-fastly` surfaces it as
 the `fastly-version` output. This is the one **provider-specific** output; the
 generic engine still exposes no deployment version.
+
+A production `deploy-fastly` additionally emits `previous-version` — the version
+active _before_ this deploy — captured by an `<cli> active-version` call before
+the deploy supersedes it. It is the rollback target: because Fastly cannot infer
+a previous version (§5.4.3), the caller threads `previous-version` into
+`rollback-fastly`'s `rollback-to`. It is empty on a first-ever deploy.
 
 #### 5.4.3 The three actions
 
@@ -362,10 +368,14 @@ generic engine still exposes no deployment version.
   gate rollback on `if: failure()`), while still emitting the outputs. Needs no
   application source or build.
 - **`rollback-fastly`** — thin wrapper: takes `fastly-api-token`,
-  `fastly-service-id`, `fastly-version`, `deploy-to`; runs
+  `fastly-service-id`, `fastly-version`, `rollback-to`, `deploy-to`; runs
   `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
-  `FASTLY_API_TOKEN` in the step env; on production emits `rolled-back-to`. Needs
-  no application source or build.
+  `FASTLY_API_TOKEN` in the step env; on production emits `rolled-back-to`. A
+  production rollback **requires** `rollback-to` — Fastly's version metadata
+  cannot distinguish a previously-live version from a staged draft, so the target
+  cannot be inferred. Capture it at deploy time from `deploy-fastly`'s
+  `previous-version` output and thread it through. Needs no application source or
+  build.
 
 `healthcheck-fastly` and `rollback-fastly` map `fastly-service-id` → the
 `--service-id` flag and `fastly-api-token` → step-scoped `FASTLY_API_TOKEN`
@@ -994,9 +1004,11 @@ The design is implemented when:
 11. Fastly staging lifecycle works end to end: `deploy-fastly` `stage: true`
     stages a draft and outputs `fastly-version`; `healthcheck-fastly` probes the
     staged version (via its staging IP) and exits non-zero when unhealthy;
-    `rollback-fastly` deactivates the staged version (or activates the previous
-    production version). All three thread `--service-id` and `fastly-version` and
-    scope `FASTLY_API_TOKEN`; the generic engine is unchanged.
+    `rollback-fastly` deactivates the staged version (or, for production,
+    activates the `rollback-to` version captured from `deploy-fastly`'s
+    `previous-version` output). All three thread `--service-id` and
+    `fastly-version` and scope `FASTLY_API_TOKEN`; the generic engine is
+    unchanged.
 12. Static checks, Bash contract tests, and the composite smoke test pass.
 13. Docs include same-repo, separate-repo, and monorepo examples across the
     three-layer model, plus a Fastly staging-lifecycle example.
