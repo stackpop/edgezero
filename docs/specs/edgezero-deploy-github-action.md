@@ -299,12 +299,12 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 **`deploy-fastly` outputs**
 
-| Output             | Meaning                                                                                                                                 |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `fastly-version`   | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4).                                              |
+| Output             | Meaning                                                                                                                                      |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fastly-version`   | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4).                                                   |
 | `previous-version` | Production only: the version active BEFORE this deploy — the rollback target for `rollback-fastly`'s `rollback-to`. Empty on a first deploy. |
-| `source-revision`  | Passthrough from the engine.                                                                                                            |
-| `app-cli-version`  | Passthrough from the engine.                                                                                                            |
+| `source-revision`  | Passthrough from the engine.                                                                                                                 |
+| `app-cli-version`  | Passthrough from the engine.                                                                                                                 |
 
 The wrapper sets `adapter: fastly`, `target: wasm32-wasip1`, the action-owned
 `deploy-flags` (`--service-id …`, `--non-interactive`) so deployments cannot

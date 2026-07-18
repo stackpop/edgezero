@@ -1112,6 +1112,32 @@ test_action_output_contracts() {
 }
 
 # ---------------------------------------------------------------------------
+# enter_app_dir — lifecycle scripts run the CLI from the app dir so its manifest
+# load is correct in a monorepo. It must accept BOTH an absolute path (resolve-
+# project.sh's resolved output, used by capture) and a workspace-relative path (a
+# raw wrapper input, used by healthcheck/rollback), and reject an escape.
+# ---------------------------------------------------------------------------
+test_enter_app_dir() {
+  section "enter_app_dir"
+  local ws="$WORK_DIR/ead-ws"
+  mkdir -p "$ws/app"
+  local expected
+  expected=$(cd "$ws/app" && pwd -P)
+
+  local rel abs
+  rel=$(bash -c "source '$ACTIONS_DIR/deploy-core/scripts/common.sh'; GITHUB_WORKSPACE='$ws' enter_app_dir app && pwd -P")
+  assert_equals "a workspace-relative working-directory enters the app dir" "$expected" "$rel"
+
+  abs=$(bash -c "source '$ACTIONS_DIR/deploy-core/scripts/common.sh'; GITHUB_WORKSPACE='$ws' enter_app_dir '$expected' && pwd -P")
+  assert_equals "an absolute working-directory (resolve output) enters the app dir" "$expected" "$abs"
+
+  assert_fails "a working-directory outside the workspace is rejected" \
+    bash -c "source '$ACTIONS_DIR/deploy-core/scripts/common.sh'; GITHUB_WORKSPACE='$ws' enter_app_dir /etc"
+  assert_fails "a missing working-directory is rejected" \
+    bash -c "source '$ACTIONS_DIR/deploy-core/scripts/common.sh'; GITHUB_WORKSPACE='$ws' enter_app_dir does-not-exist"
+}
+
+# ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
@@ -1128,6 +1154,7 @@ main() {
   test_deploy_args_prepend
   test_provider_env_nul
   test_lifecycle_helpers
+  test_enter_app_dir
   test_toolchain_boundary
   test_config_push_argv
   test_exit_propagation
