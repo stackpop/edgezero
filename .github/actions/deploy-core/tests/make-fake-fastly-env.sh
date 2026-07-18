@@ -65,7 +65,17 @@ case "\${1:-} \${2:-}" in
     echo "Error: config store entry not found" >&2
     exit 1
     ;;
+  "config-store-entry list")
+    # A staged deploy MIRRORS the production selector store into the staging twin.
+    # Production (ENVSEL1) carries a non-config override the twin must copy
+    # verbatim; the twin (STAGESEL1) starts empty.
+    case "\$*" in
+      *--store-id=ENVSEL1*) echo '[{"item_key":"EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL","item_value":"debug"}]' ;;
+      *) echo '[]' ;;
+    esac
+    ;;
   "config-store-entry update") echo "SUCCESS: Updated config store entry" ;;
+  "config-store-entry delete") echo "SUCCESS: Deleted config store entry" ;;
   *)
     case "\${1:-}" in
       version | --version) echo "Fastly CLI version v$version (fake)" ;;

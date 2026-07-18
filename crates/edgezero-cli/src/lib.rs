@@ -202,6 +202,18 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     passthrough.extend_from_slice(&args.adapter_args);
 
     if args.stage {
+        // Thread the app's declared config-store logical ids so the staged
+        // relink knows which selectors to redirect to `<logical>_staging`. The
+        // adapter reads config usage from THIS list, never a remote probe —
+        // avoiding a lookup that fails open. One inline token per store; the
+        // adapter strips them before `fastly compute update`.
+        if let Some(loader) = manifest.as_ref()
+            && let Some(config) = loader.manifest().stores.config.as_ref()
+        {
+            for id in &config.ids {
+                passthrough.push(format!("--edgezero-staging-config={id}"));
+            }
+        }
         // Staged deploy: clone the active version, upload the built
         // package to a new draft, mark it staged, and emit the staged
         // version (spec §5.4). Never runs the manifest `deploy`

@@ -424,7 +424,12 @@ impl Adapter for FastlyCliAdapter {
             // Already declared; nothing to do.
         }
 
-        provision_staging_selector_store(&fastly_path, stores, dry_run, &mut out)?;
+        // The STAGING twin of the runtime-override store is created and
+        // populated entirely by a staged deploy (see
+        // `relink_runtime_env_for_staging` → `mirror_production_to_staging`), so
+        // it always mirrors production's CURRENT overrides. Provision does not
+        // touch it: a twin populated here would drift the moment an operator
+        // edited a production override.
 
         if out.is_empty() {
             out.push("fastly has no declared stores to provision".to_owned());
@@ -1203,91 +1208,152 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
     ))
 }
 
-/// Parse `fastly config-store list --json` output and return the
-/// platform `id` of the store whose `name` matches `name`. Accepts
-/// both a bare array (`[ {"id": "...", "name": "..."}, ... ]`)
-/// and an `{"items": [...]}` envelope so this stays compatible
-/// across fastly CLI versions.
-/// Provision the STAGING twin of the runtime-override store.
+/// Read every `(key, value)` in config store `store_id` via
+/// `fastly config-store-entry list --store-id=<id> --json`.
 ///
-/// A staged deploy clones the active version, and a clone inherits its resource
-/// links — so without a second selector store a staged version reads
-/// production's key. This store holds the selector pointing each declared config
-/// store at `<id>_staging`, the key `config push --staging` writes.
-///
-/// It is deliberately NOT what `compute deploy` links at runtime: the staged
-/// draft links it per-version under the name `edgezero_runtime_env` (see
-/// `relink_runtime_env_for_staging`). The `[setup]` table written here is just a
-/// local idempotency marker.
-///
-/// Gated on a LOCAL probe of `fastly.toml`, exactly like the runtime-env store.
-/// Asking the account whether to act would make provision shell out on every
-/// call — including from unit tests, which must never touch a real account.
-fn provision_staging_selector_store(
-    fastly_path: &Path,
-    stores: &ProvisionStores<'_>,
-    dry_run: bool,
-    out: &mut Vec<String>,
-) -> Result<(), String> {
-    let kind = "config";
-    // No declared config store means there is no selector to stage.
-    if stores.config.is_empty() {
-        return Ok(());
-    }
-
-    if dry_run {
-        out.push(format!(
-            "would run `fastly {kind}-store create --name={RUNTIME_ENV_STAGING_STORE}` (staged-config selector store)"
-        ));
-        for store in stores.config {
-            out.push(format!(
-                "  would set {} = {}_staging in `{RUNTIME_ENV_STAGING_STORE}`",
-                runtime_env_key_for(&store.logical),
-                store.logical
-            ));
+/// Accepts a bare array or an `{"items": [...]}` envelope, and reads each
+/// entry's key/value from `item_key`/`item_value` (the field names
+/// `config-store-entry describe` uses), falling back to `key`/`value`. A parse
+/// failure is an error, NOT an empty list: a staged deploy mirrors this store,
+/// and treating an unreadable listing as "no entries" would silently drop
+/// production's overrides from the staged version.
+fn read_config_store_entries(store_id: &str, cwd: &Path) -> Result<Vec<(String, String)>, String> {
+    let stdout = run_fastly_capture(
+        &[
+            "config-store-entry".to_owned(),
+            "list".to_owned(),
+            format!("--store-id={store_id}"),
+            "--json".to_owned(),
+        ],
+        cwd,
+    )?;
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+        format!("failed to parse `fastly config-store-entry list --json` JSON: {err}\nraw stdout: {stdout}")
+    })?;
+    let array = parsed
+        .as_array()
+        .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| {
+            format!(
+                "`fastly config-store-entry list --json` output is neither a bare array nor an `items` envelope; fastly CLI may have changed its schema. Raw stdout: {stdout}"
+            )
+        })?;
+    let mut entries = Vec::with_capacity(array.len());
+    for entry in array {
+        let key = entry
+            .get("item_key")
+            .or_else(|| entry.get("key"))
+            .and_then(serde_json::Value::as_str);
+        let value = entry
+            .get("item_value")
+            .or_else(|| entry.get("value"))
+            .and_then(serde_json::Value::as_str);
+        match (key, value) {
+            (Some(found_key), Some(found_value)) => {
+                entries.push((found_key.to_owned(), found_value.to_owned()));
+            }
+            _ => {
+                return Err(format!(
+                    "a `fastly config-store-entry list --json` entry has no string `item_key`/`item_value` fields; fastly CLI may have changed its schema. Raw stdout: {stdout}"
+                ));
+            }
         }
-        return Ok(());
     }
+    Ok(entries)
+}
 
-    // Resolve the staging store, (re)creating it if the account has none —
-    // repairing a remotely-deleted store, which the deploy-time error tells the
-    // operator to do by re-running provision.
-    let (staging_id, created) = if let Ok(id) =
-        resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE)
-    {
-        (id, false)
-    } else {
-        create_fastly_store(kind, RUNTIME_ENV_STAGING_STORE)?;
-        let id = resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE).map_err(|err| {
+/// `fastly config-store-entry delete --store-id=<id> --key=<k>`.
+fn delete_config_store_entry(store_id: &str, key: &str, cwd: &Path) -> Result<(), String> {
+    run_fastly_status(
+        &[
+            "config-store-entry".to_owned(),
+            "delete".to_owned(),
+            format!("--store-id={store_id}"),
+            format!("--key={key}"),
+        ],
+        cwd,
+    )
+}
+
+/// Compute the staging selector store's entries from production's, given the
+/// declared config-store logical ids.
+///
+/// The twin is a faithful MIRROR of production's runtime overrides — adapter
+/// host, logging level, `__NAME` redirects — with exactly one transform: every
+/// declared config store's selector key (`EDGEZERO__STORES__CONFIG__<ID>__KEY`)
+/// points at `<logical>_staging`, the key `config push --staging` writes. A
+/// declared store gets that selector even when production has no explicit entry
+/// for it (production relies on the runtime's default = the logical id; staging
+/// must NOT inherit that default, or it would read production's key).
+///
+/// Pure so the transform is unit-testable without the fastly CLI.
+fn staging_entries_from_production(
+    production: &[(String, String)],
+    config_logical_ids: &[String],
+) -> Vec<(String, String)> {
+    // selector key -> staging value, one per declared config store.
+    let selectors: Vec<(String, String)> = config_logical_ids
+        .iter()
+        .map(|id| (runtime_env_key_for(id), format!("{id}_staging")))
+        .collect();
+    let is_selector = |key: &str| selectors.iter().any(|(sel, _)| sel == key);
+
+    // Copy every non-selector production override verbatim; selectors are
+    // supplied from `selectors` below (whether or not production carried one).
+    let mut out: Vec<(String, String)> = production
+        .iter()
+        .filter(|(key, _)| !is_selector(key))
+        .cloned()
+        .collect();
+    out.extend(selectors);
+    out
+}
+
+/// Resolve the staging twin store, creating it on demand. A staged deploy owns
+/// this store end to end (it is never linked on the ACTIVE version), so it does
+/// not depend on `provision` having created it first. Fails closed on a lookup
+/// FAILURE rather than blindly creating a duplicate.
+fn ensure_staging_selector_store() -> Result<String, String> {
+    match classify_remote_config_store(RUNTIME_ENV_STAGING_STORE)? {
+        ConfigStoreLookup::Found(id) => Ok(id),
+        ConfigStoreLookup::NotFound => {
+            create_fastly_store("config", RUNTIME_ENV_STAGING_STORE)?;
+            resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE).map_err(|err| {
                 format!(
-                    "created fastly {kind}-store `{RUNTIME_ENV_STAGING_STORE}` but could not resolve its id: {err}"
+                    "created fastly config-store `{RUNTIME_ENV_STAGING_STORE}` but could not resolve its id: {err}"
                 )
-            })?;
-        (id, true)
-    };
+            })
+        }
+        ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
+            "could not parse `fastly config-store list --json` while resolving `{RUNTIME_ENV_STAGING_STORE}`: {detail}.\n  Refusing to stage. Pin a known-compatible fastly CLI version and retry."
+        )),
+    }
+}
 
-    // Upsert a selector entry for EVERY declared config store, on EVERY provision
-    // — not gated on the `[setup]` marker. A store added after the first provision
-    // would otherwise never get a `<id>_staging` selector and silently fall back
-    // to its production key on staged versions. `--upsert` makes this idempotent.
-    for store in stores.config {
-        create_config_store_entry(
-            &staging_id,
-            &runtime_env_key_for(&store.logical),
-            &format!("{}_staging", store.logical),
-        )?;
+/// Reconcile the staging twin so it MIRRORS production's runtime overrides with
+/// only the config selectors redirected to `<logical>_staging`.
+///
+/// Deletes twin entries production no longer has (so a removed override does not
+/// linger and diverge staging from production), then upserts the full desired
+/// set. Runs while the staged draft is still editable, before the relink.
+fn mirror_production_to_staging(
+    production_id: &str,
+    staging_id: &str,
+    config_logical_ids: &[String],
+    cwd: &Path,
+) -> Result<(), String> {
+    let production = read_config_store_entries(production_id, cwd)?;
+    let desired = staging_entries_from_production(&production, config_logical_ids);
+
+    let current = read_config_store_entries(staging_id, cwd)?;
+    for (key, _) in &current {
+        if !desired.iter().any(|(dk, _)| dk == key) {
+            delete_config_store_entry(staging_id, key, cwd)?;
+        }
     }
-    // The `[setup]` block is a local marker only; keep it present (idempotently)
-    // so tooling can see the store was provisioned.
-    if !setup_block_present(fastly_path, kind, RUNTIME_ENV_STAGING_STORE)? {
-        append_fastly_setup(fastly_path, kind, RUNTIME_ENV_STAGING_STORE)?;
+    for (key, value) in &desired {
+        create_config_store_entry(staging_id, key, value)?;
     }
-    out.push(format!(
-        "{verb} fastly {kind}-store `{RUNTIME_ENV_STAGING_STORE}` (id={staging_id}); reconciled {n} selector entr{plural}. Staged deploys link it as `{RUNTIME_ENV_STORE}` so they read `<id>_staging` config",
-        verb = if created { "created" } else { "reconciled" },
-        n = stores.config.len(),
-        plural = if stores.config.len() == 1 { "y" } else { "ies" },
-    ));
     Ok(())
 }
 
@@ -1332,6 +1398,11 @@ fn find_resource_link_id(stdout: &str, link_name: &str) -> Option<String> {
     })
 }
 
+/// Parse `fastly config-store list --json` output and return the
+/// platform `id` of the store whose `name` matches `name`. Accepts
+/// both a bare array (`[ {"id": "...", "name": "..."}, ... ]`)
+/// and an `{"items": [...]}` envelope so this stays compatible
+/// across fastly CLI versions.
 fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
     let parsed: serde_json::Value = match serde_json::from_str(stdout) {
         Ok(value) => value,
@@ -1394,6 +1465,26 @@ fn shape_summary(value: &serde_json::Value) -> &'static str {
 /// `name`. The provision flow doesn't persist this id, so push
 /// has to re-fetch every time.
 fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
+    match classify_remote_config_store(name)? {
+        ConfigStoreLookup::Found(id) => Ok(id),
+        ConfigStoreLookup::NotFound => Err(format!(
+            "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
+        )),
+        ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
+            "could not parse `fastly config-store list --json` output: {detail}.\n  The fastly CLI may have changed its JSON schema in a recent version. Please file a bug report at https://github.com/stackpop/edgezero/issues with the fastly CLI version (`fastly version`) and the raw stdout. Workaround: pin to a known-compatible fastly CLI version."
+        )),
+    }
+}
+
+/// Look a config store up by name and return the raw [`ConfigStoreLookup`], so
+/// callers can tell "the account has no such store" (`NotFound`) apart from "the
+/// lookup itself failed" (`Err` — CLI missing / non-zero exit — or
+/// `SchemaDrift`). A staged deploy relies on that distinction to decide whether
+/// to skip config isolation (genuinely no store) or fail closed (couldn't tell).
+///
+/// `Err` is only for a failure to OBTAIN an answer; a successful listing that
+/// simply doesn't contain `name` is `Ok(ConfigStoreLookup::NotFound)`.
+fn classify_remote_config_store(name: &str) -> Result<ConfigStoreLookup, String> {
     let output = Command::new("fastly")
         .args(["config-store", "list", "--json"])
         .output()
@@ -1412,15 +1503,7 @@ fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    match find_config_store_id(&stdout, name) {
-        ConfigStoreLookup::Found(id) => Ok(id),
-        ConfigStoreLookup::NotFound => Err(format!(
-            "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
-        )),
-        ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
-            "could not parse `fastly config-store list --json` output: {detail}.\n  The fastly CLI may have changed its JSON schema in a recent version. Please file a bug report at https://github.com/stackpop/edgezero/issues with the fastly CLI version (`fastly version`) and the raw stdout. Workaround: pin to a known-compatible fastly CLI version."
-        )),
-    }
+    Ok(find_config_store_id(&stdout, name))
 }
 
 /// # Errors
@@ -2182,6 +2265,23 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
 
     let manifest_dir_buf = resolve_manifest_dir(args)?;
     let manifest_dir = manifest_dir_buf.as_path();
+    // The CLI threads the app's declared config-store logical ids as
+    // `--edgezero-staging-config=<logical>` (one per store) so the staging relink
+    // knows which selectors to redirect — read from the app manifest, never a
+    // remote probe. These are EdgeZero-internal inline tokens; strip them so they
+    // never reach `fastly compute update`.
+    let config_logical_ids: Vec<String> = args
+        .iter()
+        .filter_map(|arg| {
+            arg.strip_prefix("--edgezero-staging-config=")
+                .map(str::to_owned)
+        })
+        .collect();
+    let deploy_args: Vec<String> = args
+        .iter()
+        .filter(|arg| !arg.starts_with("--edgezero-staging-config="))
+        .cloned()
+        .collect();
     // Strip both the explicitly-threaded `--service-id` and the
     // CLI-injected `--manifest-path` (which `fastly compute update`
     // doesn't understand), then keep only the passthrough flags
@@ -2189,7 +2289,7 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
     // NOT a `compute update` flag — it is lifted out here and applied to
     // the version below.
     let extra = args_without_flag_value(
-        &args_without_flag_value(args, "--service-id"),
+        &args_without_flag_value(&deploy_args, "--service-id"),
         "--manifest-path",
     );
     let passthrough = split_staged_passthrough(&extra);
@@ -2261,7 +2361,7 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
     // 4. Point the draft's runtime-override link at the STAGING selector store,
     //    so this version reads staged config and production keeps reading its
     //    own. Done while the version is still an editable draft.
-    relink_runtime_env_for_staging(&service_id, version, manifest_dir)?;
+    relink_runtime_env_for_staging(&service_id, version, &config_logical_ids, manifest_dir)?;
 
     // 5. Mark the draft version staged (no activation).
     run_fastly_status(
@@ -2298,29 +2398,51 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
 fn relink_runtime_env_for_staging(
     service_id: &str,
     version: u64,
+    config_logical_ids: &[String],
     manifest_dir: &Path,
 ) -> Result<(), String> {
-    // An app that declares no config stores has no selector to stage, so
-    // `provision` creates no staging store — and staging is still perfectly
-    // meaningful for it (staged CODE, no config to isolate). Requiring the store
-    // unconditionally would break `stage: true` for exactly those apps.
-    //
-    // Distinguish "nothing to stage" from "should be staged but isn't set up":
-    // if the PRODUCTION selector store is absent too, this app never provisioned
-    // a runtime-override store at all, so there is no config selection to
-    // isolate and the relink is a no-op.
-    if resolve_remote_config_store_id(RUNTIME_ENV_STORE).is_err() {
+    // An app that declares no config stores has no selector to isolate, so
+    // staging is still perfectly meaningful for it (staged CODE, no config): the
+    // draft keeps the inherited production link and this is a no-op.
+    if config_logical_ids.is_empty() {
         log::info!(
-            "no `{RUNTIME_ENV_STORE}` store on this account: the app selects no config at runtime, so staged version {version} has no config selector to isolate"
+            "app declares no config stores, so staged version {version} has no config selector to isolate; keeping the inherited runtime-env link"
         );
         return Ok(());
     }
 
-    let staging_store_id = resolve_remote_config_store_id(RUNTIME_ENV_STAGING_STORE).map_err(|err| {
-        format!(
-            "staged deploy needs the `{RUNTIME_ENV_STAGING_STORE}` config store, which holds the selector pointing at your staged config. This app HAS a `{RUNTIME_ENV_STORE}` store, so without the staging twin the staged version would read PRODUCTION config -- this deploy is refused rather than serve it.\n  Run `edgezero provision --adapter fastly` to create it.\n  underlying error: {err}"
-        )
-    })?;
+    // Classify the PRODUCTION runtime-override store. Fail CLOSED on a lookup
+    // FAILURE (CLI missing / non-zero exit / schema drift) — treating "couldn't
+    // tell" as "no store" would stage a version that silently reads production
+    // config. A genuine `NotFound` means the app never provisioned a
+    // runtime-override store (no adapter/logging/config overrides at all), so
+    // there is nothing to isolate and the relink is a no-op.
+    let production_id = match classify_remote_config_store(RUNTIME_ENV_STORE)? {
+        ConfigStoreLookup::Found(id) => id,
+        ConfigStoreLookup::NotFound => {
+            log::info!(
+                "no `{RUNTIME_ENV_STORE}` store on this account: the app selects no config at runtime, so staged version {version} has no config selector to isolate"
+            );
+            return Ok(());
+        }
+        ConfigStoreLookup::SchemaDrift(detail) => {
+            return Err(format!(
+                "could not parse `fastly config-store list --json` while resolving `{RUNTIME_ENV_STORE}` for a staged deploy: {detail}.\n  Refusing to stage rather than risk serving PRODUCTION config. Pin a known-compatible fastly CLI version and retry."
+            ));
+        }
+    };
+
+    // Mirror production's runtime overrides into the staging twin, overriding
+    // only the config selectors to `<logical>_staging`, then point THIS draft at
+    // the twin. Create the twin on demand so a staged deploy never depends on a
+    // prior provision having created it.
+    let staging_store_id = ensure_staging_selector_store()?;
+    mirror_production_to_staging(
+        &production_id,
+        &staging_store_id,
+        config_logical_ids,
+        manifest_dir,
+    )?;
 
     // Drop the inherited production link first: a version cannot carry two links
     // under the same name.
@@ -3619,9 +3741,10 @@ build = \"cargo build --release\"
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret + runtime-env + staging twin + 1 selector
-        // entry per declared config store = 6 status lines.
-        assert_eq!(out.len(), 6, "dry-run rows: {out:?}");
+        // 1 KV + 1 config + 1 secret + runtime-env = 4 status lines. The staging
+        // twin is created and populated by a staged deploy, NOT by provision, so
+        // it does not appear here.
+        assert_eq!(out.len(), 4, "dry-run rows: {out:?}");
         assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
         assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
@@ -3630,17 +3753,9 @@ build = \"cargo build --release\"
             "runtime-env store row: {out:?}",
         );
         assert!(
-            out[4].contains(
-                "would run `fastly config-store create --name=edgezero_runtime_env_staging`"
-            ),
-            "staging selector store row: {out:?}",
-        );
-        // The selector entry names the key the RUNTIME reads, pointed at the
-        // key `config push --staging` writes.
-        assert!(
-            out[5].contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY")
-                && out[5].contains("app_config_staging"),
-            "staging selector entry row: {out:?}",
+            !out.iter()
+                .any(|row| row.contains("edgezero_runtime_env_staging")),
+            "provision must NOT create the staging twin (a staged deploy owns it): {out:?}",
         );
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
@@ -5143,6 +5258,11 @@ build = \"cargo build --release\"
                printf '%s\\n' '{update_stdout}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging\"}}]'\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
+               case \"$*\" in\n    \
+                 *--store-id=ENVSEL1*) printf '%s\\n' '[{{\"item_key\":\"EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL\",\"item_value\":\"debug\"}}]' ;;\n    \
+                 *) printf '%s\\n' '[]' ;;\n  \
+               esac\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[{{\"id\":\"LINK1\",\"name\":\"edgezero_runtime_env\"}}]'\n\
              fi\n\
@@ -5268,6 +5388,62 @@ build = \"cargo build --release\"
     }
 
     #[test]
+    fn staging_entries_from_production_mirrors_and_overrides() {
+        // Production carries a non-config override, an explicit config selector,
+        // and a __NAME redirect. The twin must copy the non-config entries
+        // verbatim and redirect EVERY declared config store to `<logical>_staging`
+        // — including one production has no explicit entry for (it relies on the
+        // runtime default; the twin must NOT inherit that default).
+        let production = vec![
+            (
+                "EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL".to_owned(),
+                "debug".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+                "custom_prod_key".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
+                "app_config".to_owned(),
+            ),
+        ];
+        let out = staging_entries_from_production(
+            &production,
+            &["app_config".to_owned(), "feature_flags".to_owned()],
+        );
+
+        // Non-selector overrides copied verbatim.
+        assert!(out.contains(&(
+            "EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL".to_owned(),
+            "debug".to_owned()
+        )));
+        assert!(out.contains(&(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
+            "app_config".to_owned()
+        )));
+        // The selector production HAD is overridden to `<logical>_staging`, NOT
+        // production's custom value.
+        assert!(out.contains(&(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+            "app_config_staging".to_owned()
+        )));
+        assert!(!out.iter().any(|(_, value)| value == "custom_prod_key"));
+        // The declared store production LACKED a selector for still gets one.
+        assert!(out.contains(&(
+            "EDGEZERO__STORES__CONFIG__FEATURE_FLAGS__KEY".to_owned(),
+            "feature_flags_staging".to_owned()
+        )));
+        // Exactly one entry per selector key (no duplicate from the copy path).
+        assert_eq!(
+            out.iter()
+                .filter(|(key, _)| key == "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn find_resource_link_id_matches_on_link_name_not_resource_name() {
         // The link's `name` is an alias defaulting to the resource's name. The
         // staging relink depends on that alias: a store named
@@ -5297,10 +5473,34 @@ build = \"cargo build --release\"
         // The defect this closes: a clone inherits the active version's links,
         // so without a relink the staged version opens production's selector
         // store and reads PRODUCTION config -- `config push --staging` would
-        // write a key nothing ever reads.
-        let (result, argv) =
-            run_deploy_staged_with_fake("SUCCESS: Updated package (service SVC1, version 7)", &[]);
+        // write a key nothing ever reads. The CLI threads the declared config
+        // store as `--edgezero-staging-config=<logical>`.
+        let (result, argv) = run_deploy_staged_with_fake(
+            "SUCCESS: Updated package (service SVC1, version 7)",
+            &["--edgezero-staging-config=app_config"],
+        );
         result.expect("staged deploy must succeed");
+
+        // The twin MIRRORS production: the non-selector override is copied
+        // verbatim, and the config selector is upserted (redirected to
+        // `app_config_staging` via stdin) into the staging store.
+        assert!(
+            argv.iter().any(|line| line.starts_with(
+                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL"
+            )),
+            "production's non-config override must be mirrored into the twin: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|line| line.starts_with(
+                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+            )),
+            "the config selector must be written into the twin: {argv:?}"
+        );
+        // The mirror runs while the draft is still editable, before the relink.
+        let mirror_idx = argv
+            .iter()
+            .position(|line| line.starts_with("config-store-entry update --store-id=STAGEID1"))
+            .expect("mirror upsert");
 
         // The inherited production link is dropped: a version cannot hold two
         // links under one name.
@@ -5326,6 +5526,10 @@ build = \"cargo build --release\"
         // Order matters: delete before create (name collision), and both while
         // the version is still an editable draft -- i.e. before staging.
         assert!(delete_idx < create_idx, "delete must precede create");
+        assert!(
+            mirror_idx < delete_idx,
+            "the twin must be mirrored before the draft is relinked to it"
+        );
         let stage_idx = argv
             .iter()
             .position(|line| line.starts_with("service-version stage"))
@@ -5341,10 +5545,10 @@ build = \"cargo build --release\"
     fn deploy_staged_works_for_an_app_that_selects_no_config() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        // An app declaring no config stores has no runtime-override store, so
-        // `provision` creates no staging twin — and staging is still meaningful
-        // for it (staged CODE, no config to isolate). Requiring the staging store
-        // unconditionally broke `stage: true` for exactly these apps.
+        // An app declaring no config stores threads no
+        // `--edgezero-staging-config`, so there is no selector to isolate:
+        // staging is still meaningful (staged CODE, no config), the draft keeps
+        // the inherited link, and no config-store lookup happens at all.
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let script_path = dir.path().join("fastly");
@@ -5374,18 +5578,82 @@ build = \"cargo build --release\"
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_fails_closed_when_the_staging_selector_store_is_missing() {
+    fn deploy_staged_auto_creates_the_staging_twin_when_absent() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        // A staged version with no staging selector store would silently serve
-        // PRODUCTION config. Refuse rather than stage that.
+        // A staged deploy owns the twin end to end: if the account has no
+        // staging store yet, the deploy creates it (rather than failing), so a
+        // provisioned app can stage without a separate setup step.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let record = dir.path().join("argv.log");
+        let marker = dir.path().join("twin-created");
+        let script_path = dir.path().join("fastly");
+        // Stateful fake: `config-store list` includes the twin ONLY after a
+        // `config-store create` has touched the marker.
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{record}'\n\
+             if [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               printf '%s\\n' 'SUCCESS: Updated package (service SVC1, version 7)'\n\
+             elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"create\" ]; then\n  \
+               : > '{marker}'\n\
+             elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
+               if [ -f '{marker}' ]; then\n    \
+                 printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging\"}}]'\n  \
+               else\n    \
+                 printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}}]'\n  \
+               fi\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
+               printf '%s\\n' '[]'\n\
+             elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
+               printf '%s\\n' '[{{\"id\":\"LINK1\",\"name\":\"edgezero_runtime_env\"}}]'\n\
+             fi\n\
+             exit 0\n",
+            record = record.display(),
+            marker = marker.display(),
+        );
+        fs::write(&script_path, script).expect("write fake");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        let _path = PathPrepend::new(dir.path());
+
+        let app = tempdir().expect("app dir");
+        fs::write(app.path().join("fastly.toml"), "name = \"app\"\n").expect("write fastly.toml");
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+
+        deploy_staged(&[
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+            "--manifest-path".to_owned(),
+            app.path().join("fastly.toml").display().to_string(),
+            "--edgezero-staging-config=app_config".to_owned(),
+        ])
+        .expect("staged deploy must auto-create the twin and succeed");
+
+        let argv = fs::read_to_string(&record).unwrap_or_default();
+        assert!(
+            argv.lines()
+                .any(|line| line == "config-store create --name=edgezero_runtime_env_staging"),
+            "the twin must be created on demand: {argv}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_staged_fails_closed_when_config_store_list_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // If the store listing can't be parsed (a CLI schema change), we cannot
+        // tell whether production config exists — refuse rather than risk a
+        // staged version that silently serves PRODUCTION config.
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let script_path = dir.path().join("fastly");
-        // `config-store list` returns no staging store.
         fs::write(
             &script_path,
-            "#!/bin/sh\nif [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  printf '%s\\n' 'SUCCESS: Updated package (service SVC1, version 7)'\nelif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\\n' '[{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}]'\nfi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  printf '%s\\n' 'SUCCESS: Updated package (service SVC1, version 7)'\nelif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\\n' 'not json at all'\nfi\nexit 0\n",
         )
         .expect("write fake");
         let mut perms = fs::metadata(&script_path).expect("meta").permissions();
@@ -5402,11 +5670,12 @@ build = \"cargo build --release\"
             "SVC1".to_owned(),
             "--manifest-path".to_owned(),
             app.path().join("fastly.toml").display().to_string(),
+            "--edgezero-staging-config=app_config".to_owned(),
         ])
-        .expect_err("a staged deploy without the staging selector store must fail");
+        .expect_err("an unreadable config-store listing must fail closed");
         assert!(
-            err.contains("edgezero_runtime_env_staging") && err.contains("provision"),
-            "the error must name the missing store and point at provision: {err}"
+            err.contains("Refusing to stage") || err.contains("could not parse"),
+            "the error must explain the refusal: {err}"
         );
     }
 

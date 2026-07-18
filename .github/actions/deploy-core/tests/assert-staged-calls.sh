@@ -45,6 +45,27 @@ assert_comment_precedes_stage() {
     fail "the comment was applied after staging; it must precede it"
 }
 
+# The staging twin must MIRROR production's runtime overrides: the non-config
+# override (LOG_LEVEL) is copied verbatim and the config selector is redirected
+# to `<logical>_staging`, both written into the twin (STAGESEL1) before the
+# relink. Without the mirror the staged version would lose production's adapter /
+# logging overrides.
+assert_twin_mirrors_production() {
+  local log="$1"
+  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL' "$log" ||
+    fail "production's non-config override was not mirrored into the staging twin"
+  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY' "$log" ||
+    fail "the config selector was not written into the staging twin"
+
+  # The mirror must land before the relink points the draft at the twin.
+  local mirror_line create_line
+  mirror_line=$(grep -nE '^fastly config-store-entry update .*--store-id=STAGESEL1' "$log" | head -n 1 | cut -d: -f1)
+  create_line=$(grep -n '^fastly resource-link create ' "$log" | head -n 1 | cut -d: -f1)
+  if [[ -n "$mirror_line" && -n "$create_line" ]] && ((mirror_line >= create_line)); then
+    fail "the twin must be mirrored BEFORE the draft is relinked to it"
+  fi
+}
+
 # The staged draft must be re-pointed at the STAGING selector store, or it reads
 # production config and `config push --staging` writes a key nothing reads. The
 # link name stays `edgezero_runtime_env` (what the runtime opens); only the store
@@ -79,6 +100,7 @@ main() {
   assert_update_flags "$update"
   assert_no_comment_on_update "$log"
   assert_comment_precedes_stage "$log"
+  assert_twin_mirrors_production "$log"
   assert_relinked_to_staging_selector "$log"
 
   # The staged version must thread out of deploy-fastly, or the healthcheck and
