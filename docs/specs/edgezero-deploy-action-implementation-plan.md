@@ -165,10 +165,12 @@ reference to port from. Most transfer with light changes:
    - CLI (`edgezero-adapter-fastly` + `edgezero-cli`): add `--staging` to
      `config push`. `config.rs` already resolves one push entry
      `(key, body)` where `key = args.key.unwrap_or(logical_store_id)`; when
-     `--staging` is set, derive the staging variant `<key>_staging` (same
-     resolved store, different key). Mirror the derivation in `config diff` so a
-     staged diff compares against the staged key. Colocated tests: production key
-     unchanged, `--staging` suffixes, explicit `--key` + `--staging` composes.
+     `--staging` is set, derive the staging variant `<logical>_staging` (same
+     resolved store, different key). `--key` is mutually exclusive with
+     `--staging` (a derived staging key an explicit key would never match).
+     Mirror the derivation in `config diff` so a staged diff compares against the
+     staged key. Colocated tests: production key unchanged, `--staging` derives
+     `<logical>_staging`, explicit `--key` + `--staging` is refused.
    - CLI canonical line: after a successful non-dry-run write, `config.rs` emits
      `pushed-key=<key>` (via `log::info!`, which the CLI routes to stdout) so the
      wrapper can thread the written key out as an output.
@@ -183,8 +185,8 @@ reference to port from. Most transfer with light changes:
      every other `FASTLY_*` alias blanked. Outputs `pushed-key`, `store`.
    - Contract + smoke coverage: a `config-push.sh` argv test (staging appends
      `--staging`; production does not); the smoke fixture's fake `fastly` gains
-     `config-store list` / `config-store-entry update` handlers, and a staged push
-     asserts the `<key>_staging` key reached the store.
+     `config-store list` / `config-store-entry` handlers, and a staged push
+     asserts the `<logical>_staging` key reached the store.
 
 6. **Scripts layout**
    - Provider-neutral scripts under `deploy-core/`; the Fastly install + checksum

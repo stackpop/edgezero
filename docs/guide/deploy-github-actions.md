@@ -202,34 +202,40 @@ Pushes your app's typed config to a Fastly config store. This is **separate from
 deploy** — deploy activates code, it never writes runtime config — so you run it
 as its own step, whenever config should move.
 
-| Input               | Required | Default         | Meaning                                                             |
-| ------------------- | -------- | --------------- | ------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                |
-| `fastly-api-token`  | Yes      | —               | Fastly API token. Injected only into the push step.                 |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                    |
-| `working-directory` | No       | `.`             | App directory (holds the manifest + typed config).                  |
-| `manifest`          | No       | empty           | `edgezero.toml` path relative to `working-directory`.               |
-| `app-config`        | No       | empty           | Typed config file path (default: resolved from the manifest).       |
-| `store`             | No       | empty           | Logical config-store id (default: the manifest's resolved id).      |
-| `key`               | No       | empty           | Explicit base key (default: the logical store id).                  |
-| `deploy-to`         | No       | `production`    | `staging` writes the `<key>_staging` variant in the **same** store. |
+| Input               | Required | Default         | Meaning                                                                                                             |
+| ------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                                |
+| `fastly-api-token`  | Yes      | —               | Fastly API token. Injected only into the push step.                                                                 |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                                    |
+| `working-directory` | No       | `.`             | App directory (holds the manifest + typed config).                                                                  |
+| `manifest`          | No       | empty           | `edgezero.toml` path relative to `working-directory`.                                                               |
+| `app-config`        | No       | empty           | Typed config file path (default: resolved from the manifest).                                                       |
+| `store`             | No       | empty           | Logical config-store id (default: the manifest's resolved id).                                                      |
+| `key`               | No       | empty           | Explicit base key for a **production** push (default: the logical store id). Not allowed with `deploy-to: staging`. |
+| `deploy-to`         | No       | `production`    | `staging` writes the `<logical-store-id>_staging` variant in the **same** store.                                    |
 
-Outputs: `pushed-key` (the key written — the base key, or its `_staging` variant)
-and `store` (the logical store id, when supplied).
+Outputs: `pushed-key` (the key written — the base key, or the derived `_staging`
+variant) and `store` (the logical store id, when supplied).
 
 **Staging config is the same store, a different key.** Fastly config stores are
 not versioned like staged service versions, so `deploy-to: staging` writes your
-config under `<key>_staging` alongside the production key — never overwriting what
-the live service reads.
+config under `<logical-store-id>_staging` alongside the production key — never
+overwriting what the live service reads. The staging key is _derived_ from the
+store's logical id, so `key` is production-only: combining `key` with
+`deploy-to: staging` is rejected up front (an explicit staging key would be
+written where no staged version ever reads).
 
 What makes a _staged version_ actually read that key is the other half: a staged
 deploy re-points its own `edgezero_runtime_env` link at the
-`edgezero_runtime_env_staging` selector store, which `provision` creates. Fastly
-resource links are per-version, so the staged version reads `<key>_staging` while
-production keeps reading `<key>`. **Run `provision` before your first staged
-deploy** — without that store a staged deploy fails closed rather than silently
-serving production config. A typo like `deploy-to: Staging` is likewise rejected
-up front, never silently pushed to production.
+`edgezero_runtime_env_staging` selector store, mirroring production's runtime
+overrides into it and redirecting only the config selectors to
+`<logical-store-id>_staging`. The staged deploy creates and populates that twin
+on demand — no separate setup step — so the staged version reads
+`<logical>_staging` while production keeps reading `<logical>`. If the deploy
+cannot even read the store listing (so it cannot tell whether production config
+exists), it fails closed rather than risk serving production config. A typo like
+`deploy-to: Staging` is likewise rejected up front, never silently pushed to
+production.
 
 ## Strict lifecycle values (fail closed)
 

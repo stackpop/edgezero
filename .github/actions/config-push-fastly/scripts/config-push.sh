@@ -10,9 +10,10 @@ set -euo pipefail
 # wrapper blanks every other FASTLY_* alias, so an inherited FASTLY_ENDPOINT or
 # FASTLY_TOKEN can never redirect or re-auth the push.
 #
-# Staging: `deploy-to: staging` passes `--staging` to the CLI, which
-# writes the `<key>_staging` variant in the SAME store — never the production key
-# the live service reads.
+# Staging: `deploy-to: staging` passes `--staging` to the CLI, which writes the
+# `<logical-store-id>_staging` variant in the SAME store — the key the staging
+# selector points a staged version at, never the production key the live service
+# reads. `key` is production-only (the wrapper rejects key + staging up front).
 #
 # Path confinement: working-directory, manifest, and app-config are
 # caller strings handed to a credential-bearing CLI, so each is canonicalized
@@ -95,7 +96,7 @@ main() {
   if [[ -n "$app_config" ]]; then app_config=$(confine_to_app "$app_config" "$app_dir" app-config); fi
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the
-  # push non-interactive in CI; --staging selects the `<key>_staging` variant.
+  # push non-interactive in CI; --staging selects the `<logical>_staging` variant.
   local argv=("$cli_bin" config push --adapter fastly)
   if [[ -n "$manifest" ]]; then argv+=(--manifest "$manifest"); fi
   if [[ -n "$app_config" ]]; then argv+=(--app-config "$app_config"); fi

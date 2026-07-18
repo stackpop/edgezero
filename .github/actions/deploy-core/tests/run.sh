@@ -332,12 +332,16 @@ test_wrapper_validate() {
   run_cpf() {
     env EDGEZERO__APP__CLI__ARTIFACT_PRESENT="${A:-true}" \
       EDGEZERO__FASTLY__API_TOKEN_PRESENT="${T:-true}" \
-      EDGEZERO__DEPLOY__TO="${D:-production}" bash "$cpf"
+      EDGEZERO__DEPLOY__TO="${D:-production}" \
+      EDGEZERO__CONFIG_PUSH__KEY_PRESENT="${K:-false}" bash "$cpf"
   }
   assert_succeeds "config-push: production passes" run_cpf
   D=staging assert_succeeds "config-push: staging passes" run_cpf
   D=Staging assert_fails "config-push: a deploy-to typo is rejected (no silent prod)" run_cpf
   A=false assert_fails "config-push: missing artifact is rejected" run_cpf
+  # A staging key is derived, so an explicit key with staging is refused early.
+  D=production K=true assert_succeeds "config-push: an explicit key is fine for production" run_cpf
+  D=staging K=true assert_fails "config-push: key + staging is rejected up front" run_cpf
 
   # healthcheck + rollback: artifact presence only.
   local hc="$ACTIONS_DIR/healthcheck-fastly/scripts/validate.sh"

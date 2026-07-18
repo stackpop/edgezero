@@ -29,17 +29,17 @@ inputs:
     required: false
     default: ""
   key:
-    description: "Optional explicit base key (default: the logical store id)."
+    description: "Optional explicit base key for a PRODUCTION push (default: the logical store id). Not allowed with deploy-to: staging, whose key is derived."
     required: false
     default: ""
   deploy-to:
-    description: "'production' writes the base key; 'staging' writes the <key>_staging variant in the same store."
+    description: "'production' writes the base key; 'staging' writes the <logical-store-id>_staging variant in the same store (the key the staging selector points at)."
     required: false
     default: production
 
 outputs:
   pushed-key:
-    description: The key that was written (the base key, or its _staging variant).
+    description: The key that was written (the base key, or the derived _staging variant).
     value: ${{ steps.push.outputs['pushed-key'] }}
   store:
     description: The logical config-store id, when supplied.
@@ -54,6 +54,7 @@ runs:
         EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
         EDGEZERO__FASTLY__API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
+        EDGEZERO__CONFIG_PUSH__KEY_PRESENT: ${{ inputs.key != '' && 'true' || 'false' }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""

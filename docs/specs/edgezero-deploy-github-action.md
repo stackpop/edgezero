@@ -441,8 +441,9 @@ means the **same config store, a different key**:
 
 - **Production** writes the config blob under the resolved key (the logical store
   id, or an explicit `--key`).
-- **Staging** writes under the staging variant of that key — `<key>_staging` —
-  in the **same** store.
+- **Staging** writes under the staging variant of the logical store id —
+  `<logical-store-id>_staging` — in the **same** store. The staging key is
+  _derived_, so `--key` is mutually exclusive with `--staging`.
 
 The CLI gains a `config push --staging` flag (the same `--staging` verb
 `deploy`/`healthcheck`/`rollback` already use); the wrapper exposes it as
@@ -451,7 +452,7 @@ lifecycle actions.
 
 #### 5.5.2 What makes a staged version _read_ the staged key
 
-Writing `<key>_staging` is only half of it. The runtime picks its config key from
+Writing `<logical>_staging` is only half of it. The runtime picks its config key from
 the `EDGEZERO__STORES__CONFIG__<ID>__KEY` entry of a config store it opens by the
 name `edgezero_runtime_env`. A staged deploy clones the active version, and **a
 clone inherits its resource links** — so on its own, a staged version opens the
@@ -462,8 +463,11 @@ too.
 Fastly resource links are **per-version**, and a link's `name` is an overridable
 alias. That is the seam:
 
-- `provision` creates a second store, `edgezero_runtime_env_staging`, whose
-  selector points each declared config store at `<id>_staging`.
+- A staged deploy owns a second store, `edgezero_runtime_env_staging`, creating
+  it on demand and **mirroring** production's runtime overrides into it — copying
+  adapter/logging/`__NAME` entries verbatim and redirecting only each declared
+  config store's selector to `<id>_staging`. Because the mirror runs at deploy
+  time, the twin always reflects production's _current_ overrides.
 - A staged deploy, while the draft is still editable, drops the inherited
   `edgezero_runtime_env` link and links the **staging store** under that same
   name. The runtime opens `edgezero_runtime_env` and gets the staging selector;
@@ -476,25 +480,28 @@ So the pieces compose:
 | active (prod)  | `edgezero_runtime_env`             | `app_config`         |
 | staged (draft) | `edgezero_runtime_env_staging`     | `app_config_staging` |
 
-A staged deploy **fails closed** when the staging selector store is absent: a
-version that silently served production config would be worse than a refused
-deploy. Run `provision` to create it.
+A staged deploy **fails closed** when it cannot read the store listing (so it
+cannot tell whether production config exists): a version that silently served
+production config would be worse than a refused deploy. When the store listing is
+readable, the twin is created and mirrored automatically — no separate setup
+step. An app that declares no config store has no selector to isolate, so its
+staged version keeps the inherited link (staged code, no config to isolate).
 
 #### 5.5.3 Inputs / outputs
 
-| Input               | Required | Default       | Meaning                                                         |
-| ------------------- | -------- | ------------- | --------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                            |
-| `fastly-api-token`  | Yes      | —             | Injected only into the push step.                               |
-| `working-directory` | No       | `.`           | App directory (holds the manifest + typed config).              |
-| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact.                                |
-| `manifest`          | No       | empty         | `edgezero.toml` path relative to `working-directory`.           |
-| `app-config`        | No       | empty         | Typed config file path (default: resolved from the manifest).   |
-| `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).  |
-| `key`               | No       | empty         | Explicit base key (default: the logical store id).              |
-| `deploy-to`         | No       | `production`  | `staging` writes the `<key>_staging` variant in the same store. |
+| Input               | Required | Default       | Meaning                                                                                                         |
+| ------------------- | -------- | ------------- | --------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                                                                            |
+| `fastly-api-token`  | Yes      | —             | Injected only into the push step.                                                                               |
+| `working-directory` | No       | `.`           | App directory (holds the manifest + typed config).                                                              |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact.                                                                                |
+| `manifest`          | No       | empty         | `edgezero.toml` path relative to `working-directory`.                                                           |
+| `app-config`        | No       | empty         | Typed config file path (default: resolved from the manifest).                                                   |
+| `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).                                                  |
+| `key`               | No       | empty         | Explicit base key for a production push (default: the logical store id). Not allowed with `deploy-to: staging`. |
+| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the same store.                                    |
 
-Outputs: `pushed-key` (the key that was written — the base key, or its
+Outputs: `pushed-key` (the key that was written — the base key, or the derived
 `_staging` variant), `store` (the resolved logical store id).
 
 A staged deploy plus a staged config push and a healthcheck compose the same way
