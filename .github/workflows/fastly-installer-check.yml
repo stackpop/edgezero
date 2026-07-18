@@ -48,7 +48,11 @@ jobs:
           pinned=$(jq -r '.fastly.version' "$EDGEZERO__FASTLY__VERSIONS_JSON")
           fastly_bin="$EDGEZERO__ACTION__TOOL_ROOT/provider-bin/fastly"
           [[ -x "$fastly_bin" ]] || { echo "installer did not place an executable fastly at $fastly_bin" >&2; exit 1; }
-          reported=$("$fastly_bin" version | head -n 1)
+          # Capture the full output and take the first line via parameter
+          # expansion — piping to `head` would SIGPIPE `fastly` (exit 141) under
+          # `set -o pipefail`.
+          reported=$("$fastly_bin" version)
+          reported=${reported%%$'\n'*}
           echo "pinned=$pinned reported=$reported"
           [[ "$reported" == *"$pinned"* ]] ||
             { echo "installed Fastly CLI reports '$reported', expected version $pinned" >&2; exit 1; }
