@@ -229,13 +229,16 @@ Workflow shape:
    `Cargo.toml` already pins the Fastly adapter);
 4. run `deploy-fastly` (set `stage: true` for staging) with the CLI artifact,
    `working-directory: trusted-server`, typed Fastly credentials, and optional
-   `deploy-args: ["--comment", …]`; capture `fastly-version`;
+   `deploy-args: ["--comment", …]`; capture `fastly-version` and, for a
+   production deploy, `previous-version` (the rollback target);
 5. run `healthcheck-fastly` with the CLI artifact, typed Fastly credentials
    (`fastly-api-token`, `fastly-service-id`), `deploy-to`, `domain`, and the
    captured `fastly-version`;
 6. on failure, run `rollback-fastly` with the CLI artifact, typed Fastly
-   credentials (`fastly-api-token`, `fastly-service-id`), and the same
-   `deploy-to` / `fastly-version`; and
+   credentials (`fastly-api-token`, `fastly-service-id`), the same `deploy-to` /
+   `fastly-version`, and — for a **production** rollback — `rollback-to` set to
+   the captured `previous-version` (Fastly cannot infer it; staging ignores it);
+   and
 7. write a summary from the action outputs.
 
 ### 6.4 Required deployer changes

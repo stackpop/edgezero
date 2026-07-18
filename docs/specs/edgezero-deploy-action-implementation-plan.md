@@ -151,7 +151,9 @@ reference to port from. Most transfer with light changes:
      `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
      `FASTLY_API_TOKEN` in the step env; outputs `healthy`, `status-code`.
    - `rollback-fastly`: thin wrapper — inputs `app-cli-artifact`, `app-cli-bin`,
-     `fastly-api-token`, `fastly-service-id`, `fastly-version`, `deploy-to`;
+     `fastly-api-token`, `fastly-service-id`, `fastly-version`, `rollback-to`
+     (production only — the version to re-activate, captured from
+     `deploy-fastly`'s `previous-version`; Fastly cannot infer it), `deploy-to`;
      runs `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
      `FASTLY_API_TOKEN` in the step env; outputs `rolled-back-to`.
    - Both map `fastly-service-id` → `--service-id` and `fastly-api-token` →

@@ -299,11 +299,12 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 **`deploy-fastly` outputs**
 
-| Output            | Meaning                                                                                    |
-| ----------------- | ------------------------------------------------------------------------------------------ |
-| `fastly-version`  | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4). |
-| `source-revision` | Passthrough from the engine.                                                               |
-| `app-cli-version` | Passthrough from the engine.                                                               |
+| Output             | Meaning                                                                                                                                 |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `fastly-version`   | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4).                                              |
+| `previous-version` | Production only: the version active BEFORE this deploy — the rollback target for `rollback-fastly`'s `rollback-to`. Empty on a first deploy. |
+| `source-revision`  | Passthrough from the engine.                                                                                                            |
+| `app-cli-version`  | Passthrough from the engine.                                                                                                            |
 
 The wrapper sets `adapter: fastly`, `target: wasm32-wasip1`, the action-owned
 `deploy-flags` (`--service-id …`, `--non-interactive`) so deployments cannot
@@ -960,8 +961,12 @@ healthcheck → rollback, cache behavior, credential scope, and public outputs.
 
 ### 15.4 Installer / live gates
 
-- Scheduled CI verifies the pinned Fastly CLI installer still produces a runnable
-  binary matching the expected version, without deploying.
+- A path-filtered CI gate (`fastly-installer-check.yml`) verifies the pinned
+  Fastly CLI installer still produces a runnable binary matching the expected
+  version, without deploying. It runs on PRs/pushes that touch the installer, its
+  pinned `versions.json`, or the shared `common.sh` — validating a version / URL
+  / checksum bump against the real release exactly when it changes, rather than on
+  a fixed schedule that would download the CLI on unrelated runs.
 - A protected manual workflow may eventually deploy a disposable Fastly fixture
   before any stable version alias is created; it runs only from protected
   branches or approved dispatch, never from fork PRs, uses isolated resources,
