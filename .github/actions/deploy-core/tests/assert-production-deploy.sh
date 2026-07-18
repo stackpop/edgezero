@@ -11,6 +11,7 @@ set -euo pipefail
 # Reads (env):
 #   GITHUB_WORKSPACE                      required  checkout root (holds the smoke fixture output)
 #   EDGEZERO__TEST__FASTLY_VERSION        required  the production deploy's fastly-version output
+#   EDGEZERO__TEST__PREVIOUS_VERSION      required  the captured rollback target (previous-version)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
@@ -19,6 +20,7 @@ source "$SCRIPT_DIR/../scripts/common.sh"
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local version_out="${EDGEZERO__TEST__FASTLY_VERSION:-}"
+  local previous_out="${EDGEZERO__TEST__PREVIOUS_VERSION:-}"
   local env_seen="$workspace/fixture-app/env-seen.txt"
   local argv="$workspace/fixture-app/deploy-argv.txt"
 
@@ -31,6 +33,12 @@ main() {
 
   [[ "$version_out" == "7" ]] ||
     fail "expected fastly-version=7 out of the action, got '${version_out:-<empty>}'"
+
+  # The rollback target was captured BEFORE the deploy via `active-version`: the
+  # fake Fastly API reports version 40 active, so previous-version must be 40. A
+  # non-zero active-version exit would have failed the deploy closed instead.
+  [[ "$previous_out" == "40" ]] ||
+    fail "expected previous-version=40 (the captured rollback target), got '${previous_out:-<empty>}'"
 
   # The action supplies --non-interactive itself, so a manifest-command deploy
   # (this fixture is one) cannot block on a TTY prompt in CI.

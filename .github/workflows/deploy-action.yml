@@ -130,6 +130,14 @@ jobs:
           app-cli-package: fixture-app-cli
           working-directory: fixture-app
 
+      # The production deploy runs a manifest-command deploy (fake-deploy.sh), but
+      # deploy-fastly now also captures the rollback target first via a real
+      # `active-version` Fastly API call. Provide a fake `curl` (and `fastly`) so
+      # that capture resolves the active version (40) instead of hitting the real
+      # API. The deploy itself still exercises the manifest command.
+      - name: Set up fake Fastly API for rollback-target capture
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+
       - name: Deploy fixture (production) with local action
         id: deploy
         uses: ./.github/actions/deploy-fastly
@@ -144,6 +152,7 @@ jobs:
       - name: Assert production deploy, version threading, and credential boundary
         env:
           EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs['fastly-version'] }}
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
         run: .github/actions/deploy-core/tests/assert-production-deploy.sh
 
   # Config push: the real config-push-fastly wrapper against a fake `fastly`,
