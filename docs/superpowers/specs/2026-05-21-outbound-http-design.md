@@ -2716,7 +2716,13 @@ Commands covered by the **five** gate sites above (one inside `execute(..)` — 
 | `edgezero demo` (feature `demo-example`) | `run_demo` → Axum runner. `run_demo()` takes **no path or loader** and reads no manifest file, so a file-based gate is impossible. **Locked resolution — gate on baked manifest metadata via a new `Hooks` accessor** (see below) | `run_demo()` calls `ensure_capabilities("axum", <App as Hooks>::manifest().as_contract())` before the Axum runner starts |
 
 **The `demo` gate needs a baked-manifest accessor — `app!` must emit one.**
-`run_demo()` (`crates/edgezero-cli/src/demo_server.rs`) just calls `run_app::<App>()`;
+`run_demo()` (`crates/edgezero-cli/src/demo_server.rs`) hardcodes `run_app::<App>()` for the
+concrete `app_demo_core::App`, so a test cannot inject a crafted `Hooks`. **Add a generic
+`run_demo_for<A: Hooks + App>()`** that gates on `<A as Hooks>::manifest().as_contract()` then
+runs `A`; `run_demo()` becomes a one-line `run_demo_for::<app_demo_core::App>()`. The failure
+test calls `run_demo_for::<TestApp>()` with a `TestApp` whose `manifest_json()` returns the
+crafted contract — no manifest file, no macro re-expansion. Without this seam the required
+gate test is unwritable.
 it has no path, no `ManifestLoader`, and no way to find `edgezero.toml` at runtime. But
 the `app!` macro **already parses, validates, and serializes the manifest at compile
 time** (`crates/edgezero-macros/src/app.rs`: `manifest.finalize()` →
@@ -4157,8 +4163,15 @@ service — this distinction is explicit so a green capability check is not misr
  // checked: bare `+=` trips `clippy::arithmetic_side_effects` (denied).
           sent = sent.saturating_add(chunk.len());
           let unwritten = writer.write_all(chunk.to_vec()).await; // backpressure; cancellable
-          if !unwritten.is_empty() {                              // reader gone (send failed/cancelled)
-              return Err(EdgeError::bad_gateway("outbound upload stream closed by peer"));
+          if !unwritten.is_empty() {
+              // READER GONE is NOT an error. The origin stopped reading — almost always
+              // because it is about to send (or already sent) an EARLY FINAL response
+              // (413 Payload Too Large, 401, a redirect, …). Returning an error here
+              // would DISCARD that valid response and report 502 instead, violating
+              // "a completed exchange, including non-2xx, is Ok". So end the pump
+              // cleanly and let `send` surface the response.
+              drop(writer);
+              return Ok::<(), EdgeError>(());
           }
       }
       drop(writer);                                               // EOF
@@ -4166,15 +4179,28 @@ service — this distinction is explicit so a green capability check is not misr
       Ok::<(), EdgeError>(())
   };
 
- // ONE droppable future covering pump + send. Both results are kept and the PUMP's
- // result takes precedence: a `join!` returns `(pump_result, send_result)`, and a pump
- // failure (source error / cap overflow) must win over whatever `send` reports, because
- // a truncated or cap-violating upload is the *root cause*. Earlier drafts wrote
- // `join!(pump, send).1`, which discarded the pump result entirely — a silent data bug.
+  // ORDERED race, NOT `join!`. `join!` waits for BOTH, so it could (a) delay an
+  // already-available response until a stalled *source* pull finally ends, or (b) let
+  // the pump's outcome override a valid early final response. The rule: a completed
+  // `send` (Ok OR Err) IS the exchange result — the origin has spoken, the upload is
+  // moot; a pump SOURCE error / cap-overflow only matters if it happens BEFORE any
+  // response. (Reader-gone is Ok in the pump above, so it never competes.) No `loop`:
+  // every branch returns, so a `loop` here would trip `clippy::never_loop`.
   let exchange = async move {
-      let (pump_res, send_res) = futures::join!(pump, client::send(req));
-      pump_res?;                          // pump error wins (bad_request / bad_gateway)
-      send_res.map_err(map_spin_send_err) // else the send outcome (transport → §4.4 Errors)
+      let mut send_fut = pin!(client::send(req));
+      let pump_fut = pin!(pump);
+      match select(send_fut, pump_fut).await {
+          // send finished first — the answer; dropping the pump future cancels any
+          // in-flight upload write and the pending source pull.
+          Either::Left((send_res, _pump)) => send_res.map_err(map_spin_send_err),
+          // pump errored before a response — a real client-side upload failure
+          // (source yielded Err, or cap overflow); no response can be trusted.
+          Either::Right((Err(pump_err), _send)) => Err(pump_err),
+          // pump finished OK (full body sent, or reader-gone) — await the STILL-PENDING
+          // send future returned by `select` (awaiting `send_fut` directly would be a
+          // second mutable borrow).
+          Either::Right((Ok(()), send_still)) => send_still.await.map_err(map_spin_send_err),
+      }
   };
 
  // `remaining` is Option<Duration>, NOT Result — `?` here would not compile in a
@@ -4357,7 +4383,7 @@ async fn send_all_runs_requests_concurrently() {
 | --- | --- | --- | --- |
 | One outbound request | yes | yes | — |
 | Many concurrent outbound requests (wall-clock ≪ sum) | aggregation | — | yes |
-| Empty `send_all(vec![])` → empty vec | yes | — | — |
+| Empty `send_all(vec![])` → empty vec — Tier 1 asserts the core contract shape; **Tier 2 re-runs it per adapter** as part of the mandatory send_all conformance suite (each adapter implements `send_all` independently, so Tier 1 cannot prove the shipped orchestration) | yes | yes | — |
 | Response body buffering (`Buffered` mode) | yes | yes | — |
 | Streamed response body passthrough (`Streamed` mode) | yes | yes | yes |
 | Max response size exceeded → 502 | yes | yes | — |
@@ -4420,11 +4446,14 @@ async fn send_all_runs_requests_concurrently() {
 | **`validate_for_dispatch` runs at DISPATCH, not construction** (§3.1.4): `OutboundRequest::get(url)?.body(payload)` — a `GET` validated at construction that then acquires a body via the infallible `.body()` setter — is still rejected with `bad_request` when it reaches `send` / `send_all`. **This is the regression guard**: a construction-only check passes this test vacuously, so the test must assert the rejection happens with the body attached *after* a successful `get(..)` | yes | yes | — |
 | **`GET`/`HEAD` + `Body::Stream` → `bad_request` unconditionally** (§3.1.4), even for a stream that would yield zero bytes — emptiness is not observable without consuming the stream, and the validator does not peek-and-rechain. Asserts the documented false-positive is deliberate | yes | yes | — |
 | **`StoredError` reconstruction** (§3.4.5): after a poisoning drain, **every** access (`body_bytes` / `json_within` / `form_within` / `into_request`) returns an `EdgeError` with the **same variant, status, and message**. Asserts poison is reproducible even though `EdgeError` is not `Clone` (its `Internal` variant wraps non-clonable `anyhow::Error`). Also asserts the documented loss: a reconstructed `internal` error's `inner()` carries the message but **not** the original `anyhow` source chain | yes | — | — |
-| **`demo` capability gate reads the baked manifest** (§3.5.3): a test-only `Hooks` impl overriding `manifest_json()` to return a crafted manifest that `required`s a capability Axum only `BestEffort`-supports causes `run_demo()` to exit non-zero. Asserts the gate works with **no manifest file on disk** — the whole point of the baked accessor. A `Hooks` impl with the default `manifest_json() == None` → no capability contract → `demo` runs | yes | — | — |
+| **`demo` capability gate reads the baked manifest** (§3.5.3): a test-only `Hooks` impl overriding `manifest_json()` to return a crafted manifest that `required`s a capability Axum only `BestEffort`-supports causes `run_demo_for::<TestApp>()` to exit non-zero (the injectable seam; `run_demo()` itself is `run_demo_for::<app_demo_core::App>()`). Asserts the gate works with **no manifest file on disk** — the whole point of the baked accessor. A `Hooks` impl with the default `manifest_json() == None` → no capability contract → `demo` runs | yes | — | — |
 | **Baked manifest FAILS CLOSED on invalid contract** (§3.5.3): a crafted `manifest_json()` returning valid JSON that is missing required manifest fields (e.g. `{}`) makes `from_baked_json` return `BakedManifest::Malformed` (it runs `validate()`, not just parse+finalize), so `ensure_capabilities` **hard-fails** — it does NOT proceed against defaulted empty capabilities. Regression guard: parse-only (skipping `validate()`) would make `{}` `Present` and silently disable enforcement | yes | — | — |
 | **Spin `allowed_outbound_hosts` — `provision` writes** (§3.5.4): `edgezero provision --adapter spin` renders `[capabilities.outbound].hosts` into `spin.toml`, **preserving sibling fields and comments** (`toml_edit`), and is a no-op under `--dry-run`. Absent `[capabilities.outbound].hosts` → writes `["https://*:*"]` and **never** widens to include `http://*:*` (security-default regression guard) | yes | — | — |
 | **Spin `allowed_outbound_hosts` — `build`/`serve`/`deploy` validate, never write** (§3.5.4): drift between `spin.toml` and the manifest hard-fails with the expected list rendered; `spin.toml` is **byte-identical** afterwards (asserts the build path does not rewrite a git-tracked, user-owned file). Comparison is over **canonicalized sets**: `https://x:443` vs `https://x`, and a reordered list, must **not** report drift | yes | — | — |
 | **Spin sync hook fires for shell-overridden commands** (§3.5.4) — **dead-code regression guard.** A scaffolded manifest declares `[adapters.spin.commands].build`, so `edgezero build --adapter spin` takes the `manifest_command` → `run_shell` branch and **never reaches `SpinCliAdapter::execute`**. The test asserts the drift check **still fires** — proving the hook lives in `edgezero_cli::adapter::execute` *before* the `manifest_command` branch, not in the adapter. A hook placed in the adapter passes every other Spin test and silently fails only this one | yes | — | — |
+| **Spin early final response is NOT discarded** (§4.4): an origin that returns 413/401/redirect **before** consuming the full streamed request body — so it stops reading and the guest write sees reader-gone — yields that response (non-2xx `Ok`), NOT a 502. Regression guard: the pump's reader-gone must end the pump cleanly (Ok), and the ordered `select` must let a completed `send` win; a `join!` + pump-precedence design fails this by mapping reader-gone to `bad_gateway` | yes | — | yes |
+| **Spin stalled source does not delay an available response** (§4.4): if `send` produces a response while `source.next()` is still stalled, the response returns immediately — it is NOT held until the deadline (which would wrongly produce 504). Asserts the ordered race returns on `send`, not on both futures | yes | — | yes |
+| **Spin pump SOURCE error / cap-overflow still surfaces when there is no response** (§4.4): a `source.next()` that yields `Err`, or a body exceeding `max_request_body_bytes`, before any response → `bad_gateway` / `bad_request` (400). Asserts the ordered race propagates a pre-response pump error, so early-response tolerance does not swallow genuine client-side failures | yes | — | yes |
 | **Cloudflare `set-cookie` multi-value, upstream → core** (§4.2): two upstream `set-cookie` headers survive as **two** values in the core `HeaderMap`. Regression guard for `HeaderMap::insert` (which removes all previous values) — the test must assert **both** cookies are present, not just that a `set-cookie` exists. Valid on this repo's pinned `compatibility_date = "2023-05-01"`, which enables workerd's per-`set-cookie` `entries()` behaviour | — | yes | yes |
 | **Cloudflare `Set-Cookie` multi-value, core → client** (§4.2): a handler emitting **two** `Set-Cookie` headers ships **both** to the client. Regression guard for `Headers::set` (which replaces) on the client-facing response path — distinct from the row above, which is the upstream-response path. Both must use `append` | — | yes | yes |
 | **Cloudflare non-ASCII request header does not panic** (§4.2): proxying `x-app-display-name: café` through the CF outbound path completes without unwinding. Regression guard for `Headers::from(&HeaderMap)`'s `value.to_str().unwrap()` — `HeaderValue::to_str` errors on any byte outside visible ASCII, so this **panics the worker** today | — | yes | yes |
@@ -4772,7 +4801,7 @@ Other changes:
   explicitly:** (1) the workspace denies `clippy::missing_trait_methods`, so relying on
   a trait default is a hard error; (2) a `static` in a trait **default** body is **one
   item shared by all implementors** (proven), so a caching default would serve app A's
-  manifest to app B. `ensure_capabilities` takes `BakedManifest` and **fails closed** on
+  manifest to app B. `ensure_capabilities` takes a lifetime-bearing `ManifestContract<'_>` (**not** `BakedManifest` — the file-backed gate sites hold non-`'static` local borrows); `ManifestContract` and the inherent `BakedManifest::as_contract()` conversion both live in `edgezero-core` beside `BakedManifest`, not in the CLI crate. The gate **fails closed** on
   `Malformed`.
 - `src/lib.rs` — re-export new modules; drop proxy re-exports.
 - `Cargo.toml` — `MockOutboundClient` under the existing `test-utils` feature.
