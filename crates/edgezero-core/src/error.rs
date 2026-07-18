@@ -74,8 +74,8 @@ impl EdgeError {
         // type: string "hunter2", expected u32`), and this message is serialised
         // into the HTTP error body. The config blob may hold secrets, so the
         // value must not escape — report only the category. The field PATH is
-        // safe (a schema location, not a value) and is preserved, so the
-        // operator still knows which field is out of date.
+        // NOT assumed safe: a map-key segment is stored config data (see
+        // `redact_serde_path`), so it is redacted too.
         use serde_json::error::Category;
         let category = match serde_err.inner().classify() {
             Category::Data => "wrong type or invalid value",
@@ -88,7 +88,7 @@ impl EdgeError {
                 "typed app-config is out of date ({category}; value redacted) — \
                  run `<app-cli> config push` for this deploy"
             ),
-            field_path: serde_err.path().to_string(),
+            field_path: redact_serde_path(serde_err.path()),
         }
     }
 
@@ -273,6 +273,47 @@ impl IntoResponse for EdgeError {
     }
 }
 
+/// Render a `serde_path_to_error` path with its string segments REDACTED.
+///
+/// A path segment for a struct field (`items`) and one for a MAP KEY
+/// (`items.SECRET`) are the same `Segment::Map` in this API — indistinguishable.
+/// A map key is config DATA and may be a secret, and this path is serialised into
+/// the HTTP error body, so every string segment is replaced with `<redacted>`.
+/// Sequence indices are kept (they are positions, not values), so the operator
+/// still sees the shape/depth; the exact path is available from a local
+/// `config validate`, which runs the same deserialize without an HTTP boundary.
+fn redact_serde_path(path: &serde_path_to_error::Path) -> String {
+    use serde_path_to_error::Segment;
+    let mut out = String::new();
+    for segment in path {
+        match segment {
+            Segment::Seq { index } => {
+                out.push('[');
+                out.push_str(&index.to_string());
+                out.push(']');
+            }
+            Segment::Map { .. } | Segment::Enum { .. } => {
+                if !out.is_empty() && !out.ends_with(']') {
+                    out.push('.');
+                }
+                out.push_str("<redacted>");
+            }
+            Segment::Unknown => {
+                if !out.is_empty() && !out.ends_with(']') {
+                    out.push('.');
+                }
+                out.push('?');
+            }
+        }
+    }
+    // No segments means a root-level error; preserve serde_path_to_error's "."
+    // sentinel (a marker, not data) rather than returning an empty path.
+    if out.is_empty() {
+        return path.to_string();
+    }
+    out
+}
+
 fn json_or_text<T: Serialize>(payload: &T) -> Body {
     Body::json(payload).unwrap_or_else(|_| Body::text("internal error"))
 }
@@ -343,14 +384,67 @@ mod tests {
         let result: Result<Outer, _> = serde_path_to_error::deserialize(de);
         let serde_err = result.expect_err("expected deserialization error");
 
-        let expected_path = serde_err.path().to_string();
         let err = EdgeError::config_out_of_date_from_serde(&serde_err);
 
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!err.message().is_empty());
         match err {
             EdgeError::ConfigOutOfDate { field_path, .. } => {
-                assert_eq!(field_path, expected_path);
+                // String path segments are REDACTED (a struct field and a map key
+                // are the same segment kind here, so neither can be echoed), but
+                // the depth/structure is preserved.
+                assert_eq!(field_path, "<redacted>.<redacted>");
+                assert!(!field_path.contains("service") && !field_path.contains("timeout_ms"));
+            }
+            EdgeError::BadRequest { .. }
+            | EdgeError::Internal { .. }
+            | EdgeError::MethodNotAllowed { .. }
+            | EdgeError::NotFound { .. }
+            | EdgeError::NotImplemented { .. }
+            | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
+        }
+    }
+
+    #[test]
+    fn config_out_of_date_from_serde_does_not_leak_a_map_key() {
+        use serde::Deserialize;
+        use std::collections::BTreeMap;
+
+        #[derive(Debug, Deserialize)]
+        struct Outer {
+            #[expect(dead_code, reason = "only used to drive deserialization")]
+            items: BTreeMap<String, Inner>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Inner {
+            #[expect(dead_code, reason = "only used to drive deserialization")]
+            port: u32,
+        }
+
+        // A MAP KEY holding a secret. The type error is under that key, so the
+        // serde path is `items.SECRET_MAP_KEY.port` — the key must not leak into
+        // the field_path that the HTTP body serialises.
+        const SENTINEL: &str = "SUPER_SECRET_MAP_KEY";
+        let json = format!(r#"{{"items": {{"{SENTINEL}": {{"port": "nope"}}}}}}"#);
+        let de = &mut serde_json::Deserializer::from_str(&json);
+        let result: Result<Outer, _> = serde_path_to_error::deserialize(de);
+        let serde_err = result.expect_err("expected deserialization error");
+
+        let err = EdgeError::config_out_of_date_from_serde(&serde_err);
+        match err {
+            EdgeError::ConfigOutOfDate {
+                field_path,
+                message,
+            } => {
+                assert!(
+                    !field_path.contains(SENTINEL),
+                    "a stored map key must never reach the field_path: {field_path}"
+                );
+                assert!(
+                    !message.contains(SENTINEL),
+                    "a stored map key must never reach the message: {message}"
+                );
             }
             EdgeError::BadRequest { .. }
             | EdgeError::Internal { .. }

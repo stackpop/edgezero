@@ -290,6 +290,15 @@ impl Adapter for FastlyCliAdapter {
         "fastly"
     }
 
+    fn preflight_config_key(&self, key: &str) -> Result<(), String> {
+        // Reject a reserved-namespace key here, BEFORE the CLI's remote read, so
+        // an invalid `--key` fails offline rather than after a list/describe.
+        // The write path re-checks (with the full batch), so this is a strict
+        // early gate, not the only one.
+        let entry = [(key.to_owned(), String::new())];
+        reject_reserved_root_keys(&entry)
+    }
+
     fn provision(
         &self,
         manifest_root: &Path,
@@ -756,8 +765,17 @@ impl Adapter for FastlyCliAdapter {
         else {
             return Ok(ReadConfigEntry::MissingStore);
         };
+        // `contents` MUST be a table of `key = "value"` pairs. A scalar or array
+        // there is malformed store state — reporting `MissingKey` would render an
+        // inaccurate "all values added" diff, so degrade to "cannot diff" like
+        // the other unreadable-prior-state cases.
+        let Some(contents_tbl) = contents.as_table_like() else {
+            return Ok(ReadConfigEntry::Unsupported(
+                "local config-store `contents` is not a table; cannot diff the prior value",
+            ));
+        };
         // The contents table is `key = "value"` pairs.
-        match contents.get(key) {
+        match contents_tbl.get(key) {
             Some(item) => {
                 let Some(value) = item.as_str() else {
                     return Ok(ReadConfigEntry::Unsupported(
@@ -765,10 +783,8 @@ impl Adapter for FastlyCliAdapter {
                     ));
                 };
                 // Resolve chunk pointers using the same toml contents table.
-                let resolved =
-                    resolve_fastly_config_value(key, value.to_owned(), |chunk_key| match contents
-                        .get(chunk_key)
-                    {
+                let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
+                    match contents_tbl.get(chunk_key) {
                         Some(chunk_item) => {
                             let chunk_val = chunk_item.as_str().ok_or_else(|| {
                                 format!(
@@ -779,7 +795,8 @@ impl Adapter for FastlyCliAdapter {
                             Ok(Some(chunk_val.to_owned()))
                         }
                         None => Ok(None),
-                    });
+                    }
+                });
                 match resolved {
                     Ok(body) => Ok(ReadConfigEntry::Present(body)),
                     // A corrupt/invalid prior value must NOT block a local push.
@@ -1177,6 +1194,27 @@ fn write_fastly_local_config_store(
         match orphan_chunk_keys(plan) {
             Ok(orphans) => {
                 for key in orphans {
+                    // Never remove an orphan whose VALUE is itself a
+                    // runtime-readable root (a valid direct envelope or a
+                    // pointer). A chunk-shaped key can hold one — e.g. a small
+                    // envelope padded so its first chunk is a whole envelope —
+                    // and it is independently readable, so deleting it would drop
+                    // live config. Mirrors the cloud GC value-based protection: a
+                    // real chunk payload is a raw fragment (not pointer-kind, not
+                    // a valid envelope) and prunes normally.
+                    let is_root_like = contents_tbl
+                        .get(&key)
+                        .and_then(toml_edit::Item::as_str)
+                        .is_some_and(|value| {
+                            value_is_pointer_kind(value) || gc_classify_root(&key, value).is_ok()
+                        });
+                    if is_root_like {
+                        warnings.push(format!(
+                            "warning: kept `{key}` -- its value is a runtime-readable root \
+                             (envelope or pointer), not a chunk payload"
+                        ));
+                        continue;
+                    }
                     contents_tbl.remove(&key);
                 }
             }
@@ -1917,29 +1955,30 @@ fn assemble_pointer_chunks(
     // path -- do not reserve from a number the store supplied when growing from
     // the bytes we actually read costs nothing.
     let mut assembled = String::new();
-    for chunk in &pointer.chunks {
+    // The chunk KEY is pointer-controlled (a malformed pointer can carry any
+    // string there), so diagnostics name a POSITION, not the key. `root_key` is
+    // the operator's own logical entry key and is named for context, as the rest
+    // of the GC diagnostics do.
+    for (position, chunk) in pointer.chunks.iter().enumerate() {
         let Some(value) = value_by_key.get(chunk.key.as_str()) else {
             return Err(format!(
-                "refusing to reclaim: root `{root_key}` references `{}`, which is absent from the \
-                 store listing (the listing may be incomplete/paginated, or the store is already \
-                 inconsistent); nothing was deleted",
-                chunk.key
+                "refusing to reclaim: root `{root_key}` references chunk {position}, which is \
+                 absent from the store listing (the listing may be incomplete/paginated, or the \
+                 store is already inconsistent); nothing was deleted"
             ));
         };
         if value.len() != chunk.len {
             return Err(format!(
-                "refusing to reclaim: root `{root_key}` says `{}` is {} bytes but the store holds \
-                 {}; nothing was deleted",
-                chunk.key,
+                "refusing to reclaim: root `{root_key}` says chunk {position} is {} bytes but the \
+                 store holds {}; nothing was deleted",
                 chunk.len,
                 value.len()
             ));
         }
         if sha256_hex(value.as_bytes()) != chunk.sha256 {
             return Err(format!(
-                "refusing to reclaim: the stored value of `{}` does not match the SHA-256 that \
-                 root `{root_key}` records for it; nothing was deleted",
-                chunk.key
+                "refusing to reclaim: the stored value of chunk {position} does not match the \
+                 SHA-256 that root `{root_key}` records for it; nothing was deleted"
             ));
         }
         assembled.push_str(value);
@@ -2210,11 +2249,13 @@ fn delete_config_store_entry(store_id: &str, key: &str) -> Result<(), String> {
     // successful reclamation is strictly worse than a retry, and a retry is
     // free: `config gc` re-lists the store, so a key that really is gone simply
     // will not appear as a candidate next run.
+    // Redact stderr: a Fastly error can quote the entry value back, which on the
+    // delete path would put a stored config value into CI logs.
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(format!(
-        "`fastly config-store-entry delete --store-id={store_id} --key={key} --auto-yes` exited with status {}\nstderr: {}",
+        "`fastly config-store-entry delete --store-id={store_id} --key={key} --auto-yes` exited with status {}\n{}",
         output.status,
-        stderr.trim()
+        redact_stderr(&stderr)
     ))
 }
 
@@ -4798,6 +4839,35 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// A `contents` that is not a table (a scalar or array) is malformed store
+    /// state. It must degrade to `Unsupported`, not fall through to `MissingKey`
+    /// (which would render an inaccurate "all values added" diff).
+    #[test]
+    fn read_config_entry_local_non_table_contents_is_unsupported() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(
+            &fastly_toml,
+            format!("[local_server.config_stores.{TEST_CONFIG_ID}]\ncontents = 42\n"),
+        )
+        .expect("seed");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("a non-table contents must NOT abort the read");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "a non-table `contents` must degrade to Unsupported, not MissingKey"
+        );
+    }
+
     /// Spec 12.3 + 9.3: a second oversized push must converge the
     /// runtime on the NEW envelope — chunk keys are content-addressed
     /// by the full-envelope SHA, so push B writes a new chunk-set and
@@ -6217,6 +6287,96 @@ echo 'unexpected' >&2; exit 1
                 .any(|(key, _)| key.contains(CHUNK_KEY_INFIX)),
             "prior chunks must be pruned: {after}"
         );
+    }
+
+    /// The local prune must NOT delete a prior chunk key whose VALUE is a
+    /// runtime-readable root (a valid direct envelope). A small envelope padded
+    /// with trailing whitespace chunks so that chunk 0 is itself a whole,
+    /// verifying envelope; deleting it would drop live config.
+    #[test]
+    fn push_config_entries_local_keeps_a_chunk_key_holding_a_valid_envelope() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        // A padded envelope: chunk 0 is the whole envelope plus trailing spaces
+        // (still a valid, verifying envelope on its own).
+        let envelope = BlobEnvelope::new(json!({ "k": "v" }), "2026-06-22T00:00:00Z".into());
+        let mut padded = serde_json::to_string(&envelope).unwrap();
+        padded.push_str(&" ".repeat(8_200));
+        let entries = prepare_fastly_config_entries(TEST_CONFIG_ID, &padded).expect("expand");
+        let chunk0_key = entries[0].0.clone();
+        // Confirm the fixture: chunk 0's value verifies as an envelope.
+        let parsed: BlobEnvelope = serde_json::from_str(&entries[0].1).expect("chunk0 parses");
+        parsed.verify().expect("chunk0 verifies");
+
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), padded)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("first push");
+
+        // Re-push a direct value: the prior generation's chunks become orphans.
+        let direct = make_test_envelope(100);
+        let warnings = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("second push");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+
+        assert!(
+            contents.contains_key(&chunk0_key),
+            "a chunk key holding a valid envelope is a runtime-readable root and must be kept: \
+             {after}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("runtime-readable root")),
+            "the operator must be warned that the key was kept: {warnings:?}"
+        );
+    }
+
+    /// `preflight_config_key` rejects a reserved-namespace key, so the CLI can
+    /// reject an invalid `--key` BEFORE any provider I/O.
+    #[test]
+    fn preflight_config_key_rejects_reserved_infix() {
+        let bad = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        let err = FastlyCliAdapter
+            .preflight_config_key(&bad)
+            .expect_err("a reserved-namespace key must be rejected");
+        assert!(
+            err.contains("reserved infix"),
+            "error names the reason: {err}"
+        );
+        // A normal key passes.
+        FastlyCliAdapter
+            .preflight_config_key("app_config")
+            .expect("a normal key must pass preflight");
     }
 
     /// A logical key containing the reserved chunk infix is rejected

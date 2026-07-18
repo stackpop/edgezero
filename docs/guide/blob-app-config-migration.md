@@ -313,9 +313,19 @@ fastly config-store-entry list --store-id=<id> --json | jq -r '.[].item_key'
 sqlite3 .spin/sqlite_key_value.db "SELECT key FROM spin_key_value WHERE store='<id>'"
 ```
 
-For Fastly, `config gc` automates this safely — it derives the live set from the
-store and deletes only unreferenced chunk entries you have asserted are old
-enough:
+> **`config gc` does NOT do this per-leaf cleanup.** It reclaims a different kind
+> of orphan — the **chunk** entries an _oversized_ blob leaves behind when it is
+> re-pushed (each generation is content-addressed, so a change orphans the whole
+> previous chunk set). It never touches your old per-leaf keys. Run the per-leaf
+> deletes above for the migration cutover; run `config gc` (below) as an ongoing
+> reclamation for chunked stores.
+
+### Reclaiming orphaned chunk entries (Fastly, oversized configs)
+
+If your app-config blob exceeds Fastly's 8 000-character entry limit it is stored
+as content-addressed chunks, and every re-push orphans the previous generation.
+`config gc` reclaims them safely — it derives the live set from the store and
+deletes only unreferenced chunk entries you have asserted are old enough:
 
 ```sh
 # Preview every orphan and its age (dry-run by default):

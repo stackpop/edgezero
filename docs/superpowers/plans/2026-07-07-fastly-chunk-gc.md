@@ -195,8 +195,10 @@ cannot be used as a supersession clock.
 
 ### Task 7 — Verification ✅
 
-- [x] `cargo test --workspace --all-targets` (20 suites), `cargo test -p
-  edgezero-adapter-fastly --features cli` (132), the CLI gc gating tests.
+- [x] `cargo test --workspace --all-targets`, `cargo test -p
+  edgezero-adapter-fastly --features cli` (156 at time of writing; the count
+  grows with each review round, so it is not pinned here), the CLI gc gating
+  tests.
 - [x] `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets
   --all-features -- -D warnings` (no per-site `#[expect]` for length).
 - [x] `cargo check --workspace --all-targets --features "fastly cloudflare spin"`;

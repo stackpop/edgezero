@@ -570,6 +570,21 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
                 chunk_ref.len
             )));
         }
+        // Every chunk EXCEPT the last is a full payload: the writer walks
+        // `CHUNK_PAYLOAD_TARGET` bytes then retreats at most 3 to the previous
+        // UTF-8 boundary (the longest codepoint is 4 bytes), so a non-last chunk
+        // is always >= CHUNK_PAYLOAD_TARGET - 3. This pins the split layout to
+        // what the writer emits and bounds the chunk count (hence the runtime
+        // fetch fan-out) to about `envelope_len / CHUNK_PAYLOAD_TARGET`; a
+        // hand-authored pointer of many tiny chunks is rejected.
+        let is_last = position == pointer.chunks.len().saturating_sub(1);
+        if !is_last && chunk_ref.len < CHUNK_PAYLOAD_TARGET.saturating_sub(3) {
+            return Err(bad(&format!(
+                "references a non-final chunk at position {position} of only {} bytes; this writer \
+                 fills every chunk but the last to within 3 bytes of {CHUNK_PAYLOAD_TARGET}",
+                chunk_ref.len
+            )));
+        }
         total_len = total_len.checked_add(chunk_ref.len).ok_or_else(|| {
             bad("declares chunk lengths that overflow when summed (not a real envelope)")
         })?;
@@ -723,12 +738,15 @@ pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue,
 pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Result<(), String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
-    let actual = sha256_hex(assembled.as_bytes());
-    if actual != generation_sha {
-        return Err(format!(
-            "the chunk set reassembles to SHA-256 `{actual}`, which is not the generation its own \
-             keys name (`{generation_sha}`), so these chunks are not the generation they claim"
-        ));
+    // Neither hash is echoed: `generation_sha` comes from the chunk KEYS
+    // (pointer-controlled) and `actual` is derived from the reassembled config
+    // bytes. Both are stored/derived strings, and this message is logged.
+    if sha256_hex(assembled.as_bytes()) != generation_sha {
+        return Err(
+            "the chunk set does not reassemble to the generation its own keys name (hashes \
+             redacted), so these chunks are not the generation they claim"
+                .to_owned(),
+        );
     }
     // Content-addressing proves the bytes are SELF-CONSISTENT, not that EdgeZero
     // wrote them (a forger can content-address their own envelope -- see this
@@ -1260,6 +1278,39 @@ mod tests {
         })
         .expect("a real chunked value must still resolve");
         assert_eq!(resolved, envelope);
+    }
+
+    /// A hand-authored pointer of MANY tiny chunks (metadata-consistent: dense,
+    /// summing to `envelope_len`) is rejected — its non-final chunks are far
+    /// below a full payload, so it is not writer output. This bounds the runtime
+    /// fetch fan-out.
+    #[test]
+    fn pointer_with_many_tiny_chunks_is_rejected() {
+        use std::fmt::Write as _;
+        let root = "app_config";
+        let sha = "a".repeat(64);
+        // 100 chunks of 100 bytes each = 10_000 bytes (> entry limit, dense).
+        let mut chunks = String::new();
+        for idx in 0..100_u32 {
+            if idx > 0 {
+                chunks.push(',');
+            }
+            write!(
+                chunks,
+                r#"{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.{idx}","len":100,"sha256":"x"}}"#
+            )
+            .expect("write to String");
+        }
+        let bogus = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{chunks}],"data_sha256":"","envelope_len":10000,"envelope_sha256":"{sha}"}}"#
+        );
+        let mut fetched = false;
+        let err = resolve_fastly_config_value(root, bogus, |_key| {
+            fetched = true;
+            Ok(None)
+        })
+        .expect_err("a tiny-chunk fan-out must be rejected");
+        assert!(!fetched, "must reject before fetching 100 chunks: {err}");
     }
 
     /// A root that is itself valid but long enough that its DERIVED chunk keys

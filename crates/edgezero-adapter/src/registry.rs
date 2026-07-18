@@ -300,6 +300,22 @@ pub trait Adapter: Sync + Send {
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
 
+    /// Reject a config key that is invalid for this adapter, BEFORE any
+    /// provider I/O. Called by `config push` ahead of the remote read, so an
+    /// invalid key fails offline instead of after a `list`/`describe`
+    /// round-trip.
+    ///
+    /// Default: accept. The Fastly adapter overrides this to reject a key
+    /// colliding with its reserved chunk namespace — the check the write path
+    /// would otherwise apply only after the read.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if the key is invalid.
+    #[inline]
+    fn preflight_config_key(&self, _key: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Provision the platform resources backing each store id the
     /// user declared. Returns a list of human-readable
     /// status lines the CLI logs verbatim — one line per resource

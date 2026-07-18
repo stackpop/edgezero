@@ -447,6 +447,11 @@ where
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
     let local_sha = local_envelope.sha256.clone();
 
+    // Reject an invalid key BEFORE any provider I/O — otherwise a reserved-key
+    // `--key` would trigger a list/describe round-trip only to be rejected by
+    // the write path afterwards.
+    ctx.adapter.preflight_config_key(&key)?;
+
     // First read + diff.
     let remote = read_remote(ctx.adapter, args.local, &paths, &ctx.store, &key)?;
     let approved_remote_sha =
@@ -610,11 +615,14 @@ where
     // Branch per variant, render, determine outcome.
     let outcome: DiffOutcome = match &remote {
         ReadConfigEntry::Present(body) => {
-            let remote_envelope: BlobEnvelope = serde_json::from_str(body)
-                .map_err(|err| format!("remote envelope parse failed: {err}"))?;
+            // Redacted: a serde parse error embeds the input (the stored blob,
+            // which may hold secrets); the verify error is redacted at source.
+            let remote_envelope: BlobEnvelope = serde_json::from_str(body).map_err(|_err| {
+                "remote value is not a valid envelope (details redacted)".to_owned()
+            })?;
             remote_envelope
                 .verify()
-                .map_err(|err| format!("remote envelope verification failed: {err}"))?;
+                .map_err(|err| format!("remote envelope {err}"))?;
             if remote_envelope.sha256 == local_sha {
                 diff_info(&format!("# no changes (sha256 matches: {local_sha})"));
                 DiffOutcome::NoChanges
@@ -820,11 +828,12 @@ fn recheck_before_write(
 ) -> Result<RecheckOutcome, String> {
     let remote_now = read_remote(adapter, args.local, paths, store, key)?;
     if let ReadConfigEntry::Present(body_now) = remote_now {
-        let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now)
-            .map_err(|err| format!("post-consent remote envelope parse failed: {err}"))?;
+        let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now).map_err(|_err| {
+            "post-consent remote value is not a valid envelope (details redacted)".to_owned()
+        })?;
         remote_now_env
             .verify()
-            .map_err(|err| format!("post-consent remote envelope verification failed: {err}"))?;
+            .map_err(|err| format!("post-consent remote envelope {err}"))?;
         if remote_now_env.sha256 == local_sha {
             push_info(&format!(
                 "# concurrent push reached the same state (sha256 matches: {local_sha}); skipping write"
@@ -882,11 +891,12 @@ fn render_first_read_diff(
 ) -> Result<FirstReadOutcome, String> {
     match remote {
         ReadConfigEntry::Present(body_str) => {
-            let remote_envelope: BlobEnvelope = serde_json::from_str(body_str)
-                .map_err(|err| format!("remote envelope parse failed: {err}"))?;
+            let remote_envelope: BlobEnvelope = serde_json::from_str(body_str).map_err(|_err| {
+                "remote value is not a valid envelope (details redacted)".to_owned()
+            })?;
             remote_envelope
                 .verify()
-                .map_err(|err| format!("remote envelope verification failed: {err}"))?;
+                .map_err(|err| format!("remote envelope {err}"))?;
             if remote_envelope.sha256 == local_sha {
                 return Ok(FirstReadOutcome::NoChange);
             }

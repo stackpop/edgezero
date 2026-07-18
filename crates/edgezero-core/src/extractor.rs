@@ -1049,10 +1049,13 @@ async fn resolve_leaf(
                 })?
                 .to_owned();
             let bound = ctx.secret_store(&store_id_str).ok_or_else(|| {
+                // `store_id_str` is the blob's store_ref VALUE — config data that
+                // may be sensitive — and this message reaches the HTTP body. Name
+                // the field, not the stored id.
                 EdgeError::config_out_of_date(
                     format!(
-                        "blob declared store_ref `{store_id_str}` but \
-                         [stores.secrets] has no such id"
+                        "secret field `{leaf_path}` names a store_ref that is not declared in \
+                         [stores.secrets] (id redacted)"
                     ),
                     leaf_path.clone(),
                 )
@@ -1072,23 +1075,33 @@ async fn resolve_leaf(
 fn map_secret_error(
     err: SecretError,
     field_name: &str,
-    store_id: &str,
-    key_name: &str,
+    // The stored key name, the store id, and the provider's message/source are
+    // deliberately UNUSED in the messages below: they are blob- or
+    // provider-controlled strings that may reveal the secret or infrastructure,
+    // and these messages reach the HTTP body / logs. Every branch names only the
+    // offending FIELD (schema, safe). Kept in the signature so the redaction is
+    // visible at the one place these values could have been formatted.
+    _store_id: &str,
+    _key_name: &str,
 ) -> EdgeError {
     match err {
-        SecretError::NotFound { name } => EdgeError::config_out_of_date(
-            format!("secret `{name}` in store `{store_id}` not found"),
+        SecretError::NotFound { .. } => EdgeError::config_out_of_date(
+            format!(
+                "the secret referenced by `{field_name}` was not found in its store (identifier redacted)"
+            ),
             field_name.to_owned(),
         ),
-        SecretError::Validation(msg) => EdgeError::config_out_of_date(
-            format!("secret `{key_name}` in store `{store_id}` rejected: {msg}"),
+        SecretError::Validation(_msg) => EdgeError::config_out_of_date(
+            format!(
+                "the secret referenced by `{field_name}` was rejected by its store (details redacted)"
+            ),
             field_name.to_owned(),
         ),
-        SecretError::Unavailable => {
-            EdgeError::service_unavailable(format!("secret store `{store_id}` unreachable"))
-        }
-        SecretError::Internal(source) => EdgeError::internal(anyhow::anyhow!(
-            "secret `{key_name}` in store `{store_id}` produced unexpected store error: {source}"
+        SecretError::Unavailable => EdgeError::service_unavailable(format!(
+            "the secret store for `{field_name}` is unreachable"
+        )),
+        SecretError::Internal(_source) => EdgeError::internal(anyhow::anyhow!(
+            "secret resolution for `{field_name}` failed (details redacted)"
         )),
     }
 }
@@ -2386,11 +2399,12 @@ mod tests {
             !err.message().contains(SENTINEL),
             "the stored field value must never reach the client-facing message: {err:?}"
         );
-        // The field path is still useful and must be preserved.
+        // The field path segments are redacted (a struct field and a map key are
+        // indistinguishable in the serde path), but structure is preserved.
         if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
             assert!(
-                field_path.contains("timeout_ms"),
-                "the field path must still point at the offending field: {field_path}"
+                field_path.contains("<redacted>") && !field_path.contains("timeout_ms"),
+                "the field path must be redacted, not echo the field name: {field_path}"
             );
         }
     }
@@ -2448,11 +2462,12 @@ mod tests {
             matches!(err, EdgeError::ConfigOutOfDate { .. }),
             "deserialise failure must be ConfigOutOfDate: {err:?}"
         );
-        // serde_path_to_error should give us the field path.
+        // The field path segment is redacted (a struct field and a map key are
+        // the same serde-path segment, so the name cannot be echoed).
         if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
             assert_eq!(
-                field_path, "timeout_ms",
-                "serde_path_to_error must supply the field name: {err:?}"
+                field_path, "<redacted>",
+                "the field path segment must be redacted: {err:?}"
             );
         }
     }
@@ -2542,6 +2557,32 @@ mod tests {
                 "field_path names the secret field: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn app_config_secret_walk_error_does_not_leak_the_stored_key_name() {
+        use crate::config_store::{ConfigStore, ConfigStoreError};
+        struct BlobStore(String);
+        #[async_trait(?Send)]
+        impl ConfigStore for BlobStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+
+        // The blob's secret field holds the secret's KEY NAME — config data that
+        // may be sensitive. When resolution fails, that name (and any store id /
+        // provider message) must not reach the error, which becomes the HTTP body.
+        const SENTINEL: &str = "SUPER_SECRET_KEY_NAME";
+        let data = serde_json::json!({ "greeting": "hi", "api_token": SENTINEL });
+        let blob = make_envelope(data);
+        let ctx = ctx_with_config_and_secrets(BlobStore(blob), "key", NoopSecretStore, "vault");
+        let err = block_on(AppConfig::<SecretCfg>::from_request(&ctx))
+            .expect_err("missing secret must error");
+        assert!(
+            !err.message().contains(SENTINEL),
+            "the stored secret key name must never reach the error message: {err:?}"
+        );
     }
 
     // Build a RequestContext whose default secret store maps `default/{key}` ->
