@@ -1715,7 +1715,7 @@ mod tests {
             );
         }
         // Negative: the untyped variant must not survive template
-        // regeneration — Task 30's whole point was to eliminate the
+        // regeneration — the whole point was to eliminate the
         // bypass where scaffolded CLIs would silently skip typed
         // secret writeback.
         assert!(
@@ -1724,7 +1724,7 @@ mod tests {
         );
     }
 
-    /// Task 31: after `generate_new` returns, every adapter declared
+    /// after `generate_new` returns, every adapter declared
     /// in the generated `edgezero.toml` must have already run its
     /// local-mode `provision`, so the Cloudflare and Spin per-crate
     /// files (synthesised platform manifests + `.env`-style line
@@ -1872,7 +1872,7 @@ mod tests {
         }
     }
 
-    /// Task 31: after `generate_new` returns, the axum adapter's
+    /// after `generate_new` returns, the axum adapter's
     /// local-state directory (`.edgezero/`) and its `.env`
     /// placeholder file must already exist at the project root,
     /// courtesy of the scaffold-time provision loop dispatching to
@@ -1899,7 +1899,7 @@ mod tests {
         );
     }
 
-    /// Task 31: when any adapter's provision call fails, the error
+    /// when any adapter's provision call fails, the error
     /// bubbles out of the loop with the failing adapter's id, so
     /// operators can tell WHICH adapter blew up. Exercised via a
     /// direct call to the helper with a project root that has no

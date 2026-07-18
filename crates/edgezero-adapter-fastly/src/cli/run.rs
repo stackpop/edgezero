@@ -196,7 +196,7 @@ fn locate_artifact(
 /// §"Writeback ownership" — we deliberately don't emit
 /// `service_id = ""`).
 pub(crate) fn synthesise_fastly_toml(crate_name: &str, service_id: Option<&str>) -> String {
-    use toml_edit::{Array, DocumentMut, Item, Table, value};
+    use toml_edit::{DocumentMut, Item, Table, value};
 
     // The `name` field spells the adapter crate's Cargo package
     // name. The caller in `cli/mod.rs` reads this from the
@@ -214,12 +214,14 @@ pub(crate) fn synthesise_fastly_toml(crate_name: &str, service_id: Option<&str>)
     // -- but the return is discarded intentionally. Using `insert`
     // instead of `doc["..."] = ...` sidesteps `clippy::indexing_slicing`
     // (the index form panics if the key is missing; `insert` doesn't).
-    let mut authors = Array::new();
-    authors.push("");
-    doc.insert("authors", value(authors));
-    doc.insert("language", value("rust"));
+    // No `authors` key: the spec's normative Fastly baseline
+    // (spec §"Fastly (fastly.toml)") is `manifest_version` + `name` +
+    // `language` + `[scripts].build` + `[local_server]`. Emitting an
+    // empty `authors = [""]` array exceeded that baseline. Field order matches the spec's shown
+    // baseline so the exact-content test can pin it verbatim.
     doc.insert("manifest_version", value(3));
     doc.insert("name", value(crate_name));
+    doc.insert("language", value("rust"));
     if let Some(sid) = service_id {
         doc.insert("service_id", value(sid));
     }
@@ -229,13 +231,13 @@ pub(crate) fn synthesise_fastly_toml(crate_name: &str, service_id: Option<&str>)
     // `[local_server]` header is a placeholder the operator fills in
     // when seeding local viceroy state (config-store contents,
     // per-request backends, etc.).
-    doc.insert("local_server", Item::Table(Table::new()));
     let mut scripts = Table::new();
     scripts.insert(
         "build",
         value("cargo build --profile release --target wasm32-wasip1"),
     );
     doc.insert("scripts", Item::Table(scripts));
+    doc.insert("local_server", Item::Table(Table::new()));
     doc.to_string()
 }
 
@@ -311,25 +313,20 @@ mod tests {
     // ---------- synthesise_fastly_toml ----------
 
     #[test]
-    fn synthesises_minimal_fastly_toml_with_header_and_no_service_id() {
-        // Caller resolves the crate name from the adapter-crate
-        // Cargo.toml; the synth is a pure toml_edit shape emitter
-        // over the resolved value.
+    fn synthesises_fastly_toml_matches_spec_baseline_exactly() {
+        // Exact-content test: the
+        // synthesised fastly.toml with no tracked service_id must equal
+        // the spec's normative Fastly baseline byte-for-byte -- no
+        // `authors` array, no other extras.
         let out = synthesise_fastly_toml("demo-adapter-fastly", None);
-        assert!(out.starts_with("# edgezero-provision: v1"));
-        assert!(out.contains("manifest_version = 3"));
-        assert!(out.contains(r#"name = "demo-adapter-fastly""#));
-        assert!(out.contains(r#"language = "rust""#));
-        assert!(
-            out.contains(r#"authors = [""]"#),
-            "fastly.toml must ship the empty-authors line (scaffold parity): {out}"
-        );
-        assert!(out.contains("[scripts]"));
-        assert!(out.contains("[local_server]"));
-        assert!(
-            !out.contains("service_id"),
-            "no service_id key when None: {out}"
-        );
+        let expected = "# edgezero-provision: v1\n\
+             manifest_version = 3\n\
+             name = \"demo-adapter-fastly\"\n\
+             language = \"rust\"\n\n\
+             [scripts]\n\
+             build = \"cargo build --profile release --target wasm32-wasip1\"\n\n\
+             [local_server]\n";
+        assert_eq!(out, expected, "fastly.toml baseline drifted from spec");
     }
 
     #[test]

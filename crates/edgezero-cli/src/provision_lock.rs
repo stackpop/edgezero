@@ -61,8 +61,7 @@ impl ProvisionLock {
         let dot_edgezero = manifest_root.join(".edgezero");
         let path = dot_edgezero.join("provision.lock");
         // Reject a symlinked `.edgezero/` or `provision.lock` BEFORE
-        // creating or opening anything (PR #287 review round 9,
-        // blocking #1). `.edgezero/` is gitignored, so a hostile or
+        // creating or opening anything. `.edgezero/` is gitignored, so a hostile or
         // careless tree can carry either link without it showing up in
         // review: `OpenOptions::create(true).write(true)` follows a
         // symlinked final component and CREATES the target if the link
@@ -149,7 +148,7 @@ mod tests {
         );
     }
 
-    /// Regression (PR #287 review round 9, blocking #1): `.edgezero/`
+    /// Regression: `.edgezero/`
     /// is gitignored, so a symlinked one never shows up in review.
     /// `create_dir_all` + `OpenOptions::create` would follow it and we
     /// would hold a writable descriptor outside the project tree.

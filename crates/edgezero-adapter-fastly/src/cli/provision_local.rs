@@ -11,7 +11,7 @@ use edgezero_adapter::registry::{
 /// mutation, so operators can run `provision --local` without
 /// authenticating.
 ///
-/// The manifest must already exist (Task 8b's CLI bootstrap writes it
+/// The manifest must already exist (the CLI bootstrap writes it
 /// via `synthesise_fastly_toml`); we deliberately don't re-synthesise
 /// here because the app name isn't in scope at this call site.
 ///
@@ -42,7 +42,7 @@ pub(super) fn provision(
     let fastly_path = manifest_root.join(fastly_rel);
     if !fastly_path.exists() {
         return Err(format!(
-            "expected fastly.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            "expected fastly.toml at {} (the CLI bootstrap should have written it before provision ran)",
             fastly_path.display()
         ));
     }
@@ -133,7 +133,7 @@ pub(super) fn provision_typed(
     let fastly_path = manifest_root.join(fastly_rel);
     if !fastly_path.exists() {
         return Err(format!(
-            "expected fastly.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            "expected fastly.toml at {} (the CLI bootstrap should have written it before provision ran)",
             fastly_path.display()
         ));
     }
@@ -148,13 +148,25 @@ pub(super) fn provision_typed(
 
     let path_display = fastly_path.display().to_string();
     for entry in typed_secrets {
-        let added = upsert_secret_store_entry(&mut doc, entry.store_id, entry.key_value)?;
+        // Seed the Viceroy store under the PLATFORM name -- the name
+        // the runtime resolves via `EDGEZERO__STORES__SECRETS__<ID>__NAME`
+        // and passes to `SecretStore::open`. Keying it by the logical
+        // `store_id` would leave the runtime opening a store this seed
+        // never created whenever an env override renames it.
+        let added = upsert_secret_store_entry(&mut doc, &entry.platform, entry.key_value)?;
         if added {
             appended = appended.saturating_add(1);
         }
+        // Logical id in the human wording, platform name only when it
+        // differs (an env override is in play) so the operator can see
+        // exactly which Viceroy store was written.
+        let store_label = if entry.platform == entry.store_id {
+            entry.store_id.to_owned()
+        } else {
+            format!("{} (platform `{}`)", entry.store_id, entry.platform)
+        };
         status_lines.push(format!(
-            "fastly: secret_store `{}` key `{}` (env `{}`) in {path_display}",
-            entry.store_id,
+            "fastly: secret_store `{store_label}` key `{}` (env `{}`) in {path_display}",
             entry.key_value,
             entry.key_value.to_ascii_uppercase(),
         ));
@@ -642,6 +654,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds for nested renamed crate");
         let (rel, body) = outcome.into_iter().next().unwrap();
@@ -872,7 +885,7 @@ mod tests {
         );
     }
 
-    /// A missing `fastly.toml` is a bug in the Task 8b bootstrap path.
+    /// A missing `fastly.toml` is a bug in the CLI bootstrap path.
     /// Provision must error CLEARLY -- naming the expected path --
     /// rather than silently re-synthesising (we don't have the app
     /// name in scope here).
@@ -907,8 +920,8 @@ mod tests {
     }
 
     /// Spec §"Fastly": the deployed `service_id` must be upserted
-    /// during BOTH synthesis AND merge. Task 21 handles synthesis
-    /// (first-run bootstrap); THIS lock covers the merge case where
+    /// during BOTH synthesis AND merge. The synthesiser handles the
+    /// first-run bootstrap; THIS lock covers the merge case where
     /// the operator pre-seeded fastly.toml from a stale template
     /// before a deploy happened.
     #[test]
@@ -1238,8 +1251,8 @@ mod tests {
         assert_eq!(matches, 1, "exactly one matching key entry: {after}");
     }
 
-    /// Absent `fastly.toml` is a Task 8b bootstrap bug — error clearly
-    /// with the resolved absolute path, matching the Task 22
+    /// Absent `fastly.toml` is a CLI bootstrap bug — error clearly
+    /// with the resolved absolute path, matching the
     /// `provision_local` error style so both flows fail the same way.
     #[test]
     fn fastly_provision_typed_errors_if_manifest_absent() {
@@ -1528,6 +1541,45 @@ mod tests {
             different.get("env").and_then(|item| item.as_str()),
             Some("DIFFERENT_KEY"),
             "different_key row's env defaults to KEY_UPPER"
+        );
+    }
+
+    /// The Viceroy `[[local_server.secret_stores.<name>]]` table must
+    /// be keyed by the PLATFORM name (the entry's resolved
+    /// `EDGEZERO__STORES__SECRETS__<ID>__NAME`), not the logical id.
+    /// The runtime opens the platform name, so seeding under the
+    /// logical id leaves the lookup opening an empty/absent store.
+    #[test]
+    fn provision_typed_seeds_secret_store_under_platform_name() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        // Logical id `vault`, env-resolved platform `prod_vault`.
+        let entries = [
+            TypedSecretEntry::new("vault", "api_token", "api_token").with_platform("prod_vault")
+        ];
+        FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        let stores = doc["local_server"]["secret_stores"]
+            .as_table()
+            .expect("secret_stores table");
+        assert!(
+            stores.contains_key("prod_vault"),
+            "Viceroy store must be keyed by the platform name: {after}"
+        );
+        assert!(
+            !stores.contains_key("vault"),
+            "must NOT seed under the logical id when a platform override exists: {after}"
         );
     }
 

@@ -177,7 +177,7 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
     // `--runtime-config-file <dir>/runtime-config.toml`. Provision
     // writes each store's `[key_value_store.<name>]` block into that
     // file, so a `spin up` without it starts with none of the local
-    // KV bindings the app expects (PR #287 review round 9, #9). Only
+    // KV bindings the app expects. Only
     // when the file actually exists -- a fresh project without local
     // stores has none, and `spin up --runtime-config-file <missing>`
     // errors.
@@ -199,7 +199,7 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
     Ok(())
 }
 
-/// Header-only baseline for `runtime-config.toml`. Task 25's
+/// Header-only baseline for `runtime-config.toml`. the
 /// local arm appends `[key_value_store.<name>]` blocks on top of
 /// this baseline; there is nothing to synthesise structurally at
 /// bootstrap time — the header line pins the schema version so
@@ -272,6 +272,7 @@ pub(crate) fn synthesise_spin_toml(
     crate_name: &str,
     component: Option<&str>,
     manifest_rel: &Path,
+    allowed_outbound_hosts: &[String],
 ) -> String {
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
@@ -328,28 +329,31 @@ pub(crate) fn synthesise_spin_toml(
             "{target_prefix}target/wasm32-wasip2/release/{crate_name_under}.wasm"
         )),
     );
-    // Spin defaults outbound HTTP to deny-all; the operator-facing
-    // scaffold historically shipped `["https://*:*"]` so the first
-    // `spin up` doesn't silently refuse outbound calls. Match that
-    // default here so scaffold and clean-clone produce the same file.
-    let mut allowed_hosts = Array::new();
-    allowed_hosts.push("https://*:*");
-    comp.insert("allowed_outbound_hosts", value(allowed_hosts));
+    // Spin defaults outbound HTTP to deny-all. That secure baseline is
+    // the default here too: the key is emitted ONLY when the operator
+    // opts in via `[adapters.spin.adapter].allowed_outbound_hosts`
+    //. Both `edgezero new` and clean-clone
+    // provision read the same manifest, so the emitted file stays
+    // byte-identical across the two paths whether or not the knob is
+    // set -- the scaffold-parity contract does not require a specific
+    // value, only that both paths agree.
+    if !allowed_outbound_hosts.is_empty() {
+        let mut allowed_hosts = Array::new();
+        for host in allowed_outbound_hosts {
+            allowed_hosts.push(host.as_str());
+        }
+        comp.insert("allowed_outbound_hosts", value(allowed_hosts));
+    }
     comp.insert("key_value_stores", value(Array::new()));
 
-    // [component.<id>.build] — `spin build` reads this table; without
-    // it the operator has to `cargo build --target wasm32-wasip2 ...`
-    // manually before every `spin up`. Match the scaffold default.
-    let mut build_table = Table::new();
-    build_table.insert(
-        "command",
-        value("cargo build --target wasm32-wasip2 --release"),
-    );
-    let mut watch = Array::new();
-    watch.push("src/**/*.rs");
-    watch.push("Cargo.toml");
-    build_table.insert("watch", value(watch));
-    comp.insert("build", Item::Table(build_table));
+    // No `[component.<id>.build]` block: the spec's normative Spin
+    // baseline (spec §"Spin (spin.toml)") stops at `source` +
+    // `key_value_stores`, and EdgeZero drives builds through its own
+    // `edgezero build --adapter spin` (which runs `cargo build`
+    // directly), not through bare `spin build`. Emitting a build table
+    // exceeded that baseline. Operators
+    // who want `spin build` to work standalone add the block to their
+    // gitignored spin.toml by hand; the merge path preserves it.
 
     let mut component_section = Table::new();
     component_section.set_implicit(true);
@@ -365,6 +369,9 @@ mod tests {
     use tempfile::tempdir;
 
     const TEST_COMPONENT_ID: &str = "demo";
+    /// The common case: no `[adapters.spin.adapter].allowed_outbound_hosts`
+    /// declared, so synthesis stays at Spin's deny-all baseline.
+    const NO_HOSTS: &[String] = &[];
 
     #[test]
     fn finds_closest_manifest_when_multiple_exist() {
@@ -441,6 +448,7 @@ mod tests {
             "demo-adapter-spin",
             None,
             Path::new("crates/demo-adapter-spin/spin.toml"),
+            NO_HOSTS,
         );
         assert!(out.starts_with("# edgezero-provision: v1"));
         assert!(out.contains("spin_manifest_version = 2"));
@@ -464,6 +472,7 @@ mod tests {
             "spin-server",
             None,
             Path::new("crates/spin-server/spin.toml"),
+            NO_HOSTS,
         );
         assert!(out.contains(r#"name = "spin-server""#));
         assert!(out.contains(r#"component = "spin-server""#));
@@ -480,6 +489,7 @@ mod tests {
             "demo-adapter-spin",
             Some("worker"),
             Path::new("crates/demo-adapter-spin/spin.toml"),
+            NO_HOSTS,
         );
         // Component selector drives the trigger/section keys...
         assert!(out.contains(r#"component = "worker""#));
@@ -513,6 +523,7 @@ mod tests {
             "spin-server",
             Some("worker"),
             Path::new("crates/spin-server/spin.toml"),
+            NO_HOSTS,
         );
         assert!(
             out.contains(r#"name = "spin-server""#),
@@ -534,25 +545,53 @@ mod tests {
     }
 
     #[test]
-    fn synthesises_spin_toml_includes_allowed_outbound_hosts_and_build_block() {
-        // Scaffold parity: `allowed_outbound_hosts` is a
-        // deny-by-default guard in Spin, and `[component.<id>.build]`
-        // is what `spin build` reads. Both were previously written by
-        // the scaffold `spin.toml.hbs` template; folding them into the
-        // synth keeps `edgezero new` and clean-clone `provision --local`
-        // byte-identical.
+    fn synthesises_spin_toml_matches_spec_minimal_baseline() {
+        // Exact-content test: with
+        // no `allowed_outbound_hosts` declared, synthesis must equal
+        // the spec's normative Spin baseline byte-for-byte -- NEITHER
+        // an `allowed_outbound_hosts` key (Spin stays deny-all) NOR a
+        // `[component.<id>.build]` table. The `crates/demo-adapter-spin`
+        // path is 2-deep, so the wasm source prefix is `../../`.
         let out = synthesise_spin_toml(
             "demo-adapter-spin",
             None,
             Path::new("crates/demo-adapter-spin/spin.toml"),
+            NO_HOSTS,
+        );
+        let expected = "# edgezero-provision: v1\n\
+             spin_manifest_version = 2\n\n\
+             [application]\n\
+             name = \"demo-adapter-spin\"\n\
+             version = \"0.1.0\"\n\n\
+             [[trigger.http]]\n\
+             route = \"/...\"\n\
+             component = \"demo-adapter-spin\"\n\n\
+             [component.demo-adapter-spin]\n\
+             source = \"../../target/wasm32-wasip2/release/demo_adapter_spin.wasm\"\n\
+             key_value_stores = []\n";
+        assert_eq!(out, expected, "spin.toml baseline drifted from spec");
+    }
+
+    #[test]
+    fn synthesises_spin_toml_emits_declared_outbound_hosts() {
+        // Opt-in: the operator declares hosts, so synthesis emits the
+        // `allowed_outbound_hosts` array verbatim. Both `edgezero new`
+        // and clean-clone read the SAME manifest, so the emitted file
+        // stays byte-identical across the two paths (5e19f4f's parity
+        // requirement) regardless of the value.
+        let hosts = vec![
+            "https://*:*".to_owned(),
+            "https://api.example.com".to_owned(),
+        ];
+        let out = synthesise_spin_toml(
+            "demo-adapter-spin",
+            None,
+            Path::new("crates/demo-adapter-spin/spin.toml"),
+            &hosts,
         );
         assert!(
-            out.contains(r#"allowed_outbound_hosts = ["https://*:*"]"#),
-            "synth must ship the scaffold's outbound-host allow-list: {out}"
-        );
-        assert!(
-            out.contains(r#"command = "cargo build --target wasm32-wasip2 --release""#),
-            "synth must include the [component.<id>.build] command: {out}"
+            out.contains(r#"allowed_outbound_hosts = ["https://*:*", "https://api.example.com"]"#),
+            "declared hosts must be emitted verbatim: {out}"
         );
     }
 
@@ -576,7 +615,7 @@ mod tests {
             "has\nnewline",
             "has = equals",
         ] {
-            let out = synthesise_spin_toml(name, None, Path::new("crates/x/spin.toml"));
+            let out = synthesise_spin_toml(name, None, Path::new("crates/x/spin.toml"), NO_HOSTS);
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
             assert_eq!(
                 doc["application"]["name"].as_str(),
@@ -592,7 +631,12 @@ mod tests {
         // value AND the `[component.<id>]` table key — both must
         // round-trip cleanly.
         for cid in [r#"has"quote"#, r"has\backslash", "has\nnewline"] {
-            let out = synthesise_spin_toml("demo", Some(cid), Path::new("crates/demo/spin.toml"));
+            let out = synthesise_spin_toml(
+                "demo",
+                Some(cid),
+                Path::new("crates/demo/spin.toml"),
+                NO_HOSTS,
+            );
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
             // trigger[0].component == cid
             let trigger_http = doc["trigger"]["http"]

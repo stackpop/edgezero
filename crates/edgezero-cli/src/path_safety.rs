@@ -497,7 +497,7 @@ mod tests {
         assert_provision_paths_safe(Path::new("."), Some("crates/cf/wrangler.toml"), None).unwrap();
     }
 
-    // ---------- Symlink rejection (PR #287 review blocking #2) ----------
+    // ---------- Symlink rejection ----------
 
     #[cfg(unix)]
     #[test]
@@ -612,7 +612,7 @@ mod tests {
         .unwrap();
     }
 
-    // ---------- Windows-shape rejection (PR #287 review P1) ----------
+    // ---------- Windows-shape rejection ----------
 
     #[test]
     fn rejects_backslash_rooted_manifest_regardless_of_host_os() {

@@ -171,8 +171,7 @@ impl ProvisionStores<'_> {
     /// key-normalised dedup then keeps the FIRST line and silently
     /// drops the second, so the second store resolves to the first
     /// store's platform name at runtime -- reads and writes land in
-    /// the wrong store with no error anywhere (PR #287 review round 9,
-    /// blocking #5).
+    /// the wrong store with no error anywhere.
     ///
     /// Kind is part of the env name, so ids only collide within a
     /// kind: a `config` and a `kv` store may share a logical id.
@@ -226,7 +225,7 @@ impl ProvisionStores<'_> {
 /// so everything the first path applies was silently dropped: a
 /// `serve` would start the app with none of the secrets from its
 /// `.env` file and resolve its manifest from the process cwd rather
-/// than the project root (PR #287 review round 9, blocking #3). This
+/// than the project root. This
 /// struct is how the second path receives the same context as the
 /// first.
 ///
@@ -389,12 +388,24 @@ pub struct TypedSecretEntry<'entry> {
     pub field_name: String,
     /// Blob value — i.e. the secret-store KEY NAME.
     pub key_value: &'entry str,
-    /// Logical secret-store id this key targets.
+    /// Logical secret-store id this key targets (the id declared in
+    /// `[stores.secrets].ids`). Used for human-facing wording and the
+    /// flat-namespace collision checks.
     pub store_id: &'entry str,
+    /// Platform store name the runtime actually opens — the logical id
+    /// after the `EDGEZERO__STORES__SECRETS__<ID>__NAME` env override
+    /// is applied, or the logical id itself when unset. Adapters that
+    /// seed a local emulator store (Fastly's Viceroy
+    /// `[[local_server.secret_stores.<name>]]`) MUST key it by this,
+    /// not by `store_id` -- the runtime resolves the same override and
+    /// would otherwise open a store the seed never created.
+    pub platform: String,
 }
 
 impl<'entry> TypedSecretEntry<'entry> {
-    /// Construct a new entry from its three components.
+    /// Construct an entry whose platform name equals its logical id
+    /// (no env override). This is the right constructor for tests and
+    /// for adapters whose secret stores have no name-override path.
     #[must_use]
     #[inline]
     pub fn new<Name: Into<String>>(
@@ -406,7 +417,18 @@ impl<'entry> TypedSecretEntry<'entry> {
             field_name: field_name.into(),
             key_value,
             store_id,
+            platform: store_id.to_owned(),
         }
+    }
+
+    /// Override the resolved platform store name — the CLI applies the
+    /// `EDGEZERO__STORES__SECRETS__<ID>__NAME` overlay and threads the
+    /// result in so adapters seed the store the runtime will open.
+    #[must_use]
+    #[inline]
+    pub fn with_platform<P: Into<String>>(mut self, platform: P) -> Self {
+        self.platform = platform.into();
+        self
     }
 }
 
@@ -730,9 +752,16 @@ pub trait Adapter: Sync + Send {
     ///
     /// **Boundary contract (MUST):** signature uses only `std` +
     /// types defined IN this crate. Adapters that need values from
-    /// the parent manifest receive them through the neutral
-    /// `Option<&AdapterDeployedState>` argument — the CLI translates
-    /// from `&Manifest` to `AdapterDeployedState` at the call site.
+    /// the parent manifest receive them through neutral arguments
+    /// (`Option<&AdapterDeployedState>`, `&[String]`) — the CLI
+    /// translates from `&Manifest` at the call site.
+    ///
+    /// `allowed_outbound_hosts` carries
+    /// `[adapters.<name>.adapter].allowed_outbound_hosts` verbatim.
+    /// Only the Spin adapter consumes it (it emits
+    /// `[component.<id>].allowed_outbound_hosts`); the empty default
+    /// keeps the synthesised manifest at Spin's deny-all baseline.
+    /// Other adapters ignore it.
     ///
     /// # Errors
     /// The default impl never errors. Adapter overrides may return
@@ -745,6 +774,7 @@ pub trait Adapter: Sync + Send {
         _component_selector: Option<&str>,
         _app_name: &str,
         _deployed: Option<&AdapterDeployedState>,
+        _allowed_outbound_hosts: &[String],
     ) -> Result<Vec<(PathBuf, String)>, String> {
         Ok(Vec::new())
     }
@@ -798,7 +828,7 @@ pub trait Adapter: Sync + Send {
     ///
     /// Note: the previous signature took a `_config_keys` parameter
     /// so Spin could detect cross-namespace collision with KV-stored
-    /// values; KV-backed config dropped that need in Stage 6, and no
+    /// values; KV-backed config dropped that need, and no
     /// remaining adapter consults it. If a future adapter needs the
     /// flattened config-key set here, add it back via a builder
     /// context rather than re-introducing a positional parameter
@@ -900,7 +930,7 @@ mod tests {
         .expect("distinct ids must pass");
     }
 
-    /// Regression (PR #287 review round 9, blocking #5): both ids
+    /// Regression: both ids
     /// upper-case to `EDGEZERO__STORES__KV__MYSTORE__NAME`, so the
     /// env-file dedup would keep one line and silently point the
     /// other store at the wrong platform name.

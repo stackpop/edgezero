@@ -156,7 +156,7 @@ impl Adapter for SpinCliAdapter {
         &[]
     }
 
-    // Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$`
+    // KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$`
     // key rule and the config-vs-secret collision check. No adapter-
     // specific check applies to raw config keys.
     #[inline]
@@ -209,7 +209,7 @@ impl Adapter for SpinCliAdapter {
         //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
         // runtime / Fermyon at deploy). For each declared KV id
-        // AND each declared CONFIG id (KV-backed since Stage 5
+        // AND each declared CONFIG id (KV-backed now
         // of the spin-kv-config plan), append the env-resolved
         // platform label to the component's `key_value_stores`
         // array. Secret variables are manually declared by the
@@ -498,7 +498,7 @@ impl Adapter for SpinCliAdapter {
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: Multi for KV AND Config (both label-backed via the
-        // Spin KV API since Stage 5 of the spin-kv-config plan).
+        // Spin KV API now of the spin-kv-config plan).
         // Single for Secrets (still flat-variable namespace).
         &["secrets"]
     }
@@ -510,6 +510,7 @@ impl Adapter for SpinCliAdapter {
         component_selector: Option<&str>,
         app_name: &str,
         _deployed: Option<&AdapterDeployedState>,
+        allowed_outbound_hosts: &[String],
     ) -> Result<Vec<(PathBuf, String)>, String> {
         let spin_rel =
             adapter_manifest_path.map_or_else(|| PathBuf::from("spin.toml"), PathBuf::from);
@@ -550,8 +551,12 @@ impl Adapter for SpinCliAdapter {
         // `crates/<crate>/spin.toml` layout (2-deep). Nested paths
         // like `crates/spin-server/config/spin.toml` (3-deep) need
         // `../../../target/...`.
-        let spin_toml_body =
-            run::synthesise_spin_toml(&derived_crate_name, component_selector, &spin_rel);
+        let spin_toml_body = run::synthesise_spin_toml(
+            &derived_crate_name,
+            component_selector,
+            &spin_rel,
+            allowed_outbound_hosts,
+        );
         Ok(vec![
             (spin_rel, spin_toml_body),
             (rc_rel, run::synthesise_runtime_config_toml()),
@@ -615,9 +620,9 @@ impl Adapter for SpinCliAdapter {
 
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
         use std::collections::HashMap;
-        // Stage 5+: KV-backed config no longer shares Spin's flat
+        // KV-backed config no longer shares Spin's flat
         // variable namespace, so config keys are NOT considered here
-        // (and the trait dropped the parameter in Stage 6+) — config
+        // (and the trait later dropped the parameter) — config
         // can use arbitrary UTF-8 keys without colliding with
         // `#[secret]` values. Secrets still resolve through
         // `spin_sdk::variables`, so two checks remain:
@@ -971,11 +976,11 @@ mod tests {
         );
     }
 
-    // 12.16 — named-store secret adapter validation
+    // named-store secret adapter validation
 
     #[test]
     fn collision_error_names_both_field_names_and_lowercased_variable() {
-        // 12.16 case (b): KeyInDefault and KeyInNamedStore that
+        // KeyInDefault and KeyInNamedStore that
         // collide on the lowercased Spin variable.
         let entries = [
             TypedSecretEntry::new("default", "one", "Demo_Token"),
@@ -989,7 +994,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_spin_variable_name_with_hyphen() {
-        // 12.16 case (a): KeyInNamedStore value contains a hyphen,
+        // KeyInNamedStore value contains a hyphen,
         // which is not a valid Spin variable name.
         let entries = [TypedSecretEntry::new("vault", "api_token", "demo-token")];
         let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
@@ -1003,7 +1008,7 @@ mod tests {
 
     #[test]
     fn non_spin_adapter_is_exempt_from_collision_check() {
-        // 12.16 case (c): same collision fixture against a manifest
+        // same collision fixture against a manifest
         // declaring only [adapters.axum] — covered by run_adapter_
         // typed_checks NOT calling SpinCliAdapter at all. This is more
         // naturally a CLI-level integration test, but the adapter
@@ -1084,7 +1089,7 @@ mod tests {
 
     #[test]
     fn single_store_kinds_is_secrets_only() {
-        // Stage 5: config moved to KV (provisioned via `key_value_stores`,
+        // config moved to KV (provisioned via `key_value_stores`,
         // entries pushed via the seed handler). Secrets remain Spin
         // `[variables]` until we ship native secret support.
         assert_eq!(SpinCliAdapter.single_store_kinds(), &["secrets"]);

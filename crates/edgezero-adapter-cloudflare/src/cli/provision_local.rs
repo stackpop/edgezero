@@ -219,7 +219,7 @@ pub(super) fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Resul
 /// `EDGEZERO__STORES__<KIND>__<ID>__NAME`).
 ///
 /// Assumes `wrangler.toml` already exists at the resolved path
-/// (Task 8b's CLI bootstrap writes it before provision runs); if it
+/// (the CLI bootstrap writes it before provision runs); if it
 /// is missing, returns an error naming the path rather than silently
 /// re-synthesising, since the adapter trait does not receive an
 /// `app_name` to synthesise with.
@@ -242,7 +242,7 @@ pub(super) fn provision(
     let wrangler_path = manifest_root.join(wrangler_rel);
     if !wrangler_path.exists() {
         return Err(format!(
-            "expected wrangler.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            "expected wrangler.toml at {} (the CLI bootstrap should have written it before provision ran)",
             wrangler_path.display()
         ));
     }
@@ -911,7 +911,7 @@ mod tests {
     fn cloudflare_local_provision_errors_if_manifest_absent() {
         // Same nested path, but no pre-seed. The adapter trait
         // doesn't receive app_name -- provision cannot synthesise
-        // the manifest itself; that's Task 8b's job.
+        // the manifest itself; that's the job.
         let dir = tempdir().expect("tempdir");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
@@ -1157,6 +1157,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds for nested renamed crate");
         let (rel, body) = outcome.into_iter().next().unwrap();
@@ -1176,7 +1177,7 @@ mod tests {
     #[test]
     fn provision_local_first_run_writes_expected_files() {
         // First-run fixture: empty crate dir, no wrangler.toml, no
-        // .dev.vars. The CLI's bootstrap layer (Task 8b's
+        // .dev.vars. The CLI's bootstrap layer (the
         // `write_baseline_to_disk`) normally primes wrangler.toml via
         // `synthesise_baseline_manifest` BEFORE provision runs; this
         // test mirrors that step directly, then calls

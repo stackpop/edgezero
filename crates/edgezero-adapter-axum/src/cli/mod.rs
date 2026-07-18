@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use ctor::ctor;
 use edgezero_adapter::cli_support;
-use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
+use edgezero_adapter::env_file::{
+    EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, reject_symlinked_target,
+};
 use edgezero_adapter::registry::{
     Adapter, AdapterAction, AdapterDeployedState, AdapterExecContext, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
@@ -299,6 +301,10 @@ impl Adapter for AxumCliAdapter {
                 target.display()
             )]);
         }
+        // A symlinked local-config file would have the read below
+        // follow it and the write clobber (or, if dangling, create)
+        // its target outside the project tree.
+        reject_symlinked_target(&target)?;
         fs::create_dir_all(&local_dir)
             .map_err(|err| format!("failed to create {}: {err}", local_dir.display()))?;
         // Upsert into any existing map so a `config push --key
@@ -442,6 +448,7 @@ impl Adapter for AxumCliAdapter {
         _component_selector: Option<&str>,
         app_name: &str,
         _deployed: Option<&AdapterDeployedState>,
+        _allowed_outbound_hosts: &[String],
     ) -> Result<Vec<(PathBuf, String)>, String> {
         // Axum's manifest is pure operator-facing dev-server config
         // (host, port, crate name, crate dir). There are no cloud
@@ -665,7 +672,7 @@ mod tests {
 
     #[test]
     fn push_propagates_read_error_instead_of_clobbering_existing_keys() {
-        // Regression (PR #287 review round 9, blocking #4): the read
+        // Regression: the read
         // arm used to be `_ => BTreeMap::new()`, which swallowed EVERY
         // read failure -- not just NotFound. A local-config file that
         // is unreadable (invalid UTF-8 here; permission-denied and
@@ -706,6 +713,38 @@ mod tests {
             after,
             vec![0x66, 0x6f, 0x6f, 0xff, 0xfe],
             "push must not overwrite a local-config file it could not read"
+        );
+    }
+
+    /// A symlinked local-config file must be refused before push
+    /// reads through it and the write clobbers the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn push_refuses_a_symlinked_local_config_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim-outside");
+        fs::write(&victim, "OPERATOR DATA\n").expect("seed victim");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("mkdir .edgezero");
+        symlink(&victim, local_dir.join("local-config-app_config.json")).expect("symlink");
+
+        let err = AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &[("app_config".to_owned(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("a symlinked local-config file must be refused");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim intact"),
+            "OPERATOR DATA\n",
+            "push must not write through the symlink"
         );
     }
 
@@ -939,7 +978,7 @@ mod tests {
 
     #[test]
     fn axum_provision_typed_creates_dot_edgezero_if_missing() {
-        // No `.edgezero/` pre-existing. append_lines_dedup (Task 16c)
+        // No `.edgezero/` pre-existing. append_lines_dedup
         // creates parent dirs, so the first-run case works without an
         // explicit `create_dir_all` in provision_typed.
         let dir = tempdir().unwrap();

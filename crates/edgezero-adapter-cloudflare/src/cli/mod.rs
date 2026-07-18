@@ -239,9 +239,13 @@ impl Adapter for CloudflareCliAdapter {
                 deployed,
                 dry_run,
             ),
-            ProvisionMode::Cloud => {
-                provision_cloud::provision(manifest_root, adapter_manifest_path, stores, dry_run)
-            }
+            ProvisionMode::Cloud => provision_cloud::provision(
+                manifest_root,
+                adapter_manifest_path,
+                stores,
+                deployed,
+                dry_run,
+            ),
             // ProvisionMode is #[non_exhaustive]; a future mode variant
             // gets an explicit error so we don't accidentally dispatch
             // via one of the two known arms.
@@ -388,6 +392,7 @@ impl Adapter for CloudflareCliAdapter {
         _component_selector: Option<&str>,
         app_name: &str,
         _deployed: Option<&AdapterDeployedState>,
+        _allowed_outbound_hosts: &[String],
     ) -> Result<Vec<(PathBuf, String)>, String> {
         let rel =
             adapter_manifest_path.map_or_else(|| PathBuf::from("wrangler.toml"), PathBuf::from);

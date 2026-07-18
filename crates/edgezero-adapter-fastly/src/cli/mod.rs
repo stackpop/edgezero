@@ -236,7 +236,7 @@ impl Adapter for FastlyCliAdapter {
     // that differ only in case (`api_token` / `API_TOKEN`) produce two
     // separate secret-store rows that BOTH read `$API_TOKEN`, and the
     // two secrets silently resolve to the same value at runtime
-    // (PR #287 review round 9, blocking #5). Reject at validation
+    //. Reject at validation
     // rather than let a wrong secret be served.
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
         use std::collections::HashMap;
@@ -287,13 +287,9 @@ impl Adapter for FastlyCliAdapter {
                 deployed,
                 dry_run,
             ),
-            ProvisionMode::Cloud => provision_cloud::provision(
-                manifest_root,
-                adapter_manifest_path,
-                stores,
-                deployed,
-                dry_run,
-            ),
+            ProvisionMode::Cloud => {
+                provision_cloud::provision(manifest_root, adapter_manifest_path, stores, dry_run)
+            }
             // ProvisionMode is #[non_exhaustive]; a future mode variant
             // is an explicit error so we don't dispatch via one of the
             // two known arms by accident.
@@ -399,8 +395,9 @@ impl Adapter for FastlyCliAdapter {
         _component_selector: Option<&str>,
         app_name: &str,
         deployed: Option<&AdapterDeployedState>,
+        _allowed_outbound_hosts: &[String],
     ) -> Result<Vec<(PathBuf, String)>, String> {
-        // The CLI's `deployed_state_for` translator (Task 8b) copies
+        // The CLI's `deployed_state_for` translator copies
         // `[adapters.fastly.deployed].service_id` into
         // `deployed.fields["service_id"]` before calling this override,
         // so the adapter reads the flat field bag and never links to
@@ -482,7 +479,7 @@ mod tests {
             .expect("an identical key in two stores shares one env var by design");
     }
 
-    /// Regression (PR #287 review round 9, blocking #5): keys
+    /// Regression: keys
     /// differing only in case both upper-case to `API_TOKEN`, so
     /// `fastly.toml` gets two secret-store rows reading the same
     /// Viceroy env var and the two secrets silently share a value.

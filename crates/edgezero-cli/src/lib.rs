@@ -249,10 +249,10 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
 /// adapter reads its env file directly (cloudflare, fastly) or the
 /// adapter is unknown.
 ///
-/// `axum` maps to `<manifest_root>/.edgezero/.env` (Task 27's
+/// `axum` maps to `<manifest_root>/.edgezero/.env` (the
 /// writer target). `spin` maps to `<crate>/.env` where `<crate>` is
 /// the `[adapters.spin.adapter] crate = "..."` sub-path joined with
-/// `manifest_root` (Task 25's writer target); a missing `crate`
+/// `manifest_root` (the writer target); a missing `crate`
 /// falls back to `manifest_root`.
 ///
 /// The adapter name is matched case-insensitively so `--adapter Spin`
@@ -634,7 +634,7 @@ ids = ["MY_SECRETS"]
     #[test]
     fn resolve_serve_env_file_axum_returns_dot_edgezero_dot_env() {
         // axum's `.env` lives under `<manifest_root>/.edgezero/.env`
-        // — the target Task 27's line writer produces.
+        // — the target the line writer produces.
         let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
         let root = PathBuf::from("/tmp/proj");
         let resolved = resolve_serve_env_file(loader.manifest(), "axum", &root)
@@ -645,7 +645,7 @@ ids = ["MY_SECRETS"]
     #[test]
     fn resolve_serve_env_file_spin_returns_spin_crate_dot_env() {
         // spin's `.env` lives under `<spin_crate>/.env` — the target
-        // Task 25's line writer produces.
+        // the line writer produces.
         let loader = ManifestLoader::load_from_str(SPIN_MANIFEST_LOWER);
         let root = PathBuf::from("/tmp/proj");
         let resolved = resolve_serve_env_file(loader.manifest(), "spin", &root)
@@ -863,7 +863,7 @@ serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_displa
         // value MUST match the .env's value — proving the child
         // inherited the Command::env overlay before executing.
         //
-        // Note (post-PR#287 review, blocking #3): the load path
+        // Note: the load path
         // now threads the overlay through Command::env instead of
         // std::env::set_var, so the PARENT's env stays unchanged.
         // A dedicated no-parent-mutation assertion lives in
@@ -908,7 +908,7 @@ serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_displa
     #[cfg(not(windows))]
     #[test]
     fn run_serve_does_not_mutate_parent_process_env_yet_child_sees_env_file_value() {
-        // Regression (PR #287 review, blocking #3): the pre-fix
+        // Regression: the pre-fix
         // `env_file::load_into_process_env` wrote every KEY=VALUE
         // pair via `std::env::set_var`. That's not thread-safe on
         // Unix and can race with any concurrent reader in a

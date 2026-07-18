@@ -1619,13 +1619,22 @@ pub(crate) fn build_typed_secret_entries<'ctx, C: AppConfigMeta>(
         .secrets
         .as_ref()
         .map(StoreDeclaration::default_id);
+    // Resolve each secret store's PLATFORM name the same way the
+    // runtime does -- through the `EDGEZERO__STORES__SECRETS__<ID>__NAME`
+    // overlay -- so an adapter that seeds a local emulator store keys
+    // it by the name the runtime will open, not the raw logical id.
+    let env_config = EnvConfig::from_env();
+    let resolve = |store_id: &'ctx str, label, value| {
+        TypedSecretEntry::new(store_id, label, value)
+            .with_platform(env_config.store_name("secrets", store_id))
+    };
     let mut entries: Vec<TypedSecretEntry<'ctx>> = Vec::new();
     for field in C::secret_fields() {
         for leaf in collect_secret_leaves(&ctx.raw_config, &field)? {
             match field.kind {
                 SecretKind::KeyInDefault => {
                     if let Some(store_id) = default_store_id {
-                        entries.push(TypedSecretEntry::new(store_id, leaf.label, leaf.value));
+                        entries.push(resolve(store_id, leaf.label, leaf.value));
                     }
                 }
                 SecretKind::KeyInNamedStore { .. } => {
@@ -1635,7 +1644,7 @@ pub(crate) fn build_typed_secret_entries<'ctx, C: AppConfigMeta>(
                             leaf.label
                         )
                     })?;
-                    entries.push(TypedSecretEntry::new(store_id, leaf.label, leaf.value));
+                    entries.push(resolve(store_id, leaf.label, leaf.value));
                 }
                 SecretKind::StoreRef => {}
             }
@@ -2047,7 +2056,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
 
     #[test]
     fn raw_rejects_absolute_adapter_manifest_path_before_adapter_validators_run() {
-        // Regression (PR #287 review, blocking #1): pre-2026-07-09,
+        // Regression: pre-2026-07-09,
         // `run_config_validate` -> `run_shared_checks` ->
         // `run_adapter_shared_checks` called
         // `adapter.validate_adapter_manifest(manifest_root, path, ...)`
@@ -2236,7 +2245,7 @@ serve = "echo"
         );
     }
 
-    /// High 2 — spec 3.3.8: typed validate uses `validate_excluding_secrets`,
+    /// spec 3.3.8: typed validate uses `validate_excluding_secrets`,
     /// so a `#[secret]` field annotated with `length(min = 32)` must NOT
     /// reject a short key name like `"short_key"` (9 bytes).  The runtime
     /// resolves it to the real secret value and runs the full validator there.
@@ -2285,7 +2294,7 @@ ids = ["default"]
             .expect("secret-field validator must be skipped on typed validate");
     }
 
-    // ---------- Task 6: path-aware nested / array secret reflection ----------
+    // ---------- path-aware nested / array secret reflection ----------
 
     // Real nested derive: integrations.datadome.server_side_key (KeyInDefault),
     // partners[*].api_key (KeyInDefault).

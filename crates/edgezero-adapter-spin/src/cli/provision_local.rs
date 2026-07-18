@@ -17,7 +17,7 @@ use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores, TypedSecretE
 /// (CONFIG only) to `.env` next to `spin.toml`.
 ///
 /// Both `spin.toml` and `runtime-config.toml` MUST exist at the
-/// resolved paths -- Task 8b's CLI bootstrap writes both via
+/// resolved paths -- the CLI bootstrap writes both via
 /// `synthesise_baseline_manifest` before provision runs. If either
 /// is missing, we error clearly rather than silently re-synthesising:
 /// a missing runtime-config next to a present spin.toml is a
@@ -45,13 +45,13 @@ pub(super) fn provision(
 
     if !spin_path.exists() {
         return Err(format!(
-            "expected spin.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            "expected spin.toml at {} (the CLI bootstrap should have written it before provision ran)",
             spin_path.display()
         ));
     }
     if !rc_path.exists() {
         return Err(format!(
-            "expected runtime-config.toml at {} next to spin.toml (Task 8b's CLI bootstrap should have written it before provision ran)",
+            "expected runtime-config.toml at {} next to spin.toml (the CLI bootstrap should have written it before provision ran)",
             rc_path.display()
         ));
     }
@@ -211,7 +211,7 @@ pub(super) fn provision_typed(
 
     if !spin_path.exists() {
         return Err(format!(
-            "expected spin.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            "expected spin.toml at {} (the CLI bootstrap should have written it before provision ran)",
             spin_path.display()
         ));
     }
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn provision_writes_config_labels_into_kv_array_and_leaves_secrets_manual() {
-        // Stage 5: config now lives in Spin KV. Provision writes each
+        // config now lives in Spin KV. Provision writes each
         // `[stores.config].id` into `[component.X].key_value_stores`
         // (same machinery as `[stores.kv]`). Secrets stay manual until
         // we ship native secret support.
@@ -773,10 +773,10 @@ mod tests {
         );
     }
 
-    // ---------- provision_local (Local arm) — Task 25 ----------
+    // ---------- provision_local (Local arm) ----------
 
     /// Seed BOTH baseline files (spin.toml + runtime-config.toml) at
-    /// `dir`, matching Task 24's `synthesise_baseline_manifest` output.
+    /// `dir`, matching the `synthesise_baseline_manifest` output.
     ///
     /// The 2026-07 spin.toml synth derives its component id from
     /// `<app_name>-adapter-spin` when no explicit component override
@@ -787,7 +787,12 @@ mod tests {
     fn seed_baseline(dir: &Path, component_id: &str) {
         fs::write(
             dir.join("spin.toml"),
-            synthesise_spin_toml(component_id, Some(component_id), Path::new("spin.toml")),
+            synthesise_spin_toml(
+                component_id,
+                Some(component_id),
+                Path::new("spin.toml"),
+                &[],
+            ),
         )
         .expect("seed spin.toml");
         fs::write(
@@ -940,6 +945,7 @@ mod tests {
                 TEST_COMPONENT_ID,
                 Some(TEST_COMPONENT_ID),
                 Path::new("spin.toml"),
+                &[],
             ),
         )
         .expect("seed spin.toml");
@@ -985,6 +991,7 @@ mod tests {
                 TEST_COMPONENT_ID,
                 Some(TEST_COMPONENT_ID),
                 Path::new("spin.toml"),
+                &[],
             ),
         )
         .expect("seed spin.toml");
@@ -1189,7 +1196,7 @@ mod tests {
         );
     }
 
-    // ---------- provision_typed (Task 26) ----------
+    // ---------- provision_typed ----------
 
     #[test]
     fn spin_provision_typed_writes_lowercased_variables_and_uppercased_env() {
@@ -1200,6 +1207,7 @@ mod tests {
                 TEST_COMPONENT_ID,
                 Some(TEST_COMPONENT_ID),
                 Path::new("spin.toml"),
+                &[],
             ),
         )
         .unwrap();
@@ -1254,7 +1262,7 @@ mod tests {
         // [component.worker] table exists.
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml("demo", Some("worker"), Path::new("spin.toml")),
+            synthesise_spin_toml("demo", Some("worker"), Path::new("spin.toml"), &[]),
         )
         .unwrap();
 
@@ -1322,6 +1330,7 @@ mod tests {
                 TEST_COMPONENT_ID,
                 Some(TEST_COMPONENT_ID),
                 Path::new("spin.toml"),
+                &[],
             ),
         )
         .unwrap();
@@ -1420,7 +1429,7 @@ mod tests {
     fn spin_provision_typed_errors_if_spin_toml_absent() {
         let dir = tempdir().unwrap();
         // Do NOT seed spin.toml. Local mode must error naming the
-        // missing baseline (Task 8b's CLI bootstrap should have
+        // missing baseline (the CLI bootstrap should have
         // written it).
         let entries = [TypedSecretEntry::new("default", "API_TOKEN", "demo_token")];
         let err = SpinCliAdapter
@@ -1439,7 +1448,7 @@ mod tests {
         );
     }
 
-    // ---------- provision_local contract suite — Task 40 ----------
+    // ---------- provision_local contract suite ----------
     //
     // Eight tests locking the local-mode provision contract:
     // four common tests shared with sibling adapters (first-run
@@ -1647,6 +1656,7 @@ mod tests {
                 TEST_COMPONENT_ID,
                 Some(TEST_COMPONENT_ID),
                 Path::new("spin.toml"),
+                &[],
             ),
         )
         .unwrap();
@@ -1763,6 +1773,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds for renamed crate");
 
@@ -1816,6 +1827,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds for nested manifest");
         let (spin_rel, spin_body) = outcome
@@ -1834,7 +1846,7 @@ mod tests {
             spin_body.contains("/release/spin_server.wasm"),
             "wasm basename must underscore the crate name (spin_server) even with a nested manifest: {spin_body}"
         );
-        // Regression (PR #287 second review, P1c): the pre-fix
+        // Regression: the pre-fix
         // synthesiser hard-coded `../../target/...`, correct for a
         // 2-deep scaffold-convention manifest but WRONG for the
         // nested layout — it would resolve to `crates/target/...`
@@ -1873,6 +1885,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds");
         let (_, spin_body) = outcome
@@ -1890,6 +1903,7 @@ mod tests {
                 Some("worker"),
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis with component selector succeeds");
         let (_, spin_body2) = outcome2
@@ -2053,7 +2067,7 @@ mod tests {
 
     #[test]
     fn re_provision_preserves_operator_uncommented_override() {
-        // Task 16c dedup contract: first provision writes a
+        // Dedup contract: first provision writes a
         // commented `# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=<logical>_staging`
         // placeholder. Operator uncomments AND changes the value.
         // Re-run provision must:

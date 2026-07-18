@@ -54,8 +54,7 @@ impl From<Action> for AdapterAction {
 /// (manifest `[adapters.<name>.commands].<action>`) and the registry
 /// fallback that hands the result to `Adapter::execute` via
 /// `AdapterExecContext`. Before this was extracted, only `run_shell`
-/// applied any of it and the fallback silently ran with none of it
-/// (PR #287 review round 9, blocking #3).
+/// applied any of it and the fallback silently ran with none of it.
 ///
 /// Precedence, high to low:
 ///   1. Parent env -- an operator's `KEY=v edgezero serve` wins over
@@ -119,7 +118,7 @@ fn build_child_env(
 /// before the `.env` overlay was applied to the command -- so a secret
 /// the provision-written `.env` file supplied was still reported
 /// missing, and `edgezero serve` refused to start on a correctly
-/// provisioned project (PR #287 review round 9, #7). Resolution order
+/// provisioned project. Resolution order
 /// is now the same one the child sees: parent env, or anything
 /// `build_child_env` resolved for it.
 fn assert_required_secrets_present(
@@ -185,7 +184,7 @@ pub(crate) fn execute_with_env_overlay(
             root,
             adapter_name,
             action,
-            Some(env),
+            Some(&env),
             adapter_bind,
             adapter_args,
             env_overlay,
@@ -217,7 +216,7 @@ pub(crate) fn execute_with_env_overlay(
     // adapter spawns its own vendor CLI. Hand it the SAME cwd + child
     // env the shell path above would have applied, otherwise a `serve`
     // here starts with none of the `.env` secrets and resolves its
-    // manifest from the process cwd (PR #287 review round 9, #3).
+    // manifest from the process cwd.
     let (cwd, child_env): (Option<&Path>, Vec<(String, String)>) = match manifest_loader {
         Some(loader) => {
             let root = loader.manifest().root();
@@ -284,7 +283,7 @@ fn run_shell(
     cwd: &Path,
     adapter_name: &str,
     action: Action,
-    environment: Option<ResolvedEnvironment>,
+    environment: Option<&ResolvedEnvironment>,
     adapter_bind: (Option<String>, Option<u16>),
     adapter_args: &[String],
     env_overlay: &[(String, String)],
@@ -311,12 +310,7 @@ fn run_shell(
     // Precedence + the required-secrets assertion both live in
     // `build_child_env` so this path and the registry fallback in
     // `execute_with_env_overlay` cannot drift apart.
-    let child_env = build_child_env(
-        adapter_name,
-        environment.as_ref(),
-        adapter_bind,
-        env_overlay,
-    )?;
+    let child_env = build_child_env(adapter_name, environment, adapter_bind, env_overlay)?;
     cmd.envs(child_env);
 
     let status = cmd
@@ -359,7 +353,7 @@ mod tests {
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
     use edgezero_core::test_env::EnvOverride;
 
-    fn value_for<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    fn value_for<'env>(env: &'env [(String, String)], key: &str) -> Option<&'env str> {
         env.iter()
             .find(|(existing, _)| existing == key)
             .map(|(_, value)| value.as_str())
@@ -389,8 +383,8 @@ mod tests {
         let adapter_name = "test-adapter";
 
         // Neither parent env nor overlay supplies the secret -> error.
-        let result = build_child_env(adapter_name, Some(&env), (None, None), &[]);
-        assert!(result.is_err());
+        build_child_env(adapter_name, Some(&env), (None, None), &[])
+            .expect_err("a required secret with no source must error");
 
         let _secret = EnvOverride::set("EDGEZERO_TEST_SECRET", "set");
         let resolved =
@@ -403,7 +397,7 @@ mod tests {
 
     #[test]
     fn build_child_env_treats_env_overlay_as_a_secret_source() {
-        // Regression (PR #287 review round 9, #7): required secrets
+        // Regression: required secrets
         // were checked against the parent env only, BEFORE the `.env`
         // overlay was applied -- so a secret supplied purely by the
         // provision-written `.env` file was falsely reported missing

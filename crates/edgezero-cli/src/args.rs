@@ -300,7 +300,7 @@ impl Default for ConfigDiffArgs {
 /// Kept for internal grouping — the `#[command(flatten)]`
 /// on [`ConfigPushArgs`] made `--no-diff` / `--no-env` still
 /// top-level CLI flags. Re-hosted directly on [`ConfigPushArgs`]
-/// in the 2026-07-13 revision (see PR #287 second review, P2c) to
+/// in the 2026-07-13 revision to
 /// restore source compatibility for downstream CLIs that construct
 /// `ConfigPushArgs` via `Default::default()` + field assignment
 /// (`args.no_diff = true;`, `args.no_env = true;`). The pre-fix
@@ -313,7 +313,7 @@ impl Default for ConfigDiffArgs {
 #[non_exhaustive]
 pub struct ConfigPushSuppressions;
 
-/// See PR #287 second review, P2c. `no_diff` and `no_env` live
+/// `no_diff` and `no_env` live
 /// on this struct as top-level public fields to preserve source
 /// compatibility with downstream CLIs that predate the 2026-07-13
 /// changes. Total bool count is 5 (`dry_run`, `local`, `no_diff`,
@@ -327,7 +327,7 @@ pub struct ConfigPushSuppressions;
     clippy::struct_excessive_bools,
     reason = "5 bools by design: source-compat for downstream CLIs that assign \
               `args.no_diff` / `args.no_env` directly. Grouping into a sub-struct \
-              trips E0609 at every existing call site. See PR #287 second review."
+              trips E0609 at every existing call site."
 )]
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]

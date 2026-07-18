@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`edgezero provision` / `edgezero config push` cross-process advisory
-  lock** (`.edgezero-provision.lock` alongside `edgezero.toml`).
+  lock** (`.edgezero/provision.lock` under the manifest's project root).
   Serialises concurrent invocations against the same tree so
   read-modify-write on `.env` / `.dev.vars` / `edgezero.toml` no
   longer silently drops a competing writer's edits. Dry-run skips
@@ -52,12 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fastly `service_id` no longer lands under `[local_server]` on
   re-provision; the merged `fastly.toml` correctly carries it at the
   TOML root so `fastly compute deploy` picks it up.
-- Fastly cloud `provision` populates `ProvisionOutcome.deployed.service_id`
-  from `fastly.toml`; the writeback to `[adapters.fastly.deployed]`
-  in `edgezero.toml` no longer silently drops.
+- Fastly cloud `provision` no longer auto-captures `service_id` from
+  the gitignored, per-machine `fastly.toml` into tracked
+  `[adapters.fastly.deployed]`. Per the v1 contract that writeback
+  stays a documented one-time manual copy after `fastly compute deploy`;
+  auto-capturing it let a stale local file silently overwrite the
+  team's committed service id.
 - Cloudflare `.dev.vars` commented `__KEY` placeholder now uses
-  `<logical>_staging` per spec Task 19 (was
-  `<placeholder-<logical>-key>`).
+  `<logical>_staging` (was `<placeholder-<logical>-key>`).
 - Cross-adapter `path_mutation_guard` unification (`edgezero-cli`
   test binary): scaffold + push-shim tests share the same mutex, no
   more intermittent CI flakes from PATH-restore races.

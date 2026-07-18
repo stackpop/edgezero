@@ -1,7 +1,7 @@
 //! `.env` file loader used by `run_serve` to expose the
 //! provision-written `.env` file to the spawned adapter.
 //!
-//! **Pre-2026-07-09 (PR #287 review, blocking #3)** this module
+//! **Pre-2026-07-09** this module
 //! wrote into `std::env::set_var` directly. On Unix, `setenv`/
 //! `getenv` are not thread-safe: they operate on the shared
 //! `environ` array with no synchronisation. A multithreaded

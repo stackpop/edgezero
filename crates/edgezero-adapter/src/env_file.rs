@@ -138,35 +138,40 @@ pub fn append_lines_dedup_with_header(
     Ok(())
 }
 
-/// Reject a target whose final component is a symlink.
+/// Reject a target whose final component is a symlink, before a
+/// provision/push write follows it.
 ///
-/// `.env` / `.dev.vars` / `.edgezero/.env` are written with
-/// `fs::write`, which FOLLOWS a symlinked final component and
-/// truncates the link's target. An operator (or a hostile tree
-/// fetched by CI) that plants `.env -> ~/.ssh/authorized_keys`
-/// would have provision write attacker-chosen `KEY=value` lines
-/// into that file -- and `set_restrictive_mode` then chmods the
-/// *victim's* file to 0600, because `fs::set_permissions` follows
-/// links too. Both writes land outside the project tree entirely.
+/// Provision- and push-owned local files (`.env` / `.dev.vars` /
+/// `.edgezero/.env`, Axum's `.edgezero/local-config-*.json`, Spin's
+/// local KV `SQLite` db) are written with `fs::write` / `File::create`
+/// / `Connection::open`, all of which FOLLOW a symlinked final
+/// component and truncate (or create) the link's target. An operator
+/// -- or a hostile tree fetched by CI -- that plants a symlink where
+/// one of these files is expected would have the provision/push write
+/// attacker-influenced content into the link's target, outside the
+/// project tree.
 ///
 /// `symlink_metadata` does not follow links, so a dangling symlink
 /// (`is_symlink() == true`, target missing) is caught as well --
-/// which matters, since `fs::write` through a dangling link happily
+/// which matters, since a write through a dangling link happily
 /// CREATES the target.
 ///
 /// Scope: this guards the final component only. Symlink safety for
 /// the parent chain belongs to the caller that resolves the path
 /// against the project root -- see `edgezero-cli`'s `path_safety`,
-/// which walks the manifest-declared `.crate` / `.manifest`
-/// components. This helper is a generic writer and has no project
-/// root to bound a walk against.
-fn reject_symlinked_target(path: &Path) -> Result<(), String> {
+/// which walks the manifest-declared components. This helper is a
+/// generic writer and has no project root to bound a walk against.
+///
+/// # Errors
+/// Returns an error when `path`'s final component is a symlink, or
+/// when its metadata can't be read for a reason other than "missing".
+#[inline]
+pub fn reject_symlinked_target(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(md) if md.file_type().is_symlink() => Err(format!(
-            "refusing to write `{}`: it is a symlink. Provision writes this file with \
-             `fs::write`, which would follow the link and overwrite its target (and chmod \
-             that target to 0600) -- both outside the project tree. Replace the symlink \
-             with a regular file",
+            "refusing to write `{}`: it is a symlink, and the write would follow the link \
+             and overwrite (or create) its target outside the project tree. Replace the \
+             symlink with a regular file",
             path.display()
         )),
         // Not a symlink, or does not exist yet (the common
@@ -221,7 +226,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Regression (PR #287 review round 9, blocking #1): a symlinked
+    /// Regression: a symlinked
     /// `.env` let provision write THROUGH the link and clobber a file
     /// outside the project tree, then chmod that victim to 0600.
     #[cfg(unix)]

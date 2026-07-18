@@ -208,7 +208,7 @@ fn locate_artifact(
 /// legal name — including values with TOML-significant characters
 /// like `"`, `\`, or newlines — is escaped correctly.
 pub(super) fn synthesise_wrangler_toml(crate_name: &str) -> String {
-    use toml_edit::{DocumentMut, Item, Table, value};
+    use toml_edit::{DocumentMut, value};
 
     let mut doc = DocumentMut::new();
     doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
@@ -221,14 +221,13 @@ pub(super) fn synthesise_wrangler_toml(crate_name: &str) -> String {
     doc.insert("main", value("build/worker/shim.mjs"));
     doc.insert("compatibility_date", value("2024-01-01"));
 
-    // [build] — wrangler reads this to know how to compile the
-    // Rust crate into a Worker bundle. Without it the operator
-    // has to invoke `worker-build --release` manually before
-    // every `wrangler dev` / `wrangler deploy`. Match the
-    // pre-2026-07 scaffold template default.
-    let mut build = Table::new();
-    build.insert("command", value("worker-build --release"));
-    doc.insert("build", Item::Table(build));
+    // No `[build]` table: the spec's normative Cloudflare baseline
+    // (spec §"Cloudflare (wrangler.toml)") is exactly `name` + `main`
+    // + `compatibility_date`. EdgeZero drives builds through its own
+    // `edgezero build --adapter cloudflare` (which runs `cargo build`
+    // + artifact copy), not bare `wrangler deploy`, so emitting a
+    // `[build]` command exceeded that baseline. Operators who invoke wrangler directly add it by hand;
+    // the merge path preserves it.
 
     doc.to_string()
 }
@@ -240,22 +239,18 @@ mod tests {
     // ---------- synthesise_wrangler_toml ----------
 
     #[test]
-    fn synthesises_minimal_wrangler_toml_with_header() {
-        // Caller resolves the crate name from the adapter-crate
-        // Cargo.toml (see `read_adapter_crate_name` in cli_support);
-        // the synth itself is a pure toml_edit shape emitter over the
-        // resolved value.
+    fn synthesises_wrangler_toml_matches_spec_baseline_exactly() {
+        // Exact-content test: the
+        // synthesised wrangler.toml must equal the spec's normative
+        // Cloudflare baseline byte-for-byte -- no `[build]` table, no
+        // other extras. A loose `contains` check let the baseline
+        // drift above the spec; this pins it.
         let out = synthesise_wrangler_toml("demo-adapter-cloudflare");
-        assert!(out.starts_with("# edgezero-provision: v1"));
-        assert!(out.contains(r#"name = "demo-adapter-cloudflare""#));
-        assert!(out.contains(r#"main = "build/worker/shim.mjs""#));
-        assert!(out.contains("compatibility_date = "));
-        // [build] table is required so `wrangler deploy` knows how
-        // to compile the Rust crate into a Worker bundle.
-        assert!(
-            out.contains(r#"command = "worker-build --release""#),
-            "wrangler.toml must ship a [build] command: {out}"
-        );
+        let expected = "# edgezero-provision: v1\n\
+             name = \"demo-adapter-cloudflare\"\n\
+             main = \"build/worker/shim.mjs\"\n\
+             compatibility_date = \"2024-01-01\"\n";
+        assert_eq!(out, expected, "wrangler.toml baseline drifted from spec");
     }
 
     #[test]

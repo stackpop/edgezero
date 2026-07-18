@@ -264,7 +264,7 @@ mod tests {
         // env-resolved platform (`prod_config`); the ENV-VAR KEY
         // must still use the LOGICAL id upper-cased (`APP_CONFIG`)
         // so the runtime env overlay finds it. Same discipline as
-        // Cloudflare Task 19.
+        // Cloudflare handles this separately.
         let dir = tempdir().unwrap();
         let config_ids = vec![ResolvedStoreId::new("app_config", "prod_config")];
         let stores = ProvisionStores {
@@ -431,6 +431,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds for renamed crate");
         assert_eq!(outcome.len(), 1);
@@ -474,6 +475,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds for nested manifest");
         let (rel, body) = outcome.into_iter().next().unwrap();
@@ -486,7 +488,7 @@ mod tests {
             !body.contains(r#"crate = "demo-app-adapter-axum""#),
             "MUST NOT fall back to scaffold convention when the crate Cargo.toml exists further up: {body}"
         );
-        // Regression (PR #287 second review, P2b): the pre-fix
+        // Regression: the pre-fix
         // synthesiser hard-coded `crate_dir = "."`, which for a
         // nested manifest points the loader at `config/Cargo.toml`
         // (manifest parent) — where no Cargo.toml exists.
@@ -528,6 +530,7 @@ mod tests {
                 None,
                 "demo-app",
                 None,
+                &[],
             )
             .expect("baseline synthesis succeeds for scaffold-convention manifest");
         let (_, body) = outcome.into_iter().next().unwrap();
@@ -594,7 +597,7 @@ mod tests {
         // AND edits the line to point at their own override value.
         // Re-running provision must NOT re-add the commented form and
         // MUST leave the operator's uncommented line byte-identical
-        // (Task 16c dedup semantics — key-normalised uncommented
+        // (dedup semantics — key-normalised uncommented
         // form wins over any commented sibling).
         let dir = tempdir().unwrap();
         let config_ids = ResolvedStoreId::from_logicals(&["app_config"]);

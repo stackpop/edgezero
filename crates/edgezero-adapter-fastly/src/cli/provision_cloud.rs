@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 
-use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
+use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores};
 
 use super::FASTLY_INSTALL_HINT;
 
@@ -19,7 +19,6 @@ pub(super) fn provision(
     manifest_root: &Path,
     adapter_manifest_path: Option<&str>,
     stores: &ProvisionStores<'_>,
-    deployed: Option<&AdapterDeployedState>,
     dry_run: bool,
 ) -> Result<ProvisionOutcome, String> {
     // Fastly is Multi for every store kind. Each id maps 1:1
@@ -156,74 +155,20 @@ pub(super) fn provision(
     if out.is_empty() {
         out.push("fastly has no declared stores to provision".to_owned());
     }
-    // Read-back the service_id from fastly.toml (if the operator has
-    // already run `fastly compute deploy` at least once) and thread it
-    // into ProvisionOutcome.deployed so the CLI's writeback path lands
-    // `[adapters.fastly.deployed].service_id` in `edgezero.toml`.
-    // deployed_fields() advertises ownership of `service_id`; without
-    // this population the writeback is silently dropped and the
-    // operator has to hand-copy from fastly.toml. Dry-run still
-    // populates: the CLI's `merge_deployed_into_manifest` respects
-    // its own dry_run flag and will only report (not write) the
-    // pending edgezero.toml change.
-    let captured = capture_service_id(&fastly_path, deployed)?;
-    Ok(match captured {
-        Some(state) => ProvisionOutcome::with_deployed(out, state),
-        None => ProvisionOutcome::from_status_lines(out),
-    })
-}
-
-/// Decide what `service_id`, if any, cloud provision should write back
-/// into TRACKED `edgezero.toml`.
-///
-/// `fastly.toml` is gitignored (per-machine), `edgezero.toml` is
-/// committed (shared). The two provision paths move `service_id` in
-/// OPPOSITE directions -- local pins the tracked id INTO fastly.toml,
-/// cloud captures fastly.toml's id back OUT into the tracked block --
-/// so the read-back needs a rule about which side is authoritative
-/// (PR #287 review round 9, blocking #2). The rule:
-///
-/// * tracked has no id -> CAPTURE. This is the intended bootstrap:
-///   `fastly compute deploy` creates the service and writes its id
-///   into fastly.toml, and provision records it for the team.
-/// * tracked id == fastly.toml's -> nothing to do. Returning `None`
-///   rather than the identical value keeps the writeback (and its
-///   dry-run diff) quiet instead of reporting a no-op edit.
-/// * tracked id != fastly.toml's -> ERROR. Previously the read-back
-///   won unconditionally (`merge_deployed_into_manifest` does a plain
-///   `insert`), so one developer's stale gitignored fastly.toml --
-///   left over from another service, and never visible in review --
-///   silently replaced the id the whole team deploys against. Neither
-///   side can be trusted automatically here: the local file may be
-///   stale, or it may be a legitimately re-created service. Stop and
-///   make the operator say which.
-/// * fastly.toml has no id -> nothing to capture.
-fn capture_service_id(
-    fastly_path: &Path,
-    deployed: Option<&AdapterDeployedState>,
-) -> Result<Option<AdapterDeployedState>, String> {
-    let Some(local_sid) = read_fastly_service_id(fastly_path)? else {
-        return Ok(None);
-    };
-    let tracked_sid = deployed.and_then(|state| state.fields.get("service_id"));
-    if let Some(tracked) = tracked_sid {
-        if tracked == &local_sid {
-            return Ok(None);
-        }
-        return Err(format!(
-            "service_id conflict: `{}` declares `service_id = \"{local_sid}\"`, but tracked \
-             `[adapters.fastly.deployed].service_id` is \"{tracked}\". `fastly.toml` is \
-             gitignored and per-machine, so provision will not silently overwrite the \
-             committed id with it. Resolve it explicitly: if the tracked id is correct, \
-             delete `service_id` from `{}` (`provision --local` re-pins it from the tracked \
-             block); if the local id is correct, update the tracked value in `edgezero.toml`.",
-            fastly_path.display(),
-            fastly_path.display(),
-        ));
-    }
-    let mut state = AdapterDeployedState::default();
-    state.fields.insert("service_id".to_owned(), local_sid);
-    Ok(Some(state))
+    // Cloud provision does NOT write back `service_id`. Per spec
+    // §"Writeback ownership" (and the plan's "Fastly note"), Fastly's
+    // `service_id` is populated by `fastly compute deploy` -- which
+    // runs as the manifest `[adapters.fastly.commands].deploy` shell
+    // command, bypassing the adapter dispatch entirely -- and the
+    // operator does a documented ONE-TIME copy from `fastly.toml` into
+    // `[adapters.fastly.deployed].service_id`. An earlier build
+    // auto-captured the id here; that both exceeded the v1 contract
+    // AND opened a data-loss path where a stale, gitignored,
+    // per-machine `fastly.toml` silently replaced the team's committed
+    // id. Local provision still pins the
+    // TRACKED id INTO fastly.toml (the spec-blessed direction); only
+    // this reverse auto-capture is removed.
+    Ok(ProvisionOutcome::from_status_lines(out))
 }
 
 /// Shell out to `fastly <kind>-store create --name=<platform-name>`. The
@@ -428,7 +373,7 @@ mod tests {
     use super::super::run::synthesise_fastly_toml;
     use super::*;
     use edgezero_adapter::registry::{
-        Adapter as _, ProvisionMode, ResolvedStoreId, TypedSecretEntry,
+        Adapter as _, AdapterDeployedState, ProvisionMode, ResolvedStoreId, TypedSecretEntry,
     };
     use tempfile::tempdir;
 
@@ -703,22 +648,21 @@ mod tests {
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
     }
 
-    /// Cloud provision must populate `ProvisionOutcome.deployed` with
-    /// `service_id` when fastly.toml declares it. `deployed_fields()`
-    /// claims ownership of `service_id`; without this the writeback to
-    /// `[adapters.fastly.deployed]` in edgezero.toml is silently
-    /// dropped and the operator has to hand-copy from fastly.toml.
-    ///
-    /// Regression test: pre-`Adapters` fix, the cloud arm unconditionally
-    /// returned `deployed: None`.
+    /// Spec contract: cloud provision
+    /// NEVER writes back `service_id`, even when `fastly.toml` already
+    /// declares one. Per spec §"Writeback ownership" the id is
+    /// populated by `fastly compute deploy` and copied into
+    /// `edgezero.toml` once, by hand. Auto-capturing it here exceeded
+    /// the v1 contract and let a stale gitignored `fastly.toml`
+    /// overwrite the team's committed id.
     #[test]
-    fn provision_populates_deployed_service_id_from_fastly_toml() {
+    fn cloud_provision_never_writes_back_service_id() {
         let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("fastly.toml");
         // fastly.toml declares a service_id (as it would after a first
-        // successful `fastly compute deploy`).
+        // successful `fastly compute deploy`) -- and cloud provision
+        // must STILL leave `deployed` empty.
         fs::write(
-            &path,
+            dir.path().join("fastly.toml"),
             "manifest_version = 3\nname = \"demo\"\nservice_id = \"SVC_ALREADY_DEPLOYED\"\n\n[local_server]\n",
         )
         .expect("write");
@@ -733,136 +677,23 @@ mod tests {
                 Some("fastly.toml"),
                 None,
                 &stores,
-                None,
+                // A tracked id that DIFFERS from fastly.toml's would,
+                // under the old auto-capture, be silently overwritten.
+                Some(&{
+                    let mut state = AdapterDeployedState::default();
+                    state
+                        .fields
+                        .insert("service_id".to_owned(), "SVC_TRACKED".to_owned());
+                    state
+                }),
                 ProvisionMode::Cloud,
                 true, // dry-run avoids invoking the real fastly CLI
             )
             .expect("dry-run succeeds");
-        let deployed = outcome
-            .deployed
-            .as_ref()
-            .expect("deployed must be Some when fastly.toml declares service_id");
-        assert_eq!(
-            deployed.fields.get("service_id").map(String::as_str),
-            Some("SVC_ALREADY_DEPLOYED"),
-            "service_id must flow into ProvisionOutcome.deployed"
-        );
-    }
-
-    /// Inverse: when `fastly.toml` has no `service_id` (fresh project,
-    /// not yet deployed), cloud provision returns `deployed: None`.
-    /// Nothing to write back -- the operator hasn't picked a service
-    /// yet.
-    #[test]
-    fn provision_returns_none_deployed_when_fastly_toml_has_no_service_id() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
-            "manifest_version = 3\nname = \"demo\"\n\n[local_server]\n",
-        )
-        .expect("write");
-        let stores = ProvisionStores {
-            config: &[],
-            kv: &[],
-            secrets: &[],
-        };
-        let outcome = FastlyCliAdapter
-            .provision(
-                dir.path(),
-                Some("fastly.toml"),
-                None,
-                &stores,
-                None,
-                ProvisionMode::Cloud,
-                true,
-            )
-            .expect("dry-run succeeds");
         assert!(
             outcome.deployed.is_none(),
-            "no service_id in fastly.toml means deployed must be None"
-        );
-    }
-
-    /// Build an `AdapterDeployedState` carrying a tracked `service_id`,
-    /// standing in for `[adapters.fastly.deployed]` in `edgezero.toml`.
-    fn tracked(service_id: &str) -> AdapterDeployedState {
-        let mut state = AdapterDeployedState::default();
-        state
-            .fields
-            .insert("service_id".to_owned(), service_id.to_owned());
-        state
-    }
-
-    fn write_fastly_toml_with_service_id(dir: &Path, service_id: &str) {
-        fs::write(
-            dir.join("fastly.toml"),
-            format!(
-                "manifest_version = 3\nname = \"demo\"\nservice_id = \"{service_id}\"\n\n[local_server]\n"
-            ),
-        )
-        .expect("write");
-    }
-
-    /// Tracked and local agree: nothing to write back. Returning the
-    /// identical value instead of `None` would make the CLI report a
-    /// no-op edit (and render a dry-run diff) for every cloud run.
-    #[test]
-    fn provision_returns_none_deployed_when_tracked_service_id_matches_local() {
-        let dir = tempdir().expect("tempdir");
-        write_fastly_toml_with_service_id(dir.path(), "SVC_SAME");
-        let stores = ProvisionStores {
-            config: &[],
-            kv: &[],
-            secrets: &[],
-        };
-        let outcome = FastlyCliAdapter
-            .provision(
-                dir.path(),
-                Some("fastly.toml"),
-                None,
-                &stores,
-                Some(&tracked("SVC_SAME")),
-                ProvisionMode::Cloud,
-                true,
-            )
-            .expect("dry-run succeeds");
-        assert!(
-            outcome.deployed.is_none(),
-            "an unchanged service_id must not produce a writeback"
-        );
-    }
-
-    /// Regression (PR #287 review round 9, blocking #2): the read-back
-    /// used to win unconditionally, so a stale per-machine (gitignored)
-    /// `fastly.toml` silently replaced the team's committed
-    /// `[adapters.fastly.deployed].service_id` and everyone started
-    /// deploying against the wrong service.
-    #[test]
-    fn provision_errors_when_local_service_id_conflicts_with_tracked() {
-        let dir = tempdir().expect("tempdir");
-        write_fastly_toml_with_service_id(dir.path(), "SVC_STALE_LOCAL");
-        let stores = ProvisionStores {
-            config: &[],
-            kv: &[],
-            secrets: &[],
-        };
-        let err = FastlyCliAdapter
-            .provision(
-                dir.path(),
-                Some("fastly.toml"),
-                None,
-                &stores,
-                Some(&tracked("SVC_TRACKED")),
-                ProvisionMode::Cloud,
-                true,
-            )
-            .expect_err("a conflicting service_id must stop provision");
-        assert!(
-            err.contains("SVC_STALE_LOCAL")
-                && err.contains("SVC_TRACKED")
-                && err.contains("conflict"),
-            "error must name both ids so the operator can pick: {err}"
+            "cloud provision must never write back service_id: {:?}",
+            outcome.deployed
         );
     }
 

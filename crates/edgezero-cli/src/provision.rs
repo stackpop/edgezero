@@ -41,8 +41,8 @@ use validator::Validate;
 /// Owned counterpart to the borrowed `ProvisionStores<'_>`. Used by
 /// dispatch arms that need to build resolved store ids per-root
 /// (e.g. inside the `run_with_staging` closure where a borrowed
-/// return would dangle when the `Vec` locals dropped). Task 29
-/// (typed provision) consumes this too.
+/// return would dangle when the `Vec` locals dropped). The typed
+/// provision path consumes this too.
 pub(crate) struct OwnedProvisionStores {
     pub config: Vec<ResolvedStoreId>,
     pub kv: Vec<ResolvedStoreId>,
@@ -225,8 +225,8 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
     let app_name = manifest.app.name.clone().unwrap_or_default();
 
     // Translate the manifest's deployed block into the neutral
-    // `AdapterDeployedState` for the synthesiser call site. Task 14
-    // adds the typed struct that makes this a real translation;
+    // `AdapterDeployedState` for the synthesiser call site. The typed
+    // deployed struct makes this a real translation;
     // today it's always `None`.
     let deployed = deployed_state_for(manifest, &args.adapter);
 
@@ -235,16 +235,11 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
             // Cloud: no synthesis. Validate + build stores against the
             // real worktree, dispatch with mode=Cloud.
             //
-            // `deployed` IS threaded here (it used to be hard-coded
-            // `None` -- PR #287 review round 9, blocking #2). Cloud
-            // adapters read durable ids back out of their gitignored
-            // adapter manifest (fastly.toml's `service_id`) and return
-            // them in `ProvisionOutcome.deployed`, which the writeback
-            // below `insert`s unconditionally into TRACKED
-            // edgezero.toml. Without the tracked block to compare
-            // against, an adapter could not tell a first-time capture
-            // from a stale per-machine file silently replacing the
-            // team's committed id -- so it always did the latter.
+            // The tracked `deployed` block is threaded in so a cloud
+            // adapter can compare ids it discovers (e.g. Cloudflare's
+            // created KV namespaces) against what the team already has
+            // committed, rather than blindly overwriting it -- the
+            // writeback below `insert`s whatever the adapter returns.
             let dispatch = DispatchContext {
                 adapter,
                 adapter_cfg,
@@ -269,6 +264,7 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
                 adapter_cfg.adapter.component.as_deref(),
                 &app_name,
                 deployed.as_ref(),
+                &adapter_cfg.adapter.allowed_outbound_hosts,
             )?;
             let synthesised = write_baseline_to_disk(manifest_root, &baseline_pairs)?;
             let dispatch = DispatchContext {
@@ -520,6 +516,7 @@ fn run_local_dry_run_typed(
         adapter_component,
         &app_name,
         deployed_state.as_ref(),
+        outbound_hosts_for(ctx.manifest(), canonical_adapter_name),
     )?;
 
     let (report, _tempdir) = run_with_staging(
@@ -701,6 +698,17 @@ fn write_baseline_to_disk(
             ));
         }
         let abs = root.join(rel_path);
+        // Reject a symlinked component anywhere from `root` down to the
+        // baseline file itself. `abs.exists()` follows links, so a
+        // symlinked-to-existing target would be silently skipped, and a
+        // DANGLING symlink would sail past `.exists()` into the
+        // `fs::write` below, which creates the link's target outside
+        // the tree.
+        reject_symlink_components(
+            root,
+            &abs,
+            &format!("baseline output `{}`", rel_path.display()),
+        )?;
         if abs.exists() {
             continue;
         }
@@ -712,6 +720,21 @@ fn write_baseline_to_disk(
         written.push(abs);
     }
     Ok(written)
+}
+
+/// `[adapters.<name>.adapter].allowed_outbound_hosts` for the adapter,
+/// or an empty slice when the adapter (or the key) is absent. Threaded
+/// into `synthesise_baseline_manifest` so the Spin synthesiser can emit
+/// the opt-in outbound allow-list.
+fn outbound_hosts_for<'manifest>(
+    manifest: &'manifest Manifest,
+    adapter_name: &str,
+) -> &'manifest [String] {
+    manifest
+        .adapter_entry(adapter_name)
+        .map_or(&[], |(_, cfg)| {
+            cfg.adapter.allowed_outbound_hosts.as_slice()
+        })
 }
 
 /// Translate the parent manifest's `[adapters.<name>.deployed]` block
@@ -872,7 +895,7 @@ pub(crate) fn merge_deployed_into_manifest(
 
     let updated = doc.to_string();
     if dry_run {
-        // Regression (PR #287 second review, P2a): dry-run used to
+        // Regression: dry-run used to
         // return silently here. Adapters like Fastly can emit a
         // freshly-discovered `service_id` during cloud dry-run (the
         // adapter shells `fastly service describe --json` which
@@ -960,7 +983,7 @@ fn validate_and_dispatch(
 /// Same store-construction pattern `validate_and_dispatch` runs
 /// inline, but returns the owned form so the caller can hold it
 /// across a closure and `.as_refs()` immediately before dispatch.
-/// Used by the `(true, true)` arm today; Task 29 (typed provision)
+/// Used by the `(true, true)` arm today; the typed provision path
 /// consumes it too.
 ///
 /// The `_root` parameter is unused today — reserved for future
@@ -1271,6 +1294,7 @@ fn run_local_dry_run(
         adapter_cfg.adapter.component.as_deref(),
         app_name,
         deployed,
+        &adapter_cfg.adapter.allowed_outbound_hosts,
     )?;
     let adapter_crate_rel = adapter_cfg
         .adapter
@@ -1437,8 +1461,7 @@ where
     // walks, but it cannot vet the root it is handed: `.exists()`
     // follows links, so a symlinked `.edgezero` would have us walk and
     // copy whatever it points at (e.g. `~/.aws`) into the staging dir
-    // that the dry-run then surfaces to the operator (PR #287 review
-    // round 9, blocking #1).
+    // that the dry-run then surfaces to the operator.
     reject_symlink_components(
         project_root,
         &dot_edgezero,
@@ -1490,7 +1513,7 @@ mod tests {
     //
     // The fake echoes `adapter_manifest_path` back as the
     // synthesised file's relative path, mirroring the Spin override
-    // that lands at Task 24 — the file must land at
+    // that the Spin synthesiser lands — the file must land at
     // `<root>/<adapter_cfg.adapter.manifest>`, NOT at a hard-coded
     // path.
 
@@ -1517,7 +1540,7 @@ serve = "echo"
     // real `[adapters.<name>.deployed]` block and threaded it
     // through — not left it silently `None`.
     static RECORDED_SYNTH_DEPLOYED: Mutex<Option<AdapterDeployedState>> = Mutex::new(None);
-    // Task 29: captures the `TypedSecretEntry` slice the CLI passes
+    // captures the `TypedSecretEntry` slice the CLI passes
     // into `FakeBootstrapAdapter::provision_typed`. Recorded as
     // `(store_id, field_name, key_value)` triples because the entry
     // itself borrows from the `ValidationContext`'s raw config; the
@@ -1615,7 +1638,7 @@ serve = "echo"
 
         fn single_store_kinds(&self) -> &'static [&'static str] {
             // The fake advertises `secrets` as Single-capable so the
-            // Task 29 capability-gate test can drive
+            // capability-gate test can drive
             // `enforce_single_store_capability` without leaning on a
             // real adapter's registration. Existing fake fixtures
             // declare zero or one secret id, so this override does
@@ -1630,6 +1653,7 @@ serve = "echo"
             _component_selector: Option<&str>,
             _app_name: &str,
             deployed: Option<&AdapterDeployedState>,
+            _allowed_outbound_hosts: &[String],
         ) -> Result<Vec<(PathBuf, String)>, String> {
             SYNTH_CALLED.store(true, Ordering::SeqCst);
             if let Ok(mut slot) = RECORDED_SYNTH_DEPLOYED.lock() {
@@ -2307,7 +2331,7 @@ ids = ["default"]
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         fs::write(temp.path().join("edgezero.toml"), PROVISION_MANIFEST).expect("write manifest");
-        // Task 11 wires the (true, true) arm through `run_with_staging`,
+        // The (true, true) arm is wired through `run_with_staging`,
         // which recursively copies the adapter crate dir into the
         // staging tempdir. The fixture must pre-create the crate dir
         // referenced by PROVISION_MANIFEST or staging errors before
@@ -2315,7 +2339,7 @@ ids = ["default"]
         fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
         let _cwd = CwdGuard::set(temp.path()).expect("chdir into tempdir");
 
-        // Task 27: axum's Local arm now succeeds (writes .env into a
+        // axum's Local arm now succeeds (writes .env into a
         // `.edgezero/` under `manifest_root`). This test used to
         // sentinel on the Section-5 stub's error; the equivalent
         // positive signal is a status line that names axum's Local
@@ -2342,7 +2366,7 @@ ids = ["default"]
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
         fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
 
-        // Task 27: same successful-Local-arm sentinel as the "_default"
+        // same successful-Local-arm sentinel as the "_default"
         // sibling above.
         run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
@@ -2788,7 +2812,7 @@ ids = ["default"]
 
     #[test]
     fn provision_cloud_dry_run_passes_dry_run_true_to_adapter() {
-        // Cloud dry-run must not synthesise (Task 8b covers that) and
+        // Cloud dry-run must not synthesise (the CLI bootstrap covers that) and
         // must pass dry_run=true down to the adapter. Use the fake and
         // read back RECORDED_DRY_RUN to confirm the boolean rode
         // through the dispatch matrix untouched.
@@ -3424,9 +3448,30 @@ manifest = "crates/cf/wrangler.toml"
         );
     }
 
+    /// A symlinked baseline output (e.g. a planted
+    /// `spin.toml -> ~/.ssh/config`) must be refused. `.exists()`
+    /// follows the link, so a dangling one sails past the skip check
+    /// into `fs::write`, which creates the link's target off-tree.
+    #[cfg(unix)]
+    #[test]
+    fn write_baseline_rejects_symlinked_output() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let victim = temp.path().join("victim-outside");
+        symlink(&victim, temp.path().join("spin.toml")).expect("symlink");
+        let pairs = vec![(PathBuf::from("spin.toml"), "content".to_owned())];
+        let err = write_baseline_to_disk(temp.path(), &pairs)
+            .expect_err("a symlinked baseline output must be rejected");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !victim.exists(),
+            "the refused write must not have created the link target"
+        );
+    }
+
     // ---------- run_provision_typed ----------
     //
-    // Task 29 wires the CLI's typed-secret companion to `run_provision`.
+    // The CLI's typed-secret companion is wired to `run_provision`.
     // The public entry cloud-short-circuits (delegates to
     // `run_provision`) and only performs typed-secret handling in local
     // mode. Local mode runs the shared preflight (capability +

@@ -17,7 +17,7 @@ use crate::registry::AdapterExecContext;
 /// [`AdapterExecContext::cwd`] carries the project root; the adapter
 /// must seed discovery there rather than from the process cwd, or a
 /// `serve`/`build` invoked from elsewhere resolves the wrong project
-/// (PR #287 review round 9, blocking #3). With no context (empty ctx
+///. With no context (empty ctx
 /// / no manifest) it falls back to the process cwd, preserving the
 /// pre-context behaviour.
 ///

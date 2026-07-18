@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use edgezero_adapter::env_file::reject_symlinked_target;
 use edgezero_adapter::registry::{AdapterPushContext, ReadConfigEntry, ResolvedStoreId};
 use rusqlite::{Connection, params};
 
@@ -226,6 +227,10 @@ pub(crate) fn write_batch(
     // racing `push_cloud`'s fake-spin tests; see its doc comment.
     verify_spin_runtime_compat();
 
+    // A symlinked db path would have `Connection::open` follow it and
+    // create/write the SQLite file at the link's target outside the
+    // project tree.
+    reject_symlinked_target(db_path)?;
     if let Some(parent) = db_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1385,6 +1390,25 @@ mod tests {
     fn write_kv_entry(db_path: &Path, store_label: &str, key: &str, value: &str) {
         write_batch(db_path, store_label, &[(key.to_owned(), value.to_owned())])
             .expect("seed entry");
+    }
+
+    /// A symlinked db path must be refused before `Connection::open`
+    /// follows it and creates the `SQLite` file at the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn write_batch_refuses_a_symlinked_db_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let victim = dir.path().join("victim-outside.db");
+        let link = dir.path().join("local.db");
+        symlink(&victim, &link).expect("symlink");
+        let err = write_batch(&link, "store", &[("k".to_owned(), "v".to_owned())])
+            .expect_err("a symlinked db path must be refused");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            !victim.exists(),
+            "the refused open must not have created the link target"
+        );
     }
 
     // Branch 3a: redis backend → error naming the backend.
