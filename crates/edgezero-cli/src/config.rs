@@ -2962,31 +2962,84 @@ ids = ["app_config"]
 ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
 
-        // Seed fastly.toml with a pointer-kind prior value that cannot resolve:
-        // it references a chunk that is not present, so the runtime resolver
-        // errors and the local read degrades to Unsupported.
-        let corrupt = format!(
-            "{{\"edgezero_kind\":\"fastly_config_chunks\",\"version\":1,\"chunks\":[{{\"key\":\"app_config.__edgezero_chunks.{sha}.0\",\"len\":10,\"sha256\":\"x\"}}],\"data_sha256\":\"\",\"envelope_len\":10,\"envelope_sha256\":\"{sha}\"}}",
-            sha = "a".repeat(64),
+        // Every kind of unreadable prior STATE must let a local dry-run reach the
+        // writer's degrading count rather than hitting the Spin-Cloud rejection:
+        // a corrupt-but-parsing pointer, malformed TOML, and a non-string root.
+        let corrupt_pointer = format!(
+            "app_config = {}",
+            toml_string_literal(&format!(
+                "{{\"edgezero_kind\":\"fastly_config_chunks\",\"version\":1,\"chunks\":[{{\"key\":\"app_config.__edgezero_chunks.{sha}.0\",\"len\":10,\"sha256\":\"x\"}}],\"data_sha256\":\"\",\"envelope_len\":10,\"envelope_sha256\":\"{sha}\"}}",
+                sha = "a".repeat(64),
+            )),
         );
-        let fastly_toml = format!(
-            "[local_server.config_stores.app_config.contents]\napp_config = {}\n",
-            toml_string_literal(&corrupt),
-        );
-        fs::write(dir.path().join("fastly.toml"), fastly_toml).expect("write fastly.toml");
+        let cases = [
+            (
+                "corrupt pointer",
+                format!("[local_server.config_stores.app_config.contents]\n{corrupt_pointer}\n"),
+            ),
+            (
+                "malformed TOML",
+                "[local_server.config_stores.app_config.contents]\nthis is not valid toml = = ="
+                    .to_owned(),
+            ),
+            (
+                "non-string root",
+                "[local_server.config_stores.app_config.contents]\napp_config = 42\n".to_owned(),
+            ),
+        ];
+
+        for (label, fastly_toml) in cases {
+            let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+            fs::write(dir.path().join("fastly.toml"), &fastly_toml).expect("write fastly.toml");
+
+            let mut args = push_args(&manifest, "fastly");
+            args.local = true;
+            args.dry_run = true;
+            args.app_config = Some(dir.path().join("demo-app.toml"));
+
+            run_config_push_typed::<FixtureConfig>(&args).unwrap_or_else(|err| {
+                panic!("a local dry-run over {label} must reach the writer, not be rejected: {err}")
+            });
+        }
+    }
+
+    /// The dry-run degradation does NOT weaken the real push: a real
+    /// `config push --local` over malformed TOML still fails fatally at the
+    /// writer (which cannot parse the file to write into it).
+    #[test]
+    fn local_real_push_over_malformed_toml_still_fails() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        fs::write(dir.path().join("fastly.toml"), "this is not = = valid toml")
+            .expect("write fastly.toml");
 
         let mut args = push_args(&manifest, "fastly");
         args.local = true;
-        args.dry_run = true;
+        args.yes = true; // real write, non-interactive
         args.app_config = Some(dir.path().join("demo-app.toml"));
 
-        // The push must proceed past consent to the writer's dry-run rather than
-        // hitting the Spin-Cloud dry-run rejection that every `Unsupported`
-        // previously triggered.
         run_config_push_typed::<FixtureConfig>(&args)
-            .expect("a local dry-run over a corrupt prior must reach the writer, not be rejected");
+            .expect_err("a real push over malformed TOML must fail at the writer");
     }
 
     /// Serialise a string as a TOML basic-string literal (test helper).

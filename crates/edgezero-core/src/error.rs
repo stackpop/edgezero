@@ -70,8 +70,24 @@ impl EdgeError {
     #[must_use]
     #[inline]
     pub fn config_out_of_date_from_serde(serde_err: &SerdePathError<serde_json::Error>) -> Self {
+        // The serde message embeds the offending stored VALUE (e.g. `invalid
+        // type: string "hunter2", expected u32`), and this message is serialised
+        // into the HTTP error body. The config blob may hold secrets, so the
+        // value must not escape — report only the category. The field PATH is
+        // safe (a schema location, not a value) and is preserved, so the
+        // operator still knows which field is out of date.
+        use serde_json::error::Category;
+        let category = match serde_err.inner().classify() {
+            Category::Data => "wrong type or invalid value",
+            Category::Syntax => "malformed JSON",
+            Category::Eof => "unexpected end of input",
+            Category::Io => "i/o error while reading",
+        };
         Self::ConfigOutOfDate {
-            message: serde_err.inner().to_string(),
+            message: format!(
+                "typed app-config is out of date ({category}; value redacted) — \
+                 run `<app-cli> config push` for this deploy"
+            ),
             field_path: serde_err.path().to_string(),
         }
     }

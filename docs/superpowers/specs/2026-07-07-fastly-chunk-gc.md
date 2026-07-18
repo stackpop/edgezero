@@ -186,14 +186,20 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
     process (including the edge guest, on the read path) before any check could
     reject it.
 
-15. **The chunked read path verifies the INNER envelope, like the direct path.**
-    The outer pointer checks (per-chunk and full-envelope hashes) prove the
-    chunks reassemble to the bytes the pointer names, but say nothing about the
-    `BlobEnvelope` inside. The resolver parses and `verify()`s the reconstructed
-    envelope and returns only a redacted category — otherwise a reconstructed
-    value with a wrong embedded `sha256` (a secret) reaches core, whose own
-    `verify()` formats that stored hash into an HTTP 500. Both the resolver and
-    core's extractor redact.
+15. **The chunked read path verifies the INNER envelope, like the direct path,
+    and validates pointer metadata before fetching.** The outer pointer checks
+    (per-chunk and full-envelope hashes) prove the chunks reassemble to the bytes
+    the pointer names, but say nothing about the `BlobEnvelope` inside. The
+    resolver parses and `verify()`s the reconstructed envelope and returns only a
+    redacted category — otherwise a reconstructed value with a wrong embedded
+    `sha256` (a secret) reaches core, whose own `verify()` formats that stored
+    hash into an HTTP 500. Both the resolver and core's extractor redact
+    (including the typed-deserialize path, whose serde error otherwise quotes a
+    field value into the response). The resolver ALSO runs the same pointer
+    metadata validation the CLI/GC path uses (canonical keys, one generation,
+    dense indexes, per-chunk length bound, checked sum), so a shape the writer
+    could never emit is rejected up front rather than driving a fan-out of chunk
+    fetches (invariant 14 holds on the read path, not just in GC).
 
 16. **Root-vs-chunk is decided by VALUE, and any runtime-readable root is
     protected.** An entry whose value is a valid direct envelope OR a pointer is
@@ -203,11 +209,15 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
     protecting it (and thereby leaving its generation unreclaimed) is safe, and a
     real chunk fragment does not parse so is unaffected.
 
-17. **Derived keys are validated against the store's key limit before I/O.** A
-    chunk key adds ~85 characters (infix + 64-char SHA + index) to the root, so a
-    root that is itself valid can produce a physical key over Fastly's
-    256-character limit. `prepare_fastly_config_entries` rejects any over-limit
-    key up front, so a push never fails mid-write with some chunks committed.
+17. **Derived keys are validated against the store's key limit before I/O,
+    counted in CHARACTERS.** A chunk key adds ~85 characters (infix + 64-char SHA
+    + index) to the root, so a root that is itself valid can produce a physical
+    key over Fastly's key limit. `prepare_fastly_config_entries` rejects any
+    over-limit key up front (counting `chars()`, not UTF-8 bytes, so a non-ASCII
+    `--key` is measured the way Fastly measures it), so a push never fails
+    mid-write with some chunks committed. Fastly's docs disagree (guide 255, API
+    reference 256); we take the stricter **255** so an emitted key is valid under
+    either.
 
 ## Two further invariants (PR #314 review)
 
@@ -282,9 +292,11 @@ Dry-run by default; deletes only with `--yes`.
    run aborts. A missing/empty field is never skipped or defaulted — skipping a
    root would hide the chunks it references and get them deleted while live.
 2. Classify entries as roots by their **VALUE, not their key shape**: any entry
-   whose value is a chunk pointer is a root, wherever it happens to live.
-   `gc_classify_root` yields the **canonical** chunk keys that pointer references,
-   and the union over all roots is the **live** set. (The listing already carries
+   whose value is a chunk pointer OR a valid direct envelope is a
+   runtime-readable root, wherever it happens to live. For a pointer,
+   `gc_classify_root` yields the **canonical** chunk keys it references, and the
+   union over all roots is the **live** set; a direct-envelope root references no
+   chunks but is itself protected from deletion. (The listing already carries
    `item_value`, so this costs no extra `describe` calls.)
 
    **Key shape is not authoritative for roots either** (round 9). The runtime
@@ -537,7 +549,11 @@ passed to the writer explicitly — never inferred from the flattened set:
     `"would delete an unknown number of orphan chunks from the previous generation of `app_config` (unknown: could not read prior state)"`
     for that root and continue. (The real push still fails fatally on
     malformed TOML via the writer at `cli.rs:938`; only the dry-run
-    *count* degrades.)
+    *count* degrades.) For this to be reachable, the CLI's diff read
+    (`read_config_entry_local`) must ALSO degrade these to `Unsupported`
+    rather than erroring — otherwise the orchestration aborts before the
+    writer's count runs. A LOCAL `Unsupported` therefore takes the normal
+    consent path (not the Spin-Cloud dry-run rejection).
   - Prior value is pointer-kind-but-invalid (`prior_chunk_keys` → `Err`)
     → report the same line with `(unknown: suspicious prior pointer)`.
 

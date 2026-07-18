@@ -2357,6 +2357,45 @@ mod tests {
     }
 
     #[test]
+    fn app_config_extractor_does_not_leak_data_value_in_deserialize_error() {
+        const SENTINEL: &str = "SUPER_SECRET_FIELD_VALUE";
+        struct TypeErrorStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for TypeErrorStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                // A VALID envelope (verify passes) whose data has the wrong type
+                // for `timeout_ms` — a string sentinel where u32 is expected.
+                // The deserialize error names that value; it must not reach the
+                // client-facing message.
+                let env = BlobEnvelope::new(
+                    serde_json::json!({ "greeting": "hi", "timeout_ms": SENTINEL }),
+                    "2026-01-01T00:00:00Z".into(),
+                );
+                Ok(Some(serde_json::to_string(&env).unwrap()))
+            }
+        }
+
+        let ctx = ctx_with_config_store(TypeErrorStore, "key");
+        let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
+            .expect_err("a type mismatch in the typed config must error");
+        assert!(
+            matches!(err, EdgeError::ConfigOutOfDate { .. }),
+            "a typed deserialize failure must be ConfigOutOfDate: {err:?}"
+        );
+        assert!(
+            !err.message().contains(SENTINEL),
+            "the stored field value must never reach the client-facing message: {err:?}"
+        );
+        // The field path is still useful and must be preserved.
+        if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
+            assert!(
+                field_path.contains("timeout_ms"),
+                "the field path must still point at the offending field: {field_path}"
+            );
+        }
+    }
+
+    #[test]
     fn app_config_extractor_returns_internal_on_bad_envelope_json() {
         struct GarbageStore;
         #[async_trait(?Send)]

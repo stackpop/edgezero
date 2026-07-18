@@ -724,18 +724,28 @@ impl Adapter for FastlyCliAdapter {
         };
         let fastly_path = manifest_root.join(rel);
         let name = store.platform.as_str();
+        // A prior-state read failure must never BLOCK the command: the diff just
+        // cannot be computed, so it degrades to `Unsupported` ("cannot diff").
+        // Downstream, a dry-run then reaches the writer's orphan-count
+        // degradation (spec 12.x) and a real push reaches the writer, which
+        // fails fatally on malformed TOML or overwrites otherwise. Erroring here
+        // would newly fail a dry-run that reads nothing today.
         let raw = match fs::read_to_string(&fastly_path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 return Ok(ReadConfigEntry::MissingStore);
             }
-            Err(err) => {
-                return Err(format!("failed to read {}: {err}", fastly_path.display()));
+            Err(_err) => {
+                return Ok(ReadConfigEntry::Unsupported(
+                    "local fastly.toml could not be read; cannot diff the prior value",
+                ));
             }
         };
-        let doc: toml_edit::DocumentMut = raw
-            .parse()
-            .map_err(|err| format!("failed to parse {}: {err}", fastly_path.display()))?;
+        let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+            return Ok(ReadConfigEntry::Unsupported(
+                "local fastly.toml is not valid TOML; cannot diff the prior value",
+            ));
+        };
         // Probe `[local_server.config_stores.<name>]` — if absent, the store
         // has not been seeded locally yet.
         let Some(contents) = doc
@@ -749,12 +759,11 @@ impl Adapter for FastlyCliAdapter {
         // The contents table is `key = "value"` pairs.
         match contents.get(key) {
             Some(item) => {
-                let value = item.as_str().ok_or_else(|| {
-                    format!(
-                        "`[local_server.config_stores.{name}.contents].{key}` in {} is not a string",
-                        fastly_path.display()
-                    )
-                })?;
+                let Some(value) = item.as_str() else {
+                    return Ok(ReadConfigEntry::Unsupported(
+                        "the local prior value is not a string; cannot diff the prior value",
+                    ));
+                };
                 // Resolve chunk pointers using the same toml contents table.
                 let resolved =
                     resolve_fastly_config_value(key, value.to_owned(), |chunk_key| match contents
@@ -3898,7 +3907,7 @@ key=""
 for arg in "$@"; do case "$arg" in --key=*) key="${arg#--key=}";; esac; done
 if [ "$sub" = "list" ]; then printf 'list\n' >> '{{{oplog}}}'; cat '{{{entries}}}'; exit 0; fi
 if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '{{{oplog}}}'; exit 0; fi
-if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; printf 'delete-argv %s\n' "$*" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
+if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; printf 'delete-argv %s\n' "$*" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: 404 item not found' >&2; exit 1; fi; exit 0; fi
 if [ "$sub" = "describe" ]; then
   printf 'describe %s\n' "$key" >> '{{{oplog}}}'
   cfile='{{{dir}}}/count_'"$key"
@@ -5391,6 +5400,101 @@ echo 'unexpected' >&2; exit 1
             "an entry whose value is a valid direct envelope is a runtime-readable root and must \
              never be deleted, whatever its key looks like: `{holder_key}`; log:\n{log}"
         );
+        // The SIBLING chunks must survive too: protecting the holder drops the
+        // generation to an incomplete group, which is left unprovable — so
+        // nothing in this generation is deleted, not just the holder.
+        for (key, _) in &entries[1..entries.len().saturating_sub(1)] {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a sibling of a protected root must also survive (the group is left \
+                 unprovable): `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// A generation is aged by its YOUNGEST member, so a generation with one
+    /// recent chunk is retained whole even if its other chunks are ancient.
+    #[cfg(unix)]
+    #[test]
+    fn gc_ages_a_generation_by_its_youngest_member() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // `app_config` live is direct, so there is no live-config age signal —
+        // aging falls to the generation's own chunks.
+        let live_direct = gen_envelope_padded("live-direct", 100);
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 2, "need a multi-chunk generation");
+
+        let mut listing = vec![(
+            TEST_CONFIG_ID.to_owned(),
+            stamp_secs_ago(999_999),
+            live_direct,
+        )];
+        // The doomed generation: chunk 0 written 30s ago (YOUNG), the rest a week
+        // ago. Its youngest-member age (30s) is under the 1-day window.
+        let dead_parts = chunked_parts(TEST_CONFIG_ID, &dead).0;
+        for (idx, (key, value)) in dead_parts.iter().enumerate() {
+            let age = if idx == 0 { 30 } else { 604_800 };
+            listing.push((key.clone(), stamp_secs_ago(age), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &dead_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a generation with a recent member must be retained WHOLE (aged by its youngest): \
+                 `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// A delete failure in one generation must not stop an INDEPENDENT
+    /// generation's deletes.
+    #[cfg(unix)]
+    #[test]
+    fn gc_failure_in_one_generation_does_not_stop_another() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead_a = gen_envelope("dead-a");
+        let dead_b = gen_envelope("dead-b");
+        let a_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead_a);
+        let b_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead_b);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead_a, 604_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead_b, 604_800));
+
+        // Generation A's first delete fails.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&a_chunks[0]),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete is a failure");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        // Generation B must still have been reclaimed despite A's failure.
+        for key in &b_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "an independent generation must still be reclaimed after another one fails: \
+                 `{key}`; err: {err}; log:\n{log}"
+            );
+        }
     }
 
     /// key shape is not authoritative for ROOTS either.

@@ -21,25 +21,26 @@
 
 use sha2::{Digest as _, Sha256};
 
-/// Per-entry value limit enforced by Fastly Config Store. Used by the
-/// CLI writer to gate direct-vs-chunked storage; the runtime resolver
-/// reads chunk lengths from the pointer struct, not this constant.
-#[cfg(any(feature = "cli", test))]
+/// Per-entry value limit enforced by Fastly Config Store. Used by the CLI writer
+/// to gate direct-vs-chunked storage, and by the pointer validator (which both
+/// the CLI and the runtime resolver call) — a chunked envelope is always larger
+/// than this, so a pointer claiming otherwise is not one this writer emitted.
 pub(crate) const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
-/// Maximum length of a Config Store KEY, per Fastly's documented limit. The
-/// writer must not emit a physical key longer than this — a derived chunk key
-/// adds ~85 characters to the root, so a near-limit root would otherwise fail
-/// only mid-write. CLI writer only.
+/// Maximum length of a Config Store KEY, in CHARACTERS. Fastly's docs disagree
+/// (the guide says 255, the API reference says 256); we take the STRICTER 255 so
+/// a key we emit is valid under either. The writer must not emit a physical key
+/// longer than this — a derived chunk key adds ~85 characters to the root, so a
+/// near-limit root would otherwise fail only mid-write. CLI writer only.
 #[cfg(any(feature = "cli", test))]
-pub(crate) const FASTLY_CONFIG_KEY_LIMIT: usize = 256;
-/// Target payload size per chunk (kept under the entry limit to leave
-/// room for the key and any protocol overhead). CLI writer only.
-#[cfg(any(feature = "cli", test))]
+pub(crate) const FASTLY_CONFIG_KEY_LIMIT: usize = 255;
+/// Target payload size per chunk (kept under the entry limit to leave room for
+/// the key and any protocol overhead). The writer never emits a chunk larger
+/// than this, so the pointer validator (CLI and runtime) uses it as an upper
+/// bound on any single chunk's declared length.
 pub(crate) const CHUNK_PAYLOAD_TARGET: usize = 7_000;
-/// Infix inserted between the root key and the content-address in a
-/// chunk key: `<root>.__edgezero_chunks.<sha256>.<index>`. CLI writer
-/// only; the resolver reads chunk keys from the pointer struct.
-#[cfg(any(feature = "cli", test))]
+/// Infix inserted between the root key and the content-address in a chunk key:
+/// `<root>.__edgezero_chunks.<sha256>.<index>`. Used by the writer and by the
+/// pointer validator (CLI and runtime) to recognise a canonical chunk key.
 pub(crate) const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
 /// `edgezero_kind` discriminant stored in the pointer JSON. Used by
 /// BOTH the writer (when serialising the pointer) AND the resolver
@@ -120,14 +121,16 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// before any write is attempted.
 #[cfg(any(feature = "cli", test))]
 fn check_config_key_len(key: &str) -> Result<(), String> {
-    if key.len() > FASTLY_CONFIG_KEY_LIMIT {
+    // CHARACTERS, not bytes: Fastly's limit is a character count, so a non-ASCII
+    // `--key` must be measured by `chars().count()`, not `len()` (UTF-8 bytes).
+    let char_len = key.chars().count();
+    if char_len > FASTLY_CONFIG_KEY_LIMIT {
         return Err(format!(
-            "config-store key is {} characters, over Fastly's {FASTLY_CONFIG_KEY_LIMIT}-character \
-             limit. Chunked storage derives keys of the form \
+            "config-store key is {char_len} characters, over Fastly's \
+             {FASTLY_CONFIG_KEY_LIMIT}-character limit. Chunked storage derives keys of the form \
              `<root>.__edgezero_chunks.<64-char-sha>.<index>`, adding ~85 characters to the root, \
              so a long store id or `--key` override can push the derived key past the limit. Use a \
-             shorter store id / `--key`.",
-            key.len()
+             shorter store id / `--key`."
         ));
     }
     Ok(())
@@ -310,6 +313,13 @@ where
             pointer.version
         ));
     }
+    // Validate the pointer METADATA before fetching anything: a shape the writer
+    // could never emit (non-canonical keys, mixed generations, gaps, per-chunk
+    // lengths over the payload target, a sum that disagrees with `envelope_len`,
+    // or an `envelope_len` small enough to have been stored directly) is
+    // rejected up front rather than driving a fan-out of chunk fetches whose
+    // hashes could only fail at the end. Same validator the CLI/GC path uses.
+    validate_pointer_chunks(root_key, &pointer)?;
 
     // Fetch, verify, and concatenate all chunks.
     //
@@ -459,7 +469,8 @@ pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>,
     //    index, a stale generation mixed in, lengths that cannot add up to the
     //    envelope) would leave real live chunks looking orphaned. Only accept a
     //    chunk list this writer could actually have emitted.
-    validate_pointer_chunks(root_key, &pointer)?;
+    validate_pointer_chunks(root_key, &pointer)
+        .map_err(|err| format!("{err}; skipping chunk GC"))?;
 
     Ok(pointer.chunks.into_iter().map(|chunk| chunk.key).collect())
 }
@@ -496,19 +507,20 @@ fn redact_json_err(err: &serde_json::Error) -> String {
 /// in order; per-chunk lengths within what the writer emits; and
 /// `sum(len) == envelope_len`, computed with CHECKED arithmetic.
 ///
+/// Called on BOTH the CLI/GC path and the runtime resolver, so a pointer shape
+/// the writer could never emit is rejected everywhere, not just during GC.
+///
 /// **Diagnostics name a chunk's POSITION, never its key.** `chunks[].key` is
 /// pointer-controlled and, on this path, not yet validated -- a malformed
 /// pointer can carry any string at all there (`prod-db-password=hunter2`), and
 /// these messages are logged verbatim.
 ///
-/// **Lengths are untrusted input.** They are attacker-supplied `usize`s that
-/// later size allocations, so they are bounded against what the writer can
-/// actually emit and summed with `checked_add`. Saturating arithmetic would let
-/// a metadata-consistent pointer declare `usize::MAX` and survive validation.
-#[cfg(any(feature = "cli", test))]
+/// **Lengths are untrusted input.** They are attacker-supplied `usize`s, so they
+/// are bounded against what the writer can actually emit and summed with
+/// `checked_add`. Saturating arithmetic would let a metadata-consistent pointer
+/// declare `usize::MAX` and survive validation.
 fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Result<(), String> {
-    let bad =
-        |detail: &str| format!("prior chunk pointer at `{root_key}` {detail}; skipping chunk GC");
+    let bad = |detail: &str| format!("chunk pointer at `{root_key}` {detail}");
 
     if pointer.chunks.is_empty() {
         // An oversized envelope always splits into >= 2 chunks, so an empty
@@ -755,7 +767,6 @@ pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> 
 /// The validating half of [`chunk_key_generation`], which discards the index.
 /// Pointer validation needs both: the generation to prove a chunk list names one
 /// generation, the index to prove the list is dense and ordered.
-#[cfg(any(feature = "cli", test))]
 fn chunk_key_parts(root_key: &str, key: &str) -> Option<(String, usize)> {
     if root_key.is_empty() {
         return None;
@@ -777,7 +788,6 @@ fn chunk_key_parts(root_key: &str, key: &str) -> Option<(String, usize)> {
 }
 
 /// Exactly 64 lowercase hex characters.
-#[cfg(any(feature = "cli", test))]
 fn is_canonical_sha256_hex(sha: &str) -> bool {
     sha.len() == 64
         && sha
@@ -790,9 +800,7 @@ fn is_canonical_sha256_hex(sha: &str) -> bool {
 ///
 /// Must be an index this writer could actually have emitted: the chunk loop
 /// counts in `usize`, so a digit run that overflows it (or is absurdly long) is
-/// not ours. This is the destructive-delete gate -- accept only what
-/// `prepare_fastly_config_entries` can produce.
-#[cfg(any(feature = "cli", test))]
+/// not ours -- accept only what `prepare_fastly_config_entries` can produce.
 fn canonical_index(index: &str) -> Option<usize> {
     if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -845,6 +853,29 @@ mod tests {
 
     fn reserialise(pointer: &FastlyChunkPointer) -> String {
         serde_json::to_string(pointer).expect("serialise")
+    }
+
+    /// A valid pointer whose chunks are scoped to a CHUNK-SHAPED holder key
+    /// classifies successfully (returns `Chunked` with those keys), not `Err`.
+    /// The cross-root GC test only shows an unclassifiable pointer failing
+    /// closed; this pins that a well-formed self-scoped pointer is accepted.
+    #[test]
+    fn gc_classify_root_accepts_a_pointer_rooted_at_a_chunk_shaped_key() {
+        let holder = format!("app_config{CHUNK_KEY_INFIX}{}.0", "e".repeat(64));
+        let (pointer_json, pointer) = pointer_fixture(&holder);
+        let classified = gc_classify_root(&holder, &pointer_json)
+            .expect("a valid self-scoped pointer classifies");
+        let GcRootValue::Chunked(gc_pointer) = classified else {
+            panic!("a pointer value must classify as Chunked");
+        };
+        assert_eq!(gc_pointer.chunks.len(), pointer.chunks.len());
+        for chunk in &gc_pointer.chunks {
+            assert!(
+                chunk.key.starts_with(&format!("{holder}{CHUNK_KEY_INFIX}")),
+                "each referenced key must be scoped to the holder: `{}`",
+                chunk.key
+            );
+        }
     }
 
     /// The happy path: a real pointer classifies as its own chunk keys.
@@ -1191,18 +1222,58 @@ mod tests {
         assert!(!value_is_pointer_kind("not json at all"));
     }
 
+    /// The runtime resolver rejects a pointer shape the writer could never emit
+    /// BEFORE fetching any chunk -- the same metadata validation the CLI/GC path
+    /// runs, so invariant 14 holds on the read path too.
+    #[test]
+    fn runtime_resolver_rejects_non_writer_pointer_shapes() {
+        let root = "app_config";
+        let sha = "a".repeat(64);
+        // A metadata-consistent-looking pointer whose per-chunk length is far
+        // over the writer's payload target (and whose envelope is too small to
+        // have been chunked at all).
+        let bogus = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":99999,"sha256":"x"}},{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.1","len":1,"sha256":"y"}}],"data_sha256":"","envelope_len":100000,"envelope_sha256":"{sha}"}}"#
+        );
+        // No fetch should even be attempted: fail on metadata alone.
+        let mut fetched = false;
+        let err = resolve_fastly_config_value(root, bogus, |_key| {
+            fetched = true;
+            Ok(None)
+        })
+        .expect_err("a non-writer pointer shape must be rejected");
+        assert!(
+            !fetched,
+            "validation must reject before any chunk fetch: {err}"
+        );
+
+        // The real thing still resolves.
+        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = prepare_fastly_config_entries(root, &envelope).unwrap();
+        let (root_key, pointer_json) = entries.last().unwrap().clone();
+        let chunk_map: HashMap<String, String> = entries[..entries.len().saturating_sub(1)]
+            .iter()
+            .cloned()
+            .collect();
+        let resolved = resolve_fastly_config_value(&root_key, pointer_json, |key| {
+            Ok(chunk_map.get(key).cloned())
+        })
+        .expect("a real chunked value must still resolve");
+        assert_eq!(resolved, envelope);
+    }
+
     /// A root that is itself valid but long enough that its DERIVED chunk keys
     /// exceed the store limit must be rejected up front, not fail mid-write.
     #[test]
     fn oversized_derived_chunk_keys_are_rejected_before_write() {
         // A root ~200 chars: valid as a key on its own, but + ~85 for the chunk
-        // suffix exceeds 256.
+        // suffix exceeds the limit.
         let long_root = "r".repeat(200);
         let big_envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let err = prepare_fastly_config_entries(&long_root, &big_envelope)
             .expect_err("derived chunk keys over the limit must be rejected");
         assert!(
-            err.contains("256") && err.contains("limit"),
+            err.contains(&FASTLY_CONFIG_KEY_LIMIT.to_string()) && err.contains("limit"),
             "error must name the key limit: {err}"
         );
 
@@ -1216,6 +1287,17 @@ mod tests {
         // A normal root is unaffected.
         prepare_fastly_config_entries("app_config", &big_envelope)
             .expect("a normal root must still expand");
+
+        // The limit is CHARACTERS, not bytes: a multi-byte key at exactly the
+        // character limit must be accepted even though its byte length exceeds
+        // it. U+00E9 ('é') is 2 bytes, so 255 of them is 510 bytes, 255 chars.
+        let multibyte_root = "\u{e9}".repeat(FASTLY_CONFIG_KEY_LIMIT);
+        assert!(
+            multibyte_root.len() > FASTLY_CONFIG_KEY_LIMIT,
+            "fixture must be multi-byte"
+        );
+        prepare_fastly_config_entries(&multibyte_root, "{}")
+            .expect("a key at the CHARACTER limit must be accepted regardless of byte length");
     }
 
     // ---- helpers ----
@@ -1517,10 +1599,9 @@ mod tests {
             Ok(chunk_map.get(chunk_key).cloned())
         })
         .expect_err("envelope hash mismatch must error");
-        assert!(
-            err.contains("does not match the pointer's"),
-            "error must say what failed: {err}"
-        );
+        // Whether metadata validation (the chunk keys name a different
+        // generation than the tampered `envelope_sha256`) or the full-envelope
+        // check catches it, the stored hash must never reach the diagnostic.
         assert!(
             !err.contains(sentinel),
             "the stored envelope_sha256 must never reach a diagnostic: {err}"
@@ -1572,15 +1653,12 @@ mod tests {
         let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let entries = prepare_fastly_config_entries("root", &envelope).unwrap();
         let (root_key, pointer_json) = entries.last().unwrap().clone();
-
-        // Point the first chunk ref at a secret-bearing key, then have the
-        // callback fail while naming that key (as the real store lookup would).
-        let mut pointer: FastlyChunkPointer = serde_json::from_str(&pointer_json).unwrap();
-        pointer.chunks[0].key = format!("root{CHUNK_KEY_INFIX}{}.0", "a".repeat(64));
+        // A VALID pointer (so metadata validation passes), whose first chunk key
+        // the callback names in its failure — as the real store lookup would.
+        let pointer: FastlyChunkPointer = serde_json::from_str(&pointer_json).unwrap();
         let secret_key = pointer.chunks[0].key.clone();
-        let tampered = serde_json::to_string(&pointer).unwrap();
 
-        let err = resolve_fastly_config_value(&root_key, tampered, |chunk_key| {
+        let err = resolve_fastly_config_value(&root_key, pointer_json, |chunk_key| {
             Err(format!(
                 "config store lookup failed for `{chunk_key}` -- {SENTINEL}"
             ))

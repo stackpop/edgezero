@@ -156,10 +156,11 @@ cannot be used as a supersession clock.
   must clear `--older-than`, more restrictive wins — and the operator's
   `--older-than` assertion remains the only sound basis for any delete.
 - [x] Delete whole GENERATIONS with `--key --auto-yes` (never `--all`), stopping
-  each generation at its FIRST failure so a confirmed partial delete cannot strand
-  it. Independent generations are all attempted; a **non-zero** error names the
-  failed keys. A failed remote delete's outcome is treated as UNKNOWN, so the
-  error distinguishes uncertain generations from definitely-stranded ones and
+  each generation at its FIRST failure so we never CONFIRM a partial delete
+  ourselves. (Stopping does not guarantee no stranding: a failed remote delete's
+  outcome is UNKNOWN — Fastly may commit it before erroring.) Independent
+  generations are all attempted; a **non-zero** error names the failed keys and
+  distinguishes uncertain generations from definitely-stranded ones, and
   prints shell-safe manual-recovery commands rather than claiming idempotent
   retry.
 - [x] `plan_gc_reclamation` extracted from `gc_fastly_config_store` so the guards
