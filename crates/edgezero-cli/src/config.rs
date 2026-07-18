@@ -108,11 +108,11 @@ impl ValidationContext {
 
 /// Typed exit-code outcome of a successful `config diff` run.
 ///
-/// Returned so the generated CLI's main can pick the right exit code
-/// per Q10.  NOT used on the error path — `Result::Err` bypasses this
+/// Returned so the generated CLI's main can pick the right exit code.
+/// NOT used on the error path — `Result::Err` bypasses this
 /// and the main always exits ≥ 2.
 ///
-/// Exit code semantics (Q10):
+/// Exit code semantics:
 /// - `0` — no changes, or `--exit-code` is false.
 /// - `1` — diff present AND `--exit-code` was set (CI gate signal).
 /// - `2` — diff structurally impossible (`Unsupported`).
@@ -215,7 +215,7 @@ where
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx)?;
 
-    // Typed deserialise + validate_excluding_secrets (spec 3.3.8: push,
+    // Typed deserialise + validate_excluding_secrets (push,
     // diff, AND typed validate all use deserialize-only +
     // validate_excluding_secrets; the runtime is the only path that runs
     // full validate against RESOLVED secret values).
@@ -244,7 +244,7 @@ where
 
 // -------------------------------------------------------------------
 /// Stub-pointer for the bundled `edgezero` binary's `config push`
-/// subcommand (spec 3.2.1).
+/// subcommand.
 ///
 /// The blob app-config rewrite requires a TYPED downstream CLI that
 /// embeds the app's `AppConfig<C>` struct. The bundled `edgezero`
@@ -254,13 +254,13 @@ where
 /// [`run_config_push_typed`] with their concrete `C`.
 ///
 /// This function always returns `Err(...)` with a pointer to the
-/// typed downstream CLI and the spec section. The subcommand itself
+/// typed downstream CLI. The subcommand itself
 /// must still be registered in the bundled binary's `Command` enum so
 /// `edgezero config push --help` is reachable and the error message
 /// can be displayed.
 ///
 /// # Errors
-/// Always returns a pointer error explaining 3.2.1.
+/// Always returns a pointer error.
 #[inline]
 pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
     Err(
@@ -338,7 +338,7 @@ where
             FirstReadOutcome::ProceedFromMissingOrUnsupported => None,
         };
 
-    // Consent gate (8.2 default or 8.3 Spin Cloud Unsupported).
+    // Consent gate (default flow or Spin Cloud Unsupported).
     handle_consent(args, &remote)?;
 
     // Pre-write re-fetch + skip-on-equal + concurrent-push detection.
@@ -402,8 +402,7 @@ fn diff_info(msg: &str) {
     eprintln!("{msg}");
 }
 
-/// Translate an outcome + `--exit-code` flag into a typed exit code
-/// per Q10's table.
+/// Translate an outcome + `--exit-code` flag into a typed exit code.
 fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
     let code = match (exit_code_flag, outcome) {
         (_, DiffOutcome::Unsupported) => 2_i32,
@@ -435,7 +434,7 @@ pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, Strin
 where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
-    // Load + validate (spec 3.3.2: diff runs the same structural
+    // Load + validate (diff runs the same structural
     // checks as push — validate_excluding_secrets + typed_secret_checks +
     // adapter_typed_checks; no consent gate, no re-fetch).
     let validate_args = ConfigValidateArgs {
@@ -615,8 +614,8 @@ fn dispatch_diff_format(
 // Helpers for run_config_push_typed
 // -------------------------------------------------------------------
 
-/// Consent gate: 8.3 Spin Cloud four-branch UX when `remote` is
-/// `Unsupported`; 8.2 default flow otherwise.
+/// Consent gate: Spin Cloud four-branch UX when `remote` is
+/// `Unsupported`; default flow otherwise.
 fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(), String> {
     if let ReadConfigEntry::Unsupported(reason) = remote {
         if args.dry_run {
@@ -825,7 +824,7 @@ fn render_first_read_diff(
     }
 }
 
-/// Consent gate for 8.2 default flow (non-Spin-Cloud adapters and all
+/// Consent gate for the default flow (non-Spin-Cloud adapters and all
 /// read-capable variants). `--yes` or `--dry-run` bypass the prompt.
 /// TTY: prompt. Non-TTY without `--yes`: error.
 fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(), String> {
@@ -1058,7 +1057,7 @@ pub(crate) fn print_unified_diff_inline(
 // -------------------------------------------------------------------
 
 fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
-    // Spec: push is strict — the synthesized validate args
+    // Push is strict — the synthesized validate args
     // unconditionally request `--strict` so `run_shared_checks`
     // runs the capability-completeness + handler-path checks
     // alongside the schema and per-adapter shared checks.
@@ -1171,7 +1170,7 @@ fn resolved_default(declaration: &StoreDeclaration) -> String {
 /// resolved secret value. The runtime extractor
 /// (`crates/edgezero-core/src/extractor.rs`, `secret_walk`) reads those
 /// key names from `data` and swaps each one for the resolved secret value
-/// from the appropriate secret store. Spec 3.3 (secret-key NAMES at rest).
+/// from the appropriate secret store (secret-key NAMES at rest).
 ///
 /// `generated_at` is stamped with the current UTC second.
 ///
@@ -1185,7 +1184,7 @@ where
     // and #[secret(store_ref)] fields, whose value at rest is the
     // operator-supplied key NAME (e.g. "demo_api_token"). The runtime
     // extractor reads those key names from data and swaps each one for
-    // the resolved secret value. Spec 3.3 (secret-key NAMES at rest).
+    // the resolved secret value (secret-key NAMES at rest).
     let data: serde_json::Value = serde_json::to_value(typed)
         .map_err(|err| format!("failed to serialise typed config: {err}"))?;
     let envelope = BlobEnvelope::new(data, generated_at_rfc3339());
@@ -1193,7 +1192,7 @@ where
 }
 
 /// Current UTC timestamp formatted as RFC 3339 with second precision and
-/// a trailing `Z` (`2026-06-17T18:42:31Z`). Matches spec 4.1 example.
+/// a trailing `Z` (`2026-06-17T18:42:31Z`).
 /// `generated_at` is informational only — it is NOT part of the SHA.
 fn generated_at_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -1203,7 +1202,7 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     let manifest_loader = ManifestLoader::from_path(&args.manifest)
         .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
 
-    // Spec: every project carries a `[app].name`. Without it we
+    // Every project carries a `[app].name`. Without it we
     // can't compute the env-overlay prefix or resolve the default
     // app-config path.
     let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
@@ -1588,7 +1587,7 @@ fn flatten_keys_into(table: &Table, prefix: &str, out: &mut Vec<String>) {
 // -------------------------------------------------------------------
 
 fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
-    // Spec capability matrix, driven by each adapter crate's
+    // Capability matrix, driven by each adapter crate's
     // `Adapter::single_store_kinds()` impl. Adapters not in the
     // registry (e.g. a feature-gated build that omitted some) are
     // skipped — we can't speak for what isn't linked.
@@ -2026,7 +2025,7 @@ serve = "echo"
         );
     }
 
-    /// High 2 — spec 3.3.8: typed validate uses `validate_excluding_secrets`,
+    /// Typed validate uses `validate_excluding_secrets`,
     /// so a `#[secret]` field annotated with `length(min = 32)` must NOT
     /// reject a short key name like `"short_key"` (9 bytes).  The runtime
     /// resolves it to the real secret value and runs the full validator there.
@@ -2407,7 +2406,7 @@ ids = ["default"]
 
     #[test]
     fn spin_distinct_logical_ids_collide_when_env_overlay_resolves_to_same_platform_label() {
-        // F2: distinct logical ids `sessions` (KV) and `app_config`
+        // Distinct logical ids `sessions` (KV) and `app_config`
         // (Config) BOTH map to the same Spin KV label via the env
         // overlay. The runtime opens one underlying store for both
         // -- silent shared writes. The merged-id check must catch
@@ -2797,12 +2796,12 @@ deep = true
     }
 
     // -------------------------------------------------------------------
-    // config push (raw + typed) — spec
+    // config push (raw + typed)
     // -------------------------------------------------------------------
 
-    // ---------- raw push (stub-pointer, spec 3.2.1) ----------
+    // ---------- raw push (stub-pointer) ----------
 
-    /// Spec 3.2.1: `config push` on the bundled `edgezero` binary is a
+    /// `config push` on the bundled `edgezero` binary is a
     /// stub-pointer. The blob app-config rewrite requires a typed downstream
     /// CLI; the bundled binary has no `AppConfig<C>` in scope. The subcommand
     /// must always return `Err(...)` with a pointer to the typed downstream CLI.
@@ -2855,7 +2854,7 @@ deep = true
         // `vault` (#[secret(store_ref)]) — must be PRESENT in envelope.data.
         // Their value at rest is the operator-supplied key NAME, not the
         // resolved secret value. The runtime extractor (`secret_walk`) reads
-        // those key names and swaps them for the resolved secret. Spec 3.3.
+        // those key names and swaps them for the resolved secret.
         let data = &envelope.data;
         assert_eq!(
             data.get("api_token").and_then(|val| val.as_str()),
@@ -2885,7 +2884,7 @@ deep = true
         // object is deterministic.
 
         // All fields are present verbatim — secret key names included.
-        // Spec 3.3: secret-field VALUES at rest are the operator-supplied
+        // Secret-field VALUES at rest are the operator-supplied
         // key NAMEs (not the resolved secret values).
         let data = serde_json::json!({
             "api_token": "demo_api_token",
@@ -2914,7 +2913,7 @@ deep = true
         );
     }
 
-    /// Spec 3.3: the blob MUST carry the secret key NAME verbatim.
+    /// The blob MUST carry the secret key NAME verbatim.
     /// The runtime extractor (`secret_walk`) reads that name to look up
     /// the resolved value in the secret store. Stripping the field would
     /// cause `ConfigOutOfDate` on every request after a push.
@@ -3042,7 +3041,7 @@ timeout_ms = 50
         );
     }
 
-    /// 5.4: `--key` overrides the default logical store id used as the
+    /// `--key` overrides the default logical store id used as the
     /// blob key. Without `--key`, the written file is keyed by the
     /// manifest's `[stores.config]` id (`"app_config"`). With
     /// `--key staging`, the blob must appear under "staging" instead.
@@ -3089,7 +3088,7 @@ timeout_ms = 50
     // ---------- push runs the strict preflight (regression) ----------
 
     /// Push must run the same shared adapter checks `config
-    /// validate` runs (spec strict pre-flight). Pre-fix,
+    /// validate` runs (strict pre-flight). Pre-fix,
     /// `load_push_context` synthesised `ConfigValidateArgs { strict:
     /// false }` and `run_config_push*` never called
     /// `run_shared_checks`, so an adapter-specific shape error
@@ -3202,7 +3201,7 @@ default = "one"
     }
 
     // -------------------------------------------------------------------
-    // run_config_push_typed — 8.2 consent rules + diff
+    // run_config_push_typed — consent rules + diff
     // -------------------------------------------------------------------
 
     /// Build a valid `BlobEnvelope` JSON string for the given data, suitable
@@ -3231,7 +3230,7 @@ default = "one"
 
     // ---------- deserialise + validate_excluding_secrets ----------
 
-    /// 3.3.8 rule: a `#[secret]` field's VALUE is a key name like
+    /// A `#[secret]` field's VALUE is a key name like
     /// "my-prod-api-key", which may be shorter than a `length(min = 32)`
     /// rule intended for the resolved runtime value. The old
     /// `load_app_config_with_options` path validated the key name against
@@ -3312,7 +3311,7 @@ ids = ["default"]
             .expect("second push with same content must exit Ok via skip-on-equal");
     }
 
-    // ---------- 8.2 consent gate ----------
+    // ---------- consent gate ----------
 
     #[test]
     fn c4_non_tty_without_yes_errors_on_consent() {
@@ -3394,12 +3393,12 @@ ids = ["default"]
             .expect("--no-diff --yes typed push must succeed");
     }
 
-    // ---------- 8.3 Spin Cloud Unsupported four-branch UX ----------
+    // ---------- Spin Cloud Unsupported four-branch UX ----------
     //
     // The Spin adapter returns ReadConfigEntry::Unsupported when the
     // deploy command targets Fermyon Cloud ("spin deploy" / "spin cloud
-    // deploy"). We use that to exercise the four-branch UX defined in
-    // spec 8.3. The manifest uses `deploy = "spin deploy"` to trigger
+    // deploy"). We use that to exercise the four-branch Unsupported
+    // UX. The manifest uses `deploy = "spin deploy"` to trigger
     // the Fermyon Cloud detection path inside `read_config_entry`.
 
     // --- PATH-mutation helpers (mirrors Cloudflare adapter test pattern) ---
@@ -3442,7 +3441,7 @@ ids = ["default"]
         tmp
     }
 
-    /// Manifest fixture for the 8.3 tests: Spin adapter with a Fermyon
+    /// Manifest fixture for the Unsupported tests: Spin adapter with a Fermyon
     /// Cloud deploy command so `read_config_entry` returns `Unsupported`.
     fn spin_cloud_manifest() -> String {
         r#"
@@ -3477,14 +3476,14 @@ ids = ["default"]
     }
 
     /// Non-TTY + no --yes + Spin Cloud (Unsupported) must error with the
-    /// 8.3 non-interactive message. CI has no TTY; no --yes is passed.
+    /// non-interactive message. CI has no TTY; no --yes is passed.
     #[test]
     fn c4_unsupported_non_tty_without_yes_errors() {
         let _lock = manifest_guard().lock().expect("manifest guard");
         let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
         write_minimal_spin_toml(dir.path());
         let args = push_args(&manifest_path, "spin");
-        // No --yes, no TTY: must error with the 8.3 non-interactive error.
+        // No --yes, no TTY: must error with the non-interactive error.
         let err = run_config_push_typed::<FixtureConfig>(&args)
             .expect_err("Unsupported + non-TTY + no --yes must error");
         assert!(
@@ -3494,7 +3493,7 @@ ids = ["default"]
     }
 
     /// `--dry-run` against Spin Cloud (Unsupported) must error immediately
-    /// with the 8.3 dry-run message — the flag's contract is "show the
+    /// with the dry-run message — the flag's contract is "show the
     /// diff", which is structurally impossible without a remote read-back.
     #[test]
     fn c4_unsupported_dry_run_errors_with_spin_cloud_message() {
@@ -3705,10 +3704,10 @@ ids = ["default"]
     }
 
     // -------------------------------------------------------------------
-    // High — diff runs run_shared_checks (adapter manifest + collision)
+    // diff runs run_shared_checks (adapter manifest + collision)
     // -------------------------------------------------------------------
 
-    /// High — spec 3.3.2: `run_config_diff_typed` must run
+    /// `run_config_diff_typed` must run
     /// `run_shared_checks` (which includes `validate_adapter_manifest`)
     /// before reaching the remote-read step.  A broken Spin
     /// `spin.toml` (no `[component.*]` sections) triggers
@@ -3766,7 +3765,7 @@ ids = ["default"]
     }
 
     // -------------------------------------------------------------------
-    // Medium 1 — diff runs typed_secret_checks + adapter_typed_checks
+    // diff runs typed_secret_checks + adapter_typed_checks
     // -------------------------------------------------------------------
 
     /// A NESTED `#[secret]` that is present but empty must be caught by the
@@ -3846,7 +3845,7 @@ ids = ["default"]
         );
     }
 
-    /// Medium 1 — spec 3.3.2: `run_config_diff_typed` must run the same
+    /// `run_config_diff_typed` must run the same
     /// structural checks as push, including `typed_secret_checks`.  A
     /// `#[secret]` field that is present but empty must be rejected even
     /// on a read-only diff operation.

@@ -17,13 +17,13 @@ pub enum Action {
     AuthStatus,
     Build,
     Deploy,
-    /// Fastly staging lifecycle (spec §5.4): stage a draft version.
+    /// Fastly staging lifecycle: stage a draft version.
     DeployStaged,
-    /// Fastly staging lifecycle (spec §5.4): emit the active version.
+    /// Fastly staging lifecycle: emit the active version.
     EmitVersion,
-    /// Fastly staging lifecycle (spec §5.4): probe health.
+    /// Fastly staging lifecycle: probe health.
     Healthcheck,
-    /// Fastly staging lifecycle (spec §5.4): activate previous /
+    /// Fastly staging lifecycle: activate previous /
     /// deactivate staged.
     Rollback,
     Serve,
@@ -219,7 +219,7 @@ fn manifest_command<'manifest>(
         Action::Build => cfg.commands.build.as_deref(),
         Action::Deploy => cfg.commands.deploy.as_deref(),
         Action::Serve => cfg.commands.serve.as_deref(),
-        // The Fastly staging lifecycle actions (spec §5.4) are not
+        // The Fastly staging lifecycle actions are not
         // manifest-configurable shell commands — they run the
         // adapter's built-in Fastly logic directly. Returning None
         // routes `adapter::execute` past the manifest-command path to

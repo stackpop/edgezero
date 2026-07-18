@@ -38,8 +38,8 @@ pub enum Command {
     Demo,
     /// Deploy to a target edge.
     Deploy(DeployArgs),
-    /// Probe a deployed version's health (Fastly staging lifecycle,
-    /// spec §5.4). Exits non-zero when unhealthy after retries.
+    /// Probe a deployed version's health (Fastly staging lifecycle).
+    /// Exits non-zero when unhealthy after retries.
     Healthcheck(HealthcheckArgs),
     /// Create a new `EdgeZero` app skeleton (multi-crate workspace).
     New(NewArgs),
@@ -49,7 +49,7 @@ pub enum Command {
     /// `fastly`, spin edits `spin.toml` in-place, axum is a no-op.
     Provision(ProvisionArgs),
     /// Roll a service back to a previous version, or deactivate a
-    /// staged version (Fastly staging lifecycle, spec §5.4).
+    /// staged version (Fastly staging lifecycle).
     Rollback(RollbackArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
@@ -69,7 +69,7 @@ pub enum ConfigCmd {
     Diff(ConfigCmdStubArgs),
     /// Push the typed `<name>.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
-    /// (per spec 3.3 Model A — `#[secret]` fields store the key NAME,
+    /// (Model A — `#[secret]` fields store the key NAME,
     /// resolved at runtime); a SHA over the canonical-form data gates
     /// drift detection.
     /// (Bundled `edgezero` stub — see after-help for the typed CLI.)
@@ -82,10 +82,10 @@ pub enum ConfigCmd {
 
 /// Hidden catch-all argument sink for the bundled stub variants of
 /// `config push` and `config diff`.  Absorbs any flags the user types
-/// so clap does not error before we can print the pointer text (3.2.2).
+/// so clap does not error before we can print the pointer text.
 #[derive(clap::Args, Debug)]
 pub struct ConfigCmdStubArgs {
-    /// Hidden catch-all sink (see spec 3.2.2).
+    /// Hidden catch-all sink.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     pub trailing: Vec<String>,
 }
@@ -160,14 +160,14 @@ pub struct DeployArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub adapter_args: Vec<String>,
     /// Platform service id the deploy targets. Consumed by the Fastly
-    /// staging lifecycle (spec §5.4): production deploy passes it
+    /// staging lifecycle: production deploy passes it
     /// through to `fastly compute deploy` and resolves the activated
     /// version; `--stage` uses it to clone + stage a draft version.
     /// Adapters that don't need a service id ignore it.
     #[arg(long)]
     pub service_id: Option<String>,
-    /// Stage a draft version instead of activating (Fastly only, spec
-    /// §5.4): builds and uploads to a new draft service version cloned
+    /// Stage a draft version instead of activating (Fastly only):
+    /// builds and uploads to a new draft service version cloned
     /// from the active one, marks it staged, and emits the staged
     /// version. Non-Fastly adapters reject `--stage`.
     #[arg(long)]
@@ -229,8 +229,7 @@ pub struct ServeArgs {
     pub adapter: String,
 }
 
-/// Arguments for the `healthcheck` command (Fastly staging lifecycle,
-/// spec §5.4).
+/// Arguments for the `healthcheck` command (Fastly staging lifecycle).
 ///
 /// No `Default` impl (like `AuthArgs`): `--adapter` is required and
 /// the numeric flags carry clap defaults that a derived `Default`
@@ -268,8 +267,7 @@ pub struct HealthcheckArgs {
     pub version: String,
 }
 
-/// Arguments for the `rollback` command (Fastly staging lifecycle,
-/// spec §5.4).
+/// Arguments for the `rollback` command (Fastly staging lifecycle).
 ///
 /// No `Default` impl (like `AuthArgs`): `--adapter` is required.
 #[derive(clap::Args, Debug)]
@@ -313,7 +311,7 @@ pub struct ActiveVersionArgs {
 #[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
 pub enum DiffFormat {
     /// Machine-readable JSON object with `local_sha256`, `remote_sha256`,
-    /// `added`, `removed`, `changed` fields (per spec 8.1.3).
+    /// `added`, `removed`, `changed` fields.
     Json,
     /// Machine-readable structured representation (key/old/new triples).
     Structured,
@@ -350,7 +348,7 @@ pub struct ConfigDiffArgs {
     /// Output format for the diff.
     #[arg(long, default_value = "unified")]
     pub format: DiffFormat,
-    /// Override the default key — 5.4.
+    /// Override the default key.
     #[arg(long)]
     pub key: Option<String>,
     /// Diff against the adapter's local-emulator state instead of the
@@ -424,7 +422,7 @@ pub struct ConfigPushArgs {
     /// Print the would-be operations without performing them.
     #[arg(long)]
     pub dry_run: bool,
-    /// Override the default key — 5.4.
+    /// Override the default key.
     #[arg(long)]
     pub key: Option<String>,
     /// Push to the adapter's local-emulator state instead of the live
@@ -582,7 +580,7 @@ mod tests {
 
     #[test]
     fn provision_args_default_manifest_matches_clap_default() {
-        // PR #269 round 4 / F4: library callers using
+        // Library callers using
         // `ProvisionArgs { adapter: "...", ..Default::default() }`
         // must end up with `manifest = "edgezero.toml"`, matching
         // what clap writes when no `--manifest` is passed on the
@@ -710,7 +708,7 @@ mod tests {
 
     #[test]
     fn config_validate_args_defaults() {
-        // Post-F4 (PR #269 round 4): library callers using
+        // Library callers using
         // `..Default::default()` now get the same `manifest`
         // value clap writes when no `--manifest` is passed
         // (`edgezero.toml`), instead of the empty-PathBuf the
@@ -791,7 +789,7 @@ mod tests {
             .expect_err("`provision` without --adapter must error");
     }
 
-    // ── Fastly staging lifecycle arg tests (spec §5.4) ─────────────────
+    // ── Fastly staging lifecycle arg tests ─────────────────────────────
 
     #[test]
     fn deploy_stage_flag_defaults_false() {
@@ -806,7 +804,7 @@ mod tests {
 
     #[test]
     fn deploy_parses_service_id_and_stage() {
-        // Mirrors the spec §5.4 invocation:
+        // Mirrors the Fastly staging lifecycle invocation:
         // `<cli> deploy --adapter fastly --service-id <id> --stage`.
         let args = Args::try_parse_from([
             "edgezero",
@@ -925,7 +923,7 @@ mod tests {
     #[test]
     fn healthcheck_requires_service_id_version_and_domain() {
         // Each required lifecycle input must be present; omitting any
-        // one is a parse error (spec §5.4 deploy→healthcheck→rollback
+        // one is a parse error (deploy→healthcheck→rollback
         // threading depends on them).
         Args::try_parse_from([
             "edgezero",
@@ -1039,7 +1037,7 @@ mod tests {
         .expect_err("missing --version must error");
     }
 
-    // ── config push / diff stub tests (12.8 + 12.11) ──────────────────
+    // ── config push / diff stub tests ─────────────────────────────────
 
     /// Bundled binary: bare `config push` parses to the stub variant.
     /// The catch-all absorbs nothing; trailing is empty.
@@ -1081,7 +1079,7 @@ mod tests {
         assert!(matches!(args.cmd, Command::Config(ConfigCmd::Diff(_))));
     }
 
-    /// 12.11 — `ConfigPushArgs` new flags: `--yes` / `-y` / `--no-diff`
+    /// `ConfigPushArgs` new flags: `--yes` / `-y` / `--no-diff`
     /// / `--dry-run` parse correctly on the *downstream* typed struct.
     /// (The bundled binary uses `ConfigCmdStubArgs`; these tests cover the
     /// struct fields directly via `Default` + mutation, since clap can only
@@ -1102,7 +1100,7 @@ mod tests {
         assert!(ConfigPushArgs::default().key.is_none());
     }
 
-    // ── ConfigDiffArgs parser-roundtrip tests (12.11) ──────────────────
+    // ── ConfigDiffArgs parser-roundtrip tests ─────────────────────────
 
     /// Default `ConfigDiffArgs` has correct zero-values.
     /// KEEP as struct-literal sanity check — this is a Default-impl pin,

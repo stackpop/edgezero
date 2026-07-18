@@ -137,7 +137,7 @@ impl Adapter for AxumCliAdapter {
         match action {
             // The axum adapter is the in-process native dev server —
             // there is no remote auth provider to sign in/out of.
-            // Per spec this is an explicit no-op.
+            // This is an explicit no-op.
             AdapterAction::AuthLogin | AdapterAction::AuthLogout | AdapterAction::AuthStatus => {
                 log::info!(
                     "[edgezero] axum has no remote auth surface; `auth` is a no-op for this adapter"
@@ -147,12 +147,12 @@ impl Adapter for AxumCliAdapter {
             AdapterAction::Build => build(args),
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
-            // The Fastly staging lifecycle (spec §5.4) is Fastly-only.
+            // The Fastly staging lifecycle is Fastly-only.
             AdapterAction::DeployStaged
             | AdapterAction::EmitVersion
             | AdapterAction::Healthcheck
             | AdapterAction::Rollback => Err(format!(
-                "axum adapter does not support the Fastly staging lifecycle action {action:?} (spec §5.4)"
+                "axum adapter does not support the Fastly staging lifecycle action {action:?}"
             )),
             other => Err(format!("axum adapter does not support {other:?}")),
         }
@@ -191,7 +191,7 @@ impl Adapter for AxumCliAdapter {
             // Axum reads `.edgezero/local-config-<logical>.json`.
             // The platform name is informational here -- the env
             // overlay isn't used for local file paths because the
-            // path encoding is the spec's canonical form.
+            // path encoding is the canonical form.
             let logical = store.logical.as_str();
             out.push(format!(
                 "axum config store `{logical}` reads `.edgezero/local-config-{logical}.json`; nothing to provision"
@@ -223,7 +223,7 @@ impl Adapter for AxumCliAdapter {
         // `string -> string` JSON object `AxumConfigStore` reads
         // back from `.edgezero/local-config-<id>.json`. The path
         // is keyed on the LOGICAL id, not the env-resolved
-        // platform name -- the local file flow is the spec's
+        // platform name -- the local file flow is the
         // canonical form and isn't subject to the per-store env
         // overlay (which targets platform store names, not local
         // file paths).
@@ -241,8 +241,8 @@ impl Adapter for AxumCliAdapter {
             .map_err(|err| format!("failed to create {}: {err}", local_dir.display()))?;
         // Upsert into any existing map so a `config push --key
         // app_config_staging` doesn't wipe a previously-pushed
-        // `app_config` blob (spec 12.7 requires default + staging
-        // to coexist for the `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`
+        // `app_config` blob (default + staging must coexist
+        // for the `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`
         // override to switch between them). The map is owned (rather
         // than borrowed) so we can merge old + new without lifetime
         // surgery on the slice.
@@ -598,7 +598,7 @@ fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
-    // Per the spec hard-cutoff: only the canonical
+    // Per the hard-cutoff: only the canonical
     // `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT` env
     // vars are honoured. The pre-rewrite `EDGEZERO_HOST` /
     // `EDGEZERO_PORT` shim is gone -- the core runtime stopped
@@ -1415,7 +1415,7 @@ mod tests {
         }
     }
 
-    /// Spec 12.7: pushing two blobs under different keys (e.g.
+    /// Pushing two blobs under different keys (e.g.
     /// `app_config` + `app_config_staging`) must leave both keys
     /// readable so the runtime
     /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` override can

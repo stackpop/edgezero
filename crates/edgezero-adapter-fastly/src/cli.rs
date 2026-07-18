@@ -137,10 +137,10 @@ const RUNTIME_ENV_STAGING_STORE: &str = "edgezero_runtime_env_staging";
 
 /// Env var carrying the Fastly API token (read by the Fastly CLI and
 /// forwarded to the Fastly API via the `Fastly-Key` header). Part of
-/// the Fastly staging lifecycle (deploy-github-action spec §5.4).
+/// the Fastly staging lifecycle.
 const FASTLY_API_TOKEN_ENV: &str = "FASTLY_API_TOKEN";
 /// Env var carrying the default Fastly service id, used when
-/// `--service-id` is not passed explicitly (spec §5.4).
+/// `--service-id` is not passed explicitly.
 const FASTLY_SERVICE_ID_ENV: &str = "FASTLY_SERVICE_ID";
 
 /// Flags `fastly compute update` accepts that take a VALUE (either
@@ -264,7 +264,7 @@ impl Adapter for FastlyCliAdapter {
             }
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
-            // Fastly staging lifecycle (deploy-github-action spec §5.4).
+            // Fastly staging lifecycle.
             AdapterAction::DeployStaged => deploy_staged(args),
             AdapterAction::EmitVersion => emit_active_version(args),
             AdapterAction::Healthcheck => healthcheck(args),
@@ -1049,8 +1049,8 @@ fn write_fastly_local_config_store(
 
     // Upsert into the existing per-store contents table so a
     // `config push --key app_config_staging` does NOT wipe the
-    // previously-pushed `app_config` blob. Spec 12.7 requires
-    // default + staging keys to coexist so the runtime
+    // previously-pushed `app_config` blob. The
+    // default + staging keys must coexist so the runtime
     // EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY env var can
     // switch between them. (Earlier wholesale-replace was a
     // misread of the "stale entries don't linger" property:
@@ -1705,7 +1705,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 }
 
 // ===================================================================
-// Fastly staging lifecycle (deploy-github-action spec §5.4)
+// Fastly staging lifecycle
 // ===================================================================
 //
 // These entry points back the `deploy --stage`, `healthcheck`, and
@@ -1721,7 +1721,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 //   * rollback        → activate `<v>-1` (production) or deactivate
 //     `<v>` (staging) via the Fastly API.
 //
-// **Version-output contract (spec §5.4.2):** deploy/stage print a
+// **Version-output contract:** deploy/stage print a
 // single `version=<N>` line to stdout (via `log::info!`, which the CLI
 // logger emits verbatim). The `deploy-fastly` action greps that line
 // to surface `fastly-version`. Rollback prints `rolled-back-to=<N>`.
@@ -1865,7 +1865,7 @@ fn last_version_after(lower: &str, marker: &str, terminator: char) -> Option<u64
 /// Parse a Fastly service version out of Fastly CLI output, accepting
 /// ONLY the shapes the CLI actually emits, in precedence order:
 ///
-///   1. Our canonical `version=<N>` contract line (spec §5.4.2).
+///   1. Our canonical `version=<N>` contract line.
 ///   2. The CLI's success line, whose Go format string is
 ///      `"Updated package (service %s, version %v)"` (and
 ///      `"Deployed package (...)"` for `compute deploy`) — matched as
@@ -2252,7 +2252,7 @@ fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())
 }
 
-/// `deploy --adapter fastly --service-id <id> --stage` (spec §5.4):
+/// `deploy --adapter fastly --service-id <id> --stage`:
 /// build, upload to a new draft version (no activation), stage it, and
 /// emit `version=<N>`.
 fn deploy_staged(args: &[String]) -> Result<(), String> {
@@ -2490,7 +2490,7 @@ fn relink_runtime_env_for_staging(
     Ok(())
 }
 
-/// Production companion to `deploy` (spec §5.4.2): resolve the active
+/// Production companion to `deploy`: resolve the active
 /// service version via the Fastly API and emit `version=<N>`.
 fn emit_active_version(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
@@ -2504,7 +2504,7 @@ fn emit_active_version(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `healthcheck --adapter fastly ...` (spec §5.4): probe the domain
+/// `healthcheck --adapter fastly ...`: probe the domain
 /// (production) or the version's staging IP (`--staging`), retrying up
 /// to `--retry` times. Emits `status-code` / `healthy` and returns
 /// `Err` (non-zero exit) when unhealthy after retries.
@@ -2596,7 +2596,7 @@ fn curl_status(args: &[String]) -> Result<u16, String> {
     })
 }
 
-/// `rollback --adapter fastly ...` (spec §5.4): production activates
+/// `rollback --adapter fastly ...`: production activates
 /// `<version> - 1`; staging deactivates `<version>`.
 fn rollback(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
@@ -2664,7 +2664,7 @@ mod tests {
     // `edgezero_core::test_env`; the merge with edition-2024 main replaced our
     // local copy with it (its `set_var` calls are wrapped for 2024's unsafe-env).
 
-    // ── Fastly staging lifecycle helpers (spec §5.4) ──────────────────
+    // ── Fastly staging lifecycle helpers ──────────────────────────────
 
     #[test]
     fn arg_value_reads_flag_value() {
@@ -2825,7 +2825,7 @@ mod tests {
         }
     }
 
-    // ── healthcheck / rollback input validation (spec §5.4) ───────────
+    // ── healthcheck / rollback input validation ───────────────────────
     //
     // GitHub Actions' `required: true` does NOT fail when an input is
     // omitted or empty, so the CLI is the real guard. An absent / empty /
@@ -3025,7 +3025,7 @@ mod tests {
             parse_fastly_version("\nSUCCESS: Updated package (service SU1Z0, version 42)\n"),
             Some(42)
         );
-        // Our canonical contract line (spec §5.4.2).
+        // Our canonical contract line.
         assert_eq!(parse_fastly_version("version=12"), Some(12));
         // The --autoclone notice, when no success line is present.
         assert_eq!(
@@ -3488,7 +3488,7 @@ mod tests {
 
     #[test]
     fn setup_block_present_true_when_only_setup_exists() {
-        // Post-F6 (PR #269 round 2): `setup_block_present` only
+        // `setup_block_present` only
         // checks `[setup.<kind>_stores.<id>]`. The pre-fix check
         // ALSO required `[local_server.<kind>_stores.<id>]`, but
         // writing an empty `[local_server.*]` table didn't match
@@ -3530,7 +3530,7 @@ mod tests {
             after.contains("[setup.kv_stores.sessions]"),
             "setup table added: {after}"
         );
-        // Post-F6: no `[local_server.*]` write — that empty stanza
+        // No `[local_server.*]` write — that empty stanza
         // didn't satisfy fastly's local-server schema and made
         // `fastly compute serve` error or skip the store. Local-
         // server seeding is now `config push --adapter fastly
@@ -4664,7 +4664,7 @@ build = \"cargo build --release\"
         );
     }
 
-    /// Spec 12.7: pushing two blobs under different root keys
+    /// Pushing two blobs under different root keys
     /// (e.g. `app_config` + `app_config_staging`) must leave both
     /// keys readable from the local fastly.toml so the runtime
     /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` override can
@@ -5082,14 +5082,14 @@ build = \"cargo build --release\"
         );
     }
 
-    /// Spec 12.3 + 9.3: a second oversized push must converge the
+    /// A second oversized push must converge the
     /// runtime on the NEW envelope — chunk keys are content-addressed
     /// by the full-envelope SHA, so push B writes a new chunk-set and
     /// installs a new root pointer.
     ///
     /// The local fastly.toml writer upserts per-key (so a sibling
-    /// `--key app_config_staging` push leaves `app_config` intact per
-    /// spec 12.7). Within the SAME root key, old chunks for envelope
+    /// `--key app_config_staging` push leaves `app_config` intact).
+    /// Within the SAME root key, old chunks for envelope
     /// A remain in the contents table after envelope B's push — they're
     /// unreferenced (the root pointer at `app_config` now names B's
     /// chunks), matching the remote Fastly behaviour where the
@@ -5111,7 +5111,7 @@ build = \"cargo build --release\"
 
         // First push: envelope A. Records the chunk-key set so we can
         // confirm they survive the second push (no garbage collection
-        // in v1 — spec 9.3 + Q6).
+        // in v1).
         let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         FastlyCliAdapter
             .push_config_entries_local(

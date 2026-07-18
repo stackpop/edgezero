@@ -163,7 +163,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
 
-    // Thread `--service-id` (spec §5.4) into the adapter invocation
+    // Thread `--service-id` into the adapter invocation
     // when provided, ahead of any operator passthrough args. Fastly
     // consumes it; adapters that don't need a service id ignore it.
     let action = if args.stage {
@@ -216,7 +216,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         }
         // Staged deploy: clone the active version, upload the built
         // package to a new draft, mark it staged, and emit the staged
-        // version (spec §5.4). Never runs the manifest `deploy`
+        // version. Never runs the manifest `deploy`
         // command, which would activate production.
         return adapter::execute(
             &args.adapter,
@@ -226,7 +226,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         );
     }
 
-    // Production deploy also emits the activated version (spec §5.4.2)
+    // Production deploy also emits the activated version
     // so the deploy-fastly action can surface `fastly-version` and the
     // deploy→healthcheck→rollback chain has a real version to thread.
     //
@@ -241,7 +241,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     //   2. Only when the output yields nothing: the Fastly API lookup
     //      (`EmitVersion`), which needs a live API + a real token.
     //   3. If BOTH fail: a clear `Err`. We never silently emit an empty
-    //      version — that was the original finding.
+    //      version — that was the original bug.
     if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
         let captured = adapter::execute_capture(
             &args.adapter,
@@ -358,8 +358,8 @@ fn resolve_adapter_manifest_path(loader: Option<&ManifestLoader>, adapter: &str)
     Some(root.join(rel).to_string_lossy().into_owned())
 }
 
-/// Probe a deployed version's health (Fastly staging lifecycle, spec
-/// §5.4) and return `Err` when the probe is unhealthy after retries so
+/// Probe a deployed version's health (Fastly staging lifecycle)
+/// and return `Err` when the probe is unhealthy after retries so
 /// the process exits non-zero (letting a CI caller gate rollback on
 /// failure).
 ///
@@ -400,7 +400,7 @@ pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
     )
 }
 
-/// Roll a service back (Fastly staging lifecycle, spec §5.4):
+/// Roll a service back (Fastly staging lifecycle):
 /// production activates the previous version; staging deactivates the
 /// staged version.
 ///
@@ -649,7 +649,7 @@ mod tests {
         assert!(manifest.manifest().adapters.contains_key("fastly"));
     }
 
-    // ── deploy-output version parsing (spec §5.4.2) ───────────────────
+    // ── deploy-output version parsing ─────────────────────────────────
 
     #[test]
     fn parse_deploy_version_reads_canonical_line() {
@@ -818,8 +818,8 @@ mod tests {
         let args = DeployArgs {
             adapter: "fastly".to_owned(),
             adapter_args: Vec::new(),
-            // No service id → the production version-emit step (spec
-            // §5.4.2) is skipped, so this test exercises only the
+            // No service id → the production version-emit step is
+            // skipped, so this test exercises only the
             // manifest `deploy` command path.
             service_id: None,
             stage: false,

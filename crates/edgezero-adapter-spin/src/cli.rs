@@ -133,7 +133,7 @@ struct SpinCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch)."
+    reason = "KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch)."
 )]
 impl Adapter for SpinCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -157,12 +157,12 @@ impl Adapter for SpinCliAdapter {
             }
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
-            // The Fastly staging lifecycle (spec §5.4) is Fastly-only.
+            // The Fastly staging lifecycle is Fastly-only.
             AdapterAction::DeployStaged
             | AdapterAction::EmitVersion
             | AdapterAction::Healthcheck
             | AdapterAction::Rollback => Err(format!(
-                "spin adapter does not support the Fastly staging lifecycle action {action:?} (spec §5.4)"
+                "spin adapter does not support the Fastly staging lifecycle action {action:?}"
             )),
             other => Err(format!("spin adapter does not support {other:?}")),
         }
@@ -191,8 +191,7 @@ impl Adapter for SpinCliAdapter {
         //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
         // runtime / Fermyon at deploy). For each declared KV id
-        // AND each declared CONFIG id (KV-backed since Stage 5
-        // of the spin-kv-config plan), append the env-resolved
+        // AND each declared CONFIG id (KV-backed), append the env-resolved
         // platform label to the component's `key_value_stores`
         // array. Secret variables are manually declared by the
         // developer in spin.toml -- secrets stay on Spin
@@ -319,7 +318,7 @@ impl Adapter for SpinCliAdapter {
         // 2. Deploy command targets Fermyon Cloud → `Unsupported`.
         //    Fermyon Cloud's `spin cloud key-value list` enumerates
         //    STORES, not keys; there is no stable per-key get CLI in
-        //    v1 (8.3 / 9.4 of the spec). NO shell-out.
+        //    v1. NO shell-out.
         // 3. `runtime-config.toml` declares a non-`spin` backend
         //    (Redis / AzureCosmos / Unknown) → error naming the backend
         //    and pointing at its native CLI, matching the writer at
@@ -456,7 +455,7 @@ impl Adapter for SpinCliAdapter {
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: Multi for KV AND Config (both label-backed via the
-        // Spin KV API since Stage 5 of the spin-kv-config plan).
+        // Spin KV API).
         // Single for Secrets (still flat-variable namespace).
         &["secrets"]
     }
@@ -518,9 +517,9 @@ impl Adapter for SpinCliAdapter {
 
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
         use std::collections::HashMap;
-        // Stage 5+: KV-backed config no longer shares Spin's flat
+        // KV-backed config no longer shares Spin's flat
         // variable namespace, so config keys are NOT considered here
-        // (and the trait dropped the parameter in Stage 6+) — config
+        // (and the trait dropped the parameter) — config
         // can use arbitrary UTF-8 keys without colliding with
         // `#[secret]` values. Secrets still resolve through
         // `spin_sdk::variables`, so two checks remain:
@@ -1339,11 +1338,11 @@ mod tests {
         );
     }
 
-    // 12.16 — named-store secret adapter validation
+    // named-store secret adapter validation
 
     #[test]
     fn collision_error_names_both_field_names_and_lowercased_variable() {
-        // 12.16 case (b): KeyInDefault and KeyInNamedStore that
+        // case (b): KeyInDefault and KeyInNamedStore that
         // collide on the lowercased Spin variable.
         let entries = [
             TypedSecretEntry::new("default", "one", "Demo_Token"),
@@ -1357,7 +1356,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_spin_variable_name_with_hyphen() {
-        // 12.16 case (a): KeyInNamedStore value contains a hyphen,
+        // case (a): KeyInNamedStore value contains a hyphen,
         // which is not a valid Spin variable name.
         let entries = [TypedSecretEntry::new("vault", "api_token", "demo-token")];
         let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
@@ -1371,7 +1370,7 @@ mod tests {
 
     #[test]
     fn non_spin_adapter_is_exempt_from_collision_check() {
-        // 12.16 case (c): same collision fixture against a manifest
+        // case (c): same collision fixture against a manifest
         // declaring only [adapters.axum] — covered by run_adapter_
         // typed_checks NOT calling SpinCliAdapter at all. This is more
         // naturally a CLI-level integration test, but the adapter
@@ -1435,7 +1434,7 @@ mod tests {
 
     #[test]
     fn single_store_kinds_is_secrets_only() {
-        // Stage 5: config moved to KV (provisioned via `key_value_stores`,
+        // Config moved to KV (provisioned via `key_value_stores`,
         // entries pushed via the seed handler). Secrets remain Spin
         // `[variables]` until we ship native secret support.
         assert_eq!(SpinCliAdapter.single_store_kinds(), &["secrets"]);
@@ -1747,7 +1746,7 @@ mod tests {
 
     #[test]
     fn provision_writes_config_labels_into_kv_array_and_leaves_secrets_manual() {
-        // Stage 5: config now lives in Spin KV. Provision writes each
+        // Config now lives in Spin KV. Provision writes each
         // `[stores.config].id` into `[component.X].key_value_stores`
         // (same machinery as `[stores.kv]`). Secrets stay manual until
         // we ship native secret support.
@@ -1855,7 +1854,7 @@ mod tests {
 
     #[test]
     fn dispatch_push_local_forces_sqlite_even_when_runtime_config_declares_redis() {
-        // F1 (blocker): `--local` MUST bypass runtime-config backend
+        // `--local` MUST bypass runtime-config backend
         // dispatch. Without this test, the code that says "Redis: error
         // out" would silently fire even under --local.
         let dir = tempdir().expect("tempdir");
