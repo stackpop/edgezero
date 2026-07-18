@@ -10,6 +10,7 @@ on:
   pull_request:
     paths:
       - .github/actions/deploy-fastly/scripts/install-fastly.sh
+      - .github/actions/deploy-fastly/scripts/verify-installed-version.sh
       - .github/actions/deploy-fastly/versions.json
       - .github/actions/deploy-core/scripts/common.sh
       - .github/workflows/fastly-installer-check.yml
@@ -17,6 +18,7 @@ on:
     branches: [main]
     paths:
       - .github/actions/deploy-fastly/scripts/install-fastly.sh
+      - .github/actions/deploy-fastly/scripts/verify-installed-version.sh
       - .github/actions/deploy-fastly/versions.json
       - .github/actions/deploy-core/scripts/common.sh
       - .github/workflows/fastly-installer-check.yml
@@ -43,16 +45,4 @@ jobs:
         env:
           EDGEZERO__FASTLY__VERSIONS_JSON: ${{ github.workspace }}/.github/actions/deploy-fastly/versions.json
           EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
-        run: |
-          set -euo pipefail
-          pinned=$(jq -r '.fastly.version' "$EDGEZERO__FASTLY__VERSIONS_JSON")
-          fastly_bin="$EDGEZERO__ACTION__TOOL_ROOT/provider-bin/fastly"
-          [[ -x "$fastly_bin" ]] || { echo "installer did not place an executable fastly at $fastly_bin" >&2; exit 1; }
-          # Capture the full output and take the first line via parameter
-          # expansion — piping to `head` would SIGPIPE `fastly` (exit 141) under
-          # `set -o pipefail`.
-          reported=$("$fastly_bin" version)
-          reported=${reported%%$'\n'*}
-          echo "pinned=$pinned reported=$reported"
-          [[ "$reported" == *"$pinned"* ]] ||
-            { echo "installed Fastly CLI reports '$reported', expected version $pinned" >&2; exit 1; }
+        run: .github/actions/deploy-fastly/scripts/verify-installed-version.sh
