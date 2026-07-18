@@ -855,10 +855,20 @@ where
                 String::new(),
             )
         })?;
-    let envelope: BlobEnvelope = serde_json::from_str(&raw)
-        .map_err(|err| EdgeError::internal(anyhow::anyhow!("envelope parse failed: {err}")))?;
-    envelope.verify().map_err(|err| {
-        EdgeError::internal(anyhow::anyhow!("envelope verification failed: {err}"))
+    // Neither the parse error nor the verify error is echoed into the
+    // client-facing message: a serde error embeds the offending input, and a
+    // `BlobEnvelope` integrity failure names the stored hashes — both are
+    // config-store values that may hold secrets, and this message reaches the
+    // HTTP body. Report a category only.
+    let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
+        EdgeError::internal(anyhow::anyhow!(
+            "typed app-config blob is not a valid envelope (details redacted)"
+        ))
+    })?;
+    envelope.verify().map_err(|_err| {
+        EdgeError::internal(anyhow::anyhow!(
+            "typed app-config blob failed its integrity check (details redacted)"
+        ))
     })?;
     let mut data = envelope.into_data();
     // Secret walk per spec 3.3.3.
@@ -2308,16 +2318,20 @@ mod tests {
 
     #[test]
     fn app_config_extractor_returns_internal_on_sha_mismatch() {
+        const SENTINEL: &str = "SUPER_SECRET_STORED_HASH";
         struct TamperedStore;
         #[async_trait(?Send)]
         impl ConfigStore for TamperedStore {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                // Build a valid envelope then corrupt its sha.
+                // A valid envelope whose stored sha is a SENTINEL secret. The
+                // stored hash is attacker-influenced (it comes from the config
+                // store), and this error becomes the HTTP 500 body — so the
+                // message must NOT echo it.
                 let mut env = BlobEnvelope::new(
                     serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
                     "2026-01-01T00:00:00Z".into(),
                 );
-                env.sha256 = "ff".repeat(32);
+                env.sha256 = SENTINEL.to_owned();
                 Ok(Some(serde_json::to_string(&env).unwrap()))
             }
         }
@@ -2330,9 +2344,15 @@ mod tests {
             matches!(err, EdgeError::Internal { .. }),
             "SHA mismatch must surface as Internal: {err:?}"
         );
+        // The client-facing message (the HTTP body) must not carry the stored
+        // hash, only a redacted category.
         assert!(
-            err.message().contains("envelope verification failed"),
-            "message names the problem: {err:?}"
+            !err.message().contains(SENTINEL),
+            "the stored hash must never reach the client-facing message: {err:?}"
+        );
+        assert!(
+            err.message().contains("integrity check"),
+            "message must still name the category: {err:?}"
         );
     }
 
@@ -2354,8 +2374,14 @@ mod tests {
             "Envelope parse failure must be Internal: {err:?}"
         );
         assert!(
-            err.message().contains("envelope parse failed"),
+            err.message().contains("not a valid envelope"),
             "message names the problem: {err:?}"
+        );
+        // The offending input is not echoed (a serde error would embed it, and a
+        // stored value may hold secrets).
+        assert!(
+            !err.message().contains("not-json-at-all"),
+            "the offending stored value must not reach the client message: {err:?}"
         );
     }
 

@@ -185,6 +185,18 @@ struct GcDeleteOutcome {
     uncertain: Vec<String>,
 }
 
+/// The result of classifying a store's entries for reclamation.
+struct GcClassification {
+    /// Chunk keys a live root pointer references, each verified against its
+    /// content-address. Never deletable.
+    live: HashSet<String>,
+    /// Keys whose OWN value is a runtime-readable root — a valid direct envelope
+    /// or a pointer — regardless of what their key looks like. Never deletable.
+    protected: HashSet<String>,
+    /// Count of entries classified as roots, for the summary line.
+    roots: usize,
+}
+
 /// One `config-store-entry list` item.
 ///
 /// `item_value` IS captured — `config gc` must parse root pointers to learn
@@ -1610,14 +1622,16 @@ fn shell_single_quote(value: &str) -> String {
 /// A generation is provable only as a whole (`prove_generation` reassembles it),
 /// so a half-deleted one can never be proved again: the next run sees a fragment,
 /// cannot verify it, and correctly refuses to touch it — forever. Ploughing on
-/// after a failure is therefore the one thing that turns a retryable error into
-/// permanent, unreclaimable litter.
+/// after a failure is therefore the one thing that turns a possibly-recoverable
+/// error into permanent, unreclaimable litter.
 ///
-/// Stopping on first failure means the common case (a generation whose FIRST
-/// delete fails — auth, network, a vanished store) leaves that generation whole
-/// and genuinely retryable. Only a failure PART-WAY through strands one, and the
-/// caller reports those explicitly rather than pretending a re-run fixes them.
-/// Generations are independent, so a failure in one does not stop the others.
+/// A failed remote delete has an UNKNOWN outcome — Fastly may commit it before
+/// returning an error — so nothing here is promised as cleanly retryable. The
+/// caller distinguishes two cases: a failure with a CONFIRMED prior sibling
+/// delete strands the survivors for good (manual recovery), and a failure with
+/// no confirmed prior delete leaves the generation in an UNCERTAIN state (a
+/// re-run may reclaim it, or surface it as an unprovable fragment). Generations
+/// are independent, so a failure in one does not stop the others.
 fn execute_gc_deletes(
     resolved_id: &str,
     doomed: &[Vec<(String, u64)>],
@@ -1667,41 +1681,53 @@ fn execute_gc_deletes(
     outcome
 }
 
-/// The proven live set for a store, plus the number of true roots.
+/// Classify a store's entries: the live chunk set, the protected root keys, and
+/// the root count.
 ///
-/// LIVE = the chunk keys every root pointer currently references, each verified
-/// against its content-address. Root-vs-chunk is decided by VALUE, not key shape.
+/// Root-vs-chunk is decided by VALUE, not key shape. The runtime resolver reads
+/// whatever value sits at a key, so ANY entry whose value is a valid direct
+/// envelope or a chunk pointer is a runtime-readable root and must never be
+/// deleted — even at a chunk-shaped key. Two ways that happens:
 ///
-/// Round 9: excluding chunk-shaped keys from the root scan was the same mistake
-/// this module rejects for delete candidates -- key shape is not authoritative.
-/// The runtime resolver follows whatever pointer it is handed, so a valid pointer
-/// parked at a chunk-shaped key (`shadow.__edgezero_chunks.<sha>.0`) still makes
-/// its references LIVE. Skipping it left those chunks looking orphaned, and GC
-/// deleted config that reads depended on. A chunk PAYLOAD is a raw fragment of
-/// envelope JSON, so it does not announce `edgezero_kind` and is never a root.
-fn compute_live_set(
+/// - a pointer parked at a chunk-shaped key makes its references LIVE;
+/// - a value that is itself a valid direct envelope (e.g. a small envelope whose
+///   first 7 000-byte chunk is the whole envelope plus trailing whitespace, and
+///   so still parses and verifies) is a root in its own right.
+///
+/// Only a value that is NEITHER — a raw envelope fragment, which does not parse —
+/// is a delete candidate. In normal operation a chunk payload is exactly such a
+/// fragment, so this protects the pathological cases at no cost to real GC.
+fn classify_store_entries(
     items: &[ConfigStoreItem],
     value_by_key: &HashMap<&str, &str>,
-) -> Result<(HashSet<String>, usize), String> {
+) -> Result<GcClassification, String> {
     let mut live: HashSet<String> = HashSet::new();
+    let mut protected: HashSet<String> = HashSet::new();
     let mut roots = 0_usize;
     for item in items {
         let is_chunk_shaped = chunk_key_generation_any(&item.item_key).is_some();
-        if is_chunk_shaped && !value_is_pointer_kind(&item.item_value) {
-            continue; // a chunk payload: a delete candidate, not a root
-        }
-        if !is_chunk_shaped {
-            roots = roots.saturating_add(1);
-        }
-        // gc_classify_root (NOT prior_chunk_keys): on this destructive path an
-        // empty/truncated/unrelated value must FAIL, not read as "references
-        // nothing" -- that would make its live chunks look orphaned.
-        let classified = gc_classify_root(&item.item_key, &item.item_value).map_err(|err| {
-            format!(
-                "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
-                item.item_key
-            )
-        })?;
+        let classified = match gc_classify_root(&item.item_key, &item.item_value) {
+            Ok(classified) => classified,
+            // A chunk-shaped key whose value we cannot classify is a genuine
+            // chunk fragment (a candidate) ONLY if that value is not itself
+            // root-like. A pointer-kind value is always root-like — the runtime
+            // reads it as a pointer — so an unclassifiable one (e.g. a
+            // cross-root pointer that fails this root's scope check) must FAIL
+            // CLOSED, never become a deletable candidate whose references we
+            // would orphan.
+            Err(_) if is_chunk_shaped && !value_is_pointer_kind(&item.item_value) => {
+                continue; // a chunk payload: a delete candidate
+            }
+            Err(err) => {
+                return Err(format!(
+                    "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
+                    item.item_key
+                ));
+            }
+        };
+        // A runtime-readable root, wherever it lives: never a delete candidate.
+        roots = roots.saturating_add(1);
+        protected.insert(item.item_key.clone());
         let GcRootValue::Chunked(pointer) = classified else {
             continue; // A direct envelope references no chunks.
         };
@@ -1722,7 +1748,11 @@ fn compute_live_set(
         })?;
         live.extend(pointer.chunks.into_iter().map(|chunk| chunk.key));
     }
-    Ok((live, roots))
+    Ok(GcClassification {
+        live,
+        protected,
+        roots,
+    })
 }
 
 /// The reclamation plan for one store: which orphan chunk entries to delete, and
@@ -1756,8 +1786,12 @@ fn plan_gc_reclamation(
         value_by_key.insert(item.item_key.as_str(), item.item_value.as_str());
     }
 
-    // ---- 1. LIVE set: what the roots currently reference, PROVEN ----
-    let (live, roots) = compute_live_set(items, &value_by_key)?;
+    // ---- 1. Classify entries: live chunks, protected roots, root count ----
+    let GcClassification {
+        live,
+        protected,
+        roots,
+    } = classify_store_entries(items, &value_by_key)?;
 
     // ---- 2. Per-root live-config age (best-effort; see the guard below) ----
     let root_live_since: HashMap<&str, u64> = live.iter().fold(HashMap::new(), |mut acc, key| {
@@ -1777,6 +1811,14 @@ fn plan_gc_reclamation(
     let mut groups: BTreeMap<(&str, String), Vec<&ConfigStoreItem>> = BTreeMap::new();
     for item in items {
         if live.contains(&item.item_key) {
+            continue;
+        }
+        // A key whose own value is a runtime-readable root is never a candidate,
+        // even when its key is chunk-shaped (a valid direct envelope can sit at
+        // one). Excluding it here also means any real chunk sharing that
+        // generation drops to an incomplete group, which prove_generation then
+        // leaves untouched — safe: we leak rather than delete a possible root.
+        if protected.contains(&item.item_key) {
             continue;
         }
         let Some((root, _)) = item.item_key.split_once(CHUNK_KEY_INFIX) else {
@@ -4598,7 +4640,7 @@ echo 'unexpected' >&2; exit 1
             err.contains("does not match the SHA-256"),
             "error must say what failed: {err}"
         );
-        // Round 8 [P1]: identified by POSITION, and neither hash echoed -- the
+        // identified by POSITION, and neither hash echoed -- the
         // expected one comes from the stored pointer, so it is value-controlled.
         assert!(
             err.contains("chunk 0"),
@@ -4705,7 +4747,7 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// PR #314 round-9 [P2]: a corrupt/invalid prior value must NOT abort the
+    /// a corrupt/invalid prior value must NOT abort the
     /// local read, or the CLI push aborts on the diff read before the writer's
     /// fail-soft ("overwrite, warn, prune nothing") can repair the state.
     /// `config push --local` is how an operator recovers, so the read reports
@@ -4974,7 +5016,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// THE soundness test (PR #314 review, design-3 counterexample): a root whose
+    /// The soundness test (design-3 counterexample): a root whose
     /// current config was deployed seconds ago must NOT have its prior generation
     /// reclaimed, even if that generation's chunks are ANCIENT. The clock is the
     /// live config's age, not the orphan chunk's own creation time.
@@ -5010,7 +5052,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 round-7 [P1], at the GC level: a live root whose pointer drops its
+    /// a live root whose pointer drops its
     /// last chunk ref AND restates `envelope_len` as the remaining sum passes
     /// every metadata check. The dropped chunk is then absent from the live set
     /// and looks like a deletable orphan -- while the config still needs it.
@@ -5070,7 +5112,7 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// PR #314 round-7 [P1]: a LONE entry whose value hashes to the generation
+    /// a LONE entry whose value hashes to the generation
     /// its own key names would otherwise "prove" itself and be deleted. But our
     /// writer never emits a one-chunk generation (an oversized envelope always
     /// splits into >= 2), so a group of one is never ours -- it is a root-like
@@ -5110,9 +5152,9 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// PR #314 round-9 [P2]: a delete that fails on a generation's FIRST key has
+    /// a delete that fails on a generation's FIRST key has
     /// an UNKNOWN outcome -- Fastly may have committed it before returning an
-    /// error. Round 8 called this "whole and retryable", which is unsound: if the
+    /// error.  called this "whole and retryable", which is unsound: if the
     /// failed delete did commit, a re-run finds a fragment. The honest report is
     /// a NOTE that the outcome is uncertain, NOT a clean-retry promise. We still
     /// stop the generation so a CONFIRMED partial delete cannot happen.
@@ -5161,7 +5203,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 round-9 [P2]: the stateful case. A remote delete that COMMITS but
+    /// the stateful case. A remote delete that COMMITS but
     /// still reports failure leaves a real fragment. On the SECOND run that
     /// missing key makes the generation unprovable, so it must be reported as
     /// left-untouched (surfaced), never silently dropped.
@@ -5201,7 +5243,7 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// PR #314 round-8 [P2]: if a delete fails PART-WAY through a generation, the
+    /// if a delete fails PART-WAY through a generation, the
     /// survivors are an incomplete generation that `prove_generation` can never
     /// verify again -- so `gc` will never reclaim them. Claiming "re-run to
     /// retry" there was false. Say plainly that recovery is manual.
@@ -5257,7 +5299,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 round-9 [P2]: root keys are free-form, so a chunk key can hold
+    /// root keys are free-form, so a chunk key can hold
     /// shell metacharacters. Manual-recovery commands must render them so that
     /// pasting cannot execute or misparse -- single-quoted, with embedded quotes
     /// escaped.
@@ -5298,7 +5340,60 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// RED (round-9 [P1]): key shape is not authoritative for ROOTS either.
+    /// a valid DIRECT envelope at a chunk-shaped key is a
+    /// runtime-readable root, but round 9 only protected POINTER values there.
+    ///
+    /// Construction: pad a small valid envelope with trailing JSON whitespace
+    /// past the entry limit. The writer chunks it; chunk 0 (the first 7 000
+    /// bytes) is the whole envelope plus trailing spaces, which STILL parses and
+    /// verifies as that envelope. So chunk 0's key holds a valid direct envelope
+    /// -- a root -- yet the generation round-trips through the writer and passes
+    /// every proof, so GC deletes chunk 0.
+    #[cfg(unix)]
+    #[test]
+    fn valid_envelope_at_chunk_shaped_key_is_a_protected_root() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // A small valid envelope + trailing whitespace over the entry limit.
+        let envelope = BlobEnvelope::new(json!({"k":"v"}), "2026-06-22T00:00:00Z".into());
+        let mut padded = serde_json::to_string(&envelope).unwrap();
+        padded.push_str(&" ".repeat(8_200));
+        let entries = prepare_fastly_config_entries(TEST_CONFIG_ID, &padded).expect("expand");
+        assert!(entries.len() >= 3, "need >= 2 chunks + pointer");
+        let holder_key = entries[0].0.clone();
+        // Sanity: chunk 0's value IS a standalone valid envelope.
+        let parsed: BlobEnvelope =
+            serde_json::from_str(&entries[0].1).expect("chunk 0 must parse as an envelope");
+        parsed.verify().expect("chunk 0 must verify as an envelope");
+
+        // Seed the store with the chunk entries only -- NO live pointer refers
+        // to them, so this generation looks orphaned. Aged old.
+        let stamp = stamp_secs_ago(604_800);
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+        for (key, value) in &entries[..entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp.clone(), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        drop(run_gc(dir.path(), 86_400, false));
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !oplog_has(&oplog, &format!("delete {holder_key}")),
+            "an entry whose value is a valid direct envelope is a runtime-readable root and must \
+             never be deleted, whatever its key looks like: `{holder_key}`; log:\n{log}"
+        );
+    }
+
+    /// key shape is not authoritative for ROOTS either.
     ///
     /// A valid pointer stored at a chunk-SHAPED key (`shadow.__edgezero_chunks.
     /// <sha>.0`) is skipped by the live-set scan, which excludes chunk-shaped
@@ -5307,7 +5402,7 @@ echo 'unexpected' >&2; exit 1
     /// generation orphaned, and deletes it.
     #[cfg(unix)]
     #[test]
-    fn red_pointer_at_chunk_shaped_key_keeps_its_references_live() {
+    fn pointer_at_chunk_shaped_key_keeps_its_references_live() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
@@ -5349,7 +5444,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 round-8 [P1]: a FOREIGN writer needs NO preimage to satisfy a
+    /// a FOREIGN writer needs NO preimage to satisfy a
     /// content-address. Pick envelope E, compute H = sha256(E), split E however
     /// you like, store the parts as `<root>.__edgezero_chunks.H.0` / `.1`. Under
     /// hash-only checking that group "proved" itself and was deleted.
@@ -5403,12 +5498,12 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 round-6/7 [P1]: an entry can be chunk-SHAPED without being a chunk
+    /// an entry can be chunk-SHAPED without being a chunk
     /// -- a store may predate this feature or be shared, and push-time
     /// reserved-key rejection cannot protect what already exists. Deleting one
     /// would destroy live config.
     ///
-    /// Round 7: proof is CONTENT, not shape. A candidate generation is ours only
+    /// proof is CONTENT, not shape. A candidate generation is ours only
     /// if it reassembles to the content-address its own keys name. Unprovable
     /// entries are left UNTOUCHED and reported -- not fatal, because one foreign
     /// entry must not block reclaiming the rest of the store forever.
@@ -5475,7 +5570,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 round-6 [P2]: a key is unique in a config store, so duplicate rows
+    /// a key is unique in a config store, so duplicate rows
     /// mean the listing is not one consistent view. Left alone, last-row-wins on
     /// `created_at` could age a recent key into eligibility.
     #[cfg(unix)]
@@ -5509,7 +5604,7 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// PR #314 round-6 [P2]: `gc_config_entries` is a public trait method, so the
+    /// `gc_config_entries` is a public trait method, so the
     /// zero-window rule must live at the DESTRUCTIVE boundary, not only in the
     /// CLI that usually calls it. Rejected before any `fastly` invocation.
     #[cfg(unix)]
@@ -5544,7 +5639,7 @@ echo 'unexpected' >&2; exit 1
         run_gc(dir.path(), 0, true).expect("a dry-run may preview at zero");
     }
 
-    /// PR #314 review [P1]: a root whose value is TRUNCATED/unparseable must fail
+    /// a root whose value is TRUNCATED/unparseable must fail
     /// closed. It is pointer-shaped garbage -- we cannot tell what it references,
     /// so its (live!) chunks must not be judged orphaned. Regression guard: the
     /// push-path helper returns `Ok([])` for a non-pointer value, which on THIS
@@ -5591,7 +5686,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 review [P1]: an ENVELOPED listing (`{"items":[...]}`) may carry
+    /// an ENVELOPED listing (`{"items":[...]}`) may carry
     /// pagination we do not follow. A page that omitted a root would make that
     /// root's live chunks look orphaned -- and the completeness guard cannot see
     /// a root that isn't there. Refuse the shape outright.
@@ -5626,7 +5721,7 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// PR #314 review [P1]: a root with an EMPTY value is as dangerous as a
+    /// a root with an EMPTY value is as dangerous as a
     /// missing one -- it would classify as "references nothing" and orphan its
     /// live chunks. The listing parser rejects it before any reasoning.
     #[cfg(unix)]
@@ -5661,7 +5756,7 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 review [P2]: the orphan's OWN age is mandatory -- an old root does
+    /// the orphan's OWN age is mandatory -- an old root does
     /// not license deleting a chunk written seconds ago (e.g. by a concurrent
     /// push that has not committed its pointer yet). Both ages must clear the
     /// window; the more restrictive wins.

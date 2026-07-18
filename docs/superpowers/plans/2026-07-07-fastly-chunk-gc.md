@@ -135,9 +135,11 @@ cannot be used as a supersession clock.
   may carry pagination we don't follow), and every entry must carry a NON-EMPTY
   string `item_key`/`item_value`/`created_at`, else abort. A skipped, defaulted,
   or empty field would hide a root and get its live chunks deleted.
-- [x] Live set — classify non-chunk entries as roots via `gc_classify_root`, which
-  accepts ONLY a valid direct envelope or a valid v1 pointer; union of referenced
-  canonical keys = live. Deliberately NOT the push-path `prior_chunk_keys`, which
+- [x] Live set — classify entries as roots by VALUE, not key shape: any entry
+  whose value is a valid direct envelope or a v1 pointer is a runtime-readable
+  root (protected from deletion wherever it lives, even at a chunk-shaped key),
+  via `gc_classify_root`; the union of referenced canonical keys = live.
+  Deliberately NOT the push-path `prior_chunk_keys`, which
   answers `Ok([])` for a non-pointer value — on a destructive path an empty or
   truncated pointer must fail, not read as "references nothing" and orphan its own
   live chunks.

@@ -714,7 +714,18 @@ fn dispatch_diff_format(
 /// Consent gate: 8.3 Spin Cloud four-branch UX when `remote` is
 /// `Unsupported`; 8.2 default flow otherwise.
 fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(), String> {
+    // The `Unsupported` branch below is Spin-Cloud-specific: a CLOUD read that
+    // cannot reach the backend, where a dry-run is genuinely impossible. A LOCAL
+    // read returns `Unsupported` only when the prior value could not be resolved
+    // (corrupt/incomplete chunk state) — a recoverable single-file overwrite, not
+    // an unreachable backend. That takes the NORMAL consent path, so a dry-run
+    // reaches the writer's report and a real write just needs `--yes`. Without
+    // this, a corrupt local prior would hit the Spin-Cloud dry-run rejection and
+    // the fail-soft ("overwrite, warn, prune nothing") would be unreachable.
     if let ReadConfigEntry::Unsupported(reason) = remote {
+        if args.local {
+            return require_consent(args, remote);
+        }
         if args.dry_run {
             return Err(format!(
                 "config push --dry-run --adapter spin against Spin Cloud is unsupported \
@@ -1784,7 +1795,7 @@ mod tests {
         );
     }
 
-    /// PR #314 review [P1]: `--older-than 0 --yes` parses, but asserts NOTHING --
+    /// `--older-than 0 --yes` parses, but asserts NOTHING --
     /// it makes every orphan eligible, including one superseded a second ago whose
     /// pointer POPs still serve. A destructive run must reject it (a dry-run may
     /// still preview at zero — see `config_gc_dry_run_allows_missing_older_than`).
@@ -2923,6 +2934,74 @@ deep = true
     }
 
     // ---------- typed push ----------
+
+    /// A corrupt local prior value must not block `config push --local`: the
+    /// diff read degrades to `Unsupported`, and the shared handler must route a
+    /// LOCAL `Unsupported` through the normal consent path (reaching the writer)
+    /// rather than the Spin-Cloud dry-run rejection. Exercises the real
+    /// orchestration end-to-end, not the adapter methods in isolation.
+    #[test]
+    fn local_dry_run_over_corrupt_prior_reaches_the_writer() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+
+        // Seed fastly.toml with a pointer-kind prior value that cannot resolve:
+        // it references a chunk that is not present, so the runtime resolver
+        // errors and the local read degrades to Unsupported.
+        let corrupt = format!(
+            "{{\"edgezero_kind\":\"fastly_config_chunks\",\"version\":1,\"chunks\":[{{\"key\":\"app_config.__edgezero_chunks.{sha}.0\",\"len\":10,\"sha256\":\"x\"}}],\"data_sha256\":\"\",\"envelope_len\":10,\"envelope_sha256\":\"{sha}\"}}",
+            sha = "a".repeat(64),
+        );
+        let fastly_toml = format!(
+            "[local_server.config_stores.app_config.contents]\napp_config = {}\n",
+            toml_string_literal(&corrupt),
+        );
+        fs::write(dir.path().join("fastly.toml"), fastly_toml).expect("write fastly.toml");
+
+        let mut args = push_args(&manifest, "fastly");
+        args.local = true;
+        args.dry_run = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        // The push must proceed past consent to the writer's dry-run rather than
+        // hitting the Spin-Cloud dry-run rejection that every `Unsupported`
+        // previously triggered.
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect("a local dry-run over a corrupt prior must reach the writer, not be rejected");
+    }
+
+    /// Serialise a string as a TOML basic-string literal (test helper).
+    fn toml_string_literal(value: &str) -> String {
+        let mut out = String::from('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+        out
+    }
 
     #[test]
     fn typed_push_writes_blob_envelope_to_local_config_file() {

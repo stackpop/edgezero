@@ -156,11 +156,14 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 
 11. **A generation is deleted whole or not at all, and a failure stops it.** A
     generation is provable only as a unit, so a half-deleted one can never be
-    proved again. Deletion therefore stops at a generation's first failure: the
-    common case leaves it whole and genuinely retryable. A failure PART-WAY
-    through strands the survivors permanently — `gc` will never reclaim them —
-    so the command names them and the manual delete commands, and does NOT
-    pretend a re-run helps.
+    proved again. Deletion therefore stops at a generation's first failure. A
+    failed remote delete has an UNKNOWN outcome — Fastly may commit it before
+    returning an error — so nothing is promised as cleanly retryable: a failure
+    with no confirmed prior sibling delete leaves the generation UNCERTAIN (a
+    re-run may reclaim it, or surface it as an unprovable fragment), and a
+    failure PART-WAY through (a sibling already confirmed deleted) strands the
+    survivors permanently. Either way the command names the affected keys and the
+    manual delete commands, and does NOT pretend a re-run is guaranteed to help.
 
 12. **A failed delete is always a failure.** There is no "already gone" stderr
     special case: `not found`/`404` text cannot distinguish a missing key from a
@@ -182,6 +185,29 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
     from them — a pointer declaring `usize::MAX` would otherwise abort the
     process (including the edge guest, on the read path) before any check could
     reject it.
+
+15. **The chunked read path verifies the INNER envelope, like the direct path.**
+    The outer pointer checks (per-chunk and full-envelope hashes) prove the
+    chunks reassemble to the bytes the pointer names, but say nothing about the
+    `BlobEnvelope` inside. The resolver parses and `verify()`s the reconstructed
+    envelope and returns only a redacted category — otherwise a reconstructed
+    value with a wrong embedded `sha256` (a secret) reaches core, whose own
+    `verify()` formats that stored hash into an HTTP 500. Both the resolver and
+    core's extractor redact.
+
+16. **Root-vs-chunk is decided by VALUE, and any runtime-readable root is
+    protected.** An entry whose value is a valid direct envelope OR a pointer is
+    a root the runtime could read at that key, so it is never a delete candidate
+    — even at a chunk-shaped key. A small envelope padded with trailing
+    whitespace chunks so that chunk 0 is itself a complete, verifying envelope;
+    protecting it (and thereby leaving its generation unreclaimed) is safe, and a
+    real chunk fragment does not parse so is unaffected.
+
+17. **Derived keys are validated against the store's key limit before I/O.** A
+    chunk key adds ~85 characters (infix + 64-char SHA + index) to the root, so a
+    root that is itself valid can produce a physical key over Fastly's
+    256-character limit. `prepare_fastly_config_entries` rejects any over-limit
+    key up front, so a push never fails mid-write with some chunks committed.
 
 ## Two further invariants (PR #314 review)
 
@@ -586,9 +612,11 @@ in the `cli.rs` test module.
   case: `not found`/`404` text cannot distinguish a missing key from a missing
   store, an auth failure or a 500, and reporting those as reclamation is worse
   than a retry.
-- **Deletion stops at a generation's first failure**, so the generation stays
-  whole and provable and a re-run really does retry it. Retrying is free — `gc`
-  re-lists, so a key that is genuinely gone never becomes a candidate again.
+- **Deletion stops at a generation's first failure.** A failed remote delete has
+  an UNKNOWN outcome (Fastly may commit it before returning an error), so a
+  failure with no confirmed prior sibling delete leaves the generation UNCERTAIN:
+  a re-run may reclaim it if still whole, or surface it as an unprovable fragment
+  if the delete did commit. `gc` re-lists, so this is safe to attempt.
 - **A failure part-way through a generation strands its survivors, and `gc` says
   so.** They are an incomplete generation that can never be proved again, so `gc`
   will never reclaim them; the command names them and prints the manual delete

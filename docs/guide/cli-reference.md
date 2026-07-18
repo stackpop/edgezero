@@ -380,12 +380,16 @@ edgezero config gc --adapter fastly --older-than 7d --yes
 deleted) and non-zero if any delete failed, so automation detects a partial pass.
 
 Deletion works one generation at a time and **stops a generation at its first
-failure**, which normally leaves it whole and a re-run retries it. If a delete
-fails _part-way_ through a generation, the survivors become an incomplete
-generation that `gc` can no longer verify — it will never reclaim them, so
-**re-running will not help**. The command names those keys and prints the
-`fastly config-store-entry delete` commands to remove them by hand. They are
-inert in the meantime: no pointer references them.
+failure**. A failed remote delete has an _unknown_ outcome — Fastly may commit
+it before returning an error — so `gc` does not promise a clean retry. A failure
+with no confirmed prior sibling delete leaves the generation **uncertain**: a
+re-run may reclaim it if it is still whole, or report it as an unprovable
+fragment if the delete did commit. A failure _part-way_ through a generation (a
+sibling already confirmed deleted) strands the survivors: they are an incomplete
+generation `gc` can no longer verify, so **re-running will not reclaim them**. In
+both cases the command names the affected keys and prints the
+`fastly config-store-entry delete` commands (shell-escaped) to remove them by
+hand. They are inert in the meantime: no pointer references them.
 
 ### edgezero provision
 
