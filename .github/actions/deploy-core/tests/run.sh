@@ -625,6 +625,31 @@ test_toolchain_boundary() {
   edgezero_rust=$(awk '$1 == "rust" { print $2 }' "$REPO_ROOT/.tool-versions")
   assert_equals "the search stops at the app's Git root (deployer's 1.60.0 ignored)" \
     "$edgezero_rust" "$fallback"
+
+  # An extensionless `rust-toolchain` in TOML form must resolve its channel, not
+  # the literal `[toolchain]` header line. rustup accepts both forms. The fixture
+  # uses the `stable` channel keyword — distinct from the `[toolchain]` header
+  # (which a broken parser would return), so a pass proves the file was parsed as
+  # TOML. It names a channel, not a pinned version.
+  printf '[toolchain]\nchannel = "stable"\n' >"$ws/app/rust-toolchain"
+  local toml_form
+  toml_form=$(
+    bash -c "
+      source '$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh'
+      resolve_rust_toolchain auto '$ws/app' '$ws' '$REPO_ROOT'
+    "
+  )
+  assert_equals "a TOML-form extensionless rust-toolchain resolves its channel" "stable" "$toml_form"
+  # The same file must resolve identically through resolve-project.sh's copy.
+  local toml_form_deploy
+  toml_form_deploy=$(
+    bash -c "
+      source '$ACTIONS_DIR/deploy-core/scripts/resolve-project.sh'
+      parse_toolchain_from_channel_file '$ws/app/rust-toolchain'
+    "
+  )
+  assert_equals "resolve-project.sh parses the TOML-form channel too" "stable" "$toml_form_deploy"
+  rm -f "$ws/app/rust-toolchain"
 }
 
 # ---------------------------------------------------------------------------

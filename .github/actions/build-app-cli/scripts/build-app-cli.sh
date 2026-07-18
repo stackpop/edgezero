@@ -29,6 +29,14 @@ source "$SCRIPT_DIR/common.sh"
 # --- Rust toolchain resolution helpers ---------------------------------------
 parse_toolchain_from_channel_file() {
   local file="$1"
+  # An extensionless `rust-toolchain` is EITHER a legacy single-line channel
+  # (e.g. `1.95.0`) OR a TOML document (`[toolchain]` + `channel = "..."`).
+  # rustup accepts both, so detect the TOML form and parse its channel rather
+  # than taking the literal `[toolchain]` line as the channel.
+  if grep -qE '^[[:space:]]*\[toolchain\]' "$file"; then
+    parse_toolchain_from_toml "$file"
+    return
+  fi
   local value
   value=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$file" | awk 'NF { print; exit }')
   [[ -n "$value" ]] || fail "malformed Rust toolchain file: $file"
