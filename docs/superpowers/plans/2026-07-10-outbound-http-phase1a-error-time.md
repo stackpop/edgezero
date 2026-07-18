@@ -62,12 +62,22 @@ web-time = { workspace = true }
 
 The existing `#[cfg(test)] mod tests` already imports `StatusCode`, `CONTENT_TYPE`, `HeaderValue`, `str` and does `use super::*;`, and has a `parse_body(response) -> serde_json::Value` helper (error.rs:498). Add — **no new imports** (re-importing under `-D warnings` fails):
 
+This code is **pre-wrapped to rustfmt's canonical form at the final nesting depth** (inside `mod tests` → `fn` → `for`). Written as one-liners, the array-of-tuples rows and the message-bearing `assert!` exceed `max_width = 100` once indented into the test module and rustfmt rewraps them — which would surface as a diff at the Task 3 `cargo fmt --all -- --check` gate. (Step 9's `cargo fmt` would rewrap them for you, but the plan shows the landed form.)
+
 ```rust
 #[test]
 fn bad_gateway_and_gateway_timeout_surface() {
     for (err, code, msg) in [
-        (EdgeError::bad_gateway("upstream refused"), StatusCode::BAD_GATEWAY, "upstream refused"),
-        (EdgeError::gateway_timeout("deadline expired"), StatusCode::GATEWAY_TIMEOUT, "deadline expired"),
+        (
+            EdgeError::bad_gateway("upstream refused"),
+            StatusCode::BAD_GATEWAY,
+            "upstream refused",
+        ),
+        (
+            EdgeError::gateway_timeout("deadline expired"),
+            StatusCode::GATEWAY_TIMEOUT,
+            "deadline expired",
+        ),
     ] {
         assert_eq!(err.status(), code);
         assert_eq!(err.message(), msg);
@@ -78,8 +88,18 @@ fn bad_gateway_and_gateway_timeout_surface() {
 #[test]
 fn bad_gateway_and_gateway_timeout_json_shape() {
     for (err, code, kind, msg) in [
-        (EdgeError::bad_gateway("nope"), 502u16, "bad_gateway", "nope"),
-        (EdgeError::gateway_timeout("late"), 504u16, "gateway_timeout", "late"),
+        (
+            EdgeError::bad_gateway("nope"),
+            502u16,
+            "bad_gateway",
+            "nope",
+        ),
+        (
+            EdgeError::gateway_timeout("late"),
+            504u16,
+            "gateway_timeout",
+            "late",
+        ),
     ] {
         let response = err.into_response().expect("response");
         assert_eq!(response.status().as_u16(), code);
@@ -87,7 +107,10 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
         assert_eq!(body_json["error"]["status"], code);
         assert_eq!(body_json["error"]["kind"], serde_json::Value::from(kind));
         assert_eq!(body_json["error"]["message"], serde_json::Value::from(msg));
-        assert!(body_json["error"].get("field_path").is_none(), "502/504 carry no field_path");
+        assert!(
+            body_json["error"].get("field_path").is_none(),
+            "502/504 carry no field_path"
+        );
     }
 }
 ```
@@ -219,7 +242,9 @@ mod tests {
     fn deadline_before_now_is_expired() {
         let base = Instant::now();
         let past = Deadline::at_instant(base);
-        let now = base.checked_add(Duration::from_secs(1)).expect("no overflow");
+        let now = base
+            .checked_add(Duration::from_secs(1))
+            .expect("no overflow");
         assert!(past.is_expired_at(now));
         assert_eq!(past.remaining_at(now), None);
     }
@@ -231,14 +256,24 @@ mod tests {
         // impl would wrongly report NOT expired.
         let base = Instant::now();
         let at_now = Deadline::at_instant(base);
-        assert_eq!(at_now.remaining_at(base), None, "zero remaining is expired, not Some(0)");
-        assert!(at_now.is_expired_at(base), "a deadline exactly at now is expired");
+        assert_eq!(
+            at_now.remaining_at(base),
+            None,
+            "zero remaining is expired, not Some(0)"
+        );
+        assert!(
+            at_now.is_expired_at(base),
+            "a deadline exactly at now is expired"
+        );
     }
 
     #[test]
     fn deadline_in_future_has_exact_remaining() {
         let base = Instant::now();
-        let future = Deadline::at_instant(base.checked_add(Duration::from_mins(1)).expect("no overflow"));
+        let future = Deadline::at_instant(
+            base.checked_add(Duration::from_mins(1))
+                .expect("no overflow"),
+        );
         assert!(!future.is_expired_at(base));
         // EXACT equality — both instants are explicit, so there is no elapsed-time slop.
         assert_eq!(future.remaining_at(base), Some(Duration::from_mins(1)));
@@ -253,19 +288,28 @@ mod tests {
         let after = Instant::now();
         // `after()` computed `t0 + FAR_FUTURE` for some t0 in [before, after],
         // so the instant must land within [before+FAR_FUTURE, after+FAR_FUTURE].
-        let lower = before.checked_add(DEADLINE_FAR_FUTURE).expect("no overflow");
+        let lower = before
+            .checked_add(DEADLINE_FAR_FUTURE)
+            .expect("no overflow");
         let upper = after.checked_add(DEADLINE_FAR_FUTURE).expect("no overflow");
         assert!(deadline.instant() >= lower, "clamped below the 7-day bound");
-        assert!(deadline.instant() <= upper, "Duration::MAX was NOT clamped to 7 days");
+        assert!(
+            deadline.instant() <= upper,
+            "Duration::MAX was NOT clamped to 7 days"
+        );
     }
 
     #[test]
     fn instant_round_trips() {
-        let base = Instant::now().checked_add(Duration::from_secs(10)).expect("no overflow");
+        let base = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .expect("no overflow");
         assert_eq!(Deadline::at_instant(base).instant(), base);
     }
 }
 ```
+
+> The test snippet above is **pre-wrapped to rustfmt's canonical form** (the `.checked_add(..).expect(..)` chains and the message-bearing `assert!`/`assert_eq!` exceed `max_width = 100` at this nesting). Copy it verbatim and the Task 3 `cargo fmt --all -- --check` gate stays a no-op.
 
 - [ ] **Step 2: Wire the module in and run to verify failure**
 
