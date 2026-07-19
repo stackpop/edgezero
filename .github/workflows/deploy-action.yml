@@ -11,6 +11,7 @@ on:
       - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
       - .github/workflows/fastly-installer-check.yml
+      - scripts/install-actionlint.sh
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
       - crates/edgezero-cli/**
@@ -27,6 +28,7 @@ on:
       - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
       - .github/workflows/fastly-installer-check.yml
+      - scripts/install-actionlint.sh
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
       - crates/edgezero-cli/**
@@ -49,17 +51,7 @@ jobs:
           persist-credentials: false
 
       - name: Install actionlint (pinned release binary, checksum-verified)
-        run: |
-          set -euo pipefail
-          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
-          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl --fail --location --silent --show-error "$base/$archive" --output "/tmp/$archive"
-          # Verify against the checksums file published with the same release.
-          curl --fail --location --silent --show-error \
-            "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt" --output /tmp/actionlint_checksums.txt
-          ( cd /tmp && grep -- " ${archive}\$" actionlint_checksums.txt | sha256sum --check --strict - )
-          tar -xzf "/tmp/$archive" -C /tmp actionlint
-          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+        run: scripts/install-actionlint.sh "${ACTIONLINT_VERSION}"
 
       - name: Actionlint (this workflow)
         run: |
@@ -96,7 +88,8 @@ jobs:
         run: |
           shellcheck -e SC1091 \
             .github/actions/*/scripts/*.sh \
-            .github/actions/deploy-core/tests/*.sh
+            .github/actions/deploy-core/tests/*.sh \
+            scripts/install-actionlint.sh
 
       - name: Bash contract tests
         run: .github/actions/deploy-core/tests/run.sh

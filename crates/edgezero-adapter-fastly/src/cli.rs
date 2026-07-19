@@ -1431,12 +1431,14 @@ fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
             shape_summary(&parsed)
         ));
     };
+    // Scan the WHOLE list — never short-circuit on the first match — so every
+    // entry is validated and a second entry with the same name (an ambiguous
+    // listing) is caught. EVERY entry must be well-formed before a Found/NotFound
+    // verdict can be trusted: a malformed entry could be the very store we're
+    // looking for, hidden behind a missing `name`/`id`, and reporting NotFound
+    // then would fail OPEN (e.g. staging would mirror no production overrides).
+    let mut found: Option<String> = None;
     for entry in array {
-        // EVERY entry must be well-formed before a Found/NotFound verdict can be
-        // trusted: a single malformed entry could be the very store we're looking
-        // for, hidden behind a missing `name`/`id`. Reporting NotFound then would
-        // fail OPEN (e.g. staging would mirror no production overrides). Refuse to
-        // decide instead.
         let (Some(entry_name), Some(entry_id)) = (
             entry.get("name").and_then(serde_json::Value::as_str),
             entry.get("id").and_then(serde_json::Value::as_str),
@@ -1446,11 +1448,15 @@ fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
             ));
         };
         if entry_name == name {
-            return ConfigStoreLookup::Found(entry_id.to_owned());
+            if found.is_some() {
+                return ConfigStoreLookup::SchemaDrift(format!(
+                    "the config-store listing has more than one store named `{name}`, so a lookup is ambiguous -- refusing to pick one"
+                ));
+            }
+            found = Some(entry_id.to_owned());
         }
     }
-    // All entries were well-formed and none matched.
-    ConfigStoreLookup::NotFound
+    found.map_or(ConfigStoreLookup::NotFound, ConfigStoreLookup::Found)
 }
 
 /// One-line type label for a `serde_json::Value` (for diagnostic
@@ -1939,10 +1945,25 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
     })?;
     let mut active_version: Option<u64> = None;
     for entry in array {
-        // Fastly always includes a boolean `active`; a missing field is a
-        // non-active entry, but a PRESENT non-boolean is schema drift.
-        let active = match entry.get("active") {
-            None => continue,
+        // EVERY entry must be a well-formed version object with an unsigned
+        // integer `number` — Fastly includes it on every version. A `null`, a
+        // non-object, or a missing/non-integer `number` means the response
+        // cannot be trusted; treating such an entry as merely "not active" would
+        // let a garbled payload read as "no active version" (fail open).
+        let Some(object) = entry.as_object() else {
+            return Err(format!(
+                "a Fastly version list element is not an object; the API may have changed its schema. Element: {entry}"
+            ));
+        };
+        let number = object.get("number").and_then(serde_json::Value::as_u64).ok_or_else(|| {
+            format!(
+                "a Fastly version entry has no unsigned-integer `number`; the API may have changed its schema. Entry: {entry}"
+            )
+        })?;
+        // `active` is optional (an omitted field means not active), but a PRESENT
+        // non-boolean is schema drift.
+        let active = match object.get("active") {
+            None => false,
             Some(active_field) => active_field.as_bool().ok_or_else(|| {
                 format!(
                     "a Fastly version entry has a non-boolean `active` field; the API may have changed its schema. Entry: {entry}"
@@ -1950,14 +1971,6 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
             })?,
         };
         if active {
-            // The active entry MUST carry an unsigned integer `number`. A
-            // missing or non-integer `number` here is a malformed active entry,
-            // not "no active version".
-            let number = entry.get("number").and_then(serde_json::Value::as_u64).ok_or_else(|| {
-                format!(
-                    "the active Fastly version entry has no unsigned-integer `number`; the API may have changed its schema. Entry: {entry}"
-                )
-            })?;
             if active_version.is_some() {
                 return Err(format!(
                     "the Fastly version list reports more than one active version ({} and {number}); the response is ambiguous, refusing to pick one",
@@ -2240,18 +2253,35 @@ fn validate_domain(domain: &str) -> Result<(), String> {
 }
 
 /// `GET https://api.fastly.com<path>` with the `Fastly-Key` header;
-/// returns the response body. Both the header (carrying the secret
-/// token) and the URL are written through `curl_quote` so neither can
+/// returns the response body ONLY on a 2xx status. Both the header (carrying the
+/// secret token) and the URL are written through `curl_quote` so neither can
 /// inject curl options into the `--config` document.
 ///
-/// The `fail` directive (curl `--fail`) makes an HTTP 4xx/5xx a non-zero curl
-/// exit — so an error body (even an array-shaped one) can never be mistaken for
-/// valid version data. `curl_config_capture` surfaces the failure as `Err`.
+/// The HTTP status is captured explicitly via `write-out` (as the PUT helper
+/// does) and required to be 2xx before the body is trusted. `--fail` alone would
+/// reject 4xx/5xx but still accept a 3xx — whose (array-shaped) body could
+/// otherwise be parsed as version data. No `location` directive is set, so a
+/// redirect is never followed.
 fn fastly_api_get(path: &str, token: &str) -> Result<String, String> {
     let header = curl_quote(&format!("Fastly-Key: {token}"));
     let url = curl_quote(&format!("https://api.fastly.com{path}"));
-    let config = format!("header = {header}\nurl = {url}\nfail\n");
-    curl_config_capture(&config).map_err(|err| format!("Fastly API GET {path} failed: {err}"))
+    // `write-out` appends the status on its own trailing line AFTER the body.
+    let config = format!("header = {header}\nurl = {url}\nwrite-out = \"\\n%{{http_code}}\"\n");
+    let out = curl_config_capture(&config)
+        .map_err(|err| format!("Fastly API GET {path} failed: {err}"))?;
+    let (body, status_line) = out
+        .rsplit_once('\n')
+        .ok_or_else(|| format!("Fastly API GET {path}: no HTTP status in the curl output"))?;
+    let status: u16 = status_line.trim().parse().map_err(|err| {
+        format!(
+            "Fastly API GET {path}: could not parse the HTTP status {:?}: {err}",
+            status_line.trim()
+        )
+    })?;
+    if !(200..300).contains(&status) {
+        return Err(format!("Fastly API GET {path} returned HTTP {status}"));
+    }
+    Ok(body.to_owned())
 }
 
 /// `PUT https://api.fastly.com<path>` with the `Fastly-Key` header;
@@ -3213,6 +3243,15 @@ mod tests {
         // More than one active version is ambiguous — refuse rather than pick one.
         resolve_active_version(r#"[{"active":true,"number":9},{"active":true,"number":10}]"#)
             .expect_err("two active versions must error as ambiguous");
+        // EVERY element must be a version object with a numeric `number` — a
+        // garbled entry must fail closed, not be skipped as "not active".
+        resolve_active_version("[null]").expect_err("a null element must error");
+        resolve_active_version("[{}]").expect_err("an entry with no `number` must error");
+        resolve_active_version(r#"[{"number":"invalid"}]"#)
+            .expect_err("a non-numeric `number` must error");
+        // An omitted `active` field means "not active" (not an error), as long
+        // as the entry is otherwise a well-formed version object.
+        assert_eq!(resolve_active_version(r#"[{"number":42}]"#), Ok(None));
         // Sanity: a well-formed list still resolves.
         assert_eq!(
             resolve_active_version(r#"[{"active":false,"number":1},{"active":true,"number":2}]"#),
@@ -4166,6 +4205,34 @@ build = \"cargo build --release\"
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
             "a malformed entry alongside a well-formed one must be schema drift, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_scans_past_a_match() {
+        // The full list is scanned: a malformed entry AFTER the match must still
+        // be caught (no short-circuit on the first Found).
+        let stdout = r#"[
+            {"id": "abc123", "name": "edgezero_runtime_env"},
+            {"name": "broken"}
+        ]"#;
+        let drift = find_config_store_id(stdout, "edgezero_runtime_env");
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "a malformed entry after the match must be schema drift, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_flags_duplicate_names_as_ambiguous() {
+        let stdout = r#"[
+            {"id": "abc123", "name": "edgezero_runtime_env"},
+            {"id": "def456", "name": "edgezero_runtime_env"}
+        ]"#;
+        let drift = find_config_store_id(stdout, "edgezero_runtime_env");
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "two stores with the same name must be ambiguous drift, got {drift:?}"
         );
     }
 

@@ -1009,8 +1009,9 @@ The design is implemented when:
 4. Adding a second adapter is a new minimal wrapper plus target/allowlist data,
    with no engine fork.
 5. Deploy steps consume the prebuilt CLI artifact and never recompile it.
-6. Typed provider credentials reach only the deploy step and never appear in
-   outputs, caches, action-owned logs, or summaries.
+6. Typed provider credentials reach only the provider steps (the deploy and the
+   rollback-target capture) and never appear in outputs, caches, action-owned
+   logs, or summaries.
 7. Passthrough argument boundaries are preserved; no `eval`.
 8. `cache: true` uses exact keys and caches only the **Cargo workspace root**
    `target/` (§11.1), so nested-workspace monorepos cache the right artifacts.

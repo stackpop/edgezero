@@ -14,6 +14,7 @@ Implement the layered deploy actions in the EdgeZero monorepo:
 .github/actions/deploy-fastly
 .github/actions/healthcheck-fastly
 .github/actions/rollback-fastly
+.github/actions/config-push-fastly
 ```
 
 `build-app-cli` compiles the app-provided CLI package once and publishes it as an
@@ -226,10 +227,12 @@ reference to port from. Most transfer with light changes:
    - Fastly staging deploy: extend the Fastly adapter `deploy` path with
      `--stage` → `fastly compute update --autoclone --version=active` +
      `fastly service-version stage`; emit the service version in a parseable form.
-   - Add `healthcheck` and `rollback` CLI subcommands with a Fastly adapter
-     implementation (staging-IP resolution via the Fastly API + `curl`; activate
-     previous / deactivate staged), and wire `Healthcheck` / `Rollback` arms into
-     the downstream CLI template so app CLIs expose them.
+   - Add `active-version`, `healthcheck`, and `rollback` CLI subcommands with a
+     Fastly adapter implementation (`active-version` resolves the currently-active
+     version via the Fastly API for rollback-target capture; staging-IP resolution
+     via the Fastly API + `curl`; activate previous / deactivate staged), and wire
+     `ActiveVersion` / `Healthcheck` / `Rollback` arms into the downstream CLI
+     template so app CLIs expose them.
 
 10. **Docs**
 

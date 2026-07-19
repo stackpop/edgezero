@@ -47,7 +47,9 @@ main() {
   # `active-version` BEFORE invoking it with the token. A missing subcommand here
   # means the CLI was built without the lifecycle commands wired — fail with a
   # clear, actionable message instead of a bare clap "unrecognized subcommand".
-  if ! "$cli_bin" active-version --help >/dev/null 2>&1; then
+  # The token is UNSET for this probe so it truly never reaches a `--help` call;
+  # only the real API invocation below sees it.
+  if ! env -u FASTLY_API_TOKEN "$cli_bin" active-version --help >/dev/null 2>&1; then
     fail "the app CLI does not expose the \`active-version\` command, which a production deploy needs to capture the rollback target. Wire \`edgezero_cli::run_active_version\` (and \`run_healthcheck\` / \`run_rollback\`) into your CLI -- see the 'Deploying from GitHub Actions' guide's required command surface."
   fi
 

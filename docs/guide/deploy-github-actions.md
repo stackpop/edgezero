@@ -149,19 +149,19 @@ Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`
 
 ### `deploy-fastly`
 
-| Input               | Required | Default         | Meaning                                                         |
-| ------------------- | -------- | --------------- | --------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                            |
-| `fastly-api-token`  | Yes      | —               | Injected only into the deploy step.                             |
-| `fastly-service-id` | Yes      | —               | Passed as the typed `--service-id` flag.                        |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                |
-| `working-directory` | No       | `.`             | App directory.                                                  |
-| `manifest`          | No       | empty           | Optional `edgezero.toml` path relative to `working-directory`.  |
-| `build-mode`        | No       | `auto`          | `auto` (→ `never` for Fastly), `always`, or `never`.            |
-| `build-args`        | No       | `[]`            | JSON array passed to `<cli> build`. No secrets.                 |
-| `deploy-args`       | No       | `[]`            | JSON array — allowlisted to `--comment` for Fastly. No secrets. |
-| `stage`             | No       | `false`         | Deploy to a staged draft version instead of activating.         |
-| `cache`             | No       | `false`         | Exact-key Cargo-workspace `target/` caching.                    |
+| Input               | Required | Default         | Meaning                                                                                      |
+| ------------------- | -------- | --------------- | -------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                         |
+| `fastly-api-token`  | Yes      | —               | Injected only into the provider steps (rollback-target capture + deploy); blanked elsewhere. |
+| `fastly-service-id` | Yes      | —               | Passed as the typed `--service-id` flag.                                                     |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                             |
+| `working-directory` | No       | `.`             | App directory.                                                                               |
+| `manifest`          | No       | empty           | Optional `edgezero.toml` path relative to `working-directory`.                               |
+| `build-mode`        | No       | `auto`          | `auto` (→ `never` for Fastly), `always`, or `never`.                                         |
+| `build-args`        | No       | `[]`            | JSON array passed to `<cli> build`. No secrets.                                              |
+| `deploy-args`       | No       | `[]`            | JSON array — allowlisted to `--comment` for Fastly. No secrets.                              |
+| `stage`             | No       | `false`         | Deploy to a staged draft version instead of activating.                                      |
+| `cache`             | No       | `false`         | Exact-key Cargo-workspace `target/` caching.                                                 |
 
 Outputs: `fastly-version`, `source-revision`, `app-cli-version`, and (production
 only) `previous-version` — the version that was active _before_ this deploy.

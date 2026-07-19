@@ -104,16 +104,20 @@ if [[ "$*" == *"--config"* ]]; then
     exit 0
   fi
   printf 'GET %s\n' "$url" >>"$FAKE_CALL_LOG"
+  # fastly_api_get appends `write-out = "\n%{http_code}"`, so the real curl emits
+  # `<body>\n<status>` and the caller requires a 2xx. Mirror that: body, then a
+  # trailing `\n200`, with NO trailing newline after the code.
+  #
   # The service-version list, for production rollback target resolution. TWO
   # staged versions sit above the active one on purpose: v42 and v41 are both
   # staged, v40 is the previously-live version, so a caller passing rollback-to=40
   # rolls back to a real production version rather than a staged one.
   if [[ "$url" == */version ]]; then
-    printf '[{"number":42,"staged":true,"locked":true},{"number":41,"staged":true,"locked":true},{"number":40,"active":true,"locked":true}]\n'
+    printf '[{"number":42,"staged":true,"locked":true},{"number":41,"staged":true,"locked":true},{"number":40,"active":true,"locked":true}]\n200'
     exit 0
   fi
   # Domain lookup: Fastly returns a SINGULAR `staging_ip` string per domain.
-  printf '[{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n'
+  printf '[{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n200'
   exit 0
 fi
 printf 'PROBE %s\n' "$*" >>"$FAKE_CALL_LOG"
@@ -145,6 +149,20 @@ main() {
 
   local pinned
   pinned=$(json_get "$action_dir/versions.json" fastly.version)
+
+  # Regression guard against the installer trust-by-version-text bypass: plant a
+  # DIFFERENT binary at the extract target that REPORTS the pinned version but
+  # errors on every real command. install-fastly.sh must overwrite it from the
+  # verified archive; if it ever went back to adopting a pre-seeded binary by its
+  # version text, THIS one would survive and the staged deploy's first real
+  # `fastly` call would exit non-zero — failing the smoke.
+  local provider_bin="$runner_temp/edgezero-action-tools/provider-bin"
+  mkdir -p "$provider_bin"
+  # `$1`/`$2` here are the PLANTED script's args, not this script's — intentionally
+  # literal (single-quoted printf format).
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\ncase "$1" in\n  version|--version) echo "Fastly CLI version v%s (planted, should have been overwritten)";;\n  *) echo "install-fastly adopted a planted binary instead of extracting the verified archive" >&2; exit 97;;\nesac\n' "$pinned" >"$provider_bin/fastly"
+  chmod +x "$provider_bin/fastly"
 
   # Package a fake `fastly` as the archive install-fastly.sh expects, pre-placed
   # at its cache path so no network fetch happens.

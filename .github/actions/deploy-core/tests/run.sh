@@ -1124,6 +1124,58 @@ test_action_output_contracts() {
 }
 
 # ---------------------------------------------------------------------------
+# capture-previous.sh — the production rollback-target capture. A first deploy
+# (no active version) must yield an EMPTY previous-version and still succeed; an
+# active version threads out; and an operational failure must fail CLOSED.
+# ---------------------------------------------------------------------------
+test_capture_previous() {
+  section "capture-previous (rollback target)"
+  local dir="$WORK_DIR/capture"
+  rm -rf "$dir"
+  mkdir -p "$dir/bin"
+  cat >"$dir/bin/fake-cli" <<'CLI'
+#!/usr/bin/env bash
+# `active-version --help` is the credential-free preflight (must succeed).
+if [ "$1" = active-version ] && [ "$2" = --help ]; then exit 0; fi
+if [ "$1" = active-version ]; then
+  printf '%s\n' "${FAKE_VERSION_LINE-version=}"
+  exit "${FAKE_EXIT:-0}"
+fi
+exit 3
+CLI
+  chmod +x "$dir/bin/fake-cli"
+
+  run_capture() {
+    : >"$dir/out.txt"
+    PATH="$dir/bin:$PATH" \
+      EDGEZERO__APP__CLI__BIN=fake-cli \
+      EDGEZERO__FASTLY__SERVICE_ID=svc \
+      FASTLY_API_TOKEN=tok \
+      GITHUB_OUTPUT="$dir/out.txt" \
+      FAKE_VERSION_LINE="${FVL-version=}" FAKE_EXIT="${FE:-0}" \
+      "$ACTIONS_DIR/deploy-fastly/scripts/capture-previous.sh"
+  }
+  capture_prev() { sed -nE 's/^previous-version=(.*)$/\1/p' "$dir/out.txt"; }
+
+  # First deploy: no active version (empty `version=`) → empty target, success.
+  FVL='version=' FE=0 assert_succeeds "first deploy: capture succeeds with no active version" run_capture
+  assert_equals "first deploy: previous-version is empty" "" "$(capture_prev)"
+
+  # Normal deploy: an active version threads out as previous-version.
+  FVL='version=40' FE=0 assert_succeeds "capture succeeds with an active version" run_capture
+  assert_equals "previous-version threads the active version" "40" "$(capture_prev)"
+
+  # Operational failure: a non-zero active-version exit must fail CLOSED, so a
+  # production deploy never proceeds with no captured rollback target.
+  FVL='' FE=2 assert_fails "capture fails closed when active-version errors" run_capture
+
+  # A CLI without `active-version` fails the credential-free preflight early.
+  printf '#!/usr/bin/env bash\nexit 2\n' >"$dir/bin/fake-cli"
+  chmod +x "$dir/bin/fake-cli"
+  assert_fails "capture fails when the CLI lacks active-version" run_capture
+}
+
+# ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
@@ -1140,6 +1192,7 @@ main() {
   test_deploy_args_prepend
   test_provider_env_nul
   test_lifecycle_helpers
+  test_capture_previous
   test_toolchain_boundary
   test_config_push_argv
   test_exit_propagation

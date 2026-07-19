@@ -142,6 +142,19 @@ steps:
 - Provide a CLI package in your own workspace and name it via `app-cli-package`;
   `build-app-cli` compiles that package from your checkout, so the CLI and your app
   never disagree on schema. `build-app-cli` does not use the EdgeZero monorepo CLI.
+- **Expose the command surface the actions drive.** An existing or hand-written
+  CLI does NOT automatically gain the lifecycle commands. Before adopting, confirm
+  your CLI dispatches all of these (the scaffolded template already does):
+  - upgrade `edgezero-cli` to a version that provides `run_active_version`,
+    `run_healthcheck`, and `run_rollback` (alongside `run_build` / `run_deploy` /
+    the typed `config` handlers);
+  - add `Build`, `Deploy`, `ActiveVersion`, `Healthcheck`, `Rollback`, and
+    `Config` variants to your `Cmd` enum and dispatch each to its `edgezero_cli::run_*`
+    handler.
+    A production deploy runs `active-version` to capture the rollback target and
+    fails fast (before any provider mutation) if it is missing; a staged deploy
+    that lacks `healthcheck`/`rollback` can otherwise fail only AFTER creating
+    provider state.
 - Provide typed provider credentials through wrapper inputs, not caller `env:`.
 - Ensure the deployed ref has committed source (no dirty working tree) and a
   `Cargo.lock` at your app's **Cargo workspace root** (the workspace that owns
