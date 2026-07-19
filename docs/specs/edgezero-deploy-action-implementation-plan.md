@@ -120,8 +120,8 @@ reference to port from. Most transfer with light changes:
      Bash arrays. Note the build-in-deploy caveat: Fastly's default `never`
      compiles the app during deploy with the token in scope, so require trusted
      immutable refs (spec §10.1).
-   - Surface results to the wrapper: `adapter`, `source-revision`, `app-cli-version`,
-     `effective-build-mode`.
+   - Surface results to the wrapper: `source-revision`, `app-cli-version` (the
+     Fastly wrapper adds `fastly-version` and, for production, `previous-version`).
    - Contains no provider-specific credential names, service concepts, endpoints,
      or CLI flags; invokes `<app-cli-bin>`, never a hard-coded `edgezero`.
 

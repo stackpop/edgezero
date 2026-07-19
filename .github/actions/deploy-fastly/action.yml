@@ -10,7 +10,7 @@ inputs:
     required: false
     default: ""
   fastly-api-token:
-    description: Fastly API token. Injected only into the deploy step.
+    description: Fastly API token. Injected only into the provider steps — the rollback-target capture (as FASTLY_API_TOKEN, the adapter convention) and the deploy (as provider-env data); every other step blanks it.
     required: true
   fastly-service-id:
     description: Fastly service ID. Passed as the typed --service-id CLI flag.

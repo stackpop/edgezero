@@ -1431,32 +1431,26 @@ fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
             shape_summary(&parsed)
         ));
     };
-    let mut any_well_formed = false;
     for entry in array {
-        let entry_name = entry.get("name").and_then(serde_json::Value::as_str);
-        let entry_id = entry.get("id").and_then(serde_json::Value::as_str);
-        if entry_name.is_some() && entry_id.is_some() {
-            any_well_formed = true;
-        }
-        if entry_name == Some(name) {
-            return entry_id.map_or_else(
-                || {
-                    ConfigStoreLookup::SchemaDrift(format!(
-                        "entry matched name `{name}` but is missing a string `id` field"
-                    ))
-                },
-                |id| ConfigStoreLookup::Found(id.to_owned()),
-            );
+        // EVERY entry must be well-formed before a Found/NotFound verdict can be
+        // trusted: a single malformed entry could be the very store we're looking
+        // for, hidden behind a missing `name`/`id`. Reporting NotFound then would
+        // fail OPEN (e.g. staging would mirror no production overrides). Refuse to
+        // decide instead.
+        let (Some(entry_name), Some(entry_id)) = (
+            entry.get("name").and_then(serde_json::Value::as_str),
+            entry.get("id").and_then(serde_json::Value::as_str),
+        ) else {
+            return ConfigStoreLookup::SchemaDrift(format!(
+                "a config-store entry is missing a string `name` or `id` field, so the listing cannot be trusted -- fastly CLI may have changed its output schema. Entry: {entry}"
+            ));
+        };
+        if entry_name == name {
+            return ConfigStoreLookup::Found(entry_id.to_owned());
         }
     }
-    if array.is_empty() || any_well_formed {
-        ConfigStoreLookup::NotFound
-    } else {
-        ConfigStoreLookup::SchemaDrift(
-            "no entry has both string `name` and `id` fields -- fastly CLI may have changed its output schema"
-                .to_owned(),
-        )
-    }
+    // All entries were well-formed and none matched.
+    ConfigStoreLookup::NotFound
 }
 
 /// One-line type label for a `serde_json::Value` (for diagnostic
@@ -1923,14 +1917,19 @@ fn parse_canonical_version_line(lower: &str) -> Option<u64> {
 /// version.
 /// Resolve the active version from a Fastly version-list JSON.
 ///
-/// `Ok(Some(n))` — a version is active. `Ok(None)` — the list parsed but NO
-/// version is active (a first-ever deploy; the caller records an empty rollback
-/// target and proceeds). `Err(_)` — the payload could not be parsed as a version
-/// list, OR an entry is MALFORMED (a non-boolean `active`, or an `active: true`
-/// entry whose `number` is missing or not an unsigned integer). Both are
-/// OPERATIONAL failures the caller must NOT silently treat as "no active
-/// version" — otherwise a garbled response would fail open and let a production
-/// deploy proceed with no rollback target.
+/// `Ok(Some(n))` — exactly one version is active. `Ok(None)` — the list parsed
+/// but NO version is active (a first-ever deploy; the caller records an empty
+/// rollback target and proceeds). `Err(_)` — the payload could not be parsed as
+/// a version list, OR it is MALFORMED (a non-boolean `active` on ANY entry, an
+/// `active: true` entry whose `number` is missing or not an unsigned integer, or
+/// MORE THAN ONE active version). All are OPERATIONAL failures the caller must
+/// NOT silently treat as "no active version" — otherwise a garbled or ambiguous
+/// response would fail open and let a production deploy proceed with no rollback
+/// target.
+///
+/// The ENTIRE list is scanned (not short-circuited at the first active entry) so
+/// that a malformed `active` field or a second active version anywhere in the
+/// response is caught rather than ignored.
 fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|err| format!("failed to parse the Fastly version list as JSON: {err}"))?;
@@ -1938,6 +1937,7 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
         "the Fastly version list was not a JSON array; the API may have changed its schema"
             .to_owned()
     })?;
+    let mut active_version: Option<u64> = None;
     for entry in array {
         // Fastly always includes a boolean `active`; a missing field is a
         // non-active entry, but a PRESENT non-boolean is schema drift.
@@ -1958,10 +1958,16 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
                     "the active Fastly version entry has no unsigned-integer `number`; the API may have changed its schema. Entry: {entry}"
                 )
             })?;
-            return Ok(Some(number));
+            if active_version.is_some() {
+                return Err(format!(
+                    "the Fastly version list reports more than one active version ({} and {number}); the response is ambiguous, refusing to pick one",
+                    active_version.unwrap_or_default()
+                ));
+            }
+            active_version = Some(number);
         }
     }
-    Ok(None)
+    Ok(active_version)
 }
 
 /// First staging IP found in a Fastly
@@ -2237,11 +2243,15 @@ fn validate_domain(domain: &str) -> Result<(), String> {
 /// returns the response body. Both the header (carrying the secret
 /// token) and the URL are written through `curl_quote` so neither can
 /// inject curl options into the `--config` document.
+///
+/// The `fail` directive (curl `--fail`) makes an HTTP 4xx/5xx a non-zero curl
+/// exit — so an error body (even an array-shaped one) can never be mistaken for
+/// valid version data. `curl_config_capture` surfaces the failure as `Err`.
 fn fastly_api_get(path: &str, token: &str) -> Result<String, String> {
     let header = curl_quote(&format!("Fastly-Key: {token}"));
     let url = curl_quote(&format!("https://api.fastly.com{path}"));
-    let config = format!("header = {header}\nurl = {url}\n");
-    curl_config_capture(&config)
+    let config = format!("header = {header}\nurl = {url}\nfail\n");
+    curl_config_capture(&config).map_err(|err| format!("Fastly API GET {path} failed: {err}"))
 }
 
 /// `PUT https://api.fastly.com<path>` with the `Fastly-Key` header;
@@ -2551,22 +2561,42 @@ fn emit_active_version(args: &[String]) -> Result<(), String> {
     validate_service_id(&service_id)?;
     let token = require_token()?;
     let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
-    if let Some(version) = resolve_active_version(&json)? {
+    if let Some(version) =
+        active_version_or_require(&json, arg_flag(args, "--require-active"), &service_id)?
+    {
         log::info!("version={version}");
-    } else if arg_flag(args, "--require-active") {
-        return Err(format!(
-            "the deploy reported success but the Fastly API returns no active version for service {service_id}; refusing to report a deploy with no resolvable version"
-        ));
     } else {
-        // Confirmed no active version (first-ever deploy). Emit an explicit
-        // empty line so the caller records an empty rollback target and succeeds
-        // — distinct from a failure, which returns `Err` above.
+        // Confirmed no active version (first-ever deploy), and it was not
+        // required. Emit an explicit empty line so the caller records an empty
+        // rollback target and succeeds — distinct from a failure (`Err`).
         log::info!("version=");
         log::info!(
             "service {service_id} has no active version yet; emitting an empty rollback target"
         );
     }
     Ok(())
+}
+
+/// Resolve the active version and apply the `--require-active` policy.
+///
+/// `Ok(Some(n))` — a version is active. `Ok(None)` — no active version and
+/// `require_active` is false (a first-ever `active-version` call; the caller
+/// records an empty rollback target). `Err` — the response was malformed
+/// ([`resolve_active_version`]), OR no version is active while `require_active`
+/// is true. The latter is the production-`deploy` fallback: a version was JUST
+/// activated, so "no active version" is an error, not a valid empty result.
+fn active_version_or_require(
+    json: &str,
+    require_active: bool,
+    service_id: &str,
+) -> Result<Option<u64>, String> {
+    match resolve_active_version(json)? {
+        Some(version) => Ok(Some(version)),
+        None if require_active => Err(format!(
+            "the deploy reported success but the Fastly API returns no active version for service {service_id}; refusing to report a deploy with no resolvable version"
+        )),
+        None => Ok(None),
+    }
 }
 
 /// `healthcheck --adapter fastly ...`: probe the domain
@@ -3173,15 +3203,41 @@ mod tests {
             .expect_err("active entry with a string `number` must error");
         resolve_active_version(r#"[{"active":"true","number":7}]"#)
             .expect_err("a non-boolean `active` must error");
-        // A non-active entry with a bad `number` is irrelevant (we never read it)
-        // — but a non-boolean `active` anywhere is still schema drift.
+        // A non-boolean `active` ANYWHERE is schema drift — the whole list is
+        // scanned, so it is caught even AFTER a valid active entry (a naive
+        // first-match parser would miss this one).
         resolve_active_version(r#"[{"active":"false"},{"active":true,"number":9}]"#)
-            .expect_err("a non-boolean `active` on any entry is schema drift");
+            .expect_err("a non-boolean `active` before the active entry is schema drift");
+        resolve_active_version(r#"[{"active":true,"number":9},{"active":"nope"}]"#)
+            .expect_err("a non-boolean `active` AFTER the active entry is still schema drift");
+        // More than one active version is ambiguous — refuse rather than pick one.
+        resolve_active_version(r#"[{"active":true,"number":9},{"active":true,"number":10}]"#)
+            .expect_err("two active versions must error as ambiguous");
         // Sanity: a well-formed list still resolves.
         assert_eq!(
             resolve_active_version(r#"[{"active":false,"number":1},{"active":true,"number":2}]"#),
             Ok(Some(2))
         );
+    }
+
+    #[test]
+    fn active_version_or_require_enforces_require_active() {
+        let active = r#"[{"active":true,"number":5}]"#;
+        let none = r#"[{"active":false,"number":5}]"#;
+
+        // A resolvable active version is returned regardless of the flag.
+        assert_eq!(active_version_or_require(active, false, "svc"), Ok(Some(5)));
+        assert_eq!(active_version_or_require(active, true, "svc"), Ok(Some(5)));
+
+        // No active version: tolerated for `active-version` (first deploy), but an
+        // ERROR for the production-deploy fallback (`--require-active`), which
+        // must never report a deploy with no resolvable version.
+        assert_eq!(active_version_or_require(none, false, "svc"), Ok(None));
+        active_version_or_require(none, true, "svc")
+            .expect_err("require-active with no active version must fail closed");
+
+        // A malformed response is an error either way.
+        active_version_or_require("not json", false, "svc").expect_err("malformed must error");
     }
 
     #[test]
@@ -4093,6 +4149,23 @@ build = \"cargo build --release\"
         assert!(
             matches!(drift, ConfigStoreLookup::NotFound),
             "empty array must be NotFound, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_flags_schema_drift_when_any_entry_is_malformed() {
+        // A well-formed, non-matching entry must NOT mask a malformed one: the
+        // malformed entry could be the store we're looking for (hidden behind a
+        // missing name/id). Deciding NotFound here would fail OPEN — staging
+        // would then mirror no production overrides. Any malformed entry is drift.
+        let stdout = r#"[
+            {"id": "abc123", "name": "some_other_store"},
+            {"id": "def456"}
+        ]"#;
+        let drift = find_config_store_id(stdout, "edgezero_runtime_env");
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "a malformed entry alongside a well-formed one must be schema drift, got {drift:?}"
         );
     }
 

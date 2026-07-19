@@ -10,6 +10,7 @@ on:
       - .github/actions/rollback-fastly/**
       - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
+      - .github/workflows/fastly-installer-check.yml
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
       - crates/edgezero-cli/**
@@ -25,6 +26,7 @@ on:
       - .github/actions/rollback-fastly/**
       - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
+      - .github/workflows/fastly-installer-check.yml
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
       - crates/edgezero-cli/**
@@ -60,7 +62,10 @@ jobs:
           sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
 
       - name: Actionlint (this workflow)
-        run: actionlint .github/workflows/deploy-action.yml
+        run: |
+          actionlint \
+            .github/workflows/deploy-action.yml \
+            .github/workflows/fastly-installer-check.yml
 
       - name: Third-party actions pinned to a ref
         run: .github/actions/deploy-core/tests/check-action-pins.sh
@@ -72,6 +77,7 @@ jobs:
         run: |
           zizmor --offline \
             .github/workflows/deploy-action.yml \
+            .github/workflows/fastly-installer-check.yml \
             .github/actions/build-app-cli/action.yml \
             .github/actions/deploy-fastly/action.yml \
             .github/actions/healthcheck-fastly/action.yml \
@@ -339,6 +345,7 @@ jobs:
         env:
           EDGEZERO__TEST__OUTCOME: ${{ steps.unhealthy.outcome }}
           EDGEZERO__TEST__HEALTHY: ${{ steps.unhealthy.outputs.healthy }}
+          EDGEZERO__TEST__STATUS_CODE: ${{ steps.unhealthy.outputs['status-code'] }}
         run: .github/actions/deploy-core/tests/assert-unhealthy-failed.sh
 
       - name: Roll back the staged version

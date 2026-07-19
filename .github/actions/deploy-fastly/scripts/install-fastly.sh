@@ -32,22 +32,6 @@ require_linux_x86_64() {
 # removes them together.
 provider_bin_dir() { printf '%s\n' "$1/provider-bin"; }
 
-# Whether the action-owned tool root already holds an executable `fastly`
-# reporting the pinned version.
-tool_root_has_pinned_fastly() {
-  local tool_root="$1" version="$2"
-  local bin
-  bin="$(provider_bin_dir "$tool_root")/fastly"
-
-  [[ -x "$bin" ]] || return 1
-  local reported
-  reported=$("$bin" version 2>/dev/null | head -n 1) || return 1
-  [[ "$reported" == *"$version"* ]] || return 1
-
-  notice "reusing the already-installed Fastly CLI: $reported"
-  return 0
-}
-
 main() {
   local action_dir
   action_dir=$(cd -- "$SCRIPT_DIR/.." && pwd)
@@ -69,27 +53,28 @@ main() {
   [[ -n "$tool_version" ]] || fail "EdgeZero repository .tool-versions must contain a fastly entry"
   [[ "$version" == "$tool_version" ]] || fail "Fastly version mismatch: versions.json has $version but .tool-versions has $tool_version"
 
-  # Idempotent: if the action-owned tool root already holds a `fastly` reporting
-  # the pinned version, adopt it instead of downloading again. Running the
-  # wrapper twice in one job should not refetch a binary we already verified.
-  # The scope is deliberately narrow — only this dir, which the action creates
-  # under RUNNER_TEMP, populates, executes from, and deletes on cleanup. A
-  # `fastly` found merely on PATH is NOT trusted and is always superseded.
-  if ! tool_root_has_pinned_fastly "$tool_root" "$version"; then
-    local url sha256 archive
-    url=$(json_get "$versions_json" fastly.linux_amd64.url)
-    sha256=$(json_get "$versions_json" fastly.linux_amd64.sha256)
-    archive="$tool_root/downloads/fastly-$version-linux-amd64.tar.gz"
+  # The `fastly` binary is ALWAYS (re)extracted from a checksum-verified archive
+  # — never adopted from a pre-existing binary. Trusting an already-present
+  # binary by its version text would let an earlier step plant an arbitrary
+  # executable in this predictable dir that then runs with FASTLY_API_TOKEN. The
+  # ARCHIVE is the trust anchor: its SHA-256 must match `versions.json`, and the
+  # binary is extracted from it every run.
+  #
+  # This stays idempotent WITHOUT trusting a binary: the archive is cached under
+  # `downloads/`, so a second run in the same job re-verifies the cached archive
+  # (cheap) and re-extracts rather than refetching.
+  local url sha256 archive actual
+  url=$(json_get "$versions_json" fastly.linux_amd64.url)
+  sha256=$(json_get "$versions_json" fastly.linux_amd64.sha256)
+  archive="$tool_root/downloads/fastly-$version-linux-amd64.tar.gz"
 
-    [[ -f "$archive" ]] || curl --fail --location --silent --show-error "$url" --output "$archive"
+  [[ -f "$archive" ]] || curl --fail --location --silent --show-error "$url" --output "$archive"
 
-    local actual
-    actual=$(sha256_file "$archive")
-    [[ "$actual" == "$sha256" ]] || fail "Fastly CLI checksum mismatch for version $version"
+  actual=$(sha256_file "$archive")
+  [[ "$actual" == "$sha256" ]] || fail "Fastly CLI checksum mismatch for version $version"
 
-    tar -xzf "$archive" -C "$provider_bin" fastly
-    chmod +x "$provider_bin/fastly"
-  fi
+  tar -xzf "$archive" -C "$provider_bin" fastly
+  chmod +x "$provider_bin/fastly"
 
   printf '%s\n' "$provider_bin" >>"${GITHUB_PATH:-/dev/null}"
   export PATH="$provider_bin:$PATH"

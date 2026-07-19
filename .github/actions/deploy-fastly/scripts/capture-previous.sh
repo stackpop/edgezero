@@ -43,6 +43,14 @@ main() {
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_cmd "$cli_bin"
 
+  # Credential-free preflight: confirm the app CLI actually exposes
+  # `active-version` BEFORE invoking it with the token. A missing subcommand here
+  # means the CLI was built without the lifecycle commands wired — fail with a
+  # clear, actionable message instead of a bare clap "unrecognized subcommand".
+  if ! "$cli_bin" active-version --help >/dev/null 2>&1; then
+    fail "the app CLI does not expose the \`active-version\` command, which a production deploy needs to capture the rollback target. Wire \`edgezero_cli::run_active_version\` (and \`run_healthcheck\` / \`run_rollback\`) into your CLI -- see the 'Deploying from GitHub Actions' guide's required command surface."
+  fi
+
   new_private_log
   # Fail CLOSED on an operational failure: the CLI exits 0 for "no active version"
   # (first deploy) and non-zero only for a real failure. Capture the CLI's exit

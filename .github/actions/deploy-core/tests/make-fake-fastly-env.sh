@@ -14,11 +14,13 @@ set -euo pipefail
 #   * The Fastly domain API returns a SINGULAR `staging_ip` string.
 #   * activate/deactivate are PUT, and staging deactivate is /deactivate/staging.
 #
-# The fake `fastly` is placed in the ACTION-OWNED TOOL ROOT, reporting the pinned
-# version, so `install-fastly.sh` adopts it instead of downloading the real CLI
-# (its idempotency check). That is what lets the staged path be exercised through
-# the real deploy-fastly wrapper rather than by calling the CLI directly.
-# The fake `curl` goes on PATH, which nothing reinstalls.
+# The fake `fastly` is packaged as a tar.gz at install-fastly.sh's cache path and
+# the checked-out `versions.json` is repointed at it with a matching SHA-256, so
+# install-fastly.sh VERIFIES and extracts the fake through its real
+# download+checksum+extract path — never adopting a planted binary. That lets the
+# staged path be exercised through the real deploy-fastly wrapper while keeping
+# the installer's provenance guarantee intact. The fake `curl` goes on PATH,
+# which nothing reinstalls.
 #
 # The fake binaries write their call log to FAKE_CALL_LOG and read FORCE_UNHEALTHY.
 # These are deliberately OUTSIDE the EDGEZERO__ namespace: the app CLI scrubs
@@ -131,20 +133,40 @@ main() {
   local action_dir
   action_dir=$(cd -- "$SCRIPT_DIR/../../deploy-fastly" && pwd)
   local path_dir="$workspace/fake-bin"
-  # install-fastly.sh keeps the provider CLI in its own dir (never the app
-  # CLI's bin/), so seed the fake where that adoption check looks.
-  local tool_bin="$runner_temp/edgezero-action-tools/provider-bin"
+  # install-fastly.sh extracts the provider CLI from a checksum-verified archive
+  # into `<tool root>/provider-bin`, caching the archive under `downloads/`.
+  # Deliver the fake THROUGH that verified path (not by planting a binary), so the
+  # smoke exercises the real download+verify+extract and never relies on a bypass.
+  local downloads="$runner_temp/edgezero-action-tools/downloads"
   local log="$workspace/fake-calls.log"
 
-  mkdir -p "$path_dir" "$tool_bin"
+  mkdir -p "$path_dir" "$downloads"
   : >"$log"
 
-  # The fake must claim the pinned version, or install-fastly.sh replaces it.
   local pinned
   pinned=$(json_get "$action_dir/versions.json" fastly.version)
 
-  write_fake_fastly "$tool_bin/fastly" "$pinned"
-  write_fake_fastly "$path_dir/fastly" "$pinned"
+  # Package a fake `fastly` as the archive install-fastly.sh expects, pre-placed
+  # at its cache path so no network fetch happens.
+  local stage archive sha
+  stage=$(mktemp -d)
+  write_fake_fastly "$stage/fastly" "$pinned"
+  archive="$downloads/fastly-$pinned-linux-amd64.tar.gz"
+  tar -C "$stage" -czf "$archive" fastly
+  sha=$(sha256_file "$archive")
+
+  # Repoint the CHECKED-OUT versions.json (what the local action reads) at the
+  # fake archive with its real checksum, so install-fastly.sh verifies and
+  # extracts the fake. The version stays pinned, so the `.tool-versions`
+  # agreement check still holds. This modifies only the job's checkout, never a
+  # committed file — production reads the real, pinned versions.json.
+  local patched
+  patched=$(mktemp)
+  jq --arg url "file://$archive" --arg sha "$sha" \
+    '.fastly.linux_amd64.url = $url | .fastly.linux_amd64.sha256 = $sha' \
+    "$action_dir/versions.json" >"$patched"
+  mv "$patched" "$action_dir/versions.json"
+
   write_fake_curl "$path_dir/curl"
 
   printf '%s\n' "$path_dir" >>"${GITHUB_PATH:?GITHUB_PATH is required}"
@@ -152,7 +174,7 @@ main() {
     printf 'FAKE_CALL_LOG=%s\n' "$log"
   } >>"${GITHUB_ENV:?GITHUB_ENV is required}"
 
-  notice "fake fastly (v$pinned) installed in the tool root and on PATH; fake curl on PATH"
+  notice "fake fastly (v$pinned) packaged as a checksum-verified archive at $archive; fake curl on PATH"
 }
 
 main "$@"

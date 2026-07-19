@@ -250,8 +250,8 @@ The engine is parameterized by the values the wrapper passes to those scripts
 | `deploy-flags`       | JSON array of action-owned deploy flags the wrapper injects before caller `deploy-args` (`--service-id …`, `--non-interactive`).                                                                                                                   |
 | `cache`              | Enable exact-key application `target/` caching (`true`/`false`).                                                                                                                                                                                   |
 
-The wrapper surfaces engine results as its own outputs: `adapter`,
-`source-revision`, `app-cli-version`, `effective-build-mode`.
+The wrapper surfaces its outputs: `fastly-version`, `previous-version`
+(production only), `source-revision`, and `app-cli-version`.
 
 The engine contains no provider-specific credential names, service concepts,
 endpoints, or CLI flags — those, and the list of aliases to clear
@@ -283,19 +283,19 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 **`deploy-fastly` inputs**
 
-| Input               | Required | Default       | Contract                                                                                       |
-| ------------------- | -------- | ------------- | ---------------------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | none          | `build-app-cli` artifact name. Forwarded to the engine.                                        |
-| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact. Forwarded to the engine.                                      |
-| `fastly-api-token`  | Yes      | none          | Mapped into `provider-env` as `FASTLY_API_TOKEN`, deploy step only.                            |
-| `fastly-service-id` | Yes      | none          | Mapped into action-owned `deploy-flags` as `--service-id <id>` to prevent accidental creation. |
-| `working-directory` | No       | `.`           | Forwarded to the engine.                                                                       |
-| `manifest`          | No       | empty         | Forwarded to the engine.                                                                       |
-| `build-mode`        | No       | `auto`        | Forwarded. Fastly `auto` resolves to `never`.                                                  |
-| `build-args`        | No       | `[]`          | Forwarded to the engine.                                                                       |
-| `deploy-args`       | No       | `[]`          | Forwarded. Allowlisted to `--comment` for Fastly (§9).                                         |
-| `stage`             | No       | `false`       | When `true`, deploy to a **staged** draft version instead of activating production (§5.4).     |
-| `cache`             | No       | `false`       | Forwarded to the engine.                                                                       |
+| Input               | Required | Default       | Contract                                                                                                                                                                     |
+| ------------------- | -------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | none          | `build-app-cli` artifact name. Forwarded to the engine.                                                                                                                      |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact. Forwarded to the engine.                                                                                                                    |
+| `fastly-api-token`  | Yes      | none          | Mapped into `provider-env` as `FASTLY_API_TOKEN` for the deploy step, and passed directly (adapter convention) to the rollback-target capture step; blanked everywhere else. |
+| `fastly-service-id` | Yes      | none          | Mapped into action-owned `deploy-flags` as `--service-id <id>` to prevent accidental creation.                                                                               |
+| `working-directory` | No       | `.`           | Forwarded to the engine.                                                                                                                                                     |
+| `manifest`          | No       | empty         | Forwarded to the engine.                                                                                                                                                     |
+| `build-mode`        | No       | `auto`        | Forwarded. Fastly `auto` resolves to `never`.                                                                                                                                |
+| `build-args`        | No       | `[]`          | Forwarded to the engine.                                                                                                                                                     |
+| `deploy-args`       | No       | `[]`          | Forwarded. Allowlisted to `--comment` for Fastly (§9).                                                                                                                       |
+| `stage`             | No       | `false`       | When `true`, deploy to a **staged** draft version instead of activating production (§5.4).                                                                                   |
+| `cache`             | No       | `false`       | Forwarded to the engine.                                                                                                                                                     |
 
 **`deploy-fastly` outputs**
 

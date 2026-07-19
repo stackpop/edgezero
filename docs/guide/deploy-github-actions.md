@@ -32,9 +32,16 @@ provider-neutral behavior; the wrappers above are thin.
   builds your `edgezero`-based CLI binary) via `app-cli-package`. `build-app-cli`
   compiles exactly that, from your checkout's `Cargo.lock`, so the CLI and your
   app can never disagree on schema.
+  - **Required command surface.** The deploy actions drive your CLI, so it must
+    expose the built-in commands they invoke: `build`, `deploy`, and — for the
+    Fastly lifecycle — `active-version`, `healthcheck`, and `rollback` (plus
+    `config` for `config-push-fastly`). The scaffolded template wires all of
+    them; if you hand-write your CLI, dispatch each to its `edgezero_cli::run_*`
+    handler. A production deploy runs `active-version` to capture the rollback
+    target and fails fast (before touching the provider) if it is missing.
 - **Typed provider credentials.** Pass `fastly-api-token` / `fastly-service-id`
   through the wrapper inputs — never through workflow `env:`. They reach only the
-  deploy step.
+  provider steps (the rollback-target capture and the deploy).
 
 ## Quick start (same repository)
 
@@ -237,12 +244,14 @@ store's logical id, so `key` is production-only: combining `key` with
 written where no staged version ever reads).
 
 What makes a _staged version_ actually read that key is the other half: a staged
-deploy re-points its own `edgezero_runtime_env` link at the
-`edgezero_runtime_env_staging` selector store, mirroring production's runtime
-overrides into it and redirecting only the config selectors to
-`<logical-store-id>_staging`. The staged deploy creates and populates that twin
-on demand — no separate setup step — so the staged version reads
-`<logical>_staging` while production keeps reading `<logical>`. If the deploy
+deploy re-points its own `edgezero_runtime_env` link at a **per-service**
+`edgezero_runtime_env_staging_<service-id>` selector store, mirroring
+production's runtime overrides into it and redirecting only the config selectors
+to `<logical-store-id>_staging`. The staged deploy creates and populates that
+twin on demand — no separate setup step — so the staged version reads
+`<logical>_staging` while production keeps reading `<logical>`. (The store is
+named per service because Fastly config stores are account-wide and versionless,
+so a shared twin could let one service's staged deploy clobber another's.) If the deploy
 cannot even read the store listing (so it cannot tell whether production config
 exists), it fails closed rather than risk serving production config. A typo like
 `deploy-to: Staging` is likewise rejected up front, never silently pushed to

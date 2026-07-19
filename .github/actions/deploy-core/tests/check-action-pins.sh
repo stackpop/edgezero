@@ -10,6 +10,7 @@ REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)
 
 files=(
   "$REPO_ROOT/.github/workflows/deploy-action.yml"
+  "$REPO_ROOT/.github/workflows/fastly-installer-check.yml"
   "$REPO_ROOT/.github/actions/build-app-cli/action.yml"
   "$REPO_ROOT/.github/actions/deploy-core"
   "$REPO_ROOT/.github/actions/deploy-fastly/action.yml"
