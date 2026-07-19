@@ -427,9 +427,11 @@ git commit -m "feat(core): add time module (Deadline + budget constants)"
 
 ---
 
-### Task 3: Full CI-gate verification (all five gates)
+### Task 3: Core CI-gate verification (the five CLAUDE.md gates)
 
 **Files:** none (verification only). Run from the repo root.
+
+**Scope:** Phase 1a is **additive, core-only** (new `EdgeError` variants + a new `time` module; no adapter, CLI, template, or `app-demo` change), so this task runs the **five CLAUDE.md gates** over the workspace. It deliberately does **not** run the generated-project build, the `examples/app-demo` build, or the per-adapter WASM test/check/clippy matrices — nothing Phase 1a touches can affect them (they run in full CI regardless). Phases that touch adapters/templates/app-demo DO add those.
 
 - [ ] **Step 1: Format check + workspace test**
 
