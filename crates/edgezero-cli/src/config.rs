@@ -1451,6 +1451,10 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
             manifest_root,
             adapter_cfg.adapter.manifest.as_deref(),
             adapter_cfg.adapter.component.as_deref(),
+            // `config validate` is a static check: an out-of-phase Spin
+            // selector is reported as an inconsistency, not silently
+            // refreshed (that is provision's job).
+            false,
         )?;
         reject_merged_id_collisions(name, adapter, ctx.manifest(), &env_config)?;
     }
@@ -2752,14 +2756,14 @@ source = "b.wasm"
     }
 
     #[test]
-    fn spin_component_discovery_allows_selector_refresh_against_single_component() {
+    fn spin_component_discovery_rejects_bad_selector_against_single_component() {
         let _lock = manifest_guard().lock().expect("manifest guard");
-        // A selector that doesn't match the sole component is a
-        // recoverable out-of-phase state: `provision --local` renames
-        // the component to it (the spec's rerun-to-refresh workflow).
-        // `config validate` must therefore NOT reject it -- provision
-        // validates first, so a hard error here would make the refresh
-        // impossible.
+        // `config validate` is a STATIC check and stays strict: a
+        // selector that matches no component is reported as the
+        // inconsistency it is. (provision's pre-flight passes
+        // `allow_component_refresh = true` and renames the sole
+        // component instead -- that transition is provision-specific,
+        // not part of the static validate contract.)
         let spin_toml = r#"
 spin_manifest_version = 2
 [application]
@@ -2787,8 +2791,12 @@ ids = ["default"]
 "#;
         let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
         write_spin_toml(dir.path(), spin_toml);
-        run_config_validate(&args_for(&manifest))
-            .expect("single-component selector refresh must validate");
+        let err = run_config_validate(&args_for(&manifest))
+            .expect_err("strict config validate must reject a selector mismatch");
+        assert!(
+            err.contains("typo") && err.contains("actual"),
+            "error names both the bad selector and the available id: {err}"
+        );
     }
 
     #[test]

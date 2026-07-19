@@ -788,6 +788,13 @@ pub trait Adapter: Sync + Send {
     /// `[adapters.<name>.adapter].manifest` and `.component`
     /// respectively. Default: no-op.
     ///
+    /// `allow_component_refresh` is `true` only on the `provision`
+    /// pre-flight, where a recoverable transient mismatch (Spin's
+    /// single-component selector-refresh) must NOT block provision
+    /// from performing the refresh. `config validate` passes `false`,
+    /// keeping the standard static check strict: an out-of-phase
+    /// selector is reported as the inconsistency it is.
+    ///
     /// # Errors
     /// Returns a human-readable error string on any manifest
     /// inconsistency the adapter can detect.
@@ -797,6 +804,7 @@ pub trait Adapter: Sync + Send {
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
+        _allow_component_refresh: bool,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -1156,7 +1164,7 @@ mod tests {
         assert!(FIRST.merged_id_kinds().is_empty());
         assert!(FIRST.single_store_kinds().is_empty());
         assert_eq!(
-            FIRST.validate_adapter_manifest(Path::new("/tmp"), None, None),
+            FIRST.validate_adapter_manifest(Path::new("/tmp"), None, None, false),
             Ok(())
         );
         assert_eq!(

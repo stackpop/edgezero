@@ -179,8 +179,31 @@ the literal id `app_config`).
 ::: tip Adapter manifests are gitignored
 Your local copy of `axum.toml`, `wrangler.toml`, `fastly.toml`,
 `spin.toml`, and `runtime-config.toml` is not tracked — regenerate
-each with `<app>-cli provision --adapter <name> --local` and
-re-apply any operator edits after cloning. All five adapter
-manifests follow the same gitignored-generated model, so the
+each with `cargo run -p <app>-cli -- provision --adapter <name> --local`
+(the project CLI isn't installed on a fresh clone, so build-and-run it
+from source) and re-apply any operator edits after cloning. All five
+adapter manifests follow the same gitignored-generated model, so the
 source of truth is `edgezero.toml` (which stays tracked).
 :::
+
+## Un-tracking manifests already committed to your repo
+
+If your project committed these manifests before the cutover, add them
+to `.gitignore` and then untrack them **without deleting your working
+copy** (`--cached`), so provision can own them going forward. Guard the
+`git rm` so it's a no-op when nothing is tracked:
+
+```bash
+tracked=$(git ls-files -- '**/axum.toml' '**/wrangler.toml' \
+  '**/fastly.toml' '**/spin.toml' '**/runtime-config.toml')
+if [ -n "$tracked" ]; then
+  printf '%s\n' "$tracked" | xargs git rm --cached
+fi
+# Verify none remain tracked (expect no output):
+git ls-files -- '**/axum.toml' '**/wrangler.toml' '**/fastly.toml' \
+  '**/spin.toml' '**/runtime-config.toml'
+```
+
+Commit the `.gitignore` change plus the `git rm --cached` removals
+together. Your local files stay on disk; teammates regenerate theirs
+with `provision --local` after pulling.

@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use edgezero_adapter::env_file::reject_symlinked_target;
+use edgezero_adapter::env_file::{reject_symlink_components, reject_symlinked_target};
 use edgezero_adapter::registry::{AdapterPushContext, ReadConfigEntry, ResolvedStoreId};
 use rusqlite::{Connection, params};
 
@@ -111,6 +111,42 @@ pub(crate) fn resolve_sqlite_path(
         return runtime_config_dir.join(custom);
     }
     spin_manifest_dir.join(DEFAULT_SQLITE_RELATIVE_PATH)
+}
+
+/// Reject a symlinked component anywhere from the project-side
+/// `spin_manifest_dir` down to the resolved `db_path`, so a symlinked
+/// intermediate (e.g. `.spin`) can't send the create/open off-tree.
+///
+/// Only applied when `db_path` sits UNDER `spin_manifest_dir` (the
+/// default `.spin/...` layout). An operator who set an explicit
+/// ABSOLUTE `path` in `runtime-config.toml` chose it deliberately, and
+/// there is no project root to bound the walk against there -- the
+/// final-component `reject_symlinked_target` in `write_batch` still
+/// applies.
+///
+/// # Errors
+/// Propagates a symlinked-component rejection.
+fn guard_sqlite_path_symlinks(spin_manifest_dir: &Path, db_path: &Path) -> Result<(), String> {
+    if db_path.starts_with(spin_manifest_dir) {
+        reject_symlink_components(spin_manifest_dir, db_path)?;
+    }
+    Ok(())
+}
+
+/// [`resolve_sqlite_path`] plus the symlinked-component guard. Both the
+/// write and the read paths resolve the db this way so neither can be
+/// steered off-tree by a symlinked intermediate directory.
+///
+/// # Errors
+/// Propagates a symlinked-component rejection.
+pub(super) fn resolve_sqlite_path_guarded(
+    spin_manifest_dir: &Path,
+    runtime_config_dir: &Path,
+    explicit_path: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let db_path = resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, explicit_path);
+    guard_sqlite_path_symlinks(spin_manifest_dir, &db_path)?;
+    Ok(db_path)
 }
 
 /// Tracks whether the compat warning has already fired this session
@@ -527,7 +563,8 @@ fn write_sqlite(
     entries: &[(String, String)],
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
-    let db_path = resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, explicit_path);
+    let db_path =
+        resolve_sqlite_path_guarded(spin_manifest_dir, runtime_config_dir, explicit_path)?;
     if dry_run {
         let mut out = Vec::with_capacity(entries.len().saturating_add(1));
         out.push(format!(
@@ -566,25 +603,34 @@ pub(super) fn read_sqlite_entry(
     if !db_path.exists() {
         return Ok(ReadConfigEntry::MissingStore);
     }
-    let connection = Connection::open(db_path)
-        .map_err(|err| format!("failed to open `{}`: {err}", db_path.display()))?;
-    // Ensure the schema exists so opening a fresh (empty) file doesn't error.
-    connection
-        .execute(SPIN_KV_CREATE_TABLE, [])
-        .map_err(|err| format!("failed to verify schema in `{}`: {err}", db_path.display()))?;
-    let raw: Option<Vec<u8>> = connection
+    // The read path MUST NOT mutate the database. Opening read-write and
+    // running `CREATE TABLE` (as the writer does) turns a nominally
+    // read-only `config diff --local` / push preflight into a write that
+    // dirties the file's bytes. Open READ_ONLY and run no DDL; a db that
+    // has never been written has no `spin_key_value` table, which we
+    // surface as `MissingStore` rather than by creating the schema.
+    let connection =
+        Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| format!("failed to open `{}` read-only: {err}", db_path.display()))?;
+    let raw: Option<Vec<u8>> = match connection
         .query_row(
             "SELECT value FROM spin_key_value WHERE store=$1 AND key=$2",
             params![store, key],
             |row| row.get(0),
         )
         .optional()
-        .map_err(|err| {
-            format!(
+    {
+        Ok(value) => value,
+        Err(err) if err.to_string().contains("no such table") => {
+            return Ok(ReadConfigEntry::MissingStore);
+        }
+        Err(err) => {
+            return Err(format!(
                 "failed to query `{}` for store `{store}` key `{key}`: {err}",
                 db_path.display()
-            )
-        })?;
+            ));
+        }
+    };
     match raw {
         None => Ok(ReadConfigEntry::MissingKey),
         Some(bytes) => {
@@ -1423,6 +1469,49 @@ mod tests {
     fn write_kv_entry(db_path: &Path, store_label: &str, key: &str, value: &str) {
         write_batch(db_path, store_label, &[(key.to_owned(), value.to_owned())])
             .expect("seed entry");
+    }
+
+    /// The read path must NOT mutate the database: opening a
+    /// schema-less db read-only and querying a missing table returns
+    /// `MissingStore` without creating the schema or touching bytes.
+    #[test]
+    fn read_sqlite_entry_is_read_only_and_creates_no_schema() {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("kv.db");
+        // A valid but schema-less SQLite db (no `spin_key_value` table).
+        drop(Connection::open(&db).expect("create empty db"));
+        let bytes_before = fs::read(&db).expect("read bytes");
+
+        let result = read_sqlite_entry(&db, "store", "key")
+            .expect("read on a schema-less db must not error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "schema-less db reads as MissingStore, not by creating the table"
+        );
+        assert_eq!(
+            fs::read(&db).expect("read bytes after"),
+            bytes_before,
+            "a read must not mutate the database (no CREATE TABLE on the read path)"
+        );
+    }
+
+    /// A symlinked INTERMEDIATE component (`.spin`) must be rejected --
+    /// the final-component guard alone would let `create_dir_all` follow
+    /// it off-tree.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_sqlite_path_guarded_rejects_symlinked_intermediate() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let manifest_dir = dir.path().join("proj");
+        fs::create_dir_all(&manifest_dir).expect("mkdir proj");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        symlink(&outside, manifest_dir.join(".spin")).expect("symlink .spin");
+
+        let err = resolve_sqlite_path_guarded(&manifest_dir, &manifest_dir, None)
+            .expect_err("symlinked .spin intermediate must be rejected");
+        assert!(err.contains("symlink"), "{err}");
     }
 
     /// A symlinked db path must be refused before `Connection::open`

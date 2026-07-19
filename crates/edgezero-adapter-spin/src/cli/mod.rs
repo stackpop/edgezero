@@ -430,16 +430,19 @@ impl Adapter for SpinCliAdapter {
             )),
             // Branch 4: `type = "spin"` or missing stanza (default).
             Some(runtime_config::KeyValueBackend::Spin { path }) => {
-                let db_path = push_local::resolve_sqlite_path(
+                let db_path = push_local::resolve_sqlite_path_guarded(
                     spin_manifest_dir,
                     runtime_config_dir,
                     path.as_deref(),
-                );
+                )?;
                 push_local::read_sqlite_entry(&db_path, platform, key)
             }
             None => {
-                let db_path =
-                    push_local::resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, None);
+                let db_path = push_local::resolve_sqlite_path_guarded(
+                    spin_manifest_dir,
+                    runtime_config_dir,
+                    None,
+                )?;
                 push_local::read_sqlite_entry(&db_path, platform, key)
             }
         }
@@ -491,8 +494,11 @@ impl Adapter for SpinCliAdapter {
             Some(runtime_config::KeyValueBackend::Spin { path }) => path.as_deref(),
             _ => None,
         };
-        let db_path =
-            push_local::resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, explicit_path);
+        let db_path = push_local::resolve_sqlite_path_guarded(
+            spin_manifest_dir,
+            runtime_config_dir,
+            explicit_path,
+        )?;
         push_local::read_sqlite_entry(&db_path, platform, key)
     }
 
@@ -568,6 +574,7 @@ impl Adapter for SpinCliAdapter {
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
         component_selector: Option<&str>,
+        allow_component_refresh: bool,
     ) -> Result<(), String> {
         // check 3: spin.toml must exist and either declare
         // exactly one `[component.*]` or carry an explicit selector
@@ -599,13 +606,16 @@ impl Adapter for SpinCliAdapter {
             if component_ids.iter().any(|id| id == selector) {
                 return Ok(());
             }
-            // Single-component refresh: the operator changed the
+            // Single-component refresh: on the PROVISION pre-flight
+            // (`allow_component_refresh`), the operator changed the
             // selector out of phase with the already-synthesised
-            // spin.toml. `provision --local` renames the sole component
-            // to the new selector, so this transient mismatch is
-            // recoverable -- do not block it. Only a genuinely
-            // ambiguous multi-component mismatch is an error.
-            if component_ids.len() == 1 {
+            // spin.toml, and provision renames the sole component to
+            // the new selector -- so this transient mismatch is
+            // recoverable and must not block provision. `config
+            // validate` (allow_component_refresh = false) stays strict
+            // and reports it. Ambiguous multi-component mismatches are
+            // always an error.
+            if allow_component_refresh && component_ids.len() == 1 {
                 return Ok(());
             }
             return Err(format!(
@@ -1071,7 +1081,7 @@ mod tests {
         )
         .unwrap();
         let err = SpinCliAdapter
-            .validate_adapter_manifest(dir.path(), Some("spin.toml"), None)
+            .validate_adapter_manifest(dir.path(), Some("spin.toml"), None, false)
             .expect_err("no [component.*] must error");
         assert!(
             err.contains("no [component.*]"),
@@ -1092,8 +1102,29 @@ mod tests {
         )
         .unwrap();
         SpinCliAdapter
-            .validate_adapter_manifest(dir.path(), Some("spin.toml"), Some("worker"))
+            .validate_adapter_manifest(dir.path(), Some("spin.toml"), Some("worker"), true)
             .expect("single-component selector refresh must validate");
+    }
+
+    #[test]
+    fn validate_adapter_manifest_strict_rejects_single_component_selector_mismatch() {
+        // Without `allow_component_refresh` (the `config validate`
+        // path), a selector that matches no component is reported as
+        // the inconsistency it is -- even for a single-component
+        // manifest. Only provision's pre-flight tolerates it.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.actual]\nsource = \"a.wasm\"\n",
+        )
+        .unwrap();
+        let err = SpinCliAdapter
+            .validate_adapter_manifest(dir.path(), Some("spin.toml"), Some("typo"), false)
+            .expect_err("strict validate must reject a selector mismatch");
+        assert!(
+            err.contains("typo") && err.contains("actual"),
+            "error names the bad selector and the available id: {err}"
+        );
     }
 
     #[test]
@@ -1108,7 +1139,7 @@ mod tests {
         )
         .unwrap();
         let err = SpinCliAdapter
-            .validate_adapter_manifest(dir.path(), Some("spin.toml"), Some("typo"))
+            .validate_adapter_manifest(dir.path(), Some("spin.toml"), Some("typo"), true)
             .expect_err("ambiguous selector must error");
         assert!(
             err.contains("typo") && err.contains('a') && err.contains('b'),

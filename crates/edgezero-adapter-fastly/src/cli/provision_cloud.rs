@@ -48,16 +48,20 @@ pub(super) fn provision(
             // human-facing wording.
             let logical = store.logical.as_str();
             let name = store.platform.as_str();
-            if dry_run {
+            // Check the skip condition FIRST, so dry-run models what the
+            // real run does: if the `[setup.*]` block is already present
+            // the real invocation skips the store, and dry-run must
+            // report "would skip", not "would create".
+            if setup_block_present(&fastly_path, kind, name)? {
                 out.push(format!(
-                    "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] to {} (logical id `{logical}`)",
+                    "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] block AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
                     fastly_path.display()
                 ));
                 continue;
             }
-            if setup_block_present(&fastly_path, kind, name)? {
+            if dry_run {
                 out.push(format!(
-                    "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] block AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
+                    "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] to {} (logical id `{logical}`)",
                     fastly_path.display()
                 ));
                 continue;
@@ -793,6 +797,43 @@ mod tests {
         assert!(
             out.status_lines[0].contains("already declared"),
             "got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn provision_dry_run_reports_skip_for_already_declared_store() {
+        // Dry-run must model the real operation: a store whose
+        // `[setup.*]` block already exists is skipped by the real run,
+        // so dry-run reports "already declared; skipping", NOT
+        // "would create".
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("fastly.toml"),
+            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert!(
+            out.status_lines[0].contains("already declared")
+                && !out.status_lines[0].contains("would run"),
+            "dry-run must report the skip, not a would-create: {out:?}"
         );
     }
 

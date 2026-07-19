@@ -535,7 +535,12 @@ fn run_local_dry_run_typed(
             let synthesised =
                 write_baseline_to_disk(staged_root, &baseline_pairs).map_err(&sanitize)?;
             adapter
-                .validate_adapter_manifest(staged_root, adapter_manifest_rel, adapter_component)
+                .validate_adapter_manifest(
+                    staged_root,
+                    adapter_manifest_rel,
+                    adapter_component,
+                    true,
+                )
                 .map_err(&sanitize)?;
             let owned_stores = build_stores_against(staged_root, args, adapter, ctx.manifest())
                 .map_err(&sanitize)?;
@@ -958,6 +963,8 @@ fn validate_and_dispatch(
         ctx.manifest_root,
         ctx.adapter_cfg.adapter.manifest.as_deref(),
         ctx.adapter_cfg.adapter.component.as_deref(),
+        // provision may refresh a single-component selector mismatch.
+        true,
     )?;
     let env_config = EnvConfig::from_env();
     reject_merged_id_collisions(ctx.adapter_name, ctx.adapter, manifest, &env_config)?;
@@ -1321,6 +1328,7 @@ fn run_local_dry_run(
                     staged_root,
                     adapter_cfg.adapter.manifest.as_deref(),
                     adapter_cfg.adapter.component.as_deref(),
+                    true,
                 )
                 .map_err(sanitize)?;
             let owned_stores =
@@ -1668,9 +1676,10 @@ serve = "echo"
             manifest_root: &Path,
             adapter_manifest_path: Option<&str>,
             _component_selector: Option<&str>,
+            _allow_component_refresh: bool,
         ) -> Result<(), String> {
             // The synthesised file MUST exist by the time validate
-            // runs — that's the invariant this whole task guards.
+            // runs — that's the invariant this whole guards.
             let rel = adapter_manifest_path.unwrap_or("spin.toml");
             let abs = manifest_root.join(rel);
             if abs.exists() {

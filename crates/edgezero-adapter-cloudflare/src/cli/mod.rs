@@ -202,6 +202,7 @@ impl Adapter for CloudflareCliAdapter {
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
+        _allow_component_refresh: bool,
     ) -> Result<(), String> {
         Ok(())
     }

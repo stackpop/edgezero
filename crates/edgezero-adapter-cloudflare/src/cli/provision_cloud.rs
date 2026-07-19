@@ -87,30 +87,43 @@ pub(super) fn provision(
             .and_then(|namespaces| namespaces.get(logical.as_str()));
         let existing = existing_real_namespace_id(&wrangler_path, binding)?;
         if let Some(existing_id) = existing {
-            // Local wrangler.toml already carries a real id. If it
-            // disagrees with the committed one, the local file is
-            // stale (or was hand-edited): refuse rather than let the
-            // writeback below silently replace the team's id.
-            if let Some(tracked) = tracked_id
-                && tracked != &existing_id
-            {
-                return Err(format!(
-                    "namespace id conflict for logical store `{logical}`: gitignored `{}` declares \
-                     `{existing_id}`, but tracked `[adapters.cloudflare.deployed].kv_namespaces.{logical}` \
-                     is `{tracked}`. wrangler.toml is per-machine, so provision will not overwrite the \
-                     committed id with it. Resolve by hand: delete the stale [[kv_namespaces]] entry for \
-                     binding `{binding}` (the committed id is restored on the next run), or update the \
-                     tracked value in edgezero.toml.",
-                    wrangler_path.display()
-                ));
+            match tracked_id {
+                // Local disagrees with the committed id: the gitignored
+                // file is stale or hand-edited. Refuse rather than let
+                // the writeback silently replace the team's id.
+                Some(tracked) if tracked != &existing_id => {
+                    return Err(format!(
+                        "namespace id conflict for logical store `{logical}`: gitignored `{}` declares \
+                         `{existing_id}`, but tracked `[adapters.cloudflare.deployed].kv_namespaces.{logical}` \
+                         is `{tracked}`. wrangler.toml is per-machine, so provision will not overwrite the \
+                         committed id with it. Resolve by hand: delete the stale [[kv_namespaces]] entry for \
+                         binding `{binding}` (the committed id is restored on the next run), or update the \
+                         tracked value in edgezero.toml.",
+                        wrangler_path.display()
+                    ));
+                }
+                // Local matches the committed id: already the team's
+                // source of truth, nothing to write back.
+                Some(_) => {
+                    out.push(format!(
+                        "binding `{binding}` (logical id `{logical}`) already provisioned (id={existing_id}, matches tracked); skipping."
+                    ));
+                }
+                // No tracked id. The local id is unverified, gitignored,
+                // per-machine state -- a stale, deleted, or wrong-account
+                // namespace. Do NOT promote it into tracked deployed
+                // state; the spec derives durable ids from
+                // `wrangler kv namespace create` output only, and an
+                // unconditional local promotion would silently make bad
+                // state the team's source of truth without any
+                // Cloudflare call.
+                None => {
+                    out.push(format!(
+                        "binding `{binding}` (logical id `{logical}`) has a local namespace id (id={existing_id} in {}) but no tracked id; NOT promoting an unverified gitignored id. If it is correct, set `[adapters.cloudflare.deployed].kv_namespaces.{logical}` in edgezero.toml by hand; to recreate, delete the [[kv_namespaces]] entry for binding `{binding}` and re-run provision.",
+                        wrangler_path.display()
+                    ));
+                }
             }
-            out.push(format!(
-                "binding `{binding}` (logical id `{logical}`) already provisioned (id={existing_id} in {}); skipping. To force a fresh namespace: delete the [[kv_namespaces]] entry for binding `{binding}` AND run `wrangler kv namespace delete --namespace-id={existing_id}` (the old remote namespace lingers otherwise), then re-run provision.",
-                wrangler_path.display()
-            ));
-            // Record it so a retry after a partial failure still
-            // surfaces the full set in `ProvisionOutcome.deployed`.
-            created_kv_ns.insert(logical.clone(), existing_id);
             continue;
         }
         // No real id locally. If the team already tracks one, this is a
@@ -687,13 +700,16 @@ id = "00112233445566778899aabbccddeeff"
             kv: &kv_ids,
             secrets: &[],
         };
+        // The committed id matches the local one, so this is genuinely
+        // "already provisioned" from the team's perspective.
+        let tracked = tracked_kv(TEST_KV_ID, "00112233445566778899aabbccddeeff");
         let out = CloudflareCliAdapter
             .provision(
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
                 &stores,
-                None,
+                Some(&tracked),
                 ProvisionMode::Cloud,
                 true,
             )
@@ -712,23 +728,14 @@ id = "00112233445566778899aabbccddeeff"
     }
 
     #[test]
-    fn skipped_existing_namespace_ids_still_surface_in_deployed_outcome() {
-        // Regression: if attempt 1 of
-        // provision creates namespace A then fails on B, the outcome
-        // is discarded. On retry, A is skipped (already present in
-        // wrangler.toml) and only B ends up in `created_kv_ns` —
-        // permanently dropping A from
-        // `[adapters.cloudflare.deployed].kv_namespaces` in
-        // edgezero.toml. Teammates cloning fresh would then
-        // regenerate wrangler.toml without A's id and point the
-        // runtime at a missing namespace.
-        //
-        // The fix records the already-existing id in `created_kv_ns`
-        // too, so a retry's outcome surfaces the FULL set (existing
-        // + newly-created), and the writeback captures A even when
-        // it was created on an earlier attempt.
+    fn provision_does_not_promote_unverified_local_namespace_id() {
+        // A real-looking id present ONLY in gitignored wrangler.toml,
+        // with no tracked id, must NOT be promoted into deployed
+        // writeback: it could be stale, deleted, or from another
+        // account, and the spec derives durable ids from
+        // `wrangler kv namespace create` output, not from reading the
+        // per-machine file.
         let dir = tempdir().expect("tempdir");
-        // Real 32-char lowercase hex id already present for `sessions`.
         write_wrangler(
             dir.path(),
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"00112233445566778899aabbccddeeff\"\n",
@@ -739,9 +746,6 @@ id = "00112233445566778899aabbccddeeff"
             kv: &kv_ids,
             secrets: &[],
         };
-        // Dry-run so no shell-out happens. The outcome's `deployed`
-        // is populated regardless of dry-run for existing IDs (we
-        // just record what we already see on disk).
         let out = CloudflareCliAdapter
             .provision(
                 dir.path(),
@@ -753,19 +757,17 @@ id = "00112233445566778899aabbccddeeff"
                 true,
             )
             .expect("dry-run succeeds");
-        let deployed = out
-            .deployed
-            .as_ref()
-            .expect("skipped existing id must still land in deployed writeback");
-        let kv_ns = deployed
-            .sub_tables
-            .get("kv_namespaces")
-            .expect("kv_namespaces sub-table present");
-        assert_eq!(
-            kv_ns.get(TEST_KV_ID).map(String::as_str),
-            Some("00112233445566778899aabbccddeeff"),
-            "existing id must be recorded under the LOGICAL key so \
-             edgezero.toml writeback captures it: {kv_ns:?}"
+        assert!(
+            out.deployed.is_none(),
+            "an unverified local id with no tracked entry must NOT be promoted: {:?}",
+            out.deployed
+        );
+        assert!(
+            out.status_lines
+                .iter()
+                .any(|line| line.contains("NOT promoting")),
+            "operator is told the local id was not promoted: {:?}",
+            out.status_lines
         );
     }
 

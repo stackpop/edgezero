@@ -187,6 +187,58 @@ pub fn reject_symlinked_target(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Reject a symlink at ANY existing component from `start` down to
+/// `candidate`, before a caller creates directories or opens/writes a
+/// file at `candidate`.
+///
+/// [`reject_symlinked_target`] only guards the final component; a
+/// symlinked INTERMEDIATE directory (e.g. a `.spin` that points
+/// elsewhere) would still have `create_dir_all` / a subsequent open
+/// escape the project tree. This walks each component instead, bounded
+/// by `start` -- a trusted root inside the project, such as the
+/// manifest root -- so legitimate symlinks ABOVE the project (macOS's
+/// `/tmp -> /private/tmp`, say) are never inspected.
+///
+/// Components that don't exist yet are fine (first write creates them
+/// from EdgeZero-owned code). `symlink_metadata` doesn't follow links,
+/// so a dangling symlink is caught too.
+///
+/// # Errors
+/// Returns an error naming the offending symlinked component, or a
+/// non-`NotFound` metadata read failure.
+#[inline]
+pub fn reject_symlink_components(start: &Path, candidate: &Path) -> Result<(), String> {
+    let mut walk = start.to_path_buf();
+    for comp in candidate
+        .strip_prefix(start)
+        .unwrap_or(candidate)
+        .components()
+    {
+        walk.push(comp.as_os_str());
+        match fs::symlink_metadata(&walk) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to use `{}`: `{}` is a symlink, so the write would escape the \
+                     project tree. Replace it with a regular directory (or a symlink to a path \
+                     INSIDE the project)",
+                    candidate.display(),
+                    walk.display()
+                ));
+            }
+            // Missing intermediate is fine -- EdgeZero creates it.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Ok(_) => {}
+            Err(err) => {
+                return Err(format!(
+                    "failed to inspect `{}` for symlink safety: {err}",
+                    walk.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_restrictive_mode(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
