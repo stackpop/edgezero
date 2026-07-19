@@ -129,6 +129,11 @@ RS
   printf 'provider-env-json=%s\n' "${EDGEZERO__PROVIDER__ENV:-CLEARED}"
 } >"${GITHUB_WORKSPACE}/fixture-app/env-seen.txt"
 printf '%s\n' "$@" >"${GITHUB_WORKSPACE}/fixture-app/deploy-argv.txt"
+# Reflect the activation in the fake Fastly API's state: this "deploy" makes
+# version 7 the active one, so the production-rollback guard (which requires the
+# rolled-back-from --version to still be active) sees 7 rather than the 40 that
+# capture saw before this deploy.
+[ -n "${FAKE_ACTIVE_VERSION_FILE:-}" ] && printf '7\n' >"${FAKE_ACTIVE_VERSION_FILE}"
 echo "version=7"
 SH
   chmod +x fake-deploy.sh

@@ -356,10 +356,13 @@ jobs:
         with:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           deploy-to: production
-          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
-          # Fastly cannot infer the previously-live version, so the caller passes
-          # it explicitly (a real caller wires deploy-fastly's `previous-version`).
-          rollback-to: "40"
+          # The fake Fastly API reports version 40 as active, and the
+          # compare-and-swap guard requires the rolled-back-from `--version` to
+          # still be active — so roll back FROM 40 TO 39. Fastly cannot infer the
+          # previous version, so `rollback-to` is explicit (a real caller wires
+          # deploy-fastly's `previous-version`; the composite-smoke proves that).
+          fastly-version: "40"
+          rollback-to: "39"
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
 

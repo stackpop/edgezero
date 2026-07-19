@@ -26,11 +26,11 @@ inputs:
     required: false
     default: production
   retry:
-    description: Number of retries.
+    description: Total number of probe ATTEMPTS (not additional retries); e.g. 3 means at most 3 probes.
     required: false
     default: "3"
   retry-delay:
-    description: Seconds between retries.
+    description: Seconds between attempts.
     required: false
     default: "5"
   timeout:

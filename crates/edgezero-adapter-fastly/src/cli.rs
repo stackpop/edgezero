@@ -1943,6 +1943,14 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
         "the Fastly version list was not a JSON array; the API may have changed its schema"
             .to_owned()
     })?;
+    // A real Fastly service always has at least an initial (inactive) version, so
+    // an EMPTY list is an invalid response — fail closed rather than read it as a
+    // legitimate "no active version yet" (first deploy).
+    if array.is_empty() {
+        return Err(
+            "the Fastly version list is empty; a service always has at least an initial version, so this response cannot be trusted".to_owned()
+        );
+    }
     let mut active_version: Option<u64> = None;
     for entry in array {
         // EVERY entry must be a well-formed version object with an unsigned
@@ -1981,6 +1989,26 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
         }
     }
     Ok(active_version)
+}
+
+/// Guard a production rollback: the version being rolled back FROM
+/// (`from_version`, the caller's `--version`) must still be the ACTIVE version.
+/// A rollback can run long after its deploy; if a newer version was activated
+/// since, activating the old target would clobber it — so refuse.
+fn ensure_rollback_from_is_active(
+    active: Option<u64>,
+    from_version: u64,
+    service_id: &str,
+) -> Result<(), String> {
+    match active {
+        Some(active_version) if active_version == from_version => Ok(()),
+        Some(active_version) => Err(format!(
+            "refusing to roll back service {service_id}: the active version is now {active_version}, not the {from_version} being rolled back from -- a newer deploy is live and rolling back would clobber it"
+        )),
+        None => Err(format!(
+            "refusing to roll back service {service_id}: it has no active version"
+        )),
+    }
 }
 
 /// First staging IP found in a Fastly
@@ -2754,6 +2782,12 @@ fn rollback(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| {
                 "production rollback requires a valid --rollback-to version".to_owned()
             })?;
+        // Compare-and-swap guard: the version being rolled back FROM (`--version`)
+        // must STILL be the active version. A rollback workflow can run long after
+        // its deploy — if a newer version was activated meanwhile, activating the
+        // old target would silently clobber that newer deploy. Refuse instead.
+        let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
+        ensure_rollback_from_is_active(resolve_active_version(&json)?, version, &service_id)?;
         // Fastly's activate endpoint requires `PUT` (not `POST`).
         fastly_api_put(
             &format!("/service/{service_id}/version/{previous}/activate"),
@@ -3245,6 +3279,7 @@ mod tests {
             .expect_err("two active versions must error as ambiguous");
         // EVERY element must be a version object with a numeric `number` — a
         // garbled entry must fail closed, not be skipped as "not active".
+        resolve_active_version("[]").expect_err("an empty version list is an invalid response");
         resolve_active_version("[null]").expect_err("a null element must error");
         resolve_active_version("[{}]").expect_err("an entry with no `number` must error");
         resolve_active_version(r#"[{"number":"invalid"}]"#)
@@ -3257,6 +3292,19 @@ mod tests {
             resolve_active_version(r#"[{"active":false,"number":1},{"active":true,"number":2}]"#),
             Ok(Some(2))
         );
+    }
+
+    #[test]
+    fn ensure_rollback_from_is_active_blocks_racing_deploys() {
+        // The version being rolled back FROM is still active → proceed.
+        assert_eq!(ensure_rollback_from_is_active(Some(7), 7, "svc"), Ok(()));
+        // A NEWER version is active (a deploy raced the rollback) → refuse, so
+        // the newer deploy is not clobbered.
+        ensure_rollback_from_is_active(Some(9), 7, "svc")
+            .expect_err("a newer active version must block the rollback");
+        // No active version at all → refuse.
+        ensure_rollback_from_is_active(None, 7, "svc")
+            .expect_err("no active version must block the rollback");
     }
 
     #[test]

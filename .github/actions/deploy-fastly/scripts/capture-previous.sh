@@ -64,6 +64,16 @@ main() {
     fail_with "$rc" "could not determine the active version (CLI exit $rc); refusing to deploy without a captured rollback target. A first-ever deploy (no active version) exits 0 with an empty target — a non-zero exit means an API/auth/parse failure."
   fi
 
+  # A successful exit is NOT enough: the CLI must emit the `version=` contract
+  # line — `version=<N>` for an active version, or an empty `version=` for a
+  # confirmed first deploy. If NEITHER is present (a CLI that exited 0 but printed
+  # nothing parseable — e.g. an app CLI that never called `init_cli_logger`), fail
+  # CLOSED rather than mistake silence for a first deploy and deploy with no
+  # rollback target.
+  if ! grep -qE '^version=' "$LIFECYCLE_LOG"; then
+    fail_with 1 "active-version exited 0 but emitted no \`version=\` line; refusing to deploy without a confirmed rollback target. Ensure the app CLI dispatches \`active-version\` to \`edgezero_cli::run_active_version\` and initialises its logger (\`edgezero_cli::init_cli_logger()\`) so machine-readable lines are printed unprefixed."
+  fi
+
   local previous
   previous=$(read_numeric_line version "$LIFECYCLE_LOG")
   append_output previous-version "$previous"

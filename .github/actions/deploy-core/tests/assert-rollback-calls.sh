@@ -23,8 +23,10 @@ main() {
   local staged="${EDGEZERO__TEST__STAGED_VERSION:?EDGEZERO__TEST__STAGED_VERSION is required}"
   local rolled_back_to="${EDGEZERO__TEST__ROLLED_BACK_TO:-}"
   local api='https://api\.fastly\.com/service/dummy-service'
-  # The EXPLICIT rollback-to the smoke passes to the production rollback.
-  local target=40
+  # The EXPLICIT rollback-to the smoke passes to the production rollback (it rolls
+  # back FROM the active version 40 TO 39; the compare-and-swap guard requires the
+  # rolled-back-from version to still be active).
+  local target=39
 
   echo "--- recorded fastly/curl calls:"
   cat "$log"

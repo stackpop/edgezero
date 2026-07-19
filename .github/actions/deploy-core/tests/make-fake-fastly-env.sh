@@ -81,7 +81,9 @@ case "\${1:-} \${2:-}" in
   *)
     case "\${1:-}" in
       version | --version) echo "Fastly CLI version v$version (fake)" ;;
-      *) echo "fake fastly: unhandled: \$*" >&2 ;;
+      # An UNHANDLED command must fail: an unexpected provider call (a new command
+      # the code started issuing) should break the smoke, not pass silently.
+      *) echo "fake fastly: unhandled command: \$*" >&2; exit 90 ;;
     esac
     ;;
 esac
@@ -108,12 +110,15 @@ if [[ "$*" == *"--config"* ]]; then
   # `<body>\n<status>` and the caller requires a 2xx. Mirror that: body, then a
   # trailing `\n200`, with NO trailing newline after the code.
   #
-  # The service-version list, for production rollback target resolution. TWO
-  # staged versions sit above the active one on purpose: v42 and v41 are both
-  # staged, v40 is the previously-live version, so a caller passing rollback-to=40
-  # rolls back to a real production version rather than a staged one.
+  # The service-version list. The ACTIVE version is read from a state file so the
+  # smoke can model reality: it is 40 before the production deploy (rollback-target
+  # capture), and a deploy (or a test step) updates it. The production-rollback
+  # compare-and-swap guard requires the active version to equal the `--version`
+  # being rolled back from.
   if [[ "$url" == */version ]]; then
-    printf '[{"number":42,"staged":true,"locked":true},{"number":41,"staged":true,"locked":true},{"number":40,"active":true,"locked":true}]\n200'
+    active=$(cat "${FAKE_ACTIVE_VERSION_FILE:-/dev/null}" 2>/dev/null || true)
+    active="${active:-40}"
+    printf '[{"number":1,"active":false},{"number":%s,"active":true}]\n200' "$active"
     exit 0
   fi
   # Domain lookup: Fastly returns a SINGULAR `staging_ip` string per domain.
@@ -187,9 +192,16 @@ main() {
 
   write_fake_curl "$path_dir/curl"
 
+  # The active version the fake Fastly API reports, in a file so a deploy or a
+  # test step can update it (see the production-rollback guard). Starts at 40 —
+  # the version rollback-target capture sees BEFORE the first production deploy.
+  local active_state="$workspace/fake-active-version"
+  printf '40\n' >"$active_state"
+
   printf '%s\n' "$path_dir" >>"${GITHUB_PATH:?GITHUB_PATH is required}"
   {
     printf 'FAKE_CALL_LOG=%s\n' "$log"
+    printf 'FAKE_ACTIVE_VERSION_FILE=%s\n' "$active_state"
   } >>"${GITHUB_ENV:?GITHUB_ENV is required}"
 
   notice "fake fastly (v$pinned) packaged as a checksum-verified archive at $archive; fake curl on PATH"

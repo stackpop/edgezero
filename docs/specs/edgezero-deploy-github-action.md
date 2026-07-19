@@ -84,7 +84,10 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
    prebuilt binary and never recompile it.
 6. **Typed provider credentials.** Credentials are passed through wrapper action
    inputs, not caller `env:`, so setup and build steps never inherit provider
-   tokens. Only the provider mutation step receives them.
+   tokens. Only the provider steps receive them — the deploy (as `provider-env`
+   data) and the Fastly lifecycle steps that call the provider directly
+   (rollback-target capture, healthcheck, rollback, config-push, under the
+   adapter's own `FASTLY_API_TOKEN` convention); every other step blanks them.
 7. **No shell string APIs.** Passthrough arguments are JSON arrays invoked
    through Bash arrays without `eval`.
 8. **No Python in tooling or CI.** Validation, metadata checks, and security

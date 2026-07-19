@@ -391,6 +391,9 @@ production).
 
 The actions do not check out source, expand or convert configuration, or push
 runtime config as a side effect of deploy. Config push and provisioning are
-explicit CLI subcommands (`edgezero config push`, `edgezero provision`) you run
-as separate steps. Cloudflare and Spin deploy wrappers are future work; today
-these actions target Fastly.
+explicit subcommands you run as separate steps — via the `config-push-fastly`
+action, or your **app-owned** CLI's `<app-cli> config push` / `<app-cli> provision`
+(the typed `config push` is only available on your app's CLI; the bundled
+`edgezero` binary has no typed config in scope and returns an unsupported error).
+Cloudflare and Spin deploy wrappers are future work; today these actions target
+Fastly.
