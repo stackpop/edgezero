@@ -599,8 +599,17 @@ impl Adapter for SpinCliAdapter {
             if component_ids.iter().any(|id| id == selector) {
                 return Ok(());
             }
+            // Single-component refresh: the operator changed the
+            // selector out of phase with the already-synthesised
+            // spin.toml. `provision --local` renames the sole component
+            // to the new selector, so this transient mismatch is
+            // recoverable -- do not block it. Only a genuinely
+            // ambiguous multi-component mismatch is an error.
+            if component_ids.len() == 1 {
+                return Ok(());
+            }
             return Err(format!(
-                "[adapters.spin.adapter].component = {:?} is not declared in {} (available: {})",
+                "[adapters.spin.adapter].component = {:?} is not declared in {} (available: {}); with multiple components provision cannot infer which to rename -- add a `[component.{selector}]` block or point the selector at an existing id",
                 selector,
                 spin_path.display(),
                 component_ids.join(", ")
@@ -1071,19 +1080,39 @@ mod tests {
     }
 
     #[test]
-    fn validate_adapter_manifest_rejects_bad_selector_against_single_component() {
+    fn validate_adapter_manifest_allows_single_component_selector_refresh() {
+        // A selector that doesn't match the sole component is a
+        // recoverable out-of-phase state: `provision --local` renames
+        // the component to it. Validation must NOT block that, or
+        // provision (which validates first) could never refresh.
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("spin.toml"),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.actual]\nsource = \"a.wasm\"\n",
         )
         .unwrap();
+        SpinCliAdapter
+            .validate_adapter_manifest(dir.path(), Some("spin.toml"), Some("worker"))
+            .expect("single-component selector refresh must validate");
+    }
+
+    #[test]
+    fn validate_adapter_manifest_rejects_bad_selector_against_multiple_components() {
+        // With more than one component, a non-matching selector is
+        // ambiguous -- provision can't infer which to rename -- so it
+        // stays a hard error.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.a]\nsource = \"a.wasm\"\n[component.b]\nsource = \"b.wasm\"\n",
+        )
+        .unwrap();
         let err = SpinCliAdapter
             .validate_adapter_manifest(dir.path(), Some("spin.toml"), Some("typo"))
-            .expect_err("typo selector must error");
+            .expect_err("ambiguous selector must error");
         assert!(
-            err.contains("typo") && err.contains("actual"),
-            "error names both the bad selector and the available id: {err}"
+            err.contains("typo") && err.contains('a') && err.contains('b'),
+            "error names the bad selector and the available ids: {err}"
         );
     }
 

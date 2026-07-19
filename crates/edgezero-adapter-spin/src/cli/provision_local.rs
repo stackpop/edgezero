@@ -65,7 +65,11 @@ pub(super) fn provision(
     let mut spin_changed = false;
     let needs_component = !stores.kv.is_empty() || !stores.config.is_empty();
     if needs_component {
-        let component_id = resolve_component_id(&spin_doc, component_selector, &spin_path)?;
+        let (component_id, renamed) =
+            resolve_component_id(&mut spin_doc, component_selector, &spin_path)?;
+        if renamed {
+            spin_changed = true;
+        }
         for store in stores.kv.iter().chain(stores.config.iter()) {
             if append_kv_store_to_component(
                 &mut spin_doc,
@@ -132,19 +136,25 @@ pub(super) fn provision(
 /// `provision_typed` write into, given a parsed `spin.toml`. Same
 /// rule as `resolve_spin_component` and
 /// `Adapter::validate_adapter_manifest`:
-/// - explicit `component_selector`: must match a declared component
-///   id, else error;
-/// - single component: implicit;
-/// - multi-component without selector: error naming
-///   `[adapters.spin.adapter].component` and listing available ids.
+/// - explicit `component_selector` matching a declared id: use it;
+/// - explicit selector that does NOT match, on a SINGLE-component
+///   manifest: RENAME the sole component to the selector -- the
+///   spec's "re-run `provision --local` to refresh" workflow after an
+///   operator changes `[adapters.spin.adapter].component` out of phase
+///   with the already-synthesised `spin.toml`;
+/// - explicit selector that does NOT match, with MULTIPLE components:
+///   error (provision cannot infer which to rename);
+/// - single component, no selector: implicit;
+/// - multi-component without selector: error.
 ///
-/// Operates on a `DocumentMut` (already parsed) so the callers can
-/// share the single doc read with the writer.
+/// Returns the resolved id and whether the doc was mutated (a rename),
+/// so the caller can flag `spin_changed` and persist it. Takes `&mut`
+/// so the refresh rename happens on the same doc the writer flushes.
 fn resolve_component_id(
-    doc: &toml_edit::DocumentMut,
+    doc: &mut toml_edit::DocumentMut,
     selector: Option<&str>,
     spin_path: &Path,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let component_ids: Vec<String> = doc
         .get("component")
         .and_then(toml_edit::Item::as_table)
@@ -159,17 +169,21 @@ fn resolve_component_id(
     }
     if let Some(sel) = selector {
         if component_ids.iter().any(|id| id == sel) {
-            return Ok(sel.to_owned());
+            return Ok((sel.to_owned(), false));
+        }
+        if let [only] = component_ids.as_slice() {
+            rename_component(doc, only, sel, spin_path)?;
+            return Ok((sel.to_owned(), true));
         }
         return Err(format!(
-            "[adapters.spin.adapter].component = {:?} is not declared in {} (available: {})",
+            "[adapters.spin.adapter].component = {:?} is not declared in {} (available: {}); with multiple components provision cannot infer which to rename -- add a `[component.{sel}]` block or point the selector at an existing id",
             sel,
             spin_path.display(),
             component_ids.join(", ")
         ));
     }
     if component_ids.len() == 1 {
-        return Ok(component_ids.into_iter().next().unwrap_or_default());
+        return Ok((component_ids.into_iter().next().unwrap_or_default(), false));
     }
     Err(format!(
         "{} declares {} components ({}) but [adapters.spin.adapter].component is unset; set one explicitly",
@@ -177,6 +191,45 @@ fn resolve_component_id(
         component_ids.len(),
         component_ids.join(", ")
     ))
+}
+
+/// Rename the sole `[component.<old>]` table to `[component.<new>]`
+/// and repoint every `[[trigger.http]].component = "<old>"` value at
+/// `<new>`, so a single-component `spin.toml` refreshes to a changed
+/// `[adapters.spin.adapter].component` selector. Spin's loader rejects
+/// a manifest whose trigger names a component id that has no matching
+/// `[component.<id>]` block, so both edits happen together.
+fn rename_component(
+    doc: &mut toml_edit::DocumentMut,
+    old: &str,
+    new: &str,
+    spin_path: &Path,
+) -> Result<(), String> {
+    let component_root = doc
+        .get_mut("component")
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| {
+            format!(
+                "{}: [component.*] table expected but `component` key missing",
+                spin_path.display()
+            )
+        })?;
+    if let Some(item) = component_root.remove(old) {
+        component_root.insert(new, item);
+    }
+    if let Some(http) = doc
+        .get_mut("trigger")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|trigger| trigger.get_mut("http"))
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+    {
+        for trigger in http.iter_mut() {
+            if trigger.get("component").and_then(toml_edit::Item::as_str) == Some(old) {
+                trigger.insert("component", toml_edit::value(new));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Local-mode `provision_typed` arm: for each typed secret declared
@@ -224,12 +277,15 @@ pub(super) fn provision_typed(
 
     // Resolve the component id ONCE — if unresolvable (multi-component
     // with no selector, or a bad explicit selector), abort BEFORE
-    // touching either the .env or spin.toml on disk.
-    let component_id = resolve_component_id(&spin_doc, component_selector, &spin_path)?;
+    // touching either the .env or spin.toml on disk. A single-component
+    // manifest whose id no longer matches the selector is refreshed
+    // (renamed) here, same as the base `provision` arm.
+    let (component_id, renamed) =
+        resolve_component_id(&mut spin_doc, component_selector, &spin_path)?;
 
     let mut status_lines: Vec<String> = Vec::with_capacity(typed_secrets.len());
     let mut env_lines: Vec<String> = Vec::with_capacity(typed_secrets.len());
-    let mut spin_changed = false;
+    let mut spin_changed = renamed;
 
     for entry in typed_secrets {
         let spin_var = entry.key_value.to_ascii_lowercase();
@@ -632,6 +688,63 @@ mod tests {
         assert!(
             !after.contains("\"sessions\""),
             "logical id is NOT written (would shadow the platform binding): {after}"
+        );
+    }
+
+    #[test]
+    fn provision_local_refreshes_sole_component_to_new_selector() {
+        // Base `provision --local` with a KV store and a selector that
+        // no longer matches the sole component renames it (refresh),
+        // rather than erroring, per the spec's rerun-to-refresh flow.
+        let dir = tempdir().expect("tempdir");
+        write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[[trigger.http]]\nroute = \"/...\"\ncomponent = \"demo\"\n[component.demo]\nsource = \"demo.wasm\"\nkey_value_stores = []\n",
+        );
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "# edgezero-provision: v1\n",
+        )
+        .expect("seed runtime-config");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                Some("worker"),
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision refresh succeeds");
+
+        let after = fs::read_to_string(dir.path().join("spin.toml")).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().unwrap();
+        let components = doc["component"].as_table().expect("component table");
+        assert!(
+            components.contains_key("worker") && !components.contains_key("demo"),
+            "sole component renamed to the new selector: {after}"
+        );
+        assert_eq!(
+            doc["trigger"]["http"]
+                .as_array_of_tables()
+                .unwrap()
+                .get(0)
+                .unwrap()["component"]
+                .as_str(),
+            Some("worker"),
+            "trigger repointed to renamed component: {after}"
+        );
+        // The KV label still landed on the (renamed) component.
+        assert!(
+            after.contains("sessions"),
+            "kv label written to the refreshed component: {after}"
         );
     }
 
@@ -1322,7 +1435,11 @@ mod tests {
     }
 
     #[test]
-    fn spin_provision_typed_errors_when_selector_does_not_match_component() {
+    fn spin_provision_typed_refreshes_sole_component_to_new_selector() {
+        // Single-component spin.toml + a selector that doesn't match:
+        // the operator changed `[adapters.spin.adapter].component` out
+        // of phase, so re-running provision refreshes (renames) the
+        // sole component to the new selector rather than erroring.
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("spin.toml"),
@@ -1336,19 +1453,33 @@ mod tests {
         .unwrap();
 
         let entries = [TypedSecretEntry::new("default", "API_TOKEN", "demo_token")];
-        let err = SpinCliAdapter
+        SpinCliAdapter
             .provision_typed(
                 dir.path(),
                 Some("spin.toml"),
-                Some("missing"),
+                Some("worker"),
                 &entries,
                 ProvisionMode::Local,
                 false,
             )
-            .expect_err("bad selector must error");
+            .expect("single-component refresh must succeed");
+
+        let after = fs::read_to_string(dir.path().join("spin.toml")).unwrap();
+        let doc: toml_edit::DocumentMut = after.parse().unwrap();
+        let components = doc["component"].as_table().expect("component table");
         assert!(
-            err.contains("missing"),
-            "error names the missing selector: {err}"
+            components.contains_key("worker") && !components.contains_key(TEST_COMPONENT_ID),
+            "sole component renamed to the new selector: {after}"
+        );
+        // The trigger must repoint at the renamed component, else Spin's
+        // loader rejects the manifest.
+        let trigger = doc["trigger"]["http"]
+            .as_array_of_tables()
+            .expect("trigger.http");
+        assert_eq!(
+            trigger.get(0).unwrap()["component"].as_str(),
+            Some("worker"),
+            "trigger repointed to the renamed component: {after}"
         );
     }
 

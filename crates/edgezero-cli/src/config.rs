@@ -2752,13 +2752,14 @@ source = "b.wasm"
     }
 
     #[test]
-    fn spin_component_discovery_rejects_bad_selector_against_single_component() {
+    fn spin_component_discovery_allows_selector_refresh_against_single_component() {
         let _lock = manifest_guard().lock().expect("manifest guard");
-        // Regression: a typo in `[adapters.spin.adapter].component`
-        // used to pass when `spin.toml` declared exactly one
-        // component because the auto-select path returned early
-        // before checking the selector. A wrong id must fail here so
-        // it doesn't blow up later in `config push` / `provision`.
+        // A selector that doesn't match the sole component is a
+        // recoverable out-of-phase state: `provision --local` renames
+        // the component to it (the spec's rerun-to-refresh workflow).
+        // `config validate` must therefore NOT reject it -- provision
+        // validates first, so a hard error here would make the refresh
+        // impossible.
         let spin_toml = r#"
 spin_manifest_version = 2
 [application]
@@ -2786,12 +2787,8 @@ ids = ["default"]
 "#;
         let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
         write_spin_toml(dir.path(), spin_toml);
-        let err = run_config_validate(&args_for(&manifest))
-            .expect_err("typo'd selector against single component must error");
-        assert!(
-            err.contains("typo") && err.contains("actual"),
-            "error names both the bad selector and the available id: {err}"
-        );
+        run_config_validate(&args_for(&manifest))
+            .expect("single-component selector refresh must validate");
     }
 
     #[test]
