@@ -107,33 +107,6 @@ json_get() {
   jq -er ".$2" "$1"
 }
 
-# cd into the application directory, confined to github.workspace. The lifecycle
-# CLIs (active-version / healthcheck / rollback) load their manifest from the
-# current directory, so in a monorepo they must run in the app dir — not the
-# workspace root, where a different `edgezero.toml` could shadow the app's and
-# break them.
-#
-# Accepts either an ABSOLUTE path (e.g. resolve-project.sh's resolved
-# `working-directory` output) or a path RELATIVE to github.workspace (a raw
-# wrapper input), so the same helper serves the deploy path and the thin
-# lifecycle wrappers.
-enter_app_dir() {
-  local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
-  local working_directory="${1:-.}"
-  local workspace_real candidate app_dir
-  workspace_real=$(canonical_path "$workspace")
-  case "$working_directory" in
-    /*) candidate="$working_directory" ;;
-    *) candidate="$workspace/$working_directory" ;;
-  esac
-  [[ -d "$candidate" ]] ||
-    fail "working-directory '$working_directory' does not exist or is not a directory"
-  app_dir=$(canonical_path "$candidate")
-  is_under "$workspace_real" "$app_dir" ||
-    fail "working-directory must resolve inside github.workspace: '$working_directory'"
-  cd "$app_dir" || fail "could not enter application directory: $app_dir"
-}
-
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{ print $1 }'

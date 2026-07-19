@@ -49,7 +49,7 @@ parse_toolchain_from_channel_file() {
 
 parse_toolchain_from_toml() {
   local value
-  value=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*["'\''`]([^"'\''`]+)["'\''`][[:space:]]*$/\1/p' "$1" | head -n 1)
+  value=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*["'\''`]([^"'\''`]+)["'\''`][[:space:]]*(#.*)?$/\1/p' "$1" | head -n 1)
   [[ -n "$value" ]] || fail "malformed Rust toolchain TOML file: $1"
   printf '%s\n' "$value"
 }

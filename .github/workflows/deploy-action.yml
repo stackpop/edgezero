@@ -155,6 +155,26 @@ jobs:
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
         run: .github/actions/deploy-core/tests/assert-production-deploy.sh
 
+      # Prove the real rollback wiring: a production rollback consumes the deploy's
+      # `previous-version` output as `rollback-to` (no hardcoded version), and the
+      # activated target threads back out as `rolled-back-to`.
+      - name: Roll back production using the captured previous-version
+        id: rollback
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+          fastly-version: ${{ steps.deploy.outputs['fastly-version'] }}
+          rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
+          deploy-to: production
+
+      - name: Assert the rollback activated the captured previous-version
+        env:
+          EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.rollback.outputs['rolled-back-to'] }}
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
+        run: .github/actions/deploy-core/tests/assert-rollback-threaded.sh
+
   # Config push: the real config-push-fastly wrapper against a fake `fastly`,
   # proving the whole chain — artifact download, Fastly CLI install, the app
   # CLI's TYPED `config push` (the bundled stub cannot do this), and the
@@ -279,6 +299,7 @@ jobs:
         run: .github/actions/deploy-core/tests/assert-staged-calls.sh
 
       - name: Health check the staged version
+        id: health
         uses: ./.github/actions/healthcheck-fastly
         with:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
@@ -293,6 +314,8 @@ jobs:
       - name: Assert the staging IP was resolved and probed
         env:
           EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
+          EDGEZERO__TEST__HEALTHY: ${{ steps.health.outputs.healthy }}
+          EDGEZERO__TEST__STATUS_CODE: ${{ steps.health.outputs['status-code'] }}
         run: .github/actions/deploy-core/tests/assert-staging-probe.sh
 
       - name: Health check must FAIL when the probe is unhealthy

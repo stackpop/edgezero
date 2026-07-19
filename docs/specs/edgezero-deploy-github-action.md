@@ -474,11 +474,15 @@ too.
 Fastly resource links are **per-version**, and a link's `name` is an overridable
 alias. That is the seam:
 
-- A staged deploy owns a second store, `edgezero_runtime_env_staging`, creating
-  it on demand and **mirroring** production's runtime overrides into it — copying
+- A staged deploy owns a second, **per-service** store,
+  `edgezero_runtime_env_staging_<service-id>`, creating it on demand and
+  **mirroring** production's runtime overrides into it — copying
   adapter/logging/`__NAME` entries verbatim and redirecting only each declared
   config store's selector to `<id>_staging`. Because the mirror runs at deploy
-  time, the twin always reflects production's _current_ overrides.
+  time, the twin always reflects production's _current_ overrides. The name is
+  per service because Fastly config stores are account-wide, versionless
+  resources: a single shared twin would let one service's staged deploy clobber
+  another's selectors.
 - A staged deploy, while the draft is still editable, drops the inherited
   `edgezero_runtime_env` link and links the **staging store** under that same
   name. The runtime opens `edgezero_runtime_env` and gets the staging selector;
@@ -486,10 +490,10 @@ alias. That is the seam:
 
 So the pieces compose:
 
-| Version        | `edgezero_runtime_env` resolves to | Config key read      |
-| -------------- | ---------------------------------- | -------------------- |
-| active (prod)  | `edgezero_runtime_env`             | `app_config`         |
-| staged (draft) | `edgezero_runtime_env_staging`     | `app_config_staging` |
+| Version        | `edgezero_runtime_env` resolves to          | Config key read      |
+| -------------- | ------------------------------------------- | -------------------- |
+| active (prod)  | `edgezero_runtime_env`                      | `app_config`         |
+| staged (draft) | `edgezero_runtime_env_staging_<service-id>` | `app_config_staging` |
 
 A staged deploy **fails closed** when it cannot read the store listing (so it
 cannot tell whether production config exists): a version that silently served
@@ -874,7 +878,14 @@ actions never construct error messages containing credentials.
 6. Use Bash arrays; never use `eval`; never use Python.
 7. Allow-list `adapter` before using it in file selection or command arguments.
 8. Treat the checked-out application and `edgezero.toml` as executable code.
-9. Inject provider credentials only into the deploy step via `provider-env`.
+9. Scope provider credentials to the step that mutates or reads the provider.
+   The generic deploy step receives them as data via `provider-env` (the engine
+   hard-codes no provider names). The provider-specific lifecycle steps —
+   rollback-target capture, healthcheck, rollback, and config-push — instead
+   receive the token DIRECTLY under the adapter's own convention
+   (`FASTLY_API_TOKEN`, what the Fastly CLI/API read), because they call the
+   adapter, not the generic engine. Every OTHER inherited provider alias is
+   blanked in those steps, so only the one typed token is in scope.
 10. Never write provider credentials to `GITHUB_ENV`, `GITHUB_OUTPUT`, caches, or
     summaries.
 11. Clear the wrapper-supplied `provider-env-clear` aliases from non-provider
@@ -1026,7 +1037,7 @@ The design is implemented when:
 | Provider deploy builds while credentials are in scope | Keep the separate build credential-free; document caching caveats; require trusted immutable refs. |
 | Mutable refs execute unexpected manifest commands     | Caller owns checkout; document tag/SHA protection and GitHub Environment approvals.                |
 | Caching stores sensitive generated output             | Disable by default; exact keys only; cache only `target/`.                                         |
-| Provider CLI installer changes or disappears          | Pin versions and checksums; run scheduled installer tests.                                         |
+| Provider CLI installer changes or disappears          | Pin versions and checksums; a path-filtered gate runs the real installer when its pins change.     |
 | Monorepo has multiple provider manifests              | Require deterministic `working-directory` or explicit `edgezero.toml`; the actions do not guess.   |
 | Engine grows provider-specific behavior               | Keep provider concepts in wrappers and the CLI; keep `deploy-core` provider-neutral.               |
 

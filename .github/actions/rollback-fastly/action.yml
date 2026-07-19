@@ -9,10 +9,6 @@ inputs:
     description: Binary name inside the artifact. Defaults to the artifact metadata.
     required: false
     default: ""
-  working-directory:
-    description: Application directory relative to github.workspace (for manifest resolution in a monorepo).
-    required: false
-    default: .
   fastly-api-token:
     description: Fastly API token.
     required: true
@@ -102,7 +98,6 @@ runs:
       env:
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
-        EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__LIFECYCLE__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         EDGEZERO__LIFECYCLE__VERSION: ${{ inputs['fastly-version'] }}
         EDGEZERO__LIFECYCLE__ROLLBACK_TO: ${{ inputs['rollback-to'] }}

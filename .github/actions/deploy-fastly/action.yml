@@ -299,7 +299,6 @@ runs:
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
-        EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory'] }}
         # Only the typed token reaches the CLI; blank every inherited alias.
         FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
         FASTLY_SERVICE_ID: ""

@@ -21,10 +21,13 @@ set -euo pipefail
 # rollback target would leave production with no way back. Only the genuine
 # first-deploy case yields an empty target.
 #
+# `active-version` is manifest-independent (a pure Fastly-API call keyed on the
+# service id), so this runs the CLI from wherever the step is — no app-directory
+# resolution needed.
+#
 # Reads (env):
 #   EDGEZERO__APP__CLI__PATH / _BIN        required  the app CLI (via resolve_app_cli)
 #   EDGEZERO__FASTLY__SERVICE_ID           required  the Fastly service id
-#   EDGEZERO__PROJECT__WORKING_DIRECTORY   optional  app dir (monorepo manifest resolution)
 #   FASTLY_API_TOKEN                       required  provider token (Fastly's own convention)
 # Writes (outputs):
 #   previous-version                       the active version before this deploy (may be empty)
@@ -39,11 +42,6 @@ main() {
   service_id="${EDGEZERO__FASTLY__SERVICE_ID:?EDGEZERO__FASTLY__SERVICE_ID is required}"
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_cmd "$cli_bin"
-
-  # Resolve the app CLI to an absolute path BEFORE cd (it may be a workspace-
-  # relative path), then run from the app dir so its manifest load is correct.
-  case "$cli_bin" in /*) ;; *) [[ -e "$cli_bin" ]] && cli_bin=$(canonical_path "$cli_bin") ;; esac
-  enter_app_dir "${EDGEZERO__PROJECT__WORKING_DIRECTORY:-.}"
 
   new_private_log
   # Fail CLOSED on an operational failure: the CLI exits 0 for "no active version"

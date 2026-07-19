@@ -253,11 +253,18 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
             log::info!("version={version}");
             return Ok(());
         }
+        // Fallback: resolve the version the deploy just activated via the Fastly
+        // API. `--require-active` makes EmitVersion FAIL (not emit an empty
+        // `version=`) when the API reports no active version — a deploy that
+        // activated a version but resolves to none is an error, never a silent
+        // empty-version success.
+        let mut emit_args = passthrough.clone();
+        emit_args.push("--require-active".to_owned());
         return adapter::execute(
             &args.adapter,
             adapter::Action::EmitVersion,
             manifest.as_ref(),
-            &passthrough,
+            &emit_args,
         )
         .map_err(|err| {
             format!(
@@ -371,8 +378,9 @@ fn resolve_adapter_manifest_path(loader: Option<&ManifestLoader>, adapter: &str)
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
-    let manifest = load_manifest_optional()?;
-    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    // Manifest-independent, like `active-version`: a pure API/curl probe keyed on
+    // explicit flags, never a manifest-command override. Not loading the manifest
+    // keeps it correct regardless of the current directory (monorepo safety).
     let mut passthrough: Vec<String> = vec![
         "--service-id".to_owned(),
         args.service_id.clone(),
@@ -395,7 +403,7 @@ pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
     adapter::execute(
         &args.adapter,
         adapter::Action::Healthcheck,
-        manifest.as_ref(),
+        None,
         &passthrough,
     )
 }
@@ -412,8 +420,8 @@ pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
-    let manifest = load_manifest_optional()?;
-    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    // Manifest-independent, like `active-version` / `healthcheck`: a pure API
+    // operation keyed on explicit flags, never a manifest-command override.
     let mut passthrough: Vec<String> = vec![
         "--service-id".to_owned(),
         args.service_id.clone(),
@@ -437,12 +445,7 @@ pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
                 .to_owned(),
         );
     }
-    adapter::execute(
-        &args.adapter,
-        adapter::Action::Rollback,
-        manifest.as_ref(),
-        &passthrough,
-    )
+    adapter::execute(&args.adapter, adapter::Action::Rollback, None, &passthrough)
 }
 
 /// Resolve and print the currently-active service version as `version=<N>`.
@@ -457,12 +460,16 @@ pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
 /// configured, or the active version cannot be resolved.
 #[inline]
 pub fn run_active_version(args: &ActiveVersionArgs) -> Result<(), String> {
-    let manifest = load_manifest_optional()?;
-    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    // No manifest load: `active-version` is a pure Fastly-API operation keyed on
+    // `--adapter` + `--service-id`, and `EmitVersion` can never be a
+    // manifest-command override (see `adapter::manifest_command`). Loading the
+    // manifest would only couple it to the current directory — breaking it in a
+    // monorepo where a stray root `edgezero.toml` shadows the app's. The adapter
+    // registry still validates `--adapter`.
     adapter::execute(
         &args.adapter,
         adapter::Action::EmitVersion,
-        manifest.as_ref(),
+        None,
         &["--service-id".to_owned(), args.service_id.clone()],
     )
 }

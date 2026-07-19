@@ -1926,8 +1926,11 @@ fn parse_canonical_version_line(lower: &str) -> Option<u64> {
 /// `Ok(Some(n))` — a version is active. `Ok(None)` — the list parsed but NO
 /// version is active (a first-ever deploy; the caller records an empty rollback
 /// target and proceeds). `Err(_)` — the payload could not be parsed as a version
-/// list at all (schema drift / a truncated body), which is an OPERATIONAL
-/// failure the caller must not silently treat as "no active version".
+/// list, OR an entry is MALFORMED (a non-boolean `active`, or an `active: true`
+/// entry whose `number` is missing or not an unsigned integer). Both are
+/// OPERATIONAL failures the caller must NOT silently treat as "no active
+/// version" — otherwise a garbled response would fail open and let a production
+/// deploy proceed with no rollback target.
 fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|err| format!("failed to parse the Fastly version list as JSON: {err}"))?;
@@ -1935,11 +1938,30 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
         "the Fastly version list was not a JSON array; the API may have changed its schema"
             .to_owned()
     })?;
-    Ok(array.iter().find_map(|entry| {
-        (entry.get("active").and_then(serde_json::Value::as_bool) == Some(true))
-            .then(|| entry.get("number").and_then(serde_json::Value::as_u64))
-            .flatten()
-    }))
+    for entry in array {
+        // Fastly always includes a boolean `active`; a missing field is a
+        // non-active entry, but a PRESENT non-boolean is schema drift.
+        let active = match entry.get("active") {
+            None => continue,
+            Some(active_field) => active_field.as_bool().ok_or_else(|| {
+                format!(
+                    "a Fastly version entry has a non-boolean `active` field; the API may have changed its schema. Entry: {entry}"
+                )
+            })?,
+        };
+        if active {
+            // The active entry MUST carry an unsigned integer `number`. A
+            // missing or non-integer `number` here is a malformed active entry,
+            // not "no active version".
+            let number = entry.get("number").and_then(serde_json::Value::as_u64).ok_or_else(|| {
+                format!(
+                    "the active Fastly version entry has no unsigned-integer `number`; the API may have changed its schema. Entry: {entry}"
+                )
+            })?;
+            return Ok(Some(number));
+        }
+    }
+    Ok(None)
 }
 
 /// First staging IP found in a Fastly
@@ -2519,6 +2541,11 @@ fn relink_runtime_env_for_staging(
 /// rollback target. Only a real failure (API/auth error, or a version list that
 /// cannot be parsed) returns `Err`, so the caller can fail closed instead of
 /// silently proceeding without a rollback target.
+///
+/// `--require-active` flips the no-active-version case to an error: it is passed
+/// by the production-`deploy` version fallback, where a version was JUST
+/// activated, so "no active version" is not a valid first-deploy state but an
+/// operational failure the CLI must not report as success.
 fn emit_active_version(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
@@ -2526,6 +2553,10 @@ fn emit_active_version(args: &[String]) -> Result<(), String> {
     let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
     if let Some(version) = resolve_active_version(&json)? {
         log::info!("version={version}");
+    } else if arg_flag(args, "--require-active") {
+        return Err(format!(
+            "the deploy reported success but the Fastly API returns no active version for service {service_id}; refusing to report a deploy with no resolvable version"
+        ));
     } else {
         // Confirmed no active version (first-ever deploy). Emit an explicit
         // empty line so the caller records an empty rollback target and succeeds
@@ -3129,6 +3160,28 @@ mod tests {
         resolve_active_version("not json").expect_err("non-JSON must be an operational error");
         resolve_active_version(r#"{"error":"unauthorized"}"#)
             .expect_err("a non-array body must be an operational error");
+    }
+
+    #[test]
+    fn resolve_active_version_errors_on_malformed_active_entries() {
+        // A garbled ACTIVE entry must fail closed, not read as "no active
+        // version" — otherwise a production deploy proceeds with no rollback
+        // target. Each of these is malformed and must be an operational error.
+        resolve_active_version(r#"[{"active":true}]"#)
+            .expect_err("active entry with no `number` must error");
+        resolve_active_version(r#"[{"active":true,"number":"7"}]"#)
+            .expect_err("active entry with a string `number` must error");
+        resolve_active_version(r#"[{"active":"true","number":7}]"#)
+            .expect_err("a non-boolean `active` must error");
+        // A non-active entry with a bad `number` is irrelevant (we never read it)
+        // — but a non-boolean `active` anywhere is still schema drift.
+        resolve_active_version(r#"[{"active":"false"},{"active":true,"number":9}]"#)
+            .expect_err("a non-boolean `active` on any entry is schema drift");
+        // Sanity: a well-formed list still resolves.
+        assert_eq!(
+            resolve_active_version(r#"[{"active":false,"number":1},{"active":true,"number":2}]"#),
+            Ok(Some(2))
+        );
     }
 
     #[test]
