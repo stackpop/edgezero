@@ -1329,7 +1329,7 @@ deadline at headers." Adapter notes (§4.1–§4.4) implement this end-to-end.
 | Axum | `reqwest::RequestBuilder::timeout(effective)` — reqwest applies it through response-body read | Real, whole-operation |
 | Cloudflare | race the entire `send_one` future (fetch **and** body drain) against `worker::Delay(effective)`; drop on expiry | Real, whole-operation |
 | Spin | race the entire `send_one` future (send **and** body collect) against a wasi monotonic-clock timer; drop on expiry | Real, whole-operation |
-| Fastly | host phase timers split per §4.3 over the **bucketed** budget (`connect = budget_bucket/4`, `first_byte = 3*budget_bucket/4`, `between_bytes = budget_bucket`; `budget_bucket` is ≥ budget and < 1.1×); during body drain, `budget.deadline.is_expired()` is checked **after every blocking body read returns, including the EOF read** (the synthetic 30 s deadline applies when no caller deadline was set); the host between-bytes timeout bounds each gap | Real for connect+headers with a documented phase split (see §4.3 — a connect that itself takes longer than `budget/4` fails even if the rest of the budget would have sufficed); **bounded-cooperative** for the body phase |
+| Fastly | host phase timers split per §4.3 (`connect = budget/4`, `first_byte = 3*budget/4`, `between_bytes = budget`); during body drain, `budget.deadline.is_expired()` is checked **after every blocking body read returns, including the EOF read** (the synthetic 30 s deadline applies when no caller deadline was set); the host between-bytes timeout bounds each gap | Real for connect+headers with a documented phase split (see §4.3 — a connect that itself takes longer than `budget/4` fails even if the rest of the budget would have sufficed); **bounded-cooperative** for the body phase |
 
 **Fastly precision, stated honestly.** Fastly has no guest wall-clock primitive to
 preempt a chunk read in progress. At dispatch the adapter computes `let budget =
@@ -1343,9 +1343,11 @@ every other adapter) and derives the host timeouts via the named helper:
 // and `arithmetic_side_effects` are hard errors — no `as` casts, no bare `+`/`-`/`/`.
 // Use `Duration::as_millis` (already integer-ms), saturating/checked arithmetic, and
 // `u64::try_from` instead of `as u64`.
-// Returns the BUCKETED host-timeout ms — the single source used for BOTH the phase
-// split (connect/first-byte/between-bytes) AND the backend identity key, so a cached
-// backend's timers always match the identity it was registered under.
+// Returns the EXACT host-timeout ms (true ceil-to-ms) — the single source used for BOTH
+// the phase split (connect/first-byte/between-bytes) AND the backend identity key, so a
+// cached backend's timers always match the identity it was registered under. No
+// bucketing: the cache is per-session and bounded by the fan-out size, so the raw value
+// is fine and keeps the deadline bound exact.
 fn fastly_timeout_ms(budget: &DispatchBudget) -> u64 {
     // True ceil-to-ms — never floor a sub-ms remainder away.
     // `as_millis` floors, so add 1 when there is a sub-ms remainder.
@@ -1357,24 +1359,11 @@ fn fastly_timeout_ms(budget: &DispatchBudget) -> u64 {
         .saturating_add(u128::from(has_remainder))
         .max(1);
 
-    // Bucket UP a geometric ladder (ratio 1.1) so the result is in [ceil_ms,
-    // 1.1*ceil_ms): bounds the session cache to ~213 buckets AND the headers-phase
-    // overshoot to <10%. Integer-only (no float `as`, forbidden by the lint): step a
-    // running value up by *11/10 with checked arithmetic until it reaches ceil_ms.
-    let mut bucket_ms: u128 = 1;
-    while bucket_ms < ceil_ms {
-        bucket_ms = bucket_ms
-            .saturating_mul(11)
-            .checked_div(10)
-            .unwrap_or(u128::MAX)
-            .max(bucket_ms.saturating_add(1)); // ensure strict progress for small values
-    }
-
     // The DEADLINE_FAR_FUTURE clamp keeps this below Fastly's 2^32 ms ceiling. Clamp
     // defensively, then convert fallibly — a bug elsewhere must not crash the host,
     // and a bare `as` cast is forbidden by the lint.
     let ceiling = u128::from(u32::MAX).saturating_sub(1);
-    let clamped = bucket_ms.min(ceiling);
+    let clamped = ceil_ms.min(ceiling);
     u64::try_from(clamped).unwrap_or(u64::from(u32::MAX).saturating_sub(1))
 }
 
@@ -1438,7 +1427,7 @@ let budget = dispatch_budget(req, now)?;
 // where the 1/4 share would round to 0, we degenerate to "both = total_ms" —
 // the absolute-deadline bound becomes 2*total_ms but at sub-4 ms scale this is
 // negligible (and the ceil-to-ms rounding already dominates).
-let total_ms = fastly_timeout_ms(&budget);                 // BUCKETED ceil-to-ms (>= budget, < 1.1x)
+let total_ms = fastly_timeout_ms(&budget);                 // exact ceil-to-ms of budget.duration
 let (connect_ms, first_byte_ms) = if total_ms < 4 {
     (total_ms, total_ms)                                   // sum = 2*total_ms; documented
 } else {
@@ -2436,7 +2425,7 @@ uploads use `Body::Once`, no `stream.next().await`, and fall under `outbound-dea
 budget as one elastic pool. On Axum/CF/Spin there is a single total SDK timeout
 (reqwest's `.timeout(..)`, `worker::Delay`, the wasi timer); a slow connect followed
 by a fast headers+body inside the total budget succeeds. On Fastly the budget is
-**rigidly split** (§4.3 — over the bucketed budget: `connect = budget_bucket/4`, `first_byte = 3*budget_bucket/4`,
+**rigidly split** (§4.3 — `connect = budget/4`, `first_byte = 3*budget/4`,
 `between_bytes = budget`); a request that takes more than `budget/4` on connect-phase
 work fails at the connect timer even though the rest of the budget would have
 sufficed. This is a documented `BestEffort` deviation — the platform-level cause is
@@ -2710,19 +2699,29 @@ Commands covered by the **five** gate sites above (one inside `execute(..)` — 
 | `edgezero deploy` | `run_deploy` → `execute(Action::Deploy, ..)` | `execute(..)` — **gated** |
 | `edgezero auth login` / `logout` / `status` | `run_auth` → `execute(Action::AuthLogin/Logout/Status, ..)` | **EXEMPT** (credential + read-only class). The `execute(..)` gate must **branch on the action** and skip the `Auth*` actions. |
 | `edgezero provision` | `run_provision` → `Adapter::provision(..)` | `run_provision(..)` sibling — **gated** |
-| `edgezero config push` | real writeback is **`run_config_push_typed`** in the downstream typed CLI (the bundled `run_config_push` is a v1 stub that errors) | `run_config_push_typed(..)` — **gated** (via the shared inner op, both entries) |
+| `edgezero config push` | real writeback is **`run_config_push_typed`** in the downstream typed CLI (the bundled `run_config_push` is a v1 stub that errors) | `run_config_push_typed(..)` — **gated (TYPED entry only)**; the bundled stub is not a gate site (gating an erroring stub enforces nothing). *No shared two-entry op* — unlike `config validate`, only the typed push path performs work |
 | `edgezero config diff` | `run_config_diff_typed` → resolves an adapter via `run_shared_checks` | **EXEMPT** (read-only diagnostic class). Reverses the earlier "gate `config diff`" draft — a read-only diff must not hard-fail on a runtime mismatch. |
 | `edgezero config validate` | `run_config_validate` / `run_config_validate_typed` — **adapter-less** (`ConfigValidateArgs` has no `adapter` field); validates against **all configured adapters** in `[adapters]` | **gated** via the shared inner op (§ note above) that **both** the bundled and typed entries call, looping every configured adapter |
 | `edgezero demo` (feature `demo-example`) | `run_demo` → Axum runner. `run_demo()` takes **no path or loader** and reads no manifest file, so a file-based gate is impossible. **Locked resolution — gate on baked manifest metadata via a new `Hooks` accessor** (see below) | `run_demo()` calls `ensure_capabilities("axum", <App as Hooks>::manifest().as_contract())` before the Axum runner starts |
 
 **The `demo` gate needs a baked-manifest accessor — `app!` must emit one.**
 `run_demo()` (`crates/edgezero-cli/src/demo_server.rs`) hardcodes `run_app::<App>()` for the
-concrete `app_demo_core::App`, so a test cannot inject a crafted `Hooks`. **Add a generic
-`run_demo_for<A: Hooks + App>()`** that gates on `<A as Hooks>::manifest().as_contract()` then
-runs `A`; `run_demo()` becomes a one-line `run_demo_for::<app_demo_core::App>()`. The failure
-test calls `run_demo_for::<TestApp>()` with a `TestApp` whose `manifest_json()` returns the
-crafted contract — no manifest file, no macro re-expansion. Without this seam the required
-gate test is unwritable.
+concrete `app_demo_core::App` (a **struct**, so it cannot be a trait bound), so a test cannot
+inject a crafted `Hooks`. **Add a PURE gate helper**, not a generic `run_demo`:
+
+```rust
+// edgezero-cli — no server start, so a test can call it directly and cheaply.
+pub(crate) fn demo_capability_gate<A: Hooks>() -> Result<(), String> {
+    ensure_capabilities("axum", <A as Hooks>::manifest().as_contract())
+}
+```
+
+`run_demo()` calls `demo_capability_gate::<app_demo_core::App>()?` **before** `run_app`. The
+failure test calls `demo_capability_gate::<TestApp>()` directly — no blocking server on the
+success path. **`TestApp` must override `manifest()`, not just `manifest_json()`:** the default
+`manifest()` returns `Absent` (a static in the trait default would be shared across impls), so
+overriding only `manifest_json()` would leave the gate seeing `Absent` and proceeding. `TestApp`
+overrides `manifest()` to return `BakedManifest::from_baked_json(<crafted-json>)`.
 it has no path, no `ManifestLoader`, and no way to find `edgezero.toml` at runtime. But
 the `app!` macro **already parses, validates, and serializes the manifest at compile
 time** (`crates/edgezero-macros/src/app.rs`: `manifest.finalize()` →
@@ -3462,10 +3461,9 @@ async fn send_all(
   documented recovery (`Backend::from_str(name)`) returns a handle without
   exposing the registered properties. EdgeZero therefore owns the entire
   uniqueness story **at the guest layer**: a **session-scoped** adapter-local cache
-  (a `thread_local!` `RefCell<HashMap<String, (BackendIdentity, Backend)>>` — **not**
-  a field on `FastlyOutboundClient`, which is rebuilt per inbound request while
-  backend names are session-global; see *Cache ownership* below for the full
-  rationale and the no-`Mutex` single-threaded-guest model) holds the identity →
+  (a per-session `RefCell<HashMap<String, (BackendIdentity, Backend)>>` **field on the
+  per-request `FastlyOutboundClient`** — fresh each request/session; see *Cache
+  ownership* below for why a per-request field is correct and a cross-request cache is wrong) holds the identity →
   backend mapping, and a hit
   reuses the cached `Backend` while a miss calls `Backend::builder(..).finish()`
   exactly once. Because EdgeZero hashes every relevant property into the
@@ -3473,49 +3471,34 @@ async fn send_all(
   distinct names — so a 50 ms slot and a 3 s slot to the same host get distinct
   backends by construction, not by SDK-side property comparison. A
   `NameInUse` on a name **not** in the adapter's collision map can therefore
-  only mean an externally-registered backend (another component, a prior
-  session) is squatting the name — fail-closed `EdgeError::internal` because
+  only mean an externally-registered backend (a static service backend, or another
+  component in **this** session — NOT a prior session, whose names are gone) is squatting the name — fail-closed `EdgeError::internal` because
   the SDK does not let us prove identity match. The precise collision-detection
   protocol is in the §4.3 algorithm later in this section.
 
   Identity tuple:
-  `scheme + ":" + host + ":" + resolved_port + ":" + tls_mode + ":" + budget_bucket_ms`,
+  `scheme + ":" + host + ":" + resolved_port + ":" + tls_mode + ":" + budget_ms`,
   where:
   - `resolved_port` is the URI port or scheme default (`80`/`443`).
   - `tls_mode` is `"tls"` for `https` or `"plain"` for `http`.
-  - **`budget_bucket_ms` is a BUCKETED budget, not the raw ceil-to-ms — this bounds the
-    session cache.** The raw ceil-to-ms of `dispatch_budget(req).duration` drifts by a
-    millisecond or two across requests even for a *nominally identical* deadline
-    (`duration` = `deadline.remaining()` at dispatch, minus however much wall-clock
-    elapsed since `batch_now`). Since the backend cache is a **session-wide**
-    `thread_local!` (survives across requests), a repeated 100 ms deadline would
-    otherwise register a fresh backend for 97, 98, 99, 100 ms … — **unbounded growth
-    over the session's lifetime**, one leaked dynamic backend per distinct millisecond.
-    So the identity uses `budget_ms` **rounded UP a TIGHT geometric grid — the next
-    power of `1.1` (10 % steps)**: `budget_bucket_ms = ceil_pow(ceil_ms, 1.1)`. A
-    geometric grid bounds **both** quantities that matter: the bucket **count** is
-    `log_1.1(range)` ≈ 213 buckets from 1 ms to the 7-day clamp (independent of request
-    count), **and** the relative gap to the real budget is `< 10 %`. A coarse 1-2-5 grid
-    (an earlier draft) was **rejected** — its 2×–2.5× steps turn a 201 ms budget into a
-    500 ms bucket, i.e. a ~299 ms overshoot on the one phase that cannot self-preempt
-    (below).
-  - The **host timers are armed with the BUCKET value** (`connect-timeout` /
-    `first-byte-timeout` / `between-bytes-timeout` from `budget_bucket_ms`), which is
-    `≥` the caller's real budget — a *looser* backstop, never tighter, so it can only
-    fire late, never early.
-  - **⚠️ This DOES loosen the headers-phase deadline (bounded, documented) — the
-    contract is NOT "unchanged".** The **body** phase is still enforced to the
-    millisecond by the cooperative `budget.deadline.is_expired()` check against the
-    original `Deadline`. But the **headers** phase (connect + first-byte) has **no**
-    cooperative check — the guest is blocked inside the SDK awaiting headers, so only
-    the host timer bounds it. With a bucketed timer, a request can therefore block in
-    the headers phase up to `budget_bucket_ms`, i.e. **up to ~10 % past the caller's
-    budget** (the grid ratio), before the host timer fires. This is a real, bounded
-    degradation and is folded into Fastly's already-`BoundedCooperative` posture for
-    `outbound-deadlines`: the documented bound becomes "body phase exact; headers phase
-    ≤ `1.1 ×` budget (geometric-bucket overshoot) plus the connect/first-byte split".
-    Apps needing the headers phase bounded tighter than 10 % on Fastly declare
-    `outbound-deadlines` as needing exactness and target a different adapter.
+  - `budget_ms` is the **exact true-ceil-to-ms** of `dispatch_budget(req).duration` —
+    `((duration.as_nanos() + 999_999) / 1_000_000).max(1)`, lint-clean form in the
+    `fastly_timeout_ms` helper. **No bucketing.** The cache is **per-session** (below),
+    so it cannot grow unbounded across requests — earlier drafts bucketed the budget to
+    bound a *cross-request* thread-local cache, but that cache model was wrong (Fastly
+    backend names are **session-scoped**, verified against `BackendBuilder` docs — a new
+    request is a new session with a fresh namespace). Within one session a `send_all`
+    shares a single `batch_now`, so same-budget slots to the same host compute the
+    **same** `budget_ms` → one backend; distinct budgets → distinct backends. The cache
+    is therefore bounded by the number of distinct `(host, budget)` pairs in the
+    session's fan-out (≤ batch size), with **no** millisecond drift to bucket away.
+  - The **host timers use `budget_ms` exactly** (`connect-timeout` /
+    `first-byte-timeout` / `between-bytes-timeout` derive from the exact value), so the
+    headers phase is bounded by `budget.duration` (+ ms-rounding + `BATCH_DISPATCH_SLACK_MAX`),
+    **not** a looser bucket. The body phase is additionally enforced to the millisecond by
+    the cooperative `budget.deadline.is_expired()` check against the original `Deadline`.
+    Removing the bucket removes the ~10 % headers-phase overshoot an earlier draft
+    introduced; the net guarantee is again exactly what §4.3 "Net guarantee" states.
   - `ceil_ms` itself is the **true ceil-to-ms** — `((duration.as_nanos() + 999_999) /
     1_000_000).max(1)` (lint-clean form per §3.3.2), since `as_millis()` floors and
     would make the *bucket* input too small. (Apps wanting sub-ms wall-clock should not
@@ -3633,39 +3616,43 @@ async fn send_all(
   see §4.1 / §4.2 / §4.4 step 3). **Collision detection** is
   belt-and-suspenders.
 
-  **Cache ownership — SESSION-scoped `thread_local!`, NOT a field on the client.**
+  **Cache ownership — a PER-SESSION map (a `RefCell` field on the per-request client).**
   This is the single authoritative statement; it governs the protocol below and the
-  §4.3 *Dynamic backends* discussion. Fastly dynamic-backend **names are
-  session-global** (registered for the whole Compute session, across inbound
-  requests), but `FastlyOutboundClient` is **constructed per inbound request**
-  (`crates/edgezero-adapter-fastly/src/request.rs` inserts a fresh one into each
-  request's extensions). A map held *as a field on the client* would therefore start
-  **empty on every request**, so request #2 to the same host would rebuild the name,
-  hit `NameInUse`, have no cached identity to verify against, and **fail closed**. The
-  map must outlive the client:
+  §4.3 *Dynamic backends* discussion. **Fastly dynamic-backend names are
+  session-scoped, NOT global across requests** (verified against the `BackendBuilder`
+  docs: connections to same-name+settings backends *pool* across sessions, but each
+  session registers into its **own** namespace — a `NameInUse` only fires within the
+  current session). Every inbound request is a **new session**: `FastlyOutboundClient`
+  is constructed per request (`crates/edgezero-adapter-fastly/src/request.rs`), it gets
+  a **fresh** cache, and the session's backend namespace is **also fresh** — so request
+  #2 re-registering `ez_abc` does **not** collide with request #1's registration (that
+  was a different session). The cache is therefore correctly a **field on the per-request
+  client**, and its lifetime matches the session by construction:
 
   ```rust
-  thread_local! {
-      static BACKENDS: RefCell<HashMap<String, (BackendIdentity, Backend)>> =
-          RefCell::new(HashMap::new());
+  struct FastlyOutboundClient {
+      // Per-request/per-session dedup map. Interior mutability; single-threaded
+      // WASM guest, so a RefCell (no Mutex, no Send + Sync) is the whole model.
+      backends: RefCell<HashMap<String, (BackendIdentity, Backend)>>,
+      // …
   }
   ```
 
-  **No `Mutex`, no `Send + Sync` requirement:** the Fastly guest is single-threaded
-  WASM, so a `thread_local!` + `RefCell` is sufficient and is the whole
-  synchronization model. (Earlier drafts specified a
-  `Mutex<HashMap<..>>` field on `FastlyOutboundClient` "one per request context" —
-  that is **wrong on both counts**: wrong lifetime, and an unnecessary lock.) Each
-  per-request `FastlyOutboundClient` **reads/writes this shared session map** rather
-  than owning one. The **test seam** (§5.5) therefore exposes the *thread-local* map,
-  not a client field.
+  **This reverses two earlier drafts that were wrong for the same root reason** — the
+  belief that names persist across requests. One made the cache a cross-request
+  `thread_local!` (which would carry **stale** entries into a reused instance's next
+  session, where those names are unregistered); another bucketed the budget to bound
+  that non-existent cross-request growth. Neither is needed: the map exists only to
+  **dedup within a single session's fan-out** (multiple `send_all` slots / multiple
+  `send`s in one handler to the same host+budget reuse one registration), so its size
+  is bounded by the fan-out, and it is discarded when the request ends. The **test seam**
+  (§5.5) exposes this client field.
 
-  The protocol below is written directly in terms of the session-map borrow. There is
-  no lock and no contention: the guest is single-threaded, so the borrow is uncontended
-  by construction. (Read any surviving "lock" phrasing in the appendices as the
-  superseded `Mutex` design.)
+  The protocol below borrows the map with no lock and no contention — the guest is
+  single-threaded, so the borrow is uncontended by construction. (Read any surviving
+  "lock" / "thread-local" phrasing in the appendices as superseded.)
 
-  1. Borrow the session map (`BACKENDS.with_borrow_mut(..)`).
+  1. Borrow the map (`self.backends.borrow_mut()`).
   2. If the name maps to a stored entry `(stored_identity, cached)`:
      - **`stored_identity == identity`**: clone the cached `Backend`, drop the
        lock, dispatch.
@@ -3897,7 +3884,7 @@ async fn send_all(
     `EdgeError::internal("dynamic backend name collision — refusing to reuse")`.
   - **Single `send`** — same lookup path; same fail-closed behaviour.
   - **Across calls — the cache MUST be session/process-scoped, NOT per-client.**
-    Fastly dynamic-backend **names are session-global**: once `Backend::builder(name,..)`
+    Fastly dynamic-backend **names are session-scoped** (per request execution): once `Backend::builder(name,..)`
     registers a name, it stays registered for the whole Compute session (across inbound
     requests), and re-registering the same name returns `NameInUse`. But
     `FastlyOutboundClient` (a.k.a. today's `FastlyProxyClient`) is **constructed per
@@ -3906,7 +3893,7 @@ async fn send_all(
     **empty on every request** — so request #2 to the same host rebuilds the name, hits
     `NameInUse`, and (having no cached identity to verify against) **fails closed**. That
     is a latent bug the current adapter avoids only because it has no cache at all today.
-    The cache must live at **session scope**: a module-level `thread_local!`
+    The cache is a **per-session field** on the per-request client (fresh each request): a `RefCell`
     (the Fastly guest is single-threaded, so no `Mutex` is needed) holding the
     `HashMap<name, (BackendIdentity, Backend)>`, populated across requests for the life of
     the instance. Each per-request `FastlyOutboundClient` reads/writes that shared map
@@ -4446,8 +4433,8 @@ async fn send_all_runs_requests_concurrently() {
 | **`validate_for_dispatch` runs at DISPATCH, not construction** (§3.1.4): `OutboundRequest::get(url)?.body(payload)` — a `GET` validated at construction that then acquires a body via the infallible `.body()` setter — is still rejected with `bad_request` when it reaches `send` / `send_all`. **This is the regression guard**: a construction-only check passes this test vacuously, so the test must assert the rejection happens with the body attached *after* a successful `get(..)` | yes | yes | — |
 | **`GET`/`HEAD` + `Body::Stream` → `bad_request` unconditionally** (§3.1.4), even for a stream that would yield zero bytes — emptiness is not observable without consuming the stream, and the validator does not peek-and-rechain. Asserts the documented false-positive is deliberate | yes | yes | — |
 | **`StoredError` reconstruction** (§3.4.5): after a poisoning drain, **every** access (`body_bytes` / `json_within` / `form_within` / `into_request`) returns an `EdgeError` with the **same variant, status, and message**. Asserts poison is reproducible even though `EdgeError` is not `Clone` (its `Internal` variant wraps non-clonable `anyhow::Error`). Also asserts the documented loss: a reconstructed `internal` error's `inner()` carries the message but **not** the original `anyhow` source chain | yes | — | — |
-| **`demo` capability gate reads the baked manifest** (§3.5.3): a test-only `Hooks` impl overriding `manifest_json()` to return a crafted manifest that `required`s a capability Axum only `BestEffort`-supports causes `run_demo_for::<TestApp>()` to exit non-zero (the injectable seam; `run_demo()` itself is `run_demo_for::<app_demo_core::App>()`). Asserts the gate works with **no manifest file on disk** — the whole point of the baked accessor. A `Hooks` impl with the default `manifest_json() == None` → no capability contract → `demo` runs | yes | — | — |
-| **Baked manifest FAILS CLOSED on invalid contract** (§3.5.3): a crafted `manifest_json()` returning valid JSON that is missing required manifest fields (e.g. `{}`) makes `from_baked_json` return `BakedManifest::Malformed` (it runs `validate()`, not just parse+finalize), so `ensure_capabilities` **hard-fails** — it does NOT proceed against defaulted empty capabilities. Regression guard: parse-only (skipping `validate()`) would make `{}` `Present` and silently disable enforcement | yes | — | — |
+| **`demo` capability gate reads the baked manifest** (§3.5.3): a test-only `Hooks` impl overriding `manifest_json()` to return a crafted manifest that `required`s a capability Axum only `BestEffort`-supports causes `demo_capability_gate::<TestApp>()` to return `Err` (the pure seam — no server started; `run_demo()` calls it before `run_app`). `TestApp` overrides `manifest()` (not just `manifest_json()`, whose value the default `manifest()` ignores). Asserts the gate works with **no manifest file on disk** — the whole point of the baked accessor. A `Hooks` impl with the default `manifest_json() == None` → no capability contract → `demo` runs | yes | — | — |
+| **Baked manifest FAILS CLOSED on invalid contract** (§3.5.3): a crafted `manifest_json()` returning JSON that **parses but fails `validate()`** — e.g. an invalid outbound host `{"capabilities":{"outbound":{"hosts":["ftp://x"]}}}` (rejected by `validate_outbound_hosts`), or a capability listed in **both** `required` and `optional` — makes `from_baked_json` return `BakedManifest::Malformed`, so `ensure_capabilities` **hard-fails**. **NOT `{}`:** an empty manifest is explicitly *valid* (every field defaults; `empty_manifest_has_defaults` in `manifest.rs`), so `{}` yields `Present` with empty capabilities, not `Malformed`. Regression guard: parse-only (skipping `validate()`) would make the invalid fixture `Present` and silently disable enforcement | yes | — | — |
 | **Spin `allowed_outbound_hosts` — `provision` writes** (§3.5.4): `edgezero provision --adapter spin` renders `[capabilities.outbound].hosts` into `spin.toml`, **preserving sibling fields and comments** (`toml_edit`), and is a no-op under `--dry-run`. Absent `[capabilities.outbound].hosts` → writes `["https://*:*"]` and **never** widens to include `http://*:*` (security-default regression guard) | yes | — | — |
 | **Spin `allowed_outbound_hosts` — `build`/`serve`/`deploy` validate, never write** (§3.5.4): drift between `spin.toml` and the manifest hard-fails with the expected list rendered; `spin.toml` is **byte-identical** afterwards (asserts the build path does not rewrite a git-tracked, user-owned file). Comparison is over **canonicalized sets**: `https://x:443` vs `https://x`, and a reordered list, must **not** report drift | yes | — | — |
 | **Spin sync hook fires for shell-overridden commands** (§3.5.4) — **dead-code regression guard.** A scaffolded manifest declares `[adapters.spin.commands].build`, so `edgezero build --adapter spin` takes the `manifest_command` → `run_shell` branch and **never reaches `SpinCliAdapter::execute`**. The test asserts the drift check **still fires** — proving the hook lives in `edgezero_cli::adapter::execute` *before* the `manifest_command` branch, not in the adapter. A hook placed in the adapter passes every other Spin test and silently fails only this one | yes | — | — |
@@ -4466,8 +4453,7 @@ async fn send_all_runs_requests_concurrently() {
 | Fastly `send_all` Buffered mode, **body phase**: a slot whose own `budget.deadline` would have covered its body in isolation can still return `gateway_timeout` because an earlier slot's body drain monopolised harvest. The contract explicitly admits these harvest-order-induced 504s on Fastly Buffered. **Adapter-specific harvest mechanics** — Tier 1's mock has no harvest queue and cannot reproduce the head-of-line block; covered by Tier 2 (deterministic harvest ordering against a host-side fake) and Tier 3 (Viceroy wall-clock) | — | yes | yes |
 | `[capabilities] required = ["send-all-slot-isolation"]` on a Fastly target → **every adapter-selecting CLI command** (`build` / `serve` / `deploy` / `provision` / `config push` / `config validate` / `demo` — the gated classes) exits non-zero with the BestEffort + required hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)` branching to skip `auth`, four siblings on `run_provision` / `run_config_push_typed` / `run_config_validate` / `run_demo`); `config diff` and `auth *` are exempt; same manifest on Axum/CF/Spin passes | yes | — | — |
 | Fastly mixed-budget `send_all` to the **same host**: slots with `50 ms` and `3 s` budgets create **distinct** dynamic backends (identity tuple includes `budget_ms`); the 50 ms slot's host timeout is not silently inherited by the 3 s slot or vice versa. **Asserts the Fastly identity tuple** — Tier 1's mock has no dynamic-backend abstraction; Tier 2 (Fastly contract crate) inspects the registered-backend map and Tier 3 (Viceroy) observes the wall-clock divergence | — | yes | yes |
-| **Fastly cache is BOUNDED across requests — millisecond noise is bucketed** (§4.3): repeatedly dispatching to the same host with a *nominally identical* deadline (whose raw ceil-to-ms drifts, e.g. 97/98/99/100 ms) registers **one** backend, not one per millisecond. Assert: N such dispatches whose raw `ceil_ms` spans one 1-2-5 bucket leave the registered-backend map at size 1 (regression guard against the unbounded session-cache growth an exact-`budget_ms` identity would cause). Distinct *buckets* (50 ms vs 3 s) still get distinct backends per the row above | — | yes | yes |
-| **Fastly geometric bucket: overshoot < 10 %, never premature** (§4.3): `fastly_timeout_ms` rounds ceil-to-ms up a ratio-1.1 ladder. Assert (pure Tier 1, no runtime): result ≥ real ceil-to-ms (host timer never fires early); result < 1.1 × ceil-to-ms for budgets ≥ 20 ms (bounded headers-phase overshoot); 97/98/99/100 ms collapse to ≤ 2 buckets; the whole 1 ms–7 day range yields < 300 distinct buckets. Concrete: 201 ms → 215 ms (NOT the 500 ms a 1-2-5 grid gave), 100 ms → 103 ms | yes | — | — |
+| **Fastly per-session cache is bounded by fan-out size** (§4.3): a `send_all` of N slots to the same host with the same shared `batch_now` budget registers **exactly one** backend (identical `budget_ms`); N slots with N distinct budgets register N backends. Across requests the cache is fresh (session-scoped names), so there is no cross-request accumulation to bound. Regression guard against a cross-request thread-local cache | — | yes | yes |
 | `RequestContext::into_request()` after `body_bytes` poison: returns `Err(stored_err)`, not `Ok(Request<Body::empty()>)` — a permissive proxy-forward cannot mask a stricter middleware's poisoned read | yes | — | — |
 | Fastly + `outbound-http = required`: `ensure_capabilities` emits the dynamic-backends informational log | yes | — | — |
 | **Fastly stage 1 — `BackendCreationError` (registration), per the exhaustive §4.3 table.** `Disallowed` and `HostError` → **`bad_gateway` (502)** (genuine host rejection; `Disallowed` carries the "enable dynamic backends" diagnostic). **`ConnectTimeoutTooLarge` / `FirstByteTimeoutTooLarge` / `BetweenBytesTimeoutTooLarge` / `NameTooLong` / `EncodingError` → `internal` (500)** — these mean **EdgeZero** broke its own clamp/naming invariant, so mapping them to 502 would disguise an adapter bug as an upstream failure (regression guard). `BackendCreationError` is constructible + `PartialEq` + not `#[non_exhaustive]`, so each branch is unit-testable directly and the match is exhaustive. A fake builder cannot produce DNS/TLS/connect branches — those are stage-2 | yes | yes | — |
@@ -4504,7 +4490,7 @@ async fn send_all_runs_requests_concurrently() {
 | Capability enforcement: a manifest requiring `lazy-streamed-response-passthrough` causes the **`edgezero demo` runner** (contributor-only, the PR-#269 replacement for the removed `dev` command) to exit non-zero with the Axum BestEffort hard-fail message — via `run_demo(..)`'s sibling pre-dispatch gate against the Axum adapter, *not* via the `execute(..)` path (`demo` does not flow through it). The same hard-fail also fires via `execute(..)`'s pre-dispatch gate on `build` / `serve` / `deploy` (**not** `auth` — exempt), and via the `run_config_push_typed` / `run_config_validate` / `run_provision` siblings. Test asserts every **gated** command exits non-zero, and that `config diff` / `auth *` do **not** | yes | — | — |
 | `[capabilities.outbound].hosts` Spin render output is canonicalized: `["HTTPS://EXAMPLE.com:443", "api.example.com"]` → rendered `spin.toml` shows `["https://example.com", "https://api.example.com"]` (lowercase scheme/host, default port stripped, default-scheme https for bare hosts) | yes | — | — |
 | Fastly `send_all` dispatch-overhead slack hard-bounded: with the adapter's **`test-utils`-gated** injection hook (NOT `#[cfg(test)]` — external integration tests compile the lib without it, §5.5) set to `Duration::from_millis(50)`, a `send_all` of N requests returns an `EdgeError::internal` whose message **contains the stable substring `"BATCH_DISPATCH_SLACK_MAX"`** (the full normative diagnostic per §4.3 is `"Fastly send_all adapter overhead between batch_now and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) exceeded BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration"`) for the slots dispatched after the cumulative delay crosses `BATCH_DISPATCH_SLACK_MAX` (25 ms). Without the hook, no slot ever returns that error. A handler-side `thread::sleep` before `send_all` is **not** sufficient — it runs before `batch_now` is captured and cannot exercise the guard. Tests assert against the substring, not the full string, so future wording polish doesn't break them. **The hook lives in the Fastly adapter crate**, so this row is Tier 2 (substring assertion in `crates/edgezero-adapter-fastly/tests/contract.rs`) + Tier 3 (Viceroy with hook) — not Tier 1 (Tier 1's `MockOutboundClient` has no SDK arming step to wrap) | — | yes | yes |
-| Fastly dispatch+headers phase-budget split **(common case, `total_ms ≥ 4`)**: a single `send` to a target that never returns headers fires the host timeout at `connect_ms + first_byte_ms = budget_bucket_ms`, **not** `2 × budget`. Two separate test fakes — one that hangs the TCP connect, one that hangs after request bytes are sent — each return 504 within `budget_bucket_ms + BATCH_DISPATCH_SLACK_MAX + ms_rounding` (i.e. ≤ ~1.1 × budget + 29 ms — the geometric-bucket headers overshoot), never twice the budget. The sub-4 ms degenerate branch is covered by the row below | — | yes | yes |
+| Fastly dispatch+headers phase-budget split **(common case, `total_ms ≥ 4`)**: a single `send` to a target that never returns headers fires the host timeout at `connect_ms + first_byte_ms = budget.duration`, **not** `2 × budget.duration`. Two separate test fakes — one that hangs the TCP connect, one that hangs after request bytes are sent — each return 504 within `budget.duration + BATCH_DISPATCH_SLACK_MAX + ms_rounding` (< 29 ms + budget), never twice the budget. The sub-4 ms degenerate branch is covered by the row below | — | yes | yes |
 | Fastly single-`send` dispatch-overhead slack guard: the same **`test-utils`-gated** injection hook used for `send_all` (round 31) also wraps the single-send path between `dispatch_budget` and `send_async`; with the hook set to 50 ms, a single `send` returns `internal("Fastly send adapter overhead between dispatch_budget and SDK arming exceeded BATCH_DISPATCH_SLACK_MAX; …")`. Single send is **not** "structurally 0 slack" — the same hard constant applies (round 38) | — | yes | yes |
 | Fastly body-phase EOF deadline: an upstream that sends headers + N-1 chunks within budget but holds the final read so EOF arrives *after* `budget.deadline` returns `gateway_timeout`, not `Ok(resp)`. Buffered drain checks `is_expired()` after every blocking read including EOF; streamed wrapper checks before and after each underlying read so the consumer sees an `Err` chunk instead of clean stream-end | — | yes | yes |
 | `OutboundResponse::into_bytes_bounded_until(max, until)` with `until` **tighter** than `dispatch_budget(req).deadline`: the helper drives a streamed body whose adapter wrapper has 500 ms of effective budget left, but the caller passes `until = now + 100 ms`. The upstream sends data for 90 ms then holds the final read; EOF arrives at 110 ms. The helper returns `gateway_timeout` (not `Ok(bytes)`) because its `until_deadline.is_expired()` check fires before and after the EOF read. (`OutboundResponse` carries no effective-deadline state; the wrapper enforces the request budget separately — whichever fires first wins) | — | yes | yes |
@@ -4579,7 +4565,7 @@ seams for their own Tier 2 rows):
   adapter builds through (`.override_host(..)`, `.sni_hostname(..)`,
   `.check_certificate(..)`, `.connect_timeout(..)`, …) whose test impl **records every
   call** into an observable log. The identity / canonical-accessor / phase-split rows
-  assert against that recording. (The session cache — now a `thread_local!`, §4.3 — still
+  assert against that recording. (The per-session cache field — §4.3 — still
   gets a `test-utils` accessor for the *collision/reuse* rows, but that only proves
   name→identity bookkeeping, not the builder calls.)
 - **Fastly — injectable clock / dispatch-overhead hook.** A `test-utils` `Duration`
