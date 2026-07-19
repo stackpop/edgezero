@@ -717,19 +717,44 @@ mod tests {
         );
     }
 
-    /// Push-after-provision: `config push --local` writes config into
-    /// `.edgezero/local-config-<id>.json` and must leave the
-    /// provision-written secret file (`.edgezero/.env`) byte-for-byte
-    /// intact.
+    /// Push-after-provision COMPOSITION: run real `provision_typed`
+    /// (which writes the secret file), let the operator fill in the
+    /// value, then `config push --local` (which writes
+    /// `.edgezero/local-config-<id>.json`) and assert the operator's
+    /// secret survives. Running the actual provision means a
+    /// provision-output-shape regression can't slip past this test.
     #[test]
     fn push_after_provision_preserves_dotenv_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let local_dir = dir.path().join(".edgezero");
-        fs::create_dir_all(&local_dir).expect("mkdir .edgezero");
-        let env_path = local_dir.join(".env");
-        let seeded = "demo_api_token=real-secret-value\n";
-        fs::write(&env_path, seeded).expect("seed .env");
+        // 1. Provision writes the secret placeholder into .edgezero/.env.
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &[TypedSecretEntry::new(
+                    "default",
+                    "api_token",
+                    "demo_api_token",
+                )],
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed writes the placeholder");
+        let env_path = dir.path().join(".edgezero").join(".env");
+        assert!(
+            fs::read_to_string(&env_path)
+                .expect("provision wrote .env")
+                .contains("demo_api_token="),
+            "provision must write the secret placeholder line"
+        );
+        // 2. Operator fills the placeholder with a real value.
+        let filled = fs::read_to_string(&env_path)
+            .unwrap()
+            .replace("demo_api_token=", "demo_api_token=real-secret-value");
+        fs::write(&env_path, &filled).expect("operator edit");
 
+        // 3. Push config; the secret file must be left intact.
         AxumCliAdapter
             .push_config_entries(
                 dir.path(),
@@ -742,10 +767,11 @@ mod tests {
             )
             .expect("push succeeds");
 
-        assert_eq!(
-            fs::read_to_string(&env_path).expect("read .env"),
-            seeded,
-            "config push must not touch the provision-written .env secret file"
+        assert!(
+            fs::read_to_string(&env_path)
+                .expect("read .env")
+                .contains("demo_api_token=real-secret-value"),
+            "config push must not touch the provision-written .env secret"
         );
     }
 

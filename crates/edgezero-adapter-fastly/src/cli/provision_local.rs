@@ -190,16 +190,21 @@ pub(super) fn provision_typed(
 /// / `[local_server]` header from parse silently produces
 /// `local_server.<key>` on re-emit.
 ///
-/// If the key already exists, `insert` preserves its position (the
-/// value cell is overwritten in place), so we only need the reorder
-/// dance in the fresh-insert case: hoist every root-level sub-table
-/// / array-of-tables out, insert the scalar, then re-attach the
-/// tables in original order. Preserves comments and decor on both
-/// the scalar's neighbours and the sub-tables via `toml_edit`'s
-/// per-item decor tracking.
+/// If the key already exists, we update the value IN PLACE preserving
+/// its decor (a trailing inline comment survives) -- a plain `insert`
+/// would replace the whole item and drop it. Only the fresh-insert
+/// case needs the reorder dance: hoist every root-level sub-table /
+/// array-of-tables out, insert the scalar, then re-attach the tables
+/// in original order.
 fn upsert_root_scalar_before_tables(doc: &mut toml_edit::DocumentMut, key: &str, val: &str) {
     use toml_edit::value;
     let table = doc.as_table_mut();
+    if let Some(existing) = table.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
+        let mut replacement = toml_edit::Value::from(val);
+        *replacement.decor_mut() = existing.decor().clone();
+        *existing = replacement;
+        return;
+    }
     if table.contains_key(key) {
         table.insert(key, value(val));
         return;

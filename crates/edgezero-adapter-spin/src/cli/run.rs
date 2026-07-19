@@ -20,7 +20,9 @@ const TARGET_TRIPLE: &str = "wasm32-wasip2";
 /// Returns an error if the Spin CLI build command fails.
 #[inline]
 pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<PathBuf, String> {
-    let manifest = find_spin_manifest(cli_support::discovery_base(ctx)?.as_path())?;
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_spin_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -66,7 +68,9 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
 /// Returns an error if the Spin CLI deploy command fails.
 #[inline]
 pub fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
-    let manifest = find_spin_manifest(cli_support::discovery_base(ctx)?.as_path())?;
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_spin_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -166,7 +170,9 @@ fn locate_artifact(
 /// Returns an error if the Spin CLI up command fails.
 #[inline]
 pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
-    let manifest = find_spin_manifest(cli_support::discovery_base(ctx)?.as_path())?;
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_spin_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;

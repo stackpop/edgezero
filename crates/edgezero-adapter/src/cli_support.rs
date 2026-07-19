@@ -31,6 +31,31 @@ pub fn discovery_base(ctx: &AdapterExecContext<'_>) -> Result<PathBuf, String> {
     }
 }
 
+/// The manifest an adapter should operate on: the declared,
+/// root-resolved path from [`AdapterExecContext::adapter_manifest`]
+/// when the CLI provided one, otherwise the result of `discover`
+/// (the adapter's workspace-scan fallback).
+///
+/// Using the declared path stops ambient discovery from selecting the
+/// wrong manifest in a nested / multi-app layout or following a symlink
+/// off the validated tree whenever a manifest was actually loaded.
+///
+/// # Errors
+/// Propagates a discovery failure when no declared path is present.
+#[inline]
+pub fn declared_or_discovered_manifest<F>(
+    ctx: &AdapterExecContext<'_>,
+    discover: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce() -> Result<PathBuf, String>,
+{
+    match ctx.adapter_manifest() {
+        Some(declared) => Ok(declared.to_path_buf()),
+        None => discover(),
+    }
+}
+
 /// Walks up the directory tree looking for `manifest_name` alongside a `Cargo.toml`.
 #[inline]
 #[must_use]
@@ -250,7 +275,30 @@ pub fn read_package_name(manifest: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::AdapterExecContext;
     use tempfile::tempdir;
+
+    #[test]
+    fn declared_manifest_wins_over_ambient_discovery() {
+        // When the context carries the declared adapter manifest, the
+        // adapter must use it verbatim and NOT run its scan closure.
+        let declared = Path::new("/proj/crates/server/spin.toml");
+        let ctx = AdapterExecContext::new().with_adapter_manifest(declared);
+        let got = declared_or_discovered_manifest(&ctx, || {
+            panic!("discovery must not run when a manifest is declared")
+        })
+        .expect("declared path returned");
+        assert_eq!(got, declared);
+    }
+
+    #[test]
+    fn discovery_runs_only_when_no_manifest_declared() {
+        let ctx = AdapterExecContext::new();
+        let discovered = Path::new("/scanned/spin.toml").to_path_buf();
+        let got =
+            declared_or_discovered_manifest(&ctx, || Ok(discovered.clone())).expect("discovered");
+        assert_eq!(got, discovered);
+    }
 
     #[test]
     fn read_adapter_crate_name_returns_package_name_from_sibling_cargo_toml() {

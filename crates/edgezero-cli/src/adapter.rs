@@ -3,7 +3,7 @@ use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::env;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 include!(concat!(env!("OUT_DIR"), "/linked_adapters.rs"));
@@ -233,9 +233,23 @@ pub(crate) fn execute_with_env_overlay(
             build_child_env(adapter_name, None, (None, None), env_overlay)?,
         ),
     };
+    // The manifest-declared, root-resolved `[adapters.<name>.adapter].manifest`.
+    // Passing it stops the adapter from rediscovering (and possibly
+    // mis-selecting, or symlink-escaping) its per-platform manifest by
+    // scanning the workspace.
+    let adapter_manifest_abs: Option<PathBuf> = manifest_loader.and_then(|loader| {
+        let manifest = loader.manifest();
+        let (_canonical, cfg) = manifest.adapter_entry(adapter_name)?;
+        let rel = cfg.adapter.manifest.as_deref()?;
+        let root = manifest.root().unwrap_or_else(|| Path::new("."));
+        Some(root.join(rel))
+    });
     let mut ctx = AdapterExecContext::new().with_env(&child_env);
     if let Some(root) = cwd {
         ctx = ctx.with_cwd(root);
+    }
+    if let Some(manifest_abs) = adapter_manifest_abs.as_deref() {
+        ctx = ctx.with_adapter_manifest(manifest_abs);
     }
     adapter.execute(AdapterAction::from(action), adapter_args, &ctx)
 }

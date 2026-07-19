@@ -137,11 +137,10 @@ fn item_kind(item: &toml_edit::Item) -> &'static str {
 /// re-running on a scaffolded wrangler.toml replaces the placeholder
 /// with the real id instead of silently skipping.
 ///
-/// Caveat: `toml_edit::Table::insert` replaces the value's `Item`,
-/// which drops any trailing inline comment that was attached to
-/// the prior `id = "..."` line (e.g. `id = "old"  # delete me`).
-/// Sibling fields under the same `[[kv_namespaces]]` table are
-/// preserved verbatim -- only the `id` line's decor is lost.
+/// The `id` value is updated IN PLACE, preserving its decor (a
+/// trailing inline comment such as `id = "old"  # note` survives the
+/// rewrite) per the spec's byte-preserving merge contract. Sibling
+/// fields under the same `[[kv_namespaces]]` table are untouched.
 ///
 /// Concurrency: provision is NOT safe to run concurrently against
 /// the same `wrangler.toml`. Two concurrent runs may both miss the
@@ -149,6 +148,21 @@ fn item_kind(item: &toml_edit::Item) -> &'static str {
 /// remotely, then race the file write -- the loser's namespace
 /// becomes an orphan in the Cloudflare account. `EdgeZero` does not
 /// take a lockfile; operators must serialise provision themselves.
+/// Set `table[key] = new` while PRESERVING the existing value's decor
+/// (a trailing inline comment on the line survives). `Table::insert`
+/// replaces the whole `Item`, dropping that decor; for an in-place
+/// value update we clone the old decor onto the replacement. When the
+/// key is absent or isn't a scalar value, fall back to a plain insert.
+fn set_str_preserving_decor(table: &mut toml_edit::Table, key: &str, new: &str) {
+    if let Some(existing) = table.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
+        let mut replacement = toml_edit::Value::from(new);
+        *replacement.decor_mut() = existing.decor().clone();
+        *existing = replacement;
+    } else {
+        table.insert(key, toml_edit::value(new));
+    }
+}
+
 pub(super) fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), String> {
     use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
@@ -182,7 +196,7 @@ pub(super) fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Resul
         .position(|table| table.get("binding").and_then(Item::as_str) == Some(binding));
     if let Some(idx) = existing_idx {
         if let Some(existing) = arr_of_tables.get_mut(idx) {
-            existing.insert("id", value(id));
+            set_str_preserving_decor(existing, "id", id);
         }
     } else {
         let mut new_table = Table::new();
@@ -397,9 +411,9 @@ fn upsert_kv_namespace_entry(
             .or(existing_id)
             .unwrap_or_else(|| placeholder.to_owned());
         if let Some(table) = arr.get_mut(idx) {
-            table.insert("id", value(&resolved));
+            set_str_preserving_decor(table, "id", &resolved);
             if let Some(preview) = deployed_preview {
-                table.insert("preview_id", value(preview));
+                set_str_preserving_decor(table, "preview_id", preview);
             }
         }
         resolved
@@ -606,6 +620,24 @@ mod tests {
         assert!(
             after.contains("description = \"hand-added by ops\""),
             "preserved description: {after}"
+        );
+    }
+
+    #[test]
+    fn upsert_kv_namespace_preserves_inline_comment_on_id_line() {
+        // Byte-preserving merge contract: updating `id` in place must
+        // keep a trailing inline comment on that line, not drop it as a
+        // plain `insert` (whole-item replace) would.
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"  # set by ops\n",
+        );
+        upsert_kv_namespace(&path, TEST_KV_ID, "00112233445566778899aabbccddeeff").expect("upsert");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("00112233445566778899aabbccddeeff") && after.contains("# set by ops"),
+            "the id value updated but its trailing comment survives: {after}"
         );
     }
 

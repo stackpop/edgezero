@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use similar::TextDiff;
-use toml_edit::{DocumentMut, table, value};
+use toml_edit::{DocumentMut, table};
 
 use crate::args::ProvisionArgs;
 use crate::config::{
@@ -808,6 +808,21 @@ fn deployed_state_for(
 /// it, a buggy adapter's `AdapterDeployedState` could persist
 /// unknown or non-owned keys into `edgezero.toml`, breaking future
 /// manifest loads.
+/// Set `table[key] = new` in place, preserving the existing value's
+/// decor (trailing inline comments survive) per the spec's
+/// byte-preserving merge contract. `Table::insert` would replace the
+/// whole item and drop that decor; a plain insert is used only when the
+/// key is absent or not a scalar.
+fn set_str_preserving_decor(table: &mut toml_edit::Table, key: &str, new: &str) {
+    if let Some(existing) = table.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
+        let mut replacement = toml_edit::Value::from(new);
+        *replacement.decor_mut() = existing.decor().clone();
+        *existing = replacement;
+    } else {
+        table.insert(key, toml_edit::value(new));
+    }
+}
+
 pub(crate) fn merge_deployed_into_manifest(
     manifest_path: &Path,
     adapter_name: &str,
@@ -883,7 +898,7 @@ pub(crate) fn merge_deployed_into_manifest(
     })?;
 
     for (key, val) in &state.fields {
-        deployed_tbl.insert(key, value(val.clone()));
+        set_str_preserving_decor(deployed_tbl, key, val);
     }
     for (sub_name, sub_map) in &state.sub_tables {
         let sub_item = deployed_tbl.entry(sub_name).or_insert_with(table);
@@ -894,7 +909,7 @@ pub(crate) fn merge_deployed_into_manifest(
             )
         })?;
         for (key, val) in sub_map {
-            sub_tbl.insert(key, value(val.clone()));
+            set_str_preserving_decor(sub_tbl, key, val);
         }
     }
 

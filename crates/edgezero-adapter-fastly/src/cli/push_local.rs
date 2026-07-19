@@ -340,6 +340,7 @@ mod tests {
     /// `env` mapping) untouched.
     #[test]
     fn push_after_provision_preserves_secret_store_entry() {
+        use edgezero_adapter::registry::{ProvisionMode, TypedSecretEntry};
         use edgezero_core::blob_envelope::BlobEnvelope;
         use serde_json::json;
 
@@ -347,9 +348,32 @@ mod tests {
         let path = dir.path().join("fastly.toml");
         fs::write(
             &path,
-            "name = \"demo\"\n\n[[local_server.secret_stores.default]]\nkey = \"api_token\"\nenv = \"REAL_ENV_MAPPING\"\n",
+            super::super::run::synthesise_fastly_toml("demo", None),
         )
-        .expect("write");
+        .expect("write baseline");
+        // 1. Provision writes the `[[local_server.secret_stores.*]]`
+        //    entry (env defaults to the upper-cased key).
+        FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &[TypedSecretEntry::new("default", "field", "api_token")],
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed writes the secret entry");
+        // 2. Operator customises the env mapping on that entry.
+        let provisioned = fs::read_to_string(&path).expect("provision wrote fastly.toml");
+        assert!(
+            provisioned.contains("[[local_server.secret_stores.default]]"),
+            "provision must write the secret_store entry: {provisioned}"
+        );
+        fs::write(
+            &path,
+            provisioned.replace("env = \"API_TOKEN\"", "env = \"REAL_ENV_MAPPING\""),
+        )
+        .expect("operator edit");
 
         let envelope = serde_json::to_string(&BlobEnvelope::new(
             json!({"hello": "world"}),

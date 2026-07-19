@@ -243,6 +243,7 @@ impl ProvisionStores<'_> {
 pub struct AdapterExecContext<'ctx> {
     cwd: Option<&'ctx Path>,
     env: &'ctx [(String, String)],
+    adapter_manifest: Option<&'ctx Path>,
 }
 
 impl<'ctx> AdapterExecContext<'ctx> {
@@ -254,6 +255,7 @@ impl<'ctx> AdapterExecContext<'ctx> {
         Self {
             cwd: None,
             env: &[],
+            adapter_manifest: None,
         }
     }
 
@@ -263,6 +265,19 @@ impl<'ctx> AdapterExecContext<'ctx> {
     #[inline]
     pub fn with_cwd(mut self, cwd: &'ctx Path) -> Self {
         self.cwd = Some(cwd);
+        self
+    }
+
+    /// The manifest-declared, project-root-resolved
+    /// `[adapters.<name>.adapter].manifest` path. When set, an adapter
+    /// MUST use it verbatim instead of scanning the workspace for its
+    /// per-platform manifest -- ambient discovery can pick the wrong
+    /// manifest in a nested / multi-app layout, or follow a symlink off
+    /// the validated tree.
+    #[must_use]
+    #[inline]
+    pub fn with_adapter_manifest(mut self, adapter_manifest: &'ctx Path) -> Self {
+        self.adapter_manifest = Some(adapter_manifest);
         self
     }
 
@@ -287,6 +302,15 @@ impl<'ctx> AdapterExecContext<'ctx> {
     #[inline]
     pub fn env(&self) -> &'ctx [(String, String)] {
         self.env
+    }
+
+    /// The declared adapter-manifest path, when the CLI loaded a
+    /// manifest. `Some` means the adapter must NOT run ambient
+    /// discovery -- see [`Self::with_adapter_manifest`].
+    #[must_use]
+    #[inline]
+    pub fn adapter_manifest(&self) -> Option<&'ctx Path> {
+        self.adapter_manifest
     }
 
     /// Apply this context to a [`Command`] the adapter is about to

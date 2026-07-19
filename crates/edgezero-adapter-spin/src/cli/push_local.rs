@@ -968,15 +968,42 @@ mod tests {
     /// `.env` (next to spin.toml) byte-for-byte intact.
     #[test]
     fn push_after_provision_preserves_dotenv_secret() {
+        use edgezero_adapter::registry::{ProvisionMode, TypedSecretEntry};
+
         let dir = tempdir().expect("tempdir");
         write_minimal_spin_toml(dir.path());
+        // 1. Provision writes the `SPIN_VARIABLE_` secret placeholder
+        //    into the Spin-side `.env`.
+        SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &[TypedSecretEntry::new(
+                    "default",
+                    "demo_api_token",
+                    "demo_api_token",
+                )],
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed writes the placeholder");
         let env_path = dir.path().join(".env");
-        let seeded = "SPIN_VARIABLE_DEMO_API_TOKEN=real-secret-value\n";
-        fs::write(&env_path, seeded).expect("seed .env");
+        let provisioned = fs::read_to_string(&env_path).expect("provision wrote .env");
+        assert!(
+            provisioned.contains("SPIN_VARIABLE_DEMO_API_TOKEN="),
+            "provision must write the SPIN_VARIABLE_ placeholder: {provisioned}"
+        );
+        // 2. Operator fills the placeholder with a real value.
+        let filled = provisioned.replace(
+            "SPIN_VARIABLE_DEMO_API_TOKEN=",
+            "SPIN_VARIABLE_DEMO_API_TOKEN=real-secret-value",
+        );
+        fs::write(&env_path, &filled).expect("operator edit");
 
-        // Use the `default` label Spin auto-provides, so the push needs
-        // no `[key_value_store.<label>]` stanza in runtime-config.toml
-        // -- this test is about the `.env` file, not label wiring.
+        // 3. Push config (SQLite direct); the `.env` secret must survive.
+        //    `default` is the label Spin auto-provides, so no
+        //    runtime-config stanza is needed for the push.
         SpinCliAdapter
             .push_config_entries_local(
                 dir.path(),
@@ -989,10 +1016,11 @@ mod tests {
             )
             .expect("push succeeds");
 
-        assert_eq!(
-            fs::read_to_string(&env_path).expect("read .env"),
-            seeded,
-            "config push --local (SQLite) must not touch Spin's .env secret file"
+        assert!(
+            fs::read_to_string(&env_path)
+                .expect("read .env")
+                .contains("SPIN_VARIABLE_DEMO_API_TOKEN=real-secret-value"),
+            "config push --local (SQLite) must not touch Spin's .env secret"
         );
     }
 

@@ -17,7 +17,9 @@ pub(super) fn build(
     extra_args: &[String],
     ctx: &AdapterExecContext<'_>,
 ) -> Result<PathBuf, String> {
-    let manifest = find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())?;
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
@@ -62,7 +64,9 @@ pub(super) fn build(
 /// # Errors
 /// Returns an error if the Cloudflare wrangler deploy command fails.
 pub(super) fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
-    let manifest = find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())?;
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
@@ -91,7 +95,9 @@ pub(super) fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Res
 /// # Errors
 /// Returns an error if the Cloudflare wrangler dev command fails.
 pub(super) fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
-    let manifest = find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())?;
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;

@@ -540,15 +540,41 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn push_after_provision_preserves_dev_vars_secret() {
+        use edgezero_adapter::registry::{ProvisionMode, TypedSecretEntry};
+
         let _lock = path_mutation_guard().lock().expect("guard");
         let project_dir = tempdir().expect("tempdir");
         write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        // 1. Provision writes the secret placeholder into `.dev.vars`.
+        CloudflareCliAdapter
+            .provision_typed(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &[TypedSecretEntry::new("default", "field", "demo_api_token")],
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed writes the placeholder");
         let dev_vars = project_dir.path().join(".dev.vars");
-        let seeded = "demo_api_token=\"real-secret-value\"\n";
-        fs::write(&dev_vars, seeded).expect("seed .dev.vars");
+        let provisioned = fs::read_to_string(&dev_vars).expect("provision wrote .dev.vars");
+        assert!(
+            provisioned.contains("demo_api_token=\"\""),
+            "provision must write the secret placeholder: {provisioned}"
+        );
+        // 2. Operator fills in the real value.
+        fs::write(
+            &dev_vars,
+            provisioned.replace(
+                "demo_api_token=\"\"",
+                "demo_api_token=\"real-secret-value\"",
+            ),
+        )
+        .expect("operator edit");
+
+        // 3. Push (fake wrangler); the `.dev.vars` secret must survive.
         let fake = fake_wrangler_returning("", "", 0);
         let _path = PathPrepend::new(fake.path());
-
         CloudflareCliAdapter
             .push_config_entries_local(
                 project_dir.path(),
@@ -561,10 +587,11 @@ mod tests {
             )
             .expect("push --local succeeds with fake wrangler");
 
-        assert_eq!(
-            fs::read_to_string(&dev_vars).expect("read .dev.vars"),
-            seeded,
-            "config push --local must not touch the operator's .dev.vars secrets"
+        assert!(
+            fs::read_to_string(&dev_vars)
+                .expect("read .dev.vars")
+                .contains("demo_api_token=\"real-secret-value\""),
+            "config push --local must not touch the operator's .dev.vars secret"
         );
     }
 

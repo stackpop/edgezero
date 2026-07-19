@@ -76,8 +76,9 @@ pub(super) fn deploy(_extra_args: &[String]) -> Result<(), String> {
 }
 
 fn locate_project(ctx: &AdapterExecContext<'_>) -> Result<AxumProject, String> {
-    let base = cli_support::discovery_base(ctx)?;
-    let manifest = find_axum_manifest(&base)?;
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_axum_manifest(&cli_support::discovery_base(ctx)?)
+    })?;
     read_axum_project(&manifest)
 }
 
