@@ -3053,6 +3053,48 @@ ids = ["default"]
             .expect_err("a real push over malformed TOML must fail at the writer");
     }
 
+    /// The body-aware preflight runs BEFORE any remote I/O: an infeasible cloud
+    /// push (here, a reserved `--key`) fails with the preflight error, not a
+    /// `fastly`-not-found / auth error from the remote read. If preflight ran
+    /// after `read_remote`, the error would be about the missing/failed shell-out.
+    #[test]
+    fn cloud_push_preflight_rejects_reserved_key_before_remote_io() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+
+        let mut args = push_args(&manifest, "fastly");
+        // A reserved-namespace --key: infeasible, and preflight-detectable.
+        args.key = Some("app_config.__edgezero_chunks.deadbeef.0".to_owned());
+        args.yes = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("a reserved --key must be rejected");
+        assert!(
+            err.contains("reserved infix"),
+            "must fail at preflight (before any remote read), not on a shell-out: {err}"
+        );
+    }
+
     /// Serialise a string as a TOML basic-string literal (test helper).
     fn toml_string_literal(value: &str) -> String {
         let mut out = String::from('"');

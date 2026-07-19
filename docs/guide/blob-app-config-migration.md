@@ -381,10 +381,12 @@ instead — `edgezero new` generates this CLI for you.
 
 ### Local fastly.toml writer prunes old chunks on re-push
 
-The local writer **upserts the keys it is pushing and prunes exactly the
-chunks the prior generation of those roots referenced** — it does not
-wholesale-replace the per-store contents block, so keys it isn't pushing
-(including sibling roots and their chunks) are preserved. Pruning is safe
+The local writer **upserts the keys it is pushing and prunes the chunks the
+prior generation of those roots referenced** — except any prior chunk key whose
+VALUE is itself a runtime-readable root (a valid envelope or pointer), which is
+kept with a warning rather than deleted. It does not wholesale-replace the
+per-store contents block, so keys it isn't pushing (including sibling roots and
+their chunks) are preserved. Pruning is safe
 here in a way it is not in the cloud: `fastly.toml` is a single file that
 Viceroy reads at startup, so there is no propagation window and no POP
 that could still be serving the prior pointer.

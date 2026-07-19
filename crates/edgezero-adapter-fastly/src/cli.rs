@@ -2927,6 +2927,33 @@ mod tests {
         assert!(setup_block_present(&path, "kv", TEST_KV_ID).expect("probe"));
     }
 
+    /// The three provisioning parsers must NOT echo a malformed fastly.toml's
+    /// source text (which can contain a stored secret) on a parse failure.
+    #[test]
+    fn provisioning_parsers_redact_malformed_toml() {
+        const SENTINEL: &str = "SUPER_SECRET_IN_A_BROKEN_LINE";
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Malformed TOML whose offending line carries a secret.
+        fs::write(&path, format!("service_id = \"{SENTINEL}\" = broken\n")).expect("write");
+
+        let errs = [
+            read_fastly_service_id(&path).expect_err("malformed toml must error"),
+            setup_block_present(&path, "kv", TEST_KV_ID).expect_err("malformed toml must error"),
+            append_fastly_setup(&path, "kv", TEST_KV_ID).expect_err("malformed toml must error"),
+        ];
+        for err in &errs {
+            assert!(
+                !err.contains(SENTINEL),
+                "a parse error must not echo the stored value: {err}"
+            );
+            assert!(
+                err.contains("redacted"),
+                "error should say it redacted: {err}"
+            );
+        }
+    }
+
     #[test]
     fn setup_block_present_false_when_id_missing() {
         let dir = tempdir().expect("tempdir");
@@ -4218,17 +4245,19 @@ echo 'unexpected' >&2; exit 1
         assert!(err.contains(&bad_key), "names the key: {err}");
     }
 
-    /// Schema drift must never echo the config payload. App config can hold
-    /// credentials; CLI status lines are logged verbatim and CI logs are
-    /// retained/shared. Only a size + field-name shape may be reported.
+    /// Schema drift must never echo the config payload — including OBJECT KEYS,
+    /// which are provider/stored data. App config can hold credentials; CLI
+    /// status lines are logged verbatim and CI logs are retained/shared. Only a
+    /// size + field COUNT may be reported.
     #[cfg(unix)]
     #[test]
     fn read_config_entry_schema_drift_does_not_leak_payload() {
         const SENTINEL: &str = "SUPER_SECRET_TOKEN_abc123";
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Valid JSON, but the value moved out of `item_value` (schema drift).
-        let drift = format!(r#"{{"value_moved_here":"{SENTINEL}"}}"#);
+        // The sentinel is an OBJECT KEY (not a value): the earlier redactor joined
+        // keys into the diagnostic, so this is what pins the key-disclosure fix.
+        let drift = format!(r#"{{"{SENTINEL}":"x"}}"#);
         let fake = fake_fastly_returning(&drift, "", 0);
         let _path = PathPrepend::new(fake.path());
 
@@ -4245,11 +4274,11 @@ echo 'unexpected' >&2; exit 1
         };
         assert!(
             !err.contains(SENTINEL),
-            "error must not leak the config payload: {err}"
+            "error must not leak an object KEY from the config payload: {err}"
         );
         assert!(
-            err.contains("bytes"),
-            "error should carry a redacted size/shape summary: {err}"
+            err.contains("bytes") && err.contains("field(s)"),
+            "error should carry a redacted size + field COUNT: {err}"
         );
     }
 
@@ -4280,6 +4309,30 @@ echo 'unexpected' >&2; exit 1
         assert!(
             !err.contains(SENTINEL),
             "stderr must be redacted, not echoed: {err}"
+        );
+        assert!(
+            err.contains("suppressed"),
+            "error should say the stderr was suppressed: {err}"
+        );
+    }
+
+    /// The WRITE path leaks too: a failing `config-store-entry update --upsert`
+    /// whose stderr quotes the value being written must be redacted.
+    #[cfg(unix)]
+    #[test]
+    fn upsert_stderr_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_upsert1";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        // A fake `fastly` that fails every call, echoing the value in stderr.
+        let stderr = format!("Error: rejected value {SENTINEL}");
+        let fake = fake_fastly_returning("", &stderr, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = create_config_store_entry("store-abc", "cfg", SENTINEL)
+            .expect_err("a failing upsert must error");
+        assert!(
+            !err.contains(SENTINEL),
+            "upsert stderr must be redacted, not echoed: {err}"
         );
         assert!(
             err.contains("suppressed"),
@@ -5673,6 +5726,61 @@ echo 'unexpected' >&2; exit 1
             assert!(
                 oplog_has(&oplog, &format!("delete {key}")),
                 "a nested orphan generation must be reclaimed, not silently dropped: `{key}`; \
+                 log:\n{log}"
+            );
+        }
+    }
+
+    /// Age attribution works per NESTED root: a nested orphan generation whose
+    /// nested root's live config went live RECENTLY must be RETAINED (POPs may
+    /// still serve the superseded generation), even though the orphan's own
+    /// chunks are old. This pins that `root_live_since` splits on the last infix.
+    #[cfg(unix)]
+    #[test]
+    fn gc_retains_a_nested_orphan_under_a_recently_changed_nested_root() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let nested_root = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "a".repeat(64));
+
+        // The nested root's CURRENT (live) generation, created 30s ago.
+        let live_nested = gen_envelope("live-nested");
+        let live_entries = prepare_fastly_config_entries(&nested_root, &live_nested).expect("exp");
+        let (_, live_pointer) = live_entries.last().expect("pointer").clone();
+
+        // An OLD orphan generation under the SAME nested root (a week old).
+        let old_nested = gen_envelope("old-nested-orphan");
+        let old_entries = prepare_fastly_config_entries(&nested_root, &old_nested).expect("exp");
+        let old_chunks: Vec<String> = old_entries[..old_entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        // The nested root holds its live pointer; its live chunks are 30s old.
+        listing.push((nested_root.clone(), stamp_secs_ago(30), live_pointer));
+        for (key, value) in &live_entries[..live_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp_secs_ago(30), value.clone()));
+        }
+        // The old orphan chunks are a week old.
+        for (key, value) in &old_entries[..old_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp_secs_ago(604_800), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // A generous 1-day window: the orphan's OWN chunks are older, but the
+        // nested root's live config is only 30s old, so its orphan is retained.
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &old_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a nested orphan under a recently-changed nested root must be retained: `{key}`; \
                  log:\n{log}"
             );
         }

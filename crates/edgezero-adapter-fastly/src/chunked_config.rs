@@ -108,7 +108,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// Prepare the physical Config Store entries for a single logical
 /// `(root_key, envelope_json)` pair.
 ///
-/// - If `envelope_json.len() <= 8_000`: returns one `(root_key, envelope_json)` tuple unchanged.
+/// - If `envelope_json` is at most 8 000 CHARACTERS: returns one `(root_key, envelope_json)` tuple unchanged.
 /// - Otherwise: splits into UTF-8-safe 7 000-byte chunks, returns chunk
 ///   entries first and the root pointer entry last.
 ///
@@ -236,7 +236,7 @@ pub(crate) fn prepare_fastly_config_entries(
              large even for chunked storage). Restructure your typed app-config \
              into multiple types split across [stores.config] ids, or use an \
              adapter with a larger single-value limit.",
-            pointer_json.len()
+            pointer_json.chars().count()
         ));
     }
 
@@ -411,6 +411,23 @@ where
         return Err(format!(
             "reconstructed envelope for `{root_key}` does not match the pointer's \
              `envelope_sha256` (hashes redacted)"
+        ));
+    }
+
+    // The reconstructed value must actually have NEEDED chunking. The writer
+    // chunks by CHARACTER count, but `validate_pointer_chunks` can only see the
+    // byte-valued `envelope_len` up front, so it cannot catch the Unicode gap: a
+    // value under the character limit but over it in UTF-8 BYTES would have been
+    // stored directly, yet a chunked pointer for it passes every byte-level check.
+    // Now that the bytes are reconstructed and hash-verified, re-check the
+    // character count — if it fits directly, this writer would never have chunked
+    // it, so the pointer is not ours. (GC's writer round-trip would reject it too;
+    // rejecting here keeps the runtime and GC verdicts consistent.)
+    if reconstructed.chars().count() <= FASTLY_CONFIG_ENTRY_LIMIT {
+        return Err(format!(
+            "reconstructed envelope for `{root_key}` fits the \
+             {FASTLY_CONFIG_ENTRY_LIMIT}-character entry limit, so this writer would have stored it \
+             directly rather than in chunks"
         ));
     }
 
@@ -1346,6 +1363,42 @@ mod tests {
         })
         .expect_err("a tiny-chunk fan-out must be rejected");
         assert!(!fetched, "must reject before fetching 100 chunks: {err}");
+    }
+
+    /// A value UNDER the character limit but OVER it in UTF-8 BYTES would be
+    /// stored DIRECTLY by this writer (which chunks on characters). A chunked
+    /// pointer for it passes every byte-level check, but the runtime must reject
+    /// it (after reconstruction) so its verdict matches GC's writer round-trip —
+    /// otherwise, once orphaned, it becomes permanent unprovable residue.
+    #[test]
+    fn pointer_for_value_under_char_limit_but_over_byte_limit_is_rejected() {
+        let root = "app_config";
+        // 2001 crabs: 2001 characters (<= 8000) but 8004 bytes (> 8000).
+        let value = "\u{1F980}".repeat(2001);
+        assert!(value.chars().count() <= FASTLY_CONFIG_ENTRY_LIMIT);
+        assert!(value.len() > FASTLY_CONFIG_ENTRY_LIMIT);
+
+        let generation = sha256_hex(value.as_bytes());
+        let (head, tail) = value.split_at(7_000); // 1750 crabs = a full 7000-byte chunk
+        let key0 = format!("{root}{CHUNK_KEY_INFIX}{generation}.0");
+        let key1 = format!("{root}{CHUNK_KEY_INFIX}{generation}.1");
+        let pointer = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{key0}","len":{},"sha256":"{}"}},{{"key":"{key1}","len":{},"sha256":"{}"}}],"data_sha256":"","envelope_len":{},"envelope_sha256":"{generation}"}}"#,
+            head.len(),
+            sha256_hex(head.as_bytes()),
+            tail.len(),
+            sha256_hex(tail.as_bytes()),
+            value.len(),
+        );
+        let chunk_map: HashMap<String, String> =
+            HashMap::from([(key0, head.to_owned()), (key1, tail.to_owned())]);
+
+        let err = resolve_fastly_config_value(root, pointer, |key| Ok(chunk_map.get(key).cloned()))
+            .expect_err("a value that fits the character limit must not resolve as chunked");
+        assert!(
+            err.contains("character entry limit") || err.contains("stored it directly"),
+            "must reject on the character count: {err}"
+        );
     }
 
     /// An empty root key is rejected before any output: writer-valid but

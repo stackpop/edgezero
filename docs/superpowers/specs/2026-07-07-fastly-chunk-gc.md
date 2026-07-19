@@ -510,7 +510,9 @@ doomed = whole GENERATIONS of non-live chunk entries that
         # authorship; see the note in the invariants section
     (b) clear --older-than by BOTH their own age and their root's live-config age
     # a generation that does not round-trip is left UNTOUCHED and reported
-delete doomed        # whole generations only; STOP a generation at its first
+delete doomed        # generations are PLANNED/PROVEN whole; physical delete is
+                     # NOT transactional -- deletes are sequential and STOP at a
+                     # generation's first
                      # failure (a half-deleted generation can never be proved
                      # again, so ploughing on strands its survivors for good)
 ```
@@ -603,11 +605,12 @@ in the `cli.rs` test module.
 
 - **Never deletes anything** — a push writes chunks + pointer, nothing else.
 - Reserved-key and duplicate-root keys are hard errors before any I/O.
-- The adapter's push dry-run performs NO GC operations (`list`/`describe`/
-  `delete`) and NO write. (The CLI still does ONE read-back to render the diff,
-  per the `config push --dry-run` diff contract in the CLI reference; that single
-  describe is the diff, not a GC scan. An infeasible push is now rejected by the
-  body-aware preflight BEFORE that read.)
+- The adapter's push dry-run makes NO WRITE and NO delete, and runs no GC scan.
+  It is NOT fully offline, though: the CLI does one LOGICAL read-back to render
+  the diff, which for a chunked value is READ-ONLY but SEVERAL provider calls
+  (describe the root pointer, then describe each referenced chunk to reassemble
+  it) — not a single describe. An infeasible push is rejected by the body-aware
+  preflight BEFORE that read.
 - **Payload redaction**: schema-drift stdout *and* failing stderr never echo the
   stored value (sentinel-secret tests on both the read and push paths).
 

@@ -4294,15 +4294,27 @@ impl EdgeError {
 
     /// Construct from a `serde_path_to_error` error returned
     /// by the deserialise wrapper around the blob's `data`
-    /// field. The field-path is extracted via
-    /// `Error::path().to_string()`. Used by the deserialise
-    /// step in §3.3.3 / §6.2.2.
+    /// field. Used by the deserialise step in §3.3.3 / §6.2.2.
+    ///
+    /// REDACTED: `inner().to_string()` embeds the offending
+    /// stored VALUE, and `path().to_string()` can carry a MAP
+    /// KEY (indistinguishable from a struct field), both of
+    /// which may be secrets and reach the HTTP body. The
+    /// message is a category only; the path's string segments
+    /// are redacted with structure kept (see `redact_serde_path`).
+    /// The exact path is available from a local `config validate`.
     pub fn config_out_of_date_from_serde(
         serde_err: serde_path_to_error::Error<serde_json::Error>,
     ) -> Self {
+        let category = match serde_err.inner().classify() {
+            Category::Data => "wrong type or invalid value",
+            Category::Syntax => "malformed JSON",
+            Category::Eof => "unexpected end of input",
+            Category::Io => "i/o error while reading",
+        };
         Self::ConfigOutOfDate {
-            message: serde_err.inner().to_string(),
-            field_path: serde_err.path().to_string(),
+            message: format!("typed app-config is out of date ({category}; value redacted)"),
+            field_path: redact_serde_path(serde_err.path()),
         }
     }
 }

@@ -97,9 +97,11 @@ cannot be used as a supersession clock.
   a hard error: GC builds one plan per entry against the same prior, so a
   duplicate would reclaim the chunks the last tuple just installed.
 - [x] `redact_describe_response` / `redact_stderr` — every `describe`/`list`
-  diagnostic reports only a response's size + top-level field-name shape (or
-  redacted stderr), never a stored value. App config may hold credentials and CLI
-  status lines are logged verbatim. Sentinel-secret tests cover the read path and
+  diagnostic reports only a response's size + top-level field COUNT (never the
+  field NAMES/object KEYS, which are provider/stored data) or redacted stderr,
+  never a stored value. App config may hold credentials and CLI status lines are
+  logged verbatim. Sentinel-secret tests (a secret in an object KEY) cover the
+  read path and
   the `config gc` list path.
 
 ### Task 3 — Local eager prune ✅

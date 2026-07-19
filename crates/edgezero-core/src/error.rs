@@ -426,9 +426,10 @@ mod tests {
         }
 
         // A MAP KEY holding a secret. The type error is under that key, so the
-        // serde path is `items.SECRET_MAP_KEY.port`. The value-bearing MESSAGE
-        // must not carry it; the field_path DOES (the contract requires the
-        // dotted path, and a map key is indistinguishable from a struct field).
+        // serde path is `items.SECRET_MAP_KEY.port`. It must reach NEITHER the
+        // message NOR the field_path: a map key is indistinguishable from a struct
+        // field in the serde path, so every string segment is redacted (structure
+        // kept).
         const SENTINEL: &str = "SUPER_SECRET_MAP_KEY";
         let json = format!(r#"{{"items": {{"{SENTINEL}": {{"port": "nope"}}}}}}"#);
         let de = &mut serde_json::Deserializer::from_str(&json);
