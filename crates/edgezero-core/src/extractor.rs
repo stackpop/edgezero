@@ -2399,12 +2399,12 @@ mod tests {
             !err.message().contains(SENTINEL),
             "the stored field value must never reach the client-facing message: {err:?}"
         );
-        // The field path segments are redacted (a struct field and a map key are
-        // indistinguishable in the serde path), but structure is preserved.
+        // The dotted field path is preserved (contract); only the VALUE-bearing
+        // message is redacted.
         if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
             assert!(
-                field_path.contains("<redacted>") && !field_path.contains("timeout_ms"),
-                "the field path must be redacted, not echo the field name: {field_path}"
+                field_path.contains("timeout_ms"),
+                "the field path must point at the offending field: {field_path}"
             );
         }
     }
@@ -2462,12 +2462,11 @@ mod tests {
             matches!(err, EdgeError::ConfigOutOfDate { .. }),
             "deserialise failure must be ConfigOutOfDate: {err:?}"
         );
-        // The field path segment is redacted (a struct field and a map key are
-        // the same serde-path segment, so the name cannot be echoed).
+        // The dotted field path is preserved verbatim (contract).
         if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
             assert_eq!(
-                field_path, "<redacted>",
-                "the field path segment must be redacted: {err:?}"
+                field_path, "timeout_ms",
+                "serde_path_to_error must supply the field name: {err:?}"
             );
         }
     }

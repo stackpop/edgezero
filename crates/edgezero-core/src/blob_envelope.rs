@@ -5,6 +5,8 @@
 //! { "data": {...}, "sha256": "<hex>", "version": 1, "generated_at": "<RFC3339 UTC>" }
 //! ```
 
+use core::fmt;
+
 use crate::canonical_form::canonical_data_sha256;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,7 +23,7 @@ pub struct BlobEnvelope {
     pub version: u32,
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum BlobEnvelopeError {
     // The stored/computed hashes are NOT interpolated into the Display message.
     // `stored` is a blob-controlled string (a malformed envelope can set it to
@@ -34,6 +36,19 @@ pub enum BlobEnvelopeError {
     ShaMismatch { stored: String, computed: String },
     #[error("unknown envelope version {0}; expected {expected}", expected = ENVELOPE_VERSION_V1)]
     UnknownVersion(u32),
+}
+
+// Debug is hand-written (NOT derived): a derived `Debug` would print the
+// `stored`/`computed` hashes, so `{err:?}` / `?err` (anyhow) would leak what the
+// Display message deliberately redacts. Debug therefore mirrors Display.
+impl fmt::Debug for BlobEnvelopeError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShaMismatch { .. } => f.write_str("ShaMismatch { hashes redacted }"),
+            Self::UnknownVersion(version) => write!(f, "UnknownVersion({version})"),
+        }
+    }
 }
 
 impl BlobEnvelope {
@@ -110,6 +125,12 @@ mod tests {
         assert!(
             !err.to_string().contains(SENTINEL),
             "the stored hash must never appear in the error Display: {err}"
+        );
+        // Debug must redact too: `{err:?}` / `?err` (anyhow) would otherwise
+        // print the stored hash even though Display redacts it.
+        assert!(
+            !format!("{err:?}").contains(SENTINEL),
+            "the stored hash must never appear in the error Debug: {err:?}"
         );
     }
 

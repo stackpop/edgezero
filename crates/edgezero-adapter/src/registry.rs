@@ -251,8 +251,16 @@ pub trait Adapter: Sync + Send {
     /// pointer-supersession time (Fastly does not: `updated_at` is not bumped
     /// by an upsert) and offer no compare-and-swap with which to record one
     /// safely. Only the OPERATOR knows their deploy history, so `older_than`
-    /// carries that assertion: "nothing created before this is still being
-    /// served". A `dry_run` lists exactly what would be deleted, for review.
+    /// carries that assertion.
+    ///
+    /// **`older_than` is a STORE-WIDE assertion, and it is stronger than "old
+    /// creations are no longer served".** `config gc` sweeps every root in the
+    /// selected store, so the caller asserts: **no root in this store changed
+    /// within the window, AND no writer is targeting the store** while `gc` runs.
+    /// A recently-changed sibling root — especially one that shrank to a direct
+    /// value, leaving no live chunk to age by — makes a wide window unsafe. Direct
+    /// trait callers MUST honour this stronger contract, not the weaker
+    /// paraphrase. A `dry_run` lists exactly what would be deleted, for review.
     ///
     /// # Errors
     ///

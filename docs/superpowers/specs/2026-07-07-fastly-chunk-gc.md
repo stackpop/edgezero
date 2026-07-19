@@ -201,16 +201,12 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
     could never emit is rejected up front rather than driving a fan-out of chunk
     fetches (invariant 14 holds on the read path, not just in GC).
 
-> **Known limitation (fail-closed, not data-loss).** A pointer stored at a
-> chunk-shaped key whose OWN chunks are scoped to that key produces chunk keys
-> containing the reserved infix twice. `chunk_key_generation_any` splits on the
-> FIRST infix, so those doubly-nested chunks are not recognised as chunks and are
-> classified as unclassifiable roots — which makes `config gc` abort the whole
-> run (delete nothing) rather than reclaim that store. This is safe (fail-closed)
-> but leaves such a store unreclaimable. It only arises from hand-authored /
-> foreign entries; the writer never produces this shape. `gc_classify_root`
-> classifying a self-scoped pointer correctly is unit-tested; the store-level
-> abort is the documented, intended outcome.
+> **Nested self-scoped pointers are handled.** A pointer parked at a chunk-shaped
+> key whose own chunks are scoped to that key produces chunk keys containing the
+> reserved infix twice. `chunk_key_generation_any` splits on the LAST infix, so
+> those doubly-nested chunks are recognised as chunks (not misread as
+> unclassifiable roots), the holder classifies as a root, its references are
+> counted live, and store-wide GC continues rather than aborting.
 
 16. **Root-vs-chunk is decided by VALUE, and any runtime-readable root is
     protected.** An entry whose value is a valid direct envelope OR a pointer is
@@ -319,15 +315,14 @@ Dry-run by default; deletes only with `--yes`.
    depend on. A chunk PAYLOAD is a raw envelope fragment and does not announce
    `edgezero_kind`, so it is never mistaken for a root.
 
-   **`gc_classify_root`, not raw `prior_chunk_keys`.** `prior_chunk_keys` serves
-   the push path, where an unrecognised value legitimately means "nothing to
-   prune", so it answers `Ok([])`. Calling it on an arbitrary GC value would read
-   that same answer as "references nothing" and orphan the root's own **live**
-   chunks. `gc_classify_root` accepts only a valid direct envelope or a valid
-   pointer, and errors on everything else (empty, truncated, unrelated). It
-   delegates to `prior_chunk_keys` ONLY after confirming the value is
-   pointer-kind — so inside GC that helper returns validated keys or a hard
-   error, never the dangerous `Ok([])`.
+   **`gc_classify_root`, not `prior_chunk_keys`.** `prior_chunk_keys` serves the
+   push path, where an unrecognised value legitimately means "nothing to prune",
+   so it answers `Ok([])`. Reusing it on a GC value would read that same answer
+   as "references nothing" and orphan the root's own **live** chunks.
+   `gc_classify_root` therefore does NOT call it: it independently deserialises
+   the value, accepts only a valid direct envelope or a valid v1 pointer, runs
+   `validate_pointer_chunks`, and errors on everything else (empty, truncated,
+   unrelated) — it never yields the dangerous `Ok([])`.
 
    A pointer must also be **internally consistent**, not merely well-typed: a
    non-empty chunk list, one generation matching `envelope_sha256`, indexes

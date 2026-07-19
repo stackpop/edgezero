@@ -30,8 +30,9 @@ pub(crate) const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 /// (the guide says 255, the API reference says 256); we take the STRICTER 255 so
 /// a key we emit is valid under either. The writer must not emit a physical key
 /// longer than this — a derived chunk key adds ~85 characters to the root, so a
-/// near-limit root would otherwise fail only mid-write. CLI writer only.
-#[cfg(any(feature = "cli", test))]
+/// near-limit root would otherwise fail only mid-write. Also used by the pointer
+/// validator (CLI and runtime): a pointer referencing an over-limit key is not
+/// one this writer could have produced.
 pub(crate) const FASTLY_CONFIG_KEY_LIMIT: usize = 255;
 /// Target payload size per chunk (kept under the entry limit to leave room for
 /// the key and any protocol overhead). The writer never emits a chunk larger
@@ -290,6 +291,16 @@ where
     }
 
     // --- Path 2: chunk pointer ---
+    // The pointer entry itself is a single Config Store value, so the writer can
+    // never emit one larger than the entry limit. Reject an over-limit pointer up
+    // front — this bounds how many chunk refs it can carry (hence the fetch
+    // fan-out) before any parsing.
+    if root_value.len() > FASTLY_CONFIG_ENTRY_LIMIT {
+        return Err(format!(
+            "chunk pointer at `{root_key}` is larger than the {FASTLY_CONFIG_ENTRY_LIMIT}-character \
+             entry limit and so is not one this writer could have stored"
+        ));
+    }
     let pointer: FastlyChunkPointer = serde_json::from_str(&root_value).map_err(|err| {
         format!(
             "value at key `{root_key}` is neither a valid BlobEnvelope nor a valid \
@@ -538,6 +549,14 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
                 "references a non-canonical chunk key at position {position}"
             )));
         };
+        // The physical key must fit the store's key limit — the writer never
+        // emits one that does not, so an over-limit key is not ours.
+        if chunk_ref.key.chars().count() > FASTLY_CONFIG_KEY_LIMIT {
+            return Err(bad(&format!(
+                "references a chunk key at position {position} longer than the \
+                 {FASTLY_CONFIG_KEY_LIMIT}-character store limit"
+            )));
+        }
         // One pointer names exactly one generation. A mixed list means some
         // other generation's chunks are being reported as this one's.
         if generation != pointer.envelope_sha256 {

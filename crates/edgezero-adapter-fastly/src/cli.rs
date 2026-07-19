@@ -9,8 +9,8 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, gc_classify_root,
-    gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
+    CHUNK_KEY_INFIX, FASTLY_CONFIG_KEY_LIMIT, GcPointer, GcRootValue, chunk_key_generation,
+    gc_classify_root, gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
     resolve_fastly_config_value, sha256_hex, value_is_pointer_kind,
 };
 use ctor::ctor;
@@ -291,12 +291,22 @@ impl Adapter for FastlyCliAdapter {
     }
 
     fn preflight_config_key(&self, key: &str) -> Result<(), String> {
-        // Reject a reserved-namespace key here, BEFORE the CLI's remote read, so
-        // an invalid `--key` fails offline rather than after a list/describe.
-        // The write path re-checks (with the full batch), so this is a strict
-        // early gate, not the only one.
+        // Reject an invalid key here, BEFORE the CLI's remote read, so a bad
+        // `--key` fails offline rather than after a list/describe. The write path
+        // re-checks, so this is a strict early gate, not the only one.
         let entry = [(key.to_owned(), String::new())];
-        reject_reserved_root_keys(&entry)
+        reject_reserved_root_keys(&entry)?;
+        // An over-limit root key is a physical key the writer cannot store; catch
+        // it here rather than after a network round-trip. (A derived chunk key
+        // adds ~85 chars, but whether the value chunks is not known until
+        // expansion, so that stricter check stays there.)
+        if key.chars().count() > FASTLY_CONFIG_KEY_LIMIT {
+            return Err(format!(
+                "config key is longer than Fastly's {FASTLY_CONFIG_KEY_LIMIT}-character store limit; \
+                 use a shorter store id or `--key`"
+            ));
+        }
+        Ok(())
     }
 
     fn provision(
@@ -755,20 +765,46 @@ impl Adapter for FastlyCliAdapter {
                 "local fastly.toml is not valid TOML; cannot diff the prior value",
             ));
         };
-        // Probe `[local_server.config_stores.<name>]` — if absent, the store
-        // has not been seeded locally yet.
-        let Some(contents) = doc
-            .get("local_server")
-            .and_then(|ls| ls.get("config_stores"))
-            .and_then(|cs| cs.get(name))
-            .and_then(|store_tbl| store_tbl.get("contents"))
-        else {
-            return Ok(ReadConfigEntry::MissingStore);
+        // Descend `[local_server.config_stores.<name>.contents]` level by level.
+        // At each level an ABSENT key means the store isn't seeded yet
+        // (MissingStore), but a key that is PRESENT yet not a table is malformed
+        // store state — distinct outcomes. Collapsing the malformed case into
+        // MissingStore (as a plain `.get().and_then()` chain does) would render an
+        // inaccurate "all values added" diff, so it degrades to "cannot diff".
+        //
+        // `descend` returns Ok(None) for absent (-> MissingStore) and
+        // Err(Unsupported) for present-but-not-a-table.
+        let descend = |parent: &'_ toml_edit::Item,
+                       child: &str|
+         -> Result<Option<toml_edit::Item>, ReadConfigEntry> {
+            match parent.get(child) {
+                None => Ok(None),
+                Some(item) if item.is_table_like() => Ok(Some(item.clone())),
+                Some(_) => Err(ReadConfigEntry::Unsupported(
+                    "a local config-store parent table is not a table; cannot diff the prior value",
+                )),
+            }
         };
-        // `contents` MUST be a table of `key = "value"` pairs. A scalar or array
-        // there is malformed store state — reporting `MissingKey` would render an
-        // inaccurate "all values added" diff, so degrade to "cannot diff" like
-        // the other unreadable-prior-state cases.
+        let root_item = toml_edit::Item::Table(doc.as_table().clone());
+        let contents_item = (|| {
+            let Some(local_server) = descend(&root_item, "local_server")? else {
+                return Ok(None);
+            };
+            let Some(config_stores) = descend(&local_server, "config_stores")? else {
+                return Ok(None);
+            };
+            let Some(store_tbl) = descend(&config_stores, name)? else {
+                return Ok(None);
+            };
+            descend(&store_tbl, "contents")
+        })();
+        let contents = match contents_item {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(ReadConfigEntry::MissingStore),
+            Err(unsupported) => return Ok(unsupported),
+        };
+        // `contents` MUST be a table of `key = "value"` pairs. (Guaranteed by
+        // `descend` above, but re-borrow as a table to index it.)
         let Some(contents_tbl) = contents.as_table_like() else {
             return Ok(ReadConfigEntry::Unsupported(
                 "local config-store `contents` is not a table; cannot diff the prior value",
@@ -1111,9 +1147,15 @@ fn write_fastly_local_config_store(
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let mut doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    // Redacted: `toml_edit`'s parse error quotes the offending source LINE, which
+    // in a config-store `contents` table is a stored (possibly secret-bearing)
+    // value. The diff read redacts the same failure; the writer must too.
+    let mut doc: DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
 
     let local_server_entry = doc.entry("local_server").or_insert_with(table);
     let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
@@ -1386,9 +1428,22 @@ fn local_orphan_counts_for_dry_run(
                         Some(item) => match item.as_str() {
                             None => Err("could not read prior state".to_owned()),
                             Some(raw) => match prior_chunk_keys(root_key, raw) {
-                                Ok(prior) => {
-                                    Ok(prior.iter().filter(|key| !new_keys.contains(*key)).count())
-                                }
+                                Ok(prior) => Ok(prior
+                                    .iter()
+                                    .filter(|key| !new_keys.contains(*key))
+                                    // Match the real prune: an orphan whose value
+                                    // is a runtime-readable root is KEPT, so it is
+                                    // not counted as a deletion.
+                                    .filter(|key| {
+                                        contents
+                                            .get(key)
+                                            .and_then(toml_edit::Item::as_str)
+                                            .is_none_or(|text| {
+                                                !value_is_pointer_kind(text)
+                                                    && gc_classify_root(key, text).is_err()
+                                            })
+                                    })
+                                    .count()),
                                 Err(_) => Err("suspicious prior pointer".to_owned()),
                             },
                         },
@@ -2109,7 +2164,14 @@ fn group_in_index_order<'item>(group: &[&'item ConfigStoreItem]) -> Vec<&'item C
 /// Is this key a chunk key of ANY root? (`config gc` scans the whole store, so
 /// it cannot scope to one root up front.) Validates the canonical shape.
 fn chunk_key_generation_any(key: &str) -> Option<String> {
-    let (root, _rest) = key.split_once(CHUNK_KEY_INFIX)?;
+    // Split on the LAST infix, not the first: a chunk of a root that ITSELF
+    // contains the infix (a pointer parked at a chunk-shaped key with self-scoped
+    // chunks) has the infix twice, and its chunk suffix is after the LAST one.
+    // Splitting on the first would misread the doubly-nested chunk as a
+    // non-chunk, get it classified as an unclassifiable root, and abort the whole
+    // store's GC. For an ordinary single-infix key the root has no infix, so the
+    // last infix IS the first — this only changes the nested case.
+    let (root, _rest) = key.rsplit_once(CHUNK_KEY_INFIX)?;
     chunk_key_generation(root, key)
 }
 
@@ -2324,12 +2386,10 @@ fn redact_describe_response(stdout: &str) -> String {
         |_err| format!("{len} bytes, not valid JSON"),
         |value| match value {
             serde_json::Value::Object(map) => {
-                let mut names: Vec<&str> = map.keys().map(String::as_str).collect();
-                names.sort_unstable();
-                format!(
-                    "{len} bytes, JSON object with fields [{}]",
-                    names.join(", ")
-                )
+                // Object KEYS are stored/provider-controlled data (a wrong-shape
+                // response could be `{"<secret>": ...}`), so only the COUNT is
+                // reported, never the key names.
+                format!("{len} bytes, JSON object with {} field(s)", map.len())
             }
             other @ (serde_json::Value::Null
             | serde_json::Value::Bool(_)
@@ -4868,6 +4928,31 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// A malformed PARENT table (`local_server` etc. as a scalar) must degrade to
+    /// Unsupported, not collapse to `MissingStore`'s "all values added" diff.
+    #[test]
+    fn read_config_entry_local_non_table_parent_is_unsupported() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        // `local_server` is a scalar, not a table.
+        fs::write(&fastly_toml, "local_server = 42\n").expect("seed");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("a non-table parent must NOT abort the read");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "a non-table parent must degrade to Unsupported, not MissingStore"
+        );
+    }
+
     /// Spec 12.3 + 9.3: a second oversized push must converge the
     /// runtime on the NEW envelope — chunk keys are content-addressed
     /// by the full-envelope SHA, so push B writes a new chunk-set and
@@ -5480,6 +5565,53 @@ echo 'unexpected' >&2; exit 1
                  unprovable): `{key}`; log:\n{log}"
             );
         }
+    }
+
+    /// A self-scoped pointer at a chunk-shaped holder key (its chunks nest the
+    /// infix twice) must NOT abort store-wide GC: the doubly-nested chunks are
+    /// recognised as chunks (via the LAST infix), so the holder classifies as a
+    /// root, its references are counted live, and other roots still reclaim.
+    #[cfg(unix)]
+    #[test]
+    fn gc_tolerates_a_self_scoped_pointer_at_a_chunk_shaped_root() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // A pointer parked at a chunk-shaped key, with chunks scoped to itself.
+        let holder_key = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "e".repeat(64));
+        let nested = gen_envelope("nested");
+        let nested_entries = prepare_fastly_config_entries(&holder_key, &nested).expect("expand");
+        let (_, holder_pointer) = nested_entries.last().expect("pointer").clone();
+
+        // A normal live root, and a normal orphan generation that SHOULD reclaim.
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        let stamp = stamp_secs_ago(604_800);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+        listing.push((holder_key.clone(), stamp.clone(), holder_pointer));
+        for (key, value) in &nested_entries[..nested_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp.clone(), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // The run must SUCCEED (not abort) and still reclaim the ordinary orphan.
+        run_gc(dir.path(), 86_400, false).expect("store-wide GC must not abort");
+        for key in &dead_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "an ordinary orphan must still be reclaimed despite the self-scoped pointer: `{key}`"
+            );
+        }
+        assert!(
+            !oplog_has(&oplog, &format!("delete {holder_key}")),
+            "the chunk-shaped holder root must never be deleted"
+        );
     }
 
     /// A generation is aged by its YOUNGEST member, so a generation with one
@@ -6326,6 +6458,27 @@ echo 'unexpected' >&2; exit 1
 
         // Re-push a direct value: the prior generation's chunks become orphans.
         let direct = make_test_envelope(100);
+        let expected_deletions = entries.len().saturating_sub(2); // chunks minus the protected chunk0
+
+        // DRY-RUN first: its count must MATCH what the real prune deletes, i.e.
+        // it must exclude the protected root-like chunk0.
+        let dry = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run");
+        assert!(
+            dry.join("\n")
+                .contains(&format!("would delete {expected_deletions} orphan chunks")),
+            "dry-run must count only the prunable orphans (excluding the protected root): {dry:?}"
+        );
+
         let warnings = FastlyCliAdapter
             .push_config_entries_local(
                 dir.path(),
