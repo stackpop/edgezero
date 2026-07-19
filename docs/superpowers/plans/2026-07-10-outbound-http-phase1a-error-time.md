@@ -300,6 +300,22 @@ mod tests {
         );
     }
 
+    // Public smoke tests: the wall-clock wrappers (which call Instant::now()) actually
+    // delegate to the pure *_at helpers. Loose bounds only — these guard the public
+    // surface, the exact behaviour is covered by the *_at tests above.
+    #[test]
+    fn public_remaining_and_is_expired_smoke() {
+        let far = Deadline::after(Duration::from_hours(1));
+        assert!(!far.is_expired());
+        assert!(far.remaining().is_some());
+        // `after(ZERO)` yields `now`; by the time is_expired()/remaining() read a later
+        // Instant::now(), it is at-or-past — no `checked_sub` (would underflow a fresh
+        // WASM Instant near its epoch).
+        let now_deadline = Deadline::after(Duration::ZERO);
+        assert!(now_deadline.is_expired());
+        assert_eq!(now_deadline.remaining(), None);
+    }
+
     #[test]
     fn instant_round_trips() {
         let base = Instant::now()

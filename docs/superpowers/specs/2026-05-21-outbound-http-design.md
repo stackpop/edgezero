@@ -1327,7 +1327,7 @@ deadline at headers." Adapter notes (§4.1–§4.4) implement this end-to-end.
 | Adapter | Mechanism | Strength |
 | --- | --- | --- |
 | Axum | `reqwest::RequestBuilder::timeout(effective)` — reqwest applies it through response-body read | Real, whole-operation |
-| Cloudflare | race the entire `send_one` future (fetch **and** body drain) against `worker::Delay(effective)`; drop on expiry | Real, whole-operation |
+| Cloudflare | race `Fetch::send_with_signal(&signal)` (+ body drain) against `worker::Delay(effective)`; on expiry `controller.abort()` (NOT a dropped future — that leaves the subrequest running) | Real, whole-operation with cancellation |
 | Spin | race the entire `send_one` future (send **and** body collect) against a wasi monotonic-clock timer; drop on expiry | Real, whole-operation |
 | Fastly | host phase timers split per §4.3 (`connect = budget/4`, `first_byte = 3*budget/4`, `between_bytes = budget`); during body drain, `budget.deadline.is_expired()` is checked **after every blocking body read returns, including the EOF read** (the synthetic 30 s deadline applies when no caller deadline was set); the host between-bytes timeout bounds each gap | Real for connect+headers with a documented phase split (see §4.3 — a connect that itself takes longer than `budget/4` fails even if the rest of the budget would have sufficed); **bounded-cooperative** for the body phase |
 
@@ -2251,6 +2251,10 @@ pub struct ManifestCapabilities {
     #[validate(nested)]
     pub outbound: ManifestOutboundCapability,
 }
+// A custom #[validate(..)] on `capabilities` rejects a capability that is DUPLICATED
+// within `required`/`optional` or listed in BOTH (a manifest asking for a capability as
+// both required and optional is a contradiction) — this is one of the failures
+// `from_baked_json` -> Malformed and `config validate` surface.
 
 #[derive(Debug, Default, Serialize, Deserialize, Validate)]
 pub struct ManifestOutboundCapability {
@@ -2886,6 +2890,8 @@ Commands **not** covered (and why):
   absent manifest is `BakedManifest::Absent` ⇒ no capability contract ⇒ `Ok(())`; a
   *malformed* one hard-fails. Documented in the rustdoc.)
 
+**Support-level enforcement ladder (what `required` means).** `capability()` returns one of `Native` > `BoundedCooperative` > `BestEffort` > `Unsupported`. A capability in `required` is satisfied by **`Native` or `BoundedCooperative`** (both are *real* enforcement — `BoundedCooperative` has a precisely documented, deterministic bound); it **hard-fails** on `BestEffort` (real-world deviation the app must opt into) or `Unsupported`. `optional` never hard-fails — a `BestEffort`/`Unsupported` optional capability is logged, not gated. **Apps that need EXACT (Native-only) enforcement — e.g. a headers-phase deadline tighter than Fastly's `BoundedCooperative` body-phase bound — cannot express that today**; a separate `outbound-deadlines-exact` (Native-required) capability is a documented follow-up (§8 risk 14), NOT an ad-hoc “declare exactness” mechanism. This closes the gap where the Fastly section told apps to “declare exactness” with no capability to back it.
+
 **Historical (pre-#269) shape — now superseded (PR #269 has merged to main):**
 Before #269 landed, `Command::{Build, Serve, Deploy, Dev}` all dispatched through
 the registry's `Adapter::execute(AdapterAction::{Build, Serve, Deploy}, ..)` plus
@@ -3228,12 +3234,16 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   3. **Construct the `worker::Request`.** Build the request from the
      buffered (or now-buffered) body, URI, method, and normalized headers.
      Do not start the `worker::Delay` race yet.
-  4. **Arm the race and send.** Immediately before issuing fetch and starting
-     the `worker::Delay`, re-read `budget.deadline.remaining()`. `None` →
-     `gateway_timeout` without sending. Otherwise race the fetch **and**, in
-     `Buffered` mode, the body drain against `worker::Delay(remaining)` using
-     this just-re-read value (matching Spin and the round-38 Axum step). On
-     expiry drop the future (`gateway_timeout`). The existing gzip/br
+  4. **Arm the race and send — WITH an `AbortController`, not just a dropped future.**
+     Create a `worker::AbortController`, take its `signal()`, and issue the fetch via
+     **`Fetch::send_with_signal(&signal)`** (worker 0.8.3) — **not** the plain `send()`.
+     Immediately before issuing, re-read `budget.deadline.remaining()`; `None` →
+     `gateway_timeout` without sending. Otherwise race `send_with_signal(..)` **and**,
+     in `Buffered` mode, the body drain against `worker::Delay(remaining)`. **On expiry,
+     call `controller.abort()` — do NOT merely drop the future.** Dropping the Rust
+     future does not cancel the in-flight subrequest (the Workers runtime keeps the POST
+     going and may complete it after EdgeZero has returned 504); only the abort signal
+     actually cancels it. Then return `gateway_timeout`. The existing gzip/br
      decompression path is kept; the decompressed-byte cap is enforced
      incrementally while decompressing (§3.4.1), with pre-append checked
      accounting.
@@ -4229,12 +4239,23 @@ service — this distinction is explicit so a green capability check is not misr
   included in the batch budget rather than added on top.
 - Existing gzip/br decompression is kept; decompressed-byte cap enforced incrementally
   (§3.4.1). `Streamed` mode wraps the response body as `Body::Stream`.
-- Errors: wasi-timer expiry → `gateway_timeout`; transport failure (DNS/TLS/connection
-  refused) from `spin_sdk::http::send` (buffered path) or `wasip3::http::client::send`
-  (hand-built streamed path, §4.4) → `bad_gateway`; **request**-body over-cap →
-  `bad_request` (400); **response**-body over-cap (decompressed count) → `bad_gateway`
-  (502, per the global response-overflow rule §3.4.1). Any completed exchange
-  (incl. non-2xx) → `Ok`. (§3.4.3 is the fallback for variants not enumerated here.)
+- **Errors — `map_spin_send_err` classifies the WASI `ErrorCode`, mirroring Fastly's
+  `SendFailure` split (§4.3).** The `send` future (`spin_sdk::http::send` buffered path,
+  or `wasip3::http::client::send` streamed path) fails with a `wasi:http` `ErrorCode`;
+  `#[non_exhaustive]`, so the match needs a `_` arm. Mapping:
+  - **Timeout variants** — `DnsTimeout`, `ConnectionTimeout`, `ConnectionReadTimeout`
+    (WASI's response/read timeout) → **`gateway_timeout` (504)**. **These must NOT fall
+    through to the generic 502** — a fired timer is a deadline outcome, distinguishable
+    from an unreachable upstream (the fan-out caller retries them differently).
+  - DNS resolution failure, connection refused/terminated, TLS/certificate errors,
+    destination-not-found/unavailable → **`bad_gateway` (502)**.
+  - Locally-invalid request (bad URI/settings we constructed) / internal → **`internal`
+    (500)** — an EdgeZero bug, not an upstream failure.
+  - `_` (unknown/future variant) → **`bad_gateway` (502)** — narrow default.
+  - The separate wasi-timer we race the exchange against (§4.4) also yields
+    `gateway_timeout` on expiry. **request**-body over-cap → `bad_request` (400);
+    **response**-body over-cap (decompressed) → `bad_gateway` (502, §3.4.1). Any
+    completed exchange (incl. non-2xx) → `Ok`.
 - Spin requires `allowed_outbound_hosts`; the adapter renders it from
   `[capabilities.outbound].hosts` per §3.5.4 when generating `spin.toml`.
 - `capability()` per §3.5.2: `Native` for **eight of the nine**;
@@ -4584,6 +4605,7 @@ seams for their own Tier 2 rows):
 - **All adapters — dispatch counters.** `did_dispatch()` / chunk-write count behind
   `test-utils`, so "deadline expired during drain → 504 **and** no upstream send" and
   the partial-upload rows can assert the *absence* of a dispatch.
+- **Fastly — a dispatch/pending abstraction, not just the recording builder + clock.** The recording `BackendBuilder` and the injectable clock prove backend *construction* and the slack guard, but the send_all conformance + phase-timeout + error-mapping rows need to script the **exchange**: `PendingRequest::poll`/`wait` outcomes, header/connect hangs, and responses. Those SDK types are not constructible or scriptable in a test. So the adapter dispatches through a `test-utils` trait — e.g. `trait FastlyDispatch { fn dispatch(..) -> PendingLike; }` with a `PendingLike` the fake can resolve to a scripted response / hang / `SendErrorCause` — the real impl wrapping `send_async`/`PendingRequest`. Rows that still cannot be faked this way (real TCP/TLS timing) are **Tier 3 (Viceroy) only**, not Tier 2; the §5.4 tier column reflects that.
 - **Cloudflare / Spin — transport + timer fakes.** Their Tier 2 rows (deadline expiry
   per phase, transport-error mapping, upload-stall) assert platform-observable
   behaviour and currently have **no provider fake**. Each needs a `test-utils` seam
@@ -4921,7 +4943,9 @@ change lands here whether intended or not)*
     requirement later, an mpsc bridge is a separate follow-up. Capability text
     and risk section reflect this (see §3.5.2 footnote 3 and §8).
 
-  **Only Cloudflare streams `Body::Stream` lazily.** Axum, Fastly, **and Spin** all
+    **502/504 response synthesis — all three buffered adapters, not just Axum.** When a buffered-drain adapter (Axum, Fastly, Spin) hits an `EdgeError` while draining the wrapped `Body::Stream` (a `gateway_timeout`/`bad_gateway` error chunk, or over-cap), it must synthesize the platform response from **`err.status()`** + `err.into_response()`'s JSON body — the SAME concrete mapping §4.1 gives Axum. Do NOT let it degrade to a stringly platform error (today Fastly's `request.rs` returns a `FastlyError` string; Spin threads it through `anyhow`), which loses the 502-vs-504 distinction. §5.4 tests each adapter's converter for 502, 504, over-cap (502), and an `internal` (500) error chunk.
+
+**Only Cloudflare streams `Body::Stream` lazily.** Axum, Fastly, **and Spin** all
   buffer `Body::Stream` to `Bytes` before returning (BestEffort, for three different
   reasons — non-Send `LocalBoxStream`, `stream_to_client()` vs `#[fastly::main]`, and
   Spin's buffered `FullBody` surface — footnotes 3/6/7). So the earlier "buffering is
@@ -5060,9 +5084,11 @@ change lands here whether intended or not)*
 2. **Tier 3 CI runtimes.** Viceroy / `workerd` / `spin` jobs add CI cost and
    maintenance. The design degrades safely (Tier 1 + Tier 2 always run); the risk is
    schedule, not correctness.
-3. **Cloudflare cancellation.** Dropping the raced future to enforce a timeout relies on
-   the Workers runtime reclaiming the subrequest. Effective in practice; the Tier 3 CF
-   test verifies wall-clock behaviour.
+3. **Cloudflare cancellation — RESOLVED.** A timed-out subrequest is cancelled via
+   `worker::AbortController::abort()` on the `AbortSignal` passed to
+   `Fetch::send_with_signal` (§4.2), not by dropping the Rust future (which would leave
+   the POST running after EdgeZero returns 504). The Tier 3 CF test verifies the origin
+   observes the abort.
 4. **Fastly body-phase overshoot.** The deadline overshoot on Fastly is bounded by one
    between-bytes-timeout interval (§3.3.4). If a stricter guarantee is ever required, the
    adapter would need to cap total body-read attempts — out of scope here.
@@ -5190,6 +5216,7 @@ change lands here whether intended or not)*
     change. Note this affects only the response-out direction — Spin's outbound
     streamed-*upload* path is unchanged and stays `Native` for
     `streamed-upload-deadlines`.
+14. **`outbound-deadlines-exact` (Native-required) capability.** The support-level ladder (§3.5.3) satisfies a `required outbound-deadlines` with either `Native` or `BoundedCooperative`, so an app cannot demand *exact* (Native-only) deadline enforcement and fail closed on Fastly's `BoundedCooperative` body-phase bound. A dedicated `outbound-deadlines-exact` capability (Native on Axum/CF/Spin, BestEffort on Fastly, so `required` hard-fails on Fastly) would express it cleanly. **Deferred** until an app needs it; today the `BoundedCooperative` bound is documented and apps needing exactness target a non-Fastly adapter.
 
 Appendices A through the last `## Appendix` heading in the document (use that
 heading as the canonical upper bound — the index doesn't pin an exact letter
