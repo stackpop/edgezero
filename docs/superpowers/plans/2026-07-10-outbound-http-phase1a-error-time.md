@@ -21,6 +21,7 @@
   - `min_ident_chars` → no single-char idents (`d` → `duration`).
   - `arithmetic_side_effects` → **no bare `+` / `-`** on `Instant`/`Duration`; use `checked_add` / `checked_duration_since`.
   - `expect_used`, `unwrap_used`, `as_conversions` → forbidden in production; use `?`/`ok_or`/`From`/`TryFrom`.
+  - **`unseparated_literal_suffix`** → integer suffixes need an underscore: `502_u16`, not `502u16` (verified: `502u16` errors; the opposing `separated_literal_suffix` is allow-listed, so the underscore form is the one that passes).
   - **`arbitrary_source_item_ordering`** → **items must be ALPHABETICAL** — consts, enum **variants**, and impl fns alike (verified). This is why `error.rs`'s variants and methods are already alphabetized. Insert new items **in place**; never append.
   - **`duration_suboptimal_units`** (pedantic; CI runs `-D warnings`, so it *fails the build*) → use the largest readable unit: `Duration::from_hours(168)` not `from_secs(7*24*60*60)`; `Duration::from_mins(1)` not `from_secs(60)`.
   - **Verified end-to-end:** this exact `Deadline` code + these constants compile **clean** under the repo's full lint table (`restriction = deny` + `pedantic` + the real allow-list). `std_instead_of_core`/`std_instead_of_alloc` **are** allow-listed, so `use std::time::Duration;` is fine.
@@ -90,13 +91,13 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
     for (err, code, kind, msg) in [
         (
             EdgeError::bad_gateway("nope"),
-            502u16,
+            502_u16,
             "bad_gateway",
             "nope",
         ),
         (
             EdgeError::gateway_timeout("late"),
-            504u16,
+            504_u16,
             "gateway_timeout",
             "late",
         ),
@@ -191,7 +192,7 @@ Expected: PASS.
 
 - [ ] **Step 9: Format, lint, full-crate test**
 
-Run: `cargo fmt -p edgezero-core && cargo clippy -p edgezero-core --all-features -- -D warnings && cargo test -p edgezero-core`
+Run: `cargo fmt -p edgezero-core && cargo clippy -p edgezero-core --all-targets --all-features -- -D warnings && cargo test -p edgezero-core`
 Expected: clean, all green.
 
 - [ ] **Step 10: Commit**
@@ -398,7 +399,7 @@ impl Deadline {
 
 - [ ] **Step 5: Format, lint, full-crate test**
 
-Run: `cargo fmt -p edgezero-core && cargo clippy -p edgezero-core --all-features -- -D warnings && cargo test -p edgezero-core`
+Run: `cargo fmt -p edgezero-core && cargo clippy -p edgezero-core --all-targets --all-features -- -D warnings && cargo test -p edgezero-core`
 Expected: clean, all green.
 
 - [ ] **Step 6: Commit**
