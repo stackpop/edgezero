@@ -2241,7 +2241,12 @@ so an app declaring it gets exactly what the name says on every adapter.
 // Deserialize-only member breaks `Manifest`'s derive and therefore edgezero-core
 // AND the macro crate (which textually `include!`s this file). Same for every
 // nested type and for `Capability` itself.
+// `deny_unknown_fields` is REQUIRED — without it a typo like `require = [..]` or
+// `host = [..]` is silently ignored, disabling enforcement or invoking the broad default
+// (fail-open). The `#[validate(custom = ..)]` attaches the disjoint/duplicate check.
 #[derive(Debug, Default, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = "validate_capabilities_disjoint"))]
 pub struct ManifestCapabilities {
     #[serde(default)]
     pub required: Vec<Capability>,
@@ -2251,12 +2256,15 @@ pub struct ManifestCapabilities {
     #[validate(nested)]
     pub outbound: ManifestOutboundCapability,
 }
-// A custom #[validate(..)] on `capabilities` rejects a capability that is DUPLICATED
-// within `required`/`optional` or listed in BOTH (a manifest asking for a capability as
-// both required and optional is a contradiction) — this is one of the failures
-// `from_baked_json` -> Malformed and `config validate` surface.
+// `validate_capabilities_disjoint(&ManifestCapabilities) -> Result<(), ValidationError>`
+// rejects a capability DUPLICATED within `required` or `optional`, or listed in BOTH
+// (required ∩ optional must be empty — asking for a capability as both is a
+// contradiction). One of the failures `from_baked_json` -> Malformed and `config
+// validate` surface. §5.4 tests: an unknown field (typo `require`), a duplicate, and a
+// required∩optional overlap each fail.
 
 #[derive(Debug, Default, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestOutboundCapability {
  /// Outbound host plumbing.
  ///
@@ -3471,8 +3479,8 @@ async fn send_all(
   documented recovery (`Backend::from_str(name)`) returns a handle without
   exposing the registered properties. EdgeZero therefore owns the entire
   uniqueness story **at the guest layer**: a **session-scoped** adapter-local cache
-  (a per-session `RefCell<HashMap<String, (BackendIdentity, Backend)>>` **field on the
-  per-request `FastlyOutboundClient`** — fresh each request/session; see *Cache
+  (a per-session `Mutex<HashMap<String, (BackendIdentity, Backend)>>` **field on the
+  per-request `FastlyOutboundClient`** — `Mutex` not `RefCell`, because the trait is `Send + Sync` — fresh each request/session; see *Cache
   ownership* below for why a per-request field is correct and a cross-request cache is wrong) holds the identity →
   backend mapping, and a hit
   reuses the cached `Backend` while a miss calls `Backend::builder(..).finish()`
@@ -3509,16 +3517,16 @@ async fn send_all(
     the cooperative `budget.deadline.is_expired()` check against the original `Deadline`.
     Removing the bucket removes the ~10 % headers-phase overshoot an earlier draft
     introduced; the net guarantee is again exactly what §4.3 "Net guarantee" states.
-  - `ceil_ms` itself is the **true ceil-to-ms** — `((duration.as_nanos() + 999_999) /
-    1_000_000).max(1)` (lint-clean form per §3.3.2), since `as_millis()` floors and
-    would make the *bucket* input too small. (Apps wanting sub-ms wall-clock should not
-    target Fastly — host timeouts are millisecond-granular.) §3.3.4's "host timeouts =
-    `budget.duration`" is an abbreviation for "host timeouts = the bucketed ceil-to-ms".
+  - `budget_ms` is the **true ceil-to-ms** — `((duration.as_nanos() + 999_999) /
+    1_000_000).max(1)` (lint-clean form in `fastly_timeout_ms`), since `as_millis()`
+    floors and would make the host timeout too tight. (Apps wanting sub-ms wall-clock
+    should not target Fastly — host timeouts are millisecond-granular.) §3.3.4's "host
+    timeouts = `budget.duration`" is an abbreviation for "= ceil-to-ms of `budget.duration`".
 
-  This does **not** collapse the distinctions the identity exists to preserve: a 50 ms
-  slot and a 3 s slot land in far-apart buckets, so they still get separate backends
-  (they must — their host timeouts genuinely differ). Only the sub-bucket millisecond
-  *noise* is collapsed.
+  A 50 ms slot and a 3 s slot to the same host get **distinct** backends (distinct
+  `budget_ms` → distinct identity → distinct name) — they must, since their host timeouts
+  genuinely differ. Within one `send_all`, same-budget slots share `batch_now` → identical
+  `budget_ms` → one backend.
 
   Name = `format!("ez_{:032x}", sha256_128(identity))` — the first 128 bits of a
   SHA-256 digest, collision-resistant in any realistic deployment (the previous
@@ -3539,8 +3547,8 @@ async fn send_all(
 
   **Dispatch-overhead slack, hard-bounded.** Because `batch_now` is captured
   *before* preflight, dynamic-backend creation, and `send_async`, the `budget_ms`
-  baked into the backend identity is a *bucketed* timeout — not the exact remaining
-  wall-clock at the moment the SDK timer is armed. The Fastly host enforces
+  baked into the backend identity is a *snapshot* timeout (computed from `batch_now`) —
+  not the exact remaining wall-clock at the moment the SDK timer is armed. The Fastly host enforces
   `budget_ms` from the moment it sees the request, so a request can in principle
   complete up to `(now_at_send_async − batch_now) ms` after the absolute fan-out batch
   deadline before the host fires its timeout. To keep this slack
@@ -3626,7 +3634,7 @@ async fn send_all(
   see §4.1 / §4.2 / §4.4 step 3). **Collision detection** is
   belt-and-suspenders.
 
-  **Cache ownership — a PER-SESSION map (a `RefCell` field on the per-request client).**
+  **Cache ownership — a PER-SESSION map (a `Mutex` field on the per-request client).**
   This is the single authoritative statement; it governs the protocol below and the
   §4.3 *Dynamic backends* discussion. **Fastly dynamic-backend names are
   session-scoped, NOT global across requests** (verified against the `BackendBuilder`
@@ -3641,14 +3649,16 @@ async fn send_all(
 
   ```rust
   struct FastlyOutboundClient {
-      // Per-request/per-session dedup map. Interior mutability; single-threaded
-      // WASM guest, so a RefCell (no Mutex, no Send + Sync) is the whole model.
-      backends: RefCell<HashMap<String, (BackendIdentity, Backend)>>,
+      // Per-request/per-session dedup map. MUST be Mutex, not RefCell:
+      // OutboundHttpClient: Send + Sync (stored as Arc<dyn ..> in http::Extensions),
+      // and RefCell is !Sync. The Mutex is uncontended on the single-threaded WASM
+      // guest — it satisfies the Sync bound, it does not serialize anything.
+      backends: Mutex<HashMap<String, (BackendIdentity, Backend)>>,
       // …
   }
   ```
 
-  **This reverses two earlier drafts that were wrong for the same root reason** — the
+  **This reverses two earlier drafts wrong for the same root reason** — the
   belief that names persist across requests. One made the cache a cross-request
   `thread_local!` (which would carry **stale** entries into a reused instance's next
   session, where those names are unregistered); another bucketed the budget to bound
@@ -3662,7 +3672,7 @@ async fn send_all(
   single-threaded, so the borrow is uncontended by construction. (Read any surviving
   "lock" / "thread-local" phrasing in the appendices as superseded.)
 
-  1. Borrow the map (`self.backends.borrow_mut()`).
+  1. Lock the map (`self.backends.lock()` — uncontended; handle any poison by treating a poisoned lock as an internal error, never by unwrapping in production).
   2. If the name maps to a stored entry `(stored_identity, cached)`:
      - **`stored_identity == identity`**: clone the cached `Backend`, drop the
        lock, dispatch.
@@ -3893,23 +3903,23 @@ async fn send_all(
     identity, reuse; if it maps to a *different* identity, fail closed with
     `EdgeError::internal("dynamic backend name collision — refusing to reuse")`.
   - **Single `send`** — same lookup path; same fail-closed behaviour.
-  - **Across calls — the cache MUST be session/process-scoped, NOT per-client.**
-    Fastly dynamic-backend **names are session-scoped** (per request execution): once `Backend::builder(name,..)`
-    registers a name, it stays registered for the whole Compute session (across inbound
-    requests), and re-registering the same name returns `NameInUse`. But
-    `FastlyOutboundClient` (a.k.a. today's `FastlyProxyClient`) is **constructed per
-    inbound request** (`crates/edgezero-adapter-fastly/src/request.rs` inserts a fresh one
-    into each request's extensions). A cache *field on the client* would therefore start
-    **empty on every request** — so request #2 to the same host rebuilds the name, hits
-    `NameInUse`, and (having no cached identity to verify against) **fails closed**. That
-    is a latent bug the current adapter avoids only because it has no cache at all today.
-    The cache is a **per-session field** on the per-request client (fresh each request): a `RefCell`
-    (the Fastly guest is single-threaded, so no `Mutex` is needed) holding the
-    `HashMap<name, (BackendIdentity, Backend)>`, populated across requests for the life of
-    the instance. Each per-request `FastlyOutboundClient` reads/writes that shared map
-    rather than owning it. A second `send` — in the *same* handler **or a later inbound
-    request** — then reuses the backend cheaply, and a SHA-256-128 collision against any
-    earlier registration (this session) is still caught.
+  - **Across calls within ONE request — a per-session `Mutex<HashMap<..>>` field.**
+    Fastly dynamic-backend names are **session-scoped**: a new inbound request is a new
+    session with a **fresh** namespace, so request #2 re-registering `ez_abc` does NOT
+    collide with request #1 (connections merely *pool* across sessions). The cache is
+    therefore a **field on the per-request `FastlyOutboundClient`**, fresh each request —
+    it exists to dedup **within** a single session's fan-out (multiple `send_all` slots /
+    multiple `send`s in one handler to the same host+budget reuse one registration), and
+    is discarded when the request ends. **It MUST be a `Mutex<HashMap<..>>`, NOT a
+    `RefCell`:** `OutboundHttpClient: Send + Sync` (the handle stores `Arc<dyn
+    OutboundHttpClient>` in `http::Extensions`, which require `Sync`), and `RefCell` is
+    `!Sync` — a `RefCell` field would fail to compile. The `Mutex` is **uncontended** on
+    the single-threaded WASM guest (it exists to satisfy `Sync`, not to serialize), and
+    the lock is never held across a host call. A SHA-256-128 collision against an earlier
+    registration in this session is still caught. *(Two earlier drafts got this wrong for
+    the same root cause — the false belief that names persist across requests: one made
+    the cache a cross-request `thread_local!`, another used a non-`Sync` `RefCell`. Both
+    are superseded by this per-request `Mutex` field.)*
   - **`Backend::builder` returns `NameInUse`** — the adapter cannot fully verify
     the registered identity. Fastly's `Backend::from_name` returns a handle to the
     existing backend but its public getters do not round-trip every builder field
@@ -4243,9 +4253,12 @@ service — this distinction is explicit so a green capability check is not misr
   `SendFailure` split (§4.3).** The `send` future (`spin_sdk::http::send` buffered path,
   or `wasip3::http::client::send` streamed path) fails with a `wasi:http` `ErrorCode`;
   `#[non_exhaustive]`, so the match needs a `_` arm. Mapping:
-  - **Timeout variants** — `DnsTimeout`, `ConnectionTimeout`, `ConnectionReadTimeout`
-    (WASI's response/read timeout) → **`gateway_timeout` (504)**. **These must NOT fall
-    through to the generic 502** — a fired timer is a deadline outcome, distinguishable
+  - **Timeout variants — ALL FIVE** (verified against wasip3): `DnsTimeout`,
+    `ConnectionTimeout`, `ConnectionReadTimeout`, `ConnectionWriteTimeout`,
+    `HttpResponseTimeout` → **`gateway_timeout` (504)**. **None may fall through to the
+    generic 502** (an earlier draft mapped only three, leaking `ConnectionWriteTimeout`
+    and `HttpResponseTimeout` to 502). An **exhaustive classifier unit test** against the
+    pinned SDK pins every timeout variant to 504 — a fired timer is a deadline outcome, distinguishable
     from an unreachable upstream (the fan-out caller retries them differently).
   - DNS resolution failure, connection refused/terminated, TLS/certificate errors,
     destination-not-found/unavailable → **`bad_gateway` (502)**.
