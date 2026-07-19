@@ -828,7 +828,7 @@ point its allowlist runs again. Per-adapter mechanics:
 | Adapter | How to disable auto-redirect |
 | --- | --- |
 | Axum | `reqwest::ClientBuilder::redirect(reqwest::redirect::Policy::none())` |
-| Cloudflare | `worker::RequestInit { redirect: "manual", .. }` |
+| Cloudflare | `worker::RequestInit { redirect: worker::RequestRedirect::Manual, .. }` (the enum, **not** the string `"manual"`) |
 | Spin (WASI) | `spin_sdk::http::send` does not auto-follow — no opt-out needed |
 | Fastly | `fastly` does not auto-follow — no opt-out needed |
 
@@ -1657,10 +1657,14 @@ Decompression-cap responsibility per adapter:
   obligation applies in-line in their existing decode paths.
 - **Axum** — the workspace `reqwest` dependency is currently
   `default-features = false` and does not enable gzip/brotli decoding. This migration
-  enables the `gzip` and `brotli` features on `reqwest` so behaviour matches the other
-  three adapters; reqwest then performs decoding and the byte cap is enforced
-  incrementally while the adapter drains the response. The Cargo.toml change is part of
-  the file-by-file summary (§7).
+  does **NOT** enable reqwest's `gzip`/`brotli` auto-decoding, and Axum sends
+  `accept-encoding` for identity handling explicitly. reqwest's built-in decoder matches
+  **exact lowercase** `content-encoding` values from a single map entry and would not
+  honour the portable contract (case-insensitive `GZIP`, `identity`, unknown/**stacked**/
+  repeated → passthrough untouched). Instead Axum routes the raw response body through
+  the **same shared `content-encoding` inspection + decoder** the other adapters use
+  (§3.4.1 policy table), enforcing the decompressed-byte cap incrementally. This is the
+  only way all four adapters share one decompression contract.
 
 **Portable `content-encoding` policy (identical on all four adapters).** CF and Fastly
 already diverge here today, so the rule is stated normatively rather than left to each
@@ -2128,6 +2132,7 @@ hosts = ["*"]
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive] // a future capability must not break out-of-tree adapters
 // The variants are grouped SEMANTICALLY (all outbound-* together, then the three
 // store-* together) and this order is referenced by the matrix rows and
 // footnote numbers. `clippy::arbitrary_source_item_ordering` wants alphabetical, which
@@ -2206,6 +2211,7 @@ impl Capability {
 // per-adapter via `Adapter::capability`, not stored), so `Deserialize`/`Serialize` are
 // omitted here. If a future manifest field carries a `CapabilitySupport`, add both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CapabilitySupport {
  /// Fully supported with no documented caveats.
     Native,
@@ -2335,7 +2341,12 @@ Every field is `#[serde(default)]`, so existing manifests parse unchanged.
 
 #### 3.5.2 Adapter capability metadata
 
-The registry `Adapter` trait gains one method (`capability`). PR #269 has merged to
+The `Capability` / `CapabilitySupport` enums are `#[non_exhaustive]` (a future capability
+must not force every out-of-tree adapter to recompile-or-break), and `Adapter::capability`
+carries a **default returning `CapabilitySupport::Unsupported`** for any capability an
+adapter doesn't recognize — so an out-of-tree adapter compiled against an older core still
+builds, and an unknown capability fails closed (Unsupported → a `required` mismatch
+hard-fails) rather than failing to compile. The registry `Adapter` trait gains one method (`capability`). PR #269 has merged to
 main, so the trait already carries the `provision` / config-validation surface; this
 spec adds only `capability`:
 
@@ -3040,7 +3051,9 @@ fn ensure_capabilities(
   instead — the principle is "required means the matrix footnote's deviation is not
   acceptable for this deployment."
 - Required + `BoundedCooperative` → informational log (works, with a documented bound).
-- Optional + `Unsupported` → warning. `config-store` and friends stay optional.
+- Optional + **`BestEffort` OR `Unsupported`** → `log::warn!` naming the capability and
+  the degradation (the ladder logs *both*, not just Unsupported); never a hard fail.
+  `config-store` and friends stay optional.
 
 #### 3.5.4 Outbound host plumbing — not policy
 
@@ -3079,9 +3092,10 @@ Apps still enforce their own target allowlist in handler code. Adapter use of `h
      the call site, so it passes the hosts directly; **no re-parse, no wrong-file risk**;
      or (b) thread the **full manifest path** (`args.manifest`, not its parent) so the
      adapter re-reads the correct file. Both are trait-surface changes touching the four
-     adapters' `provision` signatures. *(Recommend (a): the hosts are the only datum
-     needed, and passing them avoids both a re-parse and the filename-loss bug that
-     `manifest_root` alone causes.)* Sibling fields and comments are preserved (test-pinned, on a fixture
+     adapters' `provision` signatures. **LOCKED: option (a)** — add `hosts: Option<&[String]>` to the provision context
+     (`ProvisionStores` or a sibling param). The CLI already holds the parsed manifest at
+     the call site, so it passes the hosts directly: no re-parse, no filename-loss bug.
+     This is the single additive provision-context change; option (b) is rejected.* Sibling fields and comments are preserved (test-pinned, on a fixture
      that already contains `allowed_outbound_hosts`). Writing at provision matches
      EdgeZero's model: *platform manifests are written during provision, not build.*
   3. **`edgezero build` / `serve` / `deploy`** **validate only — they never write.**
@@ -3255,11 +3269,17 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
      decompression path is kept; the decompressed-byte cap is enforced
      incrementally while decompressing (§3.4.1), with pre-append checked
      accounting.
-- **Streamed responses honour the effective-budget deadline.** Wrap the response body
-  as `Body::Stream`, with a per-chunk race against a `worker::Delay` bounded by
-  `budget.deadline` (the synthetic-if-absent absolute deadline from
-  `dispatch_budget`). The wrapper yields a `gateway_timeout` error chunk past the
-  deadline so the streamed body honours the deadline end-to-end per §3.3.3.
+- **Streamed responses honour the deadline AND cancel the subrequest.** Wrap the
+  response body as `Body::Stream`, with a per-chunk race against a `worker::Delay`
+  bounded by `budget.deadline`. **The `AbortController` (from the send step) MUST move
+  INTO the body wrapper — the wrapper owns it for the streamed case**, because the
+  subrequest is still live while the body streams. The wrapper `controller.abort()`s and
+  yields a `gateway_timeout` error chunk when: (a) the deadline `worker::Delay` fires,
+  (b) an underlying chunk read fails, or (c) the **consumer drops the stream early**
+  (`Drop` on the wrapper aborts). Merely yielding an error chunk without `abort()` (an
+  earlier draft) leaves the CF subrequest running after EdgeZero has stopped reading —
+  the same bug the buffered path fixes. So the deadline is honoured end-to-end **and**
+  the origin observes cancellation.
 - Errors: `worker::Delay` expiry → `gateway_timeout`; `worker::fetch` transport
   failure (DNS/TLS/connection refused) → `bad_gateway`; **request**-body over-cap →
   `bad_request` (400); **response**-body over-cap (decompressed count) → `bad_gateway`
@@ -4114,6 +4134,16 @@ service — this distinction is explicit so a green capability check is not misr
   `Body::Stream`, with a per-chunk race against a wasi monotonic-clock timer bounded
   by `budget.deadline`; the wrapper yields a `gateway_timeout` error chunk past the
   deadline so the streamed body honours the deadline end-to-end per §3.3.3.
+- **ALL uploads — including BUFFERED — use the hand-built `wasi:http` request, not
+  `spin_sdk::http::send`.** `spin_sdk::http::send`'s `IntoRequest` conversion spawns a
+  **detached, uncancellable** body pump (§4.4) even for a *buffered* `Body::Once`: a
+  finite buffer still blocks on **host backpressure** if the origin reads slowly, and
+  dropping the `send` future does not cancel that pump — so a buffered upload could block
+  past the deadline. Therefore buffered bodies also go through the hand-built request +
+  owned in-race pump below (a buffered body is just a one-shot stream of a single
+  chunk), which the deadline race can cancel. This keeps `streamed-upload-deadlines`
+  genuinely `Native` for both body kinds.
+
 - **Streamed request bodies — hand-built `wasi:http` request (SDK 6 / WASI 0.3).**
 
   > **⚠️ Corrected against verified SDK source.** Earlier drafts of this section
@@ -4151,8 +4181,11 @@ service — this distinction is explicit so a green capability check is not misr
   let _ = opts.set_connect_timeout(Some(connect_ns));   // transport-only; see note below
 
   let (req, _transmit) = types::Request::new(headers, Some(contents_rx), trailers_rx, Some(opts));
-  req.set_method(&method)?;   req.set_scheme(scheme.as_ref())?;
-  req.set_authority(auth)?;   req.set_path_with_query(pq)?;
+  // The wasip3 setters return `Result<(), ()>` (unit error), so bare `?` does NOT
+  // compile in an `EdgeError`-returning context — map the `()` to a concrete error.
+  let bad = |()| EdgeError::internal(anyhow::anyhow!("invalid outbound request component"));
+  req.set_method(&method).map_err(bad)?;   req.set_scheme(scheme.as_ref()).map_err(bad)?;
+  req.set_authority(auth).map_err(bad)?;   req.set_path_with_query(pq).map_err(bad)?;
 
  // The pump lives INSIDE the raced future — no `wit_bindgen::spawn`.
   let pump = async move {
@@ -4340,7 +4373,9 @@ adapter's **wasm target** for Fastly / Cloudflare / Spin (§5.5). Covers request
 and platform→response conversion, header preservation (incl. multi-value), method/body
 preflight, non-2xx mapping, buffered vs. streamed handling, decompression, and error
 mapping. Requires the **`test-utils` seams and provider fakes** of §5.5 — a Tier 2 row
-whose seam does not exist yet is **not required** and must not be listed as such.
+whose seam is a **first-class deliverable of the same change** (below) is **required** —
+the row is not waived for a missing seam; the seam is built as part of landing the adapter.
+Only rows needing a real platform runtime are deferred, and those are Tier 3, not Tier 2.
 
 **The `send_all` conformance suite lives here.** Because orchestration is per-adapter, the
 only way to hold all four to one standard is a **reusable suite** — a set of assertions
@@ -4921,7 +4956,11 @@ change lands here whether intended or not)*
     `LocalBoxStream → Send` bridge (e.g. `spawn_local` + tokio mpsc) is non-trivial
     and out of scope for this migration. **The Axum response converter therefore
     buffers `Body::Stream` into `Bytes` (bounded, pre-append-checked) before
-    constructing the axum response.** The cap is a defined Axum-adapter constant
+    constructing the axum response.** The drain is **async and reactor-safe** — the
+    converter is an `async fn` awaited on the Tokio runtime, NOT `futures::executor::block_on`
+    inside a Tokio worker (which would panic / stall the reactor). A timer-backed stream
+    test (a source that yields on a `tokio::time` interval) proves the drain makes
+    progress on the live reactor. The cap is a defined Axum-adapter constant
     `AXUM_RESPONSE_STREAM_BUFFER_BYTES = 16 MiB` (a **fixed compile-time constant**;
     no `AxumOutboundConfig` plumbing in this migration). The per-outbound-request
     `max_response_bytes` is unavailable at this stage because the app has already
@@ -4967,7 +5006,9 @@ change lands here whether intended or not)*
   and `Body::Stream`; on Cloudflare, `Body::Stream` streams and only `Body::Once` is
   trivially "buffered" (it already is bytes).
 - adapter entry — register `HttpClient`; declare `capability()`.
-- **Axum `Cargo.toml`** — enable `gzip` and `brotli` features on `reqwest` so
+- **Axum `Cargo.toml`** — do **NOT** enable reqwest's `gzip`/`brotli` features (auto-
+  decode is exact-lowercase-only and cannot honour the portable case-insensitive/stacked
+  policy); Axum uses the shared §3.4.1 decoder like the other adapters. ~~enable gzip/brotli~~ so
   transparent decompression matches the other three adapters (the workspace
   reqwest dep is `default-features = false` today; the Axum adapter opts these
   features in directly).
