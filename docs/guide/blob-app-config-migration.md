@@ -331,7 +331,8 @@ deletes only unreferenced chunk entries you have asserted are old enough:
 # Preview every orphan and its age (dry-run by default):
 <app>-cli config gc --adapter fastly
 
-# Delete, asserting nothing changed in the last 7 days and no push is running:
+# Delete, asserting that NO root in this store changed in the last 7 days AND no
+# writer is targeting the store (config gc sweeps every root, store-wide):
 <app>-cli config gc --adapter fastly --older-than 7d --yes
 ```
 

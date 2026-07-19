@@ -9,8 +9,8 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    CHUNK_KEY_INFIX, FASTLY_CONFIG_KEY_LIMIT, GcPointer, GcRootValue, chunk_key_generation,
-    gc_classify_root, gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
+    CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, gc_classify_root,
+    gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
     resolve_fastly_config_value, sha256_hex, value_is_pointer_kind,
 };
 use ctor::ctor;
@@ -290,22 +290,26 @@ impl Adapter for FastlyCliAdapter {
         "fastly"
     }
 
-    fn preflight_config_key(&self, key: &str) -> Result<(), String> {
-        // Reject an invalid key here, BEFORE the CLI's remote read, so a bad
-        // `--key` fails offline rather than after a list/describe. The write path
+    fn preflight_config_write(&self, key: &str, body: &str) -> Result<(), String> {
+        // Reject an infeasible push here, BEFORE the CLI's remote read, so it
+        // fails offline rather than after a list/describe. The write path
         // re-checks, so this is a strict early gate, not the only one.
+        //
+        // An empty key is writer-valid but resolver-invalid (canonical chunk
+        // parsing rejects an empty root); reject it before any I/O.
+        if key.is_empty() {
+            return Err(
+                "config key is empty; provide a store id or a non-empty `--key`".to_owned(),
+            );
+        }
         let entry = [(key.to_owned(), String::new())];
         reject_reserved_root_keys(&entry)?;
-        // An over-limit root key is a physical key the writer cannot store; catch
-        // it here rather than after a network round-trip. (A derived chunk key
-        // adds ~85 chars, but whether the value chunks is not known until
-        // expansion, so that stricter check stays there.)
-        if key.chars().count() > FASTLY_CONFIG_KEY_LIMIT {
-            return Err(format!(
-                "config key is longer than Fastly's {FASTLY_CONFIG_KEY_LIMIT}-character store limit; \
-                 use a shorter store id or `--key`"
-            ));
-        }
+        // Run the full chunk expansion OFFLINE (no I/O): exactly what the write
+        // path does, so every body-dependent feasibility failure — the root key
+        // over the store limit, a DERIVED chunk key over it once the value
+        // chunks, or a pointer that would not fit the entry limit — is caught
+        // here, before the remote read, instead of after it.
+        prepare_fastly_config_entries(key, body)?;
         Ok(())
     }
 
@@ -687,9 +691,10 @@ impl Adapter for FastlyCliAdapter {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Parse the JSON and extract the `item_value` field.
-            let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
                 format!(
-                    "failed to parse `fastly config-store-entry describe` JSON: {err} (response: {})",
+                    "failed to parse `fastly config-store-entry describe` JSON (parse error \
+                     redacted; response: {})",
                     redact_describe_response(&stdout)
                 )
             })?;
@@ -898,10 +903,10 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
         })?;
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
             format!(
                 "failed to parse `fastly config-store-entry describe` JSON for key \
-                 `{key}`: {err} (response: {})",
+                 `{key}` (parse error redacted; response: {})",
                 redact_describe_response(&stdout)
             )
         })?;
@@ -1017,9 +1022,12 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let doc: toml_edit::DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
     let svc = doc
         .get("service_id")
         .and_then(|item| item.as_str())
@@ -1066,9 +1074,12 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let doc: toml_edit::DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
     let plural = format!("{kind}_stores");
     Ok(doc
         .get("setup")
@@ -1097,9 +1108,12 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let mut doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let mut doc: DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
 
     let plural = format!("{kind}_stores");
     let parent_entry = doc.entry("setup").or_insert_with(table);
@@ -1459,15 +1473,14 @@ fn local_orphan_counts_for_dry_run(
 // `config push` helpers
 // -------------------------------------------------------------------
 
-/// Shell out to `fastly config-store-entry create --store-id=<id>
-/// --key=<k> --value=<v>` for a single entry. Surfaces fastly's
-/// stderr verbatim on failure — including the "entry already
-/// exists" error, which is the operator's signal to delete the
-/// entry (or use `config-store-entry update` manually) before
-/// re-running push.
-/// `fastly config-store-entry list --store-id=<id> --json`, keeping only each
-/// item's key and `created_at`. The item VALUE is discarded on purpose (it is
-/// the stored config; see `redact_describe_response`).
+/// Run `fastly config-store-entry list --store-id=<id> --json` and return each
+/// item's `item_key`, `item_value`, and `created_at`.
+///
+/// The item VALUE is KEPT (not discarded): `config gc` classifies each root by
+/// its value (`gc_classify_root`) and reconstructs live generations from the
+/// chunk values, so all three fields are required. The value is used internally
+/// only and is NEVER echoed into a diagnostic — parse failures redact it via
+/// `redact_describe_response`.
 fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, String> {
     let store_arg = format!("--store-id={store_id}");
     let output = Command::new("fastly")
@@ -1489,9 +1502,10 @@ fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, Str
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
         format!(
-            "failed to parse `fastly config-store-entry list` JSON: {err} (response: {})",
+            "failed to parse `fastly config-store-entry list` JSON (parse error redacted; \
+             response: {})",
             redact_describe_response(&stdout)
         )
     })?;
@@ -1896,8 +1910,11 @@ fn plan_gc_reclamation(
     } = classify_store_entries(items, &value_by_key)?;
 
     // ---- 2. Per-root live-config age (best-effort; see the guard below) ----
+    // rsplit_once (the LAST infix): a chunk of a chunk-shaped root nests the infix
+    // twice, and its root is everything before the LAST one. Splitting on the
+    // first would attribute a nested chunk's age to the wrong (outer) root.
     let root_live_since: HashMap<&str, u64> = live.iter().fold(HashMap::new(), |mut acc, key| {
-        if let Some((root, _)) = key.split_once(CHUNK_KEY_INFIX) {
+        if let Some((root, _)) = key.rsplit_once(CHUNK_KEY_INFIX) {
             let created = *created_by_key.get(key.as_str()).unwrap_or(&0);
             let slot = acc.entry(root).or_insert(0);
             *slot = (*slot).max(created);
@@ -1923,7 +1940,11 @@ fn plan_gc_reclamation(
         if protected.contains(&item.item_key) {
             continue;
         }
-        let Some((root, _)) = item.item_key.split_once(CHUNK_KEY_INFIX) else {
+        // rsplit_once (the LAST infix): the same nested-chunk correctness the
+        // live-set scan and classification use — a chunk of a chunk-shaped root
+        // is grouped under THAT root, not the outer one, so nested orphans are
+        // grouped (and thus reclaimed or reported), not silently dropped.
+        let Some((root, _)) = item.item_key.rsplit_once(CHUNK_KEY_INFIX) else {
             continue; // a root
         };
         let Some(generation) = chunk_key_generation(root, &item.item_key) else {
@@ -5614,6 +5635,49 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// A nested ORPHAN generation (chunks scoped to a chunk-shaped root, with NO
+    /// live pointer referencing them) must be grouped and reclaimed, not silently
+    /// dropped. Age and grouping split on the LAST infix, so the nested chunks are
+    /// attributed to their real (nested) root.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reclaims_a_nested_orphan_generation() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // A chunk-shaped root, and a full generation of chunks SCOPED to it — but
+        // no pointer references them, so they are orphaned.
+        let nested_root = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "f".repeat(64));
+        let nested = gen_envelope("nested-orphan");
+        let nested_entries = prepare_fastly_config_entries(&nested_root, &nested).expect("expand");
+        let nested_chunks: Vec<String> = nested_entries[..nested_entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let live = gen_envelope("live");
+        let stamp = stamp_secs_ago(604_800);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        for (key, value) in &nested_entries[..nested_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp.clone(), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &nested_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "a nested orphan generation must be reclaimed, not silently dropped: `{key}`; \
+                 log:\n{log}"
+            );
+        }
+    }
+
     /// A generation is aged by its YOUNGEST member, so a generation with one
     /// recent chunk is retained whole even if its other chunks are ancient.
     #[cfg(unix)]
@@ -6514,22 +6578,44 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// `preflight_config_key` rejects a reserved-namespace key, so the CLI can
-    /// reject an invalid `--key` BEFORE any provider I/O.
+    /// `preflight_config_write` rejects an infeasible push BEFORE any provider
+    /// I/O: a reserved key, an empty key, and a body whose DERIVED chunk keys
+    /// would exceed the store limit (caught by running expansion offline).
     #[test]
-    fn preflight_config_key_rejects_reserved_infix() {
-        let bad = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
-        let err = FastlyCliAdapter
-            .preflight_config_key(&bad)
-            .expect_err("a reserved-namespace key must be rejected");
+    fn preflight_config_write_rejects_infeasible_pushes_offline() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let small = make_test_envelope(100);
+
+        let reserved = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
         assert!(
-            err.contains("reserved infix"),
-            "error names the reason: {err}"
+            FastlyCliAdapter
+                .preflight_config_write(&reserved, &small)
+                .is_err_and(|err| err.contains("reserved infix")),
+            "a reserved-namespace key must be rejected"
         );
-        // A normal key passes.
+
+        assert!(
+            FastlyCliAdapter
+                .preflight_config_write("", &small)
+                .is_err_and(|err| err.contains("empty")),
+            "an empty key must be rejected"
+        );
+
+        // A ~200-char root with a CHUNKED body: derived chunk keys (root + ~85)
+        // exceed the 255-char limit. Caught offline by expansion.
+        let long_root = "r".repeat(200);
+        let big = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        assert!(
+            FastlyCliAdapter
+                .preflight_config_write(&long_root, &big)
+                .is_err(),
+            "an over-limit derived chunk key must be rejected before I/O"
+        );
+
+        // A normal push passes.
         FastlyCliAdapter
-            .preflight_config_key("app_config")
-            .expect("a normal key must pass preflight");
+            .preflight_config_write("app_config", &small)
+            .expect("a normal push must pass preflight");
     }
 
     /// A logical key containing the reserved chunk infix is rejected

@@ -4248,6 +4248,18 @@ errors only report position-in-input, not field-path; the
 the deserialise itself. The dep is small (~500 LOC, no
 transitive deps) and locked-in for the variant.
 
+> **Runtime redaction (security).** In the HTTP `ConfigOutOfDate`
+> response the path's STRING segments are redacted to `<redacted>`
+> while structure (dots and sequence indices) is kept — e.g.
+> `<redacted>.<redacted>`. A `serde_path_to_error` segment for a struct
+> field is indistinguishable from a MAP KEY, and a map key is stored
+> config data that may be a secret; the redaction invariant forbids any
+> stored string on a client-facing path. The operator recovers the EXACT
+> path by running `config validate` locally (same deserialise, no HTTP
+> boundary). This narrows the `field_path` from the original design; the
+> secret-walk/validator constructor still supplies an explicit static
+> path, since those are code-supplied field names, not stored data.
+
 **Variant declaration (sketch).** Two constructors —
 one for the serde-deserialise path (which has rich
 field-path data from `serde_path_to_error`), one for

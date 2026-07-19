@@ -75,13 +75,11 @@ impl EdgeError {
         // into the HTTP error body. The config blob may hold secrets, so the
         // VALUE must not escape — report only the category.
         //
-        // The `field_path` IS preserved verbatim: the authoritative contract
-        // (spec 2026-06-16 §"field_path for the variant's payload") requires the
-        // offending dotted field path, and `serde_path_to_error` represents a
-        // struct field and a map key with the same segment kind, so redacting map
-        // keys would blank ordinary schema fields and break the contract. The
-        // sensitive part — the value — is in the message, which is redacted; the
-        // path carries field/segment names only.
+        // The `field_path` STRING segments are redacted (structure kept): a map
+        // key is indistinguishable from a struct field here and may be a secret,
+        // and the redaction invariant forbids a stored string on any path. The
+        // exact path is available from a local `config validate`. See
+        // `redact_serde_path`.
         use serde_json::error::Category;
         let category = match serde_err.inner().classify() {
             Category::Data => "wrong type or invalid value",
@@ -94,7 +92,7 @@ impl EdgeError {
                 "typed app-config is out of date ({category}; value redacted) — \
                  run `<app-cli> config push` for this deploy"
             ),
-            field_path: serde_err.path().to_string(),
+            field_path: redact_serde_path(serde_err.path()),
         }
     }
 
@@ -279,6 +277,49 @@ impl IntoResponse for EdgeError {
     }
 }
 
+/// Render a `serde_path_to_error` path with its STRING segments redacted while
+/// preserving structure (dots and sequence indices).
+///
+/// A struct field and a map KEY are the same `Segment::Map` in this API
+/// (verified empirically), so they cannot be told apart. A map key is stored
+/// config DATA and may be a secret, and this path is serialised into the HTTP
+/// error body — which the redaction invariant forbids for any stored string. So
+/// every string segment becomes `<redacted>`; sequence indices (positions, not
+/// values) are kept. The operator recovers the EXACT path by running
+/// `config validate` locally, which deserializes the same blob without an HTTP
+/// boundary. See the `field_path` note in spec 2026-06-16.
+fn redact_serde_path(path: &serde_path_to_error::Path) -> String {
+    use serde_path_to_error::Segment;
+    let mut out = String::new();
+    for segment in path {
+        match segment {
+            Segment::Seq { index } => {
+                out.push('[');
+                out.push_str(&index.to_string());
+                out.push(']');
+            }
+            Segment::Map { .. } | Segment::Enum { .. } => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str("<redacted>");
+            }
+            Segment::Unknown => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push('?');
+            }
+        }
+    }
+    // No segments => a root-level error; keep serde's "." sentinel (a marker,
+    // not data).
+    if out.is_empty() {
+        return path.to_string();
+    }
+    out
+}
+
 fn json_or_text<T: Serialize>(payload: &T) -> Body {
     Body::json(payload).unwrap_or_else(|_| Body::text("internal error"))
 }
@@ -355,8 +396,8 @@ mod tests {
         assert!(!err.message().is_empty());
         match err {
             EdgeError::ConfigOutOfDate { field_path, .. } => {
-                // The dotted field path is preserved verbatim (contract).
-                assert_eq!(field_path, "service.timeout_ms");
+                // String segments redacted, structure preserved.
+                assert_eq!(field_path, "<redacted>.<redacted>");
             }
             EdgeError::BadRequest { .. }
             | EdgeError::Internal { .. }
@@ -369,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn config_out_of_date_from_serde_keeps_map_key_out_of_the_message() {
+    fn config_out_of_date_from_serde_redacts_map_key_from_path_and_message() {
         use serde::Deserialize;
         use std::collections::BTreeMap;
 
@@ -402,12 +443,14 @@ mod tests {
             } => {
                 assert!(
                     !message.contains(SENTINEL),
-                    "a stored map key must never reach the value-bearing message: {message}"
+                    "a stored map key must never reach the message: {message}"
                 );
                 assert!(
-                    field_path.contains(SENTINEL),
-                    "the contract requires the dotted path, which includes the key: {field_path}"
+                    !field_path.contains(SENTINEL),
+                    "a stored map key must never reach the field_path: {field_path}"
                 );
+                // Structure is preserved (items.<key>.port -> redacted, dotted).
+                assert_eq!(field_path, "<redacted>.<redacted>.<redacted>");
             }
             EdgeError::BadRequest { .. }
             | EdgeError::Internal { .. }

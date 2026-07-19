@@ -308,19 +308,23 @@ pub trait Adapter: Sync + Send {
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
 
-    /// Reject a config key that is invalid for this adapter, BEFORE any
+    /// Reject a config `(key, body)` that this adapter cannot store, BEFORE any
     /// provider I/O. Called by `config push` ahead of the remote read, so an
-    /// invalid key fails offline instead of after a `list`/`describe`
+    /// infeasible push fails offline instead of after a `list`/`describe`
     /// round-trip.
     ///
-    /// Default: accept. The Fastly adapter overrides this to reject a key
-    /// colliding with its reserved chunk namespace — the check the write path
-    /// would otherwise apply only after the read.
+    /// `body` is the serialised blob-envelope JSON that would be written, so
+    /// body-dependent feasibility (e.g. Fastly's derived chunk-key length and
+    /// pointer-size limits, which depend on whether the value chunks) can be
+    /// checked here rather than during the later write expansion.
+    ///
+    /// Default: accept. The Fastly adapter overrides this to reject a reserved
+    /// or over-limit key and to run the full chunk expansion offline.
     ///
     /// # Errors
-    /// Returns a human-readable error string if the key is invalid.
+    /// Returns a human-readable error string if the push is infeasible.
     #[inline]
-    fn preflight_config_key(&self, _key: &str) -> Result<(), String> {
+    fn preflight_config_write(&self, _key: &str, _body: &str) -> Result<(), String> {
         Ok(())
     }
 

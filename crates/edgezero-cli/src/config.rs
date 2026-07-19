@@ -447,10 +447,11 @@ where
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
     let local_sha = local_envelope.sha256.clone();
 
-    // Reject an invalid key BEFORE any provider I/O — otherwise a reserved-key
-    // `--key` would trigger a list/describe round-trip only to be rejected by
-    // the write path afterwards.
-    ctx.adapter.preflight_config_key(&key)?;
+    // Reject an infeasible push (bad/over-limit key, over-limit derived chunk
+    // keys, oversized pointer) BEFORE any provider I/O — otherwise it would
+    // trigger a list/describe round-trip only to be rejected by the write path
+    // afterwards. `body` is the envelope JSON the write would store.
+    ctx.adapter.preflight_config_write(&key, &body)?;
 
     // First read + diff.
     let remote = read_remote(ctx.adapter, args.local, &paths, &ctx.store, &key)?;

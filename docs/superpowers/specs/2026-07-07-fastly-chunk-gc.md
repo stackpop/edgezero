@@ -154,9 +154,13 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
     round-trip to this writer's exact output. Push-time reserved-key rejection
     cannot protect entries that already exist.
 
-11. **A generation is deleted whole or not at all, and a failure stops it.** A
-    generation is provable only as a unit, so a half-deleted one can never be
-    proved again. Deletion therefore stops at a generation's first failure. A
+11. **A generation is PLANNED and PROVEN atomically; physical deletion is not
+    transactional.** A generation is provable only as a unit (its whole chunk set
+    must round-trip), so the plan commits a generation whole or not at all. The
+    STORE has no multi-key transaction, though, so the deletes themselves are
+    sequential and a later one can fail after earlier siblings succeeded —
+    leaving a partial generation on the platform. Deletion therefore stops at a
+    generation's first failure to minimise that window. A
     failed remote delete has an UNKNOWN outcome — Fastly may commit it before
     returning an error — so nothing is promised as cleanly retryable: a failure
     with no confirmed prior sibling delete leaves the generation UNCERTAIN (a
@@ -232,8 +236,8 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 interpolated their raw stdout — i.e. the stored config envelope, which may hold
 credentials — into errors that the CLI logs verbatim. Because the GC prior-read
 runs on *every* cloud push, this exposed the previous config on any schema
-drift. Errors now report only the response's **size and top-level field-name
-shape** (`redact_describe_response`), never a value. Enforced by sentinel-secret
+drift. Errors now report only the response's **size and top-level field COUNT**
+(never the field NAMES, which are provider/stored data) (`redact_describe_response`), never a value. Enforced by sentinel-secret
 tests on both the read and push paths.
 
 **A batch must not name the same logical root twice.** GC builds one plan per
@@ -451,13 +455,12 @@ supplies `--older-than` is the one who knows a deploy is not in flight.
 **Local push path only.** It yields the chunk keys a pointer **references**,
 validated and prefix-scoped to that root.
 
-> **`config gc` does not call it on arbitrary values** — see §"Reclamation
-> algorithm". Its `Ok(vec![])`-for-unrecognised-values contract is right for a
-> push (nothing to prune) and dangerous for a delete (it would read as
-> "references nothing" and orphan a root's live chunks). GC classifies via
-> `gc_classify_root`, which reaches `prior_chunk_keys` only for a confirmed
-> pointer-kind value (getting validated keys or a hard error) and adds content
-> verification on top.
+> **`config gc` does not call it at all** — see §"Reclamation algorithm". Its
+> `Ok(vec![])`-for-unrecognised-values contract is right for a push (nothing to
+> prune) and dangerous for a delete (it would read as "references nothing" and
+> orphan a root's live chunks). GC classifies via `gc_classify_root`, which
+> INDEPENDENTLY deserialises the value, validates it with `validate_pointer_chunks`,
+> and adds content verification on top — it never delegates to `prior_chunk_keys`.
 >
 > The asymmetry is safe in the direction it fails: local pruning computes
 > `prior − new`, so an under-reporting pointer prunes **less** (leaks, which is
@@ -600,7 +603,11 @@ in the `cli.rs` test module.
 
 - **Never deletes anything** — a push writes chunks + pointer, nothing else.
 - Reserved-key and duplicate-root keys are hard errors before any I/O.
-- Dry-run stays offline (no `list`/`describe`/`delete`).
+- The adapter's push dry-run performs NO GC operations (`list`/`describe`/
+  `delete`) and NO write. (The CLI still does ONE read-back to render the diff,
+  per the `config push --dry-run` diff contract in the CLI reference; that single
+  describe is the diff, not a GC scan. An infeasible push is now rejected by the
+  body-aware preflight BEFORE that read.)
 - **Payload redaction**: schema-drift stdout *and* failing stderr never echo the
   stored value (sentinel-secret tests on both the read and push paths).
 

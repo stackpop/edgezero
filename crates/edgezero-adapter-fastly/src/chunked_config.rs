@@ -142,12 +142,28 @@ pub(crate) fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    // An EMPTY root key is writer-valid but resolver-INVALID: canonical chunk
+    // parsing rejects an empty root, so a chunked empty-key push would write
+    // chunks that can never be reassembled (and a partial cloud push could commit
+    // them before the final pointer write fails). Reject it before any I/O.
+    if root_key.is_empty() {
+        return Err(
+            "config key is empty; an empty key cannot be resolved at runtime. Provide a store id \
+             or a non-empty `--key`."
+                .to_owned(),
+        );
+    }
     // The root key itself is a physical key on both paths (the direct entry and
     // the pointer entry), so it must fit the store's key limit before anything
     // is written.
     check_config_key_len(root_key)?;
 
-    if envelope_json.len() <= FASTLY_CONFIG_ENTRY_LIMIT {
+    // The entry limit is a CHARACTER limit (Fastly measures characters), so the
+    // direct-vs-chunked decision counts chars, not UTF-8 bytes — a non-ASCII
+    // value that fits in 8 000 characters must not be chunked just because its
+    // byte length is larger. (Chunk PAYLOADS below are still split on byte
+    // boundaries; only this threshold and the pointer-size checks are char-based.)
+    if envelope_json.chars().count() <= FASTLY_CONFIG_ENTRY_LIMIT {
         return Ok(vec![(root_key.to_owned(), envelope_json.to_owned())]);
     }
 
@@ -213,7 +229,7 @@ pub(crate) fn prepare_fastly_config_entries(
     let pointer_json = serde_json::to_string(&pointer)
         .map_err(|err| format!("failed to serialise chunk pointer for `{root_key}`: {err}"))?;
 
-    if pointer_json.len() > FASTLY_CONFIG_ENTRY_LIMIT {
+    if pointer_json.chars().count() > FASTLY_CONFIG_ENTRY_LIMIT {
         return Err(format!(
             "chunk pointer for `{root_key}` is {} characters, which exceeds the \
              Fastly Config Store 8 000-character entry limit (the config is too \
@@ -295,7 +311,7 @@ where
     // never emit one larger than the entry limit. Reject an over-limit pointer up
     // front — this bounds how many chunk refs it can carry (hence the fetch
     // fan-out) before any parsing.
-    if root_value.len() > FASTLY_CONFIG_ENTRY_LIMIT {
+    if root_value.chars().count() > FASTLY_CONFIG_ENTRY_LIMIT {
         return Err(format!(
             "chunk pointer at `{root_key}` is larger than the {FASTLY_CONFIG_ENTRY_LIMIT}-character \
              entry limit and so is not one this writer could have stored"
@@ -1332,6 +1348,21 @@ mod tests {
         assert!(!fetched, "must reject before fetching 100 chunks: {err}");
     }
 
+    /// An empty root key is rejected before any output: writer-valid but
+    /// resolver-invalid (canonical chunk parsing rejects an empty root).
+    #[test]
+    fn empty_root_key_is_rejected() {
+        assert!(
+            prepare_fastly_config_entries("", "{}").is_err(),
+            "an empty key must be rejected on the direct path"
+        );
+        let big = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        assert!(
+            prepare_fastly_config_entries("", &big).is_err(),
+            "an empty key must be rejected on the chunked path too"
+        );
+    }
+
     /// A root that is itself valid but long enough that its DERIVED chunk keys
     /// exceed the store limit must be rejected up front, not fail mid-write.
     #[test]
@@ -1445,14 +1476,16 @@ mod tests {
         use edgezero_core::blob_envelope::BlobEnvelope;
         use serde_json::json;
 
-        // crab emoji: 4 bytes each; 3000 crabs = 12 000 bytes of payload
-        let emoji_block = "\u{1F980}".repeat(3_000);
+        // crab emoji: 4 bytes each, 1 char each. The entry limit is now a
+        // CHARACTER count, so the payload must exceed it in CHARACTERS to chunk
+        // (9 000 crabs = 9 000 chars = 36 000 bytes).
+        let emoji_block = "\u{1F980}".repeat(9_000);
         let data = json!({ "crabs": emoji_block });
         let envelope =
             serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".into())).unwrap();
         assert!(
-            envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT,
-            "emoji envelope must be oversized"
+            envelope.chars().count() > FASTLY_CONFIG_ENTRY_LIMIT,
+            "emoji envelope must exceed the character limit so it chunks"
         );
 
         let entries = prepare_fastly_config_entries("emoji_key", &envelope).unwrap();
