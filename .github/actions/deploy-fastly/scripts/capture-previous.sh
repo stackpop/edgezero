@@ -71,11 +71,20 @@ main() {
   #     parseable — e.g. one that never called `init_cli_logger`); or
   #   * a MALFORMED value like `version=12abc`, which the anchored numeric parse
   #     would otherwise silently drop to empty and mistake for a first deploy.
-  local version_line
-  version_line=$(grep -E '^version=' "$LIFECYCLE_LOG" | tail -n 1 || true)
-  if [[ -z "$version_line" ]]; then
+  # EXACTLY ONE `version=` line must be present. Taking only the last would let a
+  # malformed line hide behind a later well-formed one (e.g. `version=12abc`
+  # followed by `version=`, which would read as a first deploy), so a conflicting
+  # or duplicated contract line is refused outright.
+  local version_lines version_count version_line
+  version_lines=$(grep -E '^version=' "$LIFECYCLE_LOG" || true)
+  version_count=$(printf '%s' "$version_lines" | grep -c . || true)
+  if [[ "$version_count" -eq 0 ]]; then
     fail_with 1 "active-version exited 0 but emitted no \`version=\` line; refusing to deploy without a confirmed rollback target. Ensure the app CLI dispatches \`active-version\` to \`edgezero_cli::run_active_version\` and initialises its logger (\`edgezero_cli::init_cli_logger()\`) so machine-readable lines are printed unprefixed."
   fi
+  if [[ "$version_count" -gt 1 ]]; then
+    fail_with 1 "active-version emitted $version_count \`version=\` lines; exactly one is required. Refusing to guess which is the rollback target. Lines: $(printf '%s' "$version_lines" | tr '\n' ' ')"
+  fi
+  version_line="$version_lines"
   if [[ ! "$version_line" =~ ^version=([0-9]+)?$ ]]; then
     fail_with 1 "active-version emitted a malformed rollback target '$version_line'; expected \`version=<N>\` or an empty \`version=\`. Refusing to deploy with an unparseable version."
   fi

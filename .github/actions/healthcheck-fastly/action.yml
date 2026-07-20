@@ -10,8 +10,9 @@ inputs:
     required: false
     default: ""
   fastly-api-token:
-    description: Fastly API token (required for staging IP resolution).
-    required: true
+    description: "Fastly API token. Needed ONLY for staging (deploy-to=staging) IP resolution; a production probe requires no token and receives none."
+    required: false
+    default: ""
   fastly-service-id:
     description: Fastly service ID.
     required: true
@@ -56,6 +57,24 @@ runs:
       shell: bash
       env:
         EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
+        # Non-provider step: blank inherited provider aliases (only the probe step
+        # below receives the token, and only when it needs one).
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/scripts/validate.sh
 
     - name: Download CLI artifact
@@ -120,7 +139,9 @@ runs:
         EDGEZERO__LIFECYCLE__RETRY_DELAY: ${{ inputs['retry-delay'] }}
         EDGEZERO__LIFECYCLE__TIMEOUT: ${{ inputs.timeout }}
         # Only the typed token reaches the CLI; blank any inherited alias.
-        FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        # Only a STAGING probe needs the token (staging-IP resolution). A
+        # production probe just curls the domain, so it receives no token.
+        FASTLY_API_TOKEN: ${{ inputs['deploy-to'] == 'staging' && inputs['fastly-api-token'] || '' }}
         FASTLY_TOKEN: ""
         FASTLY_KEY: ""
         FASTLY_API_KEY: ""

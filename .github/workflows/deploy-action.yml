@@ -394,8 +394,12 @@ jobs:
 
       # A STALE rollback — one whose rolled-back-from version is no longer active
       # because a newer deploy landed — must be refused BEFORE it mutates anything.
-      - name: Simulate a newer deploy becoming active
-        run: printf '99\n' >"$FAKE_ACTIVE_VERSION_FILE"
+      - name: Simulate a newer deploy becoming active, snapshot the call log
+        run: |
+          printf '99\n' >"$FAKE_ACTIVE_VERSION_FILE"
+          # Snapshot the call log so the assertion inspects ONLY the stale
+          # rollback's calls (the delta), not the whole job's history.
+          printf 'STALE_LOG_SNAPSHOT=%s\n' "$(wc -l <"$FAKE_CALL_LOG")" >>"$GITHUB_ENV"
 
       - name: Stale production rollback must be refused
         id: stale-rollback
@@ -413,6 +417,5 @@ jobs:
       - name: Assert the stale rollback was refused and activated nothing
         env:
           EDGEZERO__TEST__OUTCOME: ${{ steps.stale-rollback.outcome }}
-          EDGEZERO__TEST__ROLLBACK_TO: "38"
+          EDGEZERO__TEST__LOG_SNAPSHOT: ${{ env.STALE_LOG_SNAPSHOT }}
         run: .github/actions/deploy-core/tests/assert-stale-rollback-refused.sh
-          echo "targetless production rollback correctly refused"

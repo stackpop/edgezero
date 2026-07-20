@@ -13,7 +13,7 @@ set -euo pipefail
 #   EDGEZERO__LIFECYCLE__SERVICE_ID       required  Fastly service id
 #   EDGEZERO__LIFECYCLE__VERSION          required  version to probe
 #   EDGEZERO__LIFECYCLE__DOMAIN           required  domain to probe
-#   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
+#   FASTLY_API_TOKEN                      staging-only  provider token (staging-IP resolution)
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__LIFECYCLE__RETRY            optional  attempts before unhealthy (default: 3)
 #   EDGEZERO__LIFECYCLE__RETRY_DELAY      optional  seconds between attempts (default: 5)
@@ -34,7 +34,6 @@ validate_inputs() {
   require_input_matching fastly-service-id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}" '^[A-Za-z0-9_-]+$'
   require_input_matching fastly-version "${EDGEZERO__LIFECYCLE__VERSION:-}" '^[0-9]+$'
   require_input_matching domain "${EDGEZERO__LIFECYCLE__DOMAIN:-}" '^[A-Za-z0-9._-]+$'
-  require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   # `retry` is a TOTAL attempt count, so 0 is meaningless (the CLI would silently
   # clamp it to 1). Require at least one attempt rather than accept-and-coerce.
   require_input_matching retry "${EDGEZERO__LIFECYCLE__RETRY:-}" '^[1-9][0-9]*$'
@@ -45,6 +44,12 @@ validate_inputs() {
     production | staging) ;;
     *) fail "input 'deploy-to' must be 'production' or 'staging' (got '${EDGEZERO__DEPLOY__TO:-}')" ;;
   esac
+  # The token is required ONLY for a staging probe (staging-IP resolution). A
+  # production probe just curls the public domain, so it needs no token — and the
+  # wrapper passes none.
+  if [[ "${EDGEZERO__DEPLOY__TO:-}" == "staging" ]]; then
+    require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
+  fi
 }
 
 main() {

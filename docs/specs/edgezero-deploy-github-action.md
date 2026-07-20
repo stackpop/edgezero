@@ -201,8 +201,9 @@ the application declares it, so the app owns adapter selection.
    ```
 
 5. Read `app-cli-version` from `cargo metadata` for `app-cli-package`, and smoke-check
-   the binary with `<app-cli-bin> --help` (today's CLI has no `--version`; see the
-   note below).
+   the binary with `<app-cli-bin> --help`. The version comes from `cargo metadata`
+   (authoritative, and works even for a hand-written CLI that omits the flag), and
+   `--help` is the runnability check every clap CLI supports.
 6. Write a small metadata file (`app-cli-meta.json`) next to the binary containing
    `app-cli-bin`, `app-cli-version`, and `app-cli-package`.
 7. Upload the binary **and `app-cli-meta.json`** as a single **tar archive** so the
@@ -216,11 +217,11 @@ binary name and version, so callers do not have to re-pass `app-cli-bin`/`app-cl
 `build-app-cli` never receives provider credentials and leaves the app checkout
 clean (no `target/`, no lockfile mutation), so a later dirty-source guard passes.
 
-> **Companion CLI improvement (tracked separately):** the generated downstream
-> CLI template currently sets no clap `version`, so `<cli> --version` fails. Add
-> `#[command(version)]` to the downstream CLI template so future apps expose a
-> version surface. Until then, `app-cli-version` comes from `cargo metadata` and the
-> runnability check uses `--help`.
+> **CLI version surface:** the generated downstream CLI template sets clap
+> `version` (`#[command(name = "…", version, …)]`), so `<cli> --version` works.
+> `build-app-cli` nonetheless takes `app-cli-version` from `cargo metadata` (it is
+> authoritative and works even for a hand-written CLI that omits the flag) and
+> uses `--help` for the runnability check.
 
 ### 5.2 Layer 2 — `deploy-core` (shared engine scripts)
 
@@ -898,8 +899,9 @@ actions never construct error messages containing credentials.
     user-influenced GitHub annotations or masking commands; reject CR/LF in
     single-line output values.
 14. Disable caching by default; use exact keys only when enabled.
-15. Do not auto-retry provider deployment; retries are limited to idempotent
-    downloads.
+15. Do not auto-retry provider DEPLOYMENT (a deploy mutation runs at most once).
+    Retries are confined to idempotent operations: installer downloads and the
+    read-only staging healthcheck probe (`retry` attempts).
 16. Do not use `github.token` for provider authentication.
 17. Document least-privilege workflow permissions (`contents: read` unless the
     caller needs more) and caller-owned environment protection, concurrency, and
@@ -1013,9 +1015,11 @@ The design is implemented when:
 4. Adding a second adapter is a new minimal wrapper plus target/allowlist data,
    with no engine fork.
 5. Deploy steps consume the prebuilt CLI artifact and never recompile it.
-6. Typed provider credentials reach only the provider steps (the deploy and the
-   rollback-target capture) and never appear in outputs, caches, action-owned
-   logs, or summaries.
+6. Typed provider credentials reach only the steps that call the provider — the
+   deploy, and the Fastly lifecycle steps (rollback-target capture, staging
+   healthcheck, rollback, config-push) — and never appear in outputs, caches,
+   action-owned logs, or summaries. A production healthcheck needs no token and
+   receives none.
 7. Passthrough argument boundaries are preserved; no `eval`.
 8. `cache: true` uses exact keys and caches only the **Cargo workspace root**
    `target/` (§11.1), so nested-workspace monorepos cache the right artifacts.

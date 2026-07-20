@@ -72,8 +72,9 @@ reference to port from. Most transfer with light changes:
      dirty-source guard, via
      `cargo build --locked --release -p <app-cli-package> --bin <app-cli-bin>`. No
      `--features` injection: the app's own `Cargo.toml` pins its adapters.
-   - Read `app-cli-version` from `cargo metadata`; smoke-check with `<app-cli-bin> --help`
-     (today's CLI has no `--version`); write `app-cli-meta.json` (`app-cli-bin`,
+   - Read `app-cli-version` from `cargo metadata` (authoritative even for a
+     hand-written CLI that omits the flag); smoke-check with `<app-cli-bin> --help`;
+     write `app-cli-meta.json` (`app-cli-bin`,
      `app-cli-version`, `app-cli-package`) next to the binary and upload both as one
      **tar** so the executable bit survives `actions/upload-artifact` and the
      artifact is self-describing.
@@ -220,10 +221,10 @@ reference to port from. Most transfer with light changes:
    - No Python; no live provider credentials.
 
 9. **Companion CLI scaffolding (`crates/edgezero-cli`, `edgezero-adapter-fastly`)**
-   - Add `#[command(version)]` to the downstream CLI template
-     (`crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`) so generated app
-     CLIs expose `--version`. Until adopted, `build-app-cli` reads the version from
-     `cargo metadata` and smoke-checks with `--help`.
+   - The downstream CLI template sets clap `version`
+     (`crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`), so generated app
+     CLIs expose `--version`. `build-app-cli` still reads the version from
+     `cargo metadata` (authoritative, flag-independent) and smoke-checks with `--help`.
    - Fastly staging deploy: extend the Fastly adapter `deploy` path with
      `--stage` → `fastly compute update --autoclone --version=active` +
      `fastly service-version stage`; emit the service version in a parseable form.

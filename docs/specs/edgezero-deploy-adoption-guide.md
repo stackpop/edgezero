@@ -158,7 +158,8 @@ steps:
   - initialise the CLI logger — call `edgezero_cli::init_cli_logger()` in `main`
     (or provide equivalent UNPREFIXED stdout). The `run_*` handlers emit their
     machine-readable contract lines (`version=<N>`, `pushed-key=<key>`,
-    `rolled-back-to=<N>`) via `log::info!`; without an initialised logger they are
+    `pushed-store=<id>`, `rolled-back-to=<N>`) via `log::info!`; without an
+    initialised logger they are
     swallowed, so the provider mutation can SUCCEED and the wrapper then fail to
     parse the version — leaving no captured rollback target. The scaffolded
     template already calls it.

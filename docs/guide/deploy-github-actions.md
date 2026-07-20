@@ -37,11 +37,24 @@ provider-neutral behavior; the wrappers above are thin.
     Fastly lifecycle — `active-version`, `healthcheck`, and `rollback` (plus
     `config` for `config-push-fastly`). The scaffolded template wires all of
     them; if you hand-write your CLI, dispatch each to its `edgezero_cli::run_*`
-    handler. A production deploy runs `active-version` to capture the rollback
-    target and fails fast (before touching the provider) if it is missing.
+    handler. Two easy-to-miss requirements when hand-writing:
+    - **Initialise the logger.** Call `edgezero_cli::init_cli_logger()` in `main`.
+      The handlers print their machine-readable contract lines (`version=<N>`,
+      `pushed-key=<key>`, `pushed-store=<id>`, `rolled-back-to=<N>`) via
+      `log::info!`; without the logger they are swallowed, so the provider
+      mutation SUCCEEDS and the wrapper then fails to parse the output.
+    - **Route `config` through the TYPED path.** Dispatch `config push` to
+      `run_config_push_typed::<YourAppConfig>` (and `validate`/`diff` likewise) —
+      the bundled untyped path returns an unsupported error. It must emit BOTH
+      `pushed-key=` and `pushed-store=`, which `config-push-fastly` requires.
+
+    A production deploy runs `active-version` to capture the rollback target and
+    fails fast (before touching the provider) if it is missing.
+
 - **Typed provider credentials.** Pass `fastly-api-token` / `fastly-service-id`
   through the wrapper inputs — never through workflow `env:`. They reach only the
-  provider steps (the rollback-target capture and the deploy).
+  steps that call the provider (the deploy, and the Fastly lifecycle steps such
+  as rollback-target capture); a production healthcheck needs none.
 
 ## Quick start (same repository)
 
@@ -175,18 +188,18 @@ and cannot — pass it through `deploy-args`.
 
 ### `healthcheck-fastly`
 
-| Input               | Required | Default         | Meaning                                                       |
-| ------------------- | -------- | --------------- | ------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                          |
-| `fastly-api-token`  | Yes      | —               | Needed to resolve a staged version's IP.                      |
-| `fastly-service-id` | Yes      | —               | Service to probe.                                             |
-| `fastly-version`    | Yes      | —               | Version to probe — thread the deploy's `fastly-version`.      |
-| `domain`            | Yes      | —               | Domain to probe, e.g. `www.example.com`.                      |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                              |
-| `deploy-to`         | No       | `production`    | `staging` probes the staged version via its resolved edge IP. |
-| `retry`             | No       | `3`             | Attempts before declaring the deployment unhealthy.           |
-| `retry-delay`       | No       | `5`             | Seconds between attempts.                                     |
-| `timeout`           | No       | `10`            | Per-attempt timeout in seconds.                               |
+| Input               | Required | Default         | Meaning                                                                                                        |
+| ------------------- | -------- | --------------- | -------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                           |
+| `fastly-api-token`  | Staging  | —               | Needed only for `deploy-to: staging` (staging-IP resolution); a production probe needs none and receives none. |
+| `fastly-service-id` | Yes      | —               | Service to probe.                                                                                              |
+| `fastly-version`    | Yes      | —               | Version to probe — thread the deploy's `fastly-version`.                                                       |
+| `domain`            | Yes      | —               | Domain to probe, e.g. `www.example.com`.                                                                       |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                               |
+| `deploy-to`         | No       | `production`    | `staging` probes the staged version via its resolved edge IP.                                                  |
+| `retry`             | No       | `3`             | Attempts before declaring the deployment unhealthy.                                                            |
+| `retry-delay`       | No       | `5`             | Seconds between attempts.                                                                                      |
+| `timeout`           | No       | `10`            | Per-attempt timeout in seconds.                                                                                |
 
 Outputs: `healthy`, `status-code`.
 
@@ -393,8 +406,15 @@ it is rolling back _from_ is still the active one and refuses otherwise, so a
 stale rollback will not clobber a much newer deploy. That check is **best-effort,
 not atomic**: Fastly's activate endpoint takes no precondition, so a deploy that
 lands in the window between the check and the activation can still be
-overwritten. Service-scoped serialization is what closes that window — the guard
-only narrows it.
+overwritten. The guard only narrows that window.
+
+Serialization closes it **only when every mutation shares one deployment
+authority.** A GitHub `concurrency` group is scoped to a single repository's
+runs, so it serializes deploys and rollbacks _within that repo_ — it cannot
+serialize another repository's workflow, a `fastly` CLI run from a laptop, or a
+Fastly-console activation. If more than one authority can activate versions on
+the service, route them all through the same serialized workflow (or accept the
+residual race).
 
 Add `timeout-minutes`, a protected GitHub Environment with required reviewers,
 and pin third-party actions to readable released tags (or full SHAs for

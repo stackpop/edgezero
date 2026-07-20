@@ -1144,6 +1144,8 @@ fi
 if [ "$1" = active-version ]; then
   # FAKE_SILENT models a broken CLI that exits 0 but prints no contract line.
   [ -n "${FAKE_SILENT:-}" ] || printf '%s\n' "${FAKE_VERSION_LINE-version=}"
+  # FAKE_EXTRA_LINE models a CLI emitting a SECOND contract line.
+  [ -z "${FAKE_EXTRA_LINE:-}" ] || printf '%s\n' "$FAKE_EXTRA_LINE"
   exit "${FAKE_EXIT:-0}"
 fi
 exit 3
@@ -1158,6 +1160,7 @@ CLI
       FASTLY_API_TOKEN=tok \
       GITHUB_OUTPUT="$dir/out.txt" \
       FAKE_VERSION_LINE="${FVL-version=}" FAKE_EXIT="${FE:-0}" FAKE_SILENT="${FS:-}" \
+      FAKE_EXTRA_LINE="${FXL:-}" \
       "$ACTIONS_DIR/deploy-fastly/scripts/capture-previous.sh"
   }
   capture_prev() { sed -nE 's/^previous-version=(.*)$/\1/p' "$dir/out.txt"; }
@@ -1181,6 +1184,14 @@ CLI
   # A MALFORMED value (a `version=` line that isn't empty and isn't all digits)
   # must fail closed, not be silently dropped to an empty first-deploy target.
   FVL='version=12abc' FE=0 assert_fails "capture fails closed on a malformed version value" run_capture
+
+  # ORDER must not matter: a malformed line followed by a well-formed one must
+  # STILL fail closed (taking only the last line would read this as a first
+  # deploy). Exactly one contract line is required.
+  FVL='version=12abc' FXL='version=' FE=0 \
+    assert_fails "capture fails closed when a malformed line precedes a valid one" run_capture
+  FVL='version=40' FXL='version=41' FE=0 \
+    assert_fails "capture fails closed on conflicting version lines" run_capture
 
   # A CLI without `active-version` fails the credential-free preflight early.
   printf '#!/usr/bin/env bash\nexit 2\n' >"$dir/bin/fake-cli"
