@@ -2761,10 +2761,17 @@ where
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
         .map_err(EdgeError::config_out_of_date_from_serde)?;
     cfg.validate().map_err(|err| {
-        EdgeError::config_out_of_date(
-            err.to_string(),
-            first_violating_field(&err).unwrap_or_default(),
-        )
+        // The secret walk above replaced `#[secret]` fields with their
+        // RESOLVED values, and `validator`'s params echo the rejected value,
+        // so `err.to_string()` would leak a secret into the HTTP body/logs.
+        // Keep the structural field name; drop the rendered report.
+        let field = first_violating_field(&err).unwrap_or_default();
+        let message = if field.is_empty() {
+            "app config failed validation".to_owned()
+        } else {
+            format!("app config failed validation for field `{field}`")
+        };
+        EdgeError::config_out_of_date(message, field)
     })?;
     Ok(cfg)
 }
@@ -4302,7 +4309,10 @@ impl EdgeError {
     /// which may be secrets and reach the HTTP body. The
     /// message is a category only; the path's string segments
     /// are redacted with structure kept (see `redact_serde_path`).
-    /// The exact path is available from a local `config validate`.
+    /// A local `config validate` can surface the exact path ONLY
+    /// when the local TOML still matches what was deployed — it
+    /// reads the local source, not the deployed blob, so a drift
+    /// between them is not recoverable this way.
     pub fn config_out_of_date_from_serde(
         serde_err: serde_path_to_error::Error<serde_json::Error>,
     ) -> Self {
@@ -4328,20 +4338,30 @@ Caller sites:
   `EdgeError::config_out_of_date_from_serde(err)`.
 
 The validator path (§6.2.2) wraps a
-`validator::ValidationErrors`:
+`validator::ValidationErrors`. **On the RUNTIME path this runs
+AFTER the secret walk**, so `#[secret]` fields now hold their
+RESOLVED values — and `validator`'s error params echo the
+rejected value, so `validation_err.to_string()` would render a
+resolved secret straight into the HTTP body and the log line.
+The message therefore carries only the structural field name,
+never the validator's rendered report:
 
 ```rust
-EdgeError::config_out_of_date(
-    validation_err.to_string(),         // validator's rendered report
-    extract_first_field(&validation_err),
-)
+let field = extract_first_field(&validation_err); // structural, not the value
+let message = if field.is_empty() {
+    "app config failed validation".to_owned()
+} else {
+    format!("app config failed validation for field `{field}`")
+};
+EdgeError::config_out_of_date(message, field)      // NO validation_err.to_string()
 ```
 
 The `extract_first_field` helper picks the first
 violating-field name from the `validator::ValidationErrors`
 tree; if multiple fields violate at once, the response
-surfaces one (the first by alphabetical order) and the full
-list goes to the log line.
+surfaces one (the first by alphabetical order). The full
+validator report — which may contain resolved secret values —
+is dropped entirely rather than logged.
 
 **Why `serde_path_to_error` is OK as a new dep.** Worth
 mentioning because PR #269 fought several "do we add this
@@ -6306,10 +6326,13 @@ Failure semantics:
   limit. This is not mathematically unlimited; it removes Fastly's
   small single-entry cap for normal oversized app configs.
 - Old content-addressed chunks are inert once the root pointer moves
-  away from them. v1 does not need automatic garbage collection for
-  correctness; a future `config gc --adapter fastly` can delete
-  unreferenced `.__edgezero_chunks.` entries if storage hygiene becomes
-  important.
+  away from them, so they are never a correctness problem. Reclaiming
+  them for storage hygiene is now implemented (see the fastly-chunk-gc
+  spec): a re-push prunes the PRIOR generation's chunks in the same
+  writeback, and an explicit `config gc --adapter fastly --older-than`
+  deletes unreferenced `.__edgezero_chunks.` generations across the
+  store. Both decide root-vs-chunk by VALUE, never by key shape, and
+  never delete a key whose value is a runtime-readable root.
 
 ### Q7. Diff against `--local` vs remote
 

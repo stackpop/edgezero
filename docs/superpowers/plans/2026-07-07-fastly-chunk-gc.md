@@ -157,14 +157,14 @@ cannot be used as a supersession clock.
   applied only as an ADDITIONAL restriction on top of the chunk's own age — both
   must clear `--older-than`, more restrictive wins — and the operator's
   `--older-than` assertion remains the only sound basis for any delete.
-- [x] Delete whole GENERATIONS with `--key --auto-yes` (never `--all`), stopping
-  each generation at its FIRST failure so we never CONFIRM a partial delete
-  ourselves. (Stopping does not guarantee no stranding: a failed remote delete's
-  outcome is UNKNOWN — Fastly may commit it before erroring.) Independent
-  generations are all attempted; a **non-zero** error names the failed keys and
-  distinguishes uncertain generations from definitely-stranded ones, and
-  prints shell-safe manual-recovery commands rather than claiming idempotent
-  retry.
+- [x] Reclaim a generation at a time — best-effort, per key (NOT an atomic
+  whole-generation delete), stopping each generation at its FIRST failure so we
+  never CONFIRM a partial delete ourselves. (Stopping does not guarantee no
+  stranding: a failed remote delete's outcome is UNKNOWN — Fastly may commit it
+  before erroring.) Independent generations are all attempted; a **non-zero**
+  error names the failed keys and distinguishes uncertain generations from
+  definitely-stranded ones, and prints shell-safe manual-recovery commands
+  rather than claiming idempotent retry.
 - [x] `plan_gc_reclamation` extracted from `gc_fastly_config_store` so the guards
   read as one unit (no `#[expect(too_many_lines)]`).
 - [x] Tests: never-delete-live, reclaim-aged-orphan, **protect recently-superseded

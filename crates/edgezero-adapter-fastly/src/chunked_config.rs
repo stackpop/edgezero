@@ -108,7 +108,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// Prepare the physical Config Store entries for a single logical
 /// `(root_key, envelope_json)` pair.
 ///
-/// - If `envelope_json` is at most 8 000 CHARACTERS: returns one `(root_key, envelope_json)` tuple unchanged.
+/// - If `envelope_json` is at most 8 000 BYTES (a conservative UTF-8 byte check): returns one `(root_key, envelope_json)` tuple unchanged.
 /// - Otherwise: splits into UTF-8-safe 7 000-byte chunks, returns chunk
 ///   entries first and the root pointer entry last.
 ///
@@ -158,12 +158,15 @@ pub(crate) fn prepare_fastly_config_entries(
     // is written.
     check_config_key_len(root_key)?;
 
-    // The entry limit is a CHARACTER limit (Fastly measures characters), so the
-    // direct-vs-chunked decision counts chars, not UTF-8 bytes — a non-ASCII
-    // value that fits in 8 000 characters must not be chunked just because its
-    // byte length is larger. (Chunk PAYLOADS below are still split on byte
-    // boundaries; only this threshold and the pointer-size checks are char-based.)
-    if envelope_json.chars().count() <= FASTLY_CONFIG_ENTRY_LIMIT {
+    // Direct-vs-chunked uses a conservative UTF-8 BYTE-count check (spec
+    // 2026-06-16 permits this and the merge-base writer used it). Byte length is
+    // >= character length, so this chunks whenever a stricter character check
+    // would AND for a few multibyte values that fit the character cap — which is
+    // safe (it never over-stores) and, crucially, is what EXISTING v1 pointers
+    // were written against. A character-based threshold would leave a value that
+    // is <= 8000 chars but > 8000 bytes stored directly, and REJECT the existing
+    // chunked pointer for it on read (an HTTP 500) — a v1 read-compat break.
+    if envelope_json.len() <= FASTLY_CONFIG_ENTRY_LIMIT {
         return Ok(vec![(root_key.to_owned(), envelope_json.to_owned())]);
     }
 
@@ -180,16 +183,10 @@ pub(crate) fn prepare_fastly_config_entries(
         })
         .unwrap_or_default();
 
-    // Split env_bytes into UTF-8-safe chunks of at most CHUNK_PAYLOAD_TARGET bytes.
+    // Split env_bytes into UTF-8-safe chunks of at most CHUNK_PAYLOAD_TARGET
+    // bytes, using the shared span computation the resolver replays.
     let mut chunks: Vec<(String, String, usize)> = Vec::new(); // (key, value, len)
-    let mut start = 0_usize;
-    let mut idx = 0_usize;
-    while start < env_bytes.len() {
-        // Walk forward by CHUNK_PAYLOAD_TARGET bytes, then retreat to the
-        // last codepoint boundary so we never split a multi-byte codepoint.
-        let end_raw = (start.saturating_add(CHUNK_PAYLOAD_TARGET)).min(env_bytes.len());
-        // Find the largest valid UTF-8 boundary <= end_raw.
-        let end = find_utf8_boundary(envelope_json, start, end_raw);
+    for (idx, (start, end)) in writer_chunk_spans(envelope_json).into_iter().enumerate() {
         let chunk_bytes = env_bytes.get(start..end).ok_or_else(|| {
             format!("chunk boundary [{start}..{end}] out of range for `{root_key}`")
         })?;
@@ -203,8 +200,6 @@ pub(crate) fn prepare_fastly_config_entries(
         // chunks already committed.
         check_config_key_len(&chunk_key)?;
         chunks.push((chunk_key, chunk_str.to_owned(), chunk_bytes.len()));
-        start = end;
-        idx = idx.saturating_add(1);
     }
 
     // Build chunk refs with per-chunk SHAs.
@@ -229,14 +224,14 @@ pub(crate) fn prepare_fastly_config_entries(
     let pointer_json = serde_json::to_string(&pointer)
         .map_err(|err| format!("failed to serialise chunk pointer for `{root_key}`: {err}"))?;
 
-    if pointer_json.chars().count() > FASTLY_CONFIG_ENTRY_LIMIT {
+    if pointer_json.len() > FASTLY_CONFIG_ENTRY_LIMIT {
         return Err(format!(
             "chunk pointer for `{root_key}` is {} characters, which exceeds the \
              Fastly Config Store 8 000-character entry limit (the config is too \
              large even for chunked storage). Restructure your typed app-config \
              into multiple types split across [stores.config] ids, or use an \
              adapter with a larger single-value limit.",
-            pointer_json.chars().count()
+            pointer_json.len()
         ));
     }
 
@@ -251,8 +246,7 @@ pub(crate) fn prepare_fastly_config_entries(
 
 /// Find the largest byte offset `<= end_raw` that is a valid UTF-8
 /// codepoint boundary within `src`.  `start` is used as a hint so we
-/// don't scan the entire string from zero each time. CLI writer only.
-#[cfg(any(feature = "cli", test))]
+/// don't scan the entire string from zero each time.
 fn find_utf8_boundary(src: &str, start: usize, end_raw: usize) -> usize {
     if end_raw >= src.len() {
         return src.len();
@@ -263,6 +257,74 @@ fn find_utf8_boundary(src: &str, start: usize, end_raw: usize) -> usize {
         boundary = boundary.saturating_sub(1);
     }
     boundary
+}
+
+/// The exact byte spans this writer splits an over-limit envelope into: walk
+/// forward `CHUNK_PAYLOAD_TARGET` bytes, then retreat to the previous UTF-8
+/// codepoint boundary so no chunk ever splits a codepoint.
+///
+/// SINGLE SOURCE OF TRUTH for the split layout. `prepare_fastly_config_entries`
+/// builds its chunks from these spans, and the resolver replays them against a
+/// reconstructed envelope to prove the pointer's boundaries are exactly the ones
+/// this writer emits — so the two can never drift. Un-gated on purpose: the
+/// runtime resolver (no `cli` feature) needs it for that check.
+fn writer_chunk_spans(envelope_json: &str) -> Vec<(usize, usize)> {
+    let len = envelope_json.len();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0_usize;
+    while start < len {
+        let end_raw = (start.saturating_add(CHUNK_PAYLOAD_TARGET)).min(len);
+        let end = find_utf8_boundary(envelope_json, start, end_raw);
+        spans.push((start, end));
+        start = end;
+    }
+    spans
+}
+
+/// Prove a pointer's chunk boundaries are EXACTLY the ones this writer emits for
+/// the reconstructed envelope.
+///
+/// Called after the per-chunk and whole-envelope SHAs have verified, so the
+/// reconstructed BYTES are already proven correct; this pins the LAYOUT. Replay
+/// the writer's span computation: the chunk count and every chunk's byte length
+/// must match the pointer. That rejects a hand-authored pointer which reassembles
+/// to the same bytes along boundaries the writer would never choose, so the
+/// resolver accepts only writer-produced layouts -- the same guarantee
+/// `prove_generation` enforces before a GC delete.
+///
+/// Comparing LENGTHS is sufficient: the SHAs already pinned the bytes, so equal
+/// boundaries pin each chunk to the writer's own chunk.
+///
+/// Diagnostics name a chunk's POSITION, never its key: `chunks[].key` is
+/// pointer-controlled and these messages are logged verbatim.
+fn verify_writer_split_layout(
+    root_key: &str,
+    reconstructed: &str,
+    pointer: &FastlyChunkPointer,
+) -> Result<(), String> {
+    let spans = writer_chunk_spans(reconstructed);
+    if spans.len() != pointer.chunks.len() {
+        return Err(format!(
+            "chunk pointer at `{root_key}` names {} chunk(s), but this writer would split its \
+             own reconstructed envelope into {}",
+            pointer.chunks.len(),
+            spans.len()
+        ));
+    }
+    for (position, (&(start, end), chunk_ref)) in
+        spans.iter().zip(pointer.chunks.iter()).enumerate()
+    {
+        let expected_len = end.saturating_sub(start);
+        if expected_len != chunk_ref.len {
+            return Err(format!(
+                "chunk {position} referenced by pointer at `{root_key}` records {} bytes, but this \
+                 writer splits the reconstructed envelope into {expected_len} bytes at that \
+                 boundary",
+                chunk_ref.len
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a logical `(root_key, root_value)` pair from the store,
@@ -311,7 +373,7 @@ where
     // never emit one larger than the entry limit. Reject an over-limit pointer up
     // front — this bounds how many chunk refs it can carry (hence the fetch
     // fan-out) before any parsing.
-    if root_value.chars().count() > FASTLY_CONFIG_ENTRY_LIMIT {
+    if root_value.len() > FASTLY_CONFIG_ENTRY_LIMIT {
         return Err(format!(
             "chunk pointer at `{root_key}` is larger than the {FASTLY_CONFIG_ENTRY_LIMIT}-character \
              entry limit and so is not one this writer could have stored"
@@ -414,22 +476,7 @@ where
         ));
     }
 
-    // The reconstructed value must actually have NEEDED chunking. The writer
-    // chunks by CHARACTER count, but `validate_pointer_chunks` can only see the
-    // byte-valued `envelope_len` up front, so it cannot catch the Unicode gap: a
-    // value under the character limit but over it in UTF-8 BYTES would have been
-    // stored directly, yet a chunked pointer for it passes every byte-level check.
-    // Now that the bytes are reconstructed and hash-verified, re-check the
-    // character count — if it fits directly, this writer would never have chunked
-    // it, so the pointer is not ours. (GC's writer round-trip would reject it too;
-    // rejecting here keeps the runtime and GC verdicts consistent.)
-    if reconstructed.chars().count() <= FASTLY_CONFIG_ENTRY_LIMIT {
-        return Err(format!(
-            "reconstructed envelope for `{root_key}` fits the \
-             {FASTLY_CONFIG_ENTRY_LIMIT}-character entry limit, so this writer would have stored it \
-             directly rather than in chunks"
-        ));
-    }
+    verify_writer_split_layout(root_key, &reconstructed, &pointer)?;
 
     // Parse AND verify the inner envelope, exactly as the direct path does.
     //
@@ -1365,40 +1412,135 @@ mod tests {
         assert!(!fetched, "must reject before fetching 100 chunks: {err}");
     }
 
-    /// A value UNDER the character limit but OVER it in UTF-8 BYTES would be
-    /// stored DIRECTLY by this writer (which chunks on characters). A chunked
-    /// pointer for it passes every byte-level check, but the runtime must reject
-    /// it (after reconstruction) so its verdict matches GC's writer round-trip —
-    /// otherwise, once orphaned, it becomes permanent unprovable residue.
+    /// RESOLVER-TO-WRITER ROUND TRIP: for a spread of over-limit sizes, the
+    /// writer's own output must resolve back to the exact input. This is the
+    /// positive half of the exact split-boundary contract — whatever the writer
+    /// emits, the resolver (including its exact-boundary replay) accepts.
     #[test]
-    fn pointer_for_value_under_char_limit_but_over_byte_limit_is_rejected() {
+    fn writer_output_round_trips_through_the_resolver() {
         let root = "app_config";
-        // 2001 crabs: 2001 characters (<= 8000) but 8004 bytes (> 8000).
-        let value = "\u{1F980}".repeat(2001);
-        assert!(value.chars().count() <= FASTLY_CONFIG_ENTRY_LIMIT);
-        assert!(value.len() > FASTLY_CONFIG_ENTRY_LIMIT);
+        // Sizes that land on, just past, and well past chunk boundaries.
+        for target in [
+            FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1),
+            CHUNK_PAYLOAD_TARGET.saturating_add(50),
+            CHUNK_PAYLOAD_TARGET.saturating_mul(2).saturating_add(10),
+            20_000,
+            35_000,
+        ] {
+            let envelope = make_envelope_json(target);
+            let entries = prepare_fastly_config_entries(root, &envelope).expect("expand");
+            let (root_key, pointer_json) = entries.last().expect("pointer").clone();
+            let chunk_map: HashMap<String, String> = entries[..entries.len().saturating_sub(1)]
+                .iter()
+                .cloned()
+                .collect();
+            let resolved = resolve_fastly_config_value(&root_key, pointer_json, |key| {
+                Ok(chunk_map.get(key).cloned())
+            })
+            .unwrap_or_else(|err| panic!("size {target} must round-trip: {err}"));
+            assert_eq!(resolved, envelope, "size {target} must reconstruct exactly");
+        }
+    }
 
-        let generation = sha256_hex(value.as_bytes());
-        let (head, tail) = value.split_at(7_000); // 1750 crabs = a full 7000-byte chunk
-        let key0 = format!("{root}{CHUNK_KEY_INFIX}{generation}.0");
-        let key1 = format!("{root}{CHUNK_KEY_INFIX}{generation}.1");
-        let pointer = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{key0}","len":{},"sha256":"{}"}},{{"key":"{key1}","len":{},"sha256":"{}"}}],"data_sha256":"","envelope_len":{},"envelope_sha256":"{generation}"}}"#,
-            head.len(),
-            sha256_hex(head.as_bytes()),
-            tail.len(),
-            sha256_hex(tail.as_bytes()),
-            value.len(),
-        );
+    /// EXACT SPLIT BOUNDARIES: a pointer whose chunks reassemble to the correct
+    /// bytes but along boundaries this writer would never choose is rejected. Here
+    /// two bytes are moved from the first (full) chunk into the last (short) one:
+    /// every metadata check still passes (dense indexes, single generation, both
+    /// lengths in range, sum == `envelope_len`, per-chunk and whole-envelope SHAs
+    /// correct), yet the writer splits the first chunk at 7 000 bytes, not 6 998,
+    /// so the resolver's boundary replay must reject it.
+    #[test]
+    fn resolver_rejects_a_non_writer_split_that_reassembles_correctly() {
+        let root = "app_config";
+        // Just over the entry limit: chunk 0 is a full CHUNK_PAYLOAD_TARGET, chunk
+        // 1 is a short remainder with room to absorb the shifted bytes.
+        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(100));
+        let entries = prepare_fastly_config_entries(root, &envelope).expect("expand");
+        assert_eq!(entries.len(), 3, "expected exactly 2 chunks + pointer");
+        let (_, pointer_json) = entries.last().expect("pointer").clone();
+        let real: FastlyChunkPointer = serde_json::from_str(&pointer_json).expect("parse");
+
+        // Re-split the SAME bytes 2 bytes earlier: chunk 0 shrinks to 6 998
+        // (still >= CHUNK_PAYLOAD_TARGET - 3, so the pre-fetch bound passes),
+        // chunk 1 grows correspondingly (still <= CHUNK_PAYLOAD_TARGET).
+        let cut = CHUNK_PAYLOAD_TARGET.saturating_sub(2);
+        let head = envelope.get(..cut).expect("cut is a char boundary");
+        let tail = envelope.get(cut..).expect("cut is a char boundary");
+        let key0 = format!("{root}{CHUNK_KEY_INFIX}{}.0", real.envelope_sha256);
+        let key1 = format!("{root}{CHUNK_KEY_INFIX}{}.1", real.envelope_sha256);
+        let shifted = FastlyChunkPointer {
+            chunks: vec![
+                FastlyChunkRef {
+                    key: key0.clone(),
+                    len: head.len(),
+                    sha256: sha256_hex(head.as_bytes()),
+                },
+                FastlyChunkRef {
+                    key: key1.clone(),
+                    len: tail.len(),
+                    sha256: sha256_hex(tail.as_bytes()),
+                },
+            ],
+            data_sha256: real.data_sha256.clone(),
+            edgezero_kind: real.edgezero_kind.clone(),
+            envelope_len: real.envelope_len,
+            envelope_sha256: real.envelope_sha256.clone(),
+            version: real.version,
+        };
         let chunk_map: HashMap<String, String> =
             HashMap::from([(key0, head.to_owned()), (key1, tail.to_owned())]);
-
-        let err = resolve_fastly_config_value(root, pointer, |key| Ok(chunk_map.get(key).cloned()))
-            .expect_err("a value that fits the character limit must not resolve as chunked");
+        let err = resolve_fastly_config_value(root, reserialise(&shifted), |key| {
+            Ok(chunk_map.get(key).cloned())
+        })
+        .expect_err("a non-writer split must be rejected even if it reassembles correctly");
         assert!(
-            err.contains("character entry limit") || err.contains("stored it directly"),
-            "must reject on the character count: {err}"
+            err.contains("writer splits the reconstructed envelope"),
+            "must fail on the exact-boundary check, got: {err}"
         );
+    }
+
+    /// v1 READ-COMPATIBILITY: an envelope UNDER 8 000 characters but OVER 8 000
+    /// UTF-8 BYTES is chunked by this writer's conservative byte-count threshold
+    /// (the merge-base behaviour), and MUST reconstruct and resolve — a
+    /// character-based threshold would leave it stored directly and reject the
+    /// existing chunked pointer on read (an HTTP 500 for previously stored data).
+    #[test]
+    fn chunked_value_under_char_limit_but_over_byte_limit_resolves() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        // ~2001 crabs of data: the serialised envelope is > 8000 BYTES but
+        // < 8000 CHARACTERS.
+        let data = json!({ "crabs": "\u{1F980}".repeat(2_001) });
+        let envelope =
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".into())).unwrap();
+        assert!(
+            envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT,
+            "must exceed the byte limit"
+        );
+        assert!(
+            envelope.chars().count() <= FASTLY_CONFIG_ENTRY_LIMIT,
+            "must fit the character limit -- this is the compatibility gap"
+        );
+
+        // The writer chunks it (byte-based), exactly as the merge-base did.
+        let entries = prepare_fastly_config_entries("app_config", &envelope).unwrap();
+        assert!(
+            entries.len() >= 3,
+            "must have chunked (>= 2 chunks + pointer)"
+        );
+        let (root_key, pointer_json) = entries.last().unwrap().clone();
+        let chunk_map: HashMap<String, String> = entries[..entries.len().saturating_sub(1)]
+            .iter()
+            .cloned()
+            .collect();
+
+        // The resolver must ACCEPT it and reconstruct the original.
+        let resolved = resolve_fastly_config_value(&root_key, pointer_json, |key| {
+            Ok(chunk_map.get(key).cloned())
+        })
+        .expect("an existing v1 byte-chunked value must still resolve");
+        assert_eq!(resolved, envelope);
     }
 
     /// An empty root key is rejected before any output: writer-valid but
@@ -1529,16 +1671,15 @@ mod tests {
         use edgezero_core::blob_envelope::BlobEnvelope;
         use serde_json::json;
 
-        // crab emoji: 4 bytes each, 1 char each. The entry limit is now a
-        // CHARACTER count, so the payload must exceed it in CHARACTERS to chunk
-        // (9 000 crabs = 9 000 chars = 36 000 bytes).
-        let emoji_block = "\u{1F980}".repeat(9_000);
+        // crab emoji: 4 bytes each. The direct-vs-chunked threshold is a
+        // conservative BYTE count, so 3 000 crabs (12 000 bytes) chunks.
+        let emoji_block = "\u{1F980}".repeat(3_000);
         let data = json!({ "crabs": emoji_block });
         let envelope =
             serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".into())).unwrap();
         assert!(
-            envelope.chars().count() > FASTLY_CONFIG_ENTRY_LIMIT,
-            "emoji envelope must exceed the character limit so it chunks"
+            envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT,
+            "emoji envelope must exceed the byte limit so it chunks"
         );
 
         let entries = prepare_fastly_config_entries("emoji_key", &envelope).unwrap();

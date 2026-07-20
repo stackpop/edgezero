@@ -3095,6 +3095,63 @@ ids = ["default"]
         );
     }
 
+    /// Stronger ordering proof: the generic push runs the FULL body-aware
+    /// preflight offline before ANY remote I/O. Unlike a reserved key (rejectable
+    /// by key SHAPE alone), a DERIVED-key overflow is only detectable by actually
+    /// expanding the envelope into chunks — a ~200-char root key is itself valid,
+    /// but once the >8 000-byte body chunks, the derived `<root>.__edgezero_chunks.
+    /// <64-char-sha>.<index>` key exceeds the 255-char store limit. If preflight
+    /// ran AFTER `read_remote`, the error would be a `fastly`-not-found shell-out
+    /// (no CLI on PATH in tests), never the key-limit message — so this pins that
+    /// the generic path performs no list/describe/update/delete before the offline
+    /// feasibility check has passed.
+    #[test]
+    fn cloud_push_preflight_rejects_derived_key_overflow_before_remote_io() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        // A body large enough to force chunking (envelope > 8 000 bytes). The
+        // huge `greeting` passes `#[validate(length(min = 1))]`.
+        let big_app_config = format!(
+            "api_token = \"demo_api_token\"\ngreeting = \"{}\"\nvault = \"default\"\n\n[service]\ntimeout_ms = 1500\n",
+            "x".repeat(9_000)
+        );
+        fs::write(dir.path().join("demo-app.toml"), big_app_config).expect("write big app config");
+
+        let mut args = push_args(&manifest, "fastly");
+        // A VALID root key (<= 255 chars, no reserved infix) whose DERIVED chunk
+        // key (+~85 chars) overflows the store's 255-char limit once chunked.
+        args.key = Some("r".repeat(200));
+        args.yes = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("a derived-key overflow must be rejected");
+        assert!(
+            err.contains("character limit"),
+            "must fail at the offline body-aware preflight (before any remote read), not on a \
+             shell-out: {err}"
+        );
+    }
+
     /// Serialise a string as a TOML basic-string literal (test helper).
     fn toml_string_literal(value: &str) -> String {
         let mut out = String::from('"');

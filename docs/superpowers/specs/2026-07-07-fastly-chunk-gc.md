@@ -533,13 +533,21 @@ passed to the writer explicitly — never inferred from the flattened set:
   `--key` containing `.__edgezero_chunks.` is separately rejected up
   front (Terminology). An empty `gc_roots` means "no GC" (setup-only
   writers pass `&[]`).
-- **Sweep inside the single rewrite.** In `write_fastly_local_config_store`
-  (`cli.rs:926`), before the upsert loop, snapshot each root's *old*
+- **Sweep inside the single rewrite.** In `write_fastly_local_config_store`,
+  before the upsert loop, snapshot each root's *old*
   value from the existing `contents_tbl`. After inserting the new
   physical entries, for each `(root, new_keys)` compute
-  `prior_chunk_keys(root, old_value)` and `contents_tbl.remove(k)` for
-  each orphan `k` in `prior − new_keys`. All within the one
-  `DocumentMut` that the trailing `fs::write` (`cli.rs:999`) persists —
+  `prior_chunk_keys(root, old_value)` and, for each orphan `k` in
+  `prior − new_keys`, `contents_tbl.remove(k)` **unless `k`'s current
+  value is itself a runtime-readable root** — a pointer
+  (`value_is_pointer_kind`) or a value that classifies as a root
+  (`gc_classify_root(k, value).is_ok()`). A chunk-shaped key can legitimately
+  hold a whole envelope or pointer (e.g. a small envelope whose first chunk is
+  a complete envelope), which the runtime resolves independently; deleting it
+  would drop live config. Such a key is KEPT with a warning, mirroring the
+  cloud GC value-based protection. A real chunk payload is a raw fragment (not
+  pointer-kind, not a valid envelope) and prunes normally. All within the one
+  `DocumentMut` that the trailing `fs::write` persists —
   one in-memory rewrite, then one write.
 - **Warnings.** `prior_chunk_keys` returning `Err` for a root → collect
   the message; the local push returns it as an extra status line. A

@@ -6870,6 +6870,162 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// PARITY: the dry-run's reported orphan count equals the number of chunk
+    /// keys the real (non-dry-run) push actually deletes, on ONE fixture. A
+    /// divergence would make the dry-run a misleading preview of the delete.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_count_matches_real_deletions() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+
+        fn count_chunk_keys(toml_src: &str) -> usize {
+            let doc: toml_edit::DocumentMut = toml_src.parse().expect("parse");
+            doc.get("local_server")
+                .and_then(|ls| ls.get("config_stores"))
+                .and_then(|cs| cs.get(TEST_CONFIG_ID))
+                .and_then(|st| st.get("contents"))
+                .and_then(toml_edit::Item::as_table)
+                .map_or(0, |table| {
+                    table
+                        .iter()
+                        .filter(|(key, _)| key.contains(CHUNK_KEY_INFIX))
+                        .count()
+                })
+        }
+        fn parse_would_delete_count(text: &str) -> Option<usize> {
+            let marker = "would delete ";
+            let idx = text.find(marker)?;
+            text.get(idx.saturating_add(marker.len())..)?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        // Seed a multi-chunk generation, then measure how many chunk keys exist.
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(5_000));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), chunked)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+        let seeded = fs::read_to_string(&fastly_toml).expect("read");
+        let prior_chunk_count = count_chunk_keys(&seeded);
+        assert!(prior_chunk_count >= 2, "seed must have chunked: {seeded}");
+
+        // Dry-run a shrink-to-direct re-push: capture the reported orphan count.
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run");
+        let reported = parse_would_delete_count(&out.join("\n"))
+            .expect("dry-run must report a numeric orphan count");
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            seeded,
+            "dry-run must not edit fastly.toml"
+        );
+
+        // Real re-push: count the chunk keys actually removed.
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("real push");
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let actually_deleted = prior_chunk_count.saturating_sub(count_chunk_keys(&after));
+
+        assert_eq!(
+            reported, actually_deleted,
+            "dry-run count {reported} must equal real deletions {actually_deleted}"
+        );
+        assert_eq!(
+            reported, prior_chunk_count,
+            "a shrink-to-direct re-push orphans every prior chunk"
+        );
+    }
+
+    /// Real (non-dry-run) push over a MALFORMED prior pointer WARNS and deletes
+    /// nothing: its chunk list is untrustworthy, so no key is removed and the
+    /// root is simply overwritten with the new value. This is the real-push
+    /// counterpart to the dry-run "unknown" degradation on the same prior state.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_real_push_over_malformed_prior_warns_and_deletes_nothing() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        // A pointer-kind prior value missing its required fields — malformed, so
+        // `prior_chunk_keys` returns Err (warn, delete nothing).
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n\n",
+            "[local_server.config_stores.app_config.contents]\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("real push must not fail on a malformed prior");
+
+        assert!(
+            out.iter().any(|line| line.contains("skipping chunk GC")),
+            "must warn about the malformed prior pointer: {out:?}"
+        );
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+        assert_eq!(
+            contents
+                .get(TEST_CONFIG_ID)
+                .and_then(toml_edit::Item::as_str),
+            Some(direct.as_str()),
+            "root is overwritten with the new direct envelope: {after}"
+        );
+    }
+
     /// Dry-run of an identical re-push reports zero orphans (new keys
     /// equal prior keys — regression for expanding `new_keys`).
     #[cfg(unix)]

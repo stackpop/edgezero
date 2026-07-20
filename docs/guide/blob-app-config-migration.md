@@ -117,8 +117,12 @@ The push uses `fastly config-store-entry update --upsert --stdin`
 to write the envelope as the value of one Config Store entry.
 
 **Oversized envelopes** are handled automatically. Fastly's per-entry
-limit is 8,000 characters. If your envelope fits, it's stored
-directly. Otherwise the adapter:
+limit is 8,000 characters. The adapter applies a conservative
+**UTF-8 byte** check (bytes are always ≥ characters, so an envelope
+that fits by bytes always fits by characters): if the envelope JSON is
+at most 8,000 bytes it's stored directly. This byte threshold is the
+v1 read/write contract — it is stable across upgrades, so a value
+stored by an earlier release always resolves. Otherwise the adapter:
 
 1. Splits the envelope JSON into UTF-8-safe chunks (target 7,000
    bytes each).
