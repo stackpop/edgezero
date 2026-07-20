@@ -190,18 +190,26 @@ source of truth is `edgezero.toml` (which stays tracked).
 
 If your project committed these manifests before the cutover, add them
 to `.gitignore` and then untrack them **without deleting your working
-copy** (`--cached`), so provision can own them going forward. Guard the
-`git rm` so it's a no-op when nothing is tracked:
+copy** (`--cached`), so provision can own them going forward. Match the
+five adapter manifests plus the Cloudflare `.dev.vars` secrets file at the
+repo root **and** any subdirectory (a `**/name.toml` pathspec silently
+skips files at the repo root), and guard the removal so it's a no-op when
+nothing is tracked:
 
 ```bash
-tracked=$(git ls-files -- '**/axum.toml' '**/wrangler.toml' \
-  '**/fastly.toml' '**/spin.toml' '**/runtime-config.toml')
-if [ -n "$tracked" ]; then
-  printf '%s\n' "$tracked" | xargs git rm --cached
+# `(^|/)` anchors each name to a path segment, so both `wrangler.toml`
+# and `adapters/wrangler.toml` match.
+matcher='(^|/)(axum|wrangler|fastly|spin|runtime-config)\.toml$|(^|/)\.dev\.vars$'
+
+# Untrack matching files without touching your working copy. NUL-delimited
+# end-to-end (`-z` / `-0`) so paths with spaces or newlines survive; the
+# `grep -q` pre-check keeps `git rm` from running on an empty list.
+if git ls-files -z | grep -qzE "$matcher"; then
+  git ls-files -z | grep -zE "$matcher" | xargs -0 git rm --cached --
 fi
+
 # Verify none remain tracked (expect no output):
-git ls-files -- '**/axum.toml' '**/wrangler.toml' '**/fastly.toml' \
-  '**/spin.toml' '**/runtime-config.toml'
+git ls-files -z | grep -zE "$matcher" | tr '\0' '\n'
 ```
 
 Commit the `.gitignore` change plus the `git rm --cached` removals

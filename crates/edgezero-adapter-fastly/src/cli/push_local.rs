@@ -153,6 +153,25 @@ mod tests {
     // Shared fixture names.
     const TEST_CONFIG_ID: &str = "app_config";
 
+    /// Write a `fastly.toml` at `path` carrying `name = "demo"` plus the
+    /// provisioned `[local_server.config_stores.<platform>]` block (with
+    /// `format` + an empty `contents` table) that `provision --local`
+    /// creates. `config push --local` only upserts into that existing
+    /// table -- it refuses to fabricate the block -- so tests that push
+    /// must seed it first.
+    fn seed_provisioned(path: &Path, platform: &str) {
+        fs::write(
+            path,
+            format!(
+                "name = \"demo\"\n\n\
+                 [local_server.config_stores.{platform}]\n\
+                 format = \"inline-toml\"\n\n\
+                 [local_server.config_stores.{platform}.contents]\n"
+            ),
+        )
+        .expect("seed provisioned fastly.toml");
+    }
+
     /// Build a valid `BlobEnvelope` JSON string of approximately `target_len` bytes.
     fn make_test_envelope(target_len: usize) -> String {
         use edgezero_core::blob_envelope::BlobEnvelope;
@@ -255,7 +274,7 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write initial toml");
+        seed_provisioned(&path, TEST_CONFIG_ID);
 
         // Use a valid BlobEnvelope value — the resolver requires BlobEnvelope
         // or chunk-pointer JSON; raw strings are not accepted post-chunking.
@@ -296,7 +315,7 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write");
+        seed_provisioned(&path, TEST_CONFIG_ID);
 
         // push_config_entries_local passes the value through the chunk-pointer
         // helper which stores it verbatim when ≤ 8 000 chars. The reader then
@@ -346,11 +365,14 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
+        // Baseline + the provisioned config-store block the later
+        // `config push --local` upserts into (absolute dotted header, so
+        // it appends cleanly regardless of the baseline's trailing table).
+        let baseline = format!(
+            "{}\n[local_server.config_stores.{TEST_CONFIG_ID}]\nformat = \"inline-toml\"\n[local_server.config_stores.{TEST_CONFIG_ID}.contents]\n",
             super::super::run::synthesise_fastly_toml("demo", None),
-        )
-        .expect("write baseline");
+        );
+        fs::write(&path, baseline).expect("write baseline");
         // 1. Provision writes the `[[local_server.secret_stores.*]]`
         //    entry (env defaults to the upper-cased key).
         FastlyCliAdapter
@@ -447,7 +469,7 @@ mod tests {
     fn push_config_entries_local_preserves_sibling_keys() {
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
-        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+        seed_provisioned(&fastly_toml, TEST_CONFIG_ID);
         let store = ResolvedStoreId::from_logical(TEST_CONFIG_ID);
         let ctx = AdapterPushContext::new();
 
@@ -507,7 +529,7 @@ mod tests {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
-        fs::write(&fastly_toml, "name = \"demo\"\n").expect("write");
+        seed_provisioned(&fastly_toml, TEST_CONFIG_ID);
 
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
@@ -597,6 +619,7 @@ mod tests {
         let json_str = serde_json::to_string(&envelope).unwrap();
         // Write directly as a single entry (not via push_config_entries_local so we
         // control the exact TOML content).
+        seed_provisioned(&fastly_toml, TEST_CONFIG_ID);
         write_fastly_local_config_store(
             &fastly_toml,
             TEST_CONFIG_ID,
@@ -629,6 +652,7 @@ mod tests {
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
         // Write all physical entries (chunks + pointer) to the local store.
+        seed_provisioned(&fastly_toml, TEST_CONFIG_ID);
         write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &physical).expect("write");
 
         let result = FastlyCliAdapter
@@ -675,7 +699,7 @@ mod tests {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
-        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+        seed_provisioned(&fastly_toml, TEST_CONFIG_ID);
 
         // First push: envelope A. Records the chunk-key set so we can
         // confirm they survive the second push (no garbage collection

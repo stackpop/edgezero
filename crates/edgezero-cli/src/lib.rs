@@ -150,6 +150,11 @@ pub fn init_cli_logger() {
 pub fn run_build(args: &BuildArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    // Same absolute-path / `..` / symlink guard `serve` and provision
+    // apply -- `build` and `deploy` dispatch the declared adapter
+    // manifest too, so a poisoned `[adapters.<name>.adapter].manifest`
+    // must not steer them at an out-of-tree project either.
+    assert_adapter_declared_paths_safe(manifest.as_ref(), &args.adapter)?;
     if let Some(loader) = &manifest {
         log_store_bindings(&args.adapter, loader);
     }
@@ -159,6 +164,28 @@ pub fn run_build(args: &BuildArgs) -> Result<(), String> {
         manifest.as_ref(),
         &args.adapter_args,
     )
+}
+
+/// Run the shared absolute-path / `..` / symlink guard on the
+/// `[adapters.<name>.adapter]` `manifest` + `crate` strings before any
+/// dispatch that resolves them. No-op when no manifest is loaded or the
+/// adapter isn't declared.
+#[cfg(feature = "cli")]
+fn assert_adapter_declared_paths_safe(
+    manifest: Option<&ManifestLoader>,
+    adapter: &str,
+) -> Result<(), String> {
+    if let Some(loader) = manifest
+        && let Some(root) = loader.manifest().root()
+        && let Some((_key, adapter_cfg)) = loader.manifest().adapter_entry(adapter)
+    {
+        assert_provision_paths_safe(
+            root,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.crate_path.as_deref(),
+        )?;
+    }
+    Ok(())
 }
 
 /// Deploy the project to a target edge adapter.
@@ -172,6 +199,7 @@ pub fn run_build(args: &BuildArgs) -> Result<(), String> {
 pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    assert_adapter_declared_paths_safe(manifest.as_ref(), &args.adapter)?;
     adapter::execute(
         &args.adapter,
         adapter::Action::Deploy,
@@ -216,18 +244,12 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
     // thread reads `std::env::var` observes a torn read. Passing
     // the overlay through `Command::env` keeps every mutation on
     // the `Command`'s private map — no shared state, no race.
+    assert_adapter_declared_paths_safe(manifest.as_ref(), &args.adapter)?;
     let mut env_overlay: Vec<(String, String)> = Vec::new();
     if let Some(loader) = manifest.as_ref()
         && let Some(root) = loader.manifest().root()
     {
         let manifest_data = loader.manifest();
-        if let Some((_key, adapter_cfg)) = manifest_data.adapter_entry(&args.adapter) {
-            assert_provision_paths_safe(
-                root,
-                adapter_cfg.adapter.manifest.as_deref(),
-                adapter_cfg.adapter.crate_path.as_deref(),
-            )?;
-        }
         if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root)
             && env_path.exists()
         {
@@ -249,11 +271,11 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
 /// adapter reads its env file directly (cloudflare, fastly) or the
 /// adapter is unknown.
 ///
-/// `axum` maps to `<manifest_root>/.edgezero/.env` (the
-/// writer target). `spin` maps to `<crate>/.env` where `<crate>` is
-/// the `[adapters.spin.adapter] crate = "..."` sub-path joined with
-/// `manifest_root` (the writer target); a missing `crate`
-/// falls back to `manifest_root`.
+/// `axum` maps to `<manifest_root>/.edgezero/.env` (the writer
+/// target). `spin` maps to `<spin.toml parent>/.env`, derived from the
+/// required `[adapters.spin.adapter].manifest` (the same directory
+/// provision writes `.env` into); a spin adapter without `.manifest`
+/// resolves to `None` — there is no `.crate`/root fallback.
 ///
 /// The adapter name is matched case-insensitively so `--adapter Spin`
 /// or `SPIN` resolves the same as `spin`.
@@ -270,36 +292,25 @@ fn resolve_serve_env_file(
             // Spin provision writes `.env` next to the resolved
             // `spin.toml` (see
             // `edgezero-adapter-spin/src/cli/provision_local.rs`:
-            // `env_path = spin_dir.join(".env")`). Derive the same
-            // path here from `[adapters.spin.adapter].manifest`.
+            // `env_path = spin_dir.join(".env")`). Derive the same path
+            // here from the REQUIRED `[adapters.spin.adapter].manifest`.
             // A nested manifest like
             // `[adapters.spin.adapter].manifest = "crates/spin/config/spin.toml"`
-            // places `.env` at `crates/spin/config/.env`, NOT at
-            // `crates/spin/.env` — deriving from `.crate` would miss
-            // the runtime env-label and typed `SPIN_VARIABLE_*` lines
-            // provision just wrote.
+            // places `.env` at `crates/spin/config/.env`.
+            //
+            // There is deliberately NO `.crate`/root fallback: build,
+            // deploy, provision, and config all reject a spin adapter
+            // whose `.manifest` is unset, so an absent `.manifest` is a
+            // malformed manifest, not a legacy shape to accommodate.
+            // Deriving from `.crate` would look in the wrong directory
+            // and miss the runtime env-label + typed `SPIN_VARIABLE_*`
+            // lines provision wrote. Absent `.manifest` => no overlay.
             let (_key, adapter_cfg) = manifest.adapter_entry(adapter_name)?;
-            let env_dir = adapter_cfg.adapter.manifest.as_deref().map_or_else(
-                || {
-                    // No `.manifest` declared (e.g. an out-of-tree
-                    // fixture that predates the 2026-07 both-required
-                    // rule). Fall back to `.crate`; if that's also
-                    // unset, `manifest_root`. Match the historical
-                    // resolution shape so this branch is a strict
-                    // superset of the pre-fix behaviour.
-                    adapter_cfg
-                        .adapter
-                        .crate_path
-                        .as_deref()
-                        .map_or_else(|| manifest_root.to_path_buf(), |cp| manifest_root.join(cp))
-                },
-                |mp| {
-                    let manifest_abs = manifest_root.join(mp);
-                    manifest_abs
-                        .parent()
-                        .map_or_else(|| manifest_root.to_path_buf(), Path::to_path_buf)
-                },
-            );
+            let manifest_rel = adapter_cfg.adapter.manifest.as_deref()?;
+            let manifest_abs = manifest_root.join(manifest_rel);
+            let env_dir = manifest_abs
+                .parent()
+                .map_or_else(|| manifest_root.to_path_buf(), Path::to_path_buf);
             Some(env_dir.join(".env"))
         }
         _ => None,
@@ -424,6 +435,7 @@ name = "demo-app"
 
 [adapters.spin.adapter]
 crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
 
 [adapters.spin.commands]
 build = "echo"
@@ -437,6 +449,7 @@ name = "demo-app"
 
 [adapters.Spin.adapter]
 crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
 
 [adapters.Spin.commands]
 build = "echo"
@@ -643,14 +656,31 @@ ids = ["MY_SECRETS"]
     }
 
     #[test]
-    fn resolve_serve_env_file_spin_returns_spin_crate_dot_env() {
-        // spin's `.env` lives under `<spin_crate>/.env` — the target
-        // the line writer produces.
+    fn resolve_serve_env_file_spin_derives_env_from_manifest_parent() {
+        // spin's `.env` lives next to the resolved `spin.toml` — the
+        // target the line writer produces — derived from the required
+        // `[adapters.spin.adapter].manifest`.
         let loader = ManifestLoader::load_from_str(SPIN_MANIFEST_LOWER);
         let root = PathBuf::from("/tmp/proj");
         let resolved = resolve_serve_env_file(loader.manifest(), "spin", &root)
             .expect("spin arm returns Some");
         assert_eq!(resolved, root.join("crates/spin").join(".env"));
+    }
+
+    #[test]
+    fn resolve_serve_env_file_spin_without_manifest_returns_none() {
+        // `.manifest` is required for spin (build/deploy/provision/config
+        // all reject its absence). run_serve must NOT fall back to
+        // `.crate`/root -- that would look for `.env` in the wrong
+        // directory. A crate-only spin adapter resolves to None.
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo-app\"\n\n[adapters.spin.adapter]\ncrate = \"crates/spin\"\n\n[adapters.spin.commands]\nbuild = \"echo\"\ndeploy = \"echo\"\nserve = \"echo\"\n",
+        );
+        let root = PathBuf::from("/tmp/proj");
+        assert!(
+            resolve_serve_env_file(loader.manifest(), "spin", &root).is_none(),
+            "no `.manifest` => no serve env overlay (no legacy `.crate` fallback)"
+        );
     }
 
     #[test]
@@ -731,6 +761,52 @@ serve = "echo"
         assert!(
             err.contains("must be a project-relative path"),
             "path-safety guard must fire before the .env read: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_build_rejects_absolute_adapter_manifest_path() {
+        // `build`/`deploy` dispatch the declared adapter manifest just
+        // like `serve`, so the same path-safety guard must fire.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let poisoned = "[app]\nname = \"demo-app\"\n\n[adapters.spin.adapter]\ncrate = \"crates/spin\"\nmanifest = \"/etc/spin.toml\"\n";
+        fs::write(&manifest_path, poisoned).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = BuildArgs {
+            adapter: "spin".to_owned(),
+            adapter_args: Vec::new(),
+        };
+        let err = run_build(&args)
+            .expect_err("run_build MUST refuse an absolute [adapters.spin.adapter].manifest");
+        assert!(
+            err.contains("must be a project-relative path"),
+            "build path-safety guard must fire: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_deploy_rejects_parent_traversal_in_adapter_manifest() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let poisoned = "[app]\nname = \"demo-app\"\n\n[adapters.spin.adapter]\ncrate = \"crates/spin\"\nmanifest = \"../../../outside/spin.toml\"\n";
+        fs::write(&manifest_path, poisoned).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = DeployArgs {
+            adapter: "spin".to_owned(),
+            adapter_args: Vec::new(),
+        };
+        let err =
+            run_deploy(&args).expect_err("run_deploy MUST refuse a `..`-traversing manifest path");
+        assert!(
+            err.contains("`..`"),
+            "deploy path-safety guard must fire: {err}"
         );
     }
 
@@ -890,8 +966,8 @@ serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_displa
     fn resolve_serve_env_file_adapter_name_is_case_insensitive() {
         // Manifest declares `[adapters.Spin]` (mixed case). Passing
         // `--adapter spin` (or SPIN) must still resolve to the Spin
-        // arm's `<crate>/.env` — the arm lowercases once and matches
-        // on the lowercase form.
+        // arm's `<spin.toml parent>/.env` — the arm lowercases once and
+        // matches on the lowercase form.
         let loader = ManifestLoader::load_from_str(SPIN_MANIFEST_MIXED_CASE);
         let root = PathBuf::from("/tmp/proj");
         let expected = root.join("crates/spin").join(".env");

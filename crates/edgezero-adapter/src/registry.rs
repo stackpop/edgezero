@@ -57,6 +57,14 @@ pub struct AdapterDeployedState {
 pub struct ProvisionOutcome {
     pub deployed: Option<AdapterDeployedState>,
     pub status_lines: Vec<String>,
+    /// A partial-failure error. When `Some`, provision did NOT fully
+    /// succeed, but `deployed` still carries the DURABLE identifiers
+    /// created before the failure (e.g. Cloudflare namespaces already
+    /// created via `wrangler kv namespace create`). The CLI persists
+    /// `deployed` FIRST -- so a partially-created set is checkpointed
+    /// into tracked `edgezero.toml` and not lost -- THEN propagates
+    /// this error. Adapters that fully succeed leave it `None`.
+    pub error: Option<String>,
 }
 
 impl ProvisionOutcome {
@@ -69,6 +77,7 @@ impl ProvisionOutcome {
         Self {
             deployed: None,
             status_lines,
+            error: None,
         }
     }
 
@@ -80,7 +89,17 @@ impl ProvisionOutcome {
         Self {
             deployed: Some(deployed),
             status_lines,
+            error: None,
         }
+    }
+
+    /// Attach a partial-failure error while keeping the durable
+    /// `deployed` identifiers already produced. See [`Self::error`].
+    #[inline]
+    #[must_use]
+    pub fn with_error(mut self, error: String) -> Self {
+        self.error = Some(error);
+        self
     }
 }
 

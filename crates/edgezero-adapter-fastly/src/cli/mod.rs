@@ -233,38 +233,46 @@ impl Adapter for FastlyCliAdapter {
     // does: `provision --local` writes each key into `fastly.toml` as
     // `{ key = "<key>", env = "<KEY>" }`, where the env name is
     // `key.to_ascii_uppercase()` -- Viceroy sources the secret's value
-    // from that variable. Uppercasing is lossy, so two distinct keys
-    // that differ only in case (`api_token` / `API_TOKEN`) produce two
-    // separate secret-store rows that BOTH read `$API_TOKEN`, and the
-    // two secrets silently resolve to the same value at runtime
-    //. Reject at validation
-    // rather than let a wrong secret be served.
+    // from that variable. The env name has no store qualifier, so two
+    // DISTINCT (store, key) secrets that upper-case to the same name --
+    // whether they differ by case (`api_token` / `API_TOKEN`) or by
+    // store (`store_a`/`api_token` vs `store_b`/`api_token`) -- both
+    // read `$API_TOKEN` and silently collapse to one value. Reject at
+    // validation rather than let a wrong secret be served.
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
         use std::collections::HashMap;
-        // Uppercased env name -> (key that claimed it, its field).
-        // Two entries sharing a key_value are fine even across stores:
-        // same key, same env, same value -- that is the intended
-        // "one secret referenced twice" shape. Only a DIFFERING
-        // key_value under the same env name is ambiguous.
-        let mut seen: HashMap<String, (&str, &str)> = HashMap::with_capacity(entries.len());
+        // A secret's production identity is (store, key): the same key
+        // in two DIFFERENT stores is two DIFFERENT secrets whose values
+        // may differ. But `provision --local` derives the Viceroy env
+        // var from the key alone (`key.to_ascii_uppercase()`), with no
+        // store qualifier, so both would read the same `$KEY` and
+        // silently resolve to one value. Reject any two DISTINCT
+        // (store, key) pairs that collide on the same env var -- whether
+        // they differ by case (`api_token` / `API_TOKEN`) or by store
+        // (`store_a`/`api_token` vs `store_b`/`api_token`). The same
+        // (store, key) referenced twice is fine (one secret, two refs).
+        let mut seen: HashMap<String, (&str, &str, &str)> = HashMap::with_capacity(entries.len());
         for entry in entries {
             let env_name = entry.key_value.to_ascii_uppercase();
-            match seen.get(&env_name) {
-                Some((prev_key, prev_field)) if *prev_key != entry.key_value => {
+            if let Some((prev_store, prev_key, prev_field)) = seen.get(&env_name) {
+                if (*prev_store, *prev_key) != (entry.store_id, entry.key_value) {
                     return Err(format!(
-                        "`#[secret]` fields `{prev_field}` (key `{prev_key}`) and `{this_field}` \
-                         (key `{this_key}`) both map to the Viceroy environment variable \
-                         `{env_name}` in `fastly.toml` -- `provision --local` derives it by \
-                         upper-casing the key, so both secrets would read the same value. Pick \
-                         keys that differ by more than case.",
+                        "`#[secret]` fields `{prev_field}` (store `{prev_store}`, key `{prev_key}`) \
+                         and `{this_field}` (store `{this_store}`, key `{this_key}`) both map to the \
+                         Viceroy environment variable `{env_name}` in `fastly.toml` -- provision \
+                         derives it by upper-casing the key with no store qualifier, so these two \
+                         DISTINCT secrets would resolve to a single value. Pick keys that differ by \
+                         more than case, even across stores.",
                         this_field = entry.field_name,
+                        this_store = entry.store_id,
                         this_key = entry.key_value,
                     ));
                 }
-                Some(_) => {}
-                None => {
-                    seen.insert(env_name, (entry.key_value, entry.field_name.as_str()));
-                }
+            } else {
+                seen.insert(
+                    env_name,
+                    (entry.store_id, entry.key_value, entry.field_name.as_str()),
+                );
             }
         }
         Ok(())
@@ -467,17 +475,34 @@ mod tests {
             .expect("distinct keys must pass");
     }
 
-    /// The same key referenced from two stores is the intended
-    /// "one secret, two references" shape: same key, same env, same
-    /// value. It must NOT be reported as a collision.
+    /// The SAME key in two DIFFERENT stores is two distinct secrets
+    /// (identity is (store, key)) whose values may differ, but both
+    /// derive the same `API_TOKEN` env var with no store qualifier --
+    /// so provision would collapse them to one value. Reject it.
     #[test]
-    fn validate_typed_secrets_allows_same_key_across_two_stores() {
-        FastlyCliAdapter
+    fn validate_typed_secrets_rejects_same_key_across_two_stores() {
+        let err = FastlyCliAdapter
             .validate_typed_secrets(&[
                 TypedSecretEntry::new("store_a", "field_a", "api_token"),
                 TypedSecretEntry::new("store_b", "field_b", "api_token"),
             ])
-            .expect("an identical key in two stores shares one env var by design");
+            .expect_err("same key in two stores collides on one Viceroy env var");
+        assert!(
+            err.contains("store_a") && err.contains("store_b") && err.contains("API_TOKEN"),
+            "error names both stores and the shared env var: {err}"
+        );
+    }
+
+    /// The exact same (store, key) referenced twice is one secret with
+    /// two references -- not a collision.
+    #[test]
+    fn validate_typed_secrets_allows_same_store_and_key_referenced_twice() {
+        FastlyCliAdapter
+            .validate_typed_secrets(&[
+                TypedSecretEntry::new("default", "field_a", "api_token"),
+                TypedSecretEntry::new("default", "field_b", "api_token"),
+            ])
+            .expect("one secret referenced by two fields is fine");
     }
 
     /// Regression: keys

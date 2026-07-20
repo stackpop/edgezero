@@ -64,7 +64,13 @@ pub(super) fn provision(
         .map_err(|err| format!("failed to parse {}: {err}", spin_path.display()))?;
     let mut spin_changed = false;
     let needs_component = !stores.kv.is_empty() || !stores.config.is_empty();
-    if needs_component {
+    // Resolve/refresh the component whenever there are stores to append
+    // OR an explicit selector to reconcile. Doing the latter even for
+    // empty / secrets-only store sets is load-bearing: otherwise an
+    // out-of-phase `[adapters.spin.adapter].component` would pass
+    // provision (provision validates leniently) yet leave a manifest
+    // that immediately fails strict `config validate`.
+    if needs_component || component_selector.is_some() {
         let (component_id, renamed) =
             resolve_component_id(&mut spin_doc, component_selector, &spin_path)?;
         if renamed {
@@ -224,8 +230,19 @@ fn rename_component(
         .and_then(toml_edit::Item::as_array_of_tables_mut)
     {
         for trigger in http.iter_mut() {
-            if trigger.get("component").and_then(toml_edit::Item::as_str) == Some(old) {
-                trigger.insert("component", toml_edit::value(new));
+            // Update the value IN PLACE, cloning the old decor onto the
+            // replacement. `Table::insert` swaps the whole `Item` and
+            // drops the decor -- here that would strip a trailing inline
+            // comment on the `component = "..."` line (e.g. one naming
+            // the component it points at).
+            if let Some(existing) = trigger
+                .get_mut("component")
+                .and_then(toml_edit::Item::as_value_mut)
+                && existing.as_str() == Some(old)
+            {
+                let mut replacement = toml_edit::Value::from(new);
+                *replacement.decor_mut() = existing.decor().clone();
+                *existing = replacement;
             }
         }
     }
@@ -745,6 +762,66 @@ mod tests {
         assert!(
             after.contains("sessions"),
             "kv label written to the refreshed component: {after}"
+        );
+    }
+
+    #[test]
+    fn rename_component_preserves_trigger_value_decor() {
+        // Renaming the sole component repoints the trigger's `component`
+        // value; that edit must keep a trailing inline comment on the
+        // line rather than swap the whole item and drop it.
+        let input = "spin_manifest_version = 2\n\n\
+             [[trigger.http]]\nroute = \"/...\"\n\
+             component = \"demo\"  # points at the sole component\n\n\
+             [component.demo]\nsource = \"demo.wasm\"\n";
+        let mut doc: toml_edit::DocumentMut = input.parse().expect("parse");
+        super::rename_component(&mut doc, "demo", "worker", Path::new("spin.toml"))
+            .expect("rename");
+        let out = doc.to_string();
+        assert!(out.contains("component = \"worker\""), "repointed: {out}");
+        assert!(out.contains("[component.worker]"), "table renamed: {out}");
+        assert!(
+            out.contains("# points at the sole component"),
+            "inline comment on the trigger component line preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn provision_local_refreshes_selector_with_no_kv_config_stores() {
+        // Secrets-only / empty config: even with no KV or config stores
+        // to append, a changed selector must still refresh the sole
+        // component, or provision would succeed and leave a manifest
+        // that fails strict validate.
+        let dir = tempdir().expect("tempdir");
+        write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[[trigger.http]]\nroute = \"/...\"\ncomponent = \"demo\"\n[component.demo]\nsource = \"demo.wasm\"\nkey_value_stores = []\n",
+        );
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "# edgezero-provision: v1\n",
+        )
+        .expect("seed runtime-config");
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                Some("worker"),
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision succeeds");
+        let after = fs::read_to_string(dir.path().join("spin.toml")).expect("read");
+        assert!(
+            after.contains("[component.worker]") && !after.contains("[component.demo]"),
+            "sole component refreshed to the new selector even with no stores: {after}"
         );
     }
 

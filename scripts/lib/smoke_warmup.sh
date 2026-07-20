@@ -1,6 +1,6 @@
 # Shared smoke warm-up: provisions per-adapter local state via the
 # generated app-demo-cli so smoke scripts can boot emulators on fresh
-# clones where Cloudflare/Fastly/Spin manifests are gitignored (Task 33).
+# clones where Cloudflare/Fastly/Spin manifests are gitignored.
 #
 # Caller MUST set ROOT_DIR before sourcing this file (existing smoke
 # bootstrap pattern; see scripts/smoke_test_config.sh:19).

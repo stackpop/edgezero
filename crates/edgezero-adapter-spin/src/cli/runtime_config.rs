@@ -21,6 +21,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde::de::Error as DeError;
 
 /// Backend selected for one `[key_value_store.<label>]` stanza. The
 /// variant tells the dispatcher which writer to invoke.
@@ -60,24 +61,27 @@ impl<'de> Deserialize<'de> for KeyValueBackend {
         // Spin's runtime-config format requires a `type` discriminant
         // for every store; we treat its absence as Unknown.
         let table = toml::Table::deserialize(deserializer)?;
-        let type_name = table
-            .get("type")
-            .and_then(toml::Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        // A field that is PRESENT but not a string is a malformed
+        // runtime-config, not a silent fall-through to the default: e.g.
+        // `path = 123` must surface an error rather than be dropped and
+        // resolve to the default SQLite location (which would push config
+        // to the wrong database). Absent fields keep their defaults.
+        let str_field = |field: &str| -> Result<Option<&str>, D::Error> {
+            match table.get(field) {
+                None => Ok(None),
+                Some(toml::Value::String(value)) => Ok(Some(value.as_str())),
+                Some(_) => Err(DeError::custom(format!(
+                    "`{field}` in a `[key_value_store]` stanza must be a string"
+                ))),
+            }
+        };
+        let type_name = str_field("type")?.unwrap_or("").to_owned();
         Ok(match type_name.as_str() {
             "spin" => Self::Spin {
-                path: table
-                    .get("path")
-                    .and_then(toml::Value::as_str)
-                    .map(PathBuf::from),
+                path: str_field("path")?.map(PathBuf::from),
             },
             "redis" => Self::Redis {
-                url: table
-                    .get("url")
-                    .and_then(toml::Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
+                url: str_field("url")?.unwrap_or("").to_owned(),
             },
             "azure_cosmos" => Self::AzureCosmos,
             other => Self::Unknown {
@@ -220,6 +224,41 @@ mod tests {
             parsed.key_value_stores["global"],
             KeyValueBackend::AzureCosmos
         ));
+    }
+
+    #[test]
+    fn spin_backend_rejects_non_string_path() {
+        // `path = 123` is malformed: silently defaulting to the standard
+        // SQLite location would push config to the wrong database. It must
+        // surface an error.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("runtime-config.toml");
+        fs::write(
+            &path,
+            "[key_value_store.app_config]\ntype = \"spin\"\npath = 123\n",
+        )
+        .expect("write");
+        let err = read(&path).expect_err("a non-string `path` must error, not silently default");
+        assert!(
+            err.contains("`path`") && err.contains("must be a string"),
+            "error names the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn redis_backend_rejects_non_string_url() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("runtime-config.toml");
+        fs::write(
+            &path,
+            "[key_value_store.cache]\ntype = \"redis\"\nurl = true\n",
+        )
+        .expect("write");
+        let err = read(&path).expect_err("a non-string `url` must error");
+        assert!(
+            err.contains("`url`") && err.contains("must be a string"),
+            "error names the offending field: {err}"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ SERVER_PID=""
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
 # and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
-# this because Task 33 gitignored those files.
+# this because those adapter manifests are gitignored.
 # shellcheck source=lib/smoke_warmup.sh
 . "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
 echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
@@ -74,6 +74,15 @@ JSON
       echo "Fastly CLI is required. Install from https://developer.fastly.com/reference/cli/" >&2
       exit 1
     }
+    # Seed the local Fastly config store BEFORE `fastly compute serve`.
+    # `config push --local` upserts the demo's typed config defaults into
+    # `[local_server.config_stores.app_config.contents]` in fastly.toml
+    # (the block was created by `provision --local` in the warm-up above).
+    # Without this the store is empty and the per-key checks below observe
+    # 404s instead of the demo values.
+    echo "==> Seeding Fastly local config store (config push --adapter fastly --local)..."
+    (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
+      config push --adapter fastly --local --no-env 2>&1)
     echo "==> Starting Fastly Viceroy on port $PORT..."
     (cd "$DEMO_DIR" && fastly compute serve -C crates/app-demo-adapter-fastly 2>&1) &
     SERVER_PID=$!
@@ -84,6 +93,12 @@ JSON
       echo "wrangler is required. Install with 'npm i -g wrangler'" >&2
       exit 1
     }
+    # Seed the local Cloudflare config store BEFORE `wrangler dev`, same
+    # as the Fastly arm: `config push --local` writes the demo's typed
+    # config defaults into the local KV state wrangler dev reads.
+    echo "==> Seeding Cloudflare local config store (config push --adapter cloudflare --local)..."
+    (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
+      config push --adapter cloudflare --local --no-env 2>&1)
     echo "==> Starting Cloudflare wrangler dev on port $PORT..."
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!

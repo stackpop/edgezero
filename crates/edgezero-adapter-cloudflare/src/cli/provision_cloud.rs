@@ -3,7 +3,9 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 
-use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
+use edgezero_adapter::registry::{
+    AdapterDeployedState, ProvisionOutcome, ProvisionStores, ResolvedStoreId,
+};
 
 use super::WRANGLER_INSTALL_HINT;
 use super::provision_local::{
@@ -46,162 +48,37 @@ pub(super) fn provision(
     // contribute nothing (no real wrangler invocation, no id to
     // record).
     let mut created_kv_ns: BTreeMap<String, String> = BTreeMap::new();
+    let mut pending_error: Option<String> = None;
     for store in stores.kv.iter().chain(stores.config.iter()) {
-        let logical = &store.logical;
-        // The Cloudflare KV binding name is what the runtime
-        // calls `env.kv(...)` with -- it's resolved at request
-        // time from `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME`
-        // (default = logical id). Provision must write the
-        // resolved PLATFORM name into wrangler.toml, otherwise
-        // the runtime will look up a binding the CLI never
-        // created.
-        let binding = &store.platform;
-        // Idempotency check BEFORE shelling out: if a
-        // [[kv_namespaces]] entry with `binding = <platform>`
-        // is already present and has a real namespace id, skip.
-        // Without this guard a re-run of provision would invoke
-        // `wrangler kv namespace create` again and orphan the
-        // previously-created namespace -- wasting account quota.
-        // A placeholder id (anything that isn't a 32-char
-        // lowercase hex string, like the
-        // `local-dev-placeholder` the scaffold wrangler.toml
-        // writes) is treated as "not yet provisioned" so the
-        // entry gets rewritten with the real id.
-        //
-        // We deliberately do NOT cross-check the stored id
-        // against Cloudflare's API (e.g. by calling `wrangler
-        // kv namespace list` to confirm the id still exists).
-        // Verifying every entry on every provision run would
-        // add a network round-trip per id and require parsing
-        // yet another wrangler subcommand output. The skip
-        // line names the existing id explicitly so the operator
-        // can verify it themselves and, if the Cloudflare-side
-        // namespace was deleted out-of-band, remove the stale
-        // entry by hand before re-running provision.
-        // The team-tracked namespace id for this logical store (from
-        // committed `[adapters.cloudflare.deployed].kv_namespaces`), if
-        // any. `wrangler.toml` is gitignored and per-machine; this is
-        // the shared source of truth to reconcile against.
-        let tracked_id = deployed
-            .and_then(|state| state.sub_tables.get("kv_namespaces"))
-            .and_then(|namespaces| namespaces.get(logical.as_str()));
-        let existing = existing_real_namespace_id(&wrangler_path, binding)?;
-        if let Some(existing_id) = existing {
-            match tracked_id {
-                // Local disagrees with the committed id: the gitignored
-                // file is stale or hand-edited. Refuse rather than let
-                // the writeback silently replace the team's id.
-                Some(tracked) if tracked != &existing_id => {
-                    return Err(format!(
-                        "namespace id conflict for logical store `{logical}`: gitignored `{}` declares \
-                         `{existing_id}`, but tracked `[adapters.cloudflare.deployed].kv_namespaces.{logical}` \
-                         is `{tracked}`. wrangler.toml is per-machine, so provision will not overwrite the \
-                         committed id with it. Resolve by hand: delete the stale [[kv_namespaces]] entry for \
-                         binding `{binding}` (the committed id is restored on the next run), or update the \
-                         tracked value in edgezero.toml.",
-                        wrangler_path.display()
-                    ));
-                }
-                // Local matches the committed id: already the team's
-                // source of truth, nothing to write back.
-                Some(_) => {
-                    out.push(format!(
-                        "binding `{binding}` (logical id `{logical}`) already provisioned (id={existing_id}, matches tracked); skipping."
-                    ));
-                }
-                // No tracked id. The local id is unverified, gitignored,
-                // per-machine state -- a stale, deleted, or wrong-account
-                // namespace. Do NOT promote it into tracked deployed
-                // state; the spec derives durable ids from
-                // `wrangler kv namespace create` output only, and an
-                // unconditional local promotion would silently make bad
-                // state the team's source of truth without any
-                // Cloudflare call.
-                None => {
-                    out.push(format!(
-                        "binding `{binding}` (logical id `{logical}`) has a local namespace id (id={existing_id} in {}) but no tracked id; NOT promoting an unverified gitignored id. If it is correct, set `[adapters.cloudflare.deployed].kv_namespaces.{logical}` in edgezero.toml by hand; to recreate, delete the [[kv_namespaces]] entry for binding `{binding}` and re-run provision.",
-                        wrangler_path.display()
-                    ));
-                }
-            }
-            continue;
+        if let Err(err) = provision_one_kv_store(
+            store,
+            &wrangler_path,
+            deployed,
+            dry_run,
+            &mut created_kv_ns,
+            &mut out,
+        ) {
+            // A store failed. Durable ids created by EARLIER stores are
+            // already in `created_kv_ns`; carry them out so the CLI
+            // checkpoints them into tracked `edgezero.toml` before
+            // surfacing the error, rather than losing an
+            // already-created namespace to a later store's failure.
+            pending_error = Some(err);
+            break;
         }
-        // No real id locally. If the team already tracks one, this is a
-        // fresh clone (or a wiped local file): restore the committed id
-        // into wrangler.toml rather than calling `wrangler kv namespace
-        // create` and orphaning a DUPLICATE namespace on Cloudflare.
-        if let Some(tracked) = tracked_id {
-            check_kv_namespaces_writeback_shape(&wrangler_path)?;
-            if dry_run {
-                out.push(format!(
-                    "would restore tracked namespace id {tracked} for binding `{binding}` (logical id `{logical}`) into {}; no new namespace created",
-                    wrangler_path.display()
-                ));
-                continue;
-            }
-            upsert_kv_namespace(&wrangler_path, binding, tracked)?;
-            out.push(format!(
-                "restored tracked KV namespace id {tracked} for binding `{binding}` (logical id `{logical}`) into {}; no new namespace created",
-                wrangler_path.display()
-            ));
-            created_kv_ns.insert(logical.clone(), tracked.clone());
-            continue;
-        }
-        // Pre-flight the writeback shape BEFORE shelling
-        // `wrangler kv namespace create`. `read_namespace_id`
-        // tolerates both `[[kv_namespaces]]` (array-of-tables)
-        // and `kv_namespaces = [{ binding = "...", id = "..." }]`
-        // (inline-array) forms, but `upsert_kv_namespace` only
-        // writes back through the array-of-tables shape. Without
-        // this guard, an inline-array manifest passes the
-        // "already provisioned?" probe (because no id is
-        // present), the remote `create` succeeds, and then the
-        // upsert errors out — leaving the freshly-created
-        // namespace orphaned on Cloudflare with no local
-        // writeback to track it.
-        //
-        // Refuse early so the operator fixes the manifest shape
-        // BEFORE any account-side mutation.
-        check_kv_namespaces_writeback_shape(&wrangler_path)?;
-        if dry_run {
-            out.push(format!(
-                "would run `wrangler kv namespace create {binding}` and append [[kv_namespaces]] binding = \"{binding}\" to {} (logical id `{logical}`)",
-                wrangler_path.display()
-            ));
-            continue;
-        }
-        let namespace_id = create_kv_namespace(binding)?;
-        upsert_kv_namespace(&wrangler_path, binding, &namespace_id)?;
-        out.push(format!(
-            "created KV namespace `{binding}` (logical id `{logical}`, namespace id={namespace_id}); written to {}",
-            wrangler_path.display()
-        ));
-        // Record under the LOGICAL id, not the platform binding.
-        // Teammates' `provision --local` re-resolves logical ->
-        // platform via THEIR env overlay and reads the namespace
-        // id back via the same logical key -- keying by
-        // `binding` (platform) would break that lookup when
-        // the overlays diverge.
-        created_kv_ns.insert(logical.clone(), namespace_id);
     }
-    for store in stores.secrets {
-        let logical = &store.logical;
-        let platform = &store.platform;
-        out.push(format!(
-            "cloudflare secret `{platform}` (logical id `{logical}`) is runtime-managed via `wrangler secret put`; nothing to provision"
-        ));
+    if pending_error.is_none() {
+        for store in stores.secrets {
+            let logical = &store.logical;
+            let platform = &store.platform;
+            out.push(format!(
+                "cloudflare secret `{platform}` (logical id `{logical}`) is runtime-managed via `wrangler secret put`; nothing to provision"
+            ));
+        }
     }
     if out.is_empty() {
         out.push("cloudflare has no declared stores to provision".to_owned());
     }
-    // dry_run branch above `continue`s BEFORE reaching
-    // `create_kv_namespace`, so `created_kv_ns` stays empty for
-    // dry-runs -- `deployed` collapses to `None` and the CLI
-    // writeback is a no-op. An idempotent skip (binding already
-    // present with a real id) similarly doesn't repopulate the
-    // map, since the existing id is already recorded in the
-    // operator's `[adapters.cloudflare.deployed]` block from a
-    // prior run.
     let created_deployed = if created_kv_ns.is_empty() {
         None
     } else {
@@ -211,10 +88,168 @@ pub(super) fn provision(
             .insert("kv_namespaces".to_owned(), created_kv_ns);
         Some(state)
     };
-    Ok(match created_deployed {
+    let outcome = match created_deployed {
         Some(state) => ProvisionOutcome::with_deployed(out, state),
         None => ProvisionOutcome::from_status_lines(out),
+    };
+    Ok(match pending_error {
+        Some(err) => outcome.with_error(err),
+        None => outcome,
     })
+}
+
+/// Provision a single KV/config store's Cloudflare namespace. Split out
+/// of the store loop so the caller can catch a mid-loop failure and still
+/// surface the durable ids earlier stores created (see
+/// [`ProvisionOutcome::error`]). A successful skip/restore/create returns
+/// `Ok(())`; any writeback failure returns `Err`.
+fn provision_one_kv_store(
+    store: &ResolvedStoreId,
+    wrangler_path: &Path,
+    deployed: Option<&AdapterDeployedState>,
+    dry_run: bool,
+    created_kv_ns: &mut BTreeMap<String, String>,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let logical = &store.logical;
+    // The Cloudflare KV binding name is what the runtime
+    // calls `env.kv(...)` with -- it's resolved at request
+    // time from `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME`
+    // (default = logical id). Provision must write the
+    // resolved PLATFORM name into wrangler.toml, otherwise
+    // the runtime will look up a binding the CLI never
+    // created.
+    let binding = &store.platform;
+    // Idempotency check BEFORE shelling out: if a
+    // [[kv_namespaces]] entry with `binding = <platform>`
+    // is already present and has a real namespace id, skip.
+    // Without this guard a re-run of provision would invoke
+    // `wrangler kv namespace create` again and orphan the
+    // previously-created namespace -- wasting account quota.
+    // A placeholder id (anything that isn't a 32-char
+    // lowercase hex string, like the
+    // `local-dev-placeholder` the scaffold wrangler.toml
+    // writes) is treated as "not yet provisioned" so the
+    // entry gets rewritten with the real id.
+    //
+    // We deliberately do NOT cross-check the stored id
+    // against Cloudflare's API (e.g. by calling `wrangler
+    // kv namespace list` to confirm the id still exists).
+    // Verifying every entry on every provision run would
+    // add a network round-trip per id and require parsing
+    // yet another wrangler subcommand output. The skip
+    // line names the existing id explicitly so the operator
+    // can verify it themselves and, if the Cloudflare-side
+    // namespace was deleted out-of-band, remove the stale
+    // entry by hand before re-running provision.
+    // The team-tracked namespace id for this logical store (from
+    // committed `[adapters.cloudflare.deployed].kv_namespaces`), if
+    // any. `wrangler.toml` is gitignored and per-machine; this is
+    // the shared source of truth to reconcile against.
+    let tracked_id = deployed
+        .and_then(|state| state.sub_tables.get("kv_namespaces"))
+        .and_then(|namespaces| namespaces.get(logical.as_str()));
+    let existing = existing_real_namespace_id(wrangler_path, binding)?;
+    if let Some(existing_id) = existing {
+        match tracked_id {
+            // Local disagrees with the committed id: the gitignored
+            // file is stale or hand-edited. Refuse rather than let
+            // the writeback silently replace the team's id.
+            Some(tracked) if tracked != &existing_id => {
+                return Err(format!(
+                    "namespace id conflict for logical store `{logical}`: gitignored `{}` declares \
+                     `{existing_id}`, but tracked `[adapters.cloudflare.deployed].kv_namespaces.{logical}` \
+                     is `{tracked}`. wrangler.toml is per-machine, so provision will not overwrite the \
+                     committed id with it. Resolve by hand: delete the stale [[kv_namespaces]] entry for \
+                     binding `{binding}` (the committed id is restored on the next run), or update the \
+                     tracked value in edgezero.toml.",
+                    wrangler_path.display()
+                ));
+            }
+            // Local matches the committed id: already the team's
+            // source of truth, nothing to write back.
+            Some(_) => {
+                out.push(format!(
+                    "binding `{binding}` (logical id `{logical}`) already provisioned (id={existing_id}, matches tracked); skipping."
+                ));
+            }
+            // No tracked id. The local id is unverified, gitignored,
+            // per-machine state -- a stale, deleted, or wrong-account
+            // namespace. Do NOT promote it into tracked deployed
+            // state; the spec derives durable ids from
+            // `wrangler kv namespace create` output only, and an
+            // unconditional local promotion would silently make bad
+            // state the team's source of truth without any
+            // Cloudflare call.
+            None => {
+                out.push(format!(
+                    "binding `{binding}` (logical id `{logical}`) has a local namespace id (id={existing_id} in {}) but no tracked id; NOT promoting an unverified gitignored id. If it is correct, set `[adapters.cloudflare.deployed].kv_namespaces.{logical}` in edgezero.toml by hand; to recreate, delete the [[kv_namespaces]] entry for binding `{binding}` and re-run provision.",
+                    wrangler_path.display()
+                ));
+            }
+        }
+        return Ok(());
+    }
+    // No real id locally. If the team already tracks one, this is a
+    // fresh clone (or a wiped local file): restore the committed id
+    // into wrangler.toml rather than calling `wrangler kv namespace
+    // create` and orphaning a DUPLICATE namespace on Cloudflare.
+    if let Some(tracked) = tracked_id {
+        check_kv_namespaces_writeback_shape(wrangler_path)?;
+        if dry_run {
+            out.push(format!(
+                "would restore tracked namespace id {tracked} for binding `{binding}` (logical id `{logical}`) into {}; no new namespace created",
+                wrangler_path.display()
+            ));
+            return Ok(());
+        }
+        upsert_kv_namespace(wrangler_path, binding, tracked)?;
+        out.push(format!(
+            "restored tracked KV namespace id {tracked} for binding `{binding}` (logical id `{logical}`) into {}; no new namespace created",
+            wrangler_path.display()
+        ));
+        created_kv_ns.insert(logical.clone(), tracked.clone());
+        return Ok(());
+    }
+    // Pre-flight the writeback shape BEFORE shelling
+    // `wrangler kv namespace create`. `read_namespace_id`
+    // tolerates both `[[kv_namespaces]]` (array-of-tables)
+    // and `kv_namespaces = [{ binding = "...", id = "..." }]`
+    // (inline-array) forms, but `upsert_kv_namespace` only
+    // writes back through the array-of-tables shape. Without
+    // this guard, an inline-array manifest passes the
+    // "already provisioned?" probe (because no id is
+    // present), the remote `create` succeeds, and then the
+    // upsert errors out — leaving the freshly-created
+    // namespace orphaned on Cloudflare with no local
+    // writeback to track it.
+    //
+    // Refuse early so the operator fixes the manifest shape
+    // BEFORE any account-side mutation.
+    check_kv_namespaces_writeback_shape(wrangler_path)?;
+    if dry_run {
+        out.push(format!(
+            "would run `wrangler kv namespace create {binding}` and append [[kv_namespaces]] binding = \"{binding}\" to {} (logical id `{logical}`)",
+            wrangler_path.display()
+        ));
+        return Ok(());
+    }
+    let namespace_id = create_kv_namespace(binding, wrangler_path)?;
+    // Record under the LOGICAL id (not the platform binding) BEFORE the
+    // writeback. Teammates' `provision --local` re-resolves logical ->
+    // platform via THEIR env overlay and reads the namespace id back via
+    // the same logical key -- keying by `binding` (platform) would break
+    // that lookup when the overlays diverge. Recording before the upsert
+    // means a create-success / upsert-failure still checkpoints the
+    // durable id, so the caller can persist it into tracked deployed
+    // state instead of orphaning the namespace on Cloudflare.
+    created_kv_ns.insert(logical.clone(), namespace_id.clone());
+    upsert_kv_namespace(wrangler_path, binding, &namespace_id)?;
+    out.push(format!(
+        "created KV namespace `{binding}` (logical id `{logical}`, namespace id={namespace_id}); written to {}",
+        wrangler_path.display()
+    ));
+    Ok(())
 }
 
 /// Shell out to `wrangler kv namespace create <binding>`, capture
@@ -226,9 +261,18 @@ pub(super) fn provision(
 /// Returns an error if `wrangler` isn't on `PATH`, the child fails
 /// to spawn, the exit status is non-zero, or stdout doesn't
 /// include a parseable `id = "..."` line.
-fn create_kv_namespace(binding: &str) -> Result<String, String> {
+fn create_kv_namespace(binding: &str, wrangler_path: &Path) -> Result<String, String> {
+    // Anchor the create to THIS project's `wrangler.toml` via
+    // `--config`. Without it, `wrangler` picks up whatever config it
+    // discovers from the process cwd, which -- especially under
+    // `edgezero provision --manifest <other-dir>` -- can create the
+    // namespace against the wrong Wrangler configuration / account and
+    // then record that foreign id in this project.
+    let config_arg = wrangler_path
+        .to_str()
+        .ok_or_else(|| format!("invalid wrangler.toml path {}", wrangler_path.display()))?;
     let output = Command::new("wrangler")
-        .args(["kv", "namespace", "create", binding])
+        .args(["kv", "namespace", "create", binding, "--config", config_arg])
         .output()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
@@ -384,9 +428,7 @@ mod tests {
     #[cfg(unix)]
     use super::super::path_mutation_guard;
     use super::*;
-    use edgezero_adapter::registry::{
-        Adapter as _, ProvisionMode, ProvisionStores, ResolvedStoreId,
-    };
+    use edgezero_adapter::registry::{Adapter as _, ProvisionMode};
     use edgezero_core::test_env::PathPrepend;
     use std::fs;
     use std::path::PathBuf;
@@ -799,7 +841,7 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &[],
         };
         let tracked = tracked_kv(TEST_KV_ID, "ffffffffffffffffffffffffffffffff");
-        let err = CloudflareCliAdapter
+        let out = CloudflareCliAdapter
             .provision(
                 dir.path(),
                 Some("wrangler.toml"),
@@ -809,12 +851,22 @@ id = "00112233445566778899aabbccddeeff"
                 ProvisionMode::Cloud,
                 true,
             )
-            .expect_err("a stale local namespace id must abort provision");
+            .expect("the conflict surfaces via outcome.error, not a top-level Err");
+        let err = out
+            .error
+            .as_deref()
+            .expect("a stale local namespace id must record a conflict error");
         assert!(
             err.contains("00112233445566778899aabbccddeeff")
                 && err.contains("ffffffffffffffffffffffffffffffff")
                 && err.contains("conflict"),
             "error must name both ids: {err}"
+        );
+        // A pure conflict creates nothing, so there is no id to checkpoint.
+        assert!(
+            out.deployed.is_none(),
+            "conflict aborts before any create: {:?}",
+            out.deployed
         );
     }
 
@@ -931,6 +983,73 @@ id = "00112233445566778899aabbccddeeff"
             out.deployed.is_none(),
             "no-store provision has nothing to write back: {:?}",
             out.deployed
+        );
+    }
+
+    /// A store failing mid-loop must not discard the durable ids EARLIER
+    /// stores already created. Provision surfaces the failure through
+    /// `ProvisionOutcome::error` while still carrying the created ids in
+    /// `deployed`, so the CLI checkpoints them before propagating the
+    /// error -- otherwise a later store's failure would orphan an
+    /// already-created namespace on Cloudflare.
+    #[cfg(unix)]
+    #[test]
+    fn provision_keeps_earlier_created_ids_when_a_later_store_fails() {
+        let _guard = path_mutation_guard().lock().expect("path guard");
+        let dir = tempdir().expect("tempdir");
+        // `cache` already carries a real (but stale) local id that
+        // conflicts with the tracked one -> its store aborts. `sessions`
+        // has no entry, so it is created first and must survive.
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"cache\"\nid = \"aabbccddeeff00112233445566778899\"\n",
+        );
+        let stdout = "[[kv_namespaces]]\nbinding = \"ignored-by-parser\"\nid = \"00112233445566778899aabbccddeeff\"\n";
+        let fake = fake_wrangler_returning(stdout, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        // `sessions` first (creates), then `cache` (conflict -> Err).
+        let kv_ids: Vec<ResolvedStoreId> =
+            ResolvedStoreId::from_logicals(&[TEST_KV_ID, TEST_KV_ID_ALT]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let tracked = tracked_kv(TEST_KV_ID_ALT, "ffffffffffffffffffffffffffffffff");
+        let out = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                Some(&tracked),
+                ProvisionMode::Cloud,
+                false,
+            )
+            .expect("partial failure surfaces via outcome.error, not Err");
+        let err = out
+            .error
+            .as_deref()
+            .expect("the conflicting store records an error");
+        assert!(
+            err.contains("conflict") && err.contains(TEST_KV_ID_ALT),
+            "error names the failing store: {err}"
+        );
+        // The earlier create must still be checkpointed.
+        let kv = out
+            .deployed
+            .as_ref()
+            .and_then(|state| state.sub_tables.get("kv_namespaces"))
+            .expect("earlier create is preserved despite the later failure");
+        assert_eq!(
+            kv.get(TEST_KV_ID).map(String::as_str),
+            Some("00112233445566778899aabbccddeeff"),
+            "created id for `{TEST_KV_ID}` survives a later store's failure: {kv:?}"
+        );
+        assert!(
+            !kv.contains_key(TEST_KV_ID_ALT),
+            "the failing store contributes no id: {kv:?}"
         );
     }
 

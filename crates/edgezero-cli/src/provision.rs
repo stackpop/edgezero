@@ -296,9 +296,13 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
     if args.dry_run {
         log::info!("[edgezero] provision --dry-run for `{}`:", args.adapter);
     }
-    for line in outcome.status_lines {
+    for line in &outcome.status_lines {
         log::info!("{line}");
     }
+    // Persist durable ids FIRST -- even on a partial failure (see
+    // `ProvisionOutcome::error`), so identifiers already created (e.g.
+    // Cloudflare namespaces) are checkpointed into tracked
+    // `edgezero.toml` and not lost -- THEN surface any error.
     if let Some(deployed_writeback) = outcome.deployed.as_ref() {
         let (canonical_adapter_key, _) = manifest
             .adapter_entry(&args.adapter)
@@ -310,6 +314,9 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
             adapter.deployed_fields(),
             args.dry_run,
         )?;
+    }
+    if let Some(err) = outcome.error {
+        return Err(err);
     }
     Ok(())
 }
@@ -450,6 +457,11 @@ where
                 adapter.deployed_fields(),
                 args.dry_run,
             )?;
+        }
+        // Checkpoint durable ids above, THEN surface a partial failure --
+        // same ordering as the base `run_provision`.
+        if let Some(err) = outcome.error {
+            return Err(err);
         }
         return Ok(());
     }
@@ -2706,6 +2718,28 @@ ids = ["default"]
     }
 
     #[test]
+    fn dry_run_status_lines_rewrite_staged_tempdir_paths_to_project_relative() {
+        // A status line naming the staged tempdir must be rewritten back
+        // to the project root so no staging path (e.g. `/var/folders/…`
+        // or `/tmp/…`) leaks into the report the CLI prints.
+        let project = Path::new("/home/dev/proj");
+        let staged = Path::new("/tmp/staging-xyz/proj");
+        let outcome = ProvisionOutcome::from_status_lines(vec![
+            "wrote /tmp/staging-xyz/proj/crates/spin/spin.toml".to_owned(),
+        ]);
+        let allow_list = DryRunAllowList { pairs: vec![] };
+        let report = render_dry_run_report(project, staged, &allow_list, &outcome);
+        assert!(
+            report.contains("would write /home/dev/proj/crates/spin/spin.toml"),
+            "staged path rewritten to project-relative: {report}"
+        );
+        assert!(
+            !report.contains("/tmp/staging-xyz"),
+            "no staged tempdir path may leak into the report: {report}"
+        );
+    }
+
+    #[test]
     fn dry_run_diff_covers_all_allowlist_paths() {
         // Table-driven: for each adapter, build a fixture where the
         // allow-listed files exist in the staged tree, then call
@@ -2912,28 +2946,17 @@ ids = ["default"]
         );
     }
 
-    // ---------- Section-5 lock-in: dry-run cleanliness against the real
-    // in-tree fixture, across every adapter. Ignored until Section 5's
-    // per-adapter local writers land (Tasks 17-28); today the adapters'
-    // Local-mode `provision` impls return
-    // `Err("local mode lands in Section 5")` before touching disk, so
-    // the assertions can't yet drive real behavior. This test defines
-    // the contract now so the eventual implementation doesn't drift.
-    //
-    // Contract A (worktree byte-identical after dry-run) is asserted
-    // via the existing `snapshot_dir` helper.
-    //
-    // Contract B (no tempdir path leakage into stdout) is left as a
-    // `TODO(section-5)` comment: the CLI uses `log::info!` for status
-    // lines, but `log::set_logger` is a process-wide one-shot and
-    // installing a capturing logger here would race the other tests
-    // that share the crate's default logger initialization. Adding a
-    // per-thread capture shim would require workspace-scope churn
-    // that this task explicitly declines. When Section 5 lands, a
-    // follow-up task can retrofit either a subprocess-based capture
-    // or a `tracing`-subscriber swap.
+    // Dry-run cleanliness against the real in-tree app-demo fixture,
+    // across every adapter: a local dry-run must SUCCEED and leave the
+    // worktree byte-identical -- it stages into a tempdir and only
+    // reports what it WOULD write. That no staged-tempdir path leaks
+    // into the reported status lines is covered directly by
+    // `render_dry_run_report`'s unit tests (the staged->project prefix
+    // swap); the CLI's `log::info!` output cannot be captured here
+    // because `log::set_logger` is a process-wide one-shot that would
+    // race the other tests sharing the crate's logger init.
     #[test]
-    fn provision_local_dry_run_worktree_clean_and_no_tempdir_paths_in_stdout() {
+    fn provision_local_dry_run_succeeds_and_leaves_worktree_byte_identical() {
         let _lock = manifest_guard().lock().expect("manifest guard");
 
         // Resolve the repo root from the crate's manifest dir:
@@ -2967,31 +2990,23 @@ ids = ["default"]
         for adapter in ["cloudflare", "fastly", "spin", "axum"] {
             let before = snapshot_dir_excluding(&app_demo_root, excluded);
 
-            // Ignore the Result — Contract A is the "was the worktree
-            // modified?" claim, and it holds regardless of whether the
-            // adapter's Local arm returned Ok or Err. Explicit type
-            // annotation quiets `let_underscore_untyped` /
-            // `let_underscore_must_use`.
-            let _result: Result<(), String> = run_provision(&ProvisionArgs {
+            // A local dry-run must succeed: it synthesises a baseline
+            // into a staging tempdir and reports what it WOULD write. An
+            // Err here means the dry-run path is broken, not merely that
+            // it declined to touch disk.
+            run_provision(&ProvisionArgs {
                 adapter: (*adapter).to_owned(),
                 dry_run: true,
                 local: true,
                 manifest: manifest_path.clone(),
-            });
+            })
+            .unwrap_or_else(|err| panic!("adapter {adapter}: local dry-run must succeed: {err}"));
 
             let after = snapshot_dir_excluding(&app_demo_root, excluded);
             assert_eq!(
                 before, after,
                 "adapter {adapter}: dry-run must leave the worktree byte-identical"
             );
-
-            // TODO(section-5): assert no tempdir path leakage in
-            // stdout via captured log. The `log::info!` output from
-            // `render_dry_run_report` should never contain
-            // `/var/folders/`, `/private/var/folders/`, or `/tmp/`
-            // — only project-relative paths under the manifest
-            // root. Capture strategy TBD (see the module comment
-            // above this test).
         }
     }
 

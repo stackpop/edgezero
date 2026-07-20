@@ -515,33 +515,30 @@ pub(super) fn write_fastly_local_config_store(
     entries: &[(String, String)],
 ) -> Result<(), String> {
     use std::io::ErrorKind;
-    use toml_edit::{DocumentMut, Item, Table, Value, table};
+    use toml_edit::{DocumentMut, Item, Value};
 
-    let raw = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
-    };
+    // `config push --local` OWNS only the `key = value` pairs INSIDE an
+    // already-provisioned contents table. Creating the `[local_server]`
+    // header, the `config_stores` table, the per-store block, and its
+    // `format` / empty `contents` sub-table is provision's job (see
+    // `upsert_local_config_store`). Fabricating any of that here would
+    // let a stray push mint a config store the manifest never
+    // provisioned -- possibly with the wrong shape -- so a missing store
+    // block is an error that points the operator at provision, not
+    // something push papers over.
+    let raw = fs::read_to_string(path).map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!(
+                "{}: not found; run `provision --adapter fastly --local` first to create the local config store, then re-run config push",
+                path.display()
+            )
+        } else {
+            format!("failed to read {}: {err}", path.display())
+        }
+    })?;
     let mut doc: DocumentMut = raw
         .parse()
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-
-    let local_server_entry = doc.entry("local_server").or_insert_with(table);
-    let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: `local_server` exists but is not a table; refusing to edit in place",
-            path.display()
-        )
-    })?;
-    let config_stores_entry = local_server_tbl
-        .entry("config_stores")
-        .or_insert_with(|| Item::Table(Table::new()));
-    let config_stores_tbl = config_stores_entry.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: `local_server.config_stores` exists but is not a table; refusing to edit in place",
-            path.display()
-        )
-    })?;
 
     // Upsert into the existing per-store contents table so a
     // `config push --key app_config_staging` does NOT wipe the
@@ -553,32 +550,21 @@ pub(super) fn write_fastly_local_config_store(
     // that applies WITHIN a key (old chunks for the same root
     // become unreferenced when a new chunk-set installs a new
     // pointer), NOT across sibling keys.)
-    let store_entry = config_stores_tbl.entry(platform_name).or_insert_with(|| {
-        let mut tbl = Table::new();
-        tbl.insert("format", toml_edit::value("inline-toml"));
-        tbl.insert("contents", Item::Table(Table::new()));
-        Item::Table(tbl)
-    });
-    let store_tbl = store_entry.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: `local_server.config_stores.{platform_name}` exists but is not a table; refusing to edit in place",
-            path.display()
-        )
-    })?;
-    // Ensure the `format` key is present even on a pre-existing
-    // entry that omitted it.
-    if !store_tbl.contains_key("format") {
-        store_tbl.insert("format", toml_edit::value("inline-toml"));
-    }
-    let contents_entry = store_tbl
-        .entry("contents")
-        .or_insert_with(|| Item::Table(Table::new()));
-    let contents_tbl = contents_entry.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: `local_server.config_stores.{platform_name}.contents` exists but is not a table; refusing to edit in place",
-            path.display()
-        )
-    })?;
+    let contents_tbl = doc
+        .get_mut("local_server")
+        .and_then(Item::as_table_mut)
+        .and_then(|tbl| tbl.get_mut("config_stores"))
+        .and_then(Item::as_table_mut)
+        .and_then(|tbl| tbl.get_mut(platform_name))
+        .and_then(Item::as_table_mut)
+        .and_then(|tbl| tbl.get_mut("contents"))
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            format!(
+                "{}: `[local_server.config_stores.{platform_name}.contents]` is missing or not a table; run `provision --adapter fastly --local` first to create the local config store, then re-run config push",
+                path.display()
+            )
+        })?;
     for (key, value) in entries {
         contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
     }
@@ -1628,13 +1614,26 @@ mod tests {
     //
     // The writer is exported from provision_local.rs (per the split
     // brief: local-server config-store writes are provision_local's
-    // territory). These four tests exercise the writer directly.
+    // territory). `config push --local` OWNS only the `key = value`
+    // pairs inside a contents table that provision already created --
+    // these tests seed that provisioned block first, then exercise the
+    // upsert, and verify push refuses to fabricate a missing block.
+
+    /// Write a `fastly.toml` whose head is `head` and that already
+    /// carries the provisioned `[local_server.config_stores.<platform>]`
+    /// block (with `format` + empty `contents`), exactly as
+    /// `provision --local` would leave it.
+    fn seed_provisioned_config_store(path: &Path, head: &str, platform: &str) {
+        let mut doc: toml_edit::DocumentMut = head.parse().expect("parse seed head");
+        upsert_local_config_store(&mut doc, platform).expect("seed provisioned store block");
+        fs::write(path, doc.to_string()).expect("write seed fastly.toml");
+    }
 
     #[test]
-    fn write_fastly_local_config_store_creates_inline_block_in_minimal_file() {
+    fn write_fastly_local_config_store_upserts_keys_into_provisioned_contents() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write");
+        seed_provisioned_config_store(&path, "name = \"demo\"\n", TEST_CONFIG_ID);
         let entries = vec![
             ("greeting".to_owned(), "hello".to_owned()),
             ("service.timeout_ms".to_owned(), "1500".to_owned()),
@@ -1664,10 +1663,10 @@ mod tests {
     }
 
     #[test]
-    fn write_fastly_local_config_store_replaces_existing_block_on_re_push() {
+    fn write_fastly_local_config_store_replaces_existing_key_on_re_push() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write");
+        seed_provisioned_config_store(&path, "name = \"demo\"\n", TEST_CONFIG_ID);
         write_fastly_local_config_store(
             &path,
             TEST_CONFIG_ID,
@@ -1692,7 +1691,7 @@ mod tests {
     fn write_fastly_local_config_store_preserves_unrelated_blocks() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        let original = "\
+        let head = "\
 [setup.kv_stores.sessions]
 
 [[local_server.kv_stores.sessions]]
@@ -1702,7 +1701,7 @@ data = \"\"
 [scripts]
 build = \"cargo build --release\"
 ";
-        fs::write(&path, original).expect("write");
+        seed_provisioned_config_store(&path, head, TEST_CONFIG_ID);
         write_fastly_local_config_store(
             &path,
             TEST_CONFIG_ID,
@@ -1719,29 +1718,51 @@ build = \"cargo build --release\"
             after.contains("build = \"cargo build --release\""),
             "scripts value kept: {after}"
         );
-        assert!(
-            after.contains(&format!(
-                "[local_server.config_stores.{TEST_CONFIG_ID}.contents]"
-            )),
-            "new config_stores block added: {after}"
-        );
+        assert!(after.contains("greeting = \"hi\""), "pushed key: {after}");
     }
 
     #[test]
-    fn write_fastly_local_config_store_creates_file_when_missing() {
+    fn write_fastly_local_config_store_errors_when_store_not_provisioned() {
+        // A `fastly.toml` that exists but has no provisioned store block
+        // must NOT be back-filled by push -- creating the block is
+        // provision's job. Push errors and points the operator there.
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        // No fs::write — file absent.
-        write_fastly_local_config_store(
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let err = write_fastly_local_config_store(
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
         )
-        .expect("write");
+        .expect_err("push must refuse to fabricate an unprovisioned store block");
+        assert!(
+            err.contains("provision --adapter fastly --local") && err.contains(TEST_CONFIG_ID),
+            "error points at provision and names the store: {err}"
+        );
+        // The file is left untouched.
         let after = fs::read_to_string(&path).expect("read back");
-        assert!(after.contains(&format!(
-            "[local_server.config_stores.{TEST_CONFIG_ID}.contents]"
-        )));
-        assert!(after.contains("greeting = \"hi\""));
+        assert_eq!(after, "name = \"demo\"\n", "push must not edit on refusal");
+    }
+
+    #[test]
+    fn write_fastly_local_config_store_errors_when_file_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // No fs::write — file absent.
+        let err = write_fastly_local_config_store(
+            &path,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+        )
+        .expect_err("push must not create fastly.toml from nothing");
+        assert!(
+            err.contains("provision --adapter fastly --local"),
+            "error points at provision: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "push must not create the file on refusal: {}",
+            path.display()
+        );
     }
 }
