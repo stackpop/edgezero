@@ -102,6 +102,17 @@ if [[ "$*" == *"--config"* ]]; then
   url=$(printf '%s\n' "$config" | sed -nE 's/^url = "(.*)"$/\1/p')
   if printf '%s\n' "$config" | grep -q '^request = "PUT"$'; then
     printf 'PUT %s\n' "$url" >>"$FAKE_CALL_LOG"
+    # Model reality: activating version N makes N the active version, so a later
+    # read (e.g. another rollback's staleness check) sees the mutation.
+    case "$url" in
+      */version/*/activate)
+        activated="${url##*/version/}"
+        activated="${activated%%/activate}"
+        if [ -n "${FAKE_ACTIVE_VERSION_FILE:-}" ]; then
+          printf '%s\n' "$activated" >"$FAKE_ACTIVE_VERSION_FILE"
+        fi
+        ;;
+    esac
     echo 200
     exit 0
   fi
@@ -113,7 +124,7 @@ if [[ "$*" == *"--config"* ]]; then
   # The service-version list. The ACTIVE version is read from a state file so the
   # smoke can model reality: it is 40 before the production deploy (rollback-target
   # capture), and a deploy (or a test step) updates it. The production-rollback
-  # compare-and-swap guard requires the active version to equal the `--version`
+  # best-effort staleness guard requires the active version to equal the `--version`
   # being rolled back from.
   if [[ "$url" == */version ]]; then
     active=$(cat "${FAKE_ACTIVE_VERSION_FILE:-/dev/null}" 2>/dev/null || true)

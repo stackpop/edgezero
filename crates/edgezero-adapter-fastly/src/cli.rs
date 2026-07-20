@@ -1991,10 +1991,15 @@ fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
     Ok(active_version)
 }
 
-/// Guard a production rollback: the version being rolled back FROM
-/// (`from_version`, the caller's `--version`) must still be the ACTIVE version.
-/// A rollback can run long after its deploy; if a newer version was activated
-/// since, activating the old target would clobber it — so refuse.
+/// Best-effort staleness guard for a production rollback: the version being
+/// rolled back FROM (`from_version`, the caller's `--version`) must still be the
+/// ACTIVE version. A rollback can run long after its deploy; if a newer version
+/// was activated since, activating the old target would clobber it — so refuse.
+///
+/// This narrows but does NOT close the race: the caller reads the active version
+/// and activates in two separate requests, and Fastly's activate endpoint has no
+/// precondition, so a deploy landing between them can still be clobbered.
+/// Service-scoped serialization is required to eliminate it.
 fn ensure_rollback_from_is_active(
     active: Option<u64>,
     from_version: u64,
@@ -2782,10 +2787,16 @@ fn rollback(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| {
                 "production rollback requires a valid --rollback-to version".to_owned()
             })?;
-        // Compare-and-swap guard: the version being rolled back FROM (`--version`)
-        // must STILL be the active version. A rollback workflow can run long after
-        // its deploy — if a newer version was activated meanwhile, activating the
-        // old target would silently clobber that newer deploy. Refuse instead.
+        // Best-effort staleness check: the version being rolled back FROM
+        // (`--version`) must STILL be the active version. A rollback workflow can
+        // run long after its deploy — if a newer version was activated meanwhile,
+        // activating the old target would clobber that newer deploy, so refuse.
+        //
+        // This is NOT atomic: Fastly's activate endpoint has no precondition, so
+        // a deploy that lands BETWEEN this read and the activate below can still
+        // be clobbered. It narrows the window (catching the common much-later
+        // rollback) but does not close it — serialise deploys and rollbacks per
+        // SERVICE (a service-scoped concurrency group) to eliminate the race.
         let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
         ensure_rollback_from_is_active(resolve_active_version(&json)?, version, &service_id)?;
         // Fastly's activate endpoint requires `PUT` (not `POST`).

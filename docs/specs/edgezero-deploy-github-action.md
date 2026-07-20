@@ -113,8 +113,8 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
    monorepo checkout layouts.
 6. Respect the application's `edgezero.toml` when present and support explicit
    `working-directory` and `manifest` selection.
-7. Accept typed provider credentials and expose them only to the provider
-   mutation step.
+7. Accept typed provider credentials and expose them only to the steps that call
+   the provider (the deploy and the Fastly lifecycle steps).
 8. Support JSON-array build and deploy passthrough arguments.
 9. Support opt-in, exact-key application `target/` caching.
 10. Produce actionable validation failures before deployment begins.
@@ -345,8 +345,8 @@ deployment-version surface, tracked with the other companion CLI changes.
 #### 5.4.2 Version output
 
 Because staging must thread a version from deploy → healthcheck → rollback, the
-Fastly path emits the service version. The app CLI prints it in a parseable form
-(e.g. a `version=<N>` line or `--output` file); `deploy-fastly` surfaces it as
+Fastly path emits the service version. The app CLI prints it as a canonical, anchored
+`version=<N>` line on stdout — the ONLY form the wrappers parse; `deploy-fastly` surfaces it as
 the `fastly-version` output. This is the one **provider-specific** output; the
 generic engine still exposes no deployment version.
 
@@ -945,7 +945,8 @@ Fastly wrapper:
 - build-mode resolution and build-failure-prevents-deploy;
 - deploy exit-code propagation;
 - credential presence validation and scoping (absent from build-app-cli/setup/build,
-  present only in deploy);
+  present only in the provider-calling steps: deploy and the Fastly lifecycle
+  steps such as rollback-target capture);
 - cache key construction and missing-lockfile failure;
 - staging lifecycle: `stage` flag adds `--stage`; `fastly-version` parsed from CLI
   output; `healthcheck-fastly` / `rollback-fastly` pass `--service-id` + version

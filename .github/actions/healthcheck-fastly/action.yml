@@ -26,7 +26,7 @@ inputs:
     required: false
     default: production
   retry:
-    description: Total number of probe ATTEMPTS (not additional retries); e.g. 3 means at most 3 probes.
+    description: Total number of probe ATTEMPTS (not additional retries); e.g. 3 means at most 3 probes. Must be >= 1.
     required: false
     default: "3"
   retry-delay:

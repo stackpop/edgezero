@@ -35,7 +35,9 @@ validate_inputs() {
   require_input_matching fastly-version "${EDGEZERO__LIFECYCLE__VERSION:-}" '^[0-9]+$'
   require_input_matching domain "${EDGEZERO__LIFECYCLE__DOMAIN:-}" '^[A-Za-z0-9._-]+$'
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
-  require_input_matching retry "${EDGEZERO__LIFECYCLE__RETRY:-}" '^[0-9]+$'
+  # `retry` is a TOTAL attempt count, so 0 is meaningless (the CLI would silently
+  # clamp it to 1). Require at least one attempt rather than accept-and-coerce.
+  require_input_matching retry "${EDGEZERO__LIFECYCLE__RETRY:-}" '^[1-9][0-9]*$'
   require_input_matching retry-delay "${EDGEZERO__LIFECYCLE__RETRY_DELAY:-}" '^[0-9]+$'
   require_input_matching timeout "${EDGEZERO__LIFECYCLE__TIMEOUT:-}" '^[0-9]+$'
   # A typo in deploy-to must never silently probe production.

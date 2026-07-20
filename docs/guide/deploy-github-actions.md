@@ -375,13 +375,26 @@ trusted, immutable refs.
 
 ## Recommended job hardening
 
+Serialize on the **Fastly service**, not the ref. Every deploy and rollback for a
+service mutates the same live resource, so a service-scoped group is what
+actually prevents two workflows (or two refs) from racing each other:
+
 ```yaml
 permissions:
   contents: read
 concurrency:
-  group: deploy-${{ github.ref }}
+  # Service-scoped: all deploys AND rollbacks for this service run one at a time.
+  group: fastly-${{ vars.FASTLY_SERVICE_ID }}
   cancel-in-progress: false
 ```
+
+**Why this matters for rollback.** A production rollback checks that the version
+it is rolling back _from_ is still the active one and refuses otherwise, so a
+stale rollback will not clobber a much newer deploy. That check is **best-effort,
+not atomic**: Fastly's activate endpoint takes no precondition, so a deploy that
+lands in the window between the check and the activation can still be
+overwritten. Service-scoped serialization is what closes that window — the guard
+only narrows it.
 
 Add `timeout-minutes`, a protected GitHub Environment with required reviewers,
 and pin third-party actions to readable released tags (or full SHAs for

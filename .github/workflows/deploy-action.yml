@@ -357,7 +357,7 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           deploy-to: production
           # The fake Fastly API reports version 40 as active, and the
-          # compare-and-swap guard requires the rolled-back-from `--version` to
+          # best-effort staleness guard requires the rolled-back-from `--version` to
           # still be active — so roll back FROM 40 TO 39. Fastly cannot infer the
           # previous version, so `rollback-to` is explicit (a real caller wires
           # deploy-fastly's `previous-version`; the composite-smoke proves that).
@@ -391,4 +391,28 @@ jobs:
         run: |
           [[ "${EDGEZERO__TEST__OUTCOME}" == "failure" ]] ||
             { echo "::error::a production rollback with no rollback-to must fail, got '${EDGEZERO__TEST__OUTCOME}'"; exit 1; }
+
+      # A STALE rollback — one whose rolled-back-from version is no longer active
+      # because a newer deploy landed — must be refused BEFORE it mutates anything.
+      - name: Simulate a newer deploy becoming active
+        run: printf '99\n' >"$FAKE_ACTIVE_VERSION_FILE"
+
+      - name: Stale production rollback must be refused
+        id: stale-rollback
+        continue-on-error: true
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: production
+          # 40 is no longer active (99 is), so this rollback is stale.
+          fastly-version: "40"
+          rollback-to: "38"
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+
+      - name: Assert the stale rollback was refused and activated nothing
+        env:
+          EDGEZERO__TEST__OUTCOME: ${{ steps.stale-rollback.outcome }}
+          EDGEZERO__TEST__ROLLBACK_TO: "38"
+        run: .github/actions/deploy-core/tests/assert-stale-rollback-refused.sh
           echo "targetless production rollback correctly refused"

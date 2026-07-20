@@ -24,7 +24,7 @@ main() {
   local rolled_back_to="${EDGEZERO__TEST__ROLLED_BACK_TO:-}"
   local api='https://api\.fastly\.com/service/dummy-service'
   # The EXPLICIT rollback-to the smoke passes to the production rollback (it rolls
-  # back FROM the active version 40 TO 39; the compare-and-swap guard requires the
+  # back FROM the active version 40 TO 39; the best-effort staleness guard requires the
   # rolled-back-from version to still be active).
   local target=39
 

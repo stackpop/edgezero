@@ -1178,6 +1178,10 @@ CLI
   # not be mistaken for a first deploy.
   FS=1 FE=0 assert_fails "capture fails closed on a silent exit-zero CLI" run_capture
 
+  # A MALFORMED value (a `version=` line that isn't empty and isn't all digits)
+  # must fail closed, not be silently dropped to an empty first-deploy target.
+  FVL='version=12abc' FE=0 assert_fails "capture fails closed on a malformed version value" run_capture
+
   # A CLI without `active-version` fails the credential-free preflight early.
   printf '#!/usr/bin/env bash\nexit 2\n' >"$dir/bin/fake-cli"
   chmod +x "$dir/bin/fake-cli"
