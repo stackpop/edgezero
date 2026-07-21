@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::ChildStdin;
 use std::process::Command;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2278,17 +2279,16 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
                 format!("failed to spawn `fastly`: {err}")
             }
         })?;
-    // Move stdin OUT of child via `take` so the ChildStdin drops at
-    // end of scope — that closes the pipe and lets the CLI see EOF.
+    // Take stdin OUT of the child and hand it to a helper that writes the value
+    // and drops the handle on return — closing the pipe so the CLI sees EOF.
+    // Dropping on scope-exit rather than via an explicit `drop()` keeps this
+    // valid on targets where `ChildStdin` is a non-Drop stub.
     // `child.wait_with_output()` then consumes child cleanly.
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
-    stdin
-        .write_all(value.as_bytes())
-        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))?;
-    drop(stdin);
+    write_value_to_fastly_stdin(stdin, value)?;
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `fastly`: {err}"))?;
@@ -2300,6 +2300,17 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
         output.status,
         redact_stderr(&String::from_utf8_lossy(&output.stderr))
     ))
+}
+
+/// Write `value` to the child's stdin, then drop the handle as it falls out of
+/// scope on return — closing the pipe so the `fastly` CLI sees EOF. Taking
+/// `stdin` by value gives a natural scope-end drop rather than an explicit
+/// `drop()`, which also keeps this valid on targets where `ChildStdin` is a
+/// non-Drop stub.
+fn write_value_to_fastly_stdin(mut stdin: ChildStdin, value: &str) -> Result<(), String> {
+    stdin
+        .write_all(value.as_bytes())
+        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))
 }
 
 fn delete_config_store_entry(store_id: &str, key: &str) -> Result<(), String> {
@@ -3964,7 +3975,6 @@ build = \"cargo build --release\"
     // ---------- chunked push integration tests ----------
 
     /// Build a valid `BlobEnvelope` JSON string of approximately `target_len` bytes.
-    #[cfg(unix)]
     fn make_test_envelope(target_len: usize) -> String {
         use edgezero_core::blob_envelope::BlobEnvelope;
         use serde_json::json;
