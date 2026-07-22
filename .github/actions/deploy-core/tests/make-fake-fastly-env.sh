@@ -96,18 +96,60 @@ write_fake_curl() {
   local path="$1"
   cat >"$path" <<'SHIM'
 #!/usr/bin/env bash
+# The versions this fake service has. The ACTIVE one is tracked separately (in
+# FAKE_ACTIVE_VERSION_FILE) and is always considered to exist.
+FAKE_KNOWN_VERSIONS="1 38 39 40 41 42"
+
+fake_active_version() {
+  local active
+  active=$(cat "${FAKE_ACTIVE_VERSION_FILE:-/dev/null}" 2>/dev/null || true)
+  printf '%s' "${active:-40}"
+}
+
+fake_version_exists() {
+  local want="$1" active
+  active=$(fake_active_version)
+  case " $FAKE_KNOWN_VERSIONS $active " in
+    *" $want "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Render the version list the Fastly API would return: every known version, with
+# `active: true` on exactly the current one.
+fake_version_list_json() {
+  local active out="" sep="" n flag
+  active=$(fake_active_version)
+  local all="$FAKE_KNOWN_VERSIONS"
+  case " $all " in *" $active "*) ;; *) all="$all $active" ;; esac
+  for n in $all; do
+    if [ "$n" = "$active" ]; then flag=true; else flag=false; fi
+    out="$out$sep{\"number\":$n,\"active\":$flag}"
+    sep=","
+  done
+  printf '[%s]' "$out"
+}
+
 # Two shapes: a Fastly API call via `--config -` (config on stdin), or a probe.
 if [[ "$*" == *"--config"* ]]; then
   config=$(cat)
   url=$(printf '%s\n' "$config" | sed -nE 's/^url = "(.*)"$/\1/p')
   if printf '%s\n' "$config" | grep -q '^request = "PUT"$'; then
     printf 'PUT %s\n' "$url" >>"$FAKE_CALL_LOG"
-    # Model reality: activating version N makes N the active version, so a later
-    # read (e.g. another rollback's staleness check) sees the mutation.
     case "$url" in
       */version/*/activate)
         activated="${url##*/version/}"
         activated="${activated%%/activate}"
+        # A real API rejects activating a version the service does not have, so
+        # the fixture must too — otherwise a smoke could "succeed" against a
+        # version that never existed.
+        if ! fake_version_exists "$activated"; then
+          printf 'PUT-REJECTED %s (no such version)\n' "$url" >>"$FAKE_CALL_LOG"
+          echo 404
+          exit 0
+        fi
+        # Model reality: activating version N makes N the active version, so a
+        # later read (e.g. another rollback's staleness check) sees the mutation.
         if [ -n "${FAKE_ACTIVE_VERSION_FILE:-}" ]; then
           printf '%s\n' "$activated" >"$FAKE_ACTIVE_VERSION_FILE"
         fi
@@ -125,11 +167,10 @@ if [[ "$*" == *"--config"* ]]; then
   # smoke can model reality: it is 40 before the production deploy (rollback-target
   # capture), and a deploy (or a test step) updates it. The production-rollback
   # best-effort staleness guard requires the active version to equal the `--version`
-  # being rolled back from.
+  # being rolled back from. Every version the fixture may activate is listed, so a
+  # rollback target is a version the service actually has.
   if [[ "$url" == */version ]]; then
-    active=$(cat "${FAKE_ACTIVE_VERSION_FILE:-/dev/null}" 2>/dev/null || true)
-    active="${active:-40}"
-    printf '[{"number":1,"active":false},{"number":%s,"active":true}]\n200' "$active"
+    printf '%s\n200' "$(fake_version_list_json)"
     exit 0
   fi
   # Domain lookup: Fastly returns a SINGULAR `staging_ip` string per domain.
@@ -137,6 +178,11 @@ if [[ "$*" == *"--config"* ]]; then
   exit 0
 fi
 printf 'PROBE %s\n' "$*" >>"$FAKE_CALL_LOG"
+# Record whether a provider token was in scope for this probe. A PRODUCTION
+# healthcheck just curls the public domain and must receive NO token, even when
+# one is inherited from the job env; a staging probe needs one (staging-IP
+# resolution). The assertions read this back.
+printf 'PROBE-TOKEN=%s\n' "${FASTLY_API_TOKEN:+set}" >>"$FAKE_CALL_LOG"
 if [[ -n "${FORCE_UNHEALTHY:-}" ]]; then
   echo 503
 else

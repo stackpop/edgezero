@@ -109,6 +109,30 @@ sanitize_ref() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.=-' '-'
 }
 
+# Unset the provider credential aliases named in a JSON array, so no provider
+# token is in scope when APP-CONTROLLED commands run (cargo metadata, cargo
+# build, and the built CLI's `--help`).
+#
+# Provider-NEUTRAL by construction: the NAMES come from the caller (the action's
+# `provider-env-clear` input), so this layer hard-codes no provider. Names must be
+# shell identifiers; anything else is a configuration error rather than a silent
+# no-op. Unsetting here covers this process and every child it spawns.
+clear_provider_env_aliases() {
+  local json="${1:-[]}"
+  [[ -n "$json" ]] || return 0
+  require_cmd jq
+  local names
+  names=$(printf '%s' "$json" | jq -r '.[]? // empty') ||
+    fail "input 'provider-env-clear' must be a JSON array of environment variable names; got: $json"
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+      fail "input 'provider-env-clear' contains an invalid environment variable name: '$name'"
+    unset "$name"
+  done <<<"$names"
+}
+
 # Reject an artifact name that could escape the action-owned staging directory
 # when used as a path component: no separators, no traversal, no leading dot,
 # only a conservative character set.

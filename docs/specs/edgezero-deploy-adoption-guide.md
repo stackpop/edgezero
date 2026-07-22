@@ -253,9 +253,11 @@ Workflow shape:
    `working-directory: trusted-server`, typed Fastly credentials, and optional
    `deploy-args: ["--comment", …]`; capture `fastly-version` and, for a
    production deploy, `previous-version` (the rollback target);
-5. run `healthcheck-fastly` with the CLI artifact, typed Fastly credentials
-   (`fastly-api-token`, `fastly-service-id`), `deploy-to`, `domain`, and the
-   captured `fastly-version`;
+5. run `healthcheck-fastly` with the CLI artifact, `fastly-service-id`,
+   `deploy-to`, `domain`, and the captured `fastly-version`. Pass
+   `fastly-api-token` ONLY for `deploy-to: staging` (it resolves the staged
+   version's IP); a production probe curls the public domain and needs no token,
+   so omitting it avoids exposing a production secret;
 6. on failure, run `rollback-fastly` with the CLI artifact, typed Fastly
    credentials (`fastly-api-token`, `fastly-service-id`), the same `deploy-to` /
    `fastly-version`, and — for a **production** rollback — `rollback-to` set to

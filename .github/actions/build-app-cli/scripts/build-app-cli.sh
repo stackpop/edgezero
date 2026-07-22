@@ -139,6 +139,11 @@ require_linux_x86_64() {
 }
 
 main() {
+  # FIRST: drop every caller-named provider credential alias. Everything below
+  # runs APP-CONTROLLED code (cargo metadata, cargo build, the built CLI's
+  # `--help`), which must never see a provider token.
+  clear_provider_env_aliases "${EDGEZERO__PROVIDER__ENV_CLEAR:-[]}"
+
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"
   local cli_package="${EDGEZERO__APP__CLI__PACKAGE:?input 'app-cli-package' is required}"

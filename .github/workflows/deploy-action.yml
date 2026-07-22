@@ -256,10 +256,13 @@ jobs:
   # assert-*.sh scripts for what each one regression-tests.
   lifecycle-smoke:
     runs-on: ubuntu-24.04
-    # Inherited provider aliases that every step MUST clear.
+    # Inherited provider aliases that every step MUST clear. FASTLY_API_TOKEN is
+    # here on purpose: a PRODUCTION healthcheck must probe with no token even when
+    # the job env carries one.
     env:
       FASTLY_ENDPOINT: https://inherited.invalid
       FASTLY_HOME: /nonexistent/inherited
+      FASTLY_API_TOKEN: inherited-must-not-reach-production-probes
     steps:
       - uses: actions/checkout@v4
         with:
@@ -340,6 +343,52 @@ jobs:
           EDGEZERO__TEST__HEALTHY: ${{ steps.unhealthy.outputs.healthy }}
           EDGEZERO__TEST__STATUS_CODE: ${{ steps.unhealthy.outputs['status-code'] }}
         run: .github/actions/deploy-core/tests/assert-unhealthy-failed.sh
+
+      # A PRODUCTION probe needs no credential — it just curls the public domain.
+      # The job env carries an inherited FASTLY_API_TOKEN, so this proves the
+      # wrapper withholds it rather than merely not requiring it.
+      - name: Snapshot the call log before the production probe
+        run: printf 'PROD_PROBE_SNAPSHOT=%s\n' "$(wc -l <"$FAKE_CALL_LOG")" >>"$GITHUB_ENV"
+
+      - name: Production health check (no token supplied)
+        id: prod-health
+        uses: ./.github/actions/healthcheck-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: production
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-service-id: dummy-service
+          retry: "1"
+          retry-delay: "1"
+
+      - name: Assert the production probe ran without any provider token
+        env:
+          EDGEZERO__TEST__LOG_SNAPSHOT: ${{ env.PROD_PROBE_SNAPSHOT }}
+          EDGEZERO__TEST__HEALTHY: ${{ steps.prod-health.outputs.healthy }}
+        run: .github/actions/deploy-core/tests/assert-production-probe-tokenless.sh
+
+      # A STAGING probe genuinely needs the token (staging-IP resolution), so
+      # omitting it must fail fast rather than probe the wrong thing.
+      - name: Staging health check without a token must fail
+        id: staging-no-token
+        continue-on-error: true
+        uses: ./.github/actions/healthcheck-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-service-id: dummy-service
+          retry: "1"
+          retry-delay: "1"
+
+      - name: Assert the tokenless staging check was refused
+        env:
+          EDGEZERO__TEST__OUTCOME: ${{ steps.staging-no-token.outcome }}
+        run: |
+          [[ "${EDGEZERO__TEST__OUTCOME}" == "failure" ]] ||
+            { echo "::error::a staging healthcheck with no token must fail, got '${EDGEZERO__TEST__OUTCOME}'"; exit 1; }
 
       - name: Roll back the staged version
         uses: ./.github/actions/rollback-fastly

@@ -246,7 +246,9 @@ as its own step, whenever config should move.
 | `deploy-to`         | No       | `production`    | `staging` writes the `<logical-store-id>_staging` variant in the **same** store.                                    |
 
 Outputs: `pushed-key` (the key written — the base key, or the derived `_staging`
-variant) and `store` (the logical store id, when supplied).
+variant) and `store` (the logical store id the CLI **resolved** — always emitted,
+not only when the `store` input was supplied). Your app CLI must print both
+`pushed-key=` and `pushed-store=`; the action fails if either is missing.
 
 **Staging config is the same store, a different key.** Fastly config stores are
 not versioned like staged service versions, so `deploy-to: staging` writes your

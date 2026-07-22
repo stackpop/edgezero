@@ -148,7 +148,8 @@ reference to port from. Most transfer with light changes:
 
 4. **Fastly staging lifecycle actions (§5.4)**
    - `healthcheck-fastly`: thin wrapper — inputs `app-cli-artifact`, `app-cli-bin`,
-     `fastly-api-token`, `fastly-service-id`, `fastly-version`, `domain`,
+     `fastly-api-token` (STAGING only — a production probe needs no token and is
+     passed none), `fastly-service-id`, `fastly-version`, `domain`,
      `deploy-to` (`production`/`staging`), retry/timeout; runs
      `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
      `FASTLY_API_TOKEN` in the step env; outputs `healthy`, `status-code`.
@@ -175,9 +176,12 @@ reference to port from. Most transfer with light changes:
      Mirror the derivation in `config diff` so a staged diff compares against the
      staged key. Colocated tests: production key unchanged, `--staging` derives
      `<logical>_staging`, explicit `--key` + `--staging` is refused.
-   - CLI canonical line: after a successful non-dry-run write, `config.rs` emits
-     `pushed-key=<key>` (via `log::info!`, which the CLI routes to stdout) so the
-     wrapper can thread the written key out as an output.
+   - CLI canonical lines: after a successful non-dry-run write, `config.rs` emits
+     BOTH `pushed-key=<key>` and `pushed-store=<id>` (via `log::info!`, which the
+     CLI routes to stdout) so the wrapper can thread them out as outputs. The
+     wrapper REQUIRES both — it fails after the provider mutation if either is
+     missing — so a downstream CLI must emit both, and `pushed-store` is the
+     CLI-RESOLVED store (always emitted, not only when `--store` was supplied).
    - `config-push-fastly` wrapper: a **thin** composite mirroring
      `healthcheck-fastly` / `rollback-fastly` (not the heavy `deploy` path).
      Inputs `app-cli-artifact`, `app-cli-bin`, `fastly-api-token`,

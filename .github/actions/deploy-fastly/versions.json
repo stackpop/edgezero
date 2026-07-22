@@ -2,8 +2,8 @@
   "fastly": {
     "version": "15.1.0",
     "linux_amd64": {
-      "url": "https://github.com/fastly/cli/releases/download/v15.1.0/fastly_v15.1.0_linux-amd64.tar.gz",
-      "sha256": "3ba3d8a739b7a88d0a612825a9755d735efb87a9b02ea67e53a11b96d178d500"
+      "url": "file:///var/folders/yb/0xyfpf2162lf4p4zz6hpzfnm0000gn/T/tmp.CncS4sAJBv/edgezero-action-tools/downloads/fastly-15.1.0-linux-amd64.tar.gz",
+      "sha256": "3c0d532af9a5e3d22444849fe7e93927efbb4f2c450fd52d8ef757847350b303"
     }
   },
   "rust_target": "wasm32-wasip1"

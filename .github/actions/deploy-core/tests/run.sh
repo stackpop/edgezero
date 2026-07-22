@@ -591,6 +591,47 @@ test_lifecycle_helpers() {
 # ---------------------------------------------------------------------------
 # build-app-cli.sh — the toolchain search must not cross the app's Git boundary
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# clear_provider_env_aliases — build-app-cli runs APP-CONTROLLED code (cargo
+# build, the built CLI's --help), so every caller-named provider credential must
+# be unset first. The names come from the input, so the helper is provider-neutral.
+# ---------------------------------------------------------------------------
+test_clear_provider_env_aliases() {
+  section "clear_provider_env_aliases"
+  local lib="$ACTIONS_DIR/build-app-cli/scripts/common.sh"
+
+  # Named aliases are unset; unrelated vars survive.
+  local out
+  out=$(
+    FASTLY_API_TOKEN=secret CLOUDFLARE_API_TOKEN=secret2 KEEP_ME=kept \
+      bash -c "source '$lib'
+        clear_provider_env_aliases '[\"FASTLY_API_TOKEN\",\"CLOUDFLARE_API_TOKEN\"]'
+        printf 'fastly=[%s] cloudflare=[%s] keep=[%s]' \
+          \"\${FASTLY_API_TOKEN-unset}\" \"\${CLOUDFLARE_API_TOKEN-unset}\" \"\${KEEP_ME-unset}\""
+  )
+  assert_equals "named provider aliases are unset, unrelated vars survive" \
+    "fastly=[unset] cloudflare=[unset] keep=[kept]" "$out"
+
+  # A provider this layer knows nothing about is cleared purely because the
+  # caller named it — proving no provider is hard-coded here.
+  out=$(
+    ACME_DEPLOY_TOKEN=secret bash -c "source '$lib'
+      clear_provider_env_aliases '[\"ACME_DEPLOY_TOKEN\"]'
+      printf '%s' \"\${ACME_DEPLOY_TOKEN-unset}\""
+  )
+  assert_equals "an arbitrary caller-named alias is cleared (provider-neutral)" "unset" "$out"
+
+  # A malformed name is a configuration error, not a silent no-op.
+  assert_fails "an invalid environment variable name is rejected" \
+    bash -c "source '$lib'; clear_provider_env_aliases '[\"not a name\"]'"
+  assert_fails "a non-array value is rejected" \
+    bash -c "source '$lib'; clear_provider_env_aliases 'not-json'"
+
+  # An empty list is a no-op, not an error.
+  assert_succeeds "an empty list is a no-op" \
+    bash -c "source '$lib'; clear_provider_env_aliases '[]'"
+}
+
 test_toolchain_boundary() {
   section "toolchain search boundary"
   # The adoption guide's layout: a deployer repo at github.workspace, with the
@@ -1217,6 +1258,7 @@ main() {
   test_provider_env_nul
   test_lifecycle_helpers
   test_capture_previous
+  test_clear_provider_env_aliases
   test_toolchain_boundary
   test_config_push_argv
   test_exit_propagation

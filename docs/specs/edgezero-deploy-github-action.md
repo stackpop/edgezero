@@ -338,7 +338,10 @@ The capability is scaffolded into the CLI, not reproduced in action shell:
 | `<cli> rollback --adapter fastly --service-id <id> --version <v> [--rollback-to <p>] [--staging]` | Production: activate `<p>` on `<id>` (required — Fastly cannot infer the previous version). Staging: deactivate the staged `<v>` on `<id>`.                         |
 
 Every Fastly subcommand takes `--service-id <id>` (the service the operation
-targets) and reads `FASTLY_API_TOKEN` from the environment. The app CLI (built by
+targets). All of them read `FASTLY_API_TOKEN` from the environment EXCEPT a
+PRODUCTION `healthcheck`, which only curls the public domain — it needs no token,
+so the wrapper passes none (only `--staging`, which resolves the staging IP via
+the API, requires one). The app CLI (built by
 `build-app-cli`) exposes these subcommands the same way it exposes `deploy`/`config`.
 The downstream CLI template gains `Healthcheck` and `Rollback` arms and a
 deployment-version surface, tracked with the other companion CLI changes.
@@ -901,7 +904,8 @@ actions never construct error messages containing credentials.
 14. Disable caching by default; use exact keys only when enabled.
 15. Do not auto-retry provider DEPLOYMENT (a deploy mutation runs at most once).
     Retries are confined to idempotent operations: installer downloads and the
-    read-only staging healthcheck probe (`retry` attempts).
+    read-only healthcheck probe (`retry` attempts, for BOTH production and
+    staging probes — they share one retry loop).
 16. Do not use `github.token` for provider authentication.
 17. Document least-privilege workflow permissions (`contents: read` unless the
     caller needs more) and caller-owned environment protection, concurrency, and

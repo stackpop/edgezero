@@ -42,7 +42,7 @@ outputs:
     description: The key that was written (the base key, or the derived _staging variant).
     value: ${{ steps.push.outputs['pushed-key'] }}
   store:
-    description: The logical config-store id, when supplied.
+    description: The logical config-store id the CLI resolved (always emitted, not only when the `store` input was supplied).
     value: ${{ steps.push.outputs.store }}
 
 runs:
