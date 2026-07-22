@@ -596,6 +596,34 @@ test_lifecycle_helpers() {
 # build, the built CLI's --help), so every caller-named provider credential must
 # be unset first. The names come from the input, so the helper is provider-neutral.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# versions.json must pin an OFFICIAL release. make-fake-fastly-env.sh repoints
+# this file at a local fake archive (that is how the smoke exercises the real
+# download+verify path), so running it locally dirties a tracked file. If such an
+# override were ever committed, the real installer would try to fetch from a
+# machine-local path — this guard fails fast instead.
+# ---------------------------------------------------------------------------
+test_versions_json_pins_official_release() {
+  section "versions.json pins an official release"
+  local vj="$ACTIONS_DIR/deploy-fastly/versions.json"
+  local url verdict
+  url=$(jq -r '.fastly.linux_amd64.url' "$vj")
+  case "$url" in
+    https://github.com/fastly/cli/releases/download/*) verdict=official ;;
+    *) verdict="$url" ;;
+  esac
+  assert_equals "versions.json pins an official https release URL (never a local file:// override)" \
+    "official" "$verdict"
+
+  local sha
+  sha=$(jq -r '.fastly.linux_amd64.sha256' "$vj")
+  case "$sha" in
+    [0-9a-f]*) verdict=$([ ${#sha} -eq 64 ] && echo sha256 || echo "$sha") ;;
+    *) verdict="$sha" ;;
+  esac
+  assert_equals "versions.json pins a 64-hex SHA-256" "sha256" "$verdict"
+}
+
 test_clear_provider_env_aliases() {
   section "clear_provider_env_aliases"
   local lib="$ACTIONS_DIR/build-app-cli/scripts/common.sh"
@@ -1258,6 +1286,7 @@ main() {
   test_provider_env_nul
   test_lifecycle_helpers
   test_capture_previous
+  test_versions_json_pins_official_release
   test_clear_provider_env_aliases
   test_toolchain_boundary
   test_config_push_argv
