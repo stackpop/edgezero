@@ -864,7 +864,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::shared_test_guards::path_mutation_guard;
-    use edgezero_core::app_config::app_name_prefix;
+    use edgezero_core::app_config::{AppConfigMeta, SecretField, app_name_prefix};
     use edgezero_core::test_env::PathPrepend as PathOverride;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1811,10 +1811,41 @@ mod tests {
         project_dir.join("crates/demo-app-adapter-fastly")
     }
 
+    /// Mirrors the scaffolded `<Name>Config` struct so the clean-clone
+    /// regeneration below can drive the TYPED provision entry point --
+    /// the one a generated `<app>-cli` actually calls. Fields match
+    /// `templates/app/name.toml.hbs`; `#[secret] api_token` ships
+    /// commented out in the scaffold, so there are no secret fields.
+    #[derive(Debug, serde::Deserialize, serde::Serialize, validator::Validate)]
+    #[serde(deny_unknown_fields)]
+    struct ScaffoldConfig {
+        #[validate(length(min = 1_u64))]
+        greeting: String,
+        service: ScaffoldServiceConfig,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize, validator::Validate)]
+    #[serde(deny_unknown_fields)]
+    struct ScaffoldServiceConfig {
+        timeout_ms: u64,
+    }
+
+    impl AppConfigMeta for ScaffoldConfig {
+        fn secret_fields() -> Vec<SecretField> {
+            Vec::new()
+        }
+    }
+
     /// For each provision-generated adapter manifest, snapshot the
     /// scaffold-time bytes, delete the file, re-run
     /// `provision --adapter <id> --local`, and assert the bytes
     /// come back byte-identical.
+    ///
+    /// Drives the TYPED entry point (`run_provision_typed`), which is
+    /// what a generated `<app>-cli` invokes -- the untyped path skips
+    /// the app-config load, typed validation, and `provision_typed`
+    /// dispatch, so using it here would leave the generated project's
+    /// real provisioning flow untested from clean-clone state.
     fn assert_regenerated_manifests_match_baseline(project_dir: &Path) {
         let manifest_path = project_dir.join("edgezero.toml");
 
@@ -1854,8 +1885,8 @@ mod tests {
             prov_args.local = true;
             prov_args.dry_run = false;
             prov_args.manifest.clone_from(&manifest_path);
-            crate::run_provision(&prov_args).unwrap_or_else(|err| {
-                panic!("regenerate provision for `{adapter_id}` failed: {err}")
+            crate::run_provision_typed::<ScaffoldConfig>(&prov_args).unwrap_or_else(|err| {
+                panic!("typed regenerate provision for `{adapter_id}` failed: {err}")
             });
 
             for (full, baseline) in &baselines {

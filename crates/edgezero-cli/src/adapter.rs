@@ -233,17 +233,18 @@ pub(crate) fn execute_with_env_overlay(
             build_child_env(adapter_name, None, (None, None), env_overlay)?,
         ),
     };
-    // The manifest-declared, root-resolved `[adapters.<name>.adapter].manifest`.
-    // Passing it stops the adapter from rediscovering (and possibly
-    // mis-selecting, or symlink-escaping) its per-platform manifest by
-    // scanning the workspace.
-    let adapter_manifest_abs: Option<PathBuf> = manifest_loader.and_then(|loader| {
-        let manifest = loader.manifest();
-        let (_canonical, cfg) = manifest.adapter_entry(adapter_name)?;
-        let rel = cfg.adapter.manifest.as_deref()?;
-        let root = manifest.root().unwrap_or_else(|| Path::new("."));
-        Some(root.join(rel))
-    });
+    // The manifest-declared, root-resolved
+    // `[adapters.<name>.adapter].manifest` / `.crate`. Passing them stops
+    // the adapter from rediscovering (and possibly mis-selecting, or
+    // symlink-escaping) its per-platform manifest by scanning the
+    // workspace, and tells it where `Cargo.toml` actually lives.
+    //
+    // `.manifest` is REQUIRED whenever a manifest is loaded and declares
+    // this adapter: without it every adapter falls back to a recursive,
+    // symlink-following workspace scan that can select an unrelated or
+    // out-of-tree project. Refuse the dispatch instead of discovering.
+    let (adapter_manifest_abs, adapter_crate_abs) =
+        resolve_declared_adapter_paths(manifest_loader, adapter_name)?;
     let mut ctx = AdapterExecContext::new().with_env(&child_env);
     if let Some(root) = cwd {
         ctx = ctx.with_cwd(root);
@@ -251,7 +252,53 @@ pub(crate) fn execute_with_env_overlay(
     if let Some(manifest_abs) = adapter_manifest_abs.as_deref() {
         ctx = ctx.with_adapter_manifest(manifest_abs);
     }
+    if let Some(crate_abs) = adapter_crate_abs.as_deref() {
+        ctx = ctx.with_adapter_crate(crate_abs);
+    }
     adapter.execute(AdapterAction::from(action), adapter_args, &ctx)
+}
+
+/// Resolve the declared, project-root-resolved
+/// `[adapters.<name>.adapter]` `manifest` / `crate` paths for the
+/// registry-fallback dispatch.
+///
+/// `.manifest` is REQUIRED whenever a manifest is loaded and declares
+/// this adapter: without it the adapter falls back to a recursive,
+/// symlink-following workspace scan that can select an unrelated or
+/// out-of-tree project. `.crate` is optional here — adapters fall back
+/// to the manifest's parent — but is passed through so a nested manifest
+/// still resolves the right `Cargo.toml`.
+///
+/// Returns `(None, None)` when no manifest is loaded or the adapter
+/// isn't declared in it: the adapter then runs standalone and its own
+/// discovery is the only thing available.
+#[cfg(feature = "cli")]
+fn resolve_declared_adapter_paths(
+    manifest_loader: Option<&ManifestLoader>,
+    adapter_name: &str,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    let Some((declared_root, cfg)) = manifest_loader.and_then(|loader| {
+        let manifest = loader.manifest();
+        manifest
+            .adapter_entry(adapter_name)
+            .map(|(_canonical, cfg)| (manifest.root(), cfg))
+    }) else {
+        return Ok((None, None));
+    };
+    let root = declared_root.unwrap_or_else(|| Path::new("."));
+    let rel = cfg.adapter.manifest.as_deref().ok_or_else(|| {
+        format!(
+            "`[adapters.{adapter_name}.adapter].manifest` is not declared. It is required: \
+             without it the adapter falls back to scanning the workspace for its platform \
+             manifest, which can select an unrelated or out-of-tree project. Add \
+             `manifest = \"<path/to/manifest>\"` (run `provision --adapter {adapter_name} \
+             --local` to generate the file)."
+        )
+    })?;
+    Ok((
+        Some(root.join(rel)),
+        cfg.adapter.crate_path.as_deref().map(|cp| root.join(cp)),
+    ))
 }
 
 fn manifest_command<'manifest>(
@@ -362,10 +409,72 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, build_child_env};
+    use super::{ResolvedEnvironment, build_child_env, resolve_declared_adapter_paths};
     use crate::test_support::manifest_guard;
-    use edgezero_core::manifest::ResolvedEnvironmentBinding;
+    use edgezero_core::manifest::{ManifestLoader, ResolvedEnvironmentBinding};
     use edgezero_core::test_env::EnvOverride;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn declared_adapter_paths_require_manifest_field() {
+        // Without `.manifest` the adapter would fall back to a recursive,
+        // symlink-following workspace scan. Refuse the dispatch instead.
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo\"\n\n[adapters.spin.adapter]\ncrate = \"crates/spin\"\n",
+        );
+        let err = resolve_declared_adapter_paths(Some(&loader), "spin")
+            .expect_err("a declared adapter without `.manifest` must be refused");
+        assert!(
+            err.contains("[adapters.spin.adapter].manifest") && err.contains("required"),
+            "error names the missing required field: {err}"
+        );
+        assert!(
+            err.contains("out-of-tree"),
+            "error explains why ambient discovery is unsafe: {err}"
+        );
+    }
+
+    #[test]
+    fn declared_adapter_paths_resolve_nested_manifest_and_crate_root() {
+        // A nested manifest must NOT imply its parent is the crate root:
+        // `crates/server/config/spin.toml` has its Cargo.toml at
+        // `crates/server`, which only `.crate` can tell us.
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo\"\n\n[adapters.spin.adapter]\ncrate = \"crates/server\"\nmanifest = \"crates/server/config/spin.toml\"\n",
+        );
+        let (manifest_abs, crate_abs) =
+            resolve_declared_adapter_paths(Some(&loader), "spin").expect("both declared");
+        let root = loader
+            .manifest()
+            .root()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        assert_eq!(
+            manifest_abs,
+            Some(root.join("crates/server/config/spin.toml"))
+        );
+        assert_eq!(
+            crate_abs,
+            Some(root.join("crates/server")),
+            "crate root is the DECLARED `.crate`, not the manifest's parent"
+        );
+    }
+
+    #[test]
+    fn declared_adapter_paths_are_none_without_a_manifest() {
+        // Standalone invocation (no edgezero.toml): the adapter's own
+        // discovery is the only thing available, so this is not an error.
+        let (manifest_abs, crate_abs) =
+            resolve_declared_adapter_paths(None, "spin").expect("no manifest is not an error");
+        assert!(manifest_abs.is_none() && crate_abs.is_none());
+    }
+
+    #[test]
+    fn declared_adapter_paths_are_none_for_an_undeclared_adapter() {
+        let loader = ManifestLoader::load_from_str("[app]\nname = \"demo\"\n");
+        let (manifest_abs, crate_abs) = resolve_declared_adapter_paths(Some(&loader), "spin")
+            .expect("an undeclared adapter is not an error here");
+        assert!(manifest_abs.is_none() && crate_abs.is_none());
+    }
 
     fn value_for<'env>(env: &'env [(String, String)], key: &str) -> Option<&'env str> {
         env.iter()

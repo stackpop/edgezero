@@ -172,10 +172,38 @@ impl Adapter for AxumCliAdapter {
         Ok(())
     }
 
-    // Axum has no adapter-specific canonicalisation rule on typed
-    // secret store bindings. Trait default no-op.
+    /// Axum writes each typed secret as a bare `<key>=` line into
+    /// `.edgezero/.env`. A key that cannot round-trip through that format
+    /// would emit a line meaning something else: `partner=token` becomes
+    /// `partner=token=`, which every `.env` reader parses back as the key
+    /// `partner` with the value `token=`. Reject those keys here rather
+    /// than writing an unrepresentable file.
     #[inline]
-    fn validate_typed_secrets(&self, _entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+    fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        for entry in entries {
+            let key = entry.key_value;
+            let reason = if key.is_empty() {
+                Some("is empty")
+            } else if key.contains('=') {
+                Some("contains `=`")
+            } else if key.contains('\n') || key.contains('\r') {
+                Some("contains a newline")
+            } else if key.trim() != key {
+                Some("has leading or trailing whitespace")
+            } else if key.starts_with('#') {
+                Some("starts with `#`, which `.env` readers treat as a comment")
+            } else {
+                None
+            };
+            if let Some(rejection) = reason {
+                return Err(format!(
+                    "secret key `{key}` (field `{field}`) {rejection}; axum writes typed secrets as \
+                     `<key>=` lines in `.edgezero/.env`, and this key cannot round-trip through \
+                     that format. Rename the key on the `#[secret]` field.",
+                    field = entry.field_name,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -574,6 +602,43 @@ mod tests {
     fn blueprint_has_correct_id() {
         assert_eq!(AXUM_BLUEPRINT.id, "axum");
         assert_eq!(AXUM_BLUEPRINT.display_name, "Axum");
+    }
+
+    // ---------- validate_typed_secrets ----------
+
+    #[test]
+    fn validate_typed_secrets_rejects_key_containing_equals() {
+        // `partner=token` would be written as `partner=token=`, which
+        // reads back as key `partner` with value `token=`.
+        let entries = vec![TypedSecretEntry::new("default", "field", "partner=token")];
+        let err = AXUM_ADAPTER
+            .validate_typed_secrets(&entries)
+            .expect_err("a key containing `=` cannot round-trip through a .env line");
+        assert!(
+            err.contains("partner=token") && err.contains("contains `=`"),
+            "error names the key and the reason: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_newline_whitespace_and_comment_keys() {
+        for bad in ["with\nnewline", " padded", "padded ", "#commented", ""] {
+            let entries = vec![TypedSecretEntry::new("default", "field", bad)];
+            AXUM_ADAPTER
+                .validate_typed_secrets(&entries)
+                .expect_err("a key that cannot round-trip through a .env line must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_typed_secrets_accepts_ordinary_keys() {
+        let entries = vec![
+            TypedSecretEntry::new("default", "field_a", "demo_api_token"),
+            TypedSecretEntry::new("default", "field_b", "PARTNER_TOKEN"),
+        ];
+        AXUM_ADAPTER
+            .validate_typed_secrets(&entries)
+            .expect("ordinary keys round-trip fine");
     }
 
     // ---------- push_config_entries ----------

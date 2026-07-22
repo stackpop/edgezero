@@ -502,6 +502,56 @@ fn upsert_secret_store_entry(
     Ok(true)
 }
 
+/// The error `config push --local` reports when the provision-owned
+/// `[local_server.config_stores.<platform>.contents]` table is absent.
+/// Shared so the writer and the read-only dry-run probe stay in sync.
+fn missing_local_config_store_error(path: &Path, platform_name: &str) -> String {
+    format!(
+        "{}: `[local_server.config_stores.{platform_name}.contents]` is missing or not a table; run `provision --adapter fastly --local` first to create the local config store, then re-run config push",
+        path.display()
+    )
+}
+
+/// Read-only counterpart to [`write_fastly_local_config_store`]'s
+/// structural precondition: succeeds only when the provision-owned
+/// `[local_server.config_stores.<platform_name>.contents]` table already
+/// exists.
+///
+/// `config push --local --dry-run` calls this so the preview models the
+/// real run's refusal WITHOUT touching the file -- previewing an edit the
+/// real push would reject is worse than no preview at all.
+pub(super) fn assert_local_config_store_provisioned(
+    path: &Path,
+    platform_name: &str,
+) -> Result<(), String> {
+    use std::io::ErrorKind;
+    use toml_edit::{DocumentMut, Item};
+
+    let raw = fs::read_to_string(path).map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!(
+                "{}: not found; run `provision --adapter fastly --local` first to create the local config store, then re-run config push",
+                path.display()
+            )
+        } else {
+            format!("failed to read {}: {err}", path.display())
+        }
+    })?;
+    let doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    doc.get("local_server")
+        .and_then(Item::as_table)
+        .and_then(|tbl| tbl.get("config_stores"))
+        .and_then(Item::as_table)
+        .and_then(|tbl| tbl.get(platform_name))
+        .and_then(Item::as_table)
+        .and_then(|tbl| tbl.get("contents"))
+        .and_then(Item::as_table)
+        .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
+    Ok(())
+}
+
 /// Write the local-server config-store entries to `fastly.toml`:
 /// `[local_server.config_stores.<platform_name>]` becomes
 /// `format = "inline-toml"`, and `[local_server.config_stores.<platform_name>.contents]`
@@ -559,12 +609,7 @@ pub(super) fn write_fastly_local_config_store(
         .and_then(Item::as_table_mut)
         .and_then(|tbl| tbl.get_mut("contents"))
         .and_then(Item::as_table_mut)
-        .ok_or_else(|| {
-            format!(
-                "{}: `[local_server.config_stores.{platform_name}.contents]` is missing or not a table; run `provision --adapter fastly --local` first to create the local config store, then re-run config push",
-                path.display()
-            )
-        })?;
+        .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
     for (key, value) in entries {
         contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
     }

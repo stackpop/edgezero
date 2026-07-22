@@ -263,6 +263,7 @@ pub struct AdapterExecContext<'ctx> {
     cwd: Option<&'ctx Path>,
     env: &'ctx [(String, String)],
     adapter_manifest: Option<&'ctx Path>,
+    adapter_crate: Option<&'ctx Path>,
 }
 
 impl<'ctx> AdapterExecContext<'ctx> {
@@ -275,6 +276,7 @@ impl<'ctx> AdapterExecContext<'ctx> {
             cwd: None,
             env: &[],
             adapter_manifest: None,
+            adapter_crate: None,
         }
     }
 
@@ -297,6 +299,23 @@ impl<'ctx> AdapterExecContext<'ctx> {
     #[inline]
     pub fn with_adapter_manifest(mut self, adapter_manifest: &'ctx Path) -> Self {
         self.adapter_manifest = Some(adapter_manifest);
+        self
+    }
+
+    /// The manifest-declared, project-root-resolved
+    /// `[adapters.<name>.adapter].crate` directory -- the crate root
+    /// holding `Cargo.toml`.
+    ///
+    /// Adapters MUST NOT assume `Cargo.toml` sits beside the platform
+    /// manifest: a declared nested manifest such as
+    /// `crates/server/config/spin.toml` would resolve
+    /// `crates/server/config/Cargo.toml`, which does not exist. When
+    /// this is set it names the real crate root; the manifest's parent
+    /// is only a fallback for standalone (no-context) invocations.
+    #[must_use]
+    #[inline]
+    pub fn with_adapter_crate(mut self, adapter_crate: &'ctx Path) -> Self {
+        self.adapter_crate = Some(adapter_crate);
         self
     }
 
@@ -330,6 +349,15 @@ impl<'ctx> AdapterExecContext<'ctx> {
     #[inline]
     pub fn adapter_manifest(&self) -> Option<&'ctx Path> {
         self.adapter_manifest
+    }
+
+    /// The declared adapter crate root, when the CLI loaded a manifest.
+    /// `Some` means `Cargo.toml` lives HERE, not necessarily beside the
+    /// platform manifest -- see [`Self::with_adapter_crate`].
+    #[must_use]
+    #[inline]
+    pub fn adapter_crate(&self) -> Option<&'ctx Path> {
+        self.adapter_crate
     }
 
     /// Apply this context to a [`Command`] the adapter is about to

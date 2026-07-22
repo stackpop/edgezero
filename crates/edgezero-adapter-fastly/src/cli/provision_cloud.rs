@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 
-use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores};
+use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
 
 use super::FASTLY_INSTALL_HINT;
 
@@ -19,6 +19,7 @@ pub(super) fn provision(
     manifest_root: &Path,
     adapter_manifest_path: Option<&str>,
     stores: &ProvisionStores<'_>,
+    deployed: Option<&AdapterDeployedState>,
     dry_run: bool,
 ) -> Result<ProvisionOutcome, String> {
     // Fastly is Multi for every store kind. Each id maps 1:1
@@ -32,6 +33,24 @@ pub(super) fn provision(
         );
     };
     let fastly_path = manifest_root.join(rel);
+
+    // Cloud provision MUTATES REMOTE ACCOUNT STATE and then records the
+    // resource link in fastly.toml. `fastly.toml` is gitignored, so on a
+    // clean clone it is absent -- and creating the remote stores first
+    // would then materialise a file containing ONLY `[setup.*]`: a
+    // manifest with no `manifest_version` / `name` / `language` that
+    // `fastly compute build` rejects, guarding stores that are now
+    // orphaned in the account. Refuse BEFORE any account mutation (in
+    // dry-run too, so the preview models the real outcome).
+    if !fastly_path.exists() {
+        return Err(format!(
+            "{}: not found. Cloud provision records the stores it creates in fastly.toml, and \
+             must not create remote resources against a manifest that does not exist yet. Run \
+             `provision --adapter fastly --local` first to synthesise the baseline manifest, then \
+             re-run cloud provision.",
+            fastly_path.display()
+        ));
+    }
 
     let mut out = Vec::new();
     for (kind, ids) in [
@@ -98,7 +117,7 @@ pub(super) fn provision(
             // service is surprising. The instruction names
             // both the store-id lookup AND the link command so
             // the operator can audit before committing.
-            let post_create_note = resource_link_note(&fastly_path, kind, name)?;
+            let post_create_note = resource_link_note(&fastly_path, deployed, kind, name)?;
             let mut line = format!(
                 "created fastly {kind}-store `{name}` (logical id `{logical}`); appended setup tables to {}",
                 fastly_path.display()
@@ -122,12 +141,19 @@ pub(super) fn provision(
     // `[setup.config_stores.edgezero_runtime_env]`, skip.
     let runtime_env_kind = "config";
     let runtime_env_name = "edgezero_runtime_env";
-    if dry_run {
+    // Check the skip condition FIRST -- BEFORE the dry-run branch -- the
+    // same way the declared-store loop above does. When the setup block
+    // already exists the real invocation skips silently, so a dry-run
+    // that reported "would create" would promise an account mutation
+    // that never happens.
+    if setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
+        // Already declared; nothing to do, and nothing to report.
+    } else if dry_run {
         out.push(format!(
             "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
             fastly_path.display()
         ));
-    } else if !setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
+    } else {
         create_fastly_store(runtime_env_kind, runtime_env_name)?;
         append_fastly_setup(&fastly_path, runtime_env_kind, runtime_env_name).map_err(|err| {
             format!(
@@ -142,7 +168,7 @@ pub(super) fn provision(
         // runtime can't open the store. Emit the resource-link
         // remediation alongside the populate-keys hint.
         let post_create_note =
-            resource_link_note(&fastly_path, runtime_env_kind, runtime_env_name)?;
+            resource_link_note(&fastly_path, deployed, runtime_env_kind, runtime_env_name)?;
         let mut line = format!(
             "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store); appended setup tables to {}\n  Populate per-environment override keys with:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=app_config_staging --upsert",
             fastly_path.display()
@@ -152,8 +178,6 @@ pub(super) fn provision(
             line.push_str(&note);
         }
         out.push(line);
-    } else {
-        // Already declared; nothing to do.
     }
 
     if out.is_empty() {
@@ -280,8 +304,27 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
 /// remediation note to surface in the provision output, or `None`
 /// when the service hasn't been deployed yet (so the next
 /// `compute deploy` will pick up the `[setup]` row automatically).
-fn resource_link_note(path: &Path, kind: &str, name: &str) -> Result<Option<String>, String> {
-    let note = read_fastly_service_id(path)?.map(|svc_id| {
+fn resource_link_note(
+    path: &Path,
+    deployed: Option<&AdapterDeployedState>,
+    kind: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    // Prefer the local fastly.toml, then fall back to the TRACKED
+    // `[adapters.fastly.deployed].service_id` in edgezero.toml.
+    // fastly.toml is gitignored, so a teammate on a fresh clone has a
+    // regenerated manifest with no `service_id` even though the team's
+    // tracked state says the service is deployed -- reading only the
+    // local file would silently skip this remediation and leave the
+    // freshly-created store unlinked.
+    let service_id = match read_fastly_service_id(path)? {
+        Some(svc_id) => Some(svc_id),
+        None => deployed
+            .and_then(|state| state.fields.get("service_id"))
+            .filter(|svc_id| !svc_id.is_empty())
+            .cloned(),
+    };
+    let note = service_id.map(|svc_id| {
         format!(
             "  fastly.toml declares `service_id = \"{svc_id}\"`, so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
         )
@@ -728,6 +771,97 @@ mod tests {
     }
 
     #[test]
+    fn cloud_provision_refuses_when_fastly_toml_is_missing() {
+        // fastly.toml is gitignored, so a clean clone has none. Creating
+        // remote stores first and then writing a `[setup.*]`-only file
+        // would orphan those stores behind a manifest `fastly compute
+        // build` rejects. Refuse BEFORE any account mutation.
+        let dir = tempdir().expect("tempdir");
+        // No fs::write -- fastly.toml absent.
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = provision(dir.path(), Some("fastly.toml"), &stores, None, false)
+            .expect_err("cloud provision must refuse without a baseline manifest");
+        assert!(
+            err.contains("provision --adapter fastly --local"),
+            "error points at local provision to synthesise the baseline: {err}"
+        );
+        assert!(
+            !dir.path().join("fastly.toml").exists(),
+            "refusal must not materialise a manifest"
+        );
+    }
+
+    #[test]
+    fn cloud_provision_dry_run_also_refuses_when_fastly_toml_is_missing() {
+        // The dry-run preview must model the real outcome, not promise
+        // creations the real run would refuse to perform.
+        let dir = tempdir().expect("tempdir");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = provision(dir.path(), Some("fastly.toml"), &stores, None, true)
+            .expect_err("dry-run must refuse too");
+        assert!(err.contains("provision --adapter fastly --local"), "{err}");
+    }
+
+    #[test]
+    fn cloud_dry_run_does_not_claim_to_create_existing_runtime_env_store() {
+        // Regression: the runtime-env arm reported "would create"
+        // unconditionally, so a dry-run promised an account mutation the
+        // real run skips.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "name = \"demo\"\n[setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        let out = provision(dir.path(), Some("fastly.toml"), &stores, None, true)
+            .expect("dry-run succeeds");
+        let combined = out.status_lines.join("\n");
+        assert!(
+            !combined
+                .contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
+            "dry-run must not claim to create an already-declared store: {combined}"
+        );
+    }
+
+    #[test]
+    fn resource_link_note_falls_back_to_tracked_service_id() {
+        // fastly.toml is gitignored: a teammate's regenerated manifest has
+        // no `service_id` even though the team's tracked deployed state
+        // says the service IS deployed. Reading only the local file would
+        // skip the remediation and leave the new store unlinked.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let mut tracked = AdapterDeployedState::default();
+        tracked
+            .fields
+            .insert("service_id".to_owned(), "tracked123".to_owned());
+        let note = resource_link_note(&path, Some(&tracked), "kv", "sessions")
+            .expect("read")
+            .expect("tracked service_id must still produce the remediation note");
+        assert!(
+            note.contains("tracked123"),
+            "note uses the tracked service id: {note}"
+        );
+    }
+
+    #[test]
     fn provision_with_no_declared_stores_says_so() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
@@ -856,7 +990,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\nservice_id = \"abc123svc\"\n").expect("write");
-        let note = resource_link_note(&path, "config", "edgezero_runtime_env")
+        let note = resource_link_note(&path, None, "config", "edgezero_runtime_env")
             .expect("read service_id")
             .expect("note present when service_id set");
         assert!(
@@ -889,8 +1023,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
-        let note =
-            resource_link_note(&path, "config", "edgezero_runtime_env").expect("read service_id");
+        let note = resource_link_note(&path, None, "config", "edgezero_runtime_env")
+            .expect("read service_id");
         assert!(
             note.is_none(),
             "no service_id => no resource-link prompt: {note:?}"

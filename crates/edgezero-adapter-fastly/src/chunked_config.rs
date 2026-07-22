@@ -22,9 +22,9 @@
 use sha2::{Digest as _, Sha256};
 
 /// Per-entry value limit enforced by Fastly Config Store. Used by the
-/// CLI writer to gate direct-vs-chunked storage; the runtime resolver
-/// reads chunk lengths from the pointer struct, not this constant.
-#[cfg(any(feature = "cli", test))]
+/// CLI writer to gate direct-vs-chunked storage, AND by the runtime
+/// resolver to bound the untrusted per-chunk lengths a pointer declares
+/// before any allocation -- so it stays unconditional.
 pub(crate) const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 /// Per-entry KEY length limit enforced by Fastly Config Store. Chunk
 /// keys append a fixed content-address suffix to the root key, so a
@@ -95,6 +95,18 @@ pub(crate) fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    // Fastly rejects Config Store keys longer than 256 characters. Check
+    // the ROOT key BEFORE the direct-value early return below, which
+    // writes `root_key` verbatim -- otherwise a small envelope under an
+    // over-long key sails past every local check and fails remotely.
+    if root_key.len() > FASTLY_CONFIG_KEY_LIMIT {
+        return Err(format!(
+            "config key `{root_key}` is {} characters, exceeding the Fastly Config Store \
+             {FASTLY_CONFIG_KEY_LIMIT}-character key limit. Use a shorter `[stores.config]` \
+             entry key.",
+            root_key.len(),
+        ));
+    }
     if envelope_json.len() <= FASTLY_CONFIG_ENTRY_LIMIT {
         return Ok(vec![(root_key.to_owned(), envelope_json.to_owned())]);
     }
@@ -268,8 +280,41 @@ where
         ));
     }
 
+    // `envelope_len` and the per-chunk `len`s are UNTRUSTED store data.
+    // Validate them BEFORE reserving anything: a corrupt pointer claiming
+    // a huge `envelope_len` would otherwise abort the runtime with a
+    // capacity overflow or allocation failure instead of returning a
+    // recoverable integrity error. A legitimate chunk never exceeds the
+    // per-entry limit, and the declared chunk lengths must sum to the
+    // declared envelope length -- so the sum is the only length we trust
+    // enough to pre-allocate.
+    let mut declared_total = 0_usize;
+    for chunk_ref in &pointer.chunks {
+        if chunk_ref.len > FASTLY_CONFIG_ENTRY_LIMIT {
+            return Err(format!(
+                "chunk `{}` (referenced by `{root_key}`) declares length {}, which exceeds the \
+                 Fastly Config Store {FASTLY_CONFIG_ENTRY_LIMIT}-character entry limit; the \
+                 pointer is corrupt",
+                chunk_ref.key, chunk_ref.len,
+            ));
+        }
+        declared_total = declared_total.checked_add(chunk_ref.len).ok_or_else(|| {
+            format!(
+                "chunk lengths in the pointer at `{root_key}` overflow a usize; the pointer is \
+                 corrupt"
+            )
+        })?;
+    }
+    if declared_total != pointer.envelope_len {
+        return Err(format!(
+            "chunk pointer at `{root_key}` declares envelope_len {} but its chunk lengths sum to \
+             {declared_total}; the pointer is corrupt",
+            pointer.envelope_len,
+        ));
+    }
+
     // Fetch, verify, and concatenate all chunks.
-    let mut reconstructed = String::with_capacity(pointer.envelope_len);
+    let mut reconstructed = String::with_capacity(declared_total);
     for chunk_ref in &pointer.chunks {
         let chunk_value = fetch(&chunk_ref.key)?.ok_or_else(|| {
             format!(
@@ -400,6 +445,25 @@ mod tests {
                 "non-final entries must be chunk keys: {key}"
             );
         }
+    }
+
+    #[test]
+    fn direct_value_rejects_root_key_over_256_chars() {
+        // A SMALL envelope (no chunking) under an over-long key must still
+        // be refused locally -- the direct-value path writes the root key
+        // verbatim, so skipping the check would only fail remotely.
+        let envelope = make_envelope_json(64);
+        assert!(
+            envelope.len() <= FASTLY_CONFIG_ENTRY_LIMIT,
+            "fixture must take the direct-value path"
+        );
+        let long_key = "k".repeat(257);
+        let err = prepare_fastly_config_entries(&long_key, &envelope)
+            .expect_err("a 257-char key must be rejected even without chunking");
+        assert!(
+            err.contains("256") && err.contains("key limit"),
+            "error explains the key-length limit: {err}"
+        );
     }
 
     #[test]
@@ -693,6 +757,78 @@ mod tests {
             "error must mention edgezero_kind: {err}"
         );
         assert!(err.contains("my_key"), "error must name root key: {err}");
+    }
+
+    #[test]
+    fn resolver_errors_instead_of_panicking_on_huge_declared_envelope_len() {
+        // `envelope_len` is untrusted store data. A corrupt pointer
+        // claiming a colossal length must produce a recoverable integrity
+        // error -- NOT a capacity-overflow / allocation-failure abort from
+        // pre-allocating the reconstruction buffer.
+        let pointer = FastlyChunkPointer {
+            chunks: Vec::new(),
+            data_sha256: String::new(),
+            edgezero_kind: POINTER_KIND.to_owned(),
+            envelope_len: usize::MAX,
+            envelope_sha256: String::new(),
+            version: 1,
+        };
+        let json_str = serde_json::to_string(&pointer).unwrap();
+        let err = resolve_fastly_config_value("my_key", json_str, |_| Ok(None))
+            .expect_err("a corrupt envelope_len must error, not abort");
+        assert!(
+            err.contains("corrupt") && err.contains("my_key"),
+            "error reports pointer corruption and names the root key: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_errors_on_chunk_len_exceeding_entry_limit() {
+        // A single chunk can never legitimately exceed the per-entry
+        // limit; a pointer declaring one is corrupt, and the length must
+        // be rejected before it is summed into an allocation size.
+        let pointer = FastlyChunkPointer {
+            chunks: vec![FastlyChunkRef {
+                key: "my_key.__edgezero_chunks.deadbeef.0".to_owned(),
+                len: FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1),
+                sha256: String::new(),
+            }],
+            data_sha256: String::new(),
+            edgezero_kind: POINTER_KIND.to_owned(),
+            envelope_len: FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1),
+            envelope_sha256: String::new(),
+            version: 1,
+        };
+        let json_str = serde_json::to_string(&pointer).unwrap();
+        let err = resolve_fastly_config_value("my_key", json_str, |_| Ok(None))
+            .expect_err("an over-limit chunk length must error");
+        assert!(
+            err.contains("entry limit") && err.contains("corrupt"),
+            "error explains the per-entry limit: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_errors_when_chunk_lengths_do_not_sum_to_envelope_len() {
+        let pointer = FastlyChunkPointer {
+            chunks: vec![FastlyChunkRef {
+                key: "my_key.__edgezero_chunks.deadbeef.0".to_owned(),
+                len: 10,
+                sha256: String::new(),
+            }],
+            data_sha256: String::new(),
+            edgezero_kind: POINTER_KIND.to_owned(),
+            envelope_len: 999,
+            envelope_sha256: String::new(),
+            version: 1,
+        };
+        let json_str = serde_json::to_string(&pointer).unwrap();
+        let err = resolve_fastly_config_value("my_key", json_str, |_| Ok(None))
+            .expect_err("mismatched declared lengths must error");
+        assert!(
+            err.contains("999") && err.contains("corrupt"),
+            "error reports the declared-vs-summed mismatch: {err}"
+        );
     }
 
     #[test]

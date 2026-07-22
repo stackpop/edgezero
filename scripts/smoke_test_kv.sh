@@ -19,7 +19,7 @@ SERVER_PID=""
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
 # and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
-# this because Task 33 gitignored those files.
+# this because those adapter manifests are gitignored.
 # shellcheck source=lib/smoke_warmup.sh
 . "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
 echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."

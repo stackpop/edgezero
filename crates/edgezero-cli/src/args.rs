@@ -296,23 +296,6 @@ impl Default for ConfigDiffArgs {
 /// `run_config_push_typed::<C>`.  The bundled `edgezero` binary exposes
 /// a `ConfigCmdStubArgs` catch-all instead and redirects to the typed
 /// CLI at runtime.
-/// "Suppress this default behaviour" flags for `config push`. Hoisted
-/// Kept for internal grouping — the `#[command(flatten)]`
-/// on [`ConfigPushArgs`] made `--no-diff` / `--no-env` still
-/// top-level CLI flags. Re-hosted directly on [`ConfigPushArgs`]
-/// in the 2026-07-13 revision to
-/// restore source compatibility for downstream CLIs that construct
-/// `ConfigPushArgs` via `Default::default()` + field assignment
-/// (`args.no_diff = true;`, `args.no_env = true;`). The pre-fix
-/// flatten broke every such site with E0609.
-///
-/// Retained as an empty compat stub so an out-of-tree
-/// project that reached for `crate::args::ConfigPushSuppressions`
-/// still compiles; new code should assign the top-level fields.
-#[derive(clap::Args, Debug, Default)]
-#[non_exhaustive]
-pub struct ConfigPushSuppressions;
-
 /// `no_diff` and `no_env` live
 /// on this struct as top-level public fields to preserve source
 /// compatibility with downstream CLIs that predate the 2026-07-13

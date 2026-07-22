@@ -25,6 +25,7 @@ cli = [
     "edgezero-adapter/cli",
     "dep:ctor",
     "dep:toml",
+    "dep:toml_edit",
     "dep:walkdir",
 ]
 
@@ -47,6 +48,7 @@ reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true }
 simple_logger = { workspace = true }
 thiserror = { workspace = true }
+toml_edit = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }

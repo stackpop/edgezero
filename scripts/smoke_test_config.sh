@@ -11,10 +11,12 @@ set -euo pipefail
 #   ./scripts/smoke_test_config.sh cloudflare
 #   ./scripts/smoke_test_config.sh spin
 #
-# Note (spin): handler-facing dotted keys (`feature.new_checkout`,
-# `service.timeout_ms`) are supported on Spin too; `SpinConfigStore`
-# translates them to the flat variable form (`feature__new_checkout`,
-# `service__timeout_ms`) before lookup.
+# Each adapter is seeded with `config push --local`, which writes ONE
+# BlobEnvelope holding the whole typed struct under the `app_config`
+# key. The assertions therefore exercise `/config/typed` (the
+# `AppConfig<AppDemoConfig>` extractor that reads that blob) rather than
+# raw per-key `/config/{name}` reads, which have no per-key entries to
+# find under this model.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
@@ -48,22 +50,11 @@ case "$ADAPTER" in
     PORT=8787
     echo "==> Building app-demo (axum)..."
     (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
-    # Stage 2 Axum config is read from `.edgezero/local-config-<id>.json`
-    # per logical id (see `AxumConfigStore::from_local_file`). `config push`
-    # writes that file in Stage 7; until then the smoke script seeds it
-    # directly with the same demo values Fastly's
-    # `[local_server.config_stores.app_config.contents]` carries (and that
-    # `config push --adapter spin --local` will write directly into
-    # `.spin/sqlite_key_value.db` once the per-backend writer lands).
-    echo "==> Seeding .edgezero/local-config-app_config.json..."
-    mkdir -p "$DEMO_DIR/.edgezero"
-    cat > "$DEMO_DIR/.edgezero/local-config-app_config.json" <<'JSON'
-{
-  "greeting": "hello from config store",
-  "feature.new_checkout": "false",
-  "service.timeout_ms": "1500"
-}
-JSON
+    # Axum reads `.edgezero/local-config-<id>.json`, which
+    # `config push --local` writes (see `AxumConfigStore::from_local_file`).
+    echo "==> Seeding Axum local config store (config push --adapter axum --local)..."
+    (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
+      config push --adapter axum --local --no-env 2>&1)
     echo "==> Starting Axum adapter on port $PORT..."
     (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
     SERVER_PID=$!
@@ -184,21 +175,20 @@ section "Health check"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/")
 check "GET / returns 200" "200" "$STATUS"
 
-section "Config: keys (all adapters)"
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/greeting")
-check "GET /config/greeting returns 200" "200" "$STATUS"
+# `config push` writes ONE BlobEnvelope under the `app_config` key --
+# the whole typed struct in a single value. `/config/typed` goes through
+# the `AppConfig<AppDemoConfig>` extractor, which reads that blob and
+# deserialises it, so this is the endpoint that reflects what push
+# actually seeded. (The raw per-key `/config/{name}` reads hit
+# `store.get(<name>)` directly; under the blob model there are no
+# per-key entries to find, so asserting values there would only pass
+# against hand-seeded pre-cutover emulator state.)
+section "Config: typed blob (all adapters)"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/typed")
+check "GET /config/typed returns 200" "200" "$STATUS"
 
-BODY=$(curl -s "$BASE/config/greeting")
-check "greeting value" "hello from config store" "$BODY"
-
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/feature.new_checkout")
-check "GET /config/feature.new_checkout returns 200" "200" "$STATUS"
-
-BODY=$(curl -s "$BASE/config/feature.new_checkout")
-check "feature.new_checkout value" "false" "$BODY"
-
-BODY=$(curl -s "$BASE/config/service.timeout_ms")
-check "service.timeout_ms value" "1500" "$BODY"
+BODY=$(curl -s "$BASE/config/typed")
+check "typed greeting value" "hello from app-demo" "$BODY"
 
 section "Config: missing key returns 404"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/does.not.exist")

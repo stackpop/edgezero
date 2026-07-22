@@ -21,14 +21,17 @@ DEMO_DIR="$ROOT_DIR/examples/app-demo"
 ADAPTER="${1:-axum}"
 SERVER_PID=""
 DEV_VARS_FILE=""
+# Path to a copy of the operator's pre-existing `.dev.vars`, if any.
+# Empty means the file did not exist before this run.
+DEV_VARS_BACKUP=""
 SMOKE_SECRET_NAME="SMOKE_SECRET"
 MISSING_SECRET_NAME="SMOKE_SECRET_MISSING"
 
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
 # and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
-# this because Task 33 gitignored those files. Crucial for this
-# smoke: the typed dispatch (Task 30b) writes SPIN_VARIABLE_* /
+# this because those adapter manifests are gitignored. Crucial for
+# this smoke: the typed dispatch writes SPIN_VARIABLE_* /
 # .dev.vars placeholders that the emulator boot reads.
 # shellcheck source=lib/smoke_warmup.sh
 . "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
@@ -50,8 +53,17 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
 
-  if [ -n "$DEV_VARS_FILE" ] && [ -f "$DEV_VARS_FILE" ]; then
-    rm -f "$DEV_VARS_FILE"
+  # Restore the operator's `.dev.vars` rather than deleting it. The file
+  # is gitignored but NOT regenerable: provision only writes empty
+  # placeholders, so a developer's filled-in secrets would be destroyed.
+  # `DEV_VARS_BACKUP` is empty when the file did not exist before the
+  # smoke ran -- in that case removing it restores the original state.
+  if [ -n "$DEV_VARS_FILE" ]; then
+    if [ -n "$DEV_VARS_BACKUP" ] && [ -f "$DEV_VARS_BACKUP" ]; then
+      mv -f "$DEV_VARS_BACKUP" "$DEV_VARS_FILE"
+    else
+      rm -f "$DEV_VARS_FILE"
+    fi
   fi
 }
 trap cleanup EXIT
@@ -120,6 +132,12 @@ start_server() {
         exit 1
       }
       DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      # Preserve any real secrets the developer already had here; the
+      # trap restores this copy on exit.
+      if [ -f "$DEV_VARS_FILE" ]; then
+        DEV_VARS_BACKUP=$(mktemp)
+        cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
+      fi
       printf '%s=%s\n' "$SMOKE_SECRET_NAME" "$SMOKE_SECRET_VALUE" > "$DEV_VARS_FILE"
       echo "==> Starting Cloudflare wrangler dev on port $PORT..."
       (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &

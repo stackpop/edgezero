@@ -41,8 +41,8 @@ DEMO_DIR="$ROOT_DIR/examples/app-demo"
 # `runtime-config.toml`) + line-oriented files (`.env`, `.dev.vars`)
 # so this smoke can boot each row's emulator without a pre-populated
 # worktree. Replaces the per-adapter `backup_in_tree` calls that used
-# to protect tracked copies from smoke mutation — Task 33 gitignored
-# those files, so mutation is no longer a concern.
+# to protect tracked copies from smoke mutation — those files are now
+# gitignored and regenerable, so mutation is no longer a concern.
 # shellcheck source=lib/smoke_warmup.sh
 . "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
 SERVER_PID=""
@@ -315,6 +315,12 @@ seed_secret_for_adapter() {
       ;;
     cloudflare)
       local dev_vars="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      # `.dev.vars` is gitignored but NOT regenerable: provision only
+      # writes empty placeholders, so truncating it would destroy any
+      # real secrets the developer had. Back it up once per row (this
+      # runs before the boot-time re-seed, so the copy holds the
+      # operator's original) and let `restore_backups` put it back.
+      backup_in_tree "$dev_vars"
       printf 'demo_api_token="resolved-token"\n' > "$dev_vars"
       return 0
       ;;
@@ -482,10 +488,11 @@ for suite in "${SUITES[@]}"; do
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
 
   # Warm up per-row local state — provision --local regenerates the
-  # gitignored adapter manifest + .env / .dev.vars. Task 33 gitignored
-  # these files, so the previous backup_in_tree calls (fastly.toml,
-  # .dev.vars) are obsolete: they were there to protect a TRACKED
-  # copy from smoke mutation, and there's no tracked copy anymore.
+  # gitignored adapter manifest + .env / .dev.vars. Those files are
+  # gitignored and regenerable, so the old fastly.toml backup_in_tree
+  # call is obsolete -- it protected a TRACKED copy that no longer
+  # exists. `.dev.vars` is still backed up: provision only writes empty
+  # placeholders, so it is not regenerable.
   smoke_warmup_provision_local "$adapter"
 
   # Reset the adapter's local emulator state so the smoke starts
@@ -600,7 +607,7 @@ else
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
 
   # Warm up Fastly local state — provision --local synthesises
-  # fastly.toml (gitignored per Task 33). The previous
+  # fastly.toml (gitignored, so regenerable). The previous
   # backup_in_tree call was there because fastly.toml used to be
   # tracked; it isn't anymore, so no restore is needed.
   smoke_warmup_provision_local fastly

@@ -587,9 +587,16 @@ fn run_local_dry_run_typed(
             let base_status = base.status_lines;
             let typed_status = typed.status_lines;
             let merged_status: Vec<String> = base_status.into_iter().chain(typed_status).collect();
-            let merged_outcome = match base.deployed.or(typed.deployed) {
+            // Preserve a partial-failure error from EITHER arm; dropping
+            // it here would report a failed local provision as success.
+            let merged_error = base.error.or(typed.error);
+            let merged_base = match base.deployed.or(typed.deployed) {
                 Some(state) => ProvisionOutcome::with_deployed(merged_status, state),
                 None => ProvisionOutcome::from_status_lines(merged_status),
+            };
+            let merged_outcome = match merged_error {
+                Some(err) => merged_base.with_error(err),
+                None => merged_base,
             };
             let combined = prepend_baseline_status_lines_with_rewrite(
                 canonical_adapter_name,
@@ -683,13 +690,22 @@ fn prepend_baseline_status_lines_with_rewrite(
         .iter()
         .map(|path| format!("{adapter_name}: wrote baseline {}", rewrite(path.as_path())))
         .collect();
+    // Carry the partial-failure error across recomposition. Rebuilding
+    // from `status_lines` + `deployed` alone would drop it, reporting an
+    // adapter that returned `with_error` as a clean success.
+    let error = outcome.error;
+    let deployed = outcome.deployed;
     let combined: Vec<String> = baseline_lines
         .into_iter()
         .chain(outcome.status_lines)
         .collect();
-    match outcome.deployed {
+    let rebuilt = match deployed {
         Some(state) => adapter_registry::ProvisionOutcome::with_deployed(combined, state),
         None => adapter_registry::ProvisionOutcome::from_status_lines(combined),
+    };
+    match error {
+        Some(err) => rebuilt.with_error(err),
+        None => rebuilt,
     }
 }
 
@@ -2714,6 +2730,33 @@ ids = ["default"]
         assert!(
             !report.contains("\nappended "),
             "raw 'appended' must be gone"
+        );
+    }
+
+    #[test]
+    fn baseline_prepend_preserves_partial_failure_error() {
+        // Recomposing the outcome must not drop `error`: an adapter that
+        // returned `with_error` has NOT fully succeeded, and losing the
+        // error here would report a failed local provision as clean.
+        let outcome = ProvisionOutcome::from_status_lines(vec!["did a thing".to_owned()])
+            .with_error("store `sessions` failed".to_owned());
+        let rebuilt = prepend_baseline_status_lines_worktree(
+            "spin",
+            &[PathBuf::from("/proj/crates/spin/spin.toml")],
+            outcome,
+        );
+        assert_eq!(
+            rebuilt.error.as_deref(),
+            Some("store `sessions` failed"),
+            "partial-failure error must survive baseline prepending"
+        );
+        assert!(
+            rebuilt
+                .status_lines
+                .iter()
+                .any(|line| line.contains("wrote baseline")),
+            "baseline line still prepended: {:?}",
+            rebuilt.status_lines
         );
     }
 

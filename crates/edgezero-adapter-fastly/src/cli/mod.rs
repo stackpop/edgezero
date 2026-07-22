@@ -296,9 +296,13 @@ impl Adapter for FastlyCliAdapter {
                 deployed,
                 dry_run,
             ),
-            ProvisionMode::Cloud => {
-                provision_cloud::provision(manifest_root, adapter_manifest_path, stores, dry_run)
-            }
+            ProvisionMode::Cloud => provision_cloud::provision(
+                manifest_root,
+                adapter_manifest_path,
+                stores,
+                deployed,
+                dry_run,
+            ),
             // ProvisionMode is #[non_exhaustive]; a future mode variant
             // is an explicit error so we don't dispatch via one of the
             // two known arms by accident.

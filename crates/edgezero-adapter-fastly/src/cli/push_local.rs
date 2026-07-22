@@ -6,7 +6,9 @@ use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
 
 use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value};
 
-use super::provision_local::write_fastly_local_config_store;
+use super::provision_local::{
+    assert_local_config_store_provisioned, write_fastly_local_config_store,
+};
 
 /// Local-emulator `push_config_entries_local`: edit
 /// `[local_server.config_stores.<platform>.contents]` in `fastly.toml`.
@@ -43,6 +45,12 @@ pub(super) fn write_entries(
         physical_entries.extend(expanded);
     }
     if dry_run {
+        // Model the real operation: the writer below refuses when the
+        // provision-owned `[local_server.config_stores.<name>.contents]`
+        // table is absent, so a dry-run that happily previewed the edit
+        // would promise a push the real run rejects. This probe is
+        // read-only -- a dry-run must not touch the file.
+        assert_local_config_store_provisioned(&fastly_path, name)?;
         let mut out = Vec::with_capacity(entries.len().saturating_add(1));
         out.push(format!(
             "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with entries:",
@@ -577,8 +585,8 @@ mod tests {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
-        let original = "name = \"demo\"\n";
-        fs::write(&fastly_toml, original).expect("write");
+        seed_provisioned(&fastly_toml, TEST_CONFIG_ID);
+        let original = fs::read_to_string(&fastly_toml).expect("read seed");
 
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
@@ -594,7 +602,7 @@ mod tests {
             )
             .expect("local dry-run must not error");
 
-        // File must be untouched.
+        // File must be untouched — including by the structural probe.
         let after = fs::read_to_string(&fastly_toml).expect("read back");
         assert_eq!(after, original, "dry-run must not edit fastly.toml");
 
@@ -604,6 +612,37 @@ mod tests {
             combined.contains("would set") && combined.contains("chunked"),
             "must report chunked intent: {combined}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_refuses_when_store_not_provisioned() {
+        // The dry-run must model the real operation: the real push
+        // refuses to fabricate an unprovisioned store block, so previewing
+        // a successful edit would promise something that cannot happen.
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let original = "name = \"demo\"\n";
+        fs::write(&fastly_toml, original).expect("write");
+
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "{\"envelope\":\"A\"}".to_owned())],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect_err("dry-run must surface the same refusal as the real push");
+        assert!(
+            err.contains("provision --adapter fastly --local"),
+            "error points at provision: {err}"
+        );
+        // The read-only probe must leave the file byte-identical.
+        let after = fs::read_to_string(&fastly_toml).expect("read back");
+        assert_eq!(after, original, "dry-run probe must not edit fastly.toml");
     }
 
     // ---------- local read integration tests ----------

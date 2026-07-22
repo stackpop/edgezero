@@ -16,10 +16,12 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
     let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
         find_fastly_manifest(cli_support::discovery_base(ctx)?.as_path())
     })?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
-    let cargo_manifest = manifest_dir.join("Cargo.toml");
+    // `Cargo.toml` lives at the declared crate root, which is NOT
+    // necessarily the manifest's parent -- a nested declared manifest
+    // like `crates/server/config/fastly.toml` would otherwise resolve
+    // `crates/server/config/Cargo.toml`.
+    let crate_dir = cli_support::adapter_crate_dir(ctx, &manifest)?;
+    let cargo_manifest = crate_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
     let mut command = Command::new("cargo");
@@ -45,8 +47,8 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
         return Err(format!("cargo build failed with status {status}"));
     }
 
-    let workspace_root = find_workspace_root(manifest_dir);
-    let artifact = locate_artifact(&workspace_root, manifest_dir, &crate_name)?;
+    let workspace_root = find_workspace_root(&crate_dir);
+    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name)?;
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
         .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;

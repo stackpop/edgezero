@@ -51,14 +51,21 @@ struct EdgezeroAxumConfig {
 /// the first write, so operator edits (custom host, non-default
 /// port) survive.
 pub(super) fn synthesise_axum_toml(crate_name: &str, crate_dir: &str) -> String {
-    format!(
-        "# edgezero-provision: v1\n\
-         [adapter]\n\
-         crate = \"{crate_name}\"\n\
-         crate_dir = \"{crate_dir}\"\n\
-         host = \"127.0.0.1\"\n\
-         port = 8787\n"
-    )
+    use toml_edit::{DocumentMut, Item, Table, value};
+
+    // Built through `toml_edit`, never raw string interpolation: a crate
+    // name or directory carrying a quote, backslash, or newline would
+    // otherwise emit a file that isn't valid TOML. `toml_edit` escapes
+    // the values for us.
+    let mut doc = DocumentMut::new();
+    doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
+    let mut adapter = Table::new();
+    adapter.insert("crate", value(crate_name));
+    adapter.insert("crate_dir", value(crate_dir));
+    adapter.insert("host", value("127.0.0.1"));
+    adapter.insert("port", value(8787_i64));
+    doc.insert("adapter", Item::Table(adapter));
+    doc.to_string()
 }
 
 pub(super) fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
@@ -401,6 +408,36 @@ mod tests {
     use edgezero_adapter::cli_support::find_manifest_upwards;
     use std::net::Ipv6Addr;
     use tempfile::tempdir;
+
+    #[test]
+    fn synthesise_axum_toml_emits_parseable_baseline() {
+        let rendered = synthesise_axum_toml("demo-adapter-axum", ".");
+        assert!(
+            rendered.starts_with("# edgezero-provision: v1\n"),
+            "provision marker retained: {rendered}"
+        );
+        let doc: toml_edit::DocumentMut = rendered.parse().expect("baseline must be valid TOML");
+        assert_eq!(doc["adapter"]["crate"].as_str(), Some("demo-adapter-axum"));
+        assert_eq!(doc["adapter"]["crate_dir"].as_str(), Some("."));
+        assert_eq!(doc["adapter"]["host"].as_str(), Some("127.0.0.1"));
+        assert_eq!(doc["adapter"]["port"].as_integer(), Some(8787));
+    }
+
+    #[test]
+    fn synthesise_axum_toml_escapes_toml_significant_names() {
+        // A quote/backslash in the app (hence crate) name must not break
+        // out of the string and emit an unparseable manifest.
+        let rendered = synthesise_axum_toml("we\"ird\\name", "../up");
+        let doc: toml_edit::DocumentMut = rendered
+            .parse()
+            .expect("a pathological crate name must still produce valid TOML");
+        assert_eq!(
+            doc["adapter"]["crate"].as_str(),
+            Some("we\"ird\\name"),
+            "value round-trips through escaping: {rendered}"
+        );
+        assert_eq!(doc["adapter"]["crate_dir"].as_str(), Some("../up"));
+    }
 
     #[test]
     fn read_axum_project_loads_defaults() {

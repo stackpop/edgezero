@@ -56,6 +56,38 @@ where
     }
 }
 
+/// The directory holding the adapter crate's `Cargo.toml`: the declared,
+/// root-resolved [`AdapterExecContext::adapter_crate`] when the CLI
+/// provided one, otherwise the platform manifest's parent directory.
+///
+/// The manifest's parent is only correct when the platform manifest sits
+/// AT the crate root (the scaffold convention). A declared nested
+/// manifest such as `crates/server/config/spin.toml` has its crate root
+/// one level up, so assuming the parent would look for a `Cargo.toml`
+/// that does not exist and fail the build.
+///
+/// # Errors
+/// Returns an error when neither a declared crate root nor a manifest
+/// parent is available.
+#[inline]
+pub fn adapter_crate_dir(
+    ctx: &AdapterExecContext<'_>,
+    adapter_manifest: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(declared) = ctx.adapter_crate() {
+        return Ok(declared.to_path_buf());
+    }
+    adapter_manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            format!(
+                "adapter manifest `{}` has no parent directory and no `[adapters.<name>.adapter].crate` was declared",
+                adapter_manifest.display()
+            )
+        })
+}
+
 /// Walks up the directory tree looking for `manifest_name` alongside a `Cargo.toml`.
 #[inline]
 #[must_use]
