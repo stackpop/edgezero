@@ -109,28 +109,66 @@ sanitize_ref() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.=-' '-'
 }
 
-# Unset the provider credential aliases named in a JSON array, so no provider
-# token is in scope when APP-CONTROLLED commands run (cargo metadata, cargo
-# build, and the built CLI's `--help`).
+# Validate the `provider-env-clear` input and print the credential alias names it
+# contains, one per line.
 #
-# Provider-NEUTRAL by construction: the NAMES come from the caller (the action's
-# `provider-env-clear` input), so this layer hard-codes no provider. Names must be
-# shell identifiers; anything else is a configuration error rather than a silent
-# no-op. Unsetting here covers this process and every child it spawns.
-clear_provider_env_aliases() {
-  local json="${1:-[]}"
-  [[ -n "$json" ]] || return 0
+# Fails CLOSED on anything that is not a JSON array of non-empty shell-identifier
+# strings. This matters because a permissive parse silently clears NOTHING: with
+# `jq '.[]?'`, the values `"FASTLY_API_TOKEN"`, `{}`, `null` and `123` all exit 0
+# and yield no names, so a typo in the input would leave every inherited
+# credential in scope for app-controlled code while appearing to succeed.
+provider_env_clear_names() {
+  local json="${1-}"
   require_cmd jq
-  local names
-  names=$(printf '%s' "$json" | jq -r '.[]? // empty') ||
-    fail "input 'provider-env-clear' must be a JSON array of environment variable names; got: $json"
+  local kind
+  kind=$(printf '%s' "$json" | jq -r 'type' 2>/dev/null) ||
+    fail "input 'provider-env-clear' is not valid JSON: '$json'"
+  [[ "$kind" == "array" ]] ||
+    fail "input 'provider-env-clear' must be a JSON ARRAY of environment variable names, got $kind: '$json'"
+  local malformed
+  malformed=$(printf '%s' "$json" | jq -r '[.[] | select((type != "string") or (. == ""))] | length')
+  [[ "$malformed" == "0" ]] ||
+    fail "input 'provider-env-clear' must contain only non-empty strings: '$json'"
+
   local name
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
       fail "input 'provider-env-clear' contains an invalid environment variable name: '$name'"
-    unset "$name"
-  done <<<"$names"
+    printf '%s\n' "$name"
+  done < <(printf '%s' "$json" | jq -r '.[]')
+}
+
+# Re-exec this script with the named provider credentials REMOVED from the
+# process environment, then continue.
+#
+# `unset` alone is not sufficient. On Linux, `/proc/<pid>/environ` exposes the
+# environment block a process was `execve`d with, and later `unset`/`setenv` do
+# not rewrite it — so an app-controlled Cargo build script (or the built CLI's
+# `--help`) could read the token straight out of this shell's `/proc` entry even
+# after we unset it. Replacing the process image via `env -u ... exec` gives THIS
+# process, its `/proc` entry, and every descendant a genuinely clean environment.
+#
+# Provider-NEUTRAL: the names come from the caller's `provider-env-clear` input.
+exec_with_cleared_provider_env() {
+  local json="$1"
+  shift
+  # COMMAND substitution, not process substitution: a validation failure inside
+  # `provider_env_clear_names` must abort the build. Under `< <(...)` its `fail`
+  # would only kill the subshell, leaving an EMPTY name list here — and we would
+  # then exec with nothing stripped, i.e. fail OPEN with the credentials intact.
+  local names_raw
+  names_raw=$(provider_env_clear_names "$json") || exit 1
+
+  local -a cmd=(env)
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    cmd+=(-u "$name")
+  done <<<"$names_raw"
+  # Sentinel so the re-exec'd invocation does not loop.
+  cmd+=("EDGEZERO__PROVIDER__ENV_CLEARED=1" "$@")
+  exec "${cmd[@]}"
 }
 
 # Reject an artifact name that could escape the action-owned staging directory

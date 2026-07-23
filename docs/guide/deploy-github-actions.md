@@ -150,15 +150,35 @@ workspace may be the subdirectory itself), so a monorepo caches the right
 
 ### `build-app-cli`
 
-| Input               | Required | Default             | Meaning                                                          |
-| ------------------- | -------- | ------------------- | ---------------------------------------------------------------- |
-| `app-cli-package`   | Yes      | —                   | Cargo package name of the CLI, in your app's workspace.          |
-| `app-cli-bin`       | No       | `<app-cli-package>` | Binary name the package produces.                                |
-| `working-directory` | No       | `.`                 | App directory (relative to `github.workspace`).                  |
-| `rust-toolchain`    | No       | `auto`              | Explicit toolchain, or `auto` (rustup files → `.tool-versions`). |
-| `app-cli-artifact`  | No       | `edgezero-cli`      | Uploaded artifact name.                                          |
+| Input                | Required | Default                 | Meaning                                                                                    |
+| -------------------- | -------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| `app-cli-package`    | Yes      | —                       | Cargo package name of the CLI, in your app's workspace.                                    |
+| `app-cli-bin`        | No       | `<app-cli-package>`     | Binary name the package produces.                                                          |
+| `working-directory`  | No       | `.`                     | App directory (relative to `github.workspace`).                                            |
+| `rust-toolchain`     | No       | `auto`                  | Explicit toolchain, or `auto` (rustup files → `.tool-versions`).                           |
+| `app-cli-artifact`   | No       | `edgezero-cli`          | Uploaded artifact name.                                                                    |
+| `provider-env-clear` | No       | shipped-adapter aliases | JSON array of env var names stripped before your app's code is compiled or run. See below. |
 
 Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`.
+
+**Keeping provider secrets out of your build.** This step compiles _your_ code and
+runs your CLI's `--help`, so it strips provider credentials from the environment
+first — by re-executing itself without them, not merely unsetting them (an
+`unset` variable is still readable through `/proc/<pid>/environ` on Linux).
+
+The default list covers the providers EdgeZero ships. If your job exposes a
+credential this action cannot know about, name it so it is stripped too:
+
+```yaml
+- uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
+  with:
+    app-cli-package: my-app-cli
+    # Defaults cover Fastly/Cloudflare/Spin; add your own provider's aliases.
+    provider-env-clear: '["FASTLY_API_TOKEN","ACME_DEPLOY_TOKEN"]'
+```
+
+The value must be a JSON array of non-empty variable names; anything else fails
+the build rather than silently scrubbing nothing.
 
 ### `deploy-fastly`
 

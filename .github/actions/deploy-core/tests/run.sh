@@ -625,39 +625,91 @@ test_versions_json_pins_official_release() {
 }
 
 test_clear_provider_env_aliases() {
-  section "clear_provider_env_aliases"
+  section "provider-env-clear scrubbing"
   local lib="$ACTIONS_DIR/build-app-cli/scripts/common.sh"
 
-  # Named aliases are unset; unrelated vars survive.
-  local out
-  out=$(
-    FASTLY_API_TOKEN=secret CLOUDFLARE_API_TOKEN=secret2 KEEP_ME=kept \
-      bash -c "source '$lib'
-        clear_provider_env_aliases '[\"FASTLY_API_TOKEN\",\"CLOUDFLARE_API_TOKEN\"]'
-        printf 'fastly=[%s] cloudflare=[%s] keep=[%s]' \
-          \"\${FASTLY_API_TOKEN-unset}\" \"\${CLOUDFLARE_API_TOKEN-unset}\" \"\${KEEP_ME-unset}\""
-  )
-  assert_equals "named provider aliases are unset, unrelated vars survive" \
-    "fastly=[unset] cloudflare=[unset] keep=[kept]" "$out"
-
-  # A provider this layer knows nothing about is cleared purely because the
-  # caller named it — proving no provider is hard-coded here.
-  out=$(
-    ACME_DEPLOY_TOKEN=secret bash -c "source '$lib'
-      clear_provider_env_aliases '[\"ACME_DEPLOY_TOKEN\"]'
-      printf '%s' \"\${ACME_DEPLOY_TOKEN-unset}\""
-  )
-  assert_equals "an arbitrary caller-named alias is cleared (provider-neutral)" "unset" "$out"
-
-  # A malformed name is a configuration error, not a silent no-op.
+  # --- input validation must FAIL CLOSED -------------------------------------
+  # A permissive parse (`jq '.[]?'`) accepts these and yields NO names, silently
+  # leaving every inherited credential in scope. Each must be an error instead.
+  local bad
+  for bad in '"FASTLY_API_TOKEN"' '{}' 'null' '123' 'true' '"[]"'; do
+    assert_fails "valid-but-not-an-array input is rejected: $bad" \
+      bash -c "source '$lib'; provider_env_clear_names '$bad'"
+  done
+  assert_fails "invalid JSON is rejected" \
+    bash -c "source '$lib'; provider_env_clear_names 'not-json'"
+  assert_fails "a non-string member is rejected" \
+    bash -c "source '$lib'; provider_env_clear_names '[\"OK\",42]'"
+  assert_fails "an empty-string member is rejected" \
+    bash -c "source '$lib'; provider_env_clear_names '[\"OK\",\"\"]'"
   assert_fails "an invalid environment variable name is rejected" \
-    bash -c "source '$lib'; clear_provider_env_aliases '[\"not a name\"]'"
-  assert_fails "a non-array value is rejected" \
-    bash -c "source '$lib'; clear_provider_env_aliases 'not-json'"
+    bash -c "source '$lib'; provider_env_clear_names '[\"not a name\"]'"
+  assert_succeeds "an empty array is a no-op" \
+    bash -c "source '$lib'; provider_env_clear_names '[]'"
 
-  # An empty list is a no-op, not an error.
-  assert_succeeds "an empty list is a no-op" \
-    bash -c "source '$lib'; clear_provider_env_aliases '[]'"
+  local names
+  names=$(bash -c "source '$lib'; provider_env_clear_names '[\"A_TOKEN\",\"B_TOKEN\"]' | tr '\n' ' '")
+  assert_equals "a well-formed array yields its names" "A_TOKEN B_TOKEN " "$names"
+
+  # --- the scrub must survive /proc inspection -------------------------------
+  # `unset` leaves the ORIGINAL environment visible via /proc/<pid>/environ, so
+  # the scrub re-execs. Assert the re-exec'd process sees the names truly gone
+  # from its own environment (and, on Linux, from its /proc entry).
+  local probe="$WORK_DIR/env-probe.sh"
+  cat >"$probe" <<PROBE
+#!/usr/bin/env bash
+set -euo pipefail
+source '$lib'
+if [[ -z "\${EDGEZERO__PROVIDER__ENV_CLEARED:-}" ]]; then
+  exec_with_cleared_provider_env "\${PROBE_CLEAR:-[]}" "\$0" "\$@"
+fi
+printf 'env=[%s]' "\${SECRET_TOKEN-unset}"
+if [[ -r "/proc/\$\$/environ" ]]; then
+  if tr '\0' '\n' </proc/\$\$/environ | grep -q '^SECRET_TOKEN='; then
+    printf ' proc=[leaked]'
+  else
+    printf ' proc=[clean]'
+  fi
+else
+  printf ' proc=[n/a]'
+fi
+PROBE
+  chmod +x "$probe"
+
+  local scrubbed
+  scrubbed=$(SECRET_TOKEN=super-secret PROBE_CLEAR='["SECRET_TOKEN"]' bash "$probe")
+  case "$scrubbed" in
+    'env=[unset] proc=[clean]' | 'env=[unset] proc=[n/a]')
+      assert_equals "the re-exec'd process cannot see the cleared credential" "ok" "ok" ;;
+    *)
+      assert_equals "the re-exec'd process cannot see the cleared credential" \
+        "env=[unset] proc=[clean|n/a]" "$scrubbed" ;;
+  esac
+
+  # An unrelated variable must survive the re-exec.
+  local kept
+  kept=$(SECRET_TOKEN=s KEEP_ME=kept PROBE_CLEAR='["SECRET_TOKEN"]' bash -c "
+    source '$lib'
+    if [[ -z \"\${EDGEZERO__PROVIDER__ENV_CLEARED:-}\" ]]; then
+      exec_with_cleared_provider_env '[\"SECRET_TOKEN\"]' /bin/bash -c 'printf \"%s\" \"\${KEEP_ME-unset}\"'
+    fi")
+  assert_equals "an unrelated variable survives the scrub" "kept" "$kept"
+
+  # A malformed input must abort the CALLER, not just the validation subshell.
+  # If the failure did not propagate, the caller would exec with an EMPTY strip
+  # list — running app-controlled code with the credentials still present.
+  assert_fails "a malformed input aborts the caller (never execs with an empty strip list)" \
+    bash -c "source '$lib'
+      exec_with_cleared_provider_env '\"NOT_AN_ARRAY\"' /bin/echo reached-the-command"
+  local leaked
+  leaked=$(SECRET_TOKEN=super-secret bash -c "source '$lib'
+      exec_with_cleared_provider_env '{}' /bin/bash -c 'printf \"%s\" \"\${SECRET_TOKEN-unset}\"'" 2>/dev/null || true)
+  assert_equals "a malformed input never reaches the command with credentials intact" "" "$leaked"
+
+  # The real build script must also refuse to proceed on a malformed input.
+  assert_fails "build-app-cli.sh fails closed on a malformed provider-env-clear" \
+    env EDGEZERO__PROVIDER__ENV_CLEAR='{}' GITHUB_WORKSPACE="$WORK_DIR" \
+    bash "$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh"
 }
 
 test_toolchain_boundary() {

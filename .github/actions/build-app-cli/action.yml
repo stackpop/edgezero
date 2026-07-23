@@ -60,16 +60,75 @@ runs:
         EDGEZERO__PROJECT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
         EDGEZERO__APP__CLI__ARTIFACT: ${{ inputs['app-cli-artifact'] }}
         # This step runs APP-CONTROLLED code (cargo metadata/build, and the built
-        # CLI's `--help`), which must never see a provider token. The script
-        # UNSETS every name in this list before any of that runs — the names come
-        # from the input, so this provider-neutral layer hard-codes none.
+        # CLI's `--help`), which must never see a provider token.
+        #
+        # Two layers, because neither alone is sufficient:
+        #   1. The literal blanks below mean this step's process is EXEC'd without
+        #      the shipped adapters' credentials at all, so even its
+        #      `/proc/<pid>/environ` is clean. A `uses:`/`run:` step's environment
+        #      can only be set statically, so these must be spelled out.
+        #   2. `provider-env-clear` additionally covers aliases this action cannot
+        #      know about (a caller's own provider): the script RE-EXECS itself
+        #      with those names stripped before running anything app-controlled.
         EDGEZERO__PROVIDER__ENV_CLEAR: ${{ inputs['provider-env-clear'] }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
       run: $GITHUB_ACTION_PATH/scripts/build-app-cli.sh
 
-    # Uploads the built tarball via a pinned first-party action; it executes no
-    # application code, so the credential scrub above is the control that matters.
+    # A script-level scrub cannot reach a LATER step: each step gets its own
+    # process with the job environment re-applied. This is a non-provider step, so
+    # it blanks the aliases itself rather than inheriting job-level secrets.
     - name: Upload CLI artifact
       uses: actions/upload-artifact@v4
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
       with:
         name: ${{ steps.build.outputs['app-cli-artifact'] }}
         path: ${{ steps.build.outputs['tarball-path'] }}

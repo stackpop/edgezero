@@ -26,6 +26,15 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
+# Before ANY app-controlled command runs (cargo metadata, cargo build, the built
+# CLI's `--help`), re-exec ourselves with the caller-named provider credentials
+# stripped from the process environment. This must be a re-exec rather than
+# `unset`: `/proc/<pid>/environ` still exposes the environment we were `execve`d
+# with, so a Cargo build script could otherwise read a token we had "unset".
+if [[ -z "${EDGEZERO__PROVIDER__ENV_CLEARED:-}" && "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  exec_with_cleared_provider_env "${EDGEZERO__PROVIDER__ENV_CLEAR:-[]}" "$0" "$@"
+fi
+
 # --- Rust toolchain resolution helpers ---------------------------------------
 parse_toolchain_from_channel_file() {
   local file="$1"
@@ -139,11 +148,6 @@ require_linux_x86_64() {
 }
 
 main() {
-  # FIRST: drop every caller-named provider credential alias. Everything below
-  # runs APP-CONTROLLED code (cargo metadata, cargo build, the built CLI's
-  # `--help`), which must never see a provider token.
-  clear_provider_env_aliases "${EDGEZERO__PROVIDER__ENV_CLEAR:-[]}"
-
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"
   local cli_package="${EDGEZERO__APP__CLI__PACKAGE:?input 'app-cli-package' is required}"

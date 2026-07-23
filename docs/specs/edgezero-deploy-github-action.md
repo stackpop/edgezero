@@ -158,13 +158,14 @@ never builds the EdgeZero monorepo CLI.
 
 **Inputs**
 
-| Input               | Required | Default             | Contract                                                                                                                                                         |
-| ------------------- | -------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `app-cli-package`   | Yes      | none                | Cargo package name of the CLI to build, defined in the application's own workspace. `build-app-cli` builds this package from the application checkout.           |
-| `app-cli-bin`       | No       | `<app-cli-package>` | Binary name produced by `app-cli-package`. Defaults to the package name (the generated downstream CLI names its bin after the package).                          |
-| `working-directory` | No       | `.`                 | Application directory (relative to `github.workspace`) containing the workspace/lockfile that defines `app-cli-package`. Must resolve inside `github.workspace`. |
-| `rust-toolchain`    | No       | `auto`              | Explicit toolchain, or `auto` to follow the application toolchain resolution precedence (§7).                                                                    |
-| `app-cli-artifact`  | No       | `edgezero-cli`      | Name of the uploaded artifact.                                                                                                                                   |
+| Input                | Required | Default                 | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------- | -------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `app-cli-package`    | Yes      | none                    | Cargo package name of the CLI to build, defined in the application's own workspace. `build-app-cli` builds this package from the application checkout.                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `app-cli-bin`        | No       | `<app-cli-package>`     | Binary name produced by `app-cli-package`. Defaults to the package name (the generated downstream CLI names its bin after the package).                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `working-directory`  | No       | `.`                     | Application directory (relative to `github.workspace`) containing the workspace/lockfile that defines `app-cli-package`. Must resolve inside `github.workspace`.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `rust-toolchain`     | No       | `auto`                  | Explicit toolchain, or `auto` to follow the application toolchain resolution precedence (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `provider-env-clear` | No       | shipped-adapter aliases | JSON ARRAY of environment variable names stripped from the process before any app-controlled command runs (`cargo metadata`, `cargo build`, the built CLI's `--help`). The action re-execs itself with these removed — `unset` alone would leave them readable via `/proc/<pid>/environ`. Keeps this provider-neutral layer free of hard-coded provider names; the default covers the adapters EdgeZero ships, and a consumer with another provider extends it (e.g. `'["ACME_DEPLOY_TOKEN"]'`). Rejected unless it is an array of non-empty identifier strings — a permissive parse would silently scrub nothing. |
+| `app-cli-artifact`   | No       | `edgezero-cli`          | Name of the uploaded artifact.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 There is intentionally no `adapters` / features input. The application's own
 `Cargo.toml` already pins which adapters compile into its CLI (through the
@@ -368,8 +369,10 @@ a previous version (§5.4.3), the caller threads `previous-version` into
   draft). Reuses the engine for build/source/credential scoping; only the
   `--stage` flag differs.
 - **`healthcheck-fastly`** — thin wrapper: downloads the CLI artifact, takes
-  `fastly-api-token`, `fastly-service-id`, `fastly-version`, `domain`,
-  `deploy-to` (`production`/`staging`), retry/timeout inputs; runs
+  `fastly-api-token` (STAGING only — a production probe curls the public domain,
+  needs no credential, and is passed none), `fastly-service-id`,
+  `fastly-version`, `domain`, `deploy-to` (`production`/`staging`),
+  retry/timeout inputs; runs
   `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
   `FASTLY_API_TOKEN` in the step env; outputs `healthy` and `status-code`. It
   **exits non-zero after retries when the probe is unhealthy** (so a caller can
@@ -387,7 +390,9 @@ a previous version (§5.4.3), the caller threads `previous-version` into
 
 `healthcheck-fastly` and `rollback-fastly` map `fastly-service-id` → the
 `--service-id` flag and `fastly-api-token` → step-scoped `FASTLY_API_TOKEN`
-(same credential discipline as deploy). They reuse only the CLI-artifact download
+(same credential discipline as deploy). The one exception is a PRODUCTION
+healthcheck: it needs no credential, so the wrapper passes an empty token and the
+script does not require one. They reuse only the CLI-artifact download
 and credential-scoping helpers from `deploy-core`; they skip source resolution,
 toolchain install, build, and cache, since they operate on Fastly service
 versions via the API, not on application source. They need no Fastly CLI install
@@ -1032,7 +1037,8 @@ The design is implemented when:
 10. Third-party actions are pinned to readable released tags.
 11. Fastly staging lifecycle works end to end: `deploy-fastly` `stage: true`
     stages a draft and outputs `fastly-version`; `healthcheck-fastly` probes the
-    staged version (via its staging IP) and exits non-zero when unhealthy;
+    staged version (via its staging IP, the one probe that needs the token) and
+    exits non-zero when unhealthy;
     `rollback-fastly` deactivates the staged version (or, for production,
     activates the `rollback-to` version captured from `deploy-fastly`'s
     `previous-version` output). All three thread `--service-id` and

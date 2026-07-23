@@ -55,6 +55,12 @@ reference to port from. Most transfer with light changes:
 ## Implementation phases
 
 1. **`build-app-cli` action**
+   - `provider-env-clear` input (JSON array, defaults to the shipped adapters'
+     credential aliases): the action RE-EXECS itself with these names stripped
+     before running any app-controlled command, because `unset` leaves them
+     readable through `/proc/<pid>/environ`. The names come from the input so this
+     provider-neutral layer hard-codes none; the value must be an array of
+     non-empty identifier strings or the build fails closed.
    - Required `app-cli-package` input: the Cargo package name of the CLI defined in
      the application's own workspace. Fail if missing or not found in the app
      workspace under `working-directory`.
@@ -160,7 +166,8 @@ reference to port from. Most transfer with light changes:
      runs `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
      `FASTLY_API_TOKEN` in the step env; outputs `rolled-back-to`.
    - Both map `fastly-service-id` → `--service-id` and `fastly-api-token` →
-     step-scoped `FASTLY_API_TOKEN`. They reuse only the CLI-artifact download +
+     step-scoped `FASTLY_API_TOKEN` — except a PRODUCTION healthcheck, which
+     needs no credential and is passed an empty token. They reuse only the CLI-artifact download +
      credential-scoping helpers from `deploy-core`; no source resolution,
      toolchain, build, cache, or Fastly CLI install (they call the Fastly API).
      Carry no orchestration policy — the caller wires stage → healthcheck →
