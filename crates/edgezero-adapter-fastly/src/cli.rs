@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::ChildStdin;
 use std::process::Command;
 use std::process::Stdio;
+use std::process::id as process_id;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, gc_classify_root,
+    CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, chunk_lengths, gc_classify_root,
     gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
-    resolve_fastly_config_value, sha256_hex, value_is_pointer_kind,
+    resolve_fastly_config_value, sha256_hex, value_is_pointer_kind, verify_writer_split_layout,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -165,6 +166,8 @@ struct GcPlan {
     /// Chunk-shaped entries we could NOT prove our writer produced, so left
     /// untouched. Surfaced so an operator can see we declined to judge them.
     unprovable: usize,
+    /// Non-fatal problems to print — see `GcClassification::warnings`.
+    warnings: Vec<String>,
 }
 
 /// What one pass of `config gc`'s delete loop actually did.
@@ -196,6 +199,9 @@ struct GcClassification {
     protected: HashSet<String>,
     /// Count of entries classified as roots, for the summary line.
     roots: usize,
+    /// Non-fatal problems the operator should see — currently roots that are
+    /// not runtime-readable and so can never be reclaimed automatically.
+    warnings: Vec<String>,
 }
 
 /// One `config-store-entry list` item.
@@ -1279,9 +1285,62 @@ fn write_fastly_local_config_store(
         }
     }
 
-    fs::write(path, doc.to_string())
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    atomically_replace_file(path, &raw, &doc.to_string())?;
     Ok(warnings)
+}
+
+/// Replace `path`'s contents ATOMICALLY, refusing to clobber a concurrent edit.
+///
+/// The local push is a read-modify-write of the developer's `fastly.toml`, and
+/// writing back in place had two failure modes: an interrupted or disk-exhausted
+/// write truncated the real file, and a concurrent push silently dropped
+/// whichever sibling edit landed first.
+///
+/// So, in order:
+///
+/// 1. Re-read the file and require it to still hold the exact bytes this rewrite
+///    started from (`expected_before`). If another writer moved it in the
+///    meantime, fail WITHOUT writing rather than overwrite their edit. (This
+///    detects the conflict instead of locking it out — a lock file would leave
+///    stale state behind whenever a push is interrupted, which is the worse
+///    failure mode for a developer-facing command.)
+/// 2. Write the new contents to a temp file in the SAME directory, so the
+///    rename below cannot cross a filesystem boundary.
+/// 3. `rename` it over the target. That is atomic on POSIX, so a concurrent
+///    reader sees either the old file or the new one — never a partial write.
+///
+/// The temp file is cleaned up if the rename fails.
+fn atomically_replace_file(
+    path: &Path,
+    expected_before: &str,
+    contents: &str,
+) -> Result<(), String> {
+    let current = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("failed to re-read {}: {err}", path.display())),
+    };
+    if current != expected_before {
+        return Err(format!(
+            "{} changed on disk while this push was preparing its rewrite; nothing was written. \
+             Re-run the push to pick up the other change.",
+            path.display()
+        ));
+    }
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fastly.toml");
+    // The pid keeps two concurrent pushes off each other's temp file.
+    let tmp = dir.join(format!(".{file_name}.edgezero-{}.tmp", process_id()));
+    fs::write(&tmp, contents).map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _cleanup = fs::remove_file(&tmp);
+        return Err(format!("failed to replace {}: {err}", path.display()));
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------------
@@ -1626,6 +1685,7 @@ fn gc_fastly_config_store(
         retained_recent,
         roots,
         unprovable,
+        warnings,
     } = plan;
 
     let doomed_count: usize = doomed.iter().map(Vec::len).sum();
@@ -1634,6 +1694,7 @@ fn gc_fastly_config_store(
         items.len(),
         doomed.len(),
     )];
+    out.extend(warnings);
     if unprovable > 0 {
         // NEVER silent: these entries look like chunk keys but we could not
         // prove our writer produced them, so we left them alone. Say so, or the
@@ -1821,6 +1882,7 @@ fn classify_store_entries(
     let mut live: HashSet<String> = HashSet::new();
     let mut protected: HashSet<String> = HashSet::new();
     let mut roots = 0_usize;
+    let mut warnings: Vec<String> = Vec::new();
     for item in items {
         let is_chunk_shaped = chunk_key_generation_any(&item.item_key).is_some();
         let classified = match gc_classify_root(&item.item_key, &item.item_value) {
@@ -1863,12 +1925,33 @@ fn classify_store_entries(
                 item.item_key
             )
         })?;
+        // Same exact-split predicate the RUNTIME resolver applies. The content
+        // checks above only prove the bytes; a pointer whose boundaries are not
+        // the ones this writer emits reassembles correctly here but is REJECTED
+        // at runtime -- so GC would otherwise call it a healthy live root while
+        // the guest 500s on it, and its generation can never satisfy
+        // `prove_generation` either, making it permanently unreclaimable.
+        //
+        // We still protect it (fail-closed: never delete on a judgement we are
+        // unsure of), but we no longer call it healthy silently -- the operator
+        // gets told it is unreadable and will not be reclaimed automatically.
+        if let Err(err) =
+            verify_writer_split_layout(&item.item_key, &assembled, &chunk_lengths(&pointer.chunks))
+        {
+            warnings.push(format!(
+                "warning: root `{}` is NOT runtime-readable ({err}). Its chunks are kept, but this \
+                 generation can never be proven writer-produced, so `config gc` will never reclaim \
+                 it. Re-run `config push` for this key to rewrite it, then re-run `config gc`.",
+                item.item_key
+            ));
+        }
         live.extend(pointer.chunks.into_iter().map(|chunk| chunk.key));
     }
     Ok(GcClassification {
         live,
         protected,
         roots,
+        warnings,
     })
 }
 
@@ -1908,6 +1991,7 @@ fn plan_gc_reclamation(
         live,
         protected,
         roots,
+        warnings,
     } = classify_store_entries(items, &value_by_key)?;
 
     // ---- 2. Per-root live-config age (best-effort; see the guard below) ----
@@ -2013,6 +2097,7 @@ fn plan_gc_reclamation(
         retained_recent,
         roots,
         unprovable,
+        warnings,
     })
 }
 
@@ -4847,8 +4932,10 @@ echo 'unexpected' >&2; exit 1
     fn read_config_entry_errors_on_malformed_pointer() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Root value is JSON but neither a BlobEnvelope nor a valid pointer.
-        let bad_json = r#"{"some_field":"not a pointer or envelope"}"#;
+        // Root value ANNOUNCES our chunk-pointer kind but is malformed. It must
+        // be pointer-kind: arbitrary JSON is a legitimate config-store value and
+        // now passes through untouched, so it would not reach the corrupt path.
+        let bad_json = r#"{"edgezero_kind":"fastly_config_chunks","some_field":"x"}"#;
         let item_json = format!(
             r#"{{"item_value":{}}}"#,
             serde_json::to_string(bad_json).unwrap()
@@ -6280,6 +6367,69 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
+    /// GC and the RUNTIME must agree on what a readable pointer is. A pointer
+    /// whose chunks reassemble to the correct bytes along boundaries this writer
+    /// would never choose is REJECTED by the runtime resolver, so GC must not
+    /// silently report it as a healthy root: the guest cannot read it, and its
+    /// generation can never satisfy `prove_generation`, so it is permanently
+    /// unreclaimable. GC still keeps it (fail-closed) but must SAY so.
+    #[cfg(unix)]
+    #[test]
+    fn gc_warns_that_a_non_writer_split_root_is_not_runtime_readable() {
+        use crate::chunked_config::CHUNK_PAYLOAD_TARGET;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // Just over the entry limit => a full chunk plus a short remainder with
+        // room to absorb the shifted bytes.
+        let envelope = gen_envelope("shifted");
+        let sha = sha256_hex(envelope.as_bytes());
+        // Re-split 2 bytes early: still within every metadata bound the pointer
+        // validator checks, but NOT where this writer splits.
+        let cut = CHUNK_PAYLOAD_TARGET.saturating_sub(2);
+        let head = envelope.get(..cut).expect("ascii boundary");
+        let tail = envelope.get(cut..).expect("ascii boundary");
+        let key0 = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{sha}.0");
+        let key1 = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{sha}.1");
+        let pointer_json = serde_json::json!({
+            "chunks": [
+                {"key": key0, "len": head.len(), "sha256": sha256_hex(head.as_bytes())},
+                {"key": key1, "len": tail.len(), "sha256": sha256_hex(tail.as_bytes())},
+            ],
+            "data_sha256": "",
+            "edgezero_kind": "fastly_config_chunks",
+            "envelope_len": envelope.len(),
+            "envelope_sha256": sha,
+            "version": 1_u8,
+        })
+        .to_string();
+
+        let stamp = stamp_secs_ago(604_800);
+        let listing = vec![
+            (TEST_CONFIG_ID.to_owned(), stamp.clone(), pointer_json),
+            (key0.clone(), stamp.clone(), head.to_owned()),
+            (key1.clone(), stamp, tail.to_owned()),
+        ];
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, false).expect("gc must not abort on such a root");
+        let rendered = out.join("\n");
+        assert!(
+            rendered.contains("NOT runtime-readable"),
+            "GC must warn that this root is unreadable rather than call it healthy: {rendered}"
+        );
+        // Fail-closed: nothing is deleted, including its chunks.
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in [&key0, &key1] {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "must not delete a chunk of an unreadable root: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
     /// A dry-run lists exactly what it would delete, and deletes nothing.
     #[cfg(unix)]
     #[test]
@@ -6878,6 +7028,56 @@ echo 'unexpected' >&2; exit 1
             before,
             "dry-run must not edit fastly.toml"
         );
+    }
+
+    /// A concurrent edit to `fastly.toml` between the push's read and its write
+    /// must NOT be clobbered: the rewrite refuses and reports, leaving the other
+    /// writer's file intact so no sibling change is silently lost.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_refuses_to_clobber_a_concurrent_edit() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        // Simulate: we read one thing, another writer moved the file, we write.
+        let stale_view = "name = \"demo\"\n";
+        fs::write(&fastly_toml, "name = \"demo\"\nother = \"sibling edit\"\n")
+            .expect("concurrent write");
+
+        let err = atomically_replace_file(&fastly_toml, stale_view, "name = \"clobbered\"\n")
+            .expect_err("a concurrent edit must not be overwritten");
+        assert!(
+            err.contains("changed on disk"),
+            "must report the conflict: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            "name = \"demo\"\nother = \"sibling edit\"\n",
+            "the other writer's file must survive untouched"
+        );
+    }
+
+    /// The happy path replaces contents and leaves no temp file behind.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_replaces_atomically_and_cleans_up() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "before\n").expect("seed");
+
+        atomically_replace_file(&fastly_toml, "before\n", "after\n").expect("replace");
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            "after\n",
+            "contents must be replaced"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file may be left behind");
     }
 
     /// PARITY: the dry-run's reported orphan count equals the number of chunk

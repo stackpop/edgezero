@@ -3079,7 +3079,13 @@ ids = ["app_config"]
 ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        // A fake `fastly` on PATH records any invocation, so an ordering
+        // regression shows up as a logged call rather than a real shell-out.
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_logging(&oplog);
+        let _prepend = PathPrepend::new(fake.path());
 
         let mut args = push_args(&manifest, "fastly");
         // A reserved-namespace --key: infeasible, and preflight-detectable.
@@ -3092,6 +3098,11 @@ ids = ["default"]
         assert!(
             err.contains("reserved infix"),
             "must fail at preflight (before any remote read), not on a shell-out: {err}"
+        );
+        assert!(
+            !oplog.exists(),
+            "preflight must reject BEFORE any `fastly` invocation; log: {:?}",
+            fs::read_to_string(&oplog).unwrap_or_default()
         );
     }
 
@@ -3127,7 +3138,14 @@ ids = ["app_config"]
 ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        // A fake `fastly` on PATH records any invocation, so an ordering
+        // regression shows up as a logged call rather than a real shell-out
+        // against the developer's authenticated CLI.
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_logging(&oplog);
+        let _prepend = PathPrepend::new(fake.path());
         // A body large enough to force chunking (envelope > 8 000 bytes). The
         // huge `greeting` passes `#[validate(length(min = 1))]`.
         let big_app_config = format!(
@@ -3149,6 +3167,12 @@ ids = ["default"]
             err.contains("character limit"),
             "must fail at the offline body-aware preflight (before any remote read), not on a \
              shell-out: {err}"
+        );
+        // The decisive assertion: NO list/describe/update/delete was attempted.
+        assert!(
+            !oplog.exists(),
+            "the body-aware preflight must reject BEFORE any `fastly` invocation; log: {:?}",
+            fs::read_to_string(&oplog).unwrap_or_default()
         );
     }
 
@@ -3759,6 +3783,26 @@ ids = ["default"]
     /// stdout/stderr and exits with the given code. Payloads are written
     /// to sidecar files so shell-active chars are never re-interpreted.
     #[cfg(unix)]
+    /// Build a tempdir containing a `fastly` script that APPENDS every
+    /// invocation to `oplog` and fails. Injected via PATH so an ordering
+    /// regression is caught as a recorded invocation instead of silently
+    /// shelling out to the developer's real, authenticated Fastly CLI.
+    #[cfg(unix)]
+    fn fake_fastly_logging(oplog: &Path) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script_path = tmp.path().join("fastly");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\necho 'fake fastly: refusing' >&2\nexit 1\n",
+            log = oplog.display(),
+        );
+        fs::write(&script_path, &script).expect("write fastly script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        tmp
+    }
+
     fn fake_spin_returning(
         stdout_body: &str,
         stderr_body: &str,

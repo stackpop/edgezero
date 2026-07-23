@@ -145,14 +145,13 @@ mod tests {
     #[test]
     fn corrupt_chunk_pointer_maps_to_internal_not_unavailable() {
         use futures::executor::block_on;
-        // A root value that is neither a valid BlobEnvelope nor a valid
-        // FastlyChunkPointer triggers the resolver's "malformed pointer"
-        // path. We do NOT add the chunks the (would-be) pointer expects,
-        // so any chunk fetch would also fail — but the resolver bails
-        // earlier on the parse failure.
+        // A root value that ANNOUNCES our chunk-pointer kind but is malformed.
+        // It must be a pointer-kind value: an unrelated raw value is a
+        // legitimate Config Store entry and passes through untouched, so it
+        // would not exercise the corruption path at all.
         let store = FastlyConfigStore::from_entries([(
             "app_config".to_owned(),
-            "not-a-valid-envelope-or-pointer".to_owned(),
+            r#"{"edgezero_kind":"fastly_config_chunks"}"#.to_owned(),
         )]);
         let err = block_on(store.get("app_config"))
             .expect_err("corrupt root must map to a ConfigStoreError");

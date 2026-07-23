@@ -2878,21 +2878,33 @@ materialises this mapping ONCE near the call site:
 //   NotFound { name: String }     // struct-like
 //   Unavailable                   // unit
 //   Validation(String)            // tuple
-fn map_secret_error(err: SecretError, field_path: &str, store_id: &str, key: &str) -> EdgeError {
+// SECURITY: the stored key NAME, the store id, and the provider's
+// message/source are deliberately UNUSED. They are blob- or
+// provider-controlled strings that can reveal the secret or the
+// infrastructure, and these messages reach the HTTP body and the logs.
+// Every branch names only the offending FIELD, which is schema (safe).
+// They stay in the signature so the redaction is visible at the one
+// place these values could otherwise have been formatted.
+fn map_secret_error(
+    err: SecretError,
+    field_name: &str,
+    _store_id: &str,
+    _key_name: &str,
+) -> EdgeError {
     match err {
-        SecretError::NotFound { name } => EdgeError::ConfigOutOfDate {
-            message: format!("secret `{name}` in store `{store_id}` not found"),
-            field_path: field_path.to_owned(),
-        },
-        SecretError::Validation(msg) => EdgeError::ConfigOutOfDate {
-            message: format!("secret `{key}` in store `{store_id}` rejected: {msg}"),
-            field_path: field_path.to_owned(),
-        },
+        SecretError::NotFound { .. } => EdgeError::config_out_of_date(
+            format!("the secret referenced by `{field_name}` was not found in its store (identifier redacted)"),
+            field_name.to_owned(),
+        ),
+        SecretError::Validation(_msg) => EdgeError::config_out_of_date(
+            format!("the secret referenced by `{field_name}` was rejected by its store (details redacted)"),
+            field_name.to_owned(),
+        ),
         SecretError::Unavailable => EdgeError::service_unavailable(format!(
-            "secret store `{store_id}` unreachable"
+            "the secret store for `{field_name}` is unreachable"
         )),
-        SecretError::Internal(source) => EdgeError::internal(anyhow::anyhow!(
-            "secret `{key}` in store `{store_id}` produced unexpected store error: {source}"
+        SecretError::Internal(_source) => EdgeError::internal(anyhow::anyhow!(
+            "secret resolution for `{field_name}` failed (details redacted)"
         )),
     }
 }
@@ -4030,13 +4042,20 @@ validate --strict` runs at push time, so env-overlay drift
 Once the extractor deserialises `data` into `C`, it calls
 `Validate::validate(&cfg)`. Validation failures map to:
 
-- `EdgeError::ConfigOutOfDate` — the validator's report names
-  exactly which field violated which constraint. Same surface
-  as the deserialise-failure case (§6.3): operator action is
+- `EdgeError::ConfigOutOfDate` — naming ONLY the field that
+  violated its constraint. Same surface as the
+  deserialise-failure case (§6.3): operator action is
   "re-push the typed config; the deployed `<name>.toml` is
   out of bounds for the deployed code".
-- A `log::error!` line with the full validator report so
-  dashboards see the violation, not just the 5xx.
+- A `log::error!` line naming the same field.
+
+**The validator's rendered report is never emitted — not in
+the response and not in the log.** At this point the secret
+walk has already replaced `#[secret]` fields with their
+RESOLVED values, and `validator`'s error params echo the
+rejected value, so `validation_err.to_string()` would put a
+live secret into the HTTP body and the log line. Only the
+structural field name escapes; see §4.3.
 
 Rationale for validating at every extract: the runtime trusts
 the BLOB's authenticity (sha verified) but NOT its
@@ -6595,18 +6614,34 @@ For each of axum / cloudflare / fastly / spin:
   values.
 
 **Fastly-specific chunking tests.** Q6's Fastly cap of
-8 000 characters is a per-entry platform limit, not an
-app-level config limit. Tests cover both storage forms:
+8 000 CHARACTERS is a per-entry platform limit, not an
+app-level config limit.
+
+**The writer's own threshold is 8 000 UTF-8 BYTES**, which is
+NOT the same number and must be pinned separately. Bytes are
+always ≥ characters, so the byte threshold is strictly
+conservative — it can never emit an entry that overflows the
+platform's character cap — and it is FIXED for v1 so values
+written by earlier releases stay readable. A multibyte
+envelope under 8 000 characters but over 8 000 bytes is
+therefore CHUNKED, and any test asserting "8 000 characters
+stays direct" must use single-byte content or be stated in
+bytes.
+
+Tests cover both storage forms:
 
 - A blob whose envelope JSON is exactly 8 000
-  characters pushes as a direct root value. The runtime
+  BYTES pushes as a direct root value. The runtime
   reads it back and validates.
-- A blob whose envelope JSON is 8 001 characters pushes
+- A blob whose envelope JSON is 8 001 BYTES pushes
   via content-addressed chunks plus a root pointer. The
   root pointer is written LAST. The runtime reads it
   back through `FastlyConfigStore::get`, reconstructs
   the normal `BlobEnvelope`, and validates the same
   typed struct.
+- A multibyte blob under 8 000 characters but over 8 000
+  bytes chunks, and resolves back to the original bytes —
+  the v1 read-compatibility case.
 - `config diff --adapter fastly` and push
   skip-on-equal both read through the same pointer
   resolver; they compare the reconstructed envelope,
@@ -6616,9 +6651,20 @@ app-level config limit. Tests cover both storage forms:
   Retrying the same push is idempotent because chunk
   keys include the full-envelope SHA.
 - Missing chunk, chunk hash mismatch, full-envelope
-  hash mismatch, and malformed pointer all fail with an
+  hash mismatch, and a malformed POINTER all fail with an
   actionable error naming the root key. These are
   corrupt platform state, not "missing key".
+- **Raw values pass through untouched.** A Config Store holds
+  arbitrary entries, so only a value announcing
+  `edgezero_kind == "fastly_config_chunks"` is resolved.
+  Anything else — a plain string like `"value_a"`, the
+  documented `greeting = "hello"`, unrelated JSON, a direct
+  `BlobEnvelope` — is returned verbatim by
+  `FastlyConfigStore::get`, satisfying the shared
+  `ConfigStore` contract tests. Envelope integrity is checked
+  by the typed app-config layer, not the store. A value
+  carrying `edgezero_kind` with an unrecognised value IS an
+  error: that field is our reserved namespace.
 - `config push --adapter fastly --local` mirrors the
   same direct-or-chunked representation inside
   `[local_server.config_stores.<id>.contents]`, so local
