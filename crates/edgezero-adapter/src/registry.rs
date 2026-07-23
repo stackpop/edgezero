@@ -243,6 +243,51 @@ pub trait Adapter: Sync + Send {
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
 
+    /// Reclaim chunk entries that no LIVE config pointer references.
+    ///
+    /// Deliberately NOT part of `config push`. On an eventually-consistent
+    /// store, a chunk may only be deleted once the pointer that referenced it
+    /// has stopped being served everywhere — and the platform may record no
+    /// pointer-supersession time (Fastly does not: `updated_at` is not bumped
+    /// by an upsert) and offer no compare-and-swap with which to record one
+    /// safely. Only the OPERATOR knows their deploy history, so `older_than`
+    /// carries that assertion.
+    ///
+    /// **`older_than` is a STORE-WIDE assertion, and it is stronger than "old
+    /// creations are no longer served".** `config gc` sweeps every root in the
+    /// selected store, so the caller asserts: **no root in this store changed
+    /// within the window, AND no writer is targeting the store** while `gc` runs.
+    /// A recently-changed sibling root — especially one that shrank to a direct
+    /// value, leaving no live chunk to age by — makes a wide window unsafe. Direct
+    /// trait callers MUST honour this stronger contract, not the weaker
+    /// paraphrase. A `dry_run` lists exactly what would be deleted, for review.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the adapter has no `config gc` impl, if the platform
+    /// state cannot be read, or if it cannot be classified with confidence —
+    /// reclamation FAILS CLOSED: when in doubt, nothing is deleted.
+    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors `push_config_entries`: manifest root, adapter manifest path, component selector, resolved store, push-time overlay, the operator's age assertion, and dry-run — each distinct; an aggregate struct is a worse ergonomic trade for implementers."
+    )]
+    fn gc_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _push_ctx: &AdapterPushContext<'_>,
+        _older_than_secs: u64,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "adapter `{}` does not implement `config gc`",
+            self.name()
+        ))
+    }
+
     /// Store kinds whose logical-id namespaces the adapter merges into
     /// a single backend at runtime — declaring the SAME logical id
     /// under two merged kinds causes silent write collisions because
@@ -262,6 +307,26 @@ pub trait Adapter: Sync + Send {
 
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
+
+    /// Reject a config `(key, body)` that this adapter cannot store, BEFORE any
+    /// provider I/O. Called by `config push` ahead of the remote read, so an
+    /// infeasible push fails offline instead of after a `list`/`describe`
+    /// round-trip.
+    ///
+    /// `body` is the serialised blob-envelope JSON that would be written, so
+    /// body-dependent feasibility (e.g. Fastly's derived chunk-key length and
+    /// pointer-size limits, which depend on whether the value chunks) can be
+    /// checked here rather than during the later write expansion.
+    ///
+    /// Default: accept. The Fastly adapter overrides this to reject a reserved
+    /// or over-limit key and to run the full chunk expansion offline.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if the push is infeasible.
+    #[inline]
+    fn preflight_config_write(&self, _key: &str, _body: &str) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Provision the platform resources backing each store id the
     /// user declared. Returns a list of human-readable

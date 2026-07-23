@@ -236,14 +236,18 @@ edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] 
 - `--runtime-config <path>` — adapter runtime configuration file. Currently only consumed by Spin, which reads `[key_value_store.<label>]` stanzas to dispatch per-backend (`type = "spin"` → SQLite-direct, `redis` / `azure_cosmos` / other → error pointing at the native backend CLI). Default: `runtime-config.toml` next to the adapter manifest. Ignored by the Fermyon Cloud branch — cloud pushes consult only `spin.toml`'s `[application].name`.
 - `--no-diff` — skip the inline diff render of local-vs-remote before writing. By default the push reads back the current remote blob and shows what would change.
 - `--yes` / `-y` — skip the confirmation prompt and write unconditionally (for non-interactive/CI use). Without it, an interactive push prompts before overwriting a differing remote blob.
-- `--dry-run` — print the would-be operations without performing them. No file writes, no shell-outs. Because dry-run's contract is to show the diff, it needs a remote read-back — so it errors against **Spin Cloud** (whose read-back is unsupported); use `--local` for the on-disk SQLite write, or drop `--dry-run` and write unconditionally with `--yes`.
+- `--dry-run` — print the would-be operations without performing them. It makes **no WRITE and no delete** — but it is NOT fully offline: because dry-run's contract is to show the diff, it does a **read-only** remote read-back (a shell-out on Fastly/Cloudflare). That read is **one logical read** but may be **several provider calls** for a chunked Fastly value (describe the root pointer, then describe each referenced chunk to reassemble it). It errors against **Spin Cloud** (whose read-back is unsupported); use `--local` for the on-disk SQLite write, or drop `--dry-run` and write unconditionally with `--yes`.
 
 **Two flavours (same split as `config validate`):**
 
 - The default `edgezero` binary **does not push** — `config push` on the bundled binary always errors with a pointer to the typed downstream CLI. The blob app-config model needs the app's typed `AppConfig<C>` (for validation and canonical serialisation), which the bundled binary doesn't embed.
 - A downstream CLI built on `edgezero-cli` that owns its app-config struct (e.g. `app-demo-cli`) runs the **typed** push: strict pre-flight validation (`validator::Validate`, secret presence, store-ref membership, adapter checks), then serialises the struct into a single [`BlobEnvelope`](./blob-app-config-migration.md) — one JSON `{ version, generated_at, sha256, data }` value written under one config-store key. `data` carries **every field VERBATIM, including `#[secret]` / `#[secret(store_ref)]` fields**: their value at rest is the operator-supplied key NAME (e.g. `"demo_api_token"`), which the runtime `AppConfig<C>` extractor swaps for the resolved secret at request time. Nothing is flattened or stripped, and the blob never contains resolved secret bytes.
 
-**Per-adapter behaviour:** every adapter writes the **single blob envelope** as one `(key, envelope_json)` config-store entry (the store-resolution and shell mechanics below are unchanged; see [the blob migration guide](./blob-app-config-migration.md#per-adapter-mechanics) for the authoritative per-adapter blob details, including Fastly's oversized-envelope chunking).
+**Per-adapter behaviour:** every adapter writes the **single blob envelope** as one `(key, envelope_json)` config-store entry — with one exception: on Fastly, an oversized envelope is split into multiple content-addressed chunk entries plus a root pointer, all under the one logical key. Fastly's documented per-entry cap is 8,000 **characters**; EdgeZero splits at 8,000 **bytes**, a deliberately conservative v1 threshold (bytes are always ≥ characters, so it never over-stores) that is fixed so previously stored values stay readable.
+
+Reclaiming the superseded chunks differs by target: a **`--local`** re-push prunes the prior generation as part of the same file rewrite, whereas a **cloud** push only ever writes — it never deletes. Cloud orphans are reclaimed by running [`config gc`](#config-gc) explicitly.
+
+The store-resolution and shell mechanics below are unchanged; see [the blob migration guide](./blob-app-config-migration.md#per-adapter-mechanics) for the authoritative per-adapter blob details, including Fastly's oversized-envelope chunking.
 
 | `--adapter`  | Behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -303,6 +307,93 @@ app-demo-cli config diff --adapter fastly --exit-code --format json
 ```
 
 **Exit codes:** `0` on success (or when there are no changes); with `--exit-code`, `0` when local and remote match and a non-zero code when they differ. Errors return non-zero with a one-line diagnostic.
+
+### edgezero config gc
+
+Reclaim orphaned **chunk entries** from a config store. Only Fastly needs
+this: its Config Store caps a value at 8 000 characters, so an oversized
+app-config envelope is split into content-addressed chunks plus a root
+pointer. Because the chunk keys are content-addressed, changing the config
+produces an entirely new set — and a cloud `config push` **deletes
+nothing**, so the previous generation is left orphaned (inert, but it
+accumulates). `config gc` is how you reclaim it.
+
+Unlike `push`/`validate`/`diff`, `config gc` is **untyped**: it inspects the
+store's physical entries, not your `AppConfig<C>`. The bundled `edgezero`
+binary can run it.
+
+Local (`fastly.toml`) pushes prune their own prior chunks eagerly and never
+need `gc`.
+
+```bash
+edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-than <dur>] [--no-env] [--yes]
+```
+
+**Arguments:**
+
+- `--adapter <name>` — target adapter. Only `fastly` implements reclamation; others error.
+- `--manifest <path>` — manifest path (default: `edgezero.toml`).
+- `--store <id>` — logical config-store id to reclaim. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
+- `--older-than <dur>` — **your safety assertion** (see below). Accepts `7d`, `24h`, `90m`, `30s`, or a bare number of seconds.
+- `--no-env` — ignore `EDGEZERO__STORES__CONFIG__<ID>__NAME`, so the logical store id `<ID>` is used as the physical store name. This is **not** the app-config overlay that `validate`/`push`/`diff` mean by `--no-env` — `gc` never loads your typed app config. Because that variable is normally what maps a logical id onto the real store, `--no-env` **changes which store is swept**, and this command deletes. Check the store id `gc` reports before passing `--yes`.
+- `--yes` — actually delete. **Without it, `config gc` is a dry run** that names every key and age it would delete and deletes nothing.
+
+**`--older-than` is an assertion only you can make, and it covers the whole
+store.** Fastly's config store is eventually consistent and offers no
+compare-and-swap, so nothing in the API records _when a pointer stopped being
+served by every POP_ — which is the one fact needed to delete a chunk safely.
+You know it.
+
+`config gc` sweeps **every root in the selected physical store**, so
+`--older-than <dur>` asserts: _"no root in this store changed within this
+window, and no writer is targeting it."_ Not merely the one config you have in
+mind — a sibling root you re-pushed minutes ago is enough to make a wide window
+unsafe. So:
+
+- it is **required** for `--yes`, and **`--older-than 0` is rejected** there — a zero window asserts nothing;
+- pick a window that is **at least Fastly's propagation time** (so POPs have stopped serving the superseded pointer) and **no longer than the time since _any_ root in this store last changed** (so it's a window you actually observed);
+- **do not run `config gc` alongside a `config push`** to the same store;
+- dry-run first on a store with many roots — it lists every orphan with its age.
+
+`config gc` fails closed: an unreadable, paginated, or duplicate-keyed
+listing; a root it cannot classify; a pointer whose chunk list is internally
+inconsistent or that does not reconstruct the envelope it claims; an unreadable
+timestamp; or a live pointer referencing a key absent from the listing — all
+abort with **nothing deleted**. It never deletes a chunk a live pointer
+references, however old, and never deletes a root.
+
+It also **only deletes entries that are byte-identical to what `config push`
+itself would have written** for the bytes they contain — same split boundaries,
+same content-addressed keys, same count. Anything else in the chunk namespace
+(plain text, another tool's data, a half-written generation) is **left untouched
+and reported**, not deleted and not fatal — one foreign entry does not block
+reclaiming the rest of the store. Note this is a format check, not a proof of
+authorship: another writer that reproduced `config push`'s exact output under the
+`.__edgezero_chunks.` namespace would be indistinguishable, and would be
+reclaimed. Do not store unrelated data under that reserved namespace.
+
+```bash
+# Dry run FIRST — previews every orphan and its age, deletes nothing.
+edgezero config gc --adapter fastly
+
+# Reclaim generations superseded more than 7 days ago.
+edgezero config gc --adapter fastly --older-than 7d --yes
+```
+
+**Exit codes:** `0` on success. Non-zero on any fail-closed refusal (nothing
+deleted) and non-zero if any delete failed, so automation detects a partial pass.
+
+Deletion works one generation at a time and **stops a generation at its first
+failure**. A failed remote delete has an _unknown_ outcome — Fastly may commit
+it before returning an error — so `gc` does not promise a clean retry. A failure
+with no confirmed prior sibling delete leaves the generation **uncertain**: a
+re-run may reclaim it if it is still whole, or report it as an unprovable
+fragment if the delete did commit. A failure _part-way_ through a generation (a
+sibling already confirmed deleted) strands the survivors: they are an incomplete
+generation `gc` can no longer verify, so **re-running will not reclaim them**. In
+both cases the command names the affected keys and prints the
+`fastly config-store-entry delete` commands (shell-escaped) to remove them by
+hand. They are inert in the meantime: no pointer references them.
 
 ### edgezero provision
 

@@ -25,8 +25,14 @@ pub enum Command {
     Auth(AuthArgs),
     /// Build the project for a target edge.
     Build(BuildArgs),
-    /// Inspect or mutate the typed `<name>.toml` app config.
-    #[command(subcommand, after_help = crate::args::STUB_POINTER_AFTER_HELP)]
+    /// Inspect or mutate the typed `<name>.toml` app config, or reclaim
+    /// orphaned config-store entries (`gc`).
+    ///
+    /// NOTE: no group-level typed-CLI after-help here. `push`/`diff`/`validate`
+    /// each carry their own, because they need a typed `C`; `gc` does NOT --
+    /// it inspects the store's physical entries and runs from this bundled
+    /// binary. A group-level notice would tell operators `gc` is unavailable.
+    #[command(subcommand)]
     Config(ConfigCmd),
     /// Run the bundled `app-demo` example locally (contributor-only).
     #[cfg(feature = "demo-example")]
@@ -56,6 +62,23 @@ pub enum ConfigCmd {
     /// (Bundled `edgezero` stub — see after-help for the typed CLI.)
     #[command(after_help = STUB_POINTER_AFTER_HELP)]
     Diff(ConfigCmdStubArgs),
+    /// Reclaim chunk entries in the adapter's config store that no live
+    /// config pointer references.
+    ///
+    /// Deliberately NOT part of `config push`. On an eventually-consistent
+    /// store a chunk may only be deleted once the pointer that referenced it
+    /// has stopped being served everywhere — and the platform may record no
+    /// such timestamp (Fastly does not). Only YOU know your deploy history,
+    /// so `--older-than` is your assertion — see its help: it covers EVERY
+    /// root in the selected store, not only the config you have in mind.
+    ///
+    /// UNTYPED: unlike `push`/`diff`/`validate`, `gc` inspects the store's
+    /// physical entries rather than your `AppConfig<C>`, so the bundled
+    /// `edgezero` binary can run it.
+    ///
+    /// SAFE BY DEFAULT: without `--yes` this only reports what it would
+    /// delete. Nothing is removed until you pass `--yes`.
+    Gc(ConfigGcArgs),
     /// Push the typed `<name>.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
     /// (per spec 3.3 Model A — `#[secret]` fields store the key NAME,
@@ -77,6 +100,68 @@ pub struct ConfigCmdStubArgs {
     /// Hidden catch-all sink (see spec 3.2.2).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     pub trailing: Vec<String>,
+}
+
+/// Arguments for `config gc`.
+///
+/// Unlike `push` / `diff`, `gc` needs no typed app-config: it reclaims
+/// unreferenced chunk entries by inspecting the store, so it runs in-band in
+/// the bundled `edgezero` binary.
+#[derive(clap::Args, Debug)]
+#[non_exhaustive]
+pub struct ConfigGcArgs {
+    /// Adapter whose config store to reclaim (e.g. `fastly`).
+    #[arg(long)]
+    pub adapter: String,
+    /// Path to `edgezero.toml`.
+    #[arg(long, default_value = "edgezero.toml")]
+    pub manifest: PathBuf,
+    /// Ignore `EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which
+    /// PHYSICAL store to sweep, so the logical id `<ID>` is used as the physical
+    /// store name instead.
+    ///
+    /// This is NOT the app-config overlay the other `config` subcommands mean by
+    /// `--no-env` — `gc` never loads your typed app config. On a DESTRUCTIVE
+    /// command it selects a DIFFERENT TARGET: if that variable is what maps your
+    /// logical id onto the real store, `--no-env` points `gc` at a different
+    /// store (or one that does not exist). Check the store id `gc` reports before
+    /// passing `--yes`.
+    #[arg(long)]
+    pub no_env: bool,
+    /// Only reclaim entries older than this. This is YOUR SAFETY ASSERTION,
+    /// and it is about the WHOLE PHYSICAL STORE, not just one config: `gc`
+    /// sweeps every root in the selected store, so you are asserting "NO root
+    /// in this store changed within this window, and no writer is targeting
+    /// it" — so nothing superseded more recently (which POPs may still serve)
+    /// is deleted. A sibling root you re-pushed minutes ago is enough to make
+    /// a wide window unsafe, especially if it changed to a value small enough
+    /// to store directly (that leaves no chunk for `gc` to date it by).
+    /// Accepts `s`/`m`/`h`/`d` suffixes (e.g. `7d`, `24h`, `90m`); a bare
+    /// number means seconds, and 0 is rejected for `--yes`. REQUIRED for
+    /// `--yes` (a destructive run must not guess it); a dry-run without it
+    /// previews every orphan and its age.
+    #[arg(long)]
+    pub older_than: Option<String>,
+    /// Override the config-store id (defaults to the manifest's).
+    #[arg(long)]
+    pub store: Option<String>,
+    /// Actually delete. Without this, `gc` only reports what it WOULD delete.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+impl Default for ConfigGcArgs {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            manifest: PathBuf::from("edgezero.toml"),
+            no_env: false,
+            older_than: None,
+            store: None,
+            yes: false,
+        }
+    }
 }
 
 /// Arguments for the `auth` command.
@@ -415,6 +500,44 @@ impl Default for ConfigValidateArgs {
 /// impls above.
 fn default_manifest_path() -> PathBuf {
     PathBuf::from("edgezero.toml")
+}
+
+/// Parse a human duration (`7d`, `24h`, `90m`, `30s`, or bare seconds) into
+/// seconds.
+///
+/// # Errors
+///
+/// Returns `Err` when the value is empty, non-numeric, or carries an unknown
+/// suffix — a destructive command must never guess at its safety threshold.
+#[must_use = "the parsed threshold gates a destructive command"]
+#[inline]
+pub fn parse_duration_secs(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    let unknown = || {
+        format!(
+            "could not parse `--older-than {raw}`; expected e.g. `7d`, `24h`, `90m`, `30s`, or a number of seconds"
+        )
+    };
+    let (digits, multiplier) = match trimmed.strip_suffix('s') {
+        Some(rest) => (rest, 1_u64),
+        None => match trimmed.strip_suffix('m') {
+            Some(rest) => (rest, 60_u64),
+            None => match trimmed.strip_suffix('h') {
+                Some(rest) => (rest, 3_600_u64),
+                None => match trimmed.strip_suffix('d') {
+                    Some(rest) => (rest, 86_400_u64),
+                    None => (trimmed, 1_u64),
+                },
+            },
+        },
+    };
+    if digits.is_empty() {
+        return Err(unknown());
+    }
+    let value: u64 = digits.parse().map_err(|_err| unknown())?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("`--older-than {raw}` overflows"))
 }
 
 #[cfg(test)]
@@ -843,5 +966,24 @@ mod tests {
             !help.contains("[TRAILING]"),
             "`[TRAILING]` placeholder leaked into push help: {help}"
         );
+    }
+    #[test]
+    fn parse_duration_secs_accepts_suffixes_and_bare_seconds() {
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("90m").unwrap(), 5_400);
+        assert_eq!(parse_duration_secs("24h").unwrap(), 86_400);
+        assert_eq!(parse_duration_secs("7d").unwrap(), 604_800);
+        assert_eq!(parse_duration_secs("3600").unwrap(), 3_600);
+        assert_eq!(parse_duration_secs("  7d  ").unwrap(), 604_800);
+    }
+
+    /// A destructive command must never guess at its safety threshold.
+    #[test]
+    fn parse_duration_secs_rejects_garbage() {
+        parse_duration_secs("").unwrap_err();
+        parse_duration_secs("soon").unwrap_err();
+        parse_duration_secs("7w").unwrap_err();
+        parse_duration_secs("-1d").unwrap_err();
+        parse_duration_secs("d").unwrap_err();
     }
 }

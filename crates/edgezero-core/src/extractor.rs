@@ -855,10 +855,20 @@ where
                 String::new(),
             )
         })?;
-    let envelope: BlobEnvelope = serde_json::from_str(&raw)
-        .map_err(|err| EdgeError::internal(anyhow::anyhow!("envelope parse failed: {err}")))?;
-    envelope.verify().map_err(|err| {
-        EdgeError::internal(anyhow::anyhow!("envelope verification failed: {err}"))
+    // Neither the parse error nor the verify error is echoed into the
+    // client-facing message: a serde error embeds the offending input, and a
+    // `BlobEnvelope` integrity failure names the stored hashes — both are
+    // config-store values that may hold secrets, and this message reaches the
+    // HTTP body. Report a category only.
+    let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
+        EdgeError::internal(anyhow::anyhow!(
+            "typed app-config blob is not a valid envelope (details redacted)"
+        ))
+    })?;
+    envelope.verify().map_err(|_err| {
+        EdgeError::internal(anyhow::anyhow!(
+            "typed app-config blob failed its integrity check (details redacted)"
+        ))
     })?;
     let mut data = envelope.into_data();
     // Secret walk per spec 3.3.3.
@@ -1039,10 +1049,13 @@ async fn resolve_leaf(
                 })?
                 .to_owned();
             let bound = ctx.secret_store(&store_id_str).ok_or_else(|| {
+                // `store_id_str` is the blob's store_ref VALUE — config data that
+                // may be sensitive — and this message reaches the HTTP body. Name
+                // the field, not the stored id.
                 EdgeError::config_out_of_date(
                     format!(
-                        "blob declared store_ref `{store_id_str}` but \
-                         [stores.secrets] has no such id"
+                        "secret field `{leaf_path}` names a store_ref that is not declared in \
+                         [stores.secrets] (id redacted)"
                     ),
                     leaf_path.clone(),
                 )
@@ -1062,23 +1075,33 @@ async fn resolve_leaf(
 fn map_secret_error(
     err: SecretError,
     field_name: &str,
-    store_id: &str,
-    key_name: &str,
+    // The stored key name, the store id, and the provider's message/source are
+    // deliberately UNUSED in the messages below: they are blob- or
+    // provider-controlled strings that may reveal the secret or infrastructure,
+    // and these messages reach the HTTP body / logs. Every branch names only the
+    // offending FIELD (schema, safe). Kept in the signature so the redaction is
+    // visible at the one place these values could have been formatted.
+    _store_id: &str,
+    _key_name: &str,
 ) -> EdgeError {
     match err {
-        SecretError::NotFound { name } => EdgeError::config_out_of_date(
-            format!("secret `{name}` in store `{store_id}` not found"),
+        SecretError::NotFound { .. } => EdgeError::config_out_of_date(
+            format!(
+                "the secret referenced by `{field_name}` was not found in its store (identifier redacted)"
+            ),
             field_name.to_owned(),
         ),
-        SecretError::Validation(msg) => EdgeError::config_out_of_date(
-            format!("secret `{key_name}` in store `{store_id}` rejected: {msg}"),
+        SecretError::Validation(_msg) => EdgeError::config_out_of_date(
+            format!(
+                "the secret referenced by `{field_name}` was rejected by its store (details redacted)"
+            ),
             field_name.to_owned(),
         ),
-        SecretError::Unavailable => {
-            EdgeError::service_unavailable(format!("secret store `{store_id}` unreachable"))
-        }
-        SecretError::Internal(source) => EdgeError::internal(anyhow::anyhow!(
-            "secret `{key_name}` in store `{store_id}` produced unexpected store error: {source}"
+        SecretError::Unavailable => EdgeError::service_unavailable(format!(
+            "the secret store for `{field_name}` is unreachable"
+        )),
+        SecretError::Internal(_source) => EdgeError::internal(anyhow::anyhow!(
+            "secret resolution for `{field_name}` failed (details redacted)"
         )),
     }
 }
@@ -2308,16 +2331,20 @@ mod tests {
 
     #[test]
     fn app_config_extractor_returns_internal_on_sha_mismatch() {
+        const SENTINEL: &str = "SUPER_SECRET_STORED_HASH";
         struct TamperedStore;
         #[async_trait(?Send)]
         impl ConfigStore for TamperedStore {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                // Build a valid envelope then corrupt its sha.
+                // A valid envelope whose stored sha is a SENTINEL secret. The
+                // stored hash is attacker-influenced (it comes from the config
+                // store), and this error becomes the HTTP 500 body — so the
+                // message must NOT echo it.
                 let mut env = BlobEnvelope::new(
                     serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
                     "2026-01-01T00:00:00Z".into(),
                 );
-                env.sha256 = "ff".repeat(32);
+                env.sha256 = SENTINEL.to_owned();
                 Ok(Some(serde_json::to_string(&env).unwrap()))
             }
         }
@@ -2330,10 +2357,56 @@ mod tests {
             matches!(err, EdgeError::Internal { .. }),
             "SHA mismatch must surface as Internal: {err:?}"
         );
+        // The client-facing message (the HTTP body) must not carry the stored
+        // hash, only a redacted category.
         assert!(
-            err.message().contains("envelope verification failed"),
-            "message names the problem: {err:?}"
+            !err.message().contains(SENTINEL),
+            "the stored hash must never reach the client-facing message: {err:?}"
         );
+        assert!(
+            err.message().contains("integrity check"),
+            "message must still name the category: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_extractor_does_not_leak_data_value_in_deserialize_error() {
+        const SENTINEL: &str = "SUPER_SECRET_FIELD_VALUE";
+        struct TypeErrorStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for TypeErrorStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                // A VALID envelope (verify passes) whose data has the wrong type
+                // for `timeout_ms` — a string sentinel where u32 is expected.
+                // The deserialize error names that value; it must not reach the
+                // client-facing message.
+                let env = BlobEnvelope::new(
+                    serde_json::json!({ "greeting": "hi", "timeout_ms": SENTINEL }),
+                    "2026-01-01T00:00:00Z".into(),
+                );
+                Ok(Some(serde_json::to_string(&env).unwrap()))
+            }
+        }
+
+        let ctx = ctx_with_config_store(TypeErrorStore, "key");
+        let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
+            .expect_err("a type mismatch in the typed config must error");
+        assert!(
+            matches!(err, EdgeError::ConfigOutOfDate { .. }),
+            "a typed deserialize failure must be ConfigOutOfDate: {err:?}"
+        );
+        assert!(
+            !err.message().contains(SENTINEL),
+            "the stored field value must never reach the client-facing message: {err:?}"
+        );
+        // The field path segments are redacted (a map key is indistinguishable
+        // from a struct field and may be a secret); structure is kept.
+        if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
+            assert!(
+                !field_path.contains("timeout_ms") && field_path.contains("<redacted>"),
+                "the field path must be redacted: {field_path}"
+            );
+        }
     }
 
     #[test]
@@ -2354,8 +2427,14 @@ mod tests {
             "Envelope parse failure must be Internal: {err:?}"
         );
         assert!(
-            err.message().contains("envelope parse failed"),
+            err.message().contains("not a valid envelope"),
             "message names the problem: {err:?}"
+        );
+        // The offending input is not echoed (a serde error would embed it, and a
+        // stored value may hold secrets).
+        assert!(
+            !err.message().contains("not-json-at-all"),
+            "the offending stored value must not reach the client message: {err:?}"
         );
     }
 
@@ -2383,11 +2462,11 @@ mod tests {
             matches!(err, EdgeError::ConfigOutOfDate { .. }),
             "deserialise failure must be ConfigOutOfDate: {err:?}"
         );
-        // serde_path_to_error should give us the field path.
+        // The field path segment is redacted (indistinguishable from a map key).
         if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
             assert_eq!(
-                field_path, "timeout_ms",
-                "serde_path_to_error must supply the field name: {err:?}"
+                field_path, "<redacted>",
+                "the field path must be redacted: {err:?}"
             );
         }
     }
@@ -2477,6 +2556,32 @@ mod tests {
                 "field_path names the secret field: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn app_config_secret_walk_error_does_not_leak_the_stored_key_name() {
+        use crate::config_store::{ConfigStore, ConfigStoreError};
+        struct BlobStore(String);
+        #[async_trait(?Send)]
+        impl ConfigStore for BlobStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+
+        // The blob's secret field holds the secret's KEY NAME — config data that
+        // may be sensitive. When resolution fails, that name (and any store id /
+        // provider message) must not reach the error, which becomes the HTTP body.
+        const SENTINEL: &str = "SUPER_SECRET_KEY_NAME";
+        let data = serde_json::json!({ "greeting": "hi", "api_token": SENTINEL });
+        let blob = make_envelope(data);
+        let ctx = ctx_with_config_and_secrets(BlobStore(blob), "key", NoopSecretStore, "vault");
+        let err = block_on(AppConfig::<SecretCfg>::from_request(&ctx))
+            .expect_err("missing secret must error");
+        assert!(
+            !err.message().contains(SENTINEL),
+            "the stored secret key name must never reach the error message: {err:?}"
+        );
     }
 
     // Build a RequestContext whose default secret store maps `default/{key}` ->

@@ -117,8 +117,12 @@ The push uses `fastly config-store-entry update --upsert --stdin`
 to write the envelope as the value of one Config Store entry.
 
 **Oversized envelopes** are handled automatically. Fastly's per-entry
-limit is 8,000 characters. If your envelope fits, it's stored
-directly. Otherwise the adapter:
+limit is 8,000 characters. The adapter applies a conservative
+**UTF-8 byte** check (bytes are always ≥ characters, so an envelope
+that fits by bytes always fits by characters): if the envelope JSON is
+at most 8,000 bytes it's stored directly. This byte threshold is the
+v1 read/write contract — it is stable across upgrades, so a value
+stored by an earlier release always resolves. Otherwise the adapter:
 
 1. Splits the envelope JSON into UTF-8-safe chunks (target 7,000
    bytes each).
@@ -306,16 +310,39 @@ Listing the orphans before deletion:
 # Cloudflare
 wrangler kv key list --namespace-id=<id> --remote | jq -r '.[].name'
 
-# Fastly
-fastly config-store-entry list --store-id=<id> --json | jq -r '.[].key'
+# Fastly (the JSON field is `item_key`, not `key`)
+fastly config-store-entry list --store-id=<id> --json | jq -r '.[].item_key'
 
 # Spin
 sqlite3 .spin/sqlite_key_value.db "SELECT key FROM spin_key_value WHERE store='<id>'"
 ```
 
-A future `config gc --adapter <name>` will automate this; v1 is
-manual on the rationale that orphan cleanup is best done with operator
-oversight.
+> **`config gc` does NOT do this per-leaf cleanup.** It reclaims a different kind
+> of orphan — the **chunk** entries an _oversized_ blob leaves behind when it is
+> re-pushed (each generation is content-addressed, so a change orphans the whole
+> previous chunk set). It never touches your old per-leaf keys. Run the per-leaf
+> deletes above for the migration cutover; run `config gc` (below) as an ongoing
+> reclamation for chunked stores.
+
+### Reclaiming orphaned chunk entries (Fastly, oversized configs)
+
+If your app-config blob exceeds Fastly's 8 000-character entry limit it is stored
+as content-addressed chunks, and every re-push orphans the previous generation.
+`config gc` reclaims them safely — it derives the live set from the store and
+deletes only unreferenced chunk entries you have asserted are old enough:
+
+```sh
+# Preview every orphan and its age (dry-run by default):
+<app>-cli config gc --adapter fastly
+
+# Delete, asserting that NO root in this store changed in the last 7 days AND no
+# writer is targeting the store (config gc sweeps every root, store-wide):
+<app>-cli config gc --adapter fastly --older-than 7d --yes
+```
+
+`--older-than` is REQUIRED for `--yes` and is YOUR safety assertion; do not run
+`config gc` while a `config push` to the same store is in flight (Fastly has no
+compare-and-swap). Cloudflare/Spin orphan cleanup remains manual.
 
 ### Fastly chunk-pointer hygiene
 
@@ -325,11 +352,11 @@ under 8,000 characters, the old chunks remain in the store unreferenced
 
 ```sh
 fastly config-store-entry list --store-id=<id> --json \
-  | jq -r '.[].key | select(contains(".__edgezero_chunks."))'
+  | jq -r '.[].item_key | select(contains(".__edgezero_chunks."))'
 ```
 
-They're safe to delete via the same per-key delete command above.
-A future `config gc` will sweep them automatically.
+`config gc --adapter fastly` (shown above) reclaims these safely — it will only
+delete chunk keys no live pointer references.
 
 ## Troubleshooting
 
@@ -356,13 +383,22 @@ project's typed downstream CLI. The bundled binary intentionally cannot
 push (it has no typed `C` in scope). Run `<your-app>-cli config push`
 instead — `edgezero new` generates this CLI for you.
 
-### Local fastly.toml writer wipes old chunks on re-push
+### Local fastly.toml writer prunes old chunks on re-push
 
-The local writer wholesale-replaces the per-store contents block on
-every push so stale entries don't accumulate during dev work. This is
-intentional (and STRONGER than the remote behaviour, where orphan
-chunks remain inert). The runtime correctness property holds either
-way: a read after push B reconstructs envelope B, not A.
+The local writer **upserts the keys it is pushing and prunes the chunks the
+prior generation of those roots referenced** — except any prior chunk key whose
+VALUE is itself a runtime-readable root (a valid envelope or pointer), which is
+kept with a warning rather than deleted. It does not wholesale-replace the
+per-store contents block, so keys it isn't pushing (including sibling roots and
+their chunks) are preserved. Pruning is safe
+here in a way it is not in the cloud: `fastly.toml` is a single file that
+Viceroy reads at startup, so there is no propagation window and no POP
+that could still be serving the prior pointer.
+
+This is STRONGER than the remote behaviour, where a `config push`
+reclaims nothing and orphan chunks remain inert until you run
+`config gc`. The runtime correctness property holds either way: a read
+after push B reconstructs envelope B, not A.
 
 ## Reference
 

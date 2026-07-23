@@ -1,11 +1,20 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::ChildStdin;
 use std::process::Command;
 use std::process::Stdio;
+use std::process::id as process_id;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value};
+use crate::chunked_config::{
+    CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, chunk_lengths, gc_classify_root,
+    gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
+    resolve_fastly_config_value, sha256_hex, value_is_pointer_kind, verify_writer_split_layout,
+};
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
@@ -141,6 +150,86 @@ enum ConfigStoreLookup {
     SchemaDrift(String),
 }
 
+/// The reclamation plan for `config gc`: the orphan chunk entries to delete
+/// (with their ages) plus the counts for the summary line. Produced by
+/// `plan_gc_reclamation` (which owns every safety guard); consumed by
+/// `gc_fastly_config_store` (which reports and deletes).
+struct GcPlan {
+    /// Whole generations to reclaim, each a list of `(key, age_secs)`. Grouped,
+    /// not flat: a generation is provable only as a UNIT (see
+    /// `prove_generation`), so deleting part of one destroys the very evidence
+    /// that licenses deleting the rest.
+    doomed: Vec<Vec<(String, u64)>>,
+    live_count: usize,
+    retained_recent: usize,
+    roots: usize,
+    /// Chunk-shaped entries we could NOT prove our writer produced, so left
+    /// untouched. Surfaced so an operator can see we declined to judge them.
+    unprovable: usize,
+    /// Non-fatal problems to print — see `GcClassification::warnings`.
+    warnings: Vec<String>,
+}
+
+/// What one pass of `config gc`'s delete loop actually did.
+struct GcDeleteOutcome {
+    /// Entries whose delete returned success.
+    deleted: usize,
+    /// Keys whose delete returned non-zero.
+    failed: Vec<String>,
+    /// Survivors of a generation in which an earlier sibling's delete had
+    /// ALREADY succeeded before a later one failed. These are definitely an
+    /// incomplete generation now, so they can never be proved (or reclaimed)
+    /// again -- manual removal only.
+    stranded: Vec<String>,
+    /// Members of a generation whose ONLY failure was on a delete with no
+    /// confirmed prior sibling success. A failed remote delete has UNKNOWN
+    /// outcome (Fastly may have committed it before returning an error), so we
+    /// cannot say whether the generation is still whole. A re-run reclaims it if
+    /// it is, or reports it as an unprovable fragment if it is not.
+    uncertain: Vec<String>,
+}
+
+/// The result of classifying a store's entries for reclamation.
+struct GcClassification {
+    /// Chunk keys a live root pointer references, each verified against its
+    /// content-address. Never deletable.
+    live: HashSet<String>,
+    /// Keys whose OWN value is a runtime-readable root — a valid direct envelope
+    /// or a pointer — regardless of what their key looks like. Never deletable.
+    protected: HashSet<String>,
+    /// Count of entries classified as roots, for the summary line.
+    roots: usize,
+    /// Non-fatal problems the operator should see — currently roots that are
+    /// not runtime-readable and so can never be reclaimed automatically.
+    warnings: Vec<String>,
+}
+
+/// One `config-store-entry list` item.
+///
+/// `item_value` IS captured — `config gc` must parse root pointers to learn
+/// which chunks are live, and one listing avoids a `describe` per root. It is
+/// the config payload: it may be read in memory but must NEVER be logged or
+/// surfaced (see `redact_describe_response` / `redact_stderr`).
+struct ConfigStoreItem {
+    created_at: String,
+    item_key: String,
+    item_value: String,
+}
+
+/// Per-root plan for the LOCAL path's eager prune.
+///
+/// Local reclamation is safe to do immediately: `fastly.toml` is a single
+/// file that Viceroy reads at startup — there is no propagation window and no
+/// POP that could still be serving the previous pointer. (The cloud path
+/// cannot do this; see `reclaim_orphan_generations`.)
+struct FastlyConfigGcPlan {
+    /// Exact keep-set this push writes for the root (chunk keys + root key).
+    new_keys: HashSet<String>,
+    /// Prior chunk keys to consider deleting, or a warning to surface
+    /// (suspicious prior pointer) that skips GC for this root.
+    prior_keys: Result<Vec<String>, String>,
+}
+
 // The three `validate_*` trait methods exist on `Adapter` because
 // spin requires them (variable-name regex, `[component.*]`
 // discovery, flat-namespace collision). The trait surface is typed
@@ -191,8 +280,44 @@ impl Adapter for FastlyCliAdapter {
         }
     }
 
+    fn gc_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        _push_ctx: &AdapterPushContext<'_>,
+        older_than_secs: u64,
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        gc_fastly_config_store(store.platform.as_str(), older_than_secs, dry_run)
+    }
+
     fn name(&self) -> &'static str {
         "fastly"
+    }
+
+    fn preflight_config_write(&self, key: &str, body: &str) -> Result<(), String> {
+        // Reject an infeasible push here, BEFORE the CLI's remote read, so it
+        // fails offline rather than after a list/describe. The write path
+        // re-checks, so this is a strict early gate, not the only one.
+        //
+        // An empty key is writer-valid but resolver-invalid (canonical chunk
+        // parsing rejects an empty root); reject it before any I/O.
+        if key.is_empty() {
+            return Err(
+                "config key is empty; provide a store id or a non-empty `--key`".to_owned(),
+            );
+        }
+        let entry = [(key.to_owned(), String::new())];
+        reject_reserved_root_keys(&entry)?;
+        // Run the full chunk expansion OFFLINE (no I/O): exactly what the write
+        // path does, so every body-dependent feasibility failure — the root key
+        // over the store limit, a DERIVED chunk key over it once the value
+        // chunks, or a pointer that would not fit the entry limit — is caught
+        // here, before the remote read, instead of after it.
+        prepare_fastly_config_entries(key, body)?;
+        Ok(())
     }
 
     fn provision(
@@ -368,21 +493,25 @@ impl Adapter for FastlyCliAdapter {
                 "no config entries to push to fastly config-store `{name}` (logical id `{logical}`)"
             )]);
         }
-        // Expand each logical (key, envelope_json) into physical entries
-        // via the chunk-pointer helper. Entries ≤ 8 000 chars go through
-        // as a single direct entry; larger envelopes are split into
-        // content-addressed chunks with a root pointer written LAST.
-        // Collect all physical entries before any writes so pointer-too-
-        // large errors surface before touching the remote store.
+        // Reject reserved keys before any expansion or I/O.
+        reject_reserved_root_keys(entries)?;
+        reject_duplicate_root_keys(entries)?;
+        // Expand each logical root once: flatten for the commit, and keep
+        // the exact per-root keep-set + the value written at the root key
+        // for GC (no prefix scan of the flattened set). Collecting all
+        // physical entries first also surfaces pointer-too-large errors
+        // before touching the remote store.
         let mut physical_entries: Vec<(String, String)> = Vec::new();
+        let mut roots: Vec<(String, HashSet<String>, String)> = Vec::with_capacity(entries.len());
         for (key, body) in entries {
-            let expanded = prepare_fastly_config_entries(key, body)?;
+            let (expanded, new_keys, new_root_value) = expand_root(key, body)?;
             physical_entries.extend(expanded);
+            roots.push((key.clone(), new_keys, new_root_value));
         }
         if dry_run {
-            // Report intent without shelling out. One line per logical key
-            // noting whether it would be direct or chunked, plus chunk count.
-            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            // Report intent without shelling out. Stays fully offline: no
+            // store-id resolution, no remote read (so no GC count).
+            let mut out = Vec::with_capacity(entries.len().saturating_mul(2).saturating_add(1));
             out.push(format!(
                 "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and push entries:"
             ));
@@ -405,6 +534,21 @@ impl Adapter for FastlyCliAdapter {
             return Ok(out);
         }
         let resolved_id = resolve_remote_config_store_id(name)?;
+        // NOTE: a cloud push does NOT reclaim orphaned chunks.
+        //
+        // Fastly's config store is eventually consistent, so a generation may
+        // only be deleted once the pointer that referenced it has stopped being
+        // served everywhere. Fastly records no pointer-supersession time
+        // (`updated_at` is NOT bumped by `update --upsert` -- verified against
+        // the live API), offers no compare-and-swap with which to record one
+        // safely, and chunk `created_at` is NOT a proxy for it (a chunked ->
+        // direct -> direct transition leaves the old generation with no
+        // "successor" at all). Every attempt to synthesise that fact is unsound.
+        //
+        // So reclamation is an explicit, operator-invoked `config gc`: the
+        // operator supplies the one fact the platform cannot -- that the current
+        // config has been live long enough that nothing is serving the old
+        // pointers. See the spec's "Cloud reclamation".
         push_entries_with_committer(&physical_entries, |key, value| {
             create_config_store_entry(&resolved_id, key, value)
         })?;
@@ -447,19 +591,26 @@ impl Adapter for FastlyCliAdapter {
                 fastly_path.display()
             )]);
         }
-        // Expand logical entries into physical entries (chunks + pointer).
+        // Reject reserved keys before any expansion or I/O.
+        reject_reserved_root_keys(entries)?;
+        reject_duplicate_root_keys(entries)?;
+        // Expand each logical root once: flatten for the write, keep the
+        // exact per-root keep-set for GC (no prefix scan of the flattened set).
         let mut physical_entries: Vec<(String, String)> = Vec::new();
+        let mut gc_roots: Vec<(String, HashSet<String>)> = Vec::with_capacity(entries.len());
         for (key, body) in entries {
-            let expanded = prepare_fastly_config_entries(key, body)?;
+            let (expanded, new_keys, _new_root) = expand_root(key, body)?;
             physical_entries.extend(expanded);
+            gc_roots.push((key.clone(), new_keys));
         }
         if dry_run {
-            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            let counts = local_orphan_counts_for_dry_run(&fastly_path, name, entries);
+            let mut out = Vec::with_capacity(entries.len().saturating_mul(2).saturating_add(1));
             out.push(format!(
                 "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with entries:",
                 fastly_path.display(),
             ));
-            for (key, body) in entries {
+            for (idx, (key, body)) in entries.iter().enumerate() {
                 let expanded = prepare_fastly_config_entries(key, body)
                     .unwrap_or_else(|_| vec![(key.clone(), body.clone())]);
                 if expanded.len() == 1 {
@@ -474,16 +625,28 @@ impl Adapter for FastlyCliAdapter {
                         body.len()
                     ));
                 }
+                match counts.get(idx).map(|(_, count)| count) {
+                    Some(Ok(n)) => out.push(format!(
+                        "  would delete {n} orphan chunks from the previous generation of `{key}`"
+                    )),
+                    Some(Err(reason)) => out.push(format!(
+                        "  would delete an unknown number of orphan chunks from the previous generation of `{key}` (unknown: {reason})"
+                    )),
+                    None => {}
+                }
             }
             return Ok(out);
         }
-        write_fastly_local_config_store(&fastly_path, name, &physical_entries)?;
-        Ok(vec![format!(
+        let warnings =
+            write_fastly_local_config_store(&fastly_path, name, &physical_entries, &gc_roots)?;
+        let mut out = vec![format!(
             "wrote {} physical entries ({} logical) to `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`); restart `fastly compute serve` to pick up changes",
             physical_entries.len(),
             entries.len(),
             fastly_path.display()
-        )])
+        )];
+        out.extend(warnings);
+        Ok(out)
     }
 
     fn read_config_entry(
@@ -535,19 +698,21 @@ impl Adapter for FastlyCliAdapter {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Parse the JSON and extract the `item_value` field.
-            let parsed: serde_json::Value =
-                serde_json::from_str(&stdout).map_err(|err| {
-                    format!(
-                        "failed to parse `fastly config-store-entry describe` JSON: {err}\nraw stdout: {stdout}"
-                    )
-                })?;
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
+                format!(
+                    "failed to parse `fastly config-store-entry describe` JSON (parse error \
+                     redacted; response: {})",
+                    redact_describe_response(&stdout)
+                )
+            })?;
             let value = parsed
                 .get("item_value")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     format!(
                         "`fastly config-store-entry describe` JSON has no string `item_value` field; \
-                         fastly CLI may have changed its output schema. Raw stdout: {stdout}"
+                         fastly CLI may have changed its output schema. (response: {})",
+                        redact_describe_response(&stdout)
                     )
                 })?;
             // Resolve chunk pointers: if `value` is a direct BlobEnvelope it
@@ -567,7 +732,7 @@ impl Adapter for FastlyCliAdapter {
         Err(format!(
             "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited with status {}\nstderr: {}",
             output.status,
-            stderr.trim()
+            redact_stderr(&stderr)
         ))
     }
 
@@ -590,42 +755,84 @@ impl Adapter for FastlyCliAdapter {
         };
         let fastly_path = manifest_root.join(rel);
         let name = store.platform.as_str();
+        // A prior-state read failure must never BLOCK the command: the diff just
+        // cannot be computed, so it degrades to `Unsupported` ("cannot diff").
+        // Downstream, a dry-run then reaches the writer's orphan-count
+        // degradation (spec 12.x) and a real push reaches the writer, which
+        // fails fatally on malformed TOML or overwrites otherwise. Erroring here
+        // would newly fail a dry-run that reads nothing today.
         let raw = match fs::read_to_string(&fastly_path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 return Ok(ReadConfigEntry::MissingStore);
             }
-            Err(err) => {
-                return Err(format!("failed to read {}: {err}", fastly_path.display()));
+            Err(_err) => {
+                return Ok(ReadConfigEntry::Unsupported(
+                    "local fastly.toml could not be read; cannot diff the prior value",
+                ));
             }
         };
-        let doc: toml_edit::DocumentMut = raw
-            .parse()
-            .map_err(|err| format!("failed to parse {}: {err}", fastly_path.display()))?;
-        // Probe `[local_server.config_stores.<name>]` — if absent, the store
-        // has not been seeded locally yet.
-        let Some(contents) = doc
-            .get("local_server")
-            .and_then(|ls| ls.get("config_stores"))
-            .and_then(|cs| cs.get(name))
-            .and_then(|store_tbl| store_tbl.get("contents"))
-        else {
-            return Ok(ReadConfigEntry::MissingStore);
+        let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+            return Ok(ReadConfigEntry::Unsupported(
+                "local fastly.toml is not valid TOML; cannot diff the prior value",
+            ));
+        };
+        // Descend `[local_server.config_stores.<name>.contents]` level by level.
+        // At each level an ABSENT key means the store isn't seeded yet
+        // (MissingStore), but a key that is PRESENT yet not a table is malformed
+        // store state — distinct outcomes. Collapsing the malformed case into
+        // MissingStore (as a plain `.get().and_then()` chain does) would render an
+        // inaccurate "all values added" diff, so it degrades to "cannot diff".
+        //
+        // `descend` returns Ok(None) for absent (-> MissingStore) and
+        // Err(Unsupported) for present-but-not-a-table.
+        let descend = |parent: &'_ toml_edit::Item,
+                       child: &str|
+         -> Result<Option<toml_edit::Item>, ReadConfigEntry> {
+            match parent.get(child) {
+                None => Ok(None),
+                Some(item) if item.is_table_like() => Ok(Some(item.clone())),
+                Some(_) => Err(ReadConfigEntry::Unsupported(
+                    "a local config-store parent table is not a table; cannot diff the prior value",
+                )),
+            }
+        };
+        let root_item = toml_edit::Item::Table(doc.as_table().clone());
+        let contents_item = (|| {
+            let Some(local_server) = descend(&root_item, "local_server")? else {
+                return Ok(None);
+            };
+            let Some(config_stores) = descend(&local_server, "config_stores")? else {
+                return Ok(None);
+            };
+            let Some(store_tbl) = descend(&config_stores, name)? else {
+                return Ok(None);
+            };
+            descend(&store_tbl, "contents")
+        })();
+        let contents = match contents_item {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(ReadConfigEntry::MissingStore),
+            Err(unsupported) => return Ok(unsupported),
+        };
+        // `contents` MUST be a table of `key = "value"` pairs. (Guaranteed by
+        // `descend` above, but re-borrow as a table to index it.)
+        let Some(contents_tbl) = contents.as_table_like() else {
+            return Ok(ReadConfigEntry::Unsupported(
+                "local config-store `contents` is not a table; cannot diff the prior value",
+            ));
         };
         // The contents table is `key = "value"` pairs.
-        match contents.get(key) {
+        match contents_tbl.get(key) {
             Some(item) => {
-                let value = item.as_str().ok_or_else(|| {
-                    format!(
-                        "`[local_server.config_stores.{name}.contents].{key}` in {} is not a string",
-                        fastly_path.display()
-                    )
-                })?;
+                let Some(value) = item.as_str() else {
+                    return Ok(ReadConfigEntry::Unsupported(
+                        "the local prior value is not a string; cannot diff the prior value",
+                    ));
+                };
                 // Resolve chunk pointers using the same toml contents table.
-                let resolved =
-                    resolve_fastly_config_value(key, value.to_owned(), |chunk_key| match contents
-                        .get(chunk_key)
-                    {
+                let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
+                    match contents_tbl.get(chunk_key) {
                         Some(chunk_item) => {
                             let chunk_val = chunk_item.as_str().ok_or_else(|| {
                                 format!(
@@ -636,8 +843,25 @@ impl Adapter for FastlyCliAdapter {
                             Ok(Some(chunk_val.to_owned()))
                         }
                         None => Ok(None),
-                    })?;
-                Ok(ReadConfigEntry::Present(resolved))
+                    }
+                });
+                match resolved {
+                    Ok(body) => Ok(ReadConfigEntry::Present(body)),
+                    // A corrupt/invalid prior value must NOT block a local push.
+                    // The whole point of `config push --local` here is to
+                    // OVERWRITE that broken state, and the local writer already
+                    // fail-soft handles a suspicious prior pointer (overwrite,
+                    // warn, prune nothing). Reporting `Unsupported` — "cannot
+                    // diff against this" — lets the write proceed to that path
+                    // instead of aborting the whole command on the diff read.
+                    // (Local only: a single file we are about to replace. The
+                    // cloud read keeps erroring, since we must not overwrite
+                    // remote state we could not read.)
+                    Err(_reason) => Ok(ReadConfigEntry::Unsupported(
+                        "local prior value could not be resolved (corrupt or incomplete chunk \
+                         state); it will be overwritten by this push",
+                    )),
+                }
             }
             None => Ok(ReadConfigEntry::MissingKey),
         }
@@ -686,10 +910,11 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
         })?;
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
             format!(
-                "failed to parse `fastly config-store-entry describe` JSON for chunk \
-                     key `{key}`: {err}\nraw stdout: {stdout}"
+                "failed to parse `fastly config-store-entry describe` JSON for key \
+                 `{key}` (parse error redacted; response: {})",
+                redact_describe_response(&stdout)
             )
         })?;
         let value = parsed
@@ -698,8 +923,9 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
             .ok_or_else(|| {
                 format!(
                     "`fastly config-store-entry describe` JSON has no string `item_value` \
-                     field for chunk key `{key}`; fastly CLI may have changed its output schema. \
-                     Raw stdout: {stdout}"
+                     field for key `{key}`; fastly CLI may have changed its output schema. \
+                     (response: {})",
+                    redact_describe_response(&stdout)
                 )
             })?;
         return Ok(Some(value.to_owned()));
@@ -713,7 +939,7 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
         "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` \
          exited with status {}\nstderr: {}",
         output.status,
-        stderr.trim()
+        redact_stderr(&stderr)
     ))
 }
 
@@ -803,9 +1029,12 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let doc: toml_edit::DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
     let svc = doc
         .get("service_id")
         .and_then(|item| item.as_str())
@@ -852,9 +1081,12 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let doc: toml_edit::DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
     let plural = format!("{kind}_stores");
     Ok(doc
         .get("setup")
@@ -883,9 +1115,12 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let mut doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let mut doc: DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
 
     let plural = format!("{kind}_stores");
     let parent_entry = doc.entry("setup").or_insert_with(table);
@@ -924,7 +1159,8 @@ fn write_fastly_local_config_store(
     path: &Path,
     platform_name: &str,
     entries: &[(String, String)],
-) -> Result<(), String> {
+    gc_roots: &[(String, HashSet<String>)],
+) -> Result<Vec<String>, String> {
     use toml_edit::{DocumentMut, Item, Table, Value, table};
 
     let raw = match fs::read_to_string(path) {
@@ -932,9 +1168,15 @@ fn write_fastly_local_config_store(
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let mut doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    // Redacted: `toml_edit`'s parse error quotes the offending source LINE, which
+    // in a config-store `contents` table is a stored (possibly secret-bearing)
+    // value. The diff read redacts the same failure; the writer must too.
+    let mut doc: DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
 
     let local_server_entry = doc.entry("local_server").or_insert_with(table);
     let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
@@ -989,25 +1231,1057 @@ fn write_fastly_local_config_store(
             path.display()
         )
     })?;
+    // Snapshot prior chunk keys per GC root BEFORE the upsert, using the
+    // exact keep-set the caller computed for each root (no prefix scan).
+    let mut plans: Vec<FastlyConfigGcPlan> = Vec::with_capacity(gc_roots.len());
+    for (root_key, new_keys) in gc_roots {
+        let prior_keys = contents_tbl
+            .get(root_key)
+            .and_then(toml_edit::Item::as_str)
+            .map_or_else(|| Ok(Vec::new()), |value| prior_chunk_keys(root_key, value));
+        plans.push(FastlyConfigGcPlan {
+            new_keys: new_keys.clone(),
+            prior_keys,
+        });
+    }
+
+    // Upsert the new physical entries.
     for (key, value) in entries {
         contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
     }
 
-    fs::write(path, doc.to_string())
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    // Prune orphans in the same in-memory rewrite; a suspicious prior
+    // pointer (Err) warns and deletes nothing.
+    let mut warnings = Vec::new();
+    for plan in &plans {
+        match orphan_chunk_keys(plan) {
+            Ok(orphans) => {
+                for key in orphans {
+                    // Never remove an orphan whose VALUE is itself a
+                    // runtime-readable root (a valid direct envelope or a
+                    // pointer). A chunk-shaped key can hold one — e.g. a small
+                    // envelope padded so its first chunk is a whole envelope —
+                    // and it is independently readable, so deleting it would drop
+                    // live config. Mirrors the cloud GC value-based protection: a
+                    // real chunk payload is a raw fragment (not pointer-kind, not
+                    // a valid envelope) and prunes normally.
+                    let is_root_like = contents_tbl
+                        .get(&key)
+                        .and_then(toml_edit::Item::as_str)
+                        .is_some_and(|value| {
+                            value_is_pointer_kind(value) || gc_classify_root(&key, value).is_ok()
+                        });
+                    if is_root_like {
+                        warnings.push(format!(
+                            "warning: kept `{key}` -- its value is a runtime-readable root \
+                             (envelope or pointer), not a chunk payload"
+                        ));
+                        continue;
+                    }
+                    contents_tbl.remove(&key);
+                }
+            }
+            Err(err) => warnings.push(format!("warning: {err}")),
+        }
+    }
+
+    atomically_replace_file(path, &raw, &doc.to_string())?;
+    Ok(warnings)
+}
+
+/// Replace `path`'s contents ATOMICALLY, refusing to clobber a concurrent edit.
+///
+/// The local push is a read-modify-write of the developer's `fastly.toml`, and
+/// writing back in place had two failure modes: an interrupted or disk-exhausted
+/// write truncated the real file, and a concurrent push silently dropped
+/// whichever sibling edit landed first.
+///
+/// So, in order:
+///
+/// 1. Re-read the file and require it to still hold the exact bytes this rewrite
+///    started from (`expected_before`). If another writer moved it in the
+///    meantime, fail WITHOUT writing rather than overwrite their edit. (This
+///    detects the conflict instead of locking it out — a lock file would leave
+///    stale state behind whenever a push is interrupted, which is the worse
+///    failure mode for a developer-facing command.)
+/// 2. Write the new contents to a temp file in the SAME directory, so the
+///    rename below cannot cross a filesystem boundary.
+/// 3. `rename` it over the target. That is atomic on POSIX, so a concurrent
+///    reader sees either the old file or the new one — never a partial write.
+///
+/// The temp file is cleaned up if the rename fails.
+fn atomically_replace_file(
+    path: &Path,
+    expected_before: &str,
+    contents: &str,
+) -> Result<(), String> {
+    let current = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("failed to re-read {}: {err}", path.display())),
+    };
+    if current != expected_before {
+        return Err(format!(
+            "{} changed on disk while this push was preparing its rewrite; nothing was written. \
+             Re-run the push to pick up the other change.",
+            path.display()
+        ));
+    }
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fastly.toml");
+    // The pid keeps two concurrent pushes off each other's temp file.
+    let tmp = dir.join(format!(".{file_name}.edgezero-{}.tmp", process_id()));
+    fs::write(&tmp, contents).map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _cleanup = fs::remove_file(&tmp);
+        return Err(format!("failed to replace {}: {err}", path.display()));
+    }
     Ok(())
+}
+
+// -------------------------------------------------------------------
+// chunk GC helpers (Stage 7 re-push reclamation)
+// -------------------------------------------------------------------
+
+/// Expand ONE logical `(root_key, body)` into its physical entries, the
+/// exact keep-set for that root, and the value written at the root key.
+/// No cross-root prefix scanning (a free-form `--key` can't mislead it).
+#[expect(
+    clippy::type_complexity,
+    reason = "one-off internal return; a named type would not aid readability"
+)]
+fn expand_root(
+    root_key: &str,
+    body: &str,
+) -> Result<(Vec<(String, String)>, HashSet<String>, String), String> {
+    let expanded = prepare_fastly_config_entries(root_key, body)?;
+    let new_keys: HashSet<String> = expanded.iter().map(|(key, _)| key.clone()).collect();
+    // prepare_* always emits the root entry LAST (root pointer or direct
+    // value). Make the invariant explicit rather than silently defaulting.
+    let new_root_value = expanded
+        .last()
+        .map(|(_, value)| value.clone())
+        .ok_or_else(|| format!("internal: no physical entries produced for root `{root_key}`"))?;
+    Ok((expanded, new_keys, new_root_value))
+}
+
+/// Orphans = prior chunk keys not in the new keep-set. Propagates a
+/// suspicious-pointer `Err` so the caller can warn and skip GC.
+fn orphan_chunk_keys(plan: &FastlyConfigGcPlan) -> Result<Vec<String>, String> {
+    match &plan.prior_keys {
+        Ok(prior) => Ok(prior
+            .iter()
+            .filter(|key| !plan.new_keys.contains(*key))
+            .cloned()
+            .collect()),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+/// Reject logical keys that collide with the reserved chunk namespace.
+/// `--key` is free-form, so this is enforced at the Fastly adapter
+/// boundary: such a key would let a push write into another key's chunk
+/// space, and could not be reclaimed correctly.
+fn reject_reserved_root_keys(entries: &[(String, String)]) -> Result<(), String> {
+    for (key, _) in entries {
+        if key.contains(CHUNK_KEY_INFIX) {
+            return Err(format!(
+                "config key `{key}` contains the reserved infix `{CHUNK_KEY_INFIX}`, which collides with Fastly chunk storage; choose a different config key (or --key override)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Unix epoch seconds. Push-time only (the `cli` feature is native).
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Reject a batch that names the same logical root key more than once.
+///
+/// The adapter trait takes an entry slice and does not enforce uniqueness,
+/// but GC builds one plan per entry and snapshots every plan against the
+/// SAME prior generation. With `[(root, A), (root, B)]` the last tuple wins
+/// the upsert (root = B), yet A's plan would still reclaim `prior - A_keys`
+/// — which includes B's freshly-written chunks — leaving the final pointer
+/// referencing missing chunks. Rejecting is safer than silently coalescing:
+/// a duplicated key is a caller bug, and picking a winner would hide it.
+fn reject_duplicate_root_keys(entries: &[(String, String)]) -> Result<(), String> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    for (key, _) in entries {
+        if !seen.insert(key.as_str()) {
+            return Err(format!(
+                "config key `{key}` appears more than once in a single push; each logical key must be pushed exactly once"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort per-root orphan count for `config push --local --dry-run`.
+/// Navigate to `[local_server.config_stores.<name>.contents]` for the
+/// dry-run counter. `Ok(None)` when any level is absent (no prior state);
+/// `Err` when a level is present but the wrong type — prior state the real
+/// writer would reject, so the count must degrade to "unknown", not 0.
+fn local_contents_table<'doc>(
+    doc: &'doc toml_edit::DocumentMut,
+    platform_name: &str,
+) -> Result<Option<&'doc toml_edit::Table>, String> {
+    let malformed = || "could not read prior state".to_owned();
+    let Some(server_item) = doc.get("local_server") else {
+        return Ok(None);
+    };
+    let Some(server) = server_item.as_table() else {
+        return Err(malformed());
+    };
+    let Some(stores_item) = server.get("config_stores") else {
+        return Ok(None);
+    };
+    let Some(stores) = stores_item.as_table() else {
+        return Err(malformed());
+    };
+    let Some(store_item) = stores.get(platform_name) else {
+        return Ok(None);
+    };
+    let Some(store) = store_item.as_table() else {
+        return Err(malformed());
+    };
+    let Some(contents_item) = store.get("contents") else {
+        return Ok(None);
+    };
+    contents_item
+        .as_table()
+        .map_or_else(|| Err(malformed()), |table| Ok(Some(table)))
+}
+
+/// Reads the current `fastly.toml` (offline) and, for each logical
+/// `(root_key, body)`, counts `prior_chunk_keys(root, old) - new_keys`
+/// where `new_keys` is the root's OWN expansion. Never fails the dry-run:
+/// on a missing file / no prior pointer / direct prior value it reports
+/// `Ok(0)`; on unreadable or malformed prior state it reports `Err(reason)`
+/// which the caller renders as an "unknown" line.
+fn local_orphan_counts_for_dry_run(
+    path: &Path,
+    platform_name: &str,
+    entries: &[(String, String)],
+) -> Vec<(String, Result<usize, String>)> {
+    use toml_edit::DocumentMut;
+
+    // Parse the current file once (best-effort). Absent file => no prior.
+    let parsed: Result<Option<DocumentMut>, String> = match fs::read_to_string(path) {
+        Ok(text) => text
+            .parse::<DocumentMut>()
+            .map(Some)
+            .map_err(|_err| "could not read prior state".to_owned()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("could not read prior state".to_owned()),
+    };
+
+    entries
+        .iter()
+        .map(|(root_key, body)| {
+            let new_keys = match expand_root(root_key, body) {
+                Ok((_, keys, _)) => keys,
+                Err(err) => return (root_key.clone(), Err(err)),
+            };
+            let count = match &parsed {
+                Err(reason) => Err(reason.clone()),
+                Ok(None) => Ok(0),
+                Ok(Some(doc)) => match local_contents_table(doc, platform_name) {
+                    Err(reason) => Err(reason),
+                    Ok(None) => Ok(0),
+                    Ok(Some(contents)) => match contents.get(root_key) {
+                        None => Ok(0), // no prior value for this root
+                        Some(item) => match item.as_str() {
+                            None => Err("could not read prior state".to_owned()),
+                            Some(raw) => match prior_chunk_keys(root_key, raw) {
+                                Ok(prior) => Ok(prior
+                                    .iter()
+                                    .filter(|key| !new_keys.contains(*key))
+                                    // Match the real prune: an orphan whose value
+                                    // is a runtime-readable root is KEPT, so it is
+                                    // not counted as a deletion.
+                                    .filter(|key| {
+                                        contents
+                                            .get(key)
+                                            .and_then(toml_edit::Item::as_str)
+                                            .is_none_or(|text| {
+                                                !value_is_pointer_kind(text)
+                                                    && gc_classify_root(key, text).is_err()
+                                            })
+                                    })
+                                    .count()),
+                                Err(_) => Err("suspicious prior pointer".to_owned()),
+                            },
+                        },
+                    },
+                },
+            };
+            (root_key.clone(), count)
+        })
+        .collect()
 }
 
 // -------------------------------------------------------------------
 // `config push` helpers
 // -------------------------------------------------------------------
 
-/// Shell out to `fastly config-store-entry create --store-id=<id>
-/// --key=<k> --value=<v>` for a single entry. Surfaces fastly's
-/// stderr verbatim on failure — including the "entry already
-/// exists" error, which is the operator's signal to delete the
-/// entry (or use `config-store-entry update` manually) before
-/// re-running push.
+/// Run `fastly config-store-entry list --store-id=<id> --json` and return each
+/// item's `item_key`, `item_value`, and `created_at`.
+///
+/// The item VALUE is KEPT (not discarded): `config gc` classifies each root by
+/// its value (`gc_classify_root`) and reconstructs live generations from the
+/// chunk values, so all three fields are required. The value is used internally
+/// only and is NEVER echoed into a diagnostic — parse failures redact it via
+/// `redact_describe_response`.
+fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, String> {
+    let store_arg = format!("--store-id={store_id}");
+    let output = Command::new("fastly")
+        .args(["config-store-entry", "list", store_arg.as_str(), "--json"])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`fastly config-store-entry list --store-id={store_id} --json` exited with status {}\nstderr: {}",
+            output.status,
+            redact_stderr(&stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
+        format!(
+            "failed to parse `fastly config-store-entry list` JSON (parse error redacted; \
+             response: {})",
+            redact_describe_response(&stdout)
+        )
+    })?;
+    // A BARE ARRAY ONLY. The installed Fastly CLI returns the complete store as
+    // a top-level array with no cursor/paging flags. Any other shape (e.g. an
+    // `{"items":[...], ...}` envelope) may carry pagination metadata we do not
+    // follow -- and a page that omitted a ROOT while listing its chunks would
+    // make live chunks look orphaned. The completeness guard cannot see a root
+    // that isn't there, so we refuse rather than reclaim from a partial view.
+    let array = parsed.as_array().ok_or_else(|| {
+        format!(
+            "refusing to reclaim: `fastly config-store-entry list --json` did not return a bare \
+             array (response: {}). This build only supports an unpaginated listing; a partial view \
+             could hide a root and orphan its live chunks. Nothing was deleted.",
+            redact_describe_response(&stdout)
+        )
+    })?;
+    // FAIL CLOSED on any malformed entry. A missing/non-string field on a
+    // reclamation input must NEVER be silently skipped or defaulted to empty:
+    // skipping a root hides the chunks it references (they'd look orphaned and
+    // get deleted while live), and an empty `item_value` makes a real root
+    // parse as "references nothing" — same catastrophe. If we can't read the
+    // listing exactly, we delete nothing.
+    let mut items = Vec::with_capacity(array.len());
+    for (idx, entry) in array.iter().enumerate() {
+        let field = |name: &str| -> Result<String, String> {
+            let raw = entry
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "`fastly config-store-entry list` entry #{idx} is missing a string `{name}` \
+                         field; refusing to reclaim on an unreadable listing (nothing deleted)"
+                    )
+                })?;
+            // An EMPTY field is as dangerous as a missing one: an empty root
+            // value would classify as "references nothing" and orphan its live
+            // chunks. Reject it here rather than reason about it later.
+            if raw.is_empty() {
+                return Err(format!(
+                    "`fastly config-store-entry list` entry #{idx} has an empty `{name}` field; \
+                     refusing to reclaim on an unreadable listing (nothing deleted)"
+                ));
+            }
+            Ok(raw.to_owned())
+        };
+        items.push(ConfigStoreItem {
+            created_at: field("created_at")?,
+            item_key: field("item_key")?,
+            item_value: field("item_value")?,
+        });
+    }
+
+    // DUPLICATE KEYS => fail closed. A key must appear once; a store cannot
+    // really hold two entries under one key, so duplicate rows mean we are not
+    // reading the store we think we are (a merged/paginated view, or a CLI
+    // change). Left alone, the last row silently wins for BOTH the live-set
+    // lookup and `created_at`, so conflicting rows could age a recent key into
+    // eligibility and schedule the same key for two deletes.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
+    if let Some(duplicate) = items
+        .iter()
+        .find(|item| !seen.insert(item.item_key.as_str()))
+    {
+        return Err(format!(
+            "refusing to reclaim: `fastly config-store-entry list` returned key `{}` more than \
+             once. A key is unique in a config store, so this listing does not describe one \
+             consistent view of it (nothing was deleted).",
+            duplicate.item_key
+        ));
+    }
+
+    Ok(items)
+}
+
+/// RFC 3339 (`2026-07-13T03:27:42Z`) -> unix seconds.
+fn parse_rfc3339_secs(raw: &str) -> Option<u64> {
+    let stamp = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    u64::try_from(stamp.timestamp()).ok()
+}
+
+/// `config gc` for Fastly: delete chunk entries that no LIVE root pointer
+/// references and that are older than the operator's `older_than_secs`.
+///
+/// Why this is a separate, operator-invoked command rather than part of `config
+/// push`: see `Adapter::gc_config_entries`. The operator's `--older-than` is the
+/// safety assertion the platform cannot make. A dry-run prints exactly which
+/// keys would go, with ages, so the assertion is reviewable.
+///
+/// Fails CLOSED: if the listing is unreadable, or a root's value cannot be
+/// classified, nothing is deleted.
+fn gc_fastly_config_store(
+    store_name: &str,
+    older_than_secs: u64,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    // THE destructive boundary enforces its own precondition. The CLI rejects a
+    // zero window too, but `gc_config_entries` is a public trait method any
+    // caller can reach directly -- a safety rule that lives only in the CLI is
+    // not a safety rule. A zero window asserts nothing: it makes every orphan
+    // eligible, including one superseded a second ago whose pointer POPs are
+    // still serving. (A dry-run may preview at zero; it deletes nothing.)
+    if !dry_run && older_than_secs == 0 {
+        return Err(
+            "refusing to reclaim: a destructive `config gc` requires a non-zero `--older-than` \
+             window. Zero asserts nothing -- it would make every orphan eligible, including \
+             chunks a pointer POPs are still serving. Nothing was deleted."
+                .to_owned(),
+        );
+    }
+    let resolved_id = resolve_remote_config_store_id(store_name)?;
+    let items = list_config_store_entries(&resolved_id)?;
+    let plan = plan_gc_reclamation(&items, unix_now_secs(), older_than_secs)?;
+    let GcPlan {
+        doomed,
+        live_count,
+        retained_recent,
+        roots,
+        unprovable,
+        warnings,
+    } = plan;
+
+    let doomed_count: usize = doomed.iter().map(Vec::len).sum();
+    let mut out = vec![format!(
+        "fastly config-store `{store_name}` (id={resolved_id}): {} entries, {roots} root(s), {live_count} live chunk(s), {doomed_count} orphan(s) in {} generation(s) older than {older_than_secs}s, {retained_recent} orphan(s) too recent",
+        items.len(),
+        doomed.len(),
+    )];
+    out.extend(warnings);
+    if unprovable > 0 {
+        // NEVER silent: these entries look like chunk keys but we could not
+        // prove our writer produced them, so we left them alone. Say so, or the
+        // summary reads as "everything reclaimable was reclaimed".
+        out.push(format!(
+            "  {unprovable} chunk-shaped entr(ies) left untouched: they are not byte-identical to what this writer would produce (wrong content-address, a split this writer would not choose, an incomplete generation, or a count it would never emit), so EdgeZero cannot claim them"
+        ));
+    }
+    if doomed_count == 0 {
+        out.push("nothing to reclaim".to_owned());
+        return Ok(out);
+    }
+    for (key, age) in doomed.iter().flatten() {
+        let verb = if dry_run { "would delete" } else { "deleting" };
+        out.push(format!("  {verb} `{key}` (age {age}s)"));
+    }
+    if dry_run {
+        out.push(format!(
+            "dry-run: {doomed_count} orphan chunk(s) would be deleted; re-run with --yes to apply"
+        ));
+        return Ok(out);
+    }
+
+    let GcDeleteOutcome {
+        deleted,
+        failed,
+        stranded,
+        uncertain,
+    } = execute_gc_deletes(&resolved_id, &doomed, &mut out);
+    out.push(format!(
+        "reclaimed {deleted} of {doomed_count} orphan chunk entries"
+    ));
+    if failed.is_empty() {
+        return Ok(out);
+    }
+    // Partial/total failure must be a non-zero exit so automation can see it.
+    let mut diagnostic = format!(
+        "{}\nconfig gc: {} of {doomed_count} deletes FAILED ({})",
+        out.join("\n"),
+        failed.len(),
+        failed.join(", ")
+    );
+    // A generation whose only failure was on an unconfirmed delete: the outcome
+    // is UNKNOWN (Fastly may have committed it), so a re-run is worth trying but
+    // may find a fragment.
+    if !uncertain.is_empty() {
+        write!(
+            diagnostic,
+            ".\nNOTE: a failed remote delete has an unknown outcome -- Fastly may have applied it \
+             before returning an error. Re-run `config gc`: it reclaims each affected generation \
+             if it is still whole, or reports it as an unprovable fragment (\"left untouched\") if \
+             a delete did commit. If reported as a fragment, remove the survivors by hand:\n{}",
+            recovery_commands(&resolved_id, &uncertain)
+        )
+        .map_err(|err| format!("failed to format the gc diagnostic: {err}"))?;
+    }
+    // A generation with a CONFIRMED prior delete: definitely a fragment now.
+    if !stranded.is_empty() {
+        write!(
+            diagnostic,
+            ".\nWARNING: {} entr(ies) are now an INCOMPLETE generation because a sibling was \
+             already deleted before the failure: {}. `config gc` proves a generation by \
+             reassembling it, so it can no longer prove these and will never reclaim them -- \
+             re-running will NOT help. They are inert (no pointer references them). Remove them \
+             by hand once you are satisfied they are unreferenced:\n{}",
+            stranded.len(),
+            stranded.join(", "),
+            recovery_commands(&resolved_id, &stranded),
+        )
+        .map_err(|err| format!("failed to format the gc diagnostic: {err}"))?;
+    }
+    Err(diagnostic)
+}
+
+/// Render copy-pasteable `fastly config-store-entry delete` commands, one per
+/// key, with EVERY interpolated value single-quoted for POSIX shells.
+///
+/// Root keys are free-form (`--key <override>`), and a chunk key preserves its
+/// root, so a key can contain `$(...)`, spaces, or `;`. Pasting an unquoted
+/// command could execute or misparse it, so this is not cosmetic.
+fn recovery_commands(store_id: &str, keys: &[String]) -> String {
+    keys.iter()
+        .map(|key| {
+            format!(
+                "  fastly config-store-entry delete --store-id={} --key={} --auto-yes",
+                shell_single_quote(store_id),
+                shell_single_quote(key),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Single-quote a value for a POSIX shell: wrap in `'...'` and rewrite each
+/// embedded `'` as `'\''`. Inside single quotes every other byte -- `$`, spaces,
+/// `;`, `$(...)`, backticks -- is literal, so this neutralises any hostile key.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Delete each doomed generation, stopping a generation at its FIRST failure.
+///
+/// A generation is provable only as a whole (`prove_generation` reassembles it),
+/// so a half-deleted one can never be proved again: the next run sees a fragment,
+/// cannot verify it, and correctly refuses to touch it — forever. Ploughing on
+/// after a failure is therefore the one thing that turns a possibly-recoverable
+/// error into permanent, unreclaimable litter.
+///
+/// A failed remote delete has an UNKNOWN outcome — Fastly may commit it before
+/// returning an error — so nothing here is promised as cleanly retryable. The
+/// caller distinguishes two cases: a failure with a CONFIRMED prior sibling
+/// delete strands the survivors for good (manual recovery), and a failure with
+/// no confirmed prior delete leaves the generation in an UNCERTAIN state (a
+/// re-run may reclaim it, or surface it as an unprovable fragment). Generations
+/// are independent, so a failure in one does not stop the others.
+fn execute_gc_deletes(
+    resolved_id: &str,
+    doomed: &[Vec<(String, u64)>],
+    out: &mut Vec<String>,
+) -> GcDeleteOutcome {
+    let mut outcome = GcDeleteOutcome {
+        deleted: 0,
+        failed: Vec::new(),
+        stranded: Vec::new(),
+        uncertain: Vec::new(),
+    };
+    for generation in doomed {
+        let mut deleted_here: Vec<&str> = Vec::new();
+        for (key, _) in generation {
+            match delete_config_store_entry(resolved_id, key) {
+                Ok(()) => {
+                    outcome.deleted = outcome.deleted.saturating_add(1);
+                    deleted_here.push(key.as_str());
+                }
+                Err(err) => {
+                    out.push(format!("  FAILED to delete `{key}` ({err})"));
+                    outcome.failed.push(key.clone());
+                    // Everything in this generation we have NOT confirmed deleted
+                    // -- the failed key itself, plus the ones we never reached.
+                    let unconfirmed: Vec<String> = generation
+                        .iter()
+                        .map(|(member, _)| member.clone())
+                        .filter(|member| !deleted_here.contains(&member.as_str()))
+                        .collect();
+                    if deleted_here.is_empty() {
+                        // No sibling is CONFIRMED gone. The failed delete's
+                        // outcome is unknown: if it did not commit, the
+                        // generation is whole and a re-run reclaims it; if it
+                        // did, the re-run finds a fragment and reports it. Either
+                        // way we must not claim clean retryability.
+                        outcome.uncertain.extend(unconfirmed);
+                    } else {
+                        // A sibling is CONFIRMED gone, so this generation is
+                        // definitely a fragment no future run can prove.
+                        outcome.stranded.extend(unconfirmed);
+                    }
+                    break; // stop THIS generation; the others are independent
+                }
+            }
+        }
+    }
+    outcome
+}
+
+/// Classify a store's entries: the live chunk set, the protected root keys, and
+/// the root count.
+///
+/// Root-vs-chunk is decided by VALUE, not key shape. The runtime resolver reads
+/// whatever value sits at a key, so ANY entry whose value is a valid direct
+/// envelope or a chunk pointer is a runtime-readable root and must never be
+/// deleted — even at a chunk-shaped key. Two ways that happens:
+///
+/// - a pointer parked at a chunk-shaped key makes its references LIVE;
+/// - a value that is itself a valid direct envelope (e.g. a small envelope whose
+///   first 7 000-byte chunk is the whole envelope plus trailing whitespace, and
+///   so still parses and verifies) is a root in its own right.
+///
+/// Only a value that is NEITHER — a raw envelope fragment, which does not parse —
+/// is a delete candidate. In normal operation a chunk payload is exactly such a
+/// fragment, so this protects the pathological cases at no cost to real GC.
+fn classify_store_entries(
+    items: &[ConfigStoreItem],
+    value_by_key: &HashMap<&str, &str>,
+) -> Result<GcClassification, String> {
+    let mut live: HashSet<String> = HashSet::new();
+    let mut protected: HashSet<String> = HashSet::new();
+    let mut roots = 0_usize;
+    let mut warnings: Vec<String> = Vec::new();
+    for item in items {
+        let is_chunk_shaped = chunk_key_generation_any(&item.item_key).is_some();
+        let classified = match gc_classify_root(&item.item_key, &item.item_value) {
+            Ok(classified) => classified,
+            // A chunk-shaped key whose value we cannot classify is a genuine
+            // chunk fragment (a candidate) ONLY if that value is not itself
+            // root-like. A pointer-kind value is always root-like — the runtime
+            // reads it as a pointer — so an unclassifiable one (e.g. a
+            // cross-root pointer that fails this root's scope check) must FAIL
+            // CLOSED, never become a deletable candidate whose references we
+            // would orphan.
+            Err(_) if is_chunk_shaped && !value_is_pointer_kind(&item.item_value) => {
+                continue; // a chunk payload: a delete candidate
+            }
+            Err(err) => {
+                return Err(format!(
+                    "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
+                    item.item_key
+                ));
+            }
+        };
+        // A runtime-readable root, wherever it lives: never a delete candidate.
+        roots = roots.saturating_add(1);
+        protected.insert(item.item_key.clone());
+        let GcRootValue::Chunked(pointer) = classified else {
+            continue; // A direct envelope references no chunks.
+        };
+        // The pointer's METADATA is self-consistent by here. That is not proof
+        // that it honestly describes its generation: a pointer can drop its last
+        // chunk ref AND restate `envelope_len` as the remaining sum, and every
+        // metadata check still passes while the dropped chunk silently leaves
+        // the live set and becomes deletable. So reassemble what it references
+        // and hold the bytes against its content-address.
+        let assembled = assemble_pointer_chunks(&item.item_key, &pointer, value_by_key)?;
+        gc_verify_generation(&pointer.envelope_sha256, &assembled).map_err(|err| {
+            format!(
+                "refusing to reclaim: root `{}` names a chunk set that does not reconstruct the \
+                 envelope it claims ({err}). Its chunk list is therefore not a trustworthy live \
+                 set, and treating it as one could delete a live chunk. Nothing was deleted.",
+                item.item_key
+            )
+        })?;
+        // Same exact-split predicate the RUNTIME resolver applies. The content
+        // checks above only prove the bytes; a pointer whose boundaries are not
+        // the ones this writer emits reassembles correctly here but is REJECTED
+        // at runtime -- so GC would otherwise call it a healthy live root while
+        // the guest 500s on it, and its generation can never satisfy
+        // `prove_generation` either, making it permanently unreclaimable.
+        //
+        // We still protect it (fail-closed: never delete on a judgement we are
+        // unsure of), but we no longer call it healthy silently -- the operator
+        // gets told it is unreadable and will not be reclaimed automatically.
+        if let Err(err) =
+            verify_writer_split_layout(&item.item_key, &assembled, &chunk_lengths(&pointer.chunks))
+        {
+            warnings.push(format!(
+                "warning: root `{}` is NOT runtime-readable ({err}). Its chunks are kept, but this \
+                 generation can never be proven writer-produced, so `config gc` will never reclaim \
+                 it. Re-run `config push` for this key to rewrite it, then re-run `config gc`.",
+                item.item_key
+            ));
+        }
+        live.extend(pointer.chunks.into_iter().map(|chunk| chunk.key));
+    }
+    Ok(GcClassification {
+        live,
+        protected,
+        roots,
+        warnings,
+    })
+}
+
+/// The reclamation plan for one store: which orphan chunk entries to delete, and
+/// the counts for the summary line. Deriving it is where every safety guard
+/// lives, so it is fail-closed throughout — any unreadable/incomplete state
+/// returns `Err` and the caller deletes nothing.
+///
+/// The organising idea is that **content-addressing makes a chunk set
+/// self-proving**: a chunk key embeds the SHA-256 of the whole envelope it
+/// belongs to, so reassembling a generation either reproduces the
+/// content-address its own keys name, or it does not. Every destructive decision
+/// here rests on that hash — never on what the store's metadata claims about
+/// itself, which is exactly what an inconsistent store gets wrong.
+fn plan_gc_reclamation(
+    items: &[ConfigStoreItem],
+    now: u64,
+    older_than_secs: u64,
+) -> Result<GcPlan, String> {
+    let mut value_by_key: HashMap<&str, &str> = HashMap::with_capacity(items.len());
+    let mut created_by_key: HashMap<&str, u64> = HashMap::with_capacity(items.len());
+    for item in items {
+        let Some(created) = parse_rfc3339_secs(&item.created_at) else {
+            // Unparseable timestamp anywhere in the listing -> fail closed. On a
+            // DELETE path we will not guess an age.
+            return Err(format!(
+                "refusing to reclaim: entry `{}` has an unreadable `created_at`; nothing was deleted",
+                item.item_key
+            ));
+        };
+        created_by_key.insert(item.item_key.as_str(), created);
+        value_by_key.insert(item.item_key.as_str(), item.item_value.as_str());
+    }
+
+    // ---- 1. Classify entries: live chunks, protected roots, root count ----
+    let GcClassification {
+        live,
+        protected,
+        roots,
+        warnings,
+    } = classify_store_entries(items, &value_by_key)?;
+
+    // ---- 2. Per-root live-config age (best-effort; see the guard below) ----
+    // rsplit_once (the LAST infix): a chunk of a chunk-shaped root nests the infix
+    // twice, and its root is everything before the LAST one. Splitting on the
+    // first would attribute a nested chunk's age to the wrong (outer) root.
+    let root_live_since: HashMap<&str, u64> = live.iter().fold(HashMap::new(), |mut acc, key| {
+        if let Some((root, _)) = key.rsplit_once(CHUNK_KEY_INFIX) {
+            let created = *created_by_key.get(key.as_str()).unwrap_or(&0);
+            let slot = acc.entry(root).or_insert(0);
+            *slot = (*slot).max(created);
+        }
+        acc
+    });
+
+    // ---- 3. Candidates, grouped by GENERATION and proven writer-produced ----
+    // A per-key decision cannot be safe: an entry is only ours if the whole
+    // generation it belongs to reassembles to the content-address its keys name.
+    // So group first, prove second, and delete whole generations or none -- a
+    // partial delete would leave a corrupt generation behind.
+    let mut groups: BTreeMap<(&str, String), Vec<&ConfigStoreItem>> = BTreeMap::new();
+    for item in items {
+        if live.contains(&item.item_key) {
+            continue;
+        }
+        // A key whose own value is a runtime-readable root is never a candidate,
+        // even when its key is chunk-shaped (a valid direct envelope can sit at
+        // one). Excluding it here also means any real chunk sharing that
+        // generation drops to an incomplete group, which prove_generation then
+        // leaves untouched — safe: we leak rather than delete a possible root.
+        if protected.contains(&item.item_key) {
+            continue;
+        }
+        // rsplit_once (the LAST infix): the same nested-chunk correctness the
+        // live-set scan and classification use — a chunk of a chunk-shaped root
+        // is grouped under THAT root, not the outer one, so nested orphans are
+        // grouped (and thus reclaimed or reported), not silently dropped.
+        let Some((root, _)) = item.item_key.rsplit_once(CHUNK_KEY_INFIX) else {
+            continue; // a root
+        };
+        let Some(generation) = chunk_key_generation(root, &item.item_key) else {
+            continue; // chunk-shaped but NOT canonical => never a key we emit
+        };
+        groups.entry((root, generation)).or_default().push(item);
+    }
+
+    let mut doomed: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut retained_recent = 0_usize;
+    let mut unprovable = 0_usize;
+    for ((root, generation), group) in groups {
+        if prove_generation(root, &generation, &group).is_err() {
+            // We cannot prove we wrote this, so we do not touch it. It may be an
+            // ordinary entry that merely LOOKS like a chunk key (a store can
+            // predate this feature or be shared, and push-time reserved-key
+            // rejection cannot protect what already exists), or a half-written
+            // generation. Skipped rather than fatal: one foreign entry must not
+            // block reclamation of the store forever. Reported in the summary.
+            unprovable = unprovable.saturating_add(group.len());
+            continue;
+        }
+
+        // Age the generation as a UNIT, by its youngest member: deleting a
+        // generation is one decision, so its most restrictive age governs.
+        let group_age = group
+            .iter()
+            .map(|item| {
+                now.saturating_sub(*created_by_key.get(item.item_key.as_str()).unwrap_or(&0))
+            })
+            .min()
+            .unwrap_or(0);
+        // BOTH ages must clear the operator's window; neither substitutes for
+        // the other, so take the more restrictive (the MINIMUM).
+        //
+        // - The chunks' OWN age is mandatory: a generation written seconds ago
+        //   is inside the propagation window whatever its root looks like (e.g.
+        //   a concurrent push wrote it and has not committed its pointer yet),
+        //   so an old-looking root must never license deleting it.
+        // - The root's live-config age (when known) is an EXTRA restriction: it
+        //   catches an old generation superseded recently, which its own age
+        //   cannot see.
+        let effective_age = root_live_since.get(root).map_or(group_age, |live_since| {
+            group_age.min(now.saturating_sub(*live_since))
+        });
+        if effective_age < older_than_secs {
+            retained_recent = retained_recent.saturating_add(group.len());
+            continue;
+        }
+        doomed.push(
+            group
+                .iter()
+                .map(|item| {
+                    let age = now
+                        .saturating_sub(*created_by_key.get(item.item_key.as_str()).unwrap_or(&0));
+                    (item.item_key.clone(), age)
+                })
+                .collect(),
+        );
+    }
+
+    Ok(GcPlan {
+        doomed,
+        live_count: live.len(),
+        retained_recent,
+        roots,
+        unprovable,
+        warnings,
+    })
+}
+
+/// Reassemble the chunks a live pointer references, in index order, checking each
+/// against the pointer's own per-chunk `len`/`sha256` along the way.
+///
+/// Fails closed when a referenced key is absent from the listing. This subsumes
+/// the old standalone completeness guard: an incomplete or paginated listing
+/// cannot produce the bytes, so it can never reach a passing verification.
+fn assemble_pointer_chunks(
+    root_key: &str,
+    pointer: &GcPointer,
+    value_by_key: &HashMap<&str, &str>,
+) -> Result<String, String> {
+    // NOT `with_capacity(pointer.envelope_len)`: that length is untrusted stored
+    // metadata. `validate_pointer_chunks` bounds it, but this is a destructive
+    // path -- do not reserve from a number the store supplied when growing from
+    // the bytes we actually read costs nothing.
+    let mut assembled = String::new();
+    // The chunk KEY is pointer-controlled (a malformed pointer can carry any
+    // string there), so diagnostics name a POSITION, not the key. `root_key` is
+    // the operator's own logical entry key and is named for context, as the rest
+    // of the GC diagnostics do.
+    for (position, chunk) in pointer.chunks.iter().enumerate() {
+        let Some(value) = value_by_key.get(chunk.key.as_str()) else {
+            return Err(format!(
+                "refusing to reclaim: root `{root_key}` references chunk {position}, which is \
+                 absent from the store listing (the listing may be incomplete/paginated, or the \
+                 store is already inconsistent); nothing was deleted"
+            ));
+        };
+        if value.len() != chunk.len {
+            return Err(format!(
+                "refusing to reclaim: root `{root_key}` says chunk {position} is {} bytes but the \
+                 store holds {}; nothing was deleted",
+                chunk.len,
+                value.len()
+            ));
+        }
+        if sha256_hex(value.as_bytes()) != chunk.sha256 {
+            return Err(format!(
+                "refusing to reclaim: the stored value of chunk {position} does not match the \
+                 SHA-256 that root `{root_key}` records for it; nothing was deleted"
+            ));
+        }
+        assembled.push_str(value);
+    }
+    if assembled.len() != pointer.envelope_len {
+        return Err(format!(
+            "refusing to reclaim: root `{root_key}` declares an envelope of {} bytes but its \
+             chunks reassemble to {}; nothing was deleted",
+            pointer.envelope_len,
+            assembled.len()
+        ));
+    }
+    Ok(assembled)
+}
+
+/// Is this candidate generation byte-identical to what THIS writer would have
+/// produced for the bytes it contains?
+///
+/// The gate on every delete. `group` is every listed entry sharing one
+/// `(root, generation)`.
+///
+/// **What this proves, precisely.** We reassemble the group in index order and
+/// re-run `prepare_fastly_config_entries` over the result. If the writer, given
+/// those exact bytes, would emit exactly these keys and these values, the entries
+/// are indistinguishable from our own output: same direct-vs-chunked threshold,
+/// same UTF-8-safe 7 000-byte boundaries, same content-addressed keys, same
+/// count. A lone chunk fails automatically (an envelope small enough to store
+/// directly round-trips to a single ROOT-keyed entry, and a large one to >= 2
+/// chunks), as does any set split at boundaries we would not choose.
+///
+/// **What this does NOT prove: authorship.** Content-addressing is not a
+/// signature. A foreign writer can pick envelope E, compute `H = sha256(E)`,
+/// split E exactly as we would, and store the parts under our reserved
+/// `.__edgezero_chunks.` namespace; that group is byte-identical to ours and we
+/// will reclaim it. No preimage attack is needed, and no check over the stored
+/// bytes alone can separate the two — telling them apart needs trusted
+/// generation metadata or an authenticated marker, and the store offers neither
+/// (any writer with store access could forge either).
+///
+/// We accept that residual: the namespace is reserved by convention, push-time
+/// validation rejects logical keys inside it, and anything passing this gate is
+/// a faithful reproduction of our format. The spec documents it as a limitation
+/// rather than claiming a guarantee we cannot make.
+fn prove_generation(
+    root: &str,
+    generation: &str,
+    group: &[&ConfigStoreItem],
+) -> Result<(), String> {
+    let mut ordered: Vec<(usize, &str)> = Vec::with_capacity(group.len());
+    for item in group {
+        let index = item
+            .item_key
+            .rsplit_once('.')
+            .and_then(|(_, index)| index.parse::<usize>().ok())
+            .ok_or_else(|| format!("`{}` has no readable index", item.item_key))?;
+        ordered.push((index, item.item_value.as_str()));
+    }
+    ordered.sort_by_key(|&(index, _)| index);
+    for (position, &(index, _)) in ordered.iter().enumerate() {
+        if index != position {
+            return Err(format!(
+                "indexes are not dense 0..n-1 (found {index} at position {position})"
+            ));
+        }
+    }
+    let assembled: String = ordered.iter().map(|&(_, value)| value).collect();
+
+    // 1. The bytes must be the generation the keys name, and a real envelope.
+    gc_verify_generation(generation, &assembled)?;
+
+    // 2. ...and the writer, given those bytes, must produce EXACTLY these
+    //    entries. This is what pins the split boundaries and the chunked-vs-
+    //    direct threshold, so a set assembled by anything that does not
+    //    reproduce our writer's output byte-for-byte is left alone.
+    let expected = prepare_fastly_config_entries(root, &assembled)
+        .map_err(|err| format!("this writer could not re-derive the generation ({err})"))?;
+    let Some(expected_chunks) = expected.get(..expected.len().saturating_sub(1)) else {
+        return Err("this writer produced no chunk entries for these bytes".to_owned());
+    };
+    if expected_chunks.is_empty() {
+        // The envelope fits directly, so the writer would never have chunked it:
+        // whatever these entries are, they are not ours.
+        return Err(
+            "these bytes fit the entry limit, so this writer would have stored them directly \
+             rather than in chunks"
+                .to_owned(),
+        );
+    }
+    if expected_chunks.len() != ordered.len() {
+        return Err(format!(
+            "this writer would split these bytes into {} chunk(s), not {}",
+            expected_chunks.len(),
+            ordered.len()
+        ));
+    }
+    for ((expected_key, expected_value), item) in
+        expected_chunks.iter().zip(group_in_index_order(group))
+    {
+        if *expected_key != item.item_key {
+            return Err(format!(
+                "this writer would not have produced the key `{}`",
+                item.item_key
+            ));
+        }
+        if *expected_value != item.item_value {
+            return Err(format!(
+                "the stored value of `{}` is not the chunk this writer would have written at that \
+                 index",
+                item.item_key
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `group` sorted by chunk index, so it lines up with the writer's output order.
+fn group_in_index_order<'item>(group: &[&'item ConfigStoreItem]) -> Vec<&'item ConfigStoreItem> {
+    let mut ordered: Vec<&ConfigStoreItem> = group.to_vec();
+    ordered.sort_by_key(|item| {
+        item.item_key
+            .rsplit_once('.')
+            .and_then(|(_, index)| index.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
+    ordered
+}
+
+/// Is this key a chunk key of ANY root? (`config gc` scans the whole store, so
+/// it cannot scope to one root up front.) Validates the canonical shape.
+fn chunk_key_generation_any(key: &str) -> Option<String> {
+    // Split on the LAST infix, not the first: a chunk of a root that ITSELF
+    // contains the infix (a pointer parked at a chunk-shaped key with self-scoped
+    // chunks) has the infix twice, and its chunk suffix is after the LAST one.
+    // Splitting on the first would misread the doubly-nested chunk as a
+    // non-chunk, get it classified as an unclassifiable root, and abort the whole
+    // store's GC. For an ordinary single-infix key the root has no infix, so the
+    // last infix IS the first — this only changes the nested case.
+    let (root, _rest) = key.rsplit_once(CHUNK_KEY_INFIX)?;
+    chunk_key_generation(root, key)
+}
+
 /// Drive a sequential per-entry commit loop and produce the
 /// partial-failure diagnostic when the committer fails mid-way.
 /// Pure (no I/O) so the diagnostic shape is unit-testable without
@@ -1090,17 +2364,16 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
                 format!("failed to spawn `fastly`: {err}")
             }
         })?;
-    // Move stdin OUT of child via `take` so the ChildStdin drops at
-    // end of scope — that closes the pipe and lets the CLI see EOF.
+    // Take stdin OUT of the child and hand it to a helper that writes the value
+    // and drops the handle on return — closing the pipe so the CLI sees EOF.
+    // Dropping on scope-exit rather than via an explicit `drop()` keeps this
+    // valid on targets where `ChildStdin` is a non-Drop stub.
     // `child.wait_with_output()` then consumes child cleanly.
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
-    stdin
-        .write_all(value.as_bytes())
-        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))?;
-    drop(stdin);
+    write_value_to_fastly_stdin(stdin, value)?;
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `fastly`: {err}"))?;
@@ -1110,7 +2383,58 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
     Err(format!(
         "`fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
         output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
+        redact_stderr(&String::from_utf8_lossy(&output.stderr))
+    ))
+}
+
+/// Write `value` to the child's stdin, then drop the handle as it falls out of
+/// scope on return — closing the pipe so the `fastly` CLI sees EOF. Taking
+/// `stdin` by value gives a natural scope-end drop rather than an explicit
+/// `drop()`, which also keeps this valid on targets where `ChildStdin` is a
+/// non-Drop stub.
+fn write_value_to_fastly_stdin(mut stdin: ChildStdin, value: &str) -> Result<(), String> {
+    stdin
+        .write_all(value.as_bytes())
+        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))
+}
+
+fn delete_config_store_entry(store_id: &str, key: &str) -> Result<(), String> {
+    let store_arg = format!("--store-id={store_id}");
+    let key_arg = format!("--key={key}");
+    let output = Command::new("fastly")
+        .args([
+            "config-store-entry",
+            "delete",
+            store_arg.as_str(),
+            key_arg.as_str(),
+            "--auto-yes",
+        ])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // EVERY non-zero delete is a failure -- no "already gone" special case.
+    // Pattern-matching stderr for "not found"/"404" cannot reliably tell "this
+    // key is already gone" from "the store does not exist", an auth failure, or
+    // a 500: messages like `config store abc does not exist while deleting key
+    // <key>` name the key AND say "does not exist". Reporting those as a
+    // successful reclamation is strictly worse than a retry, and a retry is
+    // free: `config gc` re-lists the store, so a key that really is gone simply
+    // will not appear as a candidate next run.
+    // Redact stderr: a Fastly error can quote the entry value back, which on the
+    // delete path would put a stored config value into CI logs.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "`fastly config-store-entry delete --store-id={store_id} --key={key} --auto-yes` exited with status {}\n{}",
+        output.status,
+        redact_stderr(&stderr)
     ))
 }
 
@@ -1161,6 +2485,52 @@ fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
                 .to_owned(),
         )
     }
+}
+
+/// Summarise a `fastly ... describe` response for diagnostics WITHOUT
+/// leaking its contents.
+///
+/// The response body is the stored config value. App config may hold
+/// credentials, internal endpoints, or security policy, and this adapter
+/// performs no secret stripping — while CLI status lines are logged
+/// verbatim and CI logs are commonly retained and shared. So a schema-drift
+/// diagnostic must never echo the payload: report only its size and its
+/// top-level *shape* (field names for an object, type otherwise), never a
+/// value.
+fn redact_describe_response(stdout: &str) -> String {
+    let len = stdout.len();
+    serde_json::from_str::<serde_json::Value>(stdout).map_or_else(
+        |_err| format!("{len} bytes, not valid JSON"),
+        |value| match value {
+            serde_json::Value::Object(map) => {
+                // Object KEYS are stored/provider-controlled data (a wrong-shape
+                // response could be `{"<secret>": ...}`), so only the COUNT is
+                // reported, never the key names.
+                format!("{len} bytes, JSON object with {} field(s)", map.len())
+            }
+            other @ (serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+            | serde_json::Value::Array(_)) => {
+                format!("{len} bytes, JSON {}", shape_summary(&other))
+            }
+        },
+    )
+}
+
+/// Summarise a failing `fastly` invocation's stderr WITHOUT echoing it.
+///
+/// The `describe` and `update --stdin` paths carry the stored config value, so
+/// a Fastly error that quotes the payload back would put credentials straight
+/// into CI logs — the same exposure as the stdout leak, via the failure branch.
+/// Not-found *classification* still inspects stderr internally; only the
+/// user-facing string is redacted.
+fn redact_stderr(stderr: &str) -> String {
+    let len = stderr.trim().len();
+    format!(
+        "{len} bytes suppressed (may echo the stored config value); re-run the `fastly` command directly to inspect it"
+    )
 }
 
 /// One-line type label for a `serde_json::Value` (for diagnostic
@@ -1389,6 +2759,7 @@ mod tests {
     use edgezero_adapter::cli_support::read_package_name;
     #[cfg(unix)]
     use edgezero_core::test_env::PathPrepend;
+    use std::collections::HashSet;
 
     #[cfg(unix)]
     use std::sync::Mutex;
@@ -1652,6 +3023,33 @@ mod tests {
         assert!(setup_block_present(&path, "kv", TEST_KV_ID).expect("probe"));
     }
 
+    /// The three provisioning parsers must NOT echo a malformed fastly.toml's
+    /// source text (which can contain a stored secret) on a parse failure.
+    #[test]
+    fn provisioning_parsers_redact_malformed_toml() {
+        const SENTINEL: &str = "SUPER_SECRET_IN_A_BROKEN_LINE";
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Malformed TOML whose offending line carries a secret.
+        fs::write(&path, format!("service_id = \"{SENTINEL}\" = broken\n")).expect("write");
+
+        let errs = [
+            read_fastly_service_id(&path).expect_err("malformed toml must error"),
+            setup_block_present(&path, "kv", TEST_KV_ID).expect_err("malformed toml must error"),
+            append_fastly_setup(&path, "kv", TEST_KV_ID).expect_err("malformed toml must error"),
+        ];
+        for err in &errs {
+            assert!(
+                !err.contains(SENTINEL),
+                "a parse error must not echo the stored value: {err}"
+            );
+            assert!(
+                err.contains("redacted"),
+                "error should say it redacted: {err}"
+            );
+        }
+    }
+
     #[test]
     fn setup_block_present_false_when_id_missing() {
         let dir = tempdir().expect("tempdir");
@@ -1798,7 +3196,7 @@ mod tests {
             ("greeting".to_owned(), "hello".to_owned()),
             ("service.timeout_ms".to_owned(), "1500".to_owned()),
         ];
-        write_fastly_local_config_store(&path, TEST_CONFIG_ID, &entries).expect("write");
+        write_fastly_local_config_store(&path, TEST_CONFIG_ID, &entries, &[]).expect("write");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains(&format!("[local_server.config_stores.{TEST_CONFIG_ID}]")),
@@ -1831,12 +3229,14 @@ mod tests {
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "stale".to_owned())],
+            &[],
         )
         .expect("first write");
         write_fastly_local_config_store(
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "fresh".to_owned())],
+            &[],
         )
         .expect("second write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -1866,6 +3266,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
         )
         .expect("write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -1895,6 +3296,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
         )
         .expect("write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -2192,9 +3594,9 @@ build = \"cargo build --release\"
                 true,
             )
             .expect("dry-run succeeds");
-        // First line names the resolve+publish flow; subsequent lines preview
-        // each key the push would create (so callers can eyeball the keyset
-        // before running for real).
+        // First line names the resolve+publish flow; then one preview line per
+        // key. A push no longer reclaims anything (see `config gc`), so there is
+        // no GC-intent line.
         assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
         assert!(
             out[0].contains("would resolve fastly config-store `app_config`")
@@ -2330,6 +3732,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), envelope_json.clone())],
+            &[],
         )
         .expect("setup write");
 
@@ -2657,7 +4060,6 @@ build = \"cargo build --release\"
     // ---------- chunked push integration tests ----------
 
     /// Build a valid `BlobEnvelope` JSON string of approximately `target_len` bytes.
-    #[cfg(unix)]
     fn make_test_envelope(target_len: usize) -> String {
         use edgezero_core::blob_envelope::BlobEnvelope;
         use serde_json::json;
@@ -2716,6 +4118,366 @@ build = \"cargo build --release\"
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod");
         fake_dir
+    }
+
+    /// Fake `fastly` for cloud chunk-GC tests. Logs each
+    /// `config-store-entry` op ("describe <key>" / "update <key>" /
+    /// "delete <key>", plus "delete-argv <full argv>") to `oplog`.
+    ///
+    /// `root_describe_seq` gives the successive raw `item_value`s returned when
+    /// the ROOT key is described (call 1 = the pre-commit prior read, call 2 =
+    /// the post-commit read-back). `entry_list` is served for
+    /// `config-store-entry list` and is what reclamation derives generations
+    /// and supersession times from. `fail_delete_key` makes that one delete
+    /// exit non-zero. `describe_hard_error` makes the FIRST describe of each key
+    /// fail hard (so the prior read errors while the read-back still works).
+    #[cfg(unix)]
+    fn fake_fastly_gc(
+        root_key: &str,
+        root_describe_seq: &[String],
+        entry_list: &[(String, String, String)],
+        fail_delete_key: Option<&str>,
+        describe_hard_error: bool,
+        oplog: &Path,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Rendered with handlebars. Triple-stache `{{{ }}}` disables HTML
+        // escaping (paths are not markup); the shell's own `${var}` /
+        // `$(( ))` use single braces so they are literal text to handlebars.
+        const TEMPLATE: &str = r#"#!/bin/sh
+if [ "$1" = "config-store" ]; then cat '{{{list}}}'; exit 0; fi
+sub="$2"
+key=""
+for arg in "$@"; do case "$arg" in --key=*) key="${arg#--key=}";; esac; done
+if [ "$sub" = "list" ]; then printf 'list\n' >> '{{{oplog}}}'; cat '{{{entries}}}'; exit 0; fi
+if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '{{{oplog}}}'; exit 0; fi
+if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; printf 'delete-argv %s\n' "$*" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: 404 item not found' >&2; exit 1; fi; exit 0; fi
+if [ "$sub" = "describe" ]; then
+  printf 'describe %s\n' "$key" >> '{{{oplog}}}'
+  cfile='{{{dir}}}/count_'"$key"
+  n=0; [ -f "$cfile" ] && n=$(cat "$cfile"); n=$((n+1)); printf '%s' "$n" > "$cfile"
+  {{#if hard_error}}if [ "$n" = "1" ]; then echo 'Error: internal server error' >&2; exit 1; fi{{/if}}
+  rf='{{{dir}}}/resp_'"$key"'_'"$n"'.json'
+  if [ -f "$rf" ]; then cat "$rf"; exit 0; fi
+  echo 'Error: item not found' >&2; exit 1
+fi
+echo 'unexpected' >&2; exit 1
+"#;
+        let dir = tempdir().expect("tempdir");
+        let list_file = dir.path().join("list.json");
+        fs::write(
+            &list_file,
+            format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#),
+        )
+        .expect("list");
+        let entries_file = dir.path().join("entries.json");
+        fs::write(&entries_file, entry_list_json(entry_list)).expect("entries");
+        for (index, value) in root_describe_seq.iter().enumerate() {
+            let wrapped = format!(
+                r#"{{"item_value":{}}}"#,
+                serde_json::to_string(value).expect("escape")
+            );
+            let nth = index.saturating_add(1);
+            fs::write(
+                dir.path().join(format!("resp_{root_key}_{nth}.json")),
+                wrapped,
+            )
+            .expect("resp");
+        }
+        let data = serde_json::json!({
+            "list": list_file.display().to_string(),
+            "entries": entries_file.display().to_string(),
+            "oplog": oplog.display().to_string(),
+            "dir": dir.path().display().to_string(),
+            "fail": fail_delete_key.unwrap_or(""),
+            "hard_error": describe_hard_error,
+        });
+        let script = handlebars::Handlebars::new()
+            .render_template(TEMPLATE, &data)
+            .expect("render fake fastly script");
+        let script_path = dir.path().join("fastly");
+        fs::write(&script_path, script).expect("script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        dir
+    }
+
+    /// Like `fake_fastly_gc`, but serves a VERBATIM `config-store-entry list`
+    /// payload so a test can present a shape `entry_list_json` cannot build
+    /// (e.g. a paginated envelope).
+    #[cfg(unix)]
+    fn fake_fastly_gc_raw_list(
+        root_key: &str,
+        raw_listing: &str,
+        oplog: &Path,
+    ) -> tempfile::TempDir {
+        let dir = fake_fastly_gc(root_key, &[], &[], None, false, oplog);
+        fs::write(dir.path().join("entries.json"), raw_listing).expect("raw entries");
+        dir
+    }
+
+    /// A `config-store-entry list --json` payload. The item VALUE is a
+    /// placeholder: reclamation must only ever use keys and timestamps.
+    #[cfg(unix)]
+    fn entry_list_json(items: &[(String, String, String)]) -> String {
+        let entries: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(key, created, value)| {
+                serde_json::json!({
+                    "item_key": key,
+                    "created_at": created,
+                    "item_value": value,
+                })
+            })
+            .collect();
+        serde_json::to_string(&entries).expect("entry list json")
+    }
+
+    /// An RFC-3339 stamp `secs` in the past (the shape Fastly returns).
+    #[cfg(unix)]
+    fn stamp_secs_ago(secs: u64) -> String {
+        let delta = chrono::Duration::seconds(i64::try_from(secs).unwrap_or(0));
+        let now = chrono::Utc::now();
+        now.checked_sub_signed(delta)
+            .unwrap_or(now)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    /// Every chunk of `envelope` as the listing would return it: REAL keys and
+    /// REAL payload bytes.
+    ///
+    /// The values are not decorative. `config gc` proves a generation is ours by
+    /// reassembling it and hashing the result against the content-address its
+    /// keys name, so a placeholder value would (correctly) fail verification and
+    /// never be reclaimed. Fixtures must be honest for these tests to mean
+    /// anything.
+    #[cfg(unix)]
+    fn listed_generation(
+        root_key: &str,
+        envelope: &str,
+        secs_ago: u64,
+    ) -> Vec<(String, String, String)> {
+        let (chunks, _) = chunked_parts(root_key, envelope);
+        let stamp = stamp_secs_ago(secs_ago);
+        chunks
+            .into_iter()
+            .map(|(key, value)| (key, stamp.clone(), value))
+            .collect()
+    }
+
+    /// The ROOT entry as the listing would return it: its value is the pointer,
+    /// which is how `config gc` learns which chunks are live.
+    #[cfg(unix)]
+    fn listed_root(root_key: &str, envelope: &str, secs_ago: u64) -> (String, String, String) {
+        let (_, pointer) = chunked_parts(root_key, envelope);
+        (root_key.to_owned(), stamp_secs_ago(secs_ago), pointer)
+    }
+
+    /// A chunked envelope with a distinct payload per tag, padded to `pad`
+    /// characters so a caller can force a given number of chunks (7 000 bytes
+    /// each).
+    #[cfg(unix)]
+    fn gen_envelope_padded(tag: &str, pad: usize) -> String {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let data = json!({ tag: "x".repeat(pad) });
+        serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".to_owned()))
+            .expect("envelope")
+    }
+
+    /// A chunked envelope with a distinct payload per tag.
+    #[cfg(unix)]
+    fn gen_envelope(tag: &str) -> String {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+        serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".to_owned()))
+            .expect("envelope")
+    }
+
+    /// Split a chunked envelope into (chunk `(key, value)` pairs, root pointer).
+    #[cfg(unix)]
+    fn chunked_parts(root_key: &str, envelope: &str) -> (Vec<(String, String)>, String) {
+        let entries = prepare_fastly_config_entries(root_key, envelope).expect("expand");
+        let (_, pointer) = entries.last().expect("pointer").clone();
+        let chunks = entries[..entries.len().saturating_sub(1)].to_vec();
+        (chunks, pointer)
+    }
+
+    /// Just the chunk KEYS of a generation (for delete assertions).
+    #[cfg(unix)]
+    fn chunk_keys_of(root_key: &str, envelope: &str) -> Vec<String> {
+        let (chunks, _) = chunked_parts(root_key, envelope);
+        chunks.into_iter().map(|(key, _)| key).collect()
+    }
+
+    #[cfg(unix)]
+    fn oplog_has(oplog: &Path, line: &str) -> bool {
+        fs::read_to_string(oplog)
+            .unwrap_or_default()
+            .lines()
+            .any(|entry| entry == line)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_rejects_reserved_key() {
+        let dir = tempdir().expect("tempdir");
+        let bad_key = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        let err = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(bad_key.clone(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("reserved key must be rejected");
+        assert!(err.contains(&bad_key), "names the key: {err}");
+    }
+
+    /// Schema drift must never echo the config payload — including OBJECT KEYS,
+    /// which are provider/stored data. App config can hold credentials; CLI
+    /// status lines are logged verbatim and CI logs are retained/shared. Only a
+    /// size + field COUNT may be reported.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_schema_drift_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_abc123";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // The sentinel is an OBJECT KEY (not a value): the earlier redactor joined
+        // keys into the diagnostic, so this is what pins the key-disclosure fix.
+        let drift = format!(r#"{{"{SENTINEL}":"x"}}"#);
+        let fake = fake_fastly_returning(&drift, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("schema drift must error")
+        };
+        assert!(
+            !err.contains(SENTINEL),
+            "error must not leak an object KEY from the config payload: {err}"
+        );
+        assert!(
+            err.contains("bytes") && err.contains("field(s)"),
+            "error should carry a redacted size + field COUNT: {err}"
+        );
+    }
+
+    /// The FAILURE branch leaks too: a Fastly error that quotes the stored
+    /// value back in stderr must not reach the user-facing error.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_stderr_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_stderr1";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Not a "not found" — a hard failure that echoes the value.
+        let stderr = format!("Error: internal failure processing value {SENTINEL}");
+        let fake = fake_fastly_returning("", &stderr, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("hard stderr failure must error")
+        };
+        assert!(
+            !err.contains(SENTINEL),
+            "stderr must be redacted, not echoed: {err}"
+        );
+        assert!(
+            err.contains("suppressed"),
+            "error should say the stderr was suppressed: {err}"
+        );
+    }
+
+    /// The WRITE path leaks too: a failing `config-store-entry update --upsert`
+    /// whose stderr quotes the value being written must be redacted.
+    #[cfg(unix)]
+    #[test]
+    fn upsert_stderr_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_upsert1";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        // A fake `fastly` that fails every call, echoing the value in stderr.
+        let stderr = format!("Error: rejected value {SENTINEL}");
+        let fake = fake_fastly_returning("", &stderr, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = create_config_store_entry("store-abc", "cfg", SENTINEL)
+            .expect_err("a failing upsert must error");
+        assert!(
+            !err.contains(SENTINEL),
+            "upsert stderr must be redacted, not echoed: {err}"
+        );
+        assert!(
+            err.contains("suppressed"),
+            "error should say the stderr was suppressed: {err}"
+        );
+    }
+
+    /// `config gc` reads `item_value` for every entry (to classify roots). A
+    /// malformed listing whose values carry secrets must fail closed WITHOUT
+    /// echoing any value. (Replaces the old push prior-read redaction tests,
+    /// which are now vacuous: a cloud push performs no pre-commit read.)
+    #[cfg(unix)]
+    #[test]
+    fn gc_list_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_gc_list";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let good = entry_list_json(&listing);
+        // A valid entry whose VALUE contains the sentinel, plus a malformed
+        // sibling (no created_at) to trip the fail-closed path.
+        let mut array: serde_json::Value = serde_json::from_str(&good).unwrap();
+        let arr = array.as_array_mut().unwrap();
+        arr.push(serde_json::json!({
+            "item_key": "some.__edgezero_chunks.deadbeef.0",
+            "item_value": SENTINEL,
+        }));
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            None,
+            false,
+            &dir.path().join("ops.log"),
+        );
+        fs::write(
+            fake.path().join("entries.json"),
+            serde_json::to_string(&array).unwrap(),
+        )
+        .expect("overwrite entries");
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            !err.contains(SENTINEL),
+            "the fail-closed error must not echo a stored value: {err}"
+        );
     }
 
     #[cfg(unix)]
@@ -3154,8 +4916,14 @@ build = \"cargo build --release\"
             panic!("corrupt chunk must error")
         };
         assert!(
-            err.contains("SHA mismatch") || err.contains("mismatch"),
-            "error must mention hash mismatch: {err}"
+            err.contains("does not match the SHA-256"),
+            "error must say what failed: {err}"
+        );
+        // identified by POSITION, and neither hash echoed -- the
+        // expected one comes from the stored pointer, so it is value-controlled.
+        assert!(
+            err.contains("chunk 0"),
+            "error must locate the failing chunk by position: {err}"
         );
     }
 
@@ -3164,8 +4932,10 @@ build = \"cargo build --release\"
     fn read_config_entry_errors_on_malformed_pointer() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Root value is JSON but neither a BlobEnvelope nor a valid pointer.
-        let bad_json = r#"{"some_field":"not a pointer or envelope"}"#;
+        // Root value ANNOUNCES our chunk-pointer kind but is malformed. It must
+        // be pointer-kind: arbitrary JSON is a legitimate config-store value and
+        // now passes through untouched, so it would not reach the corrupt path.
+        let bad_json = r#"{"edgezero_kind":"fastly_config_chunks","some_field":"x"}"#;
         let item_json = format!(
             r#"{{"item_value":{}}}"#,
             serde_json::to_string(bad_json).unwrap()
@@ -3207,6 +4977,7 @@ build = \"cargo build --release\"
             &fastly_toml,
             TEST_CONFIG_ID,
             &[("cfg".to_owned(), json_str.clone())],
+            &[],
         )
         .expect("write");
 
@@ -3235,7 +5006,8 @@ build = \"cargo build --release\"
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
         // Write all physical entries (chunks + pointer) to the local store.
-        write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &physical).expect("write");
+        write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &physical, &[])
+            .expect("write");
 
         let result = FastlyCliAdapter
             .read_config_entry_local(
@@ -3256,6 +5028,102 @@ build = \"cargo build --release\"
         );
     }
 
+    /// a corrupt/invalid prior value must NOT abort the
+    /// local read, or the CLI push aborts on the diff read before the writer's
+    /// fail-soft ("overwrite, warn, prune nothing") can repair the state.
+    /// `config push --local` is how an operator recovers, so the read reports
+    /// `Unsupported` ("cannot diff") and lets the write proceed.
+    #[test]
+    fn read_config_entry_local_degrades_corrupt_prior_to_unsupported() {
+        use crate::chunked_config::{CHUNK_KEY_INFIX, POINTER_KIND};
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        // A pointer-KIND value that is invalid (missing the chunks it needs).
+        // The resolver would error on this; the local read must NOT propagate
+        // that as `Err`.
+        let broken_pointer = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"cfg{CHUNK_KEY_INFIX}{sha}.0","len":10,"sha256":"x"}}],"data_sha256":"","envelope_len":10,"envelope_sha256":"{sha}"}}"#,
+            sha = "a".repeat(64),
+        );
+        write_fastly_local_config_store(
+            &fastly_toml,
+            TEST_CONFIG_ID,
+            &[("cfg".to_owned(), broken_pointer)],
+            &[],
+        )
+        .expect("write");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("a corrupt local prior must NOT abort the read");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "a corrupt prior value must degrade to Unsupported so the push can overwrite it"
+        );
+    }
+
+    /// A `contents` that is not a table (a scalar or array) is malformed store
+    /// state. It must degrade to `Unsupported`, not fall through to `MissingKey`
+    /// (which would render an inaccurate "all values added" diff).
+    #[test]
+    fn read_config_entry_local_non_table_contents_is_unsupported() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(
+            &fastly_toml,
+            format!("[local_server.config_stores.{TEST_CONFIG_ID}]\ncontents = 42\n"),
+        )
+        .expect("seed");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("a non-table contents must NOT abort the read");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "a non-table `contents` must degrade to Unsupported, not MissingKey"
+        );
+    }
+
+    /// A malformed PARENT table (`local_server` etc. as a scalar) must degrade to
+    /// Unsupported, not collapse to `MissingStore`'s "all values added" diff.
+    #[test]
+    fn read_config_entry_local_non_table_parent_is_unsupported() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        // `local_server` is a scalar, not a table.
+        fs::write(&fastly_toml, "local_server = 42\n").expect("seed");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("a non-table parent must NOT abort the read");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "a non-table parent must degrade to Unsupported, not MissingStore"
+        );
+    }
+
     /// Spec 12.3 + 9.3: a second oversized push must converge the
     /// runtime on the NEW envelope — chunk keys are content-addressed
     /// by the full-envelope SHA, so push B writes a new chunk-set and
@@ -3263,14 +5131,11 @@ build = \"cargo build --release\"
     ///
     /// The local fastly.toml writer upserts per-key (so a sibling
     /// `--key app_config_staging` push leaves `app_config` intact per
-    /// spec 12.7). Within the SAME root key, old chunks for envelope
-    /// A remain in the contents table after envelope B's push — they're
-    /// unreferenced (the root pointer at `app_config` now names B's
-    /// chunks), matching the remote Fastly behaviour where the
-    /// per-entry `update --upsert` shell-out has no atomic-delete
-    /// pairing. The runtime-correctness property holds either way: a
-    /// read after push B follows the active pointer and reconstructs
-    /// envelope B, not A.
+    /// spec 12.7). Within the SAME root key, GC on re-push prunes the
+    /// prior generation: after envelope B's push, envelope A's chunks —
+    /// now unreferenced by the `app_config` pointer — are removed from
+    /// the contents table. A read after push B follows the active
+    /// pointer and reconstructs envelope B, not A.
     #[cfg(unix)]
     #[test]
     #[expect(
@@ -3284,8 +5149,7 @@ build = \"cargo build --release\"
         fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
 
         // First push: envelope A. Records the chunk-key set so we can
-        // confirm they survive the second push (no garbage collection
-        // in v1 — spec 9.3 + Q6).
+        // confirm they are pruned by the second push's GC.
         let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         FastlyCliAdapter
             .push_config_entries_local(
@@ -3319,10 +5183,10 @@ build = \"cargo build --release\"
         );
 
         // Second push: a DIFFERENT oversized envelope B. The
-        // content-addressed chunk keys must shift to B's sha; old
-        // A-chunks may remain in the table (v1 doesn't GC). Build
-        // envelope B with a distinct payload key so its SHA differs
-        // from A's even at the same total length.
+        // content-addressed chunk keys must shift to B's sha; GC then
+        // prunes the old A-chunks. Build envelope B with a distinct
+        // payload key so its SHA differs from A's even at the same
+        // total length.
         let envelope_b = {
             use edgezero_core::blob_envelope::BlobEnvelope;
             use serde_json::json;
@@ -3364,8 +5228,7 @@ build = \"cargo build --release\"
 
         // Chunk keys are content-addressed by envelope SHA, so the B
         // push installs a fresh chunk-set whose keys are all distinct
-        // from A's. Under the upsert semantic the A-chunks remain in
-        // the contents table (no GC in v1); B's chunks are simply added.
+        // from A's. GC on re-push prunes the now-unreferenced A-chunks.
         let new_b_chunks: Vec<&String> = chunks_b
             .iter()
             .filter(|key| !chunks_a.contains(*key))
@@ -3374,12 +5237,12 @@ build = \"cargo build --release\"
             !new_b_chunks.is_empty(),
             "push B must have added at least one new content-addressed chunk: A-set={chunks_a:?} B-set={chunks_b:?}"
         );
-        // Old A-chunks remain in the table (orphan-but-present —
-        // matches the remote Fastly write-only-upsert semantic).
+        // Old A-chunks are pruned: GC deletes the prior generation the
+        // old pointer referenced once B's pointer supersedes it.
         for chunk_key in &chunks_a {
             assert!(
-                chunks_b.contains(chunk_key),
-                "old A-chunk `{chunk_key}` must remain in the local table after push B (v1 has no GC); B-set={chunks_b:?}"
+                !chunks_b.contains(chunk_key),
+                "old A-chunk `{chunk_key}` must be pruned from the local table after push B; B-set={chunks_b:?}"
             );
         }
 
@@ -3406,5 +5269,2287 @@ build = \"cargo build --release\"
             value, envelope_a,
             "old envelope A's chunks must be inert -- read must NOT return A"
         );
+    }
+
+    // ---------- config gc (operator-invoked reclamation) ----------
+
+    #[cfg(unix)]
+    fn run_gc(dir: &Path, older_than_secs: u64, dry_run: bool) -> Result<Vec<String>, String> {
+        FastlyCliAdapter.gc_config_entries(
+            dir,
+            None,
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            &AdapterPushContext::new(),
+            older_than_secs,
+            dry_run,
+        )
+    }
+
+    /// gc never deletes a chunk the LIVE root pointer references, however old.
+    #[cfg(unix)]
+    #[test]
+    fn gc_never_deletes_live_chunks() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
+        // The live generation is ANCIENT, but it is referenced by the root.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 1, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &live_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "live chunk `{key}` must never be reclaimed; log:\n{log}\nout: {out:?}"
+            );
+        }
+    }
+
+    /// gc reclaims unreferenced chunks older than the operator's threshold.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reclaims_unreferenced_chunks_older_than_threshold() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+
+        // The live config has been stable for 2 days; the operator asserts a 1-day
+        // window. So everything superseded (<= when live went live, i.e. >= 2
+        // days ago) is safely reclaimable.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800)); // a week old
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        for key in &dead_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "orphan `{key}` older than the threshold must be reclaimed; out: {out:?}"
+            );
+        }
+        for key in &live_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "live chunk `{key}` must survive"
+            );
+        }
+    }
+
+    /// The soundness test (design-3 counterexample): a root whose
+    /// current config was deployed seconds ago must NOT have its prior generation
+    /// reclaimed, even if that generation's chunks are ANCIENT. The clock is the
+    /// live config's age, not the orphan chunk's own creation time.
+    #[cfg(unix)]
+    #[test]
+    fn gc_protects_recently_superseded_generation_with_old_chunks() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let prior = gen_envelope("prior");
+        let prior_chunks = chunk_keys_of(TEST_CONFIG_ID, &prior);
+
+        // Live config went live 30s ago; the prior generation's chunks are a year
+        // old but were superseded only 30s ago -> POPs may still serve them.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 30)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 30));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &prior, 31_536_000)); // ~1 year
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // Even a generous 1-day threshold must NOT delete the prior generation,
+        // because the live config has only been stable for 30 seconds.
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &prior_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a generation superseded 30s ago must be retained despite old chunks: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// a live root whose pointer drops its
+    /// last chunk ref AND restates `envelope_len` as the remaining sum passes
+    /// every metadata check. The dropped chunk is then absent from the live set
+    /// and looks like a deletable orphan -- while the config still needs it.
+    ///
+    /// Guards the PLANNER's content verification (a unit test on
+    /// `gc_verify_generation` alone does not prove the planner calls it).
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_when_a_live_pointer_underreports_its_chunks() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // Padded so the generation is >= 3 chunks: this case needs a ref to
+        // drop that still leaves a plausible multi-chunk set behind.
+        let live = gen_envelope_padded("live", 20_000);
+        let (chunks, pointer_json) = chunked_parts(TEST_CONFIG_ID, &live);
+        assert!(chunks.len() >= 3, "need >= 3 chunks for this case");
+
+        // Doctor the pointer: drop the last ref, restate envelope_len to match
+        // the survivors. Generation, indexes, per-chunk lens and the sum all
+        // still agree -- only the CONTENT does not.
+        let mut pointer: serde_json::Value = serde_json::from_str(&pointer_json).expect("parse");
+        let refs = pointer
+            .get_mut("chunks")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("chunks array");
+        refs.pop().expect("drop the last chunk ref");
+        let surviving_len: u64 = refs
+            .iter()
+            .filter_map(|chunk| chunk.get("len").and_then(serde_json::Value::as_u64))
+            .sum();
+        pointer["envelope_len"] = serde_json::json!(surviving_len);
+        let doctored = serde_json::to_string(&pointer).expect("serialise");
+
+        // The store still physically holds ALL the chunks, including the one the
+        // doctored pointer no longer names.
+        let orphaned_by_omission = chunks.last().expect("last chunk").0.clone();
+        let stamp = stamp_secs_ago(999_999);
+        let mut listing = vec![(TEST_CONFIG_ID.to_owned(), stamp.clone(), doctored)];
+        for (key, value) in chunks {
+            listing.push((key, stamp.clone(), value));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
+        assert!(
+            err.contains("does not reconstruct the envelope it claims"),
+            "expected a content-address mismatch on the live pointer, got: {err}"
+        );
+        assert!(
+            !oplog_has(&oplog, &format!("delete {orphaned_by_omission}")),
+            "a chunk the live config still needs must never be deleted because its pointer \
+             under-reported it: `{orphaned_by_omission}`"
+        );
+    }
+
+    /// a LONE entry whose value hashes to the generation
+    /// its own key names would otherwise "prove" itself and be deleted. But our
+    /// writer never emits a one-chunk generation (an oversized envelope always
+    /// splits into >= 2), so a group of one is never ours -- it is a root-like
+    /// value sitting at a chunk-shaped key. This is the case a pure hash check
+    /// cannot catch on its own.
+    #[cfg(unix)]
+    #[test]
+    fn gc_never_reclaims_a_lone_self_consistent_chunk() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+
+        // A complete envelope stored at a chunk-shaped key whose generation IS
+        // that envelope's own SHA -- so it reassembles to its content-address.
+        let squatter_value = gen_envelope("someones-real-config");
+        let self_sha = sha256_hex(squatter_value.as_bytes());
+        let squatter_key = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{self_sha}.0");
+        listing.push((
+            squatter_key.clone(),
+            stamp_secs_ago(31_536_000),
+            squatter_value,
+        ));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !oplog_has(&oplog, &format!("delete {squatter_key}")),
+            "a one-chunk 'generation' is never something this writer emitted, so it must not be \
+             reclaimed even though it hashes to its own key: `{squatter_key}`; log:\n{log}"
+        );
+    }
+
+    /// a delete that fails on a generation's FIRST key has
+    /// an UNKNOWN outcome -- Fastly may have committed it before returning an
+    /// error.  called this "whole and retryable", which is unsound: if the
+    /// failed delete did commit, a re-run finds a fragment. The honest report is
+    /// a NOTE that the outcome is uncertain, NOT a clean-retry promise. We still
+    /// stop the generation so a CONFIRMED partial delete cannot happen.
+    #[cfg(unix)]
+    #[test]
+    fn gc_first_delete_failure_is_reported_as_uncertain_not_clean_retry() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 2, "need a multi-chunk generation");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        // The FIRST chunk of the doomed generation fails to delete.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&dead_chunks[0]),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete is a failure");
+        assert!(
+            err.contains("unknown outcome"),
+            "a failed delete's outcome is unknown and must be reported as such: {err}"
+        );
+        assert!(
+            !err.contains("will retry them"),
+            "the disproven clean-retry promise must be gone: {err}"
+        );
+        // The siblings must NOT have been ATTEMPTED -- stopping is what prevents a
+        // CONFIRMED partial delete.
+        for key in dead_chunks.iter().skip(1) {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "after the first failure the generation must be left alone: `{key}`"
+            );
+        }
+    }
+
+    /// the stateful case. A remote delete that COMMITS but
+    /// still reports failure leaves a real fragment. On the SECOND run that
+    /// missing key makes the generation unprovable, so it must be reported as
+    /// left-untouched (surfaced), never silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn gc_committed_but_failed_delete_surfaces_as_unprovable_next_run() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 2, "need a multi-chunk generation");
+
+        // SECOND run's world: the first chunk's delete committed last time, so it
+        // is gone. The generation is now a fragment.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let mut dead_gen = listed_generation(TEST_CONFIG_ID, &dead, 604_800);
+        let survivor = dead_gen[1].0.clone();
+        dead_gen.remove(0); // the committed-deleted chunk is absent now
+        listing.extend(dead_gen);
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        assert!(
+            !oplog_has(&oplog, &format!("delete {survivor}")),
+            "an unprovable fragment survivor must not be deleted: `{survivor}`"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("not byte-identical to what this writer would produce")),
+            "the surviving fragment must be SURFACED as left-untouched, not silently dropped: {out:?}"
+        );
+    }
+
+    /// if a delete fails PART-WAY through a generation, the
+    /// survivors are an incomplete generation that `prove_generation` can never
+    /// verify again -- so `gc` will never reclaim them. Claiming "re-run to
+    /// retry" there was false. Say plainly that recovery is manual.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reports_stranded_survivors_as_manual_recovery() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // Padded to >= 3 chunks so a mid-generation failure leaves survivors.
+        let live = gen_envelope("live");
+        let dead = gen_envelope_padded("dead", 20_000);
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 3, "need >= 3 chunks");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        // The SECOND chunk fails: the first is already gone by then.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&dead_chunks[1]),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete is a failure");
+        assert!(
+            err.contains("INCOMPLETE generation") && err.contains("re-running will NOT help"),
+            "a stranded fragment must not be described as retryable: {err}"
+        );
+        // It must name the survivors and how to remove them by hand.
+        for key in dead_chunks.iter().skip(2) {
+            assert!(
+                err.contains(key.as_str()),
+                "the operator needs the exact surviving keys: `{key}` missing from: {err}"
+            );
+        }
+        assert!(
+            err.contains("fastly config-store-entry delete"),
+            "give the operator the recovery command: {err}"
+        );
+        // And we stopped rather than deleting the rest.
+        for key in dead_chunks.iter().skip(2) {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "deletion must stop at the first failure in a generation: `{key}`"
+            );
+        }
+    }
+
+    /// root keys are free-form, so a chunk key can hold
+    /// shell metacharacters. Manual-recovery commands must render them so that
+    /// pasting cannot execute or misparse -- single-quoted, with embedded quotes
+    /// escaped.
+    #[test]
+    fn recovery_commands_are_shell_safe() {
+        // A key crafted to run `id` and to break argument parsing if unquoted.
+        let hostile = "app$(id).__edgezero_chunks.'; rm -rf /'.0".to_owned();
+        let keys = [hostile.clone()];
+        let rendered = recovery_commands("store-abc", &keys);
+
+        // The dangerous substring is not sitting there unquoted.
+        assert!(
+            !rendered.contains("$(id)") || rendered.contains("'app$(id)"),
+            "shell-active text must be inside single quotes: {rendered}"
+        );
+        // Every embedded single quote is closed-escaped-reopened, so no quote
+        // context leaks.
+        assert!(
+            rendered.contains(r"'\''"),
+            "embedded single quotes must be escaped as '\\'': {rendered}"
+        );
+        // Sanity: what a POSIX shell would parse back out of our --key argument
+        // is EXACTLY the original key (round-trip through `sh`).
+        let key_arg = rendered
+            .split("--key=")
+            .nth(1)
+            .and_then(|rest| rest.split(" --auto-yes").next())
+            .expect("a --key argument");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {key_arg}"))
+            .output()
+            .expect("run sh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            hostile,
+            "the shell must parse the quoted argument back to the exact key"
+        );
+    }
+
+    /// a valid DIRECT envelope at a chunk-shaped key is a
+    /// runtime-readable root, but round 9 only protected POINTER values there.
+    ///
+    /// Construction: pad a small valid envelope with trailing JSON whitespace
+    /// past the entry limit. The writer chunks it; chunk 0 (the first 7 000
+    /// bytes) is the whole envelope plus trailing spaces, which STILL parses and
+    /// verifies as that envelope. So chunk 0's key holds a valid direct envelope
+    /// -- a root -- yet the generation round-trips through the writer and passes
+    /// every proof, so GC deletes chunk 0.
+    #[cfg(unix)]
+    #[test]
+    fn valid_envelope_at_chunk_shaped_key_is_a_protected_root() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // A small valid envelope + trailing whitespace over the entry limit.
+        let envelope = BlobEnvelope::new(json!({"k":"v"}), "2026-06-22T00:00:00Z".into());
+        let mut padded = serde_json::to_string(&envelope).unwrap();
+        padded.push_str(&" ".repeat(8_200));
+        let entries = prepare_fastly_config_entries(TEST_CONFIG_ID, &padded).expect("expand");
+        assert!(entries.len() >= 3, "need >= 2 chunks + pointer");
+        let holder_key = entries[0].0.clone();
+        // Sanity: chunk 0's value IS a standalone valid envelope.
+        let parsed: BlobEnvelope =
+            serde_json::from_str(&entries[0].1).expect("chunk 0 must parse as an envelope");
+        parsed.verify().expect("chunk 0 must verify as an envelope");
+
+        // Seed the store with the chunk entries only -- NO live pointer refers
+        // to them, so this generation looks orphaned. Aged old.
+        let stamp = stamp_secs_ago(604_800);
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+        for (key, value) in &entries[..entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp.clone(), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        drop(run_gc(dir.path(), 86_400, false));
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !oplog_has(&oplog, &format!("delete {holder_key}")),
+            "an entry whose value is a valid direct envelope is a runtime-readable root and must \
+             never be deleted, whatever its key looks like: `{holder_key}`; log:\n{log}"
+        );
+        // The SIBLING chunks must survive too: protecting the holder drops the
+        // generation to an incomplete group, which is left unprovable — so
+        // nothing in this generation is deleted, not just the holder.
+        for (key, _) in &entries[1..entries.len().saturating_sub(1)] {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a sibling of a protected root must also survive (the group is left \
+                 unprovable): `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// A self-scoped pointer at a chunk-shaped holder key (its chunks nest the
+    /// infix twice) must NOT abort store-wide GC: the doubly-nested chunks are
+    /// recognised as chunks (via the LAST infix), so the holder classifies as a
+    /// root, its references are counted live, and other roots still reclaim.
+    #[cfg(unix)]
+    #[test]
+    fn gc_tolerates_a_self_scoped_pointer_at_a_chunk_shaped_root() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // A pointer parked at a chunk-shaped key, with chunks scoped to itself.
+        let holder_key = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "e".repeat(64));
+        let nested = gen_envelope("nested");
+        let nested_entries = prepare_fastly_config_entries(&holder_key, &nested).expect("expand");
+        let (_, holder_pointer) = nested_entries.last().expect("pointer").clone();
+
+        // A normal live root, and a normal orphan generation that SHOULD reclaim.
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        let stamp = stamp_secs_ago(604_800);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+        listing.push((holder_key.clone(), stamp.clone(), holder_pointer));
+        for (key, value) in &nested_entries[..nested_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp.clone(), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // The run must SUCCEED (not abort) and still reclaim the ordinary orphan.
+        run_gc(dir.path(), 86_400, false).expect("store-wide GC must not abort");
+        for key in &dead_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "an ordinary orphan must still be reclaimed despite the self-scoped pointer: `{key}`"
+            );
+        }
+        assert!(
+            !oplog_has(&oplog, &format!("delete {holder_key}")),
+            "the chunk-shaped holder root must never be deleted"
+        );
+    }
+
+    /// A nested ORPHAN generation (chunks scoped to a chunk-shaped root, with NO
+    /// live pointer referencing them) must be grouped and reclaimed, not silently
+    /// dropped. Age and grouping split on the LAST infix, so the nested chunks are
+    /// attributed to their real (nested) root.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reclaims_a_nested_orphan_generation() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // A chunk-shaped root, and a full generation of chunks SCOPED to it — but
+        // no pointer references them, so they are orphaned.
+        let nested_root = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "f".repeat(64));
+        let nested = gen_envelope("nested-orphan");
+        let nested_entries = prepare_fastly_config_entries(&nested_root, &nested).expect("expand");
+        let nested_chunks: Vec<String> = nested_entries[..nested_entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let live = gen_envelope("live");
+        let stamp = stamp_secs_ago(604_800);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        for (key, value) in &nested_entries[..nested_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp.clone(), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &nested_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "a nested orphan generation must be reclaimed, not silently dropped: `{key}`; \
+                 log:\n{log}"
+            );
+        }
+    }
+
+    /// Age attribution works per NESTED root: a nested orphan generation whose
+    /// nested root's live config went live RECENTLY must be RETAINED (POPs may
+    /// still serve the superseded generation), even though the orphan's own
+    /// chunks are old. This pins that `root_live_since` splits on the last infix.
+    #[cfg(unix)]
+    #[test]
+    fn gc_retains_a_nested_orphan_under_a_recently_changed_nested_root() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let nested_root = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "a".repeat(64));
+
+        // The nested root's CURRENT (live) generation, created 30s ago.
+        let live_nested = gen_envelope("live-nested");
+        let live_entries = prepare_fastly_config_entries(&nested_root, &live_nested).expect("exp");
+        let (_, live_pointer) = live_entries.last().expect("pointer").clone();
+
+        // An OLD orphan generation under the SAME nested root (a week old).
+        let old_nested = gen_envelope("old-nested-orphan");
+        let old_entries = prepare_fastly_config_entries(&nested_root, &old_nested).expect("exp");
+        let old_chunks: Vec<String> = old_entries[..old_entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        // The nested root holds its live pointer; its live chunks are 30s old.
+        listing.push((nested_root.clone(), stamp_secs_ago(30), live_pointer));
+        for (key, value) in &live_entries[..live_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp_secs_ago(30), value.clone()));
+        }
+        // The old orphan chunks are a week old.
+        for (key, value) in &old_entries[..old_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp_secs_ago(604_800), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // A generous 1-day window: the orphan's OWN chunks are older, but the
+        // nested root's live config is only 30s old, so its orphan is retained.
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &old_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a nested orphan under a recently-changed nested root must be retained: `{key}`; \
+                 log:\n{log}"
+            );
+        }
+    }
+
+    /// A generation is aged by its YOUNGEST member, so a generation with one
+    /// recent chunk is retained whole even if its other chunks are ancient.
+    #[cfg(unix)]
+    #[test]
+    fn gc_ages_a_generation_by_its_youngest_member() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // `app_config` live is direct, so there is no live-config age signal —
+        // aging falls to the generation's own chunks.
+        let live_direct = gen_envelope_padded("live-direct", 100);
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 2, "need a multi-chunk generation");
+
+        let mut listing = vec![(
+            TEST_CONFIG_ID.to_owned(),
+            stamp_secs_ago(999_999),
+            live_direct,
+        )];
+        // The doomed generation: chunk 0 written 30s ago (YOUNG), the rest a week
+        // ago. Its youngest-member age (30s) is under the 1-day window.
+        let dead_parts = chunked_parts(TEST_CONFIG_ID, &dead).0;
+        for (idx, (key, value)) in dead_parts.iter().enumerate() {
+            let age = if idx == 0 { 30 } else { 604_800 };
+            listing.push((key.clone(), stamp_secs_ago(age), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &dead_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a generation with a recent member must be retained WHOLE (aged by its youngest): \
+                 `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// A delete failure in one generation must not stop an INDEPENDENT
+    /// generation's deletes.
+    #[cfg(unix)]
+    #[test]
+    fn gc_failure_in_one_generation_does_not_stop_another() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead_a = gen_envelope("dead-a");
+        let dead_b = gen_envelope("dead-b");
+        let a_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead_a);
+        let b_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead_b);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead_a, 604_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead_b, 604_800));
+
+        // Generation A's first delete fails.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&a_chunks[0]),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete is a failure");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        // Generation B must still have been reclaimed despite A's failure.
+        for key in &b_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "an independent generation must still be reclaimed after another one fails: \
+                 `{key}`; err: {err}; log:\n{log}"
+            );
+        }
+    }
+
+    /// key shape is not authoritative for ROOTS either.
+    ///
+    /// A valid pointer stored at a chunk-SHAPED key (`shadow.__edgezero_chunks.
+    /// <sha>.0`) is skipped by the live-set scan, which excludes chunk-shaped
+    /// keys up front. The runtime resolver follows any pointer it is given, so
+    /// that pointer's references ARE live -- but GC never sees them, calls the
+    /// generation orphaned, and deletes it.
+    #[cfg(unix)]
+    #[test]
+    fn pointer_at_chunk_shaped_key_keeps_its_references_live() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // `app_config`'s CURRENT config is small enough to store directly, so
+        // its own root references no chunks at all.
+        let live_direct = gen_envelope_padded("live-direct", 100);
+        let mut listing = vec![(
+            TEST_CONFIG_ID.to_owned(),
+            stamp_secs_ago(999_999),
+            live_direct,
+        )];
+
+        // An older chunked generation of `app_config` still exists...
+        let referenced = gen_envelope("still-referenced");
+        let referenced_chunks = chunk_keys_of(TEST_CONFIG_ID, &referenced);
+        listing.extend(listed_generation(TEST_CONFIG_ID, &referenced, 604_800));
+
+        // ...and a pointer at a CHUNK-SHAPED key references it. The resolver
+        // would happily follow this, so those chunks are LIVE.
+        let (_, referenced_pointer) = chunked_parts(TEST_CONFIG_ID, &referenced);
+        let shadow_key = format!("shadow{CHUNK_KEY_INFIX}{}.0", "d".repeat(64));
+        listing.push((shadow_key, stamp_secs_ago(604_800), referenced_pointer));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // The RESULT does not matter here (it may Err after the fix if the
+        // shadow pointer's own chunks are incomplete); the invariant is purely
+        // that no LIVE-referenced chunk is deleted, which the oplog proves.
+        drop(run_gc(dir.path(), 86_400, false));
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &referenced_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a chunk a live pointer references must never be deleted, whatever the KEY of \
+                 the entry holding that pointer looks like: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// a FOREIGN writer needs NO preimage to satisfy a
+    /// content-address. Pick envelope E, compute H = sha256(E), split E however
+    /// you like, store the parts as `<root>.__edgezero_chunks.H.0` / `.1`. Under
+    /// hash-only checking that group "proved" itself and was deleted.
+    ///
+    /// The round-trip closes it: the writer, given those same bytes, must emit
+    /// exactly these keys and values. A split at boundaries we would never
+    /// choose is not our output, so it is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn gc_never_reclaims_a_foreign_content_addressed_group() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+
+        // A foreign writer's data: a valid envelope, content-addressed under our
+        // reserved namespace, but split at ITS OWN boundary (not our 7 000-byte
+        // UTF-8-safe one). Everything hashes correctly -- no preimage needed.
+        let foreign = gen_envelope_padded("foreign-tool", 20_000);
+        let generation = sha256_hex(foreign.as_bytes());
+        let (head, tail) = foreign.split_at(1_234);
+        let foreign_keys = [
+            format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{generation}.0"),
+            format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{generation}.1"),
+        ];
+        listing.push((
+            foreign_keys[0].clone(),
+            stamp_secs_ago(31_536_000),
+            head.to_owned(),
+        ));
+        listing.push((
+            foreign_keys[1].clone(),
+            stamp_secs_ago(31_536_000),
+            tail.to_owned(),
+        ));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &foreign_keys {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a group this writer would never have produced must not be reclaimed, however \
+                 well it hashes: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// an entry can be chunk-SHAPED without being a chunk
+    /// -- a store may predate this feature or be shared, and push-time
+    /// reserved-key rejection cannot protect what already exists. Deleting one
+    /// would destroy live config.
+    ///
+    /// proof is CONTENT, not shape. A candidate generation is ours only
+    /// if it reassembles to the content-address its own keys name. Unprovable
+    /// entries are left UNTOUCHED and reported -- not fatal, because one foreign
+    /// entry must not block reclaiming the rest of the store forever.
+    #[cfg(unix)]
+    #[test]
+    fn gc_leaves_unprovable_chunk_shaped_entries_untouched() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+        // A real orphan generation: provable, old -> must still be reclaimed.
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        // Pre-existing entries at chunk-shaped keys that we did NOT write: one
+        // holding somebody's real config envelope, one holding plain text.
+        // Both are old enough to look "eligible" on age alone.
+        let envelope_squatter = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "b".repeat(64));
+        let text_squatter = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "c".repeat(64));
+        listing.push((
+            envelope_squatter.clone(),
+            stamp_secs_ago(31_536_000),
+            gen_envelope("someones-real-config"),
+        ));
+        listing.push((
+            text_squatter.clone(),
+            stamp_secs_ago(31_536_000),
+            "just some plain text".to_owned(),
+        ));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+
+        for key in [&envelope_squatter, &text_squatter] {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "an entry we cannot prove we wrote must never be deleted: `{key}`; log:\n{log}"
+            );
+        }
+        // Left untouched must not mean silently ignored. The wording must not
+        // over-claim either: these two entries fail for DIFFERENT reasons (a
+        // wrong content-address vs a count this writer never emits), so the
+        // summary says "not byte-identical to what this writer would produce"
+        // rather than naming one specific check.
+        assert!(
+            out.iter()
+                .any(|line| line.contains("not byte-identical to what this writer would produce")),
+            "the summary must report what it declined to judge; out: {out:?}"
+        );
+        // ...and a genuine orphan generation is still reclaimed, so one foreign
+        // entry does not block the store.
+        for key in &dead_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "a provable orphan generation must still be reclaimed: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// a key is unique in a config store, so duplicate rows
+    /// mean the listing is not one consistent view. Left alone, last-row-wins on
+    /// `created_at` could age a recent key into eligibility.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_duplicate_listing_keys() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let mut orphans = listed_generation(TEST_CONFIG_ID, &dead, 30);
+        // The same key twice, with conflicting ages: young (real) then ancient.
+        let (dup_key, _, dup_value) = orphans[0].clone();
+        orphans.push((dup_key.clone(), stamp_secs_ago(31_536_000), dup_value));
+        listing.extend(orphans);
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            err.contains("more than once"),
+            "expected a refusal naming the duplicate key, got: {err}"
+        );
+        assert!(
+            !oplog_has(&oplog, &format!("delete {dup_key}")),
+            "a duplicated row must not let a recent key be aged into eligibility"
+        );
+    }
+
+    /// `gc_config_entries` is a public trait method, so the
+    /// zero-window rule must live at the DESTRUCTIVE boundary, not only in the
+    /// CLI that usually calls it. Rejected before any `fastly` invocation.
+    #[cfg(unix)]
+    #[test]
+    fn gc_adapter_boundary_rejects_a_zero_window() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // Straight at the adapter, bypassing the CLI's own gate.
+        let err = run_gc(dir.path(), 0, false).expect_err("a destructive zero window must fail");
+        assert!(
+            err.contains("non-zero `--older-than`"),
+            "expected the boundary itself to reject zero, got: {err}"
+        );
+        assert!(
+            !fs::read_to_string(&oplog)
+                .unwrap_or_default()
+                .contains("delete "),
+            "nothing may be deleted under a zero window"
+        );
+        // A DRY-RUN at zero is still allowed: it previews and deletes nothing.
+        run_gc(dir.path(), 0, true).expect("a dry-run may preview at zero");
+    }
+
+    /// a root whose value is TRUNCATED/unparseable must fail
+    /// closed. It is pointer-shaped garbage -- we cannot tell what it references,
+    /// so its (live!) chunks must not be judged orphaned. Regression guard: the
+    /// push-path helper returns `Ok([])` for a non-pointer value, which on THIS
+    /// path would read as "references nothing" and reclaim the whole store.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_truncated_root_pointer() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
+        let (_, pointer) = chunked_parts(TEST_CONFIG_ID, &live);
+        // A write that landed half-way: a valid PREFIX of the real pointer that
+        // is no longer valid JSON. (Chars, not a byte slice -- never split a
+        // codepoint.)
+        let truncated: String = pointer.chars().take(40).collect();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&truncated).is_err(),
+            "fixture must be unparseable to exercise the classifier: {truncated}"
+        );
+
+        let mut listing = vec![(
+            TEST_CONFIG_ID.to_owned(),
+            stamp_secs_ago(999_999),
+            truncated,
+        )];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
+        assert!(
+            err.contains("refusing to reclaim"),
+            "expected a fail-closed refusal, got: {err}"
+        );
+        for key in &live_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "nothing may be deleted when a root is unclassifiable: `{key}`"
+            );
+        }
+    }
+
+    /// an ENVELOPED listing (`{"items":[...]}`) may carry
+    /// pagination we do not follow. A page that omitted a root would make that
+    /// root's live chunks look orphaned -- and the completeness guard cannot see
+    /// a root that isn't there. Refuse the shape outright.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_enveloped_listing() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+        let enveloped = format!(
+            r#"{{"items":{},"next_cursor":"abc"}}"#,
+            entry_list_json(&listing)
+        );
+
+        let fake = fake_fastly_gc_raw_list(TEST_CONFIG_ID, &enveloped, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
+        assert!(
+            err.contains("bare array") && err.contains("Nothing was deleted"),
+            "expected a refusal naming the unsupported listing shape, got: {err}"
+        );
+        assert!(
+            !fs::read_to_string(&oplog)
+                .unwrap_or_default()
+                .contains("delete "),
+            "an unsupported listing shape must delete nothing"
+        );
+    }
+
+    /// a root with an EMPTY value is as dangerous as a
+    /// missing one -- it would classify as "references nothing" and orphan its
+    /// live chunks. The listing parser rejects it before any reasoning.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_empty_root_value() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let live_chunks = chunk_keys_of(TEST_CONFIG_ID, &live);
+        let mut listing = vec![(
+            TEST_CONFIG_ID.to_owned(),
+            stamp_secs_ago(999_999),
+            String::new(),
+        )];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
+        assert!(
+            err.contains("empty `item_value`"),
+            "expected a refusal naming the empty field, got: {err}"
+        );
+        for key in &live_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "nothing may be deleted on an unreadable listing: `{key}`"
+            );
+        }
+    }
+
+    /// the orphan's OWN age is mandatory -- an old root does
+    /// not license deleting a chunk written seconds ago (e.g. by a concurrent
+    /// push that has not committed its pointer yet). Both ages must clear the
+    /// window; the more restrictive wins.
+    #[cfg(unix)]
+    #[test]
+    fn gc_retains_young_orphan_under_long_stable_root() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let fresh = gen_envelope("fresh");
+        let fresh_chunks = chunk_keys_of(TEST_CONFIG_ID, &fresh);
+
+        // The root's live config has been stable for a year -- so the live-config
+        // clock alone would happily reclaim. But these chunks were written 10s
+        // ago and no pointer names them yet.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 31_536_000)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 31_536_000));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &fresh, 10));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &fresh_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a chunk written 10s ago must be retained under a 1-day window regardless of \
+                 how stable its root is: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// GC and the RUNTIME must agree on what a readable pointer is. A pointer
+    /// whose chunks reassemble to the correct bytes along boundaries this writer
+    /// would never choose is REJECTED by the runtime resolver, so GC must not
+    /// silently report it as a healthy root: the guest cannot read it, and its
+    /// generation can never satisfy `prove_generation`, so it is permanently
+    /// unreclaimable. GC still keeps it (fail-closed) but must SAY so.
+    #[cfg(unix)]
+    #[test]
+    fn gc_warns_that_a_non_writer_split_root_is_not_runtime_readable() {
+        use crate::chunked_config::CHUNK_PAYLOAD_TARGET;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // Just over the entry limit => a full chunk plus a short remainder with
+        // room to absorb the shifted bytes.
+        let envelope = gen_envelope("shifted");
+        let sha = sha256_hex(envelope.as_bytes());
+        // Re-split 2 bytes early: still within every metadata bound the pointer
+        // validator checks, but NOT where this writer splits.
+        let cut = CHUNK_PAYLOAD_TARGET.saturating_sub(2);
+        let head = envelope.get(..cut).expect("ascii boundary");
+        let tail = envelope.get(cut..).expect("ascii boundary");
+        let key0 = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{sha}.0");
+        let key1 = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{sha}.1");
+        let pointer_json = serde_json::json!({
+            "chunks": [
+                {"key": key0, "len": head.len(), "sha256": sha256_hex(head.as_bytes())},
+                {"key": key1, "len": tail.len(), "sha256": sha256_hex(tail.as_bytes())},
+            ],
+            "data_sha256": "",
+            "edgezero_kind": "fastly_config_chunks",
+            "envelope_len": envelope.len(),
+            "envelope_sha256": sha,
+            "version": 1_u8,
+        })
+        .to_string();
+
+        let stamp = stamp_secs_ago(604_800);
+        let listing = vec![
+            (TEST_CONFIG_ID.to_owned(), stamp.clone(), pointer_json),
+            (key0.clone(), stamp.clone(), head.to_owned()),
+            (key1.clone(), stamp, tail.to_owned()),
+        ];
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, false).expect("gc must not abort on such a root");
+        let rendered = out.join("\n");
+        assert!(
+            rendered.contains("NOT runtime-readable"),
+            "GC must warn that this root is unreadable rather than call it healthy: {rendered}"
+        );
+        // Fail-closed: nothing is deleted, including its chunks.
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in [&key0, &key1] {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "must not delete a chunk of an unreadable root: `{key}`; log:\n{log}"
+            );
+        }
+    }
+
+    /// A dry-run lists exactly what it would delete, and deletes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn gc_dry_run_lists_but_deletes_nothing() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, true).expect("dry-run succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "a dry-run must not delete; log:\n{log}"
+        );
+        let rendered = out.join("\n");
+        assert!(
+            rendered.contains("would delete"),
+            "lists intent: {rendered}"
+        );
+        for key in &dead_chunks {
+            assert!(rendered.contains(key.as_str()), "names `{key}`: {rendered}");
+        }
+    }
+
+    /// An unreadable `created_at` on a DELETE path fails CLOSED.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_unreadable_timestamp() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 3_600)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 3_600));
+        // An orphan whose timestamp is garbage.
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        for key in dead_chunks {
+            listing.push((key, "not-a-timestamp".to_owned(), "X".to_owned()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            err.contains("unreadable") && err.contains("nothing was deleted"),
+            "must refuse to reclaim: {err}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "nothing may be deleted when the state is unreadable; log:\n{log}"
+        );
+    }
+
+    /// A root whose pointer cannot be classified fails CLOSED — we cannot know
+    /// what it references, so nothing may be deleted.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_unclassifiable_root() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let dead = gen_envelope("dead");
+        // Root value is pointer-kind but invalid.
+        let bad = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#.to_owned();
+        let mut listing = vec![(TEST_CONFIG_ID.to_owned(), stamp_secs_ago(3_600), bad)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            err.contains("could not classify root") && err.contains("nothing was deleted"),
+            "must refuse to reclaim: {err}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "nothing may be deleted when a root is unclassifiable; log:\n{log}"
+        );
+    }
+
+    /// A listing entry missing a required field fails CLOSED — a defaulted/empty
+    /// field could make a real root look like it references nothing, deleting
+    /// live chunks.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_malformed_listing_entry() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let good = entry_list_json(&listing);
+        // Inject an entry with NO item_value (drop that field entirely).
+        let mut array: serde_json::Value = serde_json::from_str(&good).unwrap();
+        array.as_array_mut().unwrap().push(serde_json::json!({
+            "item_key": "some.__edgezero_chunks.deadbeef.0",
+            "created_at": stamp_secs_ago(1000),
+        }));
+        // Serve that hand-built listing.
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        fs::write(
+            fake.path().join("entries.json"),
+            serde_json::to_string(&array).unwrap(),
+        )
+        .expect("overwrite entries");
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            err.contains("missing a string") && err.contains("item_value"),
+            "must name the missing field: {err}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "nothing may be deleted on a malformed listing; log:\n{log}"
+        );
+    }
+
+    /// A failed delete is a non-zero exit that names the failed key(s), so
+    /// automation can detect partial failure.
+    #[cfg(unix)]
+    #[test]
+    fn gc_delete_failure_is_non_zero_exit() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        let fail_key = dead_chunks.first().expect("a chunk").clone();
+
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&fail_key),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete must be non-zero");
+        assert!(
+            err.contains("deletes FAILED") && err.contains(&fail_key),
+            "error names the failed key: {err}"
+        );
+    }
+
+    /// Every reclamation delete passes `--key` + `--auto-yes` and NEVER `--all`.
+    #[cfg(unix)]
+    #[test]
+    fn gc_delete_uses_key_and_auto_yes_never_all() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        let argv_lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.starts_with("delete-argv "))
+            .collect();
+        assert!(!argv_lines.is_empty(), "a delete happened: {log}");
+        for line in argv_lines {
+            assert!(
+                line.contains("--auto-yes"),
+                "delete passes --auto-yes: {line}"
+            );
+            assert!(line.contains("--key="), "delete targets a --key: {line}");
+            assert!(
+                !line.contains("--all"),
+                "delete must NEVER pass --all: {line}"
+            );
+        }
+    }
+
+    /// A non-canonical chunk-like key (short/uppercase SHA, leading-zero index)
+    /// is NOT a delete candidate — the destructive validator is canonical-only.
+    #[cfg(unix)]
+    #[test]
+    fn gc_never_deletes_non_canonical_keys() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        // Foreign-shaped keys under the reserved infix but not canonical.
+        let noncanonical = [
+            format!("{TEST_CONFIG_ID}.__edgezero_chunks.abc123.0"), // short sha
+            format!("{TEST_CONFIG_ID}.__edgezero_chunks.{}.00", "a".repeat(64)), // leading-zero idx
+            format!("{TEST_CONFIG_ID}.__edgezero_chunks.{}.0", "A".repeat(64)), // uppercase
+        ];
+        for key in &noncanonical {
+            listing.push((key.clone(), stamp_secs_ago(604_800), "X".to_owned()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // A key that is NOT canonical is not one we wrote, so it is not a
+        // reclamation candidate. It sits in our reserved namespace, though, so
+        // it is also not an ordinary root: we cannot say what it is. Since the
+        // GC classifier fails closed on any root it cannot classify, the run
+        // aborts and names it -- which satisfies this test's invariant (a
+        // non-canonical key is never deleted) the strict way.
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            err.contains("refusing to reclaim"),
+            "expected a fail-closed refusal, got: {err}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &noncanonical {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a non-canonical key must never be deleted: `{key}`; log:\n{log}"
+            );
+        }
+        assert!(
+            !log.contains("delete "),
+            "a fail-closed run deletes nothing at all; log:\n{log}"
+        );
+    }
+
+    // ---------- local chunk GC ----------
+
+    /// Config shrinks from chunked back under the 8 000-char limit: the
+    /// new value is a direct envelope, so GC prunes every prior chunk.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_prunes_prior_chunks_when_value_shrinks_to_direct() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), chunked)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("first push");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("second push");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+
+        assert_eq!(
+            contents
+                .get(TEST_CONFIG_ID)
+                .and_then(toml_edit::Item::as_str),
+            Some(direct.as_str()),
+            "root holds the direct envelope"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|(key, _)| key.contains(CHUNK_KEY_INFIX)),
+            "prior chunks must be pruned: {after}"
+        );
+    }
+
+    /// The local prune must NOT delete a prior chunk key whose VALUE is a
+    /// runtime-readable root (a valid direct envelope). A small envelope padded
+    /// with trailing whitespace chunks so that chunk 0 is itself a whole,
+    /// verifying envelope; deleting it would drop live config.
+    #[test]
+    fn push_config_entries_local_keeps_a_chunk_key_holding_a_valid_envelope() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        // A padded envelope: chunk 0 is the whole envelope plus trailing spaces
+        // (still a valid, verifying envelope on its own).
+        let envelope = BlobEnvelope::new(json!({ "k": "v" }), "2026-06-22T00:00:00Z".into());
+        let mut padded = serde_json::to_string(&envelope).unwrap();
+        padded.push_str(&" ".repeat(8_200));
+        let entries = prepare_fastly_config_entries(TEST_CONFIG_ID, &padded).expect("expand");
+        let chunk0_key = entries[0].0.clone();
+        // Confirm the fixture: chunk 0's value verifies as an envelope.
+        let parsed: BlobEnvelope = serde_json::from_str(&entries[0].1).expect("chunk0 parses");
+        parsed.verify().expect("chunk0 verifies");
+
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), padded)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("first push");
+
+        // Re-push a direct value: the prior generation's chunks become orphans.
+        let direct = make_test_envelope(100);
+        let expected_deletions = entries.len().saturating_sub(2); // chunks minus the protected chunk0
+
+        // DRY-RUN first: its count must MATCH what the real prune deletes, i.e.
+        // it must exclude the protected root-like chunk0.
+        let dry = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run");
+        assert!(
+            dry.join("\n")
+                .contains(&format!("would delete {expected_deletions} orphan chunks")),
+            "dry-run must count only the prunable orphans (excluding the protected root): {dry:?}"
+        );
+
+        let warnings = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("second push");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+
+        assert!(
+            contents.contains_key(&chunk0_key),
+            "a chunk key holding a valid envelope is a runtime-readable root and must be kept: \
+             {after}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("runtime-readable root")),
+            "the operator must be warned that the key was kept: {warnings:?}"
+        );
+    }
+
+    /// `preflight_config_write` rejects an infeasible push BEFORE any provider
+    /// I/O: a reserved key, an empty key, and a body whose DERIVED chunk keys
+    /// would exceed the store limit (caught by running expansion offline).
+    #[test]
+    fn preflight_config_write_rejects_infeasible_pushes_offline() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let small = make_test_envelope(100);
+
+        let reserved = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        assert!(
+            FastlyCliAdapter
+                .preflight_config_write(&reserved, &small)
+                .is_err_and(|err| err.contains("reserved infix")),
+            "a reserved-namespace key must be rejected"
+        );
+
+        assert!(
+            FastlyCliAdapter
+                .preflight_config_write("", &small)
+                .is_err_and(|err| err.contains("empty")),
+            "an empty key must be rejected"
+        );
+
+        // A ~200-char root with a CHUNKED body: derived chunk keys (root + ~85)
+        // exceed the 255-char limit. Caught offline by expansion.
+        let long_root = "r".repeat(200);
+        let big = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        assert!(
+            FastlyCliAdapter
+                .preflight_config_write(&long_root, &big)
+                .is_err(),
+            "an over-limit derived chunk key must be rejected before I/O"
+        );
+
+        // A normal push passes.
+        FastlyCliAdapter
+            .preflight_config_write("app_config", &small)
+            .expect("a normal push must pass preflight");
+    }
+
+    /// A logical key containing the reserved chunk infix is rejected
+    /// before any file I/O (it would collide with the chunk namespace).
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_rejects_reserved_key() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let bad_key = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(bad_key.clone(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("reserved key must be rejected");
+        assert!(err.contains(&bad_key), "error names the key: {err}");
+        assert!(
+            !fastly_toml.exists(),
+            "rejection must happen before any write"
+        );
+    }
+
+    /// A suspicious prior pointer (pointer-kind but invalid) makes GC
+    /// warn and delete nothing — pre-seeded chunk keys must survive.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_warns_on_suspicious_prior_pointer_and_keeps_chunks() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        // Seed the root with a pointer-kind-but-invalid value AND a real
+        // chunk-like key so "no deletes" is non-vacuous.
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n\n",
+            "[local_server.config_stores.app_config.contents]\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+            "\"app_config.__edgezero_chunks.deadbeef.0\" = \"seeded-chunk-payload\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must still succeed");
+
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("skipping chunk GC"),
+            "must warn about the suspicious prior pointer: {combined}"
+        );
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+        assert!(
+            contents
+                .get("app_config.__edgezero_chunks.deadbeef.0")
+                .is_some(),
+            "pre-seeded chunk key must survive a suspicious-pointer skip: {after}"
+        );
+        assert_eq!(
+            contents
+                .get(TEST_CONFIG_ID)
+                .and_then(toml_edit::Item::as_str),
+            Some(direct.as_str()),
+            "new value still written"
+        );
+    }
+
+    /// Dry-run reports the orphan count and writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_reports_orphan_count() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_a)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+        let before = fs::read_to_string(&fastly_toml).expect("read");
+
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "y".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:02Z".to_owned()))
+                .expect("envelope B")
+        };
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run");
+
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("would delete") && combined.contains("orphan chunks"),
+            "dry-run must report orphan count: {combined}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            before,
+            "dry-run must not edit fastly.toml"
+        );
+    }
+
+    /// A concurrent edit to `fastly.toml` between the push's read and its write
+    /// must NOT be clobbered: the rewrite refuses and reports, leaving the other
+    /// writer's file intact so no sibling change is silently lost.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_refuses_to_clobber_a_concurrent_edit() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        // Simulate: we read one thing, another writer moved the file, we write.
+        let stale_view = "name = \"demo\"\n";
+        fs::write(&fastly_toml, "name = \"demo\"\nother = \"sibling edit\"\n")
+            .expect("concurrent write");
+
+        let err = atomically_replace_file(&fastly_toml, stale_view, "name = \"clobbered\"\n")
+            .expect_err("a concurrent edit must not be overwritten");
+        assert!(
+            err.contains("changed on disk"),
+            "must report the conflict: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            "name = \"demo\"\nother = \"sibling edit\"\n",
+            "the other writer's file must survive untouched"
+        );
+    }
+
+    /// The happy path replaces contents and leaves no temp file behind.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_replaces_atomically_and_cleans_up() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "before\n").expect("seed");
+
+        atomically_replace_file(&fastly_toml, "before\n", "after\n").expect("replace");
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            "after\n",
+            "contents must be replaced"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file may be left behind");
+    }
+
+    /// PARITY: the dry-run's reported orphan count equals the number of chunk
+    /// keys the real (non-dry-run) push actually deletes, on ONE fixture. A
+    /// divergence would make the dry-run a misleading preview of the delete.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_count_matches_real_deletions() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+
+        fn count_chunk_keys(toml_src: &str) -> usize {
+            let doc: toml_edit::DocumentMut = toml_src.parse().expect("parse");
+            doc.get("local_server")
+                .and_then(|ls| ls.get("config_stores"))
+                .and_then(|cs| cs.get(TEST_CONFIG_ID))
+                .and_then(|st| st.get("contents"))
+                .and_then(toml_edit::Item::as_table)
+                .map_or(0, |table| {
+                    table
+                        .iter()
+                        .filter(|(key, _)| key.contains(CHUNK_KEY_INFIX))
+                        .count()
+                })
+        }
+        fn parse_would_delete_count(text: &str) -> Option<usize> {
+            let marker = "would delete ";
+            let idx = text.find(marker)?;
+            text.get(idx.saturating_add(marker.len())..)?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        // Seed a multi-chunk generation, then measure how many chunk keys exist.
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(5_000));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), chunked)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+        let seeded = fs::read_to_string(&fastly_toml).expect("read");
+        let prior_chunk_count = count_chunk_keys(&seeded);
+        assert!(prior_chunk_count >= 2, "seed must have chunked: {seeded}");
+
+        // Dry-run a shrink-to-direct re-push: capture the reported orphan count.
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run");
+        let reported = parse_would_delete_count(&out.join("\n"))
+            .expect("dry-run must report a numeric orphan count");
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            seeded,
+            "dry-run must not edit fastly.toml"
+        );
+
+        // Real re-push: count the chunk keys actually removed.
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("real push");
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let actually_deleted = prior_chunk_count.saturating_sub(count_chunk_keys(&after));
+
+        assert_eq!(
+            reported, actually_deleted,
+            "dry-run count {reported} must equal real deletions {actually_deleted}"
+        );
+        assert_eq!(
+            reported, prior_chunk_count,
+            "a shrink-to-direct re-push orphans every prior chunk"
+        );
+    }
+
+    /// Real (non-dry-run) push over a MALFORMED prior pointer WARNS and deletes
+    /// nothing: its chunk list is untrustworthy, so no key is removed and the
+    /// root is simply overwritten with the new value. This is the real-push
+    /// counterpart to the dry-run "unknown" degradation on the same prior state.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_real_push_over_malformed_prior_warns_and_deletes_nothing() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        // A pointer-kind prior value missing its required fields — malformed, so
+        // `prior_chunk_keys` returns Err (warn, delete nothing).
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n\n",
+            "[local_server.config_stores.app_config.contents]\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("real push must not fail on a malformed prior");
+
+        assert!(
+            out.iter().any(|line| line.contains("skipping chunk GC")),
+            "must warn about the malformed prior pointer: {out:?}"
+        );
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+        assert_eq!(
+            contents
+                .get(TEST_CONFIG_ID)
+                .and_then(toml_edit::Item::as_str),
+            Some(direct.as_str()),
+            "root is overwritten with the new direct envelope: {after}"
+        );
+    }
+
+    /// Dry-run of an identical re-push reports zero orphans (new keys
+    /// equal prior keys — regression for expanding `new_keys`).
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_identical_repush_counts_zero() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                true, // dry_run, same bytes
+            )
+            .expect("dry-run");
+
+        assert!(
+            out.join("\n").contains("would delete 0 orphan chunks"),
+            "identical re-push must count 0 orphans: {out:?}"
+        );
+    }
+
+    /// Dry-run over a suspicious prior pointer reports an unknown count
+    /// and does not fail.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_suspicious_prior_pointer_unknown() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n\n",
+            "[local_server.config_stores.app_config.contents]\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run must not fail on suspicious pointer");
+
+        assert!(
+            out.join("\n").contains("unknown: suspicious prior pointer"),
+            "dry-run must degrade to unknown: {out:?}"
+        );
+    }
+
+    /// A present-but-malformed `contents` (non-table) is prior state the
+    /// real writer would reject — the dry-run count must degrade to
+    /// `unknown: could not read prior state`, not silently report 0.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_non_table_contents_unknown() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n",
+            "contents = \"bad\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run must not fail on malformed contents");
+
+        assert!(
+            out.join("\n")
+                .contains("unknown: could not read prior state"),
+            "non-table contents must degrade to unknown: {out:?}"
+        );
+    }
+
+    /// A duplicate root key in one batch is rejected before any I/O.
+    /// Otherwise the earlier tuple's GC plan would reclaim the chunks the
+    /// LAST tuple just installed, leaving the final pointer dangling.
+    /// Regression: prior B, batch `[(root, A), (root, B)]` — the root must
+    /// still resolve afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_rejects_duplicate_root_keys() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let make = |tag: &str| {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".to_owned()))
+                .expect("envelope")
+        };
+        let envelope_a = make("aaa");
+        let envelope_b = make("bbb");
+
+        // Prior generation B is live.
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+        let before = fs::read_to_string(&fastly_toml).expect("read");
+
+        // Duplicate-root batch must be rejected outright.
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[
+                    (TEST_CONFIG_ID.to_owned(), envelope_a),
+                    (TEST_CONFIG_ID.to_owned(), envelope_b.clone()),
+                ],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("duplicate root keys must be rejected");
+        assert!(
+            err.contains("more than once"),
+            "error explains the duplicate: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            before,
+            "rejection must happen before any write"
+        );
+
+        // The live root still resolves to B (nothing was reclaimed).
+        let read = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("root must still resolve");
+        let ReadConfigEntry::Present(value) = read else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, envelope_b, "root still reconstructs envelope B");
+    }
+
+    /// GC of a chunked root must not touch a chunked SIBLING's chunks —
+    /// the prefix `app_config.__edgezero_chunks.` must not match
+    /// `app_config_staging.__edgezero_chunks.` (shared string prefix).
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_gc_preserves_sibling_chunks() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let make = |tag: &str| {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".to_owned()))
+                .expect("envelope")
+        };
+        let push = |key: &str, body: String| {
+            FastlyCliAdapter
+                .push_config_entries_local(
+                    dir.path(),
+                    Some("fastly.toml"),
+                    None,
+                    &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                    &[(key.to_owned(), body)],
+                    &AdapterPushContext::new(),
+                    false,
+                )
+                .expect("push");
+        };
+
+        // app_config gen X, then a chunked sibling, then app_config gen Z.
+        push("app_config", make("x1"));
+        push("app_config_staging", make("staging"));
+        let staging_chunks = chunk_keys_of("app_config_staging", &make("staging"));
+        push("app_config", make("z2")); // GCs app_config's gen-X chunks
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+        for key in &staging_chunks {
+            assert!(
+                contents.get(key).is_some(),
+                "sibling chunk `{key}` must survive app_config GC: {after}"
+            );
+        }
+    }
+
+    // ---- chunk GC helpers ----
+
+    #[test]
+    fn reject_reserved_root_keys_accepts_clean_keys() {
+        let entries = vec![
+            ("app_config".to_owned(), "{}".to_owned()),
+            ("app_config_staging".to_owned(), "{}".to_owned()),
+        ];
+        reject_reserved_root_keys(&entries).expect("clean keys accepted");
+    }
+
+    #[test]
+    fn reject_reserved_root_keys_rejects_infix_key() {
+        let bad = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        let entries = vec![(bad.clone(), "{}".to_owned())];
+        let err = reject_reserved_root_keys(&entries).expect_err("reserved infix must reject");
+        assert!(err.contains(&bad), "error names the key: {err}");
+        assert!(err.contains("reserved"), "error explains why: {err}");
+    }
+
+    #[test]
+    fn orphan_chunk_keys_subtracts_new_keys() {
+        let mut new_keys = HashSet::new();
+        new_keys.insert("keep".to_owned());
+        let plan = FastlyConfigGcPlan {
+            new_keys,
+            prior_keys: Ok(vec![
+                "gone1".to_owned(),
+                "keep".to_owned(),
+                "gone2".to_owned(),
+            ]),
+        };
+        let orphans = orphan_chunk_keys(&plan).expect("ok");
+        assert_eq!(orphans, vec!["gone1".to_owned(), "gone2".to_owned()]);
+    }
+
+    #[test]
+    fn orphan_chunk_keys_propagates_prior_err() {
+        let plan = FastlyConfigGcPlan {
+            new_keys: HashSet::new(),
+            prior_keys: Err("suspicious".to_owned()),
+        };
+        orphan_chunk_keys(&plan).unwrap_err();
+    }
+
+    #[test]
+    fn expand_root_direct_value_has_single_entry() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(new_root_value, envelope);
+        assert!(new_keys.contains(TEST_CONFIG_ID));
+        assert_eq!(new_keys.len(), 1);
+    }
+
+    #[test]
+    fn expand_root_chunked_value_carries_pointer_as_root_value() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
+        assert!(expanded.len() >= 2, "chunks + pointer");
+        let (last_key, last_value) = expanded.last().unwrap();
+        assert_eq!(last_key, TEST_CONFIG_ID);
+        assert_eq!(&new_root_value, last_value);
+        assert!(new_keys.contains(TEST_CONFIG_ID));
+        assert_eq!(new_keys.len(), expanded.len());
     }
 }

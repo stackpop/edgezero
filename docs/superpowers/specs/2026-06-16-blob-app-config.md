@@ -2761,10 +2761,17 @@ where
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
         .map_err(EdgeError::config_out_of_date_from_serde)?;
     cfg.validate().map_err(|err| {
-        EdgeError::config_out_of_date(
-            err.to_string(),
-            first_violating_field(&err).unwrap_or_default(),
-        )
+        // The secret walk above replaced `#[secret]` fields with their
+        // RESOLVED values, and `validator`'s params echo the rejected value,
+        // so `err.to_string()` would leak a secret into the HTTP body/logs.
+        // Keep the structural field name; drop the rendered report.
+        let field = first_violating_field(&err).unwrap_or_default();
+        let message = if field.is_empty() {
+            "app config failed validation".to_owned()
+        } else {
+            format!("app config failed validation for field `{field}`")
+        };
+        EdgeError::config_out_of_date(message, field)
     })?;
     Ok(cfg)
 }
@@ -2871,21 +2878,33 @@ materialises this mapping ONCE near the call site:
 //   NotFound { name: String }     // struct-like
 //   Unavailable                   // unit
 //   Validation(String)            // tuple
-fn map_secret_error(err: SecretError, field_path: &str, store_id: &str, key: &str) -> EdgeError {
+// SECURITY: the stored key NAME, the store id, and the provider's
+// message/source are deliberately UNUSED. They are blob- or
+// provider-controlled strings that can reveal the secret or the
+// infrastructure, and these messages reach the HTTP body and the logs.
+// Every branch names only the offending FIELD, which is schema (safe).
+// They stay in the signature so the redaction is visible at the one
+// place these values could otherwise have been formatted.
+fn map_secret_error(
+    err: SecretError,
+    field_name: &str,
+    _store_id: &str,
+    _key_name: &str,
+) -> EdgeError {
     match err {
-        SecretError::NotFound { name } => EdgeError::ConfigOutOfDate {
-            message: format!("secret `{name}` in store `{store_id}` not found"),
-            field_path: field_path.to_owned(),
-        },
-        SecretError::Validation(msg) => EdgeError::ConfigOutOfDate {
-            message: format!("secret `{key}` in store `{store_id}` rejected: {msg}"),
-            field_path: field_path.to_owned(),
-        },
+        SecretError::NotFound { .. } => EdgeError::config_out_of_date(
+            format!("the secret referenced by `{field_name}` was not found in its store (identifier redacted)"),
+            field_name.to_owned(),
+        ),
+        SecretError::Validation(_msg) => EdgeError::config_out_of_date(
+            format!("the secret referenced by `{field_name}` was rejected by its store (details redacted)"),
+            field_name.to_owned(),
+        ),
         SecretError::Unavailable => EdgeError::service_unavailable(format!(
-            "secret store `{store_id}` unreachable"
+            "the secret store for `{field_name}` is unreachable"
         )),
-        SecretError::Internal(source) => EdgeError::internal(anyhow::anyhow!(
-            "secret `{key}` in store `{store_id}` produced unexpected store error: {source}"
+        SecretError::Internal(_source) => EdgeError::internal(anyhow::anyhow!(
+            "secret resolution for `{field_name}` failed (details redacted)"
         )),
     }
 }
@@ -4023,13 +4042,20 @@ validate --strict` runs at push time, so env-overlay drift
 Once the extractor deserialises `data` into `C`, it calls
 `Validate::validate(&cfg)`. Validation failures map to:
 
-- `EdgeError::ConfigOutOfDate` — the validator's report names
-  exactly which field violated which constraint. Same surface
-  as the deserialise-failure case (§6.3): operator action is
+- `EdgeError::ConfigOutOfDate` — naming ONLY the field that
+  violated its constraint. Same surface as the
+  deserialise-failure case (§6.3): operator action is
   "re-push the typed config; the deployed `<name>.toml` is
   out of bounds for the deployed code".
-- A `log::error!` line with the full validator report so
-  dashboards see the violation, not just the 5xx.
+- A `log::error!` line naming the same field.
+
+**The validator's rendered report is never emitted — not in
+the response and not in the log.** At this point the secret
+walk has already replaced `#[secret]` fields with their
+RESOLVED values, and `validator`'s error params echo the
+rejected value, so `validation_err.to_string()` would put a
+live secret into the HTTP body and the log line. Only the
+structural field name escapes; see §4.3.
 
 Rationale for validating at every extract: the runtime trusts
 the BLOB's authenticity (sha verified) but NOT its
@@ -4248,6 +4274,18 @@ errors only report position-in-input, not field-path; the
 the deserialise itself. The dep is small (~500 LOC, no
 transitive deps) and locked-in for the variant.
 
+> **Runtime redaction (security).** In the HTTP `ConfigOutOfDate`
+> response the path's STRING segments are redacted to `<redacted>`
+> while structure (dots and sequence indices) is kept — e.g.
+> `<redacted>.<redacted>`. A `serde_path_to_error` segment for a struct
+> field is indistinguishable from a MAP KEY, and a map key is stored
+> config data that may be a secret; the redaction invariant forbids any
+> stored string on a client-facing path. The operator recovers the EXACT
+> path by running `config validate` locally (same deserialise, no HTTP
+> boundary). This narrows the `field_path` from the original design; the
+> secret-walk/validator constructor still supplies an explicit static
+> path, since those are code-supplied field names, not stored data.
+
 **Variant declaration (sketch).** Two constructors —
 one for the serde-deserialise path (which has rich
 field-path data from `serde_path_to_error`), one for
@@ -4282,15 +4320,30 @@ impl EdgeError {
 
     /// Construct from a `serde_path_to_error` error returned
     /// by the deserialise wrapper around the blob's `data`
-    /// field. The field-path is extracted via
-    /// `Error::path().to_string()`. Used by the deserialise
-    /// step in §3.3.3 / §6.2.2.
+    /// field. Used by the deserialise step in §3.3.3 / §6.2.2.
+    ///
+    /// REDACTED: `inner().to_string()` embeds the offending
+    /// stored VALUE, and `path().to_string()` can carry a MAP
+    /// KEY (indistinguishable from a struct field), both of
+    /// which may be secrets and reach the HTTP body. The
+    /// message is a category only; the path's string segments
+    /// are redacted with structure kept (see `redact_serde_path`).
+    /// A local `config validate` can surface the exact path ONLY
+    /// when the local TOML still matches what was deployed — it
+    /// reads the local source, not the deployed blob, so a drift
+    /// between them is not recoverable this way.
     pub fn config_out_of_date_from_serde(
         serde_err: serde_path_to_error::Error<serde_json::Error>,
     ) -> Self {
+        let category = match serde_err.inner().classify() {
+            Category::Data => "wrong type or invalid value",
+            Category::Syntax => "malformed JSON",
+            Category::Eof => "unexpected end of input",
+            Category::Io => "i/o error while reading",
+        };
         Self::ConfigOutOfDate {
-            message: serde_err.inner().to_string(),
-            field_path: serde_err.path().to_string(),
+            message: format!("typed app-config is out of date ({category}; value redacted)"),
+            field_path: redact_serde_path(serde_err.path()),
         }
     }
 }
@@ -4304,20 +4357,30 @@ Caller sites:
   `EdgeError::config_out_of_date_from_serde(err)`.
 
 The validator path (§6.2.2) wraps a
-`validator::ValidationErrors`:
+`validator::ValidationErrors`. **On the RUNTIME path this runs
+AFTER the secret walk**, so `#[secret]` fields now hold their
+RESOLVED values — and `validator`'s error params echo the
+rejected value, so `validation_err.to_string()` would render a
+resolved secret straight into the HTTP body and the log line.
+The message therefore carries only the structural field name,
+never the validator's rendered report:
 
 ```rust
-EdgeError::config_out_of_date(
-    validation_err.to_string(),         // validator's rendered report
-    extract_first_field(&validation_err),
-)
+let field = extract_first_field(&validation_err); // structural, not the value
+let message = if field.is_empty() {
+    "app config failed validation".to_owned()
+} else {
+    format!("app config failed validation for field `{field}`")
+};
+EdgeError::config_out_of_date(message, field)      // NO validation_err.to_string()
 ```
 
 The `extract_first_field` helper picks the first
 violating-field name from the `validator::ValidationErrors`
 tree; if multiple fields violate at once, the response
-surfaces one (the first by alphabetical order) and the full
-list goes to the log line.
+surfaces one (the first by alphabetical order). The full
+validator report — which may contain resolved secret values —
+is dropped entirely rather than logged.
 
 **Why `serde_path_to_error` is OK as a new dep.** Worth
 mentioning because PR #269 fought several "do we add this
@@ -6282,10 +6345,13 @@ Failure semantics:
   limit. This is not mathematically unlimited; it removes Fastly's
   small single-entry cap for normal oversized app configs.
 - Old content-addressed chunks are inert once the root pointer moves
-  away from them. v1 does not need automatic garbage collection for
-  correctness; a future `config gc --adapter fastly` can delete
-  unreferenced `.__edgezero_chunks.` entries if storage hygiene becomes
-  important.
+  away from them, so they are never a correctness problem. Reclaiming
+  them for storage hygiene is now implemented (see the fastly-chunk-gc
+  spec): a re-push prunes the PRIOR generation's chunks in the same
+  writeback, and an explicit `config gc --adapter fastly --older-than`
+  deletes unreferenced `.__edgezero_chunks.` generations across the
+  store. Both decide root-vs-chunk by VALUE, never by key shape, and
+  never delete a key whose value is a runtime-readable root.
 
 ### Q7. Diff against `--local` vs remote
 
@@ -6548,18 +6614,34 @@ For each of axum / cloudflare / fastly / spin:
   values.
 
 **Fastly-specific chunking tests.** Q6's Fastly cap of
-8 000 characters is a per-entry platform limit, not an
-app-level config limit. Tests cover both storage forms:
+8 000 CHARACTERS is a per-entry platform limit, not an
+app-level config limit.
+
+**The writer's own threshold is 8 000 UTF-8 BYTES**, which is
+NOT the same number and must be pinned separately. Bytes are
+always ≥ characters, so the byte threshold is strictly
+conservative — it can never emit an entry that overflows the
+platform's character cap — and it is FIXED for v1 so values
+written by earlier releases stay readable. A multibyte
+envelope under 8 000 characters but over 8 000 bytes is
+therefore CHUNKED, and any test asserting "8 000 characters
+stays direct" must use single-byte content or be stated in
+bytes.
+
+Tests cover both storage forms:
 
 - A blob whose envelope JSON is exactly 8 000
-  characters pushes as a direct root value. The runtime
+  BYTES pushes as a direct root value. The runtime
   reads it back and validates.
-- A blob whose envelope JSON is 8 001 characters pushes
+- A blob whose envelope JSON is 8 001 BYTES pushes
   via content-addressed chunks plus a root pointer. The
   root pointer is written LAST. The runtime reads it
   back through `FastlyConfigStore::get`, reconstructs
   the normal `BlobEnvelope`, and validates the same
   typed struct.
+- A multibyte blob under 8 000 characters but over 8 000
+  bytes chunks, and resolves back to the original bytes —
+  the v1 read-compatibility case.
 - `config diff --adapter fastly` and push
   skip-on-equal both read through the same pointer
   resolver; they compare the reconstructed envelope,
@@ -6569,9 +6651,20 @@ app-level config limit. Tests cover both storage forms:
   Retrying the same push is idempotent because chunk
   keys include the full-envelope SHA.
 - Missing chunk, chunk hash mismatch, full-envelope
-  hash mismatch, and malformed pointer all fail with an
+  hash mismatch, and a malformed POINTER all fail with an
   actionable error naming the root key. These are
   corrupt platform state, not "missing key".
+- **Raw values pass through untouched.** A Config Store holds
+  arbitrary entries, so only a value announcing
+  `edgezero_kind == "fastly_config_chunks"` is resolved.
+  Anything else — a plain string like `"value_a"`, the
+  documented `greeting = "hello"`, unrelated JSON, a direct
+  `BlobEnvelope` — is returned verbatim by
+  `FastlyConfigStore::get`, satisfying the shared
+  `ConfigStore` contract tests. Envelope integrity is checked
+  by the typed app-config layer, not the store. A value
+  carrying `edgezero_kind` with an unrecognised value IS an
+  error: that field is our reserved namespace.
 - `config push --adapter fastly --local` mirrors the
   same direct-or-chunked representation inside
   `[local_server.config_stores.<id>.contents]`, so local
