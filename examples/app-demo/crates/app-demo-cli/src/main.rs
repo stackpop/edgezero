@@ -13,8 +13,8 @@
 use app_demo_core::config::AppDemoConfig;
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs,
-    ProvisionArgs, ServeArgs,
+    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs,
+    DeployArgs, HealthcheckArgs, NewArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
 use edgezero_cli::DiffExit;
 
@@ -27,21 +27,31 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Resolve and print the currently-active service version
+    /// (`version=<N>`) — capture a production rollback target before a
+    /// deploy supersedes it.
+    ActiveVersion(ActiveVersionArgs),
     /// Sign in / out / status against the adapter's native CLI
-    /// (`wrangler` / `fastly` / `spin`). See spec.
+    /// (`wrangler` / `fastly` / `spin`).
     Auth(AuthArgs),
     /// Build the project for a target edge.
     Build(BuildArgs),
     /// Inspect or mutate the typed `app-demo.toml` app config.
     #[command(subcommand)]
     Config(AppDemoConfigCmd),
-    /// Deploy to a target edge.
+    /// Deploy to a target edge (supports `--stage` for a staged draft).
     Deploy(DeployArgs),
+    /// Probe a deployed/staged version's health (Fastly staging
+    /// lifecycle). Exits non-zero when unhealthy after retries.
+    Healthcheck(HealthcheckArgs),
     /// Create a new `EdgeZero` app skeleton.
     New(NewArgs),
     /// Create the platform resources backing the declared
     /// `[stores.<kind>].ids`.
     Provision(ProvisionArgs),
+    /// Roll a service back: production activates `--rollback-to`; staging
+    /// deactivates the staged version.
+    Rollback(RollbackArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
 }
@@ -60,7 +70,7 @@ enum AppDemoConfigCmd {
     Diff(ConfigDiffArgs),
     /// Push `app-demo.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
-    /// (per spec 3.3 Model A — `#[secret]` fields store the key NAME,
+    /// (Model A — `#[secret]` fields store the key NAME,
     /// resolved at runtime); a SHA over the canonical-form data gates
     /// drift detection.
     Push(ConfigPushArgs),
@@ -94,13 +104,16 @@ fn main() {
             edgezero_cli::run_config_validate_typed::<AppDemoConfig>(&args)
         }
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Cmd::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
+        Cmd::ActiveVersion(args) => edgezero_cli::run_active_version(&args),
+        Cmd::Rollback(args) => edgezero_cli::run_rollback(&args),
         Cmd::New(args) => edgezero_cli::run_new(&args),
         Cmd::Provision(args) => edgezero_cli::run_provision(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),
     };
     if let Err(err) = result {
         log::error!("[app-demo] {err}");
-        // Exit 2 for all errors so diff errors satisfy Q10's "errors always ≥ 2" rule.
+        // Exit 2 for all errors so diff errors satisfy the "errors always ≥ 2" rule.
         // Push / validate errors are not behaviour-checked against the 1 vs 2 distinction.
         process::exit(2);
     }

@@ -3,8 +3,10 @@ use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::env;
 use std::fmt;
+use std::io::{self, BufRead as _, BufReader, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 
 include!(concat!(env!("OUT_DIR"), "/linked_adapters.rs"));
 
@@ -15,6 +17,15 @@ pub enum Action {
     AuthStatus,
     Build,
     Deploy,
+    /// Fastly staging lifecycle: stage a draft version.
+    DeployStaged,
+    /// Fastly staging lifecycle: emit the active version.
+    EmitVersion,
+    /// Fastly staging lifecycle: probe health.
+    Healthcheck,
+    /// Fastly staging lifecycle: activate previous /
+    /// deactivate staged.
+    Rollback,
     Serve,
 }
 
@@ -27,6 +38,10 @@ impl fmt::Display for Action {
             Action::Build => "build",
             Action::Deploy => "deploy",
             Action::Serve => "serve",
+            Action::DeployStaged => "deploy --stage",
+            Action::EmitVersion => "deploy (version)",
+            Action::Healthcheck => "healthcheck",
+            Action::Rollback => "rollback",
         };
         f.write_str(label)
     }
@@ -42,6 +57,10 @@ impl From<Action> for AdapterAction {
             Action::Build => AdapterAction::Build,
             Action::Deploy => AdapterAction::Deploy,
             Action::Serve => AdapterAction::Serve,
+            Action::DeployStaged => AdapterAction::DeployStaged,
+            Action::EmitVersion => AdapterAction::EmitVersion,
+            Action::Healthcheck => AdapterAction::Healthcheck,
+            Action::Rollback => AdapterAction::Rollback,
         }
     }
 }
@@ -135,6 +154,58 @@ pub fn execute(
     adapter.execute(AdapterAction::from(action), adapter_args)
 }
 
+/// Same dispatch as [`execute`], but when the action resolves to a
+/// manifest-declared shell command the child's output is echoed AND
+/// captured (see [`run_shell_tee`]) and returned as `Some(text)`.
+///
+/// Returns `Ok(None)` when the action was served by the registered
+/// adapter's built-in `execute` instead — that path writes straight to
+/// the inherited stdio, so there is nothing for us to capture and the
+/// caller must fall back to another source of truth (for Fastly deploy:
+/// the Fastly API).
+pub fn execute_capture(
+    adapter_name: &str,
+    action: Action,
+    manifest_loader: Option<&ManifestLoader>,
+    adapter_args: &[String],
+) -> Result<Option<String>, String> {
+    if let Some(loader) = manifest_loader
+        && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
+    {
+        let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
+        let env = loader.manifest().environment_for(adapter_name);
+        let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
+        return run_shell_tee(
+            command,
+            root,
+            adapter_name,
+            action,
+            Some(env),
+            adapter_bind,
+            adapter_args,
+        )
+        .map(Some);
+    }
+    execute(adapter_name, action, manifest_loader, adapter_args)?;
+    Ok(None)
+}
+
+/// Whether `action` for `adapter_name` resolves to a manifest-declared
+/// shell command (rather than the registered adapter's built-in logic).
+///
+/// Callers use this to decide whether an EdgeZero-internal directive
+/// (e.g. `--manifest-path`, understood only by the built-in adapter) is
+/// safe to thread into `adapter_args`: a manifest shell command receives
+/// those args verbatim and would choke on a flag its own CLI lacks.
+pub fn has_manifest_command(
+    manifest_loader: Option<&ManifestLoader>,
+    adapter_name: &str,
+    action: Action,
+) -> bool {
+    manifest_loader
+        .is_some_and(|loader| manifest_command(loader.manifest(), adapter_name, action).is_some())
+}
+
 fn manifest_command<'manifest>(
     manifest: &'manifest Manifest,
     adapter_name: &str,
@@ -148,6 +219,12 @@ fn manifest_command<'manifest>(
         Action::Build => cfg.commands.build.as_deref(),
         Action::Deploy => cfg.commands.deploy.as_deref(),
         Action::Serve => cfg.commands.serve.as_deref(),
+        // The Fastly staging lifecycle actions are not
+        // manifest-configurable shell commands — they run the
+        // adapter's built-in Fastly logic directly. Returning None
+        // routes `adapter::execute` past the manifest-command path to
+        // the registered adapter's `execute`.
+        Action::DeployStaged | Action::EmitVersion | Action::Healthcheck | Action::Rollback => None,
     }
 }
 
@@ -165,15 +242,18 @@ fn adapter_bind_from_manifest(
     (cfg.adapter.host.clone(), cfg.adapter.port)
 }
 
-fn run_shell(
+/// Build the `sh -c <command>` child for a manifest-declared adapter
+/// command, with the manifest environment / bind hints applied. Shared
+/// by [`run_shell`] (inherited stdio) and [`run_shell_tee`] (piped +
+/// echoed stdio) so both dispatch paths apply identical env precedence.
+fn build_shell_command(
     command: &str,
     cwd: &Path,
     adapter_name: &str,
-    action: Action,
     environment: Option<ResolvedEnvironment>,
     adapter_bind: (Option<String>, Option<u16>),
     adapter_args: &[String],
-) -> Result<(), String> {
+) -> Result<Command, String> {
     let full_command = if adapter_args.is_empty() {
         command.to_owned()
     } else {
@@ -221,12 +301,110 @@ fn run_shell(
         apply_environment(adapter_name, &env, &mut cmd)?;
     }
 
+    Ok(cmd)
+}
+
+fn run_shell(
+    command: &str,
+    cwd: &Path,
+    adapter_name: &str,
+    action: Action,
+    environment: Option<ResolvedEnvironment>,
+    adapter_bind: (Option<String>, Option<u16>),
+    adapter_args: &[String],
+) -> Result<(), String> {
+    let mut cmd = build_shell_command(
+        command,
+        cwd,
+        adapter_name,
+        environment,
+        adapter_bind,
+        adapter_args,
+    )?;
+
     let status = cmd
         .status()
         .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
 
     if status.success() {
         Ok(())
+    } else {
+        Err(format!(
+            "{action} command `{command}` exited with status {status}"
+        ))
+    }
+}
+
+/// Stream `reader` to `writer` line-by-line while accumulating a copy.
+/// This is the "tee" half of [`run_shell_tee`]: the operator still sees
+/// the child's output as it happens, and the caller still gets the text
+/// to parse.
+fn tee_stream<R: Read, W: Write>(reader: R, mut writer: W) -> String {
+    let mut buffered = BufReader::new(reader);
+    let mut captured = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match buffered.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let _echoed = writer.write_all(line.as_bytes());
+                let _flushed = writer.flush();
+                captured.push_str(&line);
+            }
+        }
+    }
+    captured
+}
+
+/// Same dispatch as [`run_shell`], but the child's stdout/stderr are
+/// piped, echoed through to our own stdout/stderr as they arrive, AND
+/// captured. Returns the captured `stdout + stderr` text so the caller
+/// can parse machine-readable lines (e.g. Fastly's activated
+/// `version=<N>`) out of a command it does not otherwise control.
+fn run_shell_tee(
+    command: &str,
+    cwd: &Path,
+    adapter_name: &str,
+    action: Action,
+    environment: Option<ResolvedEnvironment>,
+    adapter_bind: (Option<String>, Option<u16>),
+    adapter_args: &[String],
+) -> Result<String, String> {
+    let mut cmd = build_shell_command(
+        command,
+        cwd,
+        adapter_name,
+        environment,
+        adapter_bind,
+        adapter_args,
+    )?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("failed to capture stdout of {action} command `{command}`"))?;
+    let child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("failed to capture stderr of {action} command `{command}`"))?;
+
+    // stderr is drained on a worker thread so a chatty child cannot
+    // deadlock by filling the stderr pipe while we block on stdout.
+    let stderr_worker = thread::spawn(move || tee_stream(child_stderr, io::stderr()));
+    let captured_stdout = tee_stream(child_stdout, io::stdout());
+    let captured_stderr = stderr_worker.join().unwrap_or_default();
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
+
+    if status.success() {
+        Ok(format!("{captured_stdout}{captured_stderr}"))
     } else {
         Err(format!(
             "{action} command `{command}` exited with status {status}"

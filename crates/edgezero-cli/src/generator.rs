@@ -1340,16 +1340,20 @@ mod tests {
         let main_path = project_dir.join("crates/demo-app-cli/src/main.rs");
         let main = fs::read_to_string(&main_path).expect("read cli main.rs");
 
-        // Imports — every args type the seven-command Cmd enum
-        // references must be in scope.
+        // Imports — every args type the Cmd enum references must be in scope,
+        // including the Fastly lifecycle commands (active-version / healthcheck /
+        // rollback) a deployment workflow drives.
         for import in [
+            "ActiveVersionArgs",
             "AuthArgs",
             "BuildArgs",
             "ConfigPushArgs",
             "ConfigValidateArgs",
             "DeployArgs",
+            "HealthcheckArgs",
             "NewArgs",
             "ProvisionArgs",
+            "RollbackArgs",
             "ServeArgs",
         ] {
             assert!(
@@ -1366,14 +1370,19 @@ mod tests {
             "<name>-cli must import the typed config via the underscored core module name: {main}"
         );
 
-        // Cmd variants — all seven plus the nested ConfigCmd.
+        // Cmd variants — plus the nested ConfigCmd. The Fastly lifecycle
+        // commands must be present so a generated app can be driven by the
+        // deploy actions (capture/healthcheck/rollback).
         for variant in [
+            "ActiveVersion(ActiveVersionArgs)",
             "Auth(AuthArgs)",
             "Build(BuildArgs)",
             "Config(DemoAppConfigCmd)",
             "Deploy(DeployArgs)",
+            "Healthcheck(HealthcheckArgs)",
             "New(NewArgs)",
             "Provision(ProvisionArgs)",
+            "Rollback(RollbackArgs)",
             "Serve(ServeArgs)",
         ] {
             assert!(
@@ -1389,6 +1398,11 @@ mod tests {
             "run_config_validate_typed::<DemoAppConfig>",
             "edgezero_cli::run_auth",
             "edgezero_cli::run_provision",
+            // The rollback-target capture step invokes this on the app CLI; a
+            // missing dispatch would fail every production deploy's capture.
+            "edgezero_cli::run_active_version",
+            "edgezero_cli::run_healthcheck",
+            "edgezero_cli::run_rollback",
         ] {
             assert!(
                 main.contains(call),

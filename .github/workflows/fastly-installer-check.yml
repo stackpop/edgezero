@@ -1,0 +1,54 @@
+name: Fastly installer check
+
+# The lifecycle smoke test fakes the Fastly CLI, so the REAL download + checksum
+# path in install-fastly.sh is never exercised there. This job runs it un-faked —
+# it actually fetches the pinned release, verifies its SHA-256, and confirms the
+# installed binary reports the pinned version. It is path-filtered to the
+# installer and BOTH of its pin sources — versions.json AND .tool-versions, which
+# install-fastly.sh requires to agree — plus common.sh (NOT scheduled), so a
+# version/URL/checksum bump is validated against the real release exactly when it
+# changes.
+on:
+  pull_request:
+    paths:
+      - .github/actions/deploy-fastly/scripts/install-fastly.sh
+      - .github/actions/deploy-fastly/scripts/verify-installed-version.sh
+      - .github/actions/deploy-fastly/scripts/common.sh
+      - .github/actions/deploy-fastly/versions.json
+      - .github/actions/deploy-core/scripts/common.sh
+      - .tool-versions
+      - .github/workflows/fastly-installer-check.yml
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/deploy-fastly/scripts/install-fastly.sh
+      - .github/actions/deploy-fastly/scripts/verify-installed-version.sh
+      - .github/actions/deploy-fastly/scripts/common.sh
+      - .github/actions/deploy-fastly/versions.json
+      - .github/actions/deploy-core/scripts/common.sh
+      - .tool-versions
+      - .github/workflows/fastly-installer-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  real-install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Fastly CLI for real
+        env:
+          EDGEZERO__ACTION__ROOT: ${{ github.workspace }}
+          EDGEZERO__FASTLY__VERSIONS_JSON: ${{ github.workspace }}/.github/actions/deploy-fastly/versions.json
+          EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        run: .github/actions/deploy-fastly/scripts/install-fastly.sh
+
+      - name: Verify the installed CLI reports the pinned version
+        env:
+          EDGEZERO__FASTLY__VERSIONS_JSON: ${{ github.workspace }}/.github/actions/deploy-fastly/versions.json
+          EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        run: .github/actions/deploy-fastly/scripts/verify-installed-version.sh

@@ -108,11 +108,11 @@ impl ValidationContext {
 
 /// Typed exit-code outcome of a successful `config diff` run.
 ///
-/// Returned so the generated CLI's main can pick the right exit code
-/// per Q10.  NOT used on the error path — `Result::Err` bypasses this
+/// Returned so the generated CLI's main can pick the right exit code.
+/// NOT used on the error path — `Result::Err` bypasses this
 /// and the main always exits ≥ 2.
 ///
-/// Exit code semantics (Q10):
+/// Exit code semantics:
 /// - `0` — no changes, or `--exit-code` is false.
 /// - `1` — diff present AND `--exit-code` was set (CI gate signal).
 /// - `2` — diff structurally impossible (`Unsupported`).
@@ -215,7 +215,7 @@ where
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx)?;
 
-    // Typed deserialise + validate_excluding_secrets (spec 3.3.8: push,
+    // Typed deserialise + validate_excluding_secrets (push,
     // diff, AND typed validate all use deserialize-only +
     // validate_excluding_secrets; the runtime is the only path that runs
     // full validate against RESOLVED secret values).
@@ -244,7 +244,7 @@ where
 
 // -------------------------------------------------------------------
 /// Stub-pointer for the bundled `edgezero` binary's `config push`
-/// subcommand (spec 3.2.1).
+/// subcommand.
 ///
 /// The blob app-config rewrite requires a TYPED downstream CLI that
 /// embeds the app's `AppConfig<C>` struct. The bundled `edgezero`
@@ -254,13 +254,13 @@ where
 /// [`run_config_push_typed`] with their concrete `C`.
 ///
 /// This function always returns `Err(...)` with a pointer to the
-/// typed downstream CLI and the spec section. The subcommand itself
+/// typed downstream CLI. The subcommand itself
 /// must still be registered in the bundled binary's `Command` enum so
 /// `edgezero config push --help` is reachable and the error message
 /// can be displayed.
 ///
 /// # Errors
-/// Always returns a pointer error explaining 3.2.1.
+/// Always returns a pointer error.
 #[inline]
 pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
     Err(
@@ -311,13 +311,10 @@ where
         push_ctx: &push_ctx,
     };
 
-    // Build envelope.
-    // Honour --key override (5.4): if the caller supplied an explicit key,
-    // use it; otherwise fall back to the manifest's resolved logical store id.
-    let key = args
-        .key
-        .clone()
-        .unwrap_or_else(|| ctx.store.logical.clone());
+    // Build envelope. `--key` overrides the manifest's resolved logical store id;
+    // `--staging` instead targets the `<logical>_staging` variant the staging
+    // selector points at. The two are mutually exclusive.
+    let key = resolve_config_key(args.key.as_deref(), &ctx.store.logical, args.staging)?;
     let body = build_config_envelope::<C>(&typed)?;
     let local_envelope: BlobEnvelope =
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
@@ -329,6 +326,10 @@ where
         match render_first_read_diff(&remote, &key, &local_envelope, &local_sha, args.no_diff)? {
             FirstReadOutcome::NoChange => {
                 push_info(&format!("# no changes (sha256 matches: {local_sha})"));
+                // A no-op push still SUCCEEDED at putting `key` in the store, so
+                // it reports the same outputs a writing push does. Config push is
+                // idempotent; re-running it must not fail the caller.
+                emit_push_outputs(args, &key, &ctx.store.logical);
                 return Ok(());
             }
             FirstReadOutcome::ProceedFromPresent {
@@ -337,7 +338,7 @@ where
             FirstReadOutcome::ProceedFromMissingOrUnsupported => None,
         };
 
-    // Consent gate (8.2 default or 8.3 Spin Cloud Unsupported).
+    // Consent gate (default flow or Spin Cloud Unsupported).
     handle_consent(args, &remote)?;
 
     // Pre-write re-fetch + skip-on-equal + concurrent-push detection.
@@ -352,13 +353,39 @@ where
             &remote,
             approved_remote_sha.as_deref(),
         )? {
-            RecheckOutcome::Skip => return Ok(()),
+            RecheckOutcome::Skip => {
+                // A concurrent push already landed the same content — the store
+                // holds what we wanted, so this is a success with the same
+                // outputs, not a silent no-output exit.
+                emit_push_outputs(args, &key, &ctx.store.logical);
+                return Ok(());
+            }
             RecheckOutcome::Write => {}
         }
     }
 
     // Write.
-    write_envelope(ctx.adapter, args, &ctx, &paths, &key, body)
+    write_envelope(ctx.adapter, args, &ctx, &paths, &key, body)?;
+    emit_push_outputs(args, &key, &ctx.store.logical);
+    Ok(())
+}
+
+/// Emit the canonical machine-readable lines the config-push-fastly action greps
+/// (`^pushed-key=<key>$` / `^pushed-store=<id>$`) to thread the written key and
+/// the resolved store out as outputs.
+///
+/// Every SUCCESSFUL push emits these — including the idempotent no-op paths,
+/// where the store already holds the desired content. The action treats their
+/// absence as a failure, so a push that changed nothing must still report what
+/// key it put there. The store must come from here: the wrapper only has the
+/// optional raw input, which is empty on the default path where the id is
+/// resolved from the manifest. The CLI logger routes `log::info!` to stdout, so
+/// these reach the action's log.
+fn emit_push_outputs(args: &ConfigPushArgs, key: &str, store: &str) {
+    if !args.dry_run {
+        log::info!("pushed-key={key}");
+        log::info!("pushed-store={store}");
+    }
 }
 
 // -------------------------------------------------------------------
@@ -375,8 +402,7 @@ fn diff_info(msg: &str) {
     eprintln!("{msg}");
 }
 
-/// Translate an outcome + `--exit-code` flag into a typed exit code
-/// per Q10's table.
+/// Translate an outcome + `--exit-code` flag into a typed exit code.
 fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
     let code = match (exit_code_flag, outcome) {
         (_, DiffOutcome::Unsupported) => 2_i32,
@@ -408,7 +434,7 @@ pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, Strin
 where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
-    // Load + validate (spec 3.3.2: diff runs the same structural
+    // Load + validate (diff runs the same structural
     // checks as push — validate_excluding_secrets + typed_secret_checks +
     // adapter_typed_checks; no consent gate, no re-fetch).
     let validate_args = ConfigValidateArgs {
@@ -451,7 +477,8 @@ where
     let env_config = EnvConfig::from_env();
     let platform = env_config.store_name("config", &logical);
     let store = ResolvedStoreId::new(logical.clone(), platform);
-    let key = args.key.clone().unwrap_or(logical);
+    // Diff exactly what `config push` would write, `--staging` included.
+    let key = resolve_config_key(args.key.as_deref(), &logical, args.staging)?;
 
     // Resolve adapter paths for the read call.
     let manifest_root = ctx
@@ -587,8 +614,8 @@ fn dispatch_diff_format(
 // Helpers for run_config_push_typed
 // -------------------------------------------------------------------
 
-/// Consent gate: 8.3 Spin Cloud four-branch UX when `remote` is
-/// `Unsupported`; 8.2 default flow otherwise.
+/// Consent gate: Spin Cloud four-branch UX when `remote` is
+/// `Unsupported`; default flow otherwise.
 fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(), String> {
     if let ReadConfigEntry::Unsupported(reason) = remote {
         if args.dry_run {
@@ -797,7 +824,7 @@ fn render_first_read_diff(
     }
 }
 
-/// Consent gate for 8.2 default flow (non-Spin-Cloud adapters and all
+/// Consent gate for the default flow (non-Spin-Cloud adapters and all
 /// read-capable variants). `--yes` or `--dry-run` bypass the prompt.
 /// TTY: prompt. Non-TTY without `--yes`: error.
 fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(), String> {
@@ -922,6 +949,8 @@ fn write_envelope(
     for line in lines {
         log::info!("{line}");
     }
+    // The canonical `pushed-*` lines are emitted by the caller, so that the
+    // idempotent no-op paths (which never reach this function) report them too.
     Ok(())
 }
 
@@ -1028,7 +1057,7 @@ pub(crate) fn print_unified_diff_inline(
 // -------------------------------------------------------------------
 
 fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
-    // Spec: push is strict — the synthesized validate args
+    // Push is strict — the synthesized validate args
     // unconditionally request `--strict` so `run_shared_checks`
     // runs the capability-completeness + handler-path checks
     // alongside the schema and per-adapter shared checks.
@@ -1076,6 +1105,33 @@ fn resolve_adapter_push_ctx(
     }
 }
 
+/// Derive the config-store key a push or diff targets.
+///
+/// `--staging` writes (or diffs) the `<logical>_staging` variant in the SAME
+/// store — never the production key the live service reads. Fastly config stores
+/// are not versioned like staged service versions, so a different key is what
+/// isolates staged config.
+///
+/// `--key` and `--staging` are mutually exclusive, and that is not a style
+/// choice. The staging key is not merely a name we write: `provision` puts
+/// `<logical>_staging` into the staging selector store, and that selector is what
+/// a staged version READS. An explicit key would be written to a key nothing
+/// selects — a push that silently goes nowhere. Refuse instead.
+fn resolve_config_key(
+    explicit: Option<&str>,
+    logical: &str,
+    staging: bool,
+) -> Result<String, String> {
+    match (explicit, staging) {
+        (Some(key), true) => Err(format!(
+            "`--key {key}` cannot be combined with `--staging`. The staging key is derived from the store's logical id (`{logical}_staging`) because that is what the staging selector store — written by `provision` — points a staged version at. An explicit key would be written to a key nothing reads.\n  Push the staged config without `--key`, or push to `--key {key}` without `--staging` and point the selector at it yourself."
+        )),
+        (Some(key), false) => Ok(key.to_owned()),
+        (None, false) => Ok(logical.to_owned()),
+        (None, true) => Ok(format!("{logical}_staging")),
+    }
+}
+
 fn resolve_config_store_id(requested: Option<&str>, manifest: &Manifest) -> Result<String, String> {
     let Some(declaration) = manifest.stores.config.as_ref() else {
         return Err(
@@ -1114,7 +1170,7 @@ fn resolved_default(declaration: &StoreDeclaration) -> String {
 /// resolved secret value. The runtime extractor
 /// (`crates/edgezero-core/src/extractor.rs`, `secret_walk`) reads those
 /// key names from `data` and swaps each one for the resolved secret value
-/// from the appropriate secret store. Spec 3.3 (secret-key NAMES at rest).
+/// from the appropriate secret store (secret-key NAMES at rest).
 ///
 /// `generated_at` is stamped with the current UTC second.
 ///
@@ -1128,7 +1184,7 @@ where
     // and #[secret(store_ref)] fields, whose value at rest is the
     // operator-supplied key NAME (e.g. "demo_api_token"). The runtime
     // extractor reads those key names from data and swaps each one for
-    // the resolved secret value. Spec 3.3 (secret-key NAMES at rest).
+    // the resolved secret value (secret-key NAMES at rest).
     let data: serde_json::Value = serde_json::to_value(typed)
         .map_err(|err| format!("failed to serialise typed config: {err}"))?;
     let envelope = BlobEnvelope::new(data, generated_at_rfc3339());
@@ -1136,7 +1192,7 @@ where
 }
 
 /// Current UTC timestamp formatted as RFC 3339 with second precision and
-/// a trailing `Z` (`2026-06-17T18:42:31Z`). Matches spec 4.1 example.
+/// a trailing `Z` (`2026-06-17T18:42:31Z`).
 /// `generated_at` is informational only — it is NOT part of the SHA.
 fn generated_at_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -1146,7 +1202,7 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     let manifest_loader = ManifestLoader::from_path(&args.manifest)
         .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
 
-    // Spec: every project carries a `[app].name`. Without it we
+    // Every project carries a `[app].name`. Without it we
     // can't compute the env-overlay prefix or resolve the default
     // app-config path.
     let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
@@ -1531,7 +1587,7 @@ fn flatten_keys_into(table: &Table, prefix: &str, out: &mut Vec<String>) {
 // -------------------------------------------------------------------
 
 fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
-    // Spec capability matrix, driven by each adapter crate's
+    // Capability matrix, driven by each adapter crate's
     // `Adapter::single_store_kinds()` impl. Adapters not in the
     // registry (e.g. a feature-gated build that omitted some) are
     // skipped — we can't speak for what isn't linked.
@@ -1781,6 +1837,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
             yes: false,
         }
     }
@@ -1792,6 +1849,33 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         let _lock = manifest_guard().lock().expect("manifest guard");
         let (_dir, manifest, _) = setup_project(VALID_MANIFEST, VALID_APP_CONFIG);
         run_config_validate(&args_for(&manifest)).expect("valid project passes");
+    }
+
+    #[test]
+    fn resolve_config_key_covers_key_and_staging_combinations() {
+        // Production: the logical id, or an explicit --key verbatim.
+        assert_eq!(
+            resolve_config_key(None, "app_config", false).unwrap(),
+            "app_config"
+        );
+        assert_eq!(
+            resolve_config_key(Some("custom"), "app_config", false).unwrap(),
+            "custom"
+        );
+        // Staging: the `<logical>_staging` variant the selector store points at.
+        assert_eq!(
+            resolve_config_key(None, "app_config", true).unwrap(),
+            "app_config_staging"
+        );
+        // --key + --staging is REFUSED: an explicit staging key would be written
+        // to a key the staging selector never points at, so nothing would read
+        // it. A silent no-op is worse than an error.
+        let err = resolve_config_key(Some("custom"), "app_config", true)
+            .expect_err("--key with --staging must be rejected");
+        assert!(
+            err.contains("--staging") && err.contains("app_config_staging"),
+            "the error must explain the derivation: {err}"
+        );
     }
 
     #[test]
@@ -1941,7 +2025,7 @@ serve = "echo"
         );
     }
 
-    /// High 2 — spec 3.3.8: typed validate uses `validate_excluding_secrets`,
+    /// Typed validate uses `validate_excluding_secrets`,
     /// so a `#[secret]` field annotated with `length(min = 32)` must NOT
     /// reject a short key name like `"short_key"` (9 bytes).  The runtime
     /// resolves it to the real secret value and runs the full validator there.
@@ -2322,7 +2406,7 @@ ids = ["default"]
 
     #[test]
     fn spin_distinct_logical_ids_collide_when_env_overlay_resolves_to_same_platform_label() {
-        // F2: distinct logical ids `sessions` (KV) and `app_config`
+        // Distinct logical ids `sessions` (KV) and `app_config`
         // (Config) BOTH map to the same Spin KV label via the env
         // overlay. The runtime opens one underlying store for both
         // -- silent shared writes. The merged-id check must catch
@@ -2712,12 +2796,12 @@ deep = true
     }
 
     // -------------------------------------------------------------------
-    // config push (raw + typed) — spec
+    // config push (raw + typed)
     // -------------------------------------------------------------------
 
-    // ---------- raw push (stub-pointer, spec 3.2.1) ----------
+    // ---------- raw push (stub-pointer) ----------
 
-    /// Spec 3.2.1: `config push` on the bundled `edgezero` binary is a
+    /// `config push` on the bundled `edgezero` binary is a
     /// stub-pointer. The blob app-config rewrite requires a typed downstream
     /// CLI; the bundled binary has no `AppConfig<C>` in scope. The subcommand
     /// must always return `Err(...)` with a pointer to the typed downstream CLI.
@@ -2770,7 +2854,7 @@ deep = true
         // `vault` (#[secret(store_ref)]) — must be PRESENT in envelope.data.
         // Their value at rest is the operator-supplied key NAME, not the
         // resolved secret value. The runtime extractor (`secret_walk`) reads
-        // those key names and swaps them for the resolved secret. Spec 3.3.
+        // those key names and swaps them for the resolved secret.
         let data = &envelope.data;
         assert_eq!(
             data.get("api_token").and_then(|val| val.as_str()),
@@ -2800,7 +2884,7 @@ deep = true
         // object is deterministic.
 
         // All fields are present verbatim — secret key names included.
-        // Spec 3.3: secret-field VALUES at rest are the operator-supplied
+        // Secret-field VALUES at rest are the operator-supplied
         // key NAMEs (not the resolved secret values).
         let data = serde_json::json!({
             "api_token": "demo_api_token",
@@ -2829,7 +2913,7 @@ deep = true
         );
     }
 
-    /// Spec 3.3: the blob MUST carry the secret key NAME verbatim.
+    /// The blob MUST carry the secret key NAME verbatim.
     /// The runtime extractor (`secret_walk`) reads that name to look up
     /// the resolved value in the secret store. Stripping the field would
     /// cause `ConfigOutOfDate` on every request after a push.
@@ -2957,7 +3041,7 @@ timeout_ms = 50
         );
     }
 
-    /// 5.4: `--key` overrides the default logical store id used as the
+    /// `--key` overrides the default logical store id used as the
     /// blob key. Without `--key`, the written file is keyed by the
     /// manifest's `[stores.config]` id (`"app_config"`). With
     /// `--key staging`, the blob must appear under "staging" instead.
@@ -3004,7 +3088,7 @@ timeout_ms = 50
     // ---------- push runs the strict preflight (regression) ----------
 
     /// Push must run the same shared adapter checks `config
-    /// validate` runs (spec strict pre-flight). Pre-fix,
+    /// validate` runs (strict pre-flight). Pre-fix,
     /// `load_push_context` synthesised `ConfigValidateArgs { strict:
     /// false }` and `run_config_push*` never called
     /// `run_shared_checks`, so an adapter-specific shape error
@@ -3117,7 +3201,7 @@ default = "one"
     }
 
     // -------------------------------------------------------------------
-    // run_config_push_typed — 8.2 consent rules + diff
+    // run_config_push_typed — consent rules + diff
     // -------------------------------------------------------------------
 
     /// Build a valid `BlobEnvelope` JSON string for the given data, suitable
@@ -3146,7 +3230,7 @@ default = "one"
 
     // ---------- deserialise + validate_excluding_secrets ----------
 
-    /// 3.3.8 rule: a `#[secret]` field's VALUE is a key name like
+    /// A `#[secret]` field's VALUE is a key name like
     /// "my-prod-api-key", which may be shorter than a `length(min = 32)`
     /// rule intended for the resolved runtime value. The old
     /// `load_app_config_with_options` path validated the key name against
@@ -3227,7 +3311,7 @@ ids = ["default"]
             .expect("second push with same content must exit Ok via skip-on-equal");
     }
 
-    // ---------- 8.2 consent gate ----------
+    // ---------- consent gate ----------
 
     #[test]
     fn c4_non_tty_without_yes_errors_on_consent() {
@@ -3309,12 +3393,12 @@ ids = ["default"]
             .expect("--no-diff --yes typed push must succeed");
     }
 
-    // ---------- 8.3 Spin Cloud Unsupported four-branch UX ----------
+    // ---------- Spin Cloud Unsupported four-branch UX ----------
     //
     // The Spin adapter returns ReadConfigEntry::Unsupported when the
     // deploy command targets Fermyon Cloud ("spin deploy" / "spin cloud
-    // deploy"). We use that to exercise the four-branch UX defined in
-    // spec 8.3. The manifest uses `deploy = "spin deploy"` to trigger
+    // deploy"). We use that to exercise the four-branch Unsupported
+    // UX. The manifest uses `deploy = "spin deploy"` to trigger
     // the Fermyon Cloud detection path inside `read_config_entry`.
 
     // --- PATH-mutation helpers (mirrors Cloudflare adapter test pattern) ---
@@ -3357,7 +3441,7 @@ ids = ["default"]
         tmp
     }
 
-    /// Manifest fixture for the 8.3 tests: Spin adapter with a Fermyon
+    /// Manifest fixture for the Unsupported tests: Spin adapter with a Fermyon
     /// Cloud deploy command so `read_config_entry` returns `Unsupported`.
     fn spin_cloud_manifest() -> String {
         r#"
@@ -3392,14 +3476,14 @@ ids = ["default"]
     }
 
     /// Non-TTY + no --yes + Spin Cloud (Unsupported) must error with the
-    /// 8.3 non-interactive message. CI has no TTY; no --yes is passed.
+    /// non-interactive message. CI has no TTY; no --yes is passed.
     #[test]
     fn c4_unsupported_non_tty_without_yes_errors() {
         let _lock = manifest_guard().lock().expect("manifest guard");
         let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
         write_minimal_spin_toml(dir.path());
         let args = push_args(&manifest_path, "spin");
-        // No --yes, no TTY: must error with the 8.3 non-interactive error.
+        // No --yes, no TTY: must error with the non-interactive error.
         let err = run_config_push_typed::<FixtureConfig>(&args)
             .expect_err("Unsupported + non-TTY + no --yes must error");
         assert!(
@@ -3409,7 +3493,7 @@ ids = ["default"]
     }
 
     /// `--dry-run` against Spin Cloud (Unsupported) must error immediately
-    /// with the 8.3 dry-run message — the flag's contract is "show the
+    /// with the dry-run message — the flag's contract is "show the
     /// diff", which is structurally impossible without a remote read-back.
     #[test]
     fn c4_unsupported_dry_run_errors_with_spin_cloud_message() {
@@ -3620,10 +3704,10 @@ ids = ["default"]
     }
 
     // -------------------------------------------------------------------
-    // High — diff runs run_shared_checks (adapter manifest + collision)
+    // diff runs run_shared_checks (adapter manifest + collision)
     // -------------------------------------------------------------------
 
-    /// High — spec 3.3.2: `run_config_diff_typed` must run
+    /// `run_config_diff_typed` must run
     /// `run_shared_checks` (which includes `validate_adapter_manifest`)
     /// before reaching the remote-read step.  A broken Spin
     /// `spin.toml` (no `[component.*]` sections) triggers
@@ -3670,6 +3754,7 @@ ids = ["default"]
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
         };
         let err = run_config_diff_typed::<FixtureConfig>(&diff_args)
             .expect_err("missing [component.*] must fail Spin's shared-check preflight in diff");
@@ -3680,7 +3765,7 @@ ids = ["default"]
     }
 
     // -------------------------------------------------------------------
-    // Medium 1 — diff runs typed_secret_checks + adapter_typed_checks
+    // diff runs typed_secret_checks + adapter_typed_checks
     // -------------------------------------------------------------------
 
     /// A NESTED `#[secret]` that is present but empty must be caught by the
@@ -3748,6 +3833,7 @@ ids = ["default"]
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
         };
         // The nested empty secret must be rejected by the path-aware
         // typed_secret_checks before the remote-read step, naming the path.
@@ -3759,7 +3845,7 @@ ids = ["default"]
         );
     }
 
-    /// Medium 1 — spec 3.3.2: `run_config_diff_typed` must run the same
+    /// `run_config_diff_typed` must run the same
     /// structural checks as push, including `typed_secret_checks`.  A
     /// `#[secret]` field that is present but empty must be rejected even
     /// on a read-only diff operation.
@@ -3819,6 +3905,7 @@ ids = ["default"]
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
         };
         // typed_secret_checks must catch the empty `#[secret]` field
         // before the function reaches the remote-read step.

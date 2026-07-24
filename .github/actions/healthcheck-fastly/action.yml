@@ -1,0 +1,183 @@
+name: EdgeZero healthcheck-fastly
+description: Probe a deployed Fastly version's health via the app CLI. Exits non-zero when unhealthy after retries.
+
+inputs:
+  app-cli-artifact:
+    description: Name of the build-app-cli artifact to download and run.
+    required: true
+  app-cli-bin:
+    description: Binary name inside the artifact. Defaults to the artifact metadata.
+    required: false
+    default: ""
+  fastly-api-token:
+    description: "Fastly API token. Needed ONLY for staging (deploy-to=staging) IP resolution; a production probe requires no token and receives none."
+    required: false
+    default: ""
+  fastly-service-id:
+    description: Fastly service ID.
+    required: true
+  fastly-version:
+    description: Fastly service version to check.
+    required: true
+  domain:
+    description: Domain to probe (e.g. www.example.com).
+    required: true
+  deploy-to:
+    description: Deployment target, 'production' or 'staging'.
+    required: false
+    default: production
+  retry:
+    description: Total number of probe ATTEMPTS (not additional retries); e.g. 3 means at most 3 probes. Must be >= 1.
+    required: false
+    default: "3"
+  retry-delay:
+    description: Seconds between attempts.
+    required: false
+    default: "5"
+  timeout:
+    description: Request timeout in seconds.
+    required: false
+    default: "10"
+
+outputs:
+  healthy:
+    description: Whether the deployment is healthy (true/false).
+    value: ${{ steps.check.outputs.healthy }}
+  status-code:
+    description: HTTP status code returned.
+    value: ${{ steps.check.outputs['status-code'] }}
+
+runs:
+  using: composite
+  steps:
+    # GitHub does not enforce `required: true` on composite inputs, and an empty
+    # artifact name makes actions/download-artifact fetch EVERY artifact in the
+    # run — so the CLI we execute would be arbitrary. Check before downloading.
+    - name: Validate inputs
+      shell: bash
+      env:
+        EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
+        # Non-provider step: blank inherited provider aliases (only the probe step
+        # below receives the token, and only when it needs one).
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/scripts/validate.sh
+
+    - name: Download CLI artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs['app-cli-artifact'] }}
+        path: ${{ runner.temp }}/edgezero-cli-download
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+
+    - name: Extract CLI
+      id: cli
+      shell: bash
+      env:
+        EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
+
+    - name: Health check
+      id: check
+      shell: bash
+      env:
+        EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
+        EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
+        EDGEZERO__LIFECYCLE__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        EDGEZERO__LIFECYCLE__VERSION: ${{ inputs['fastly-version'] }}
+        EDGEZERO__LIFECYCLE__DOMAIN: ${{ inputs.domain }}
+        EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
+        EDGEZERO__LIFECYCLE__RETRY: ${{ inputs.retry }}
+        EDGEZERO__LIFECYCLE__RETRY_DELAY: ${{ inputs['retry-delay'] }}
+        EDGEZERO__LIFECYCLE__TIMEOUT: ${{ inputs.timeout }}
+        # Only the typed token reaches the CLI; blank any inherited alias.
+        # Only a STAGING probe needs the token (staging-IP resolution). A
+        # production probe just curls the domain, so it receives no token.
+        FASTLY_API_TOKEN: ${{ inputs['deploy-to'] == 'staging' && inputs['fastly-api-token'] || '' }}
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/scripts/healthcheck.sh
+
+    - name: Cleanup
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh

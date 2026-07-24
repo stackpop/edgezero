@@ -1,0 +1,156 @@
+name: EdgeZero build-app-cli
+description: Compile the CLI package the application provides and publish it as a self-describing artifact.
+
+inputs:
+  app-cli-package:
+    description: Cargo package name of the CLI to build, defined in the application's own workspace.
+    required: true
+  app-cli-bin:
+    description: Binary name produced by app-cli-package. Defaults to the package name.
+    required: false
+    default: ""
+  working-directory:
+    description: Application directory (relative to github.workspace) whose workspace defines app-cli-package.
+    required: false
+    default: .
+  rust-toolchain:
+    description: Explicit host Rust toolchain, or 'auto' to follow application discovery.
+    required: false
+    default: auto
+  app-cli-artifact:
+    description: Name for the uploaded app-CLI artifact.
+    required: false
+    default: edgezero-cli
+  provider-env-clear:
+    description: >-
+      The DYNAMIC half of a two-layer credential scrub. A JSON array of
+      environment variable names re-exec'd out of the process before any
+      app-controlled command runs (cargo metadata, cargo build, the built CLI's
+      --help). The STATIC half lives in this action's step env, which blanks the
+      shipped adapters' aliases outright (and is the only layer that also protects
+      the upload step). This input exists so a consumer can add a provider this
+      action does not know about; its default repeats the shipped aliases so the
+      dynamic layer is self-contained too. Must be a JSON array of non-empty
+      identifier strings or the build fails closed.
+    required: false
+    default: >-
+      ["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_CARGO_PROFILE","FASTLY_HOME","CLOUDFLARE_API_TOKEN","CLOUDFLARE_API_KEY","CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_EMAIL","CF_API_TOKEN","CF_API_KEY","CF_ACCOUNT_ID","SPIN_AUTH_TOKEN","FERMYON_TOKEN"]
+
+outputs:
+  app-cli-version:
+    description: CLI package version read from cargo metadata.
+    value: ${{ steps.build.outputs['app-cli-version'] }}
+  app-cli-package:
+    description: The application CLI package that was built.
+    value: ${{ steps.build.outputs['app-cli-package'] }}
+  app-cli-bin:
+    description: The binary name inside the artifact.
+    value: ${{ steps.build.outputs['app-cli-bin'] }}
+  app-cli-artifact:
+    description: Artifact name the deploy, healthcheck, and rollback actions consume.
+    value: ${{ steps.build.outputs['app-cli-artifact'] }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build application CLI package
+      id: build
+      shell: bash
+      env:
+        EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
+        EDGEZERO__APP__CLI__PACKAGE: ${{ inputs['app-cli-package'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
+        EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        EDGEZERO__PROJECT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
+        EDGEZERO__APP__CLI__ARTIFACT: ${{ inputs['app-cli-artifact'] }}
+        # This step runs APP-CONTROLLED code (cargo metadata/build, and the built
+        # CLI's `--help`), which must never see a provider token.
+        #
+        # Two layers, because neither alone is sufficient:
+        #   1. STATIC (below): blank the shipped adapters' aliases in the step's
+        #      own `env:`. A `uses:`/`run:` step's environment can only be set
+        #      statically, so these must be spelled out — and because they are set
+        #      here, even this step's own `/proc/<pid>/environ` never contained
+        #      them. This is the only layer that also protects the upload step.
+        #   2. DYNAMIC (`provider-env-clear`): covers aliases this action cannot
+        #      know about (a caller's OWN provider). The `run:` body `exec`s the
+        #      script, replacing the generated wrapper shell, and the script then
+        #      re-execs itself with those names stripped — so no ancestor process
+        #      that app code could walk up to still holds them.
+        EDGEZERO__PROVIDER__ENV_CLEAR: ${{ inputs['provider-env-clear'] }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      # `exec` REPLACES the generated wrapper shell with the script, so there is
+      # no wrapper-shell ancestor still holding the caller's custom provider
+      # secret (from its own execve environment) for app-controlled Cargo code to
+      # read via `/proc/<ppid>/environ`. The script then re-execs itself with the
+      # `provider-env-clear` names stripped.
+      run: exec "$GITHUB_ACTION_PATH/scripts/build-app-cli.sh"
+
+    # A script-level scrub cannot reach a LATER step: each step gets its own
+    # process with the job environment re-applied. This non-provider step blanks
+    # the SHIPPED aliases itself rather than inheriting them.
+    #
+    # A `uses:` step's `env:` is static, so it CANNOT blank a caller's custom
+    # `provider-env-clear` alias (only the build step, which runs a script, can do
+    # that dynamically). That is an accepted boundary: this step runs no
+    # application code — it hands a fixed tarball path to a pinned first-party
+    # action — so a custom secret reaching here is not exposed to attacker code.
+    # A caller who must keep a custom secret out of EVERY step should scope it to
+    # the step that needs it rather than to job-level `env:`.
+    - name: Upload CLI artifact
+      uses: actions/upload-artifact@v4
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      with:
+        name: ${{ steps.build.outputs['app-cli-artifact'] }}
+        path: ${{ steps.build.outputs['tarball-path'] }}
+        if-no-files-found: error
+        retention-days: 1

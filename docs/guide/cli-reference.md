@@ -221,7 +221,7 @@ each adapter crate owns its own implementation, the CLI is a thin
 delegate.
 
 ```bash
-edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--no-env] [--local] [--runtime-config <path>] [--no-diff] [--yes] [--dry-run]
+edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--staging] [--no-env] [--local] [--runtime-config <path>] [--no-diff] [--yes] [--dry-run]
 ```
 
 **Arguments:**
@@ -230,7 +230,14 @@ edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] 
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to push to. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
-- `--key <key>` — override the config-store key the blob is written under (spec §5.4). Defaults to the logical store id. Use it to publish a side channel (e.g. `--key app_config_staging`); the runtime selects it back via `EDGEZERO__STORES__CONFIG__<ID>__KEY` (see [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
+- `--key <key>` — override the config-store key the blob is written under (spec §5.4).
+- `--staging` — write the `<logical-store-id>_staging` variant in the SAME store,
+  so a staged push never overwrites the key the live service reads. The staging
+  key is _derived_ from the store's logical id and is mutually exclusive with
+  `--key` (an explicit staging key would be written where no staged version reads,
+  so the combination is refused). A staged deploy points the staged version's
+  `edgezero_runtime_env` link at this key via `EDGEZERO__STORES__CONFIG__<ID>__KEY`
+  in its staging selector store (see [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config. By default the loader reads the overlay so the push sends the same values the runtime would.
 - `--local` — push into the adapter's local-emulator state instead of the live platform. Fastly edits `[local_server.config_stores]` in `fastly.toml` (Viceroy reads it on startup); Cloudflare runs `wrangler kv bulk put --local` so writes land in `.wrangler/state`; Spin forces SQLite-direct against `<spin.toml dir>/.spin/sqlite_key_value.db` even when the manifest's deploy command targets Fermyon Cloud (the runtime-config `[key_value_store.<label>].type` is also ignored for SQLite path resolution); Axum is local-only already so it's a no-op there.
 - `--runtime-config <path>` — adapter runtime configuration file. Currently only consumed by Spin, which reads `[key_value_store.<label>]` stanzas to dispatch per-backend (`type = "spin"` → SQLite-direct, `redis` / `azure_cosmos` / other → error pointing at the native backend CLI). Default: `runtime-config.toml` next to the adapter manifest. Ignored by the Fermyon Cloud branch — cloud pushes consult only `spin.toml`'s `[application].name`.
@@ -276,7 +283,7 @@ errors with a pointer to the downstream CLI, since the diff needs the
 app's typed `AppConfig<C>`.
 
 ```bash
-edgezero config diff --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--no-env] [--local] [--runtime-config <path>] [--format <fmt>] [--exit-code]
+edgezero config diff --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--staging] [--no-env] [--local] [--runtime-config <path>] [--format <fmt>] [--exit-code]
 ```
 
 **Arguments:**
@@ -286,6 +293,9 @@ edgezero config diff --adapter <name> [--manifest <path>] [--app-config <path>] 
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to diff against. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
 - `--key <key>` — override the config-store key to diff against (spec §5.4). Defaults to the logical store id; matches `config push --key`.
+- `--staging` — diff against the derived `<logical-store-id>_staging` variant,
+  matching what `config push --staging` would write. Mutually exclusive with
+  `--key`, like `config push`.
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config.
 - `--local` — diff against the adapter's local-emulator state instead of the live platform (same resolution as `config push --local`).
 - `--runtime-config <path>` — adapter runtime configuration file (Spin only; same semantics as `config push`).

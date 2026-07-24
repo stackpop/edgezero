@@ -19,6 +19,25 @@ pub enum AdapterAction {
     AuthStatus,
     Build,
     Deploy,
+    /// Stage a draft platform version without activating it. Fastly
+    /// clones the active service version, uploads the built package
+    /// to it, then marks it staged; other adapters return an
+    /// "unsupported" error. Part of the Fastly staging lifecycle.
+    DeployStaged,
+    /// Emit the deployed/active platform version in a parseable form
+    /// (`version=<N>`) so a CI action can capture it. Fastly resolves
+    /// the active service version; other adapters return
+    /// "unsupported". Companion to `Deploy` for the staging lifecycle.
+    EmitVersion,
+    /// Probe a deployed version's health and exit non-zero when
+    /// unhealthy after retries. Fastly curls the domain (or its
+    /// staging IP resolved from the Fastly API); other adapters
+    /// return "unsupported".
+    Healthcheck,
+    /// Roll a service back: production activates the previous version,
+    /// staging deactivates the staged version. Fastly-only; other
+    /// adapters return "unsupported".
+    Rollback,
     Serve,
 }
 
@@ -201,7 +220,7 @@ impl<'entry> TypedSecretEntry<'entry> {
     }
 }
 
-/// Outcome of a single-key read. See spec 9.0.
+/// Outcome of a single-key read.
 #[non_exhaustive]
 pub enum ReadConfigEntry {
     /// The store exists but the key is absent (operator hasn't pushed yet,
@@ -215,7 +234,7 @@ pub enum ReadConfigEntry {
     Present(String),
     /// The adapter cannot query the backend for this entry — e.g. Spin
     /// Cloud's CLI exposes no `get`. `&'static str` carries the human-
-    /// readable reason. See spec 8.3 four-branch UX.
+    /// readable reason. See the four-branch UX.
     Unsupported(&'static str),
 }
 
@@ -379,7 +398,7 @@ pub trait Adapter: Sync + Send {
     }
 
     /// Single-key read against the LIVE platform. Mirrors
-    /// [`Self::push_config_entries`]'s argument list per spec 9.0 so
+    /// [`Self::push_config_entries`]'s argument list so
     /// adapters can share helpers (`find_namespace_id` for Cloudflare,
     /// `resolve_label_for_store` for Spin, etc.).
     ///
@@ -430,8 +449,8 @@ pub trait Adapter: Sync + Send {
         ))
     }
 
-    /// Store kinds for which this adapter is Single-capable per
-    /// spec — `--strict` rejects `[stores.<kind>].ids.len() > 1`
+    /// Store kinds for which this adapter is Single-capable.
+    /// `--strict` rejects `[stores.<kind>].ids.len() > 1`
     /// when any listed kind matches. Default: `&[]` (Multi for
     /// every store kind).
     #[inline]
@@ -488,7 +507,7 @@ pub trait Adapter: Sync + Send {
     ///
     /// Note: the previous signature took a `_config_keys` parameter
     /// so Spin could detect cross-namespace collision with KV-stored
-    /// values; KV-backed config dropped that need in Stage 6, and no
+    /// values; KV-backed config dropped that need, and no
     /// remaining adapter consults it. If a future adapter needs the
     /// flattened config-key set here, add it back via a builder
     /// context rather than re-introducing a positional parameter
