@@ -651,65 +651,90 @@ test_clear_provider_env_aliases() {
   names=$(bash -c "source '$lib'; provider_env_clear_names '[\"A_TOKEN\",\"B_TOKEN\"]' | tr '\n' ' '")
   assert_equals "a well-formed array yields its names" "A_TOKEN B_TOKEN " "$names"
 
-  # --- the scrub must survive /proc inspection -------------------------------
-  # `unset` leaves the ORIGINAL environment visible via /proc/<pid>/environ, so
-  # the scrub re-execs. Assert the re-exec'd process sees the names truly gone
-  # from its own environment (and, on Linux, from its /proc entry).
-  local probe="$WORK_DIR/env-probe.sh"
+  # A JSON member with an ESCAPED control character (valid JSON, decoding to a
+  # newline/NUL) must be REJECTED. Otherwise it would reach `jq -r`, split into
+  # two "names" (newline) or be truncated (NUL), leaving the real variable
+  # untouched. Fixtures are printf'd so this source carries no raw control chars.
+  local bs=$'\\'
+  printf '["A%snB"]' "$bs" >"$WORK_DIR/pec-nl.json"
+  printf '["WRONG%su0000SECRET"]' "$bs" >"$WORK_DIR/pec-nul.json"
+  assert_fails "an escaped newline in a name is rejected" \
+    bash -c "source '$lib'; provider_env_clear_names \"\$(cat '$WORK_DIR/pec-nl.json')\""
+  assert_fails "an escaped NUL in a name is rejected" \
+    bash -c "source '$lib'; provider_env_clear_names \"\$(cat '$WORK_DIR/pec-nul.json')\""
+
+  # --- the scrub must clear the credential from ANCESTOR /proc, not only $$ ----
+  # A child spawned after the scrub must not find the credential in its parent's
+  # (`/proc/<ppid>/environ`) environment. The re-exec (`env -u` + exec) gives the
+  # script process a clean environ, so the child's parent (the script) is clean.
+  # This mirrors build-app-cli.sh's arg-SENTINEL guard (an env sentinel would be
+  # forgeable via job env).
+  local sentinel="--edgezero-provider-env-cleared"
+  local probe="$WORK_DIR/scrub-probe.sh"
   cat >"$probe" <<PROBE
 #!/usr/bin/env bash
 set -euo pipefail
 source '$lib'
-if [[ -z "\${EDGEZERO__PROVIDER__ENV_CLEARED:-}" ]]; then
-  exec_with_cleared_provider_env "\${PROBE_CLEAR:-[]}" "\$0" "\$@"
-fi
-printf 'env=[%s]' "\${SECRET_TOKEN-unset}"
-if [[ -r "/proc/\$\$/environ" ]]; then
-  if tr '\0' '\n' </proc/\$\$/environ | grep -q '^SECRET_TOKEN='; then
-    printf ' proc=[leaked]'
-  else
-    printf ' proc=[clean]'
-  fi
+if [[ "\${1:-}" == "$sentinel" ]]; then
+  shift
 else
-  printf ' proc=[n/a]'
+  exec_with_cleared_provider_env "\${PROBE_CLEAR:-[]}" "\$0" "$sentinel" "\$@"
 fi
+child() {
+  local own="\${SECRET_TOKEN-unset}"
+  local anc="n/a"
+  if [[ -r "/proc/\$PPID/environ" ]]; then
+    if tr '\0' '\n' <"/proc/\$PPID/environ" | grep -q '^SECRET_TOKEN='; then anc="leaked"; else anc="clean"; fi
+  fi
+  printf 'own=[%s] ancestor=[%s]' "\$own" "\$anc"
+}
+export -f child
+bash -c child
 PROBE
   chmod +x "$probe"
 
   local scrubbed
   scrubbed=$(SECRET_TOKEN=super-secret PROBE_CLEAR='["SECRET_TOKEN"]' bash "$probe")
   case "$scrubbed" in
-    'env=[unset] proc=[clean]' | 'env=[unset] proc=[n/a]')
-      assert_equals "the re-exec'd process cannot see the cleared credential" "ok" "ok" ;;
+    'own=[unset] ancestor=[clean]' | 'own=[unset] ancestor=[n/a]')
+      assert_equals "a child cannot read the credential from the scrubbed ancestor" "ok" "ok" ;;
     *)
-      assert_equals "the re-exec'd process cannot see the cleared credential" \
-        "env=[unset] proc=[clean|n/a]" "$scrubbed" ;;
+      assert_equals "a child cannot read the credential from the scrubbed ancestor" \
+        "own=[unset] ancestor=[clean|n/a]" "$scrubbed" ;;
   esac
 
   # An unrelated variable must survive the re-exec.
   local kept
-  kept=$(SECRET_TOKEN=s KEEP_ME=kept PROBE_CLEAR='["SECRET_TOKEN"]' bash -c "
+  kept=$(SECRET_TOKEN=s KEEP_ME=kept bash -c "
     source '$lib'
-    if [[ -z \"\${EDGEZERO__PROVIDER__ENV_CLEARED:-}\" ]]; then
-      exec_with_cleared_provider_env '[\"SECRET_TOKEN\"]' /bin/bash -c 'printf \"%s\" \"\${KEEP_ME-unset}\"'
-    fi")
+    exec_with_cleared_provider_env '[\"SECRET_TOKEN\"]' /bin/bash -c 'printf \"%s\" \"\${KEEP_ME-unset}\"'")
   assert_equals "an unrelated variable survives the scrub" "kept" "$kept"
 
-  # A malformed input must abort the CALLER, not just the validation subshell.
-  # If the failure did not propagate, the caller would exec with an EMPTY strip
-  # list — running app-controlled code with the credentials still present.
-  assert_fails "a malformed input aborts the caller (never execs with an empty strip list)" \
-    bash -c "source '$lib'
-      exec_with_cleared_provider_env '\"NOT_AN_ARRAY\"' /bin/echo reached-the-command"
+  # --- fail-closed propagation -----------------------------------------------
+  # A malformed input must abort the CALLER, not just the validation subshell:
+  # otherwise the caller would exec with an EMPTY strip list, running app code
+  # with the credentials intact.
   local leaked
   leaked=$(SECRET_TOKEN=super-secret bash -c "source '$lib'
       exec_with_cleared_provider_env '{}' /bin/bash -c 'printf \"%s\" \"\${SECRET_TOKEN-unset}\"'" 2>/dev/null || true)
   assert_equals "a malformed input never reaches the command with credentials intact" "" "$leaked"
 
+  # An inherited env sentinel must NOT bypass the scrub: the guard keys off an
+  # ARGUMENT, so the legacy env var is inert and a malformed input still fails.
+  assert_fails "an inherited env sentinel does not bypass validation" \
+    env EDGEZERO__PROVIDER__ENV_CLEARED=1 EDGEZERO__PROVIDER__ENV_CLEAR='{}' \
+    GITHUB_WORKSPACE="$WORK_DIR" \
+    bash "$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh"
+
   # The real build script must also refuse to proceed on a malformed input.
   assert_fails "build-app-cli.sh fails closed on a malformed provider-env-clear" \
     env EDGEZERO__PROVIDER__ENV_CLEAR='{}' GITHUB_WORKSPACE="$WORK_DIR" \
     bash "$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh"
+
+  # The action must `exec` the script from its run body, so no dirty wrapper-shell
+  # ancestor survives for app code to walk up to. Guard against silently dropping it.
+  grep -qE 'run: exec .*build-app-cli\.sh' "$ACTIONS_DIR/build-app-cli/action.yml" ||
+    fail "build-app-cli action must 'exec' the build script (eliminates the dirty wrapper-shell ancestor)"
 }
 
 test_toolchain_boundary() {
@@ -1048,6 +1073,8 @@ action_step_scripts() {
       if (id == "") next
       line = $0
       sub(/^[[:space:]]*run:[[:space:]]*/, "", line)
+      sub(/^exec[[:space:]]+/, "", line)   # a run body may exec the script
+      gsub(/"/, "", line)                  # strip quoting around the path
       gsub(/\$GITHUB_ACTION_PATH/, dir, line)
       gsub(/\$\{\{[^}]*\}\}/, "", line)
       print id, line

@@ -162,12 +162,19 @@ workspace may be the subdirectory itself), so a monorepo caches the right
 Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`.
 
 **Keeping provider secrets out of your build.** This step compiles _your_ code and
-runs your CLI's `--help`, so it strips provider credentials from the environment
-first — by re-executing itself without them, not merely unsetting them (an
-`unset` variable is still readable through `/proc/<pid>/environ` on Linux).
+runs your CLI's `--help`, so it keeps provider credentials out of the environment
+in two layers:
 
-The default list covers the providers EdgeZero ships. If your job exposes a
-credential this action cannot know about, name it so it is stripped too:
+- **Static** — the step blanks the shipped adapters' aliases (Fastly, Cloudflare,
+  Spin) in its own `env:`. Because they are set there, the step's process never
+  had them, and this is the layer that also covers the artifact-upload step.
+- **Dynamic** — `provider-env-clear` names any _other_ provider secret your job
+  exposes. The step **re-executes** itself with those removed (not merely
+  `unset`, which is still readable through `/proc/<pid>/environ` on Linux), and
+  the `run:` body `exec`s the script so no ancestor shell keeps a copy either.
+
+The default `provider-env-clear` list repeats the shipped aliases so the dynamic
+layer is self-contained. Add your own provider's aliases if you have one:
 
 ```yaml
 - uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
@@ -178,7 +185,10 @@ credential this action cannot know about, name it so it is stripped too:
 ```
 
 The value must be a JSON array of non-empty variable names; anything else fails
-the build rather than silently scrubbing nothing.
+the build rather than silently scrubbing nothing. Note the boundary: a custom
+alias is guaranteed stripped from the build step (which runs your code); the
+upload step runs no application code, so if you must keep a secret out of _every_
+step, scope it to the step that needs it rather than to job-level `env:`.
 
 ### `deploy-fastly`
 

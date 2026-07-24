@@ -109,34 +109,43 @@ sanitize_ref() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.=-' '-'
 }
 
+# Argument (NOT env var) that marks the already-re-exec'd invocation. It must be
+# an argument because a caller controls the job environment but NOT the argv of a
+# composite action's `run:` command; an env-var sentinel could be inherited to
+# skip the scrub entirely. Not `readonly`: this file may be sourced more than
+# once, and a second `readonly` of the same name errors under `set -e`.
+# shellcheck disable=SC2034  # used by build-app-cli.sh, which sources this file
+PROVIDER_ENV_CLEARED_SENTINEL="--edgezero-provider-env-cleared"
+
 # Validate the `provider-env-clear` input and print the credential alias names it
 # contains, one per line.
 #
-# Fails CLOSED on anything that is not a JSON array of non-empty shell-identifier
-# strings. This matters because a permissive parse silently clears NOTHING: with
-# `jq '.[]?'`, the values `"FASTLY_API_TOKEN"`, `{}`, `null` and `123` all exit 0
-# and yield no names, so a typo in the input would leave every inherited
-# credential in scope for app-controlled code while appearing to succeed.
+# Fails CLOSED on anything that is not a JSON array of non-empty environment-
+# variable identifiers. TWO reasons this must be strict:
+#   1. A permissive parse silently clears NOTHING: with `jq '.[]?'`, the values
+#      `"FASTLY_API_TOKEN"`, `{}`, `null`, `123` all exit 0 and yield no names, so
+#      a typo would leave every inherited credential in scope while "succeeding".
+#   2. Validation runs ENTIRELY IN JQ, on the DECODED strings, so a control
+#      character cannot survive `jq -r` transport through bash's line/NUL-
+#      sensitive streams. A member with an escaped newline would otherwise reach
+#      `jq -r`, split into two "names", and leave the real variable untouched; an
+#      escaped NUL would truncate under `$(...)`. The `\A...\z` anchors match the
+#      WHOLE decoded string (not up to a trailing newline), so any control
+#      character fails the test.
 provider_env_clear_names() {
   local json="${1-}"
   require_cmd jq
-  local kind
-  kind=$(printf '%s' "$json" | jq -r 'type' 2>/dev/null) ||
-    fail "input 'provider-env-clear' is not valid JSON: '$json'"
-  [[ "$kind" == "array" ]] ||
-    fail "input 'provider-env-clear' must be a JSON ARRAY of environment variable names, got $kind: '$json'"
-  local malformed
-  malformed=$(printf '%s' "$json" | jq -r '[.[] | select((type != "string") or (. == ""))] | length')
-  [[ "$malformed" == "0" ]] ||
-    fail "input 'provider-env-clear' must contain only non-empty strings: '$json'"
-
-  local name
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
-      fail "input 'provider-env-clear' contains an invalid environment variable name: '$name'"
-    printf '%s\n' "$name"
-  done < <(printf '%s' "$json" | jq -r '.[]')
+  printf '%s' "$json" | jq -e '
+    type == "array"
+    and (all(.[];
+      type == "string"
+      and . != ""
+      and test("\\A[A-Za-z_][A-Za-z0-9_]*\\z")))
+  ' >/dev/null 2>&1 ||
+    fail "input 'provider-env-clear' must be a JSON array of non-empty environment-variable names (identifier characters only, no control characters): '$json'"
+  # Every element is now a validated identifier (no control chars), so line-based
+  # bash transport is safe.
+  printf '%s' "$json" | jq -r '.[]'
 }
 
 # Re-exec this script with the named provider credentials REMOVED from the
@@ -144,18 +153,21 @@ provider_env_clear_names() {
 #
 # `unset` alone is not sufficient. On Linux, `/proc/<pid>/environ` exposes the
 # environment block a process was `execve`d with, and later `unset`/`setenv` do
-# not rewrite it — so an app-controlled Cargo build script (or the built CLI's
-# `--help`) could read the token straight out of this shell's `/proc` entry even
+# not rewrite it, so an app-controlled Cargo build script (or the built CLI's
+# `--help`) could read the token straight out of the process's `/proc` entry even
 # after we unset it. Replacing the process image via `env -u ... exec` gives THIS
 # process, its `/proc` entry, and every descendant a genuinely clean environment.
+# (The `run:` body must `exec` this script so no dirtier ancestor shell survives
+# for app code to walk up to; see the action.)
 #
 # Provider-NEUTRAL: the names come from the caller's `provider-env-clear` input.
+# The re-exec re-invokes with the sentinel ARGUMENT so it runs exactly once.
 exec_with_cleared_provider_env() {
   local json="$1"
   shift
   # COMMAND substitution, not process substitution: a validation failure inside
   # `provider_env_clear_names` must abort the build. Under `< <(...)` its `fail`
-  # would only kill the subshell, leaving an EMPTY name list here — and we would
+  # would only kill the subshell, leaving an EMPTY name list here, and we would
   # then exec with nothing stripped, i.e. fail OPEN with the credentials intact.
   local names_raw
   names_raw=$(provider_env_clear_names "$json") || exit 1
@@ -166,8 +178,7 @@ exec_with_cleared_provider_env() {
     [[ -n "$name" ]] || continue
     cmd+=(-u "$name")
   done <<<"$names_raw"
-  # Sentinel so the re-exec'd invocation does not loop.
-  cmd+=("EDGEZERO__PROVIDER__ENV_CLEARED=1" "$@")
+  cmd+=("$@")
   exec "${cmd[@]}"
 }
 

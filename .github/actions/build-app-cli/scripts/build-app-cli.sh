@@ -31,8 +31,18 @@ source "$SCRIPT_DIR/common.sh"
 # stripped from the process environment. This must be a re-exec rather than
 # `unset`: `/proc/<pid>/environ` still exposes the environment we were `execve`d
 # with, so a Cargo build script could otherwise read a token we had "unset".
-if [[ -z "${EDGEZERO__PROVIDER__ENV_CLEARED:-}" && "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  exec_with_cleared_provider_env "${EDGEZERO__PROVIDER__ENV_CLEAR:-[]}" "$0" "$@"
+#
+# The "already cleared" marker is the sentinel ARGUMENT, not an env var: a caller
+# controls the job environment but not this composite step's argv, so an env
+# sentinel could be inherited to bypass the scrub. The `run:` body `exec`s this
+# script, so after the re-exec there is no dirtier ancestor shell to walk up to.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  if [[ "${1:-}" == "$PROVIDER_ENV_CLEARED_SENTINEL" ]]; then
+    shift
+  else
+    exec_with_cleared_provider_env "${EDGEZERO__PROVIDER__ENV_CLEAR:-[]}" \
+      "$0" "$PROVIDER_ENV_CLEARED_SENTINEL" "$@"
+  fi
 fi
 
 # --- Rust toolchain resolution helpers ---------------------------------------

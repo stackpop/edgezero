@@ -55,12 +55,18 @@ reference to port from. Most transfer with light changes:
 ## Implementation phases
 
 1. **`build-app-cli` action**
-   - `provider-env-clear` input (JSON array, defaults to the shipped adapters'
-     credential aliases): the action RE-EXECS itself with these names stripped
-     before running any app-controlled command, because `unset` leaves them
-     readable through `/proc/<pid>/environ`. The names come from the input so this
-     provider-neutral layer hard-codes none; the value must be an array of
-     non-empty identifier strings or the build fails closed.
+   - Two-layer credential scrub for the app-controlled build:
+     - STATIC: the build (and upload) step's own `env:` blanks the shipped
+       adapters' aliases outright, so the step process never held them. A
+       `uses:`/`run:` step env is static, so this layer must spell them out — and
+       it is the only one that covers the upload step.
+     - DYNAMIC: a `provider-env-clear` input (JSON array, default = the shipped
+       aliases) names a provider this action cannot know about. The `run:` body
+       `exec`s the script, which RE-EXECS itself with those names stripped before
+       running any app-controlled command — `unset` leaves them readable through
+       `/proc/<pid>/environ`, and `exec` removes the wrapper-shell ancestor. The
+       value must be a JSON array of non-empty identifier strings (validated in
+       `jq` on the decoded values) or the build fails closed.
    - Required `app-cli-package` input: the Cargo package name of the CLI defined in
      the application's own workspace. Fail if missing or not found in the app
      workspace under `working-directory`.
