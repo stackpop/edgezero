@@ -172,6 +172,13 @@ in two layers:
   exposes. The step **re-executes** itself with those removed (not merely
   `unset`, which is still readable through `/proc/<pid>/environ` on Linux), and
   the `run:` body `exec`s the script so no ancestor shell keeps a copy either.
+  `BASH_ENV`/`ENV` are blanked as well, since a shell sources them at startup —
+  before that scrub can run.
+
+Your build code also cannot _reach out_ of this step: it runs with the
+`$GITHUB_ENV`/`$GITHUB_PATH` file channels neutralized, so a malicious build
+script cannot append (for example) `LD_PRELOAD` and have a later step — such as
+the artifact upload — execute it.
 
 The default `provider-env-clear` list repeats the shipped aliases so the dynamic
 layer is self-contained. Add your own provider's aliases if you have one:

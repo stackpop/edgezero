@@ -43,6 +43,23 @@ assert_fails() {
   if "$@" >/dev/null 2>&1; then fail "$description (expected non-zero exit)"; else pass "$description"; fi
 }
 
+# assert_fails_with "<description>" "<expected-stderr-substring>" <command...>
+# Asserts the command fails AND fails for the expected REASON. A bare exit-code
+# check can pass by accident when the command would have failed later anyway
+# (e.g. a missing required variable AFTER the scrub check we meant to exercise).
+assert_fails_with() {
+  local description="$1" needle="$2"
+  shift 2
+  local out
+  if out=$("$@" 2>&1); then
+    fail "$description (expected non-zero exit)"
+  elif [[ "$out" == *"$needle"* ]]; then
+    pass "$description"
+  else
+    fail "$description (failed, but not with: $needle)"
+  fi
+}
+
 # assert_equals "<description>" "<expected>" "<actual>"
 assert_equals() {
   local description="$1" expected="$2" actual="$3"
@@ -721,13 +738,19 @@ PROBE
 
   # An inherited env sentinel must NOT bypass the scrub: the guard keys off an
   # ARGUMENT, so the legacy env var is inert and a malformed input still fails.
-  assert_fails "an inherited env sentinel does not bypass validation" \
+  # Assert the SCRUB VALIDATION diagnostic, not merely a non-zero exit: the script
+  # would also exit later on the unset EDGEZERO__ACTION__ROOT, so a bare exit-code
+  # check would pass even if the sentinel HAD bypassed validation.
+  assert_fails_with "an inherited env sentinel does not bypass validation" \
+    "input 'provider-env-clear' must be a JSON array" \
     env EDGEZERO__PROVIDER__ENV_CLEARED=1 EDGEZERO__PROVIDER__ENV_CLEAR='{}' \
     GITHUB_WORKSPACE="$WORK_DIR" \
     bash "$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh"
 
-  # The real build script must also refuse to proceed on a malformed input.
-  assert_fails "build-app-cli.sh fails closed on a malformed provider-env-clear" \
+  # The real build script must also refuse to proceed on a malformed input, and
+  # do so AT THE SCRUB — before it reaches any app-controlled command.
+  assert_fails_with "build-app-cli.sh fails closed on a malformed provider-env-clear" \
+    "input 'provider-env-clear' must be a JSON array" \
     env EDGEZERO__PROVIDER__ENV_CLEAR='{}' GITHUB_WORKSPACE="$WORK_DIR" \
     bash "$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh"
 
@@ -735,6 +758,35 @@ PROBE
   # ancestor survives for app code to walk up to. Guard against silently dropping it.
   grep -qE 'run: exec .*build-app-cli\.sh' "$ACTIONS_DIR/build-app-cli/action.yml" ||
     fail "build-app-cli action must 'exec' the build script (eliminates the dirty wrapper-shell ancestor)"
+
+  # BASH_ENV / ENV are sourced at shell STARTUP, before the script's re-exec scrub
+  # runs, so the scrub cannot clear them — they must be blanked statically in the
+  # build step's `env:`. Guard against a regression that drops the static clear.
+  local action_yml="$ACTIONS_DIR/build-app-cli/action.yml"
+  grep -qE '^[[:space:]]+BASH_ENV: ""' "$action_yml" ||
+    fail "build-app-cli build step must statically blank BASH_ENV (sourced before the scrub can run)"
+  grep -qE '^[[:space:]]+ENV: ""' "$action_yml" ||
+    fail "build-app-cli build step must statically blank ENV (sourced before the scrub can run)"
+
+  # `run_untrusted` must point the GitHub Actions file-command channels away from
+  # the real per-step files: an app-controlled build script could otherwise append
+  # (e.g.) LD_PRELOAD to $GITHUB_ENV and have a LATER step run it with a credential
+  # in scope, or forge this action's outputs via $GITHUB_OUTPUT.
+  local ru_env ru_out
+  ru_env="$WORK_DIR/ru-github-env"
+  ru_out="$WORK_DIR/ru-github-out"
+  : >"$ru_env"
+  : >"$ru_out"
+  GITHUB_ENV="$ru_env" GITHUB_OUTPUT="$ru_out" bash -c "
+    source '$lib'
+    run_untrusted /bin/bash -c 'printf \"LD_PRELOAD=/evil.so\n\" >>\"\$GITHUB_ENV\"; printf \"forged=1\n\" >>\"\$GITHUB_OUTPUT\"'
+    append_output real value
+  " >/dev/null 2>&1
+  assert_equals "run_untrusted discards a child's GITHUB_ENV writes" "" "$(cat "$ru_env")"
+  # The parent's own append_output still reaches the real file; the child's forged
+  # output does not.
+  assert_equals "the parent still writes real outputs while the child's are discarded" \
+    "real=value" "$(cat "$ru_out")"
 }
 
 test_toolchain_boundary() {

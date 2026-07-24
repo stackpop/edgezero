@@ -142,7 +142,7 @@ provider_env_clear_names() {
       and . != ""
       and test("\\A[A-Za-z_][A-Za-z0-9_]*\\z")))
   ' >/dev/null 2>&1 ||
-    fail "input 'provider-env-clear' must be a JSON array of non-empty environment-variable names (identifier characters only, no control characters): '$json'"
+    fail "input 'provider-env-clear' must be a JSON array of non-empty environment-variable names (identifier characters only, no control characters)"
   # Every element is now a validated identifier (no control chars), so line-based
   # bash transport is safe.
   printf '%s' "$json" | jq -r '.[]'
@@ -180,6 +180,27 @@ exec_with_cleared_provider_env() {
   done <<<"$names_raw"
   cmd+=("$@")
   exec "${cmd[@]}"
+}
+
+# Run an APP-CONTROLLED command (a Cargo build script, or the built CLI) with the
+# GitHub Actions per-step file-command channels pointed away from the real files.
+#
+# `$GITHUB_ENV` and `$GITHUB_PATH` are files whose lines the runner applies to
+# EVERY LATER step. A malicious build script could append `LD_PRELOAD=…` (or any
+# variable / PATH entry) to `$GITHUB_ENV`, and the subsequent artifact-upload step
+# — a Node action that still holds the caller's own provider token — would then
+# execute that injected code with the credential in scope. `$GITHUB_OUTPUT` /
+# `$GITHUB_STATE` would likewise let it forge this action's outputs. Redirecting
+# all four to `/dev/null` discards whatever the untrusted command writes; the
+# build script's OWN outputs are written from the parent process, which keeps the
+# real `$GITHUB_OUTPUT` and never runs untrusted code.
+run_untrusted() {
+  env \
+    GITHUB_ENV=/dev/null \
+    GITHUB_PATH=/dev/null \
+    GITHUB_OUTPUT=/dev/null \
+    GITHUB_STATE=/dev/null \
+    "$@"
 }
 
 # Reject an artifact name that could escape the action-owned staging directory

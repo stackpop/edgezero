@@ -201,7 +201,7 @@ main() {
   # Require a committed lockfile and validate the package + binary target.
   cd "$app_dir"
   local metadata package_json
-  metadata=$(cargo +"$rust_toolchain" metadata --locked --no-deps --format-version 1) ||
+  metadata=$(run_untrusted cargo +"$rust_toolchain" metadata --locked --no-deps --format-version 1) ||
     fail "cargo metadata --locked failed; ensure Cargo.lock is present and up to date"
   package_json=$(jq -c --arg p "$cli_package" '.packages[] | select(.name == $p)' <<<"$metadata")
   [[ -n "$package_json" ]] || fail "app-cli-package '$cli_package' was not found in the application workspace"
@@ -240,12 +240,12 @@ main() {
 
   # Build into an action-owned target dir so the checkout stays clean.
   reset_owned_dir "$build_target_dir" "$runner_temp"
-  CARGO_TARGET_DIR="$build_target_dir" cargo +"$rust_toolchain" build \
+  run_untrusted CARGO_TARGET_DIR="$build_target_dir" cargo +"$rust_toolchain" build \
     --locked --release -p "$cli_package" --bin "$cli_bin"
 
   local bin_path="$build_target_dir/release/$cli_bin"
   [[ -x "$bin_path" ]] || fail "build did not produce an executable at $bin_path"
-  "$bin_path" --help >/dev/null 2>&1 || fail "built CLI '$cli_bin' did not run '$cli_bin --help'"
+  run_untrusted "$bin_path" --help >/dev/null 2>&1 || fail "built CLI '$cli_bin' did not run '$cli_bin --help'"
 
   # Package the binary and self-describing metadata into a tar.
   reset_owned_dir "$stage_root" "$runner_temp"

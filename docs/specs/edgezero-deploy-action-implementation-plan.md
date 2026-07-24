@@ -91,7 +91,17 @@ reference to port from. Most transfer with light changes:
      **tar** so the executable bit survives `actions/upload-artifact` and the
      artifact is self-describing.
    - Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`.
-   - No provider credentials in scope. Never builds the EdgeZero monorepo CLI.
+   - Provider credentials are kept out of the app-controlled build: the shipped
+     adapter aliases are blanked in every step's `env:`; `BASH_ENV`/`ENV` are
+     blanked too (they are sourced at shell startup, before the scrub re-exec can
+     run); and the app-controlled commands (cargo, the built CLI) run with the
+     `$GITHUB_ENV`/`$GITHUB_PATH` file channels neutralized, so a malicious build
+     script cannot inject an environment variable or PATH entry (e.g.
+     `LD_PRELOAD`) into a later step. A caller's OWN `provider-env-clear` alias is
+     re-exec'd out of the build step, but a `uses:` upload step can only blank
+     statically; such a custom alias may remain in that step's `env:` — with no
+     app-controlled code able to run there to read it. Never builds the EdgeZero
+     monorepo CLI.
 
 2. **`deploy-core` shared engine scripts (provider-neutral)**
    - A directory of scripts under `.github/actions/deploy-core/`, **not** a

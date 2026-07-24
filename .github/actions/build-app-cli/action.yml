@@ -78,6 +78,15 @@ runs:
         #      re-execs itself with those names stripped — so no ancestor process
         #      that app code could walk up to still holds them.
         EDGEZERO__PROVIDER__ENV_CLEAR: ${{ inputs['provider-env-clear'] }}
+        # BASH_ENV (bash) and ENV (POSIX sh) name a file the shell SOURCES AT
+        # STARTUP — before the first line of this step's script, and so before the
+        # credential scrub re-exec runs. If a caller's job env pointed either at
+        # checkout-controlled code, that code would run with the provider token
+        # still present AND could forge the re-exec sentinel argument (`set --
+        # <sentinel>`) to skip the scrub entirely. Blank both so no startup file
+        # is sourced.
+        BASH_ENV: ""
+        ENV: ""
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
@@ -118,9 +127,14 @@ runs:
     # `provider-env-clear` alias (only the build step, which runs a script, can do
     # that dynamically). That is an accepted boundary: this step runs no
     # application code — it hands a fixed tarball path to a pinned first-party
-    # action — so a custom secret reaching here is not exposed to attacker code.
-    # A caller who must keep a custom secret out of EVERY step should scope it to
-    # the step that needs it rather than to job-level `env:`.
+    # action. And app-controlled build code cannot smuggle its own code INTO this
+    # step: the build step runs every app-controlled command (cargo, the built
+    # CLI) with the `$GITHUB_ENV`/`$GITHUB_PATH` file channels neutralized, so it
+    # cannot inject an environment variable (e.g. `LD_PRELOAD`) or PATH entry that
+    # this later step would apply. So even a custom secret reaching here is not
+    # exposed to attacker-controlled execution. A caller who must keep a custom
+    # secret out of EVERY step should scope it to the step that needs it rather
+    # than to job-level `env:`.
     - name: Upload CLI artifact
       uses: actions/upload-artifact@v4
       env:
