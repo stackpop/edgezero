@@ -299,6 +299,64 @@ fn upsert_local_config_store(
     Ok(())
 }
 
+/// Additive-merge the managed `__NAME` keys into an EXISTING
+/// runtime-env `.contents` table, and append a commented `__KEY` hint
+/// for each CONFIG store added THIS run (its `__NAME` was absent
+/// before), so an incremental provision converges to the same shape a
+/// clean first-write produces. Returns `true` when anything changed.
+fn merge_runtime_env_keys(
+    contents_tbl: &mut toml_edit::Table,
+    managed_keys: &[(String, String)],
+    stores: &ProvisionStores<'_>,
+) -> bool {
+    use std::collections::HashSet;
+    use toml_edit::value;
+
+    // Keys present BEFORE this run — used to detect newly-added stores.
+    let existing_before: HashSet<String> =
+        contents_tbl.iter().map(|(key, _)| key.to_owned()).collect();
+    let mut added = false;
+    for (key, platform) in managed_keys {
+        if !contents_tbl.contains_key(key) {
+            contents_tbl.insert(key, value(platform.as_str()));
+            added = true;
+        }
+    }
+    let new_config_comment: String = stores
+        .config
+        .iter()
+        .filter(|store| {
+            !existing_before.contains(&format!(
+                "EDGEZERO__STORES__CONFIG__{}__NAME",
+                store.logical.to_ascii_uppercase()
+            ))
+        })
+        .map(|store| {
+            let upper = store.logical.to_ascii_uppercase();
+            let logical = store.logical.as_str();
+            format!("\n# EDGEZERO__STORES__CONFIG__{upper}__KEY = \"{logical}_staging\"")
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    if !new_config_comment.is_empty()
+        && let Some(last) = contents_tbl.iter().last().map(|(key, _)| key.to_owned())
+        && let Some(item) = contents_tbl.get_mut(&last)
+        && let Some(val) = item.as_value_mut()
+    {
+        // Append to any existing suffix rather than clobber it.
+        let mut suffix = val
+            .decor()
+            .suffix()
+            .and_then(toml_edit::RawString::as_str)
+            .unwrap_or("")
+            .to_owned();
+        suffix.push_str(&new_config_comment);
+        val.decor_mut().set_suffix(suffix);
+        added = true;
+    }
+    added
+}
+
 /// Ensure `[local_server.config_stores.edgezero_runtime_env]` exists
 /// and add any missing managed keys to its `.contents` sub-table:
 /// - one `EDGEZERO__STORES__<KIND>__<LOGICAL_UPPER>__NAME = "<platform>"`
@@ -313,11 +371,11 @@ fn upsert_local_config_store(
 /// adding a store, the block already exists — we open its `.contents`
 /// table and insert only the managed keys that aren't present.
 /// Operator-set values and non-managed keys are left byte-for-byte.
-/// The commented `__KEY` placeholder decor is only emitted on the
-/// first-write path (when the block is newly created); on re-provision
-/// we don't try to rewrite decor on existing keys, which would risk
-/// clobbering operator edits — operators who need new __KEY hints can
-/// re-run provision on an empty block or copy the shape by hand.
+/// A commented `__KEY` placeholder is emitted for each CONFIG store
+/// added in THIS run (its `__NAME` key was absent before), so an
+/// incremental provision converges to the same shape a clean provision
+/// would produce. Existing config stores are left untouched — their
+/// hint may have been intentionally uncommented or removed.
 ///
 /// Returns `true` when the block was newly written OR at least one
 /// key was added; `false` when nothing changed.
@@ -367,9 +425,7 @@ fn upsert_runtime_env_config_store(
     let block_existed = config_stores_tbl.contains_key(RUNTIME_ENV_NAME);
     if block_existed {
         // Additive merge path. Open the existing block's `.contents`
-        // sub-table and insert only the managed keys that aren't
-        // already there. Skip the commented __KEY decor rewrite —
-        // operator may have uncommented or removed those on purpose.
+        // sub-table and insert only the managed keys that aren't there.
         let store_entry = config_stores_tbl.get_mut(RUNTIME_ENV_NAME).ok_or_else(|| {
             format!(
                 "`local_server.config_stores.{RUNTIME_ENV_NAME}` disappeared between contains_key and get_mut"
@@ -388,14 +444,7 @@ fn upsert_runtime_env_config_store(
                 "`local_server.config_stores.{RUNTIME_ENV_NAME}.contents` exists but is not a table; refusing to edit in place"
             )
         })?;
-        let mut added = false;
-        for (key, platform) in &managed_keys {
-            if !contents_tbl.contains_key(key) {
-                contents_tbl.insert(key, value(platform.as_str()));
-                added = true;
-            }
-        }
-        return Ok(added);
+        return Ok(merge_runtime_env_keys(contents_tbl, &managed_keys, stores));
     }
 
     // First-write path — build the whole block, including the
@@ -687,6 +736,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/fast-edge/svc/fastly.toml"),
+                Some("crates/fast-edge"),
                 None,
                 "demo-app",
                 None,
@@ -918,6 +968,14 @@ mod tests {
             after_second.matches(block_header).count(),
             1,
             "runtime-env block header must appear exactly once (no duplicate block emitted): {after_second}"
+        );
+        // The newly-added CONFIG store must get its commented `__KEY`
+        // hint on the additive path too, so incremental provisioning
+        // converges to the same shape a clean provision would produce.
+        assert!(
+            after_second
+                .contains(r#"# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging""#),
+            "additive provision must emit the __KEY hint for the newly-added CONFIG store: {after_second}"
         );
     }
 

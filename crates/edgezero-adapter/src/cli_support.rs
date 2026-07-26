@@ -205,6 +205,26 @@ pub fn run_native_cli(program: &str, args: &[&str], install_hint: &str) -> Resul
 /// Callers fall back to a scaffold-convention crate name in that
 /// case (e.g. `<app_name>-adapter-<id>`) so the synthesis is
 /// still deterministic on a fresh scaffold.
+/// Read the crate name from the DECLARED `.crate` directory's
+/// `Cargo.toml`, resolved against `manifest_root`.
+///
+/// This is authoritative: unlike [`read_adapter_crate_name`], which
+/// walks up from the platform manifest's parent and stops at the FIRST
+/// `Cargo.toml` it finds, this reads exactly the operator-declared crate
+/// root. A nested package that happens to sit between the platform
+/// manifest and the intended crate can't be mis-selected. Returns `None`
+/// when `.crate` is undeclared or its `Cargo.toml` is unreadable, so
+/// callers fall back to the ancestor search / scaffold convention.
+#[inline]
+#[must_use]
+pub fn read_crate_name_at(
+    manifest_root: &Path,
+    adapter_crate_path: Option<&str>,
+) -> Option<String> {
+    let rel = adapter_crate_path?;
+    read_package_name(&manifest_root.join(rel).join("Cargo.toml")).ok()
+}
+
 #[inline]
 #[must_use]
 pub fn read_adapter_crate_name(

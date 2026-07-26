@@ -197,9 +197,20 @@ fn assert_adapter_declared_paths_safe(
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
+    use crate::provision_lock::ProvisionLock;
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
     assert_adapter_declared_paths_safe(manifest.as_ref(), &args.adapter)?;
+    // Deploy can mutate provision-owned local state (`fastly compute
+    // deploy` writes `service_id` back into fastly.toml). Hold the same
+    // cross-process advisory lock provision and `config push` use, so a
+    // concurrent provision's edgezero.toml/manifest writeback doesn't
+    // race the deploy's. No manifest root (standalone) => no lock to take.
+    let _lock = manifest
+        .as_ref()
+        .and_then(|loader| loader.manifest().root())
+        .map(ProvisionLock::acquire)
+        .transpose()?;
     adapter::execute(
         &args.adapter,
         adapter::Action::Deploy,

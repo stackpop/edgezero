@@ -390,6 +390,7 @@ impl Adapter for CloudflareCliAdapter {
         &self,
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
+        adapter_crate_path: Option<&str>,
         _component_selector: Option<&str>,
         app_name: &str,
         _deployed: Option<&AdapterDeployedState>,
@@ -397,13 +398,12 @@ impl Adapter for CloudflareCliAdapter {
     ) -> Result<Vec<(PathBuf, String)>, String> {
         let rel =
             adapter_manifest_path.map_or_else(|| PathBuf::from("wrangler.toml"), PathBuf::from);
-        // Prefer the ACTUAL adapter crate name from the `Cargo.toml`
-        // next to the manifest — honours the operator-tracked
-        // `[adapters.cloudflare.adapter].crate` path when it points
-        // at a rename (e.g. `crates/worker`). Fall back to the
-        // scaffold convention `<app>-adapter-cloudflare` only when
-        // no Cargo.toml is available.
-        let crate_name = cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+        // Prefer the authoritative declared `.crate` for the crate name;
+        // fall back to the ancestor `Cargo.toml` search, then the scaffold
+        // convention `<app>-adapter-cloudflare`. (An ancestor search alone
+        // could pick a nested package between the manifest and the crate.)
+        let crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
+            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
             .unwrap_or_else(|| {
                 if app_name.is_empty() {
                     "app-adapter-cloudflare".to_owned()

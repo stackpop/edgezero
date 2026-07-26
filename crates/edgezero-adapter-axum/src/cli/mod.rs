@@ -292,13 +292,29 @@ impl Adapter for AxumCliAdapter {
             .iter()
             .map(|entry| format!("{}=", entry.key_value))
             .collect();
-        append_lines_dedup_with_header(&env_path, Some(EDGEZERO_PROVISION_HEADER), &lines, dry_run)
-            .map_err(|err| format!("write {}: {err}", env_path.display()))?;
-        let status_lines = vec![format!(
-            "axum: wrote {} secret placeholders to {}",
-            typed_secrets.len(),
-            env_path.display()
-        )];
+        let wrote = append_lines_dedup_with_header(
+            &env_path,
+            Some(EDGEZERO_PROVISION_HEADER),
+            &lines,
+            dry_run,
+        )
+        .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+        // Report what actually landed, not the candidate count: on a
+        // re-provision where every placeholder already exists, the write
+        // is a dedup no-op and claiming "wrote N" would be misleading.
+        let status_lines = if wrote {
+            vec![format!(
+                "axum: wrote {} secret placeholder(s) to {}",
+                typed_secrets.len(),
+                env_path.display()
+            )]
+        } else {
+            vec![format!(
+                "axum: {} secret placeholder(s) already present in {}; no change",
+                typed_secrets.len(),
+                env_path.display()
+            )]
+        };
         Ok(ProvisionOutcome::from_status_lines(status_lines))
     }
 
@@ -474,6 +490,7 @@ impl Adapter for AxumCliAdapter {
         &self,
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
+        adapter_crate_path: Option<&str>,
         _component_selector: Option<&str>,
         app_name: &str,
         _deployed: Option<&AdapterDeployedState>,
@@ -487,14 +504,12 @@ impl Adapter for AxumCliAdapter {
         // without needing the operator to hand-author one -- same
         // model as Cloudflare / Fastly / Spin.
         let rel = adapter_manifest_path.map_or_else(|| PathBuf::from("axum.toml"), PathBuf::from);
-        // Prefer the ACTUAL adapter crate name from the
-        // `Cargo.toml` next to the manifest -- honours the
-        // operator-tracked `[adapters.axum.adapter].crate` path
-        // when it points at a rename like `crates/server`. Fall
-        // back to the scaffold convention only when the Cargo.toml
-        // is absent or unreadable (typically a first-run scaffold
-        // where the file gets written moments later).
-        let crate_name = cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+        // Prefer the authoritative declared `[adapters.axum.adapter].crate`
+        // for the crate name; fall back to the ancestor `Cargo.toml`
+        // search, then the scaffold convention. (An ancestor search alone
+        // could pick a nested package between the manifest and the crate.)
+        let crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
+            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
             .unwrap_or_else(|| {
                 if app_name.is_empty() {
                     "app-adapter-axum".to_owned()

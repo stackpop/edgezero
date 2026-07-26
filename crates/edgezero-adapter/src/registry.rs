@@ -837,11 +837,22 @@ pub trait Adapter: Sync + Send {
     /// # Errors
     /// The default impl never errors. Adapter overrides may return
     /// human-readable error strings if baseline synthesis fails.
+    /// `adapter_crate_path` is the authoritative
+    /// `[adapters.<name>.adapter].crate` (root-relative), when declared.
+    /// Adapters that derive a crate name / artifact path MUST prefer it
+    /// over an ancestor `Cargo.toml` search: a nested package sitting
+    /// between the platform manifest and the intended crate root would
+    /// otherwise be mis-selected.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "baseline synthesis needs the manifest root, adapter manifest path, authoritative crate path, component selector, app name, previously-deployed state, and allowed-outbound-hosts. Each is distinct; an aggregate struct would be a larger ergonomic regression for adapter implementers, matching the sibling `provision` methods."
+    )]
     #[inline]
     fn synthesise_baseline_manifest(
         &self,
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
+        _adapter_crate_path: Option<&str>,
         _component_selector: Option<&str>,
         _app_name: &str,
         _deployed: Option<&AdapterDeployedState>,

@@ -261,6 +261,7 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
             let baseline_pairs = adapter.synthesise_baseline_manifest(
                 manifest_root,
                 adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
                 adapter_cfg.adapter.component.as_deref(),
                 &app_name,
                 deployed.as_ref(),
@@ -589,6 +590,7 @@ fn run_local_dry_run_typed(
     let baseline_pairs = adapter.synthesise_baseline_manifest(
         manifest_root,
         adapter_manifest_rel,
+        adapter_crate_rel,
         adapter_component,
         &app_name,
         deployed_state.as_ref(),
@@ -1392,6 +1394,7 @@ fn run_local_dry_run(
     let baseline_pairs = adapter.synthesise_baseline_manifest(
         manifest_root,
         adapter_cfg.adapter.manifest.as_deref(),
+        adapter_cfg.adapter.crate_path.as_deref(),
         adapter_cfg.adapter.component.as_deref(),
         app_name,
         deployed,
@@ -1759,6 +1762,7 @@ serve = "echo"
             &self,
             _manifest_root: &Path,
             adapter_manifest_path: Option<&str>,
+            _adapter_crate_path: Option<&str>,
             _component_selector: Option<&str>,
             _app_name: &str,
             deployed: Option<&AdapterDeployedState>,

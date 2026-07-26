@@ -405,6 +405,7 @@ impl Adapter for FastlyCliAdapter {
         &self,
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
+        adapter_crate_path: Option<&str>,
         _component_selector: Option<&str>,
         app_name: &str,
         deployed: Option<&AdapterDeployedState>,
@@ -419,12 +420,13 @@ impl Adapter for FastlyCliAdapter {
             .and_then(|state| state.fields.get("service_id"))
             .map(String::as_str);
         let rel = adapter_manifest_path.map_or_else(|| PathBuf::from("fastly.toml"), PathBuf::from);
-        // Prefer the ACTUAL adapter crate name from the `Cargo.toml`
-        // next to the manifest — honours the operator-tracked
-        // `[adapters.fastly.adapter].crate` path when it points at
-        // a rename. Fall back to the scaffold convention only when
-        // no Cargo.toml is discoverable.
-        let crate_name = cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+        // Prefer the ACTUAL adapter crate name. The authoritative source
+        // is the declared `[adapters.fastly.adapter].crate`; fall back to
+        // the ancestor `Cargo.toml` search only when it's undeclared, and
+        // finally to the scaffold convention. (An ancestor search alone
+        // could pick a nested package between the manifest and the crate.)
+        let crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
+            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
             .unwrap_or_else(|| {
                 if app_name.is_empty() {
                     "app-adapter-fastly".to_owned()

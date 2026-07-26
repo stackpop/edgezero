@@ -171,10 +171,19 @@ fn locate_artifact(
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
     if let Some(custom) = env::var_os("CARGO_TARGET_DIR") {
-        let candidate = PathBuf::from(custom)
-            .join(TARGET_TRIPLE)
-            .join("release")
-            .join(&release_name);
+        // Cargo resolves a RELATIVE `CARGO_TARGET_DIR` against its working
+        // directory -- which is the crate dir, since the build runs with
+        // `current_dir(crate_dir)`. Resolve it the same way here (against
+        // `manifest_dir`, the crate root passed in), NOT against the CLI's
+        // process cwd, or a relative value points at the wrong tree and
+        // the artifact is "missing".
+        let custom_dir = PathBuf::from(custom);
+        let base = if custom_dir.is_absolute() {
+            custom_dir
+        } else {
+            manifest_dir.join(custom_dir)
+        };
+        let candidate = base.join(TARGET_TRIPLE).join("release").join(&release_name);
         if candidate.exists() {
             return Ok(candidate);
         }

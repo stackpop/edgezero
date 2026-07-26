@@ -513,6 +513,7 @@ impl Adapter for SpinCliAdapter {
         &self,
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
+        adapter_crate_path: Option<&str>,
         component_selector: Option<&str>,
         app_name: &str,
         _deployed: Option<&AdapterDeployedState>,
@@ -532,23 +533,22 @@ impl Adapter for SpinCliAdapter {
                 || PathBuf::from("runtime-config.toml"),
                 |parent| parent.join("runtime-config.toml"),
             );
-        // Prefer the ACTUAL adapter crate name from the `Cargo.toml`
-        // next to the manifest — honours the operator-tracked
-        // `[adapters.spin.adapter].crate` path when it points at a
-        // rename like `crates/spin-server`, so the emitted wasm
-        // source path names the artifact Cargo actually builds
-        // (`spin_server.wasm` rather than the scaffold-convention
-        // `demo_app_adapter_spin.wasm`). Fall back to the scaffold
-        // convention only when no Cargo.toml is discoverable.
-        let derived_crate_name =
-            cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
-                .unwrap_or_else(|| {
-                    if app_name.is_empty() {
-                        "app-adapter-spin".to_owned()
-                    } else {
-                        format!("{app_name}-adapter-spin")
-                    }
-                });
+        // Prefer the ACTUAL adapter crate name so the emitted wasm source
+        // path names the artifact Cargo actually builds. The authoritative
+        // source is the declared `[adapters.spin.adapter].crate` (e.g.
+        // `crates/spin-server` → `spin_server.wasm`); fall back to the
+        // ancestor `Cargo.toml` search, then the scaffold convention.
+        // (An ancestor search alone could pick a nested package sitting
+        // between the manifest and the intended crate root.)
+        let derived_crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
+            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
+            .unwrap_or_else(|| {
+                if app_name.is_empty() {
+                    "app-adapter-spin".to_owned()
+                } else {
+                    format!("{app_name}-adapter-spin")
+                }
+            });
         // `synthesise_spin_toml` needs the manifest's relative path
         // so it can compute the correct `../` prefix from
         // `[component.<id>].source` back to the workspace `target/`

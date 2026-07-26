@@ -71,6 +71,26 @@ jobs:
             exit 1
           fi
 
+      # The step above only proves these files are not CURRENTLY tracked.
+      # Also prove they are actually IGNORED, so a `git add` can't slip a
+      # regenerated manifest (or a secret-bearing `.dev.vars`) into a
+      # commit. `git check-ignore` evaluates the ignore rules against the
+      # pathname whether or not the file exists.
+      - name: Enforce adapter manifests and .dev.vars are gitignored
+        run: |
+          for probe in \
+            crates/demo/axum.toml \
+            crates/demo/wrangler.toml \
+            crates/demo/fastly.toml \
+            crates/demo/spin.toml \
+            crates/demo/runtime-config.toml \
+            crates/demo/.dev.vars; do
+            if ! git check-ignore -q "$probe"; then
+              echo "::error::'$probe' is NOT gitignored. Add the pattern to .gitignore so provision-generated adapter state and secret-bearing .dev.vars can never be committed by accident."
+              exit 1
+            fi
+          done
+
       # The checker's own unit tests live behind `required-features =
       # ["nested-app-config-check"]`, so the unfeatured
       # `cargo test --workspace` step below does not compile or run them.
@@ -99,7 +119,10 @@ jobs:
       # off the wasm matrix.
       - name: Run app-demo workspace tests
         working-directory: examples/app-demo
-        run: cargo test --workspace --all-targets
+        # `--locked` so a stale Cargo.lock (e.g. a dependency added to an
+        # adapter crate but not reflected here) fails CI instead of being
+        # silently regenerated.
+        run: cargo test --workspace --all-targets --locked
 
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests

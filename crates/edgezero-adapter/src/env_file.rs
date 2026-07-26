@@ -21,12 +21,21 @@ pub const EDGEZERO_PROVISION_HEADER: &str = "# edgezero-provision: v1";
 /// Existing lines are preserved byte-for-byte. Creates the file
 /// (and parent dirs) when absent.
 ///
+/// Returns `Ok(true)` when the file was actually written (new lines
+/// and/or a header landed) and `Ok(false)` when the call was a no-op
+/// (everything deduped, or `dry_run`), so callers can report accurately
+/// instead of counting candidates as writes.
+///
 /// # Errors
 /// Returns an error string when the file cannot be read, when
 /// the parent directory cannot be created, or when the write
 /// fails.
 #[inline]
-pub fn append_lines_dedup(path: &Path, new_lines: &[String], dry_run: bool) -> Result<(), String> {
+pub fn append_lines_dedup(
+    path: &Path,
+    new_lines: &[String],
+    dry_run: bool,
+) -> Result<bool, String> {
     append_lines_dedup_with_header(path, None, new_lines, dry_run)
 }
 
@@ -50,14 +59,18 @@ pub fn append_lines_dedup_with_header(
     header: Option<&str>,
     new_lines: &[String],
     dry_run: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     reject_symlinked_target(path)?;
     let mut existing = String::new();
     if path.exists() {
         existing =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     }
-    let existing_keys: BTreeSet<String> = existing.lines().filter_map(normalised_key).collect();
+    // Seeded from the file's keys, then GROWN as we append so duplicate
+    // keys WITHIN this batch are also deduped -- otherwise two new lines
+    // sharing a key (e.g. two typed secrets that resolve to the same key)
+    // both land, and a trailing blank-valued duplicate can win at load.
+    let mut existing_keys: BTreeSet<String> = existing.lines().filter_map(normalised_key).collect();
 
     // Header decision: prepend only when the caller asked for one AND
     // the existing file has no trimmed-equal line already. Empty files
@@ -91,6 +104,7 @@ pub fn append_lines_dedup_with_header(
         if existing_keys.contains(&key) {
             continue;
         }
+        existing_keys.insert(key);
         to_append.push_str(line);
         if !line.ends_with('\n') {
             to_append.push('\n');
@@ -99,8 +113,9 @@ pub fn append_lines_dedup_with_header(
 
     // Nothing to do when there are neither new dedup'd lines nor a
     // missing header to prepend. `dry_run` short-circuits any write.
+    // Either way, nothing was written -- report `false`.
     if (to_append.is_empty() && header_needed.is_none()) || dry_run {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -135,7 +150,7 @@ pub fn append_lines_dedup_with_header(
     // investigate.
     #[cfg(unix)]
     set_restrictive_mode(path)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Reject a target whose final component is a symlink, before a
@@ -356,6 +371,37 @@ mod tests {
         assert_eq!(
             occurrences, 1,
             "commented override must NOT reappear: {after}"
+        );
+    }
+
+    #[test]
+    fn dedup_collapses_duplicate_keys_within_one_batch() {
+        // Two batched entries sharing a key (e.g. two typed secrets that
+        // resolve to the same key) must collapse to the FIRST — otherwise
+        // a trailing blank-valued duplicate can win at load time.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        append_lines_dedup(
+            &path,
+            &[
+                "DEMO_API_TOKEN=real".to_owned(),
+                "DEMO_API_TOKEN=".to_owned(),
+            ],
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        let occurrences = after
+            .lines()
+            .filter(|line| normalised_key(line).as_deref() == Some("DEMO_API_TOKEN"))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "duplicate batch keys must collapse: {after}"
+        );
+        assert!(
+            after.contains("DEMO_API_TOKEN=real"),
+            "the FIRST occurrence must win: {after}"
         );
     }
 

@@ -128,13 +128,26 @@ pub(super) fn provision(
         )
         .map_err(|err| format!("failed to write {}: {err}", rc_path.display()))?;
     }
-    append_lines_dedup_with_header(
+    // `env_changed` reflects whether the write actually landed lines --
+    // NOT merely whether we had candidates -- so a dedup no-op isn't
+    // reported as a write. In dry-run the writer returns `false` (nothing
+    // written); the status still describes intent via the change flags,
+    // but we treat a would-write as changed so the preview lists the file.
+    let env_written = append_lines_dedup_with_header(
         &env_path,
         Some(EDGEZERO_PROVISION_HEADER),
         &env_lines,
         dry_run,
     )
     .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+    // On a real run, trust the writer's verdict. On dry-run the writer
+    // reports `false` unconditionally, so fall back to "have candidates"
+    // for the preview.
+    let env_changed = if dry_run {
+        !env_lines.is_empty()
+    } else {
+        env_written
+    };
 
     let status_lines = build_provision_status_lines(
         stores,
@@ -143,7 +156,7 @@ pub(super) fn provision(
         &env_path,
         spin_changed,
         rc_changed,
-        !env_lines.is_empty(),
+        env_changed,
     );
     Ok(ProvisionOutcome::from_status_lines(status_lines))
 }
@@ -256,11 +269,13 @@ fn resolve_component_id(
 }
 
 /// Rename the sole `[component.<old>]` table to `[component.<new>]`
-/// and repoint every `[[trigger.http]].component = "<old>"` value at
-/// `<new>`, so a single-component `spin.toml` refreshes to a changed
+/// and repoint every trigger's `component = "<old>"` value at `<new>`,
+/// so a single-component `spin.toml` refreshes to a changed
 /// `[adapters.spin.adapter].component` selector. Spin's loader rejects
 /// a manifest whose trigger names a component id that has no matching
-/// `[component.<id>]` block, so both edits happen together.
+/// `[component.<id>]` block, so both edits happen together. ALL trigger
+/// types are repointed (`[[trigger.http]]`, `[[trigger.redis]]`, …) --
+/// a stale reference under any type would leave the manifest invalid.
 fn rename_component(
     doc: &mut toml_edit::DocumentMut,
     old: &str,
@@ -279,26 +294,29 @@ fn rename_component(
     if let Some(item) = component_root.remove(old) {
         component_root.insert(new, item);
     }
-    if let Some(http) = doc
+    if let Some(trigger_tbl) = doc
         .get_mut("trigger")
         .and_then(toml_edit::Item::as_table_mut)
-        .and_then(|trigger| trigger.get_mut("http"))
-        .and_then(toml_edit::Item::as_array_of_tables_mut)
     {
-        for trigger in http.iter_mut() {
-            // Update the value IN PLACE, cloning the old decor onto the
-            // replacement. `Table::insert` swaps the whole `Item` and
-            // drops the decor -- here that would strip a trailing inline
-            // comment on the `component = "..."` line (e.g. one naming
-            // the component it points at).
-            if let Some(existing) = trigger
-                .get_mut("component")
-                .and_then(toml_edit::Item::as_value_mut)
-                && existing.as_str() == Some(old)
-            {
-                let mut replacement = toml_edit::Value::from(new);
-                *replacement.decor_mut() = existing.decor().clone();
-                *existing = replacement;
+        // Iterate EVERY trigger type, not just `http`.
+        for (_trigger_type, item) in trigger_tbl.iter_mut() {
+            let Some(rows) = item.as_array_of_tables_mut() else {
+                continue;
+            };
+            for trigger in rows.iter_mut() {
+                // Update the value IN PLACE, cloning the old decor onto
+                // the replacement. `Table::insert` swaps the whole `Item`
+                // and drops the decor -- here that would strip a trailing
+                // inline comment on the `component = "..."` line.
+                if let Some(existing) = trigger
+                    .get_mut("component")
+                    .and_then(toml_edit::Item::as_value_mut)
+                    && existing.as_str() == Some(old)
+                {
+                    let mut replacement = toml_edit::Value::from(new);
+                    *replacement.decor_mut() = existing.decor().clone();
+                    *existing = replacement;
+                }
             }
         }
     }
@@ -874,6 +892,31 @@ mod tests {
         assert!(
             out.contains("# points at the sole component"),
             "inline comment on the trigger component line preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn rename_component_repoints_non_http_trigger_types() {
+        // A redis (or any non-http) trigger referencing the old component
+        // must be repointed too, or the renamed manifest is invalid.
+        let input = "spin_manifest_version = 2\n\n\
+             [[trigger.http]]\nroute = \"/...\"\ncomponent = \"demo\"\n\n\
+             [[trigger.redis]]\nchannel = \"events\"\ncomponent = \"demo\"\n\n\
+             [component.demo]\nsource = \"demo.wasm\"\n";
+        let mut doc: toml_edit::DocumentMut = input.parse().expect("parse");
+        super::rename_component(&mut doc, "demo", "worker", Path::new("spin.toml"))
+            .expect("rename");
+        let out = doc.to_string();
+        assert!(out.contains("[component.worker]"), "table renamed: {out}");
+        assert!(
+            !out.contains("component = \"demo\""),
+            "no trigger may keep the stale component reference: {out}"
+        );
+        // Both trigger types now point at the new id.
+        assert_eq!(
+            out.matches("component = \"worker\"").count(),
+            2,
+            "both the http AND redis triggers must be repointed: {out}"
         );
     }
 
@@ -2069,6 +2112,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/spin-server/spin.toml"),
+                Some("crates/spin-server"),
                 None,
                 "demo-app",
                 None,
@@ -2123,6 +2167,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/spin-server/config/spin.toml"),
+                Some("crates/spin-server"),
                 None,
                 "demo-app",
                 None,
@@ -2181,6 +2226,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/spin-server/spin.toml"),
+                Some("crates/spin-server"),
                 None,
                 "demo-app",
                 None,
@@ -2199,6 +2245,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/spin-server/spin.toml"),
+                Some("crates/spin-server"),
                 Some("worker"),
                 "demo-app",
                 None,

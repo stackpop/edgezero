@@ -331,15 +331,22 @@ where
     // otherwise race with those reads before we start waiting on
     // the lock. Derive the lock's manifest root from the CLI arg's
     // parent (not from ctx, which we haven't loaded yet).
-    let _lock = if args.dry_run {
+    let manifest_root_for_lock = args
+        .manifest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    // Held across the READ phase (edgezero.toml + app-config + adapter
+    // paths + the remote diff read) so a concurrent provision can't race
+    // those reads. RELEASED before the consent prompt below -- a human at
+    // an interactive `y/N` must not hold the cross-process lock and block
+    // peers indefinitely -- then RE-ACQUIRED for the write, where
+    // `recheck_before_write` re-reads remote state to close the window.
+    let read_lock = if args.dry_run {
         None
     } else {
-        let manifest_root_for_lock = args
-            .manifest
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        Some(ProvisionLock::acquire(manifest_root_for_lock)?)
+        Some(ProvisionLock::acquire(&manifest_root_for_lock)?)
     };
 
     // Pre-flight: load + validate.
@@ -445,8 +452,20 @@ where
             FirstReadOutcome::ProceedFromMissingOrUnsupported => None,
         };
 
+    // Release the lock across the (possibly interactive) consent prompt
+    // so a human at the prompt doesn't block peers. The write phase below
+    // re-acquires it and `recheck_before_write` re-reads remote state.
+    drop(read_lock);
+
     // Consent gate (8.2 default or 8.3 Spin Cloud Unsupported).
     handle_consent(args, &remote)?;
+
+    // Re-acquire for the write phase; held to the end of the function.
+    let _write_lock = if args.dry_run {
+        None
+    } else {
+        Some(ProvisionLock::acquire(&manifest_root_for_lock)?)
+    };
 
     // Pre-write re-fetch + skip-on-equal + concurrent-push detection.
     if !args.dry_run && !matches!(remote, ReadConfigEntry::Unsupported(_)) {

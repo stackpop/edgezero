@@ -1186,6 +1186,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/cf-worker/config/wrangler.toml"),
+                Some("crates/cf-worker"),
                 None,
                 "demo-app",
                 None,

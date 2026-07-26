@@ -428,6 +428,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/server/axum.toml"),
+                Some("crates/server"),
                 None,
                 "demo-app",
                 None,
@@ -472,6 +473,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/server/config/axum.toml"),
+                Some("crates/server"),
                 None,
                 "demo-app",
                 None,
@@ -527,6 +529,7 @@ mod tests {
             .synthesise_baseline_manifest(
                 root,
                 Some("crates/server/axum.toml"),
+                Some("crates/server"),
                 None,
                 "demo-app",
                 None,
