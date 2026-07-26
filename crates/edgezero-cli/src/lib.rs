@@ -253,6 +253,14 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
         if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root)
             && env_path.exists()
         {
+            // The env-file chain (e.g. `<root>/.edgezero/.env`) is NOT
+            // covered by `assert_adapter_declared_paths_safe`, which only
+            // guards the declared `.manifest` / `.crate`. Refuse a
+            // symlinked `.edgezero` directory or `.env` file: either could
+            // redirect the read off-tree and inject externally-controlled
+            // application environment values into the spawned child.
+            use edgezero_adapter::env_file::reject_symlink_components;
+            reject_symlink_components(root, &env_path)?;
             env_overlay = env_file::parse_env_overlay(&env_path)?;
         }
     }
@@ -1062,6 +1070,55 @@ serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_displa
             "run_serve MUST NOT mutate the parent process env; found `{marker_key}={parent_observed:?}`. \
              Regression: `env_file::parse_env_overlay` bypassed and someone re-introduced \
              `std::env::set_var` on the load path."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_serve_refuses_symlinked_env_file() {
+        // A symlinked `.env` in the serve env-file chain could inject
+        // externally-controlled values into the spawned child. run_serve
+        // must refuse it before parsing, and before the child spawns.
+        use std::os::unix::fs::symlink;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let observed_path = temp.path().join("child_observed.txt");
+        let observed_path_display = observed_path.to_string_lossy();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = format!(
+            r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = 'sh -c "printf ran > {observed_path_display}"'
+"#,
+        );
+        fs::write(&manifest_path, &manifest_body).expect("write manifest");
+        let env_dir = temp.path().join("crates/spin");
+        fs::create_dir_all(&env_dir).expect("mkdir spin");
+        // `.env` is a symlink to an out-of-tree file the operator does
+        // not control.
+        let outside = temp.path().join("attacker.env");
+        fs::write(&outside, "INJECTED=1\n").expect("write outside env");
+        symlink(&outside, env_dir.join(".env")).expect("symlink .env");
+
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = ServeArgs {
+            adapter: "spin".to_owned(),
+        };
+        let err = run_serve(&args).expect_err("a symlinked .env must be refused");
+        assert!(err.contains("symlink"), "error names the symlink: {err}");
+        assert!(
+            !observed_path.exists(),
+            "the child must NOT have spawned once the env chain was rejected"
         );
     }
 

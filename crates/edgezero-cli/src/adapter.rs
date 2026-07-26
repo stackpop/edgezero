@@ -173,6 +173,15 @@ pub(crate) fn execute_with_env_overlay(
     adapter_args: &[String],
     env_overlay: &[(String, String)],
 ) -> Result<(), String> {
+    // Enforce declaration CONSISTENCY on EVERY dispatch path, including
+    // the manifest `commands.<action>` shell override -- otherwise a
+    // partially-declared adapter (`.manifest` without `.crate`, or the
+    // reverse) that provision and the registry fallback reject would be
+    // silently accepted by build/deploy/serve via the shell path. A
+    // fully commands-only adapter (neither field) stays valid: it manages
+    // its own build and never touches discovery.
+    assert_adapter_declaration_consistent(manifest_loader, adapter_name)?;
+
     if let Some(loader) = manifest_loader
         && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
     {
@@ -234,15 +243,12 @@ pub(crate) fn execute_with_env_overlay(
         ),
     };
     // The manifest-declared, root-resolved
-    // `[adapters.<name>.adapter].manifest` / `.crate`. Passing them stops
-    // the adapter from rediscovering (and possibly mis-selecting, or
-    // symlink-escaping) its per-platform manifest by scanning the
-    // workspace, and tells it where `Cargo.toml` actually lives.
-    //
-    // `.manifest` is REQUIRED whenever a manifest is loaded and declares
-    // this adapter: without it every adapter falls back to a recursive,
-    // symlink-following workspace scan that can select an unrelated or
-    // out-of-tree project. Refuse the dispatch instead of discovering.
+    // `[adapters.<name>.adapter].manifest` / `.crate`. The registry
+    // fallback discovers its per-platform manifest, so BOTH are required
+    // here (not merely consistent) -- passing them stops the adapter from
+    // rediscovering (and possibly mis-selecting, or symlink-escaping) its
+    // manifest by scanning the workspace, and tells it where `Cargo.toml`
+    // actually lives.
     let (adapter_manifest_abs, adapter_crate_abs) =
         resolve_declared_adapter_paths(manifest_loader, adapter_name)?;
     let mut ctx = AdapterExecContext::new().with_env(&child_env);
@@ -276,6 +282,42 @@ pub(crate) fn execute_with_env_overlay(
 /// Returns `(None, None)` when no manifest is loaded or the adapter
 /// isn't declared in it: the adapter then runs standalone and its own
 /// discovery is the only thing available.
+/// Reject a PARTIALLY-declared adapter (`.manifest` set without `.crate`
+/// or the reverse) on every dispatch path. A fully commands-only adapter
+/// (neither field) is left valid -- it owns its own build and never
+/// discovers -- while the registry fallback separately requires BOTH via
+/// [`resolve_declared_adapter_paths`]. This closes the gap where a
+/// `[adapters.<name>.commands]` shell override accepted a half-declared
+/// manifest that provision and the registry path reject.
+#[cfg(feature = "cli")]
+fn assert_adapter_declaration_consistent(
+    manifest_loader: Option<&ManifestLoader>,
+    adapter_name: &str,
+) -> Result<(), String> {
+    let Some(cfg) = manifest_loader
+        .and_then(|loader| loader.manifest().adapter_entry(adapter_name))
+        .map(|(_canonical, cfg)| cfg)
+    else {
+        return Ok(());
+    };
+    let has_manifest = cfg.adapter.manifest.is_some();
+    let has_crate = cfg.adapter.crate_path.is_some();
+    if has_manifest != has_crate {
+        let (present, missing) = if has_manifest {
+            ("manifest", "crate")
+        } else {
+            ("crate", "manifest")
+        };
+        return Err(format!(
+            "`[adapters.{adapter_name}.adapter].{present}` is declared but `.{missing}` is not. \
+             They are required together: a half-declared adapter is rejected by provision and the \
+             registry fallback, so build/deploy/serve must not accept it either. Add `.{missing}` \
+             (or remove `.{present}` for a commands-only adapter)."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "cli")]
 fn resolve_declared_adapter_paths(
     manifest_loader: Option<&ManifestLoader>,
@@ -418,7 +460,10 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, build_child_env, resolve_declared_adapter_paths};
+    use super::{
+        ResolvedEnvironment, assert_adapter_declaration_consistent, build_child_env,
+        resolve_declared_adapter_paths,
+    };
     use crate::test_support::manifest_guard;
     use edgezero_core::manifest::{ManifestLoader, ResolvedEnvironmentBinding};
     use edgezero_core::test_env::EnvOverride;
@@ -466,6 +511,41 @@ mod tests {
             Some(root.join("crates/server")),
             "crate root is the DECLARED `.crate`, not the manifest's parent"
         );
+    }
+
+    #[test]
+    fn declaration_consistency_rejects_manifest_without_crate() {
+        // A half-declared adapter must be refused on every path, so a
+        // `[commands]` shell override can't accept what provision rejects.
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo\"\n\n[adapters.spin.adapter]\nmanifest = \"crates/spin/spin.toml\"\n\n[adapters.spin.commands]\nbuild = \"echo\"\n",
+        );
+        let err = assert_adapter_declaration_consistent(Some(&loader), "spin")
+            .expect_err("manifest-without-crate must be refused");
+        assert!(
+            err.contains(".crate") && err.contains("half-declared"),
+            "error explains the missing half: {err}"
+        );
+    }
+
+    #[test]
+    fn declaration_consistency_allows_commands_only_adapter() {
+        // Neither field set: a commands-only adapter owns its own build
+        // and is valid.
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo\"\n\n[adapters.fastly.commands]\nbuild = \"echo build\"\n",
+        );
+        assert_adapter_declaration_consistent(Some(&loader), "fastly")
+            .expect("a commands-only adapter is valid");
+    }
+
+    #[test]
+    fn declaration_consistency_allows_fully_declared_adapter() {
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo\"\n\n[adapters.spin.adapter]\ncrate = \"crates/spin\"\nmanifest = \"crates/spin/spin.toml\"\n",
+        );
+        assert_adapter_declaration_consistent(Some(&loader), "spin")
+            .expect("both fields present is valid");
     }
 
     #[test]

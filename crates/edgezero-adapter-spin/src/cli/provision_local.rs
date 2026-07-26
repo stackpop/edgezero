@@ -6,7 +6,9 @@
 use std::fs;
 use std::path::Path;
 
-use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
+use edgezero_adapter::env_file::{
+    EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, reject_symlinked_target,
+};
 use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores, TypedSecretEntry};
 
 /// Local-mode provision arm: extend `[component.<id>].key_value_stores`
@@ -55,6 +57,14 @@ pub(super) fn provision(
             rc_path.display()
         ));
     }
+    // These are EdgeZero-owned, in-tree files. Refuse to read or rewrite
+    // them through a symlink -- a symlinked spin.toml / runtime-config.toml
+    // could redirect provision's read (leaking an off-tree file's shape)
+    // and its writeback (landing edits outside the project). The `.env`
+    // write below goes through `append_lines_dedup_with_header`, which
+    // already applies the same guard.
+    reject_symlinked_target(&spin_path)?;
+    reject_symlinked_target(&rc_path)?;
 
     // 1. spin.toml: append platform labels to [component.<id>].key_value_stores.
     let spin_raw = fs::read_to_string(&spin_path)
@@ -674,6 +684,41 @@ mod tests {
     }
 
     // ---------- provision (dry-run + error path + idempotent skip) ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_rejects_symlinked_runtime_config() {
+        // A symlinked runtime-config.toml could redirect provision's read
+        // and writeback off-tree. Refuse it.
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let outside = dir.path().join("outside-runtime-config.toml");
+        fs::write(&outside, "# edgezero-provision: v1\n").expect("write outside rc");
+        symlink(&outside, dir.path().join("runtime-config.toml")).expect("symlink rc");
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("a symlinked runtime-config.toml must be refused");
+        assert!(err.contains("symlink"), "error names the symlink: {err}");
+    }
 
     #[test]
     fn provision_dry_run_does_not_edit_spin_toml() {

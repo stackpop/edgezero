@@ -133,9 +133,43 @@ fn guard_sqlite_path_symlinks(spin_manifest_dir: &Path, db_path: &Path) -> Resul
     Ok(())
 }
 
+/// Reject a `runtime-config.toml` `path` that would place the local
+/// `SQLite` database OUTSIDE the project tree. `--local` state must stay
+/// in-tree, so an absolute path or one that climbs out with `..` is
+/// refused before it reaches `SQLite` (which would happily open it).
+///
+/// # Errors
+/// Returns an error naming the offending `path`.
+fn reject_offtree_sqlite_path(explicit_path: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if explicit_path.is_absolute() {
+        return Err(format!(
+            "runtime-config.toml sets an absolute `path = \"{}\"` for a `type = \"spin\"` \
+             key_value_store, but `--local` requires the SQLite database to live inside the \
+             project tree. Use a project-relative path.",
+            explicit_path.display()
+        ));
+    }
+    if explicit_path
+        .components()
+        .any(|comp| matches!(comp, Component::ParentDir))
+    {
+        return Err(format!(
+            "runtime-config.toml `path = \"{}\"` for a `type = \"spin\"` key_value_store climbs \
+             out of the project tree with `..`, but `--local` requires the SQLite database to \
+             stay in-tree. Remove the `..` segments.",
+            explicit_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// [`resolve_sqlite_path`] plus the symlinked-component guard. Both the
 /// write and the read paths resolve the db this way so neither can be
-/// steered off-tree by a symlinked intermediate directory.
+/// steered off-tree by a symlinked intermediate directory. The
+/// absolute/`..` off-tree rejection is applied on the WRITE path only
+/// (see [`write_sqlite`]) -- a read of an operator-declared absolute
+/// path is non-destructive, but a write there would escape the tree.
 ///
 /// # Errors
 /// Propagates a symlinked-component rejection.
@@ -404,36 +438,28 @@ pub(super) fn dispatch_push(
     );
     let runtime_config_dir = runtime_config_path.parent().unwrap_or(spin_manifest_dir);
 
-    // 1. `--local` forces SQLite-direct EVERY time. We skip both the
-    //    Fermyon Cloud auto-detect AND the runtime-config backend
-    //    dispatch — even if the operator's `runtime-config.toml`
-    //    declares `type = "redis"` / `azure_cosmos` / unknown for
-    //    this label. The intent of `--local` is "I want to seed my
-    //    local dev loop, regardless of what the deployed app's
-    //    backend selection looks like". An explicit `--runtime-config
-    //    <path>` is still honoured for resolving the SQLite path,
-    //    but the backend `type` is ignored.
+    // 1. `--local` seeds the local SQLite backend directly. It can ONLY
+    //    do that for a label whose `runtime-config.toml` backend is
+    //    `type = "spin"` (or an undeclared label like `default`, which
+    //    Spin auto-provides as SQLite). If the label selects a
+    //    `type = "redis"` / `azure_cosmos` / unknown backend, a SQLite
+    //    write would land in a file `spin up` never reads -- the push
+    //    would "succeed" while leaving the runtime with no data. Reject
+    //    those instead (dry-run included, so the preview models it).
     //
-    //    We still enforce the Spin runtime invariant that any
+    //    We also enforce the Spin runtime invariant that any
     //    non-`default` label MUST be declared in `runtime-config.toml`
     //    — without it, `spin up` errors with "unknown
-    //    key_value_stores label X" and the SQLite file we wrote is
-    //    unreadable from the running app. See `verify_label_declared`.
+    //    key_value_stores label X". See `verify_label_declared`.
     if push_ctx.local {
         let parsed = runtime_config::read(&runtime_config_path)?;
         verify_label_declared(platform, &parsed, &runtime_config_path)?;
+        let explicit_path =
+            local_sqlite_path(parsed.key_value_stores.get(platform), platform, logical)?;
         return write_sqlite(
             spin_manifest_dir,
             runtime_config_dir,
-            // If the operator DID declare `type = "spin"` with an
-            // explicit `path`, honour that path; otherwise fall
-            // through to Spin's default `.spin/sqlite_key_value.db`.
-            // Other backend types are silently treated as "no
-            // explicit path" so SQLite-direct still happens.
-            match parsed.key_value_stores.get(platform) {
-                Some(runtime_config::KeyValueBackend::Spin { path }) => path.as_deref(),
-                _ => None,
-            },
+            explicit_path,
             platform,
             logical,
             entries,
@@ -550,6 +576,39 @@ pub(super) fn verify_label_declared(
     ))
 }
 
+/// Resolve the explicit `SQLite` `path` for a `--local` push, given the
+/// label's declared backend. `type = "spin"` yields its optional path;
+/// an undeclared label (e.g. `default`) yields `None` (Spin's default
+/// location). A non-SQLite backend (`redis` / `azure_cosmos` / unknown)
+/// is REFUSED -- a `SQLite` write there lands in a database `spin up` never
+/// reads for this label.
+///
+/// # Errors
+/// Returns an error naming the backend when it is not the local `SQLite`
+/// (`type = "spin"`) backend.
+fn local_sqlite_path<'backend>(
+    backend: Option<&'backend runtime_config::KeyValueBackend>,
+    platform: &str,
+    logical: &str,
+) -> Result<Option<&'backend Path>, String> {
+    let refuse = |type_name: &str| {
+        Err(format!(
+            "runtime-config.toml selects backend `type = \"{type_name}\"` for key_value_store \
+             `{platform}` (logical id `{logical}`), but `config push --local` can only seed the \
+             local SQLite (`type = \"spin\"`) backend -- a SQLite write would land in a database \
+             `spin up` never reads for this label. Point the label at `type = \"spin\"` for local \
+             development, or write to the `{type_name}` backend with its native tooling."
+        ))
+    };
+    match backend {
+        Some(runtime_config::KeyValueBackend::Spin { path }) => Ok(path.as_deref()),
+        None => Ok(None),
+        Some(runtime_config::KeyValueBackend::Redis { .. }) => refuse("redis"),
+        Some(runtime_config::KeyValueBackend::AzureCosmos) => refuse("azure_cosmos"),
+        Some(runtime_config::KeyValueBackend::Unknown { type_name }) => refuse(type_name),
+    }
+}
+
 /// `SQLite`-direct write helper: resolves the `SQLite` path (honouring
 /// any explicit `path` from `runtime-config.toml`), then either prints
 /// a dry-run preview or actually writes the batch through
@@ -563,6 +622,11 @@ fn write_sqlite(
     entries: &[(String, String)],
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
+    // `--local` writes MUST stay in-tree: refuse an absolute or `..`
+    // `path` before it reaches SQLite (which would create the db there).
+    if let Some(custom) = explicit_path {
+        reject_offtree_sqlite_path(custom)?;
+    }
     let db_path =
         resolve_sqlite_path_guarded(spin_manifest_dir, runtime_config_dir, explicit_path)?;
     if dry_run {
@@ -1025,10 +1089,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_push_local_forces_sqlite_even_when_runtime_config_declares_redis() {
-        // F1 (blocker): `--local` MUST bypass runtime-config backend
-        // dispatch. Without this test, the code that says "Redis: error
-        // out" would silently fire even under --local.
+    fn dispatch_push_local_rejects_redis_backend_instead_of_seeding_unread_sqlite() {
+        // A SQLite write for a label whose backend is `type = "redis"`
+        // lands in a database `spin up` never reads. Rather than report a
+        // hollow success, `--local` must refuse and name the backend.
+        // This applies to the dry-run preview too.
         let dir = tempdir().expect("tempdir");
         write_minimal_spin_toml(dir.path());
         fs::write(
@@ -1039,27 +1104,23 @@ mod tests {
 
         let push_ctx = AdapterPushContext::new().with_local(true);
         let entries = entries_two();
-        let out = dispatch_push(
+        let err = dispatch_push(
             dir.path(),
             Some("spin.toml"),
             &store("app_config", "app_config"),
             &entries,
             &push_ctx,
-            true, // dry-run so the test doesn't actually touch disk
+            true, // dry-run: the refusal must model the real push
         )
-        .expect("--local + redis must dispatch to SQLite, not error");
+        .expect_err("--local against a redis backend must be refused");
         assert!(
-            out[0].contains("SQLite-backed Spin KV"),
-            "--local must force the SQLite writer: {out:?}"
-        );
-        assert!(
-            !out.iter().any(|line| line.contains("redis-cli")),
-            "--local must NOT emit the redis-cli error: {out:?}"
+            err.contains("redis") && err.contains("app_config") && err.contains("type = \"spin\""),
+            "error names the backend, the label, and the supported type: {err}"
         );
     }
 
     #[test]
-    fn dispatch_push_local_forces_sqlite_even_when_runtime_config_declares_azure() {
+    fn dispatch_push_local_rejects_azure_backend() {
         let dir = tempdir().expect("tempdir");
         write_minimal_spin_toml(dir.path());
         fs::write(
@@ -1069,7 +1130,7 @@ mod tests {
         .expect("write runtime-config");
 
         let push_ctx = AdapterPushContext::new().with_local(true);
-        let out = dispatch_push(
+        let err = dispatch_push(
             dir.path(),
             Some("spin.toml"),
             &store("app_config", "app_config"),
@@ -1077,8 +1138,11 @@ mod tests {
             &push_ctx,
             true,
         )
-        .expect("--local + azure must dispatch to SQLite");
-        assert!(out[0].contains("SQLite-backed Spin KV"), "{out:?}");
+        .expect_err("--local against an azure_cosmos backend must be refused");
+        assert!(
+            err.contains("azure_cosmos"),
+            "error names the backend: {err}"
+        );
     }
 
     #[test]
@@ -1521,6 +1585,29 @@ mod tests {
             bytes_before,
             "a read must not mutate the database (no CREATE TABLE on the read path)"
         );
+    }
+
+    #[test]
+    fn reject_offtree_sqlite_path_rejects_absolute() {
+        let err = reject_offtree_sqlite_path(Path::new("/etc/edgezero.db"))
+            .expect_err("an absolute SQLite path must be refused for --local");
+        assert!(
+            err.contains("absolute") && err.contains("project tree"),
+            "error explains the in-tree requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_offtree_sqlite_path_rejects_parent_traversal() {
+        let err = reject_offtree_sqlite_path(Path::new("../../outside.db"))
+            .expect_err("a `..` SQLite path must be refused for --local");
+        assert!(err.contains(".."), "error names the traversal: {err}");
+    }
+
+    #[test]
+    fn reject_offtree_sqlite_path_allows_in_tree_relative() {
+        reject_offtree_sqlite_path(Path::new("db/kv.db"))
+            .expect("an in-tree relative path is fine");
     }
 
     /// A symlinked INTERMEDIATE component (`.spin`) must be rejected --

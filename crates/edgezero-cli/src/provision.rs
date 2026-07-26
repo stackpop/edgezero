@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use similar::TextDiff;
-use toml_edit::{DocumentMut, table};
+use toml_edit::{DocumentMut, TableLike, table};
 
 use crate::args::ProvisionArgs;
 use crate::config::{
@@ -867,7 +867,7 @@ fn deployed_state_for(
 /// byte-preserving merge contract. `Table::insert` would replace the
 /// whole item and drop that decor; a plain insert is used only when the
 /// key is absent or not a scalar.
-fn set_str_preserving_decor(table: &mut toml_edit::Table, key: &str, new: &str) {
+fn set_str_preserving_decor(table: &mut dyn TableLike, key: &str, new: &str) {
     if let Some(existing) = table.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
         let mut replacement = toml_edit::Value::from(new);
         *replacement.decor_mut() = existing.decor().clone();
@@ -875,6 +875,29 @@ fn set_str_preserving_decor(table: &mut toml_edit::Table, key: &str, new: &str) 
     } else {
         table.insert(key, toml_edit::value(new));
     }
+}
+
+/// Get-or-insert a child table under `parent`, returning it as a
+/// `TableLike` so BOTH the standard `[header]` form AND the inline
+/// `key = { … }` form are editable. The manifest schema accepts inline
+/// deployed tables (e.g. `kv_namespaces = { sessions = "…" }`), so
+/// `as_table_mut()` — which only matches the standard form — would fail
+/// writeback for a perfectly valid manifest and strand a just-created
+/// cloud resource uncheckpointed.
+fn get_or_insert_table_like<'parent>(
+    parent: &'parent mut dyn TableLike,
+    key: &str,
+    context: &str,
+) -> Result<&'parent mut dyn TableLike, String> {
+    if parent.get(key).is_none() {
+        parent.insert(key, table());
+    }
+    parent
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| {
+            format!("{context}: `{key}` exists but is not a table; refusing to edit in place")
+        })
 }
 
 pub(crate) fn merge_deployed_into_manifest(
@@ -936,32 +959,34 @@ pub(crate) fn merge_deployed_into_manifest(
             manifest_path.display()
         )
     })?;
-    let named_item = adapters_tbl.entry(adapter_name).or_insert_with(table);
-    let named_tbl = named_item.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: `adapters.{adapter_name}` exists but is not a table; refusing to edit in place",
-            manifest_path.display()
-        )
-    })?;
-    let deployed_item = named_tbl.entry("deployed").or_insert_with(table);
-    let deployed_tbl = deployed_item.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: `adapters.{adapter_name}.deployed` exists but is not a table; refusing to edit in place",
-            manifest_path.display()
-        )
-    })?;
+    // From here down use `TableLike` access so a manifest that declares
+    // `deployed` (or a sub-table like `kv_namespaces`) in inline
+    // `key = { … }` form is still editable -- `as_table_mut()` matches
+    // only the `[header]` form and would reject valid inline state,
+    // stranding a just-created cloud resource uncheckpointed.
+    let named_tbl = get_or_insert_table_like(
+        adapters_tbl,
+        adapter_name,
+        &format!("{}: adapters", manifest_path.display()),
+    )?;
+    let deployed_tbl = get_or_insert_table_like(
+        named_tbl,
+        "deployed",
+        &format!("{}: adapters.{adapter_name}", manifest_path.display()),
+    )?;
 
     for (key, val) in &state.fields {
         set_str_preserving_decor(deployed_tbl, key, val);
     }
     for (sub_name, sub_map) in &state.sub_tables {
-        let sub_item = deployed_tbl.entry(sub_name).or_insert_with(table);
-        let sub_tbl = sub_item.as_table_mut().ok_or_else(|| {
-            format!(
-                "{}: `adapters.{adapter_name}.deployed.{sub_name}` exists but is not a table; refusing to edit in place",
+        let sub_tbl = get_or_insert_table_like(
+            deployed_tbl,
+            sub_name,
+            &format!(
+                "{}: adapters.{adapter_name}.deployed",
                 manifest_path.display()
-            )
-        })?;
+            ),
+        )?;
         for (key, val) in sub_map {
             set_str_preserving_decor(sub_tbl, key, val);
         }
@@ -3479,6 +3504,59 @@ manifest = "crates/cf/wrangler.toml"
 
         let after = fs::read_to_string(&manifest_path).unwrap();
         assert_eq!(before, after, "dry-run must leave file byte-identical");
+    }
+
+    #[test]
+    fn merge_deployed_updates_inline_table_deployed_state() {
+        // The manifest schema accepts inline-table deployed state
+        // (`deployed = { kv_namespaces = { sessions = "old" } }`).
+        // Writeback must UPDATE it in place rather than reject it with
+        // "not a table" -- otherwise a just-created cloud resource can't
+        // be checkpointed and a retry re-creates it.
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let source = r#"
+[app]
+name = "demo"
+
+[adapters.cloudflare]
+[adapters.cloudflare.adapter]
+crate = "crates/cf"
+manifest = "crates/cf/wrangler.toml"
+deployed = { kv_namespaces = { sessions = "old-id" } }
+"#;
+        fs::write(&manifest_path, source).unwrap();
+
+        let mut state = AdapterDeployedState::default();
+        let mut kv = BTreeMap::new();
+        kv.insert("sessions".to_owned(), "new-id".to_owned());
+        kv.insert("cache".to_owned(), "cache-id".to_owned());
+        state.sub_tables.insert("kv_namespaces".to_owned(), kv);
+
+        merge_deployed_into_manifest(
+            &manifest_path,
+            "cloudflare",
+            &state,
+            &["kv_namespaces", "preview_kv_namespaces"],
+            false,
+        )
+        .expect("inline-table deployed state must be updatable");
+
+        let raw = fs::read_to_string(&manifest_path).unwrap();
+        let doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        let kv_ns = doc["adapters"]["cloudflare"]["deployed"]["kv_namespaces"]
+            .as_table_like()
+            .expect("kv_namespaces present");
+        assert_eq!(
+            kv_ns.get("sessions").and_then(|i| i.as_str()),
+            Some("new-id"),
+            "existing inline key updated: {raw}"
+        );
+        assert_eq!(
+            kv_ns.get("cache").and_then(|i| i.as_str()),
+            Some("cache-id"),
+            "new key added to the inline table: {raw}"
+        );
     }
 
     #[test]

@@ -133,7 +133,12 @@ restore_backups() {
 }
 
 cleanup() {
-  stop_server
+  # `stop_server` can legitimately return non-zero (it sets FAIL and
+  # returns 1 when a port won't free). Under `set -e` that would abort
+  # this handler BEFORE `restore_backups`, leaving the operator's backed-
+  # up files (notably `.dev.vars`) unrestored. Never let it short-circuit
+  # the restore.
+  stop_server || true
   restore_backups
 }
 trap cleanup EXIT INT TERM
@@ -599,10 +604,12 @@ else
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
 
   # Warm up Fastly local state — provision --local synthesises
-  # fastly.toml (gitignored, so regenerable). The previous
-  # backup_in_tree call was there because fastly.toml used to be
-  # tracked; it isn't anymore, so no restore is needed.
+  # fastly.toml. The `config push` below and boot_runtime's
+  # `seed_fastly_runtime_env` both edit it IN PLACE, so back it up now
+  # (right after warm-up regenerated it) and let `restore_backups` return
+  # it to its pre-smoke shape on cleanup.
   smoke_warmup_provision_local fastly
+  backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
 
   # Build an oversized greeting (>= 9 000 chars after envelope wrap)
   # so the chunked path fires.
@@ -637,9 +644,8 @@ TOML
 
   # Seed the demo_api_token secret so /config/typed's secret walk
   # resolves; without it the assertion would fail in the extractor
-  # before testing the chunk-pointer round-trip. The fastly.toml
-  # append survives in the per-row backup and gets restored on
-  # cleanup.
+  # before testing the chunk-pointer round-trip. Any fastly.toml edit is
+  # covered by the `backup_in_tree` above and restored on cleanup.
   seed_secret_for_adapter fastly || true
 
   if boot_runtime fastly; then

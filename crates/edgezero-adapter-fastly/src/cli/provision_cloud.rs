@@ -52,6 +52,13 @@ pub(super) fn provision(
         ));
     }
 
+    // Reconcile the service_id in PREFLIGHT so a tracked/local conflict
+    // aborts before any `fastly *-store create` runs or `[setup]` is
+    // written -- otherwise a known conflict could leave an orphaned
+    // remote store and a mutated manifest, and dry-run (which never
+    // reached the old post-create check) would miss it entirely.
+    let service_id = reconcile_service_id(&fastly_path, deployed)?;
+
     let mut out = Vec::new();
     for (kind, ids) in [
         ("kv", stores.kv),
@@ -117,7 +124,7 @@ pub(super) fn provision(
             // service is surprising. The instruction names
             // both the store-id lookup AND the link command so
             // the operator can audit before committing.
-            let post_create_note = resource_link_note(&fastly_path, deployed, kind, name)?;
+            let post_create_note = resource_link_note(service_id.as_deref(), kind, name);
             let mut line = format!(
                 "created fastly {kind}-store `{name}` (logical id `{logical}`); appended setup tables to {}",
                 fastly_path.display()
@@ -168,7 +175,7 @@ pub(super) fn provision(
         // runtime can't open the store. Emit the resource-link
         // remediation alongside the populate-keys hint.
         let post_create_note =
-            resource_link_note(&fastly_path, deployed, runtime_env_kind, runtime_env_name)?;
+            resource_link_note(service_id.as_deref(), runtime_env_kind, runtime_env_name);
         let mut line = format!(
             "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store); appended setup tables to {}\n  Populate per-environment override keys with:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=app_config_staging --upsert",
             fastly_path.display()
@@ -296,53 +303,56 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
     Ok(svc)
 }
 
-/// If fastly.toml declares `service_id`, the next
-/// `fastly compute deploy` skips `[setup]` entirely (it only runs on
-/// the FIRST deploy of a service). Any store created by provision
-/// after that needs a separate `fastly resource-link create` to link
-/// the platform store to the service version. This helper returns the
-/// remediation note to surface in the provision output, or `None`
-/// when the service hasn't been deployed yet (so the next
-/// `compute deploy` will pick up the `[setup]` row automatically).
-fn resource_link_note(
+/// Reconcile the tracked vs local `service_id` BEFORE any account
+/// mutation, returning the authoritative id (or `None` when the service
+/// hasn't been deployed yet).
+///
+/// Tracked `[adapters.fastly.deployed].service_id` in edgezero.toml is
+/// the DURABLE AUTHORITY (spec §"Deployed state"): fastly.toml is
+/// gitignored and per-machine, so a stale or regenerated copy must not
+/// steer the resource-link command at the wrong service. Prefer tracked;
+/// if the local file DISAGREES, refuse. Fall back to the local id only
+/// when nothing is tracked (a service deployed via `fastly compute
+/// deploy` before any provision captured its id).
+///
+/// Called in preflight so a known conflict aborts BEFORE `provision`
+/// creates any remote store or edits the manifest -- and so dry-run
+/// surfaces the same conflict a real run would.
+fn reconcile_service_id(
     path: &Path,
     deployed: Option<&AdapterDeployedState>,
-    kind: &str,
-    name: &str,
 ) -> Result<Option<String>, String> {
-    // Tracked `[adapters.fastly.deployed].service_id` in edgezero.toml is
-    // the DURABLE AUTHORITY (spec §"Deployed state"): fastly.toml is
-    // gitignored and per-machine, so a stale or regenerated copy must not
-    // steer the resource-link command at the wrong service. Prefer
-    // tracked; if the local file DISAGREES, refuse rather than recommend
-    // linking to a service the team doesn't track. Fall back to the local
-    // id only when nothing is tracked (a service deployed via
-    // `fastly compute deploy` before any provision captured its id).
     let tracked = deployed
         .and_then(|state| state.fields.get("service_id"))
         .filter(|svc_id| !svc_id.is_empty())
         .cloned();
     let local = read_fastly_service_id(path)?;
-    let service_id = match (tracked, local) {
-        (Some(tracked_id), Some(local_id)) if tracked_id != local_id => {
-            return Err(format!(
-                "service_id conflict for the fastly adapter: gitignored `{}` declares `{local_id}`, \
-                 but tracked `[adapters.fastly.deployed].service_id` is `{tracked_id}`. fastly.toml \
-                 is per-machine, so provision will not recommend linking resources to the local id. \
-                 Resolve by hand: update the tracked value in edgezero.toml, or delete the stale \
-                 `service_id` from fastly.toml.",
-                path.display()
-            ));
-        }
-        (Some(tracked_id), _) => Some(tracked_id),
-        (None, local_id) => local_id,
-    };
-    let note = service_id.map(|svc_id| {
+    match (tracked, local) {
+        (Some(tracked_id), Some(local_id)) if tracked_id != local_id => Err(format!(
+            "service_id conflict for the fastly adapter: gitignored `{}` declares `{local_id}`, \
+             but tracked `[adapters.fastly.deployed].service_id` is `{tracked_id}`. fastly.toml \
+             is per-machine, so provision will not recommend linking resources to the local id. \
+             Resolve by hand: update the tracked value in edgezero.toml, or delete the stale \
+             `service_id` from fastly.toml.",
+            path.display()
+        )),
+        (Some(tracked_id), _) => Ok(Some(tracked_id)),
+        (None, local_id) => Ok(local_id),
+    }
+}
+
+/// If a `service_id` is recorded, the next `fastly compute deploy` skips
+/// `[setup]` entirely (it only runs on the FIRST deploy of a service),
+/// so any store provision creates afterwards needs a separate
+/// `fastly resource-link create`. Build that remediation note from the
+/// already-reconciled `service_id` (see [`reconcile_service_id`]), or
+/// `None` when the service hasn't been deployed yet.
+fn resource_link_note(service_id: Option<&str>, kind: &str, name: &str) -> Option<String> {
+    service_id.map(|svc_id| {
         format!(
             "  `service_id = \"{svc_id}\"` is recorded (tracked `[adapters.fastly.deployed]` takes precedence over the local fastly.toml), so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
         )
-    });
-    Ok(note)
+    })
 }
 
 /// Probe `fastly.toml` for the existence of `[setup.<kind>_stores.<id>]`.
@@ -737,13 +747,16 @@ mod tests {
                 Some("fastly.toml"),
                 None,
                 &stores,
-                // A tracked id that DIFFERS from fastly.toml's would,
-                // under the old auto-capture, be silently overwritten.
+                // Tracked id AGREES with fastly.toml's (a differing id is
+                // a conflict the preflight refuses; see
+                // `provision_cloud_refuses_service_id_conflict_before_any_mutation`).
+                // The point here is that even a KNOWN service_id is never
+                // captured back into `deployed`.
                 Some(&{
                     let mut state = AdapterDeployedState::default();
                     state
                         .fields
-                        .insert("service_id".to_owned(), "SVC_TRACKED".to_owned());
+                        .insert("service_id".to_owned(), "SVC_ALREADY_DEPLOYED".to_owned());
                     state
                 }),
                 ProvisionMode::Cloud,
@@ -853,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_link_note_falls_back_to_tracked_service_id() {
+    fn reconcile_service_id_falls_back_to_tracked() {
         // fastly.toml is gitignored: a teammate's regenerated manifest has
         // no `service_id` even though the team's tracked deployed state
         // says the service IS deployed. Reading only the local file would
@@ -865,17 +878,17 @@ mod tests {
         tracked
             .fields
             .insert("service_id".to_owned(), "tracked123".to_owned());
-        let note = resource_link_note(&path, Some(&tracked), "kv", "sessions")
+        let resolved = reconcile_service_id(&path, Some(&tracked))
             .expect("read")
-            .expect("tracked service_id must still produce the remediation note");
-        assert!(
-            note.contains("tracked123"),
-            "note uses the tracked service id: {note}"
-        );
+            .expect("tracked service_id must be used when the local file lacks one");
+        assert_eq!(resolved, "tracked123");
+        let note = resource_link_note(Some(&resolved), "kv", "sessions")
+            .expect("note present for a deployed service");
+        assert!(note.contains("tracked123"), "note uses the id: {note}");
     }
 
     #[test]
-    fn resource_link_note_prefers_tracked_over_differing_local() {
+    fn reconcile_service_id_refuses_tracked_local_conflict_in_preflight() {
         // The tracked id is the durable authority: even when a stale
         // local fastly.toml carries a DIFFERENT id, provision must refuse
         // rather than recommend linking to the wrong service.
@@ -886,7 +899,7 @@ mod tests {
         tracked
             .fields
             .insert("service_id".to_owned(), "tracked123".to_owned());
-        let err = resource_link_note(&path, Some(&tracked), "kv", "sessions")
+        let err = reconcile_service_id(&path, Some(&tracked))
             .expect_err("a tracked/local service_id conflict must be refused");
         assert!(
             err.contains("tracked123") && err.contains("local999") && err.contains("conflict"),
@@ -895,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_link_note_uses_tracked_when_it_matches_local() {
+    fn reconcile_service_id_uses_tracked_when_it_matches_local() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\nservice_id = \"same123\"\n").expect("write");
@@ -903,10 +916,47 @@ mod tests {
         tracked
             .fields
             .insert("service_id".to_owned(), "same123".to_owned());
-        let note = resource_link_note(&path, Some(&tracked), "kv", "sessions")
+        let resolved = reconcile_service_id(&path, Some(&tracked))
             .expect("matching ids are fine")
-            .expect("note present");
-        assert!(note.contains("same123"), "note uses the agreed id: {note}");
+            .expect("id present");
+        assert_eq!(resolved, "same123");
+    }
+
+    #[test]
+    fn provision_cloud_refuses_service_id_conflict_before_any_mutation() {
+        // The conflict must abort in preflight -- BEFORE any store is
+        // created or fastly.toml is edited -- and in dry-run too.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        let original = "name = \"demo\"\nservice_id = \"local999\"\n";
+        fs::write(&path, original).expect("write");
+        let mut tracked = AdapterDeployedState::default();
+        tracked
+            .fields
+            .insert("service_id".to_owned(), "tracked123".to_owned());
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        for dry_run in [true, false] {
+            let err = provision(
+                dir.path(),
+                Some("fastly.toml"),
+                &stores,
+                Some(&tracked),
+                dry_run,
+            )
+            .expect_err("a service_id conflict must abort provision");
+            assert!(err.contains("conflict"), "dry_run={dry_run}: {err}");
+        }
+        // fastly.toml must be byte-identical -- no mutation happened.
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            original,
+            "conflict must abort before any manifest edit"
+        );
     }
 
     #[test]
@@ -1038,8 +1088,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\nservice_id = \"abc123svc\"\n").expect("write");
-        let note = resource_link_note(&path, None, "config", "edgezero_runtime_env")
-            .expect("read service_id")
+        let service_id = reconcile_service_id(&path, None).expect("read service_id");
+        let note = resource_link_note(service_id.as_deref(), "config", "edgezero_runtime_env")
             .expect("note present when service_id set");
         assert!(
             note.contains("service_id = \"abc123svc\""),
@@ -1071,8 +1121,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
-        let note = resource_link_note(&path, None, "config", "edgezero_runtime_env")
-            .expect("read service_id");
+        let service_id = reconcile_service_id(&path, None).expect("read service_id");
+        let note = resource_link_note(service_id.as_deref(), "config", "edgezero_runtime_env");
         assert!(
             note.is_none(),
             "no service_id => no resource-link prompt: {note:?}"
