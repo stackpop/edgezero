@@ -126,16 +126,62 @@ pub(super) fn provision(
     )
     .map_err(|err| format!("write {}: {err}", env_path.display()))?;
 
-    let total = stores
-        .kv
-        .len()
-        .saturating_add(stores.config.len())
-        .saturating_add(stores.secrets.len());
-    let status_lines = vec![format!(
-        "spin: wrote bindings + runtime-config + .env for {total} store(s) at {}",
-        spin_path.display()
-    )];
+    let status_lines = build_provision_status_lines(
+        stores,
+        &spin_path,
+        &rc_path,
+        &env_path,
+        spin_changed,
+        rc_changed,
+        !env_lines.is_empty(),
+    );
     Ok(ProvisionOutcome::from_status_lines(status_lines))
+}
+
+/// Build one status line per touched file so the dry-run preview is
+/// complete. The previous single line named only spin.toml while the
+/// provision also edited runtime-config.toml and .env. The "wrote "
+/// verb lets the dry-run renderer rewrite each to "would write ".
+fn build_provision_status_lines(
+    stores: &ProvisionStores<'_>,
+    spin_path: &Path,
+    rc_path: &Path,
+    env_path: &Path,
+    spin_changed: bool,
+    rc_changed: bool,
+    env_changed: bool,
+) -> Vec<String> {
+    let mut status_lines = Vec::new();
+    if spin_changed {
+        status_lines.push(format!(
+            "spin: wrote component key-value bindings to {}",
+            spin_path.display()
+        ));
+    }
+    if rc_changed {
+        status_lines.push(format!(
+            "spin: wrote runtime-config key_value_store blocks to {}",
+            rc_path.display()
+        ));
+    }
+    if env_changed {
+        status_lines.push(format!(
+            "spin: wrote store env lines to {}",
+            env_path.display()
+        ));
+    }
+    if status_lines.is_empty() {
+        let total = stores
+            .kv
+            .len()
+            .saturating_add(stores.config.len())
+            .saturating_add(stores.secrets.len());
+        status_lines.push(format!(
+            "spin: {total} store(s) already provisioned; no changes to {}",
+            spin_path.display()
+        ));
+    }
+    status_lines
 }
 
 /// Resolve which `[component.<id>]` table `provision` /

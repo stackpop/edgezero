@@ -24,6 +24,16 @@ DEV_VARS_FILE=""
 # Path to a copy of the operator's pre-existing `.dev.vars`, if any.
 # Empty means the file did not exist before this run.
 DEV_VARS_BACKUP=""
+# `SMOKE_SECRET` is a smoke-only allowlisted secret, NOT a typed config
+# field, so provision never declares it in the generated fastly.toml /
+# spin.toml. The Fastly and Spin arms inject the declaration before boot
+# (axum's env-backed store needs no manifest entry). These manifests are
+# gitignored + regenerable, but we still restore them to keep the tree
+# clean after the run.
+FASTLY_TOML_FILE=""
+FASTLY_TOML_BACKUP=""
+SPIN_TOML_FILE=""
+SPIN_TOML_BACKUP=""
 SMOKE_SECRET_NAME="SMOKE_SECRET"
 MISSING_SECRET_NAME="SMOKE_SECRET_MISSING"
 
@@ -64,6 +74,14 @@ cleanup() {
     else
       rm -f "$DEV_VARS_FILE"
     fi
+  fi
+  # Restore the generated manifests we injected the SMOKE_SECRET
+  # declaration into.
+  if [ -n "$FASTLY_TOML_BACKUP" ] && [ -f "$FASTLY_TOML_BACKUP" ]; then
+    mv -f "$FASTLY_TOML_BACKUP" "$FASTLY_TOML_FILE"
+  fi
+  if [ -n "$SPIN_TOML_BACKUP" ] && [ -f "$SPIN_TOML_BACKUP" ]; then
+    mv -f "$SPIN_TOML_BACKUP" "$SPIN_TOML_FILE"
   fi
 }
 trap cleanup EXIT
@@ -121,6 +139,19 @@ start_server() {
         echo "Fastly CLI is required. Install from https://developer.fastly.com/reference/cli/" >&2
         exit 1
       }
+      # Viceroy resolves `SMOKE_SECRET` verbatim from a
+      # `[[local_server.secret_stores.default]]` entry. Provision only
+      # declares typed secrets (demo_api_token), so inject this one and
+      # map it to the exported $SMOKE_SECRET env var.
+      FASTLY_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+      FASTLY_TOML_BACKUP=$(mktemp)
+      cp -p "$FASTLY_TOML_FILE" "$FASTLY_TOML_BACKUP"
+      cat >> "$FASTLY_TOML_FILE" <<'TOML'
+
+[[local_server.secret_stores.default]]
+key = "SMOKE_SECRET"
+env = "SMOKE_SECRET"
+TOML
       echo "==> Starting Fastly Viceroy on port $PORT..."
       (cd "$DEMO_DIR" && fastly compute serve -C crates/app-demo-adapter-fastly 2>&1) &
       SERVER_PID=$!
@@ -151,6 +182,69 @@ start_server() {
       }
       echo "==> Building Spin WASM (wasm32-wasip2)..."
       (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
+      # SpinSecretStore lowercases the key, so `SMOKE_SECRET` resolves the
+      # `smoke_secret` Spin variable. Provision only declares typed secrets,
+      # so inject the variable declaration + a component binding into the
+      # generated spin.toml before boot.
+      SPIN_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+      SPIN_TOML_BACKUP=$(mktemp)
+      cp -p "$SPIN_TOML_FILE" "$SPIN_TOML_BACKUP"
+      python3 - "$SPIN_TOML_FILE" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    text = fh.read()
+
+
+def section_body(source, header_regex):
+    """Return (match, body) for the table `header_regex` names, where
+    body is the text between that header and the next `[` header."""
+    match = header_regex.search(source)
+    if match is None:
+        return None, ""
+    rest = source[match.end():]
+    nxt = re.search(r'(?m)^\[', rest)
+    return match, (rest[:nxt.start()] if nxt else rest)
+
+
+def insert_under(source, header_regex, line):
+    """Insert `line` immediately after the header the regex matches."""
+    return header_regex.sub(lambda m: m.group(0) + "\n" + line.rstrip("\n"),
+                            source, count=1)
+
+
+# 1. Declare the top-level variable (Spin requires it before a component
+#    can reference it). Insert under an existing `[variables]` table, or
+#    create one if the manifest has no typed secrets.
+vars_re = re.compile(r'(?m)^\[variables\]\s*$')
+_, vars_text = section_body(text, vars_re)
+var_line = 'smoke_secret = { required = true }\n'
+if "smoke_secret" not in vars_text:
+    if vars_re.search(text):
+        text = insert_under(text, vars_re, var_line)
+    else:
+        text += "\n[variables]\n" + var_line
+
+# 2. Bind it on the single component so the runtime exposes it. The demo
+#    ships exactly one `[component.<id>]`.
+comp = re.search(r'(?m)^\[component\.([A-Za-z0-9_-]+)\]\s*$', text)
+if comp is None:
+    sys.exit("no [component.<id>] found in spin.toml")
+cid = comp.group(1)
+bind_re = re.compile(r'(?m)^\[component\.' + re.escape(cid) + r'\.variables\]\s*$')
+_, bind_text = section_body(text, bind_re)
+bind_line = 'smoke_secret = "{{ smoke_secret }}"\n'
+if "smoke_secret" not in bind_text:
+    if bind_re.search(text):
+        text = insert_under(text, bind_re, bind_line)
+    else:
+        text += f"\n[component.{cid}.variables]\n" + bind_line
+
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PY
       echo "==> Starting Spin on port $PORT..."
       # SpinSecretStore normalises the key to lowercase, so SMOKE_SECRET maps to
       # the Spin variable smoke_secret.  Pass the value via SPIN_VARIABLE_SMOKE_SECRET.

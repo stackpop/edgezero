@@ -550,20 +550,17 @@ fn derive_axum_crate_dir(manifest_root: &Path, adapter_manifest_path: Option<&st
         return ".".to_owned();
     };
     // Count directory hops from `manifest_parent` back up to
-    // `crate_root`. The walk is guaranteed monotone-upward:
-    // `read_adapter_crate_root` returns an ancestor of
-    // `manifest_parent`, so subtracting component counts gives the
-    // number of `..` levels needed. Falls back to `.` on any
-    // arithmetic surprise (mismatched canonicalisation, symlink
-    // resolution flipping directions, etc.) so a mis-derived
-    // `crate_dir` never lands in the synthesised manifest.
-    let manifest_parent_abs = manifest_parent
-        .canonicalize()
-        .unwrap_or_else(|_| manifest_parent.to_path_buf());
-    let crate_root_abs = crate_root
-        .canonicalize()
-        .unwrap_or_else(|_| crate_root.clone());
-    let Ok(down_from_crate) = manifest_parent_abs.strip_prefix(&crate_root_abs) else {
+    // `crate_root`. Both are built from the SAME `manifest_root.join(...)`
+    // base, and `read_adapter_crate_root` returns a lexical ancestor of
+    // `manifest_parent` (it walks up via `.parent()`), so `strip_prefix`
+    // succeeds LEXICALLY. We deliberately do NOT `canonicalize()` here:
+    // canonicalisation requires the path to exist on disk, and on a fresh
+    // clone the nested `<crate>/config/` dir may not be created yet -- it
+    // would leave `manifest_parent` relative while an existing
+    // `crate_root` resolved to absolute, so `strip_prefix` would fail and
+    // emit `.` (wrong: the nested manifest needs `..`). Falls back to `.`
+    // only if the lexical prefix genuinely doesn't hold.
+    let Ok(down_from_crate) = manifest_parent.strip_prefix(&crate_root) else {
         return ".".to_owned();
     };
     let hops = down_from_crate
@@ -591,7 +588,59 @@ fn register_ctor() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
+
+    fn write_crate(root: &Path, rel: &str, name: &str) {
+        let dir = root.join(rel);
+        fs::create_dir_all(&dir).expect("mkdir crate");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .expect("write Cargo.toml");
+    }
+
+    #[test]
+    fn derive_axum_crate_dir_nested_manifest_without_existing_config_dir() {
+        // Regression: the nested `config/` dir does NOT exist yet (fresh
+        // clone / synthesis), but the crate root does. The derivation must
+        // still emit `..` -- it did not when it canonicalised the two
+        // sides independently (missing path stayed relative, existing path
+        // went absolute, `strip_prefix` failed and emitted `.`).
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_crate(root, "crates/server", "server");
+        // `crates/server/config/` is deliberately NOT created.
+        assert_eq!(
+            derive_axum_crate_dir(root, Some("crates/server/config/axum.toml")),
+            "..",
+            "a manifest one dir below the crate root needs `..`"
+        );
+        assert_eq!(
+            derive_axum_crate_dir(root, Some("crates/server/config/deep/axum.toml")),
+            "../..",
+            "two dirs below the crate root needs `../..`"
+        );
+    }
+
+    #[test]
+    fn derive_axum_crate_dir_scaffold_convention_is_dot() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_crate(root, "crates/app", "app");
+        assert_eq!(
+            derive_axum_crate_dir(root, Some("crates/app/axum.toml")),
+            ".",
+            "a manifest AT the crate root needs `.`"
+        );
+    }
+
+    #[test]
+    fn derive_axum_crate_dir_no_manifest_is_dot() {
+        let dir = tempdir().expect("tempdir");
+        assert_eq!(derive_axum_crate_dir(dir.path(), None), ".");
+    }
 
     #[test]
     fn adapter_name_is_axum() {

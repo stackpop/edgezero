@@ -310,23 +310,36 @@ fn resource_link_note(
     kind: &str,
     name: &str,
 ) -> Result<Option<String>, String> {
-    // Prefer the local fastly.toml, then fall back to the TRACKED
-    // `[adapters.fastly.deployed].service_id` in edgezero.toml.
-    // fastly.toml is gitignored, so a teammate on a fresh clone has a
-    // regenerated manifest with no `service_id` even though the team's
-    // tracked state says the service is deployed -- reading only the
-    // local file would silently skip this remediation and leave the
-    // freshly-created store unlinked.
-    let service_id = match read_fastly_service_id(path)? {
-        Some(svc_id) => Some(svc_id),
-        None => deployed
-            .and_then(|state| state.fields.get("service_id"))
-            .filter(|svc_id| !svc_id.is_empty())
-            .cloned(),
+    // Tracked `[adapters.fastly.deployed].service_id` in edgezero.toml is
+    // the DURABLE AUTHORITY (spec §"Deployed state"): fastly.toml is
+    // gitignored and per-machine, so a stale or regenerated copy must not
+    // steer the resource-link command at the wrong service. Prefer
+    // tracked; if the local file DISAGREES, refuse rather than recommend
+    // linking to a service the team doesn't track. Fall back to the local
+    // id only when nothing is tracked (a service deployed via
+    // `fastly compute deploy` before any provision captured its id).
+    let tracked = deployed
+        .and_then(|state| state.fields.get("service_id"))
+        .filter(|svc_id| !svc_id.is_empty())
+        .cloned();
+    let local = read_fastly_service_id(path)?;
+    let service_id = match (tracked, local) {
+        (Some(tracked_id), Some(local_id)) if tracked_id != local_id => {
+            return Err(format!(
+                "service_id conflict for the fastly adapter: gitignored `{}` declares `{local_id}`, \
+                 but tracked `[adapters.fastly.deployed].service_id` is `{tracked_id}`. fastly.toml \
+                 is per-machine, so provision will not recommend linking resources to the local id. \
+                 Resolve by hand: update the tracked value in edgezero.toml, or delete the stale \
+                 `service_id` from fastly.toml.",
+                path.display()
+            ));
+        }
+        (Some(tracked_id), _) => Some(tracked_id),
+        (None, local_id) => local_id,
     };
     let note = service_id.map(|svc_id| {
         format!(
-            "  fastly.toml declares `service_id = \"{svc_id}\"`, so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
+            "  `service_id = \"{svc_id}\"` is recorded (tracked `[adapters.fastly.deployed]` takes precedence over the local fastly.toml), so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
         )
     });
     Ok(note)
@@ -859,6 +872,41 @@ mod tests {
             note.contains("tracked123"),
             "note uses the tracked service id: {note}"
         );
+    }
+
+    #[test]
+    fn resource_link_note_prefers_tracked_over_differing_local() {
+        // The tracked id is the durable authority: even when a stale
+        // local fastly.toml carries a DIFFERENT id, provision must refuse
+        // rather than recommend linking to the wrong service.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\nservice_id = \"local999\"\n").expect("write");
+        let mut tracked = AdapterDeployedState::default();
+        tracked
+            .fields
+            .insert("service_id".to_owned(), "tracked123".to_owned());
+        let err = resource_link_note(&path, Some(&tracked), "kv", "sessions")
+            .expect_err("a tracked/local service_id conflict must be refused");
+        assert!(
+            err.contains("tracked123") && err.contains("local999") && err.contains("conflict"),
+            "error names both ids and the conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn resource_link_note_uses_tracked_when_it_matches_local() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\nservice_id = \"same123\"\n").expect("write");
+        let mut tracked = AdapterDeployedState::default();
+        tracked
+            .fields
+            .insert("service_id".to_owned(), "same123".to_owned());
+        let note = resource_link_note(&path, Some(&tracked), "kv", "sessions")
+            .expect("matching ids are fine")
+            .expect("note present");
+        assert!(note.contains("same123"), "note uses the agreed id: {note}");
     }
 
     #[test]

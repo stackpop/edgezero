@@ -40,7 +40,13 @@ pub(super) fn build(
                 .to_str()
                 .ok_or("invalid Cargo manifest path")?,
         ])
-        .args(extra_args);
+        .args(extra_args)
+        // Anchor cargo at the crate root, not the process cwd. When the
+        // CLI dispatches through an absolute `EDGEZERO_MANIFEST` from
+        // outside the project, an unanchored `cargo` would discover the
+        // wrong `.cargo/config.toml` and resolve relative args against the
+        // caller's directory.
+        .current_dir(&crate_dir);
     for (key, value) in ctx.env() {
         command.env(key, value);
     }

@@ -466,7 +466,7 @@ where
         return Ok(());
     }
 
-    let report = run_local_dry_run_typed(
+    let (report, dry_run_error) = run_local_dry_run_typed(
         &DryRunTypedRequest {
             adapter,
             ctx: &ctx,
@@ -481,6 +481,12 @@ where
     )?;
     if !report.is_empty() {
         log::info!("{report}");
+    }
+    // A partial-failure error from the staged provision must fail the
+    // dry-run AFTER the report is logged -- otherwise a broken provision
+    // previews cleanly and exits zero.
+    if let Some(err) = dry_run_error {
+        return Err(err);
     }
     Ok(())
 }
@@ -505,11 +511,69 @@ struct DryRunTypedRequest<'req> {
     manifest_root: &'req Path,
 }
 
+/// Merge the base + typed provision outcomes produced inside the staging
+/// tempdir, prepend the baseline "wrote …" lines, and render the dry-run
+/// report. Returns the rendered report AND any partial-failure `error`
+/// the adapters surfaced -- the caller propagates the latter so a
+/// dry-run over a failing provision exits non-zero instead of printing a
+/// report and returning success.
+fn merge_and_render_typed_dry_run(
+    base: ProvisionOutcome,
+    typed: ProvisionOutcome,
+    synthesised: &[PathBuf],
+    canonical_adapter_name: &str,
+    adapter_manifest_rel: Option<&str>,
+    manifest_root: &Path,
+    staged_root: &Path,
+) -> (String, Option<String>) {
+    let staged_str = staged_root.to_string_lossy().into_owned();
+    let project_str = manifest_root.to_string_lossy().into_owned();
+
+    let merged_status: Vec<String> = base
+        .status_lines
+        .into_iter()
+        .chain(typed.status_lines)
+        .collect();
+    // Preserve a partial-failure error from EITHER arm.
+    let merged_error = base.error.or(typed.error);
+    let merged_outcome = match base.deployed.or(typed.deployed) {
+        Some(state) => ProvisionOutcome::with_deployed(merged_status, state),
+        None => ProvisionOutcome::from_status_lines(merged_status),
+    };
+    let combined = prepend_baseline_status_lines_with_rewrite(
+        canonical_adapter_name,
+        synthesised,
+        merged_outcome,
+        |path| {
+            path.display()
+                .to_string()
+                .replace(&staged_str, &project_str)
+        },
+    );
+    // Render INSIDE this helper — the allow-list builder /
+    // `default_adapter_manifest_for` both match on lowercase, so
+    // canonical (possibly mixed-case) names MUST be lowercased first.
+    let adapter_lower = canonical_adapter_name.to_ascii_lowercase();
+    let adapter_manifest_rel_or_default = adapter_manifest_rel.map_or_else(
+        || default_adapter_manifest_for(&adapter_lower).to_owned(),
+        String::from,
+    );
+    let adapter_manifest_abs = staged_root.join(&adapter_manifest_rel_or_default);
+    let allow_list = build_dry_run_allow_list(
+        manifest_root,
+        staged_root,
+        &adapter_lower,
+        &adapter_manifest_abs,
+    );
+    let report = render_dry_run_report(manifest_root, staged_root, &allow_list, &combined);
+    (report, merged_error)
+}
+
 fn run_local_dry_run_typed(
     req: &DryRunTypedRequest<'_>,
     args: &ProvisionArgs,
     entries: &[TypedSecretEntry<'_>],
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     let &DryRunTypedRequest {
         adapter,
         ctx,
@@ -580,55 +644,17 @@ fn run_local_dry_run_typed(
                     false,
                 )
                 .map_err(&sanitize)?;
-            // Base + typed status merged; baseline "wrote …" lines
-            // prepended after with staged tempdir paths rewritten to
-            // the project root's display form (spec §"Dry-run":
-            // stdout must NEVER carry raw tempdir paths).
-            let base_status = base.status_lines;
-            let typed_status = typed.status_lines;
-            let merged_status: Vec<String> = base_status.into_iter().chain(typed_status).collect();
-            // Preserve a partial-failure error from EITHER arm; dropping
-            // it here would report a failed local provision as success.
-            let merged_error = base.error.or(typed.error);
-            let merged_base = match base.deployed.or(typed.deployed) {
-                Some(state) => ProvisionOutcome::with_deployed(merged_status, state),
-                None => ProvisionOutcome::from_status_lines(merged_status),
-            };
-            let merged_outcome = match merged_error {
-                Some(err) => merged_base.with_error(err),
-                None => merged_base,
-            };
-            let combined = prepend_baseline_status_lines_with_rewrite(
-                canonical_adapter_name,
+            // Merge, prepend baseline lines, and render. The report and
+            // any partial-failure error travel out together so the caller
+            // can propagate the error after logging the report.
+            Ok(merge_and_render_typed_dry_run(
+                base,
+                typed,
                 &synthesised,
-                merged_outcome,
-                |path| {
-                    path.display()
-                        .to_string()
-                        .replace(&staged_str, &project_str)
-                },
-            );
-            // Render INSIDE the closure — the allow-list builder /
-            // `default_adapter_manifest_for` both match on lowercase,
-            // so canonical (possibly mixed-case) names MUST be
-            // lowercased before dispatch.
-            let adapter_lower = canonical_adapter_name.to_ascii_lowercase();
-            let adapter_manifest_rel_or_default = adapter_manifest_rel.map_or_else(
-                || default_adapter_manifest_for(&adapter_lower).to_owned(),
-                String::from,
-            );
-            let adapter_manifest_abs = staged_root.join(&adapter_manifest_rel_or_default);
-            let allow_list = build_dry_run_allow_list(
+                canonical_adapter_name,
+                adapter_manifest_rel,
                 manifest_root,
                 staged_root,
-                &adapter_lower,
-                &adapter_manifest_abs,
-            );
-            Ok(render_dry_run_report(
-                manifest_root,
-                staged_root,
-                &allow_list,
-                &combined,
             ))
         },
     )?;
@@ -1444,9 +1470,16 @@ fn run_local_dry_run(
     // (false, _) uses it, and local dry-run today always sees `None`
     // there (adapters populate `deployed` only when writing real
     // cloud state).
-    Ok(match outcome.deployed {
+    let rebuilt = match outcome.deployed {
         Some(state) => adapter_registry::ProvisionOutcome::with_deployed(Vec::new(), state),
         None => adapter_registry::ProvisionOutcome::from_status_lines(Vec::new()),
+    };
+    // Carry a partial-failure error through: `run_provision` returns
+    // `Err(outcome.error)` after writeback, so an adapter that reported
+    // `with_error` fails the dry-run instead of exiting zero.
+    Ok(match outcome.error {
+        Some(err) => rebuilt.with_error(err),
+        None => rebuilt,
     })
 }
 
@@ -2761,6 +2794,31 @@ ids = ["default"]
     }
 
     #[test]
+    fn typed_dry_run_render_surfaces_partial_failure_error() {
+        // The typed dry-run merge must return a partial-failure error
+        // alongside the rendered report so the caller can exit non-zero
+        // instead of printing a clean preview.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = ProvisionOutcome::from_status_lines(vec!["base ok".to_owned()])
+            .with_error("kv store `sessions` failed".to_owned());
+        let typed = ProvisionOutcome::from_status_lines(vec!["typed ok".to_owned()]);
+        let (_report, error) = merge_and_render_typed_dry_run(
+            base,
+            typed,
+            &[],
+            "axum",
+            Some("axum.toml"),
+            dir.path(),
+            dir.path(),
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("kv store `sessions` failed"),
+            "the dry-run must carry the adapter's partial-failure error out"
+        );
+    }
+
+    #[test]
     fn dry_run_status_lines_rewrite_staged_tempdir_paths_to_project_relative() {
         // A status line naming the staged tempdir must be rewritten back
         // to the project root so no staging path (e.g. `/var/folders/…`
@@ -3903,7 +3961,7 @@ ids = ["default"]
         let entries = build_typed_secret_entries::<TypedTestConfig>(&ctx)
             .expect("build typed secret entries");
         let manifest_root = manifest_root_from(&args.manifest);
-        let report = run_local_dry_run_typed(
+        let (report, dry_run_error) = run_local_dry_run_typed(
             &DryRunTypedRequest {
                 adapter,
                 ctx: &ctx,
@@ -3917,6 +3975,10 @@ ids = ["default"]
             &entries,
         )
         .expect("dry-run helper must succeed");
+        assert!(
+            dry_run_error.is_none(),
+            "a clean dry-run must not surface a partial-failure error: {dry_run_error:?}"
+        );
 
         assert!(
             report.contains("--- "),

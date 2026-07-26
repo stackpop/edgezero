@@ -22,6 +22,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
 ADAPTER="${1:-axum}"
 SERVER_PID=""
+# `/config/typed` resolves the demo's mandatory `#[secret] api_token`
+# (key name `demo_api_token`) through the AppConfig extractor, so every
+# adapter must have that secret seeded before boot or the endpoint errors.
+DEMO_SECRET_VALUE="resolved-token"
+# Path + backup of a `.dev.vars` this run overwrites (cloudflare only).
+# `.dev.vars` is gitignored but NOT regenerable, so we restore it.
+DEV_VARS_FILE=""
+DEV_VARS_BACKUP=""
 
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
@@ -40,6 +48,13 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  if [ -n "$DEV_VARS_FILE" ]; then
+    if [ -n "$DEV_VARS_BACKUP" ] && [ -f "$DEV_VARS_BACKUP" ]; then
+      mv -f "$DEV_VARS_BACKUP" "$DEV_VARS_FILE"
+    else
+      rm -f "$DEV_VARS_FILE"
+    fi
+  fi
 }
 trap cleanup EXIT
 
@@ -52,11 +67,15 @@ case "$ADAPTER" in
     (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
     # Axum reads `.edgezero/local-config-<id>.json`, which
     # `config push --local` writes (see `AxumConfigStore::from_local_file`).
+    # `--yes` keeps the push non-interactive (no TTY in CI / warm-up).
     echo "==> Seeding Axum local config store (config push --adapter axum --local)..."
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
-      config push --adapter axum --local --no-env 2>&1)
+      config push --adapter axum --local --no-env --yes 2>&1)
     echo "==> Starting Axum adapter on port $PORT..."
-    (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
+    # `EnvSecretStore` resolves the `demo_api_token` key verbatim from the
+    # process env, so /config/typed's secret walk needs it exported.
+    (cd "$DEMO_DIR" && demo_api_token="$DEMO_SECRET_VALUE" \
+      cargo run -p app-demo-adapter-axum 2>&1) &
     SERVER_PID=$!
     ;;
   fastly)
@@ -73,9 +92,13 @@ case "$ADAPTER" in
     # 404s instead of the demo values.
     echo "==> Seeding Fastly local config store (config push --adapter fastly --local)..."
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
-      config push --adapter fastly --local --no-env 2>&1)
+      config push --adapter fastly --local --no-env --yes 2>&1)
     echo "==> Starting Fastly Viceroy on port $PORT..."
-    (cd "$DEMO_DIR" && fastly compute serve -C crates/app-demo-adapter-fastly 2>&1) &
+    # Warm-up's provision_typed wrote a `[[local_server.secret_stores.default]]`
+    # entry mapping `demo_api_token` to the DEMO_API_TOKEN env var; export it
+    # so viceroy resolves the secret /config/typed pulls in.
+    (cd "$DEMO_DIR" && DEMO_API_TOKEN="$DEMO_SECRET_VALUE" \
+      fastly compute serve -C crates/app-demo-adapter-fastly 2>&1) &
     SERVER_PID=$!
     ;;
   cloudflare|cf)
@@ -89,7 +112,16 @@ case "$ADAPTER" in
     # config defaults into the local KV state wrangler dev reads.
     echo "==> Seeding Cloudflare local config store (config push --adapter cloudflare --local)..."
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
-      config push --adapter cloudflare --local --no-env 2>&1)
+      config push --adapter cloudflare --local --no-env --yes 2>&1)
+    # wrangler dev does not inherit the shell env into the worker, so the
+    # `demo_api_token` secret must come through `.dev.vars`. Back up any
+    # operator file first (it is gitignored but not regenerable).
+    DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+    if [ -f "$DEV_VARS_FILE" ]; then
+      DEV_VARS_BACKUP=$(mktemp)
+      cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
+    fi
+    printf 'demo_api_token="%s"\n' "$DEMO_SECRET_VALUE" > "$DEV_VARS_FILE"
     echo "==> Starting Cloudflare wrangler dev on port $PORT..."
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!
@@ -109,17 +141,19 @@ case "$ADAPTER" in
     # SQLite-direct write into `.spin/sqlite_key_value.db`,
     # bypassing Fermyon Cloud auto-detection; `--no-env` matches
     # the smoke harness shape (no per-key env overlays in play).
-    echo "==> Seeding Spin local KV via 'app-demo-cli config push --adapter spin --local --no-env'..."
+    echo "==> Seeding Spin local KV via 'app-demo-cli config push --adapter spin --local --no-env --yes'..."
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
-      config push --adapter spin --local --no-env 2>&1)
+      config push --adapter spin --local --no-env --yes 2>&1)
     echo "==> Starting Spin on port $PORT..."
     # `--runtime-config-file runtime-config.toml` is REQUIRED — the
     # demo's spin.toml declares non-`default` KV labels
     # (`app_config`, `sessions`, `cache`) and Spin's runtime only
     # auto-provides the `default` label. Without the runtime-config
     # flag, `spin up` aborts with `unknown key_value_stores label
-    # <name>` before the server is ready.
+    # <name>` before the server is ready. `SPIN_VARIABLE_DEMO_API_TOKEN`
+    # supplies the `demo_api_token` secret /config/typed resolves.
     (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
+      SPIN_VARIABLE_DEMO_API_TOKEN="$DEMO_SECRET_VALUE" \
       spin up --listen "127.0.0.1:$PORT" \
         --runtime-config-file runtime-config.toml 2>&1) &
     SERVER_PID=$!

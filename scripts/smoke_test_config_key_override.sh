@@ -325,20 +325,12 @@ seed_secret_for_adapter() {
       return 0
       ;;
     fastly)
-      local fastly_toml="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-      # The fixture's [local_server.secret_stores.default] is an
-      # array-of-tables (each entry exposes one key + the env var
-      # to read its value from). Append a second entry rather than
-      # opening a normal-table block at the same path; mixing the
-      # two forms is a TOML parse error. Viceroy reads
-      # `demo_api_token`'s value from $DEMO_API_TOKEN_SECRET, which
-      # boot_runtime exports inline.
-      cat >> "$fastly_toml" <<'TOML'
-
-[[local_server.secret_stores.default]]
-key = "demo_api_token"
-env = "DEMO_API_TOKEN_SECRET"
-TOML
+      # No-op: the warm-up's `provision_typed` already wrote the
+      # `[[local_server.secret_stores.default]]` entry for the typed
+      # `demo_api_token` secret, mapping it to the DEMO_API_TOKEN env var
+      # (the uppercased key). Appending our own second entry here created
+      # a DUPLICATE with a different env var, so viceroy could resolve the
+      # wrong one. boot_runtime exports DEMO_API_TOKEN inline instead.
       return 0
       ;;
     spin)
@@ -401,10 +393,10 @@ boot_runtime() {
         wrangler dev --local --port "$PORT" 2>&1) &
       ;;
     fastly)
-      # DEMO_API_TOKEN_SECRET is the env var viceroy reads to
-      # populate the `demo_api_token` secret-store entry seeded
-      # by seed_secret_for_adapter. viceroy 0.17+ uses `serve`
-      # for the long-running HTTP path (`run` was renamed).
+      # DEMO_API_TOKEN is the env var viceroy reads to populate the
+      # `demo_api_token` secret-store entry that the warm-up's
+      # `provision_typed` wrote (env = uppercased key). viceroy 0.17+
+      # uses `serve` for the long-running HTTP path (`run` was renamed).
       #
       # The wasm artifact lives in the app-demo workspace's
       # shared target dir (not the adapter crate's local
@@ -421,7 +413,7 @@ boot_runtime() {
       seed_fastly_runtime_env "$fastly_toml" \
         "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}"
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
-        DEMO_API_TOKEN_SECRET=resolved-token \
+        DEMO_API_TOKEN=resolved-token \
         viceroy serve -C fastly.toml --addr "127.0.0.1:${PORT}" \
           "$DEMO_DIR/target/wasm32-wasip1/debug/app-demo-adapter-fastly.wasm" 2>&1) &
       ;;
@@ -513,11 +505,11 @@ for suite in "${SUITES[@]}"; do
       rm -rf "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
       ;;
     fastly)
-      # No separate local-state dir for Fastly; fastly.toml IS the
-      # local store and is already backed up above. The backup's
-      # restore puts the contents block back to its pre-smoke shape,
-      # so we don't need an extra reset here.
-      :
+      # fastly.toml IS the local store, and boot_runtime's
+      # `seed_fastly_runtime_env` mutates it in place. Back it up NOW
+      # (right after the warm-up regenerated it, before any mutation) so
+      # `restore_backups` returns it to its pre-smoke shape on cleanup.
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
       ;;
   esac
 

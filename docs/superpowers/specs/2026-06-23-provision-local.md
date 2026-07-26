@@ -530,10 +530,14 @@ already rejected `..`, normalisation is purely
    customizations (v1)" below for the cross-team sharing
    contract.
 
-   The scaffold `.hbs` templates remain the source-of-truth
-   for `edgezero new`'s richer first-time generation; only
-   `provision --local`'s bootstrap path uses the primitive
-   synthesiser.
+   There is NO `.hbs` template for any adapter manifest
+   (`axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`,
+   `runtime-config.toml`). `edgezero new` runs the same
+   `provision --local` synthesiser at scaffold time, so the
+   synthesiser is the single source of truth for these files;
+   `.hbs` templates cover only non-manifest scaffold files
+   (`Cargo.toml`, `src/…`, `.cargo/config.toml`, `.gitignore`,
+   etc.).
 
 ### Bundled binary vs. generated CLI
 

@@ -262,12 +262,16 @@ pub(crate) fn execute_with_env_overlay(
 /// `[adapters.<name>.adapter]` `manifest` / `crate` paths for the
 /// registry-fallback dispatch.
 ///
-/// `.manifest` is REQUIRED whenever a manifest is loaded and declares
-/// this adapter: without it the adapter falls back to a recursive,
+/// Both `.manifest` AND `.crate` are REQUIRED whenever a manifest is
+/// loaded and declares this adapter (the post-2026-07 hard cutoff).
+/// Without `.manifest` the adapter falls back to a recursive,
 /// symlink-following workspace scan that can select an unrelated or
-/// out-of-tree project. `.crate` is optional here — adapters fall back
-/// to the manifest's parent — but is passed through so a nested manifest
-/// still resolves the right `Cargo.toml`.
+/// out-of-tree project. Without `.crate` the adapter can only guess the
+/// crate root as the platform manifest's parent, which mis-resolves
+/// `Cargo.toml` for a nested manifest such as
+/// `crates/server/config/spin.toml`. Refusing here keeps the two fields
+/// consistent rather than silently retaining the pre-cutoff
+/// parent-fallback compatibility behaviour.
 ///
 /// Returns `(None, None)` when no manifest is loaded or the adapter
 /// isn't declared in it: the adapter then runs standalone and its own
@@ -295,10 +299,15 @@ fn resolve_declared_adapter_paths(
              --local` to generate the file)."
         )
     })?;
-    Ok((
-        Some(root.join(rel)),
-        cfg.adapter.crate_path.as_deref().map(|cp| root.join(cp)),
-    ))
+    let crate_rel = cfg.adapter.crate_path.as_deref().ok_or_else(|| {
+        format!(
+            "`[adapters.{adapter_name}.adapter].crate` is not declared. It is required alongside \
+             `.manifest`: without it the adapter guesses the crate root as the platform manifest's \
+             parent, which mis-resolves `Cargo.toml` for a nested manifest. Add \
+             `crate = \"<path/to/crate>\"` to `[adapters.{adapter_name}.adapter]`."
+        )
+    })?;
+    Ok((Some(root.join(rel)), Some(root.join(crate_rel))))
 }
 
 fn manifest_command<'manifest>(
@@ -456,6 +465,22 @@ mod tests {
             crate_abs,
             Some(root.join("crates/server")),
             "crate root is the DECLARED `.crate`, not the manifest's parent"
+        );
+    }
+
+    #[test]
+    fn declared_adapter_paths_require_crate_field() {
+        // `.crate` is required alongside `.manifest`: without it the crate
+        // root can only be guessed as the manifest's parent, which
+        // mis-resolves a nested manifest's Cargo.toml.
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo\"\n\n[adapters.spin.adapter]\nmanifest = \"crates/spin/spin.toml\"\n",
+        );
+        let err = resolve_declared_adapter_paths(Some(&loader), "spin")
+            .expect_err("a declared adapter without `.crate` must be refused");
+        assert!(
+            err.contains("[adapters.spin.adapter].crate") && err.contains("required"),
+            "error names the missing required field: {err}"
         );
     }
 

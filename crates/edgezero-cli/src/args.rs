@@ -10,6 +10,16 @@ This command requires a typed app-config struct (`C`) and runs from your generat
 CLI, not the bundled `edgezero` binary. Run `<your-app>-cli config push` (or `... diff`) \
 instead. See `<your-app>-cli config push --help`.";
 
+/// Printed after a successful bundled `edgezero provision --local`. The
+/// bundled binary has no typed `C`, so it writes the manifest + store
+/// bindings but NOT the per-`#[secret]` placeholders. This names the
+/// follow-up step the operator runs from their generated CLI.
+pub const PROVISION_TYPED_FOLLOWUP: &str = "\
+The bundled `edgezero` binary wrote the adapter manifest and store bindings, but it has no typed \
+app-config struct, so it did NOT write `#[secret]` placeholders. If your app declares typed \
+secrets, finish provisioning from your generated CLI: `<your-app>-cli provision --adapter <name> \
+--local`.";
+
 #[derive(Parser, Debug)]
 #[command(name = "edgezero", about = "EdgeZero CLI")]
 pub struct Args {

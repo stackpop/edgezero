@@ -26,7 +26,17 @@ fn main() {
         #[cfg(feature = "demo-example")]
         Command::Demo => edgezero_cli::run_demo(),
         Command::New(cmd_args) => edgezero_cli::run_new(&cmd_args),
-        Command::Provision(cmd_args) => edgezero_cli::run_provision(&cmd_args),
+        Command::Provision(cmd_args) => {
+            let result = edgezero_cli::run_provision(&cmd_args);
+            // The bundled binary can't write typed `#[secret]`
+            // placeholders (no `C`); point the operator at the generated
+            // CLI for that follow-up. Skip on dry-run so the preview
+            // isn't cluttered, and only for local provisioning.
+            if result.is_ok() && cmd_args.local && !cmd_args.dry_run {
+                info_line(args::PROVISION_TYPED_FOLLOWUP);
+            }
+            result
+        }
         Command::Serve(cmd_args) => edgezero_cli::run_serve(&cmd_args),
     };
     if let Err(err) = result {
