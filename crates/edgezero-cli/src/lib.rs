@@ -388,6 +388,8 @@ pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
         args.version.clone(),
         "--domain".to_owned(),
         args.domain.clone(),
+        "--path".to_owned(),
+        args.path.clone(),
     ];
     if args.staging {
         passthrough.push("--staging".to_owned());

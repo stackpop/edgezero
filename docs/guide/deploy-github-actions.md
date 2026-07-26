@@ -213,8 +213,12 @@ step, scope it to the step that needs it rather than to job-level `env:`.
 | `stage`             | No       | `false`         | Deploy to a staged draft version instead of activating.                                      |
 | `cache`             | No       | `false`         | Exact-key Cargo-workspace `target/` caching.                                                 |
 
-Outputs: `fastly-version`, `source-revision`, `app-cli-version`, and (production
-only) `previous-version` — the version that was active _before_ this deploy.
+Outputs: `fastly-version`, `source-revision`, `app-cli-version`,
+`provider-cli-version` (the Fastly CLI version this action installed),
+`mutation-attempted`, and (production only) `previous-version` — the version that
+was active _before_ this deploy. `mutation-attempted` is `true` once the deploy
+CLI is invoked; if the action fails, read it via `if: always()` to know a deploy
+may have occurred and reconcile rather than assume nothing happened.
 Thread `previous-version` into `rollback-fastly`'s `rollback-to` so a later
 rollback has a real target (Fastly cannot infer one — see `rollback-fastly`).
 
@@ -232,6 +236,7 @@ and cannot — pass it through `deploy-args`.
 | `fastly-service-id` | Yes      | —               | Service to probe.                                                                                              |
 | `fastly-version`    | Yes      | —               | Version to probe — thread the deploy's `fastly-version`.                                                       |
 | `domain`            | Yes      | —               | Domain to probe, e.g. `www.example.com`.                                                                       |
+| `path`              | No       | `/`             | URL path to probe (must begin with `/`). Covers production and staging alike (staging reroutes the same URL).  |
 | `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                               |
 | `deploy-to`         | No       | `production`    | `staging` probes the staged version via its resolved edge IP.                                                  |
 | `retry`             | No       | `3`             | Attempts before declaring the deployment unhealthy.                                                            |
@@ -255,7 +260,9 @@ your rollback on the step failing (`if: failure()`), not on the `healthy` output
 | `rollback-to`       | No\*     | empty           | **Production only:** the version to re-activate. Wire it from `deploy-fastly`'s `previous-version` output. Required for `deploy-to: production`; ignored for staging. |
 | `deploy-to`         | No       | `production`    | `production` activates `rollback-to`; `staging` deactivates the staged one.                                                                                           |
 
-Outputs: `rolled-back-to` (production only — the version that was activated).
+Outputs: `rolled-back-to` (production only — the version that was activated) and
+`mutation-attempted` (`true` once the rollback CLI is invoked; read it via
+`if: always()` on failure to know the active version may have changed).
 
 \* Fastly's version metadata cannot distinguish a previously-live version from a
 staged draft, so a production rollback **cannot infer its target** — you must
@@ -270,22 +277,28 @@ Pushes your app's typed config to a Fastly config store. This is **separate from
 deploy** — deploy activates code, it never writes runtime config — so you run it
 as its own step, whenever config should move.
 
-| Input               | Required | Default         | Meaning                                                                                                             |
-| ------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                                |
-| `fastly-api-token`  | Yes      | —               | Fastly API token. Injected only into the push step.                                                                 |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                                    |
-| `working-directory` | No       | `.`             | App directory (holds the manifest + typed config).                                                                  |
-| `manifest`          | No       | empty           | `edgezero.toml` path relative to `working-directory`.                                                               |
-| `app-config`        | No       | empty           | Typed config file path (default: resolved from the manifest).                                                       |
-| `store`             | No       | empty           | Logical config-store id (default: the manifest's resolved id).                                                      |
-| `key`               | No       | empty           | Explicit base key for a **production** push (default: the logical store id). Not allowed with `deploy-to: staging`. |
-| `deploy-to`         | No       | `production`    | `staging` writes the `<logical-store-id>_staging` variant in the **same** store.                                    |
+| Input               | Required | Default         | Meaning                                                                                                              |
+| ------------------- | -------- | --------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                                 |
+| `fastly-api-token`  | Yes      | —               | Fastly API token. Injected only into the push step.                                                                  |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                                     |
+| `working-directory` | No       | `.`             | App directory (holds the manifest + typed config).                                                                   |
+| `manifest`          | No       | empty           | `edgezero.toml` path relative to `working-directory`.                                                                |
+| `app-config`        | No       | empty           | Typed config file path (default: resolved from the manifest). Mutually exclusive with `app-config-inline`.           |
+| `app-config-inline` | No       | empty           | Raw typed-config (TOML) supplied inline — for config that lives in a GitHub variable with no file on disk.           |
+| `no-env`            | No       | `false`         | `true` passes `--no-env` so the CLI does not overlay `<APP_NAME>__…__<KEY>` env vars onto the config before pushing. |
+| `store`             | No       | empty           | Logical config-store id (default: the manifest's resolved id).                                                       |
+| `key`               | No       | empty           | Explicit base key for a **production** push (default: the logical store id). Not allowed with `deploy-to: staging`.  |
+| `deploy-to`         | No       | `production`    | `staging` writes the `<logical-store-id>_staging` variant in the **same** store.                                     |
 
 Outputs: `pushed-key` (the key written — the base key, or the derived `_staging`
-variant) and `store` (the logical store id the CLI **resolved** — always emitted,
-not only when the `store` input was supplied). Your app CLI must print both
-`pushed-key=` and `pushed-store=`; the action fails if either is missing.
+variant), `store` (the logical store id the CLI **resolved** — always emitted,
+not only when the `store` input was supplied), `provider-cli-version` (the Fastly
+CLI version this action installed), and `mutation-attempted`. Your app CLI must
+print both `pushed-key=` and `pushed-store=`; the action fails if either is
+missing — but `mutation-attempted` is `true` once the push CLI is invoked, so on
+that failure you can read it via `if: always()` and reconcile the config store
+rather than assume it is unchanged.
 
 **Staging config is the same store, a different key.** Fastly config stores are
 not versioned like staged service versions, so `deploy-to: staging` writes your

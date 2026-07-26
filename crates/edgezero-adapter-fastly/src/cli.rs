@@ -2062,8 +2062,14 @@ fn find_staging_ip(value: &serde_json::Value) -> Option<String> {
 
 /// Build the `curl` argv for a health probe. Production probes the
 /// domain directly; staging reroutes the TLS connection to the
-/// resolved staging IP via `--connect-to ::<ip>:443`.
-fn build_curl_probe_args(domain: &str, staging_ip: Option<&str>, timeout_secs: u64) -> Vec<String> {
+/// resolved staging IP via `--connect-to ::<ip>:443`. `path` is the
+/// URL path (always begins with '/'), applied identically to both.
+fn build_curl_probe_args(
+    domain: &str,
+    path: &str,
+    staging_ip: Option<&str>,
+    timeout_secs: u64,
+) -> Vec<String> {
     let mut args = vec![
         "-sS".to_owned(),
         "-o".to_owned(),
@@ -2077,8 +2083,24 @@ fn build_curl_probe_args(domain: &str, staging_ip: Option<&str>, timeout_secs: u
         args.push("--connect-to".to_owned());
         args.push(format!("::{ip}:443"));
     }
-    args.push(format!("https://{domain}/"));
+    args.push(format!("https://{domain}{path}"));
     args
+}
+
+/// Validate a caller-supplied probe path. It is appended to
+/// `https://{domain}` to form one curl argument, so it must begin with
+/// '/' and carry no whitespace or control characters that would break
+/// the URL or smuggle a second token.
+fn validate_probe_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("healthcheck --path must begin with '/': '{path}'"));
+    }
+    if path.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "healthcheck --path must not contain whitespace or control characters: '{path}'"
+        ));
+    }
+    Ok(())
 }
 
 /// Retry a health probe. Returns `Ok(code)` on the first healthy
@@ -2682,6 +2704,8 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
     let version_str =
         arg_value(args, "--version").ok_or_else(|| "healthcheck requires --version".to_owned())?;
     let version = validate_version_str(version_str)?;
+    let path = arg_value(args, "--path").unwrap_or("/");
+    validate_probe_path(path)?;
     let retry = arg_value(args, "--retry")
         .and_then(|value| value.parse().ok())
         .unwrap_or(3_u32);
@@ -2705,7 +2729,7 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
         None
     };
 
-    let curl_args = build_curl_probe_args(domain, staging_ip.as_deref(), timeout);
+    let curl_args = build_curl_probe_args(domain, path, staging_ip.as_deref(), timeout);
     let delay = Duration::from_secs(retry_delay);
     let outcome = probe_with_retries(retry, || curl_status(&curl_args), || thread::sleep(delay));
     match outcome {
@@ -3381,7 +3405,7 @@ mod tests {
 
     #[test]
     fn build_curl_probe_args_production_has_no_connect_to() {
-        let args = build_curl_probe_args("example.com", None, 10);
+        let args = build_curl_probe_args("example.com", "/", None, 10);
         assert!(!args.iter().any(|arg| arg == "--connect-to"));
         assert!(args.contains(&"https://example.com/".to_owned()));
         assert!(args.contains(&"--max-time".to_owned()));
@@ -3390,13 +3414,40 @@ mod tests {
 
     #[test]
     fn build_curl_probe_args_staging_reroutes_to_ip() {
-        let args = build_curl_probe_args("staging.example.com", Some("151.101.2.10"), 15);
+        let args = build_curl_probe_args("staging.example.com", "/", Some("151.101.2.10"), 15);
         let idx = args
             .iter()
             .position(|arg| arg == "--connect-to")
             .expect("--connect-to present for staging");
         assert_eq!(args[idx + 1], "::151.101.2.10:443");
         assert!(args.contains(&"https://staging.example.com/".to_owned()));
+    }
+
+    #[test]
+    fn build_curl_probe_args_honors_path_on_production_and_staging() {
+        // Production: the path is appended to the domain URL.
+        let prod = build_curl_probe_args("example.com", "/health", None, 10);
+        assert!(prod.contains(&"https://example.com/health".to_owned()));
+        // Staging: same URL (with the path), rerouted to the staging IP.
+        let staging =
+            build_curl_probe_args("staging.example.com", "/health", Some("151.101.2.10"), 10);
+        assert!(staging.contains(&"https://staging.example.com/health".to_owned()));
+        let idx = staging
+            .iter()
+            .position(|arg| arg == "--connect-to")
+            .expect("--connect-to present for staging");
+        assert_eq!(staging[idx + 1], "::151.101.2.10:443");
+    }
+
+    #[test]
+    fn validate_probe_path_requires_leading_slash_and_no_whitespace() {
+        validate_probe_path("/").expect("root");
+        validate_probe_path("/health").expect("simple path");
+        validate_probe_path("/api/v1/status?ready=1").expect("path with query");
+        validate_probe_path("health").expect_err("no leading slash");
+        validate_probe_path("").expect_err("empty");
+        validate_probe_path("/ with space").expect_err("whitespace");
+        validate_probe_path("/inject\nHost: evil").expect_err("newline injection");
     }
 
     #[test]

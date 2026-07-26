@@ -31,6 +31,9 @@ outputs:
   rolled-back-to:
     description: The Fastly version that was activated (production only).
     value: ${{ steps.rollback.outputs['rolled-back-to'] }}
+  mutation-attempted:
+    description: "'true' once the rollback CLI is invoked (emitted before it runs). If the action fails, read this via `if: always()` to know the active version may have changed and reconcile — do not assume the rollback was a no-op."
+    value: ${{ steps.rollback.outputs['mutation-attempted'] }}
 
 runs:
   using: composite
@@ -63,7 +66,7 @@ runs:
       run: $GITHUB_ACTION_PATH/scripts/validate.sh
 
     - name: Download CLI artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: ${{ inputs['app-cli-artifact'] }}
         path: ${{ runner.temp }}/edgezero-cli-download

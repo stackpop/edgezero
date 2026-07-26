@@ -136,7 +136,7 @@ runs:
     # secret out of EVERY step should scope it to the step that needs it rather
     # than to job-level `env:`.
     - name: Upload CLI artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       env:
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""

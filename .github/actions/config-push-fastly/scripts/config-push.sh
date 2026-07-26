@@ -32,7 +32,10 @@ set -euo pipefail
 #   EDGEZERO__CONFIG_PUSH__KEY            optional  explicit base key
 #   EDGEZERO__CONFIG_PUSH__MANIFEST       optional  edgezero.toml path (relative to the app dir)
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG     optional  typed config file path (relative to the app dir)
+#   EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE optional  raw inline typed-config content (exclusive with APP_CONFIG)
+#   EDGEZERO__CONFIG_PUSH__NO_ENV         optional  'true' to pass --no-env (skip the env overlay); default false
 # Writes (outputs):
+#   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
 #   pushed-key                            the key written (base, or its _staging variant)
 #   store                                 the logical store id the CLI resolved
 
@@ -65,6 +68,8 @@ main() {
   local key="${EDGEZERO__CONFIG_PUSH__KEY:-}"
   local manifest="${EDGEZERO__CONFIG_PUSH__MANIFEST:-}"
   local app_config="${EDGEZERO__CONFIG_PUSH__APP_CONFIG:-}"
+  local app_config_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE:-}"
+  local no_env="${EDGEZERO__CONFIG_PUSH__NO_ENV:-false}"
 
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_cmd "$cli_bin"
@@ -73,6 +78,17 @@ main() {
     production | staging) ;;
     *) fail "input 'deploy-to' must be 'production' or 'staging' (got '$deploy_to')" ;;
   esac
+  # A typo in no-env must never silently apply the env overlay the caller meant
+  # to skip (which could push different values than intended).
+  case "$no_env" in
+    true | false) ;;
+    *) fail "input 'no-env' must be 'true' or 'false' (got '$no_env')" ;;
+  esac
+  # A file path and inline content name the same thing two ways; requiring
+  # exactly one avoids a silent precedence surprise.
+  if [[ -n "$app_config" && -n "$app_config_inline" ]]; then
+    fail "inputs 'app-config' and 'app-config-inline' are mutually exclusive"
+  fi
 
   # Confine the app directory to github.workspace, then every path to the app.
   local workspace_real app_dir
@@ -93,7 +109,23 @@ main() {
     is_under "$app_dir" "$default_manifest" ||
       fail "the default 'edgezero.toml' resolves outside the application directory — refusing to read a manifest that escapes it"
   fi
-  if [[ -n "$app_config" ]]; then app_config=$(confine_to_app "$app_config" "$app_dir" app-config); fi
+  # Inline config is caller-supplied CONTENT (from a GitHub variable), not a
+  # checkout path, so it needs no path confinement — this step chooses the file.
+  # It is written to an action-owned temp file (removed on exit) and passed by
+  # ABSOLUTE path, which the CLI reads as-is. A checked-out path is confined to
+  # the app directory as before.
+  if [[ -n "$app_config_inline" ]]; then
+    local inline_file
+    inline_file=$(mktemp "${RUNNER_TEMP:-/tmp}/edgezero-inline-config.XXXXXX") ||
+      fail "could not create a temp file for inline config"
+    # shellcheck disable=SC2064  # expand $inline_file now, not at trap time
+    trap "rm -f '$inline_file'" EXIT
+    chmod 600 "$inline_file"
+    printf '%s' "$app_config_inline" >"$inline_file"
+    app_config="$inline_file"
+  elif [[ -n "$app_config" ]]; then
+    app_config=$(confine_to_app "$app_config" "$app_dir" app-config)
+  fi
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the
   # push non-interactive in CI; --staging selects the `<logical>_staging` variant.
@@ -103,9 +135,16 @@ main() {
   if [[ -n "$store" ]]; then argv+=(--store "$store"); fi
   if [[ -n "$key" ]]; then argv+=(--key "$key"); fi
   if [[ "$deploy_to" == "staging" ]]; then argv+=(--staging); fi
+  if [[ "$no_env" == "true" ]]; then argv+=(--no-env); fi
   argv+=(--yes --no-diff)
 
   new_private_log
+  # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
+  # signal survives a failed step (readable via `if: always()`). If the push
+  # succeeds but its canonical `pushed-key=`/`pushed-store=` lines are missing
+  # below, the caller can still reconcile the config store rather than assume the
+  # store is unchanged.
+  append_output mutation-attempted true
   local rc=0
   (cd "$app_dir" && "${argv[@]}") 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
   if [[ "$rc" -ne 0 ]]; then

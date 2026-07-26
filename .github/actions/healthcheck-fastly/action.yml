@@ -22,6 +22,10 @@ inputs:
   domain:
     description: Domain to probe (e.g. www.example.com).
     required: true
+  path:
+    description: "URL path to probe (must begin with '/'). Applies to production and staging alike — a staged probe reroutes the same URL to the resolved staging IP. Defaults to '/'."
+    required: false
+    default: "/"
   deploy-to:
     description: Deployment target, 'production' or 'staging'.
     required: false
@@ -78,7 +82,7 @@ runs:
       run: $GITHUB_ACTION_PATH/scripts/validate.sh
 
     - name: Download CLI artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: ${{ inputs['app-cli-artifact'] }}
         path: ${{ runner.temp }}/edgezero-cli-download
@@ -134,6 +138,7 @@ runs:
         EDGEZERO__LIFECYCLE__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         EDGEZERO__LIFECYCLE__VERSION: ${{ inputs['fastly-version'] }}
         EDGEZERO__LIFECYCLE__DOMAIN: ${{ inputs.domain }}
+        EDGEZERO__LIFECYCLE__PATH: ${{ inputs.path }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
         EDGEZERO__LIFECYCLE__RETRY: ${{ inputs.retry }}
         EDGEZERO__LIFECYCLE__RETRY_DELAY: ${{ inputs['retry-delay'] }}

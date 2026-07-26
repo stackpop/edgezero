@@ -632,6 +632,18 @@ test_versions_json_pins_official_release() {
   assert_equals "versions.json pins an official https release URL (never a local file:// override)" \
     "official" "$verdict"
 
+  # The URL must point at the pinned VERSION: a version bump that forgets to
+  # update the URL — or an URL swapped to a different build — is a real regression
+  # the checksum alone would not localize.
+  local version expected_tail
+  version=$(jq -r '.fastly.version' "$vj")
+  expected_tail="/releases/download/v${version}/fastly_v${version}_linux-amd64.tar.gz"
+  case "$url" in
+    *"$expected_tail") verdict=matches ;;
+    *) verdict="$url" ;;
+  esac
+  assert_equals "versions.json URL filename embeds the pinned version" "matches" "$verdict"
+
   local sha
   sha=$(jq -r '.fastly.linux_amd64.sha256' "$vj")
   case "$sha" in
@@ -876,6 +888,13 @@ run_config_push_argv() {
   cat >"$dir/bin/fake-cli" <<'CLI'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$FAKE_ARGV_OUT"
+# Capture the --app-config file's content while it still exists (the wrapper
+# removes an inline temp file on exit), so a test can verify what was pushed.
+prev=""
+for a in "$@"; do
+  if [[ "$prev" == "--app-config" ]]; then cp -f "$a" "$FAKE_ARGV_OUT.appconfig" 2>/dev/null || true; fi
+  prev="$a"
+done
 echo "pushed-key=app_config_staging"
 echo "pushed-store=app_config"
 CLI
@@ -894,6 +913,8 @@ CLI
     EDGEZERO__CONFIG_PUSH__KEY="${CP_KEY:-}" \
     EDGEZERO__CONFIG_PUSH__MANIFEST="${CP_MANIFEST:-}" \
     EDGEZERO__CONFIG_PUSH__APP_CONFIG="${CP_APP_CONFIG:-}" \
+    EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE="${CP_APP_CONFIG_INLINE:-}" \
+    EDGEZERO__CONFIG_PUSH__NO_ENV="${CP_NO_ENV:-false}" \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1
   cat "$dir/argv.txt" 2>/dev/null
 }
@@ -928,6 +949,35 @@ test_config_push_argv() {
   with_store=$(CP_STORE=cfg CP_KEY=mykey run_config_push_argv)
   assert_succeeds "--store is threaded" grep -qx -- 'cfg' <<<"$with_store"
   assert_succeeds "--key is threaded" grep -qx -- 'mykey' <<<"$with_store"
+
+  # Inline config: threaded as --app-config pointing at an action-owned temp file
+  # that holds exactly the supplied content (no checkout file required).
+  local inline_argv
+  inline_argv=$(CP_APP_CONFIG_INLINE='greeting = "hi"' run_config_push_argv)
+  assert_succeeds "inline config threads --app-config" grep -qx -- '--app-config' <<<"$inline_argv"
+  assert_equals "inline content is written to the file the CLI reads" \
+    'greeting = "hi"' "$(cat "$WORK_DIR/config-push/argv.txt.appconfig" 2>/dev/null)"
+
+  # no-env: --no-env is appended only when requested.
+  local noenv_argv
+  noenv_argv=$(CP_NO_ENV=true run_config_push_argv)
+  assert_succeeds "no-env=true appends --no-env" grep -qx -- '--no-env' <<<"$noenv_argv"
+  assert_fails "the default does NOT pass --no-env" grep -qx -- '--no-env' <<<"$prod"
+
+  # A file path and inline content are mutually exclusive, and no-env must be a
+  # boolean — both fail closed with a named diagnostic (never a silent default).
+  assert_fails_with "app-config and app-config-inline are mutually exclusive" \
+    "mutually exclusive" \
+    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    EDGEZERO__CONFIG_PUSH__APP_CONFIG=real.toml EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE='x = 1' \
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
+  assert_fails_with "an invalid no-env value is rejected" \
+    "input 'no-env' must be" \
+    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    EDGEZERO__CONFIG_PUSH__NO_ENV=yes \
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
 
   # A bad deploy-to must fail closed, never silently push to production.
   assert_fails "a non-{production,staging} deploy-to is rejected" \
@@ -1400,6 +1450,117 @@ CLI
 }
 
 # ---------------------------------------------------------------------------
+# healthcheck.sh — the probe path is threaded to the CLI and validated
+# ---------------------------------------------------------------------------
+# Runs healthcheck.sh against a fake app CLI that records its argv and emits the
+# healthy verdict. Returns the recorded argv (one arg per line).
+run_healthcheck_argv() {
+  local dir="$WORK_DIR/healthcheck-argv"
+  rm -rf "$dir"
+  mkdir -p "$dir/bin"
+  cat >"$dir/bin/fake-cli" <<'CLI'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$FAKE_ARGV_OUT"
+echo "status-code=200"
+echo "healthy=true"
+CLI
+  chmod +x "$dir/bin/fake-cli"
+  PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" \
+    EDGEZERO__APP__CLI__BIN=fake-cli \
+    EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 \
+    EDGEZERO__LIFECYCLE__VERSION=7 \
+    EDGEZERO__LIFECYCLE__DOMAIN=www.example.com \
+    EDGEZERO__LIFECYCLE__PATH="${HC_PATH:-/}" \
+    EDGEZERO__DEPLOY__TO=production \
+    EDGEZERO__LIFECYCLE__RETRY=1 \
+    EDGEZERO__LIFECYCLE__RETRY_DELAY=0 \
+    EDGEZERO__LIFECYCLE__TIMEOUT=1 \
+    "$ACTIONS_DIR/healthcheck-fastly/scripts/healthcheck.sh" >/dev/null 2>&1
+  cat "$dir/argv.txt" 2>/dev/null
+}
+
+test_healthcheck_path() {
+  section "healthcheck probe path"
+  # healthcheck.sh gates on a Linux x86-64 runner, so only there does main()
+  # reach the CLI invocation whose argv we inspect. Skip elsewhere (local macOS);
+  # CI's static-checks job runs on Linux and exercises it for real.
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64 | Linux-amd64) ;;
+    *)
+      pass "healthcheck path threading (skipped: non-Linux runner)"
+      return
+      ;;
+  esac
+
+  # Default '/' is threaded as --path.
+  local default_argv after
+  default_argv=$(run_healthcheck_argv)
+  assert_succeeds "default path is threaded as --path" grep -qx -- '--path' <<<"$default_argv"
+  after=$(grep -A1 -x -- '--path' <<<"$default_argv" | tail -n1)
+  assert_equals "default --path value is '/'" "/" "$after"
+
+  # A custom path is threaded verbatim.
+  local custom_argv
+  custom_argv=$(HC_PATH=/health run_healthcheck_argv)
+  after=$(grep -A1 -x -- '--path' <<<"$custom_argv" | tail -n1)
+  assert_equals "a custom --path value is threaded to the CLI" "/health" "$after"
+
+  # A path without a leading slash fails closed, before the CLI is invoked.
+  assert_fails "a path without a leading slash is rejected" \
+    env PATH="$WORK_DIR/healthcheck-argv/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli \
+    EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=7 \
+    EDGEZERO__LIFECYCLE__DOMAIN=www.example.com EDGEZERO__LIFECYCLE__PATH=health \
+    EDGEZERO__DEPLOY__TO=production EDGEZERO__LIFECYCLE__RETRY=1 \
+    EDGEZERO__LIFECYCLE__RETRY_DELAY=0 EDGEZERO__LIFECYCLE__TIMEOUT=1 \
+    "$ACTIONS_DIR/healthcheck-fastly/scripts/healthcheck.sh"
+}
+
+# ---------------------------------------------------------------------------
+# The mutation-attempted reconcile signal: a provider mutation whose canonical
+# output line is missing STILL fails the step (loud), but the signal is already
+# durable so an `if: always()` caller can reconcile provider state.
+# ---------------------------------------------------------------------------
+test_mutation_attempted_signal() {
+  section "mutation-attempted reconcile signal"
+  local dir="$WORK_DIR/mutation-signal"
+  rm -rf "$dir"
+  mkdir -p "$dir/bin" "$dir/app"
+  # A CLI that SUCCEEDS (exit 0) but emits no canonical line.
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/bin/fake-cli"
+  chmod +x "$dir/bin/fake-cli"
+
+  # config-push (cross-platform): missing pushed-key fails the step, yet
+  # mutation-attempted=true is already written to GITHUB_OUTPUT.
+  local out="$dir/cp-out.txt" rc=0
+  : >"$out"
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    GITHUB_WORKSPACE="$dir" EDGEZERO__PROJECT__WORKING_DIRECTORY=app GITHUB_OUTPUT="$out" \
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1 || rc=$?
+  assert_succeeds "config-push fails on a missing canonical line" test "$rc" -ne 0
+  assert_succeeds "config-push still signals mutation-attempted on that failure" \
+    grep -qx 'mutation-attempted=true' "$out"
+
+  # rollback gates on a Linux runner; only there does main() reach the CLI.
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64 | Linux-amd64) ;;
+    *)
+      pass "rollback mutation-attempted signal (skipped: non-Linux runner)"
+      return
+      ;;
+  esac
+  local rout="$dir/rb-out.txt"
+  rc=0
+  : >"$rout"
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=9 \
+    EDGEZERO__LIFECYCLE__ROLLBACK_TO=8 EDGEZERO__DEPLOY__TO=production GITHUB_OUTPUT="$rout" \
+    "$ACTIONS_DIR/rollback-fastly/scripts/rollback.sh" >/dev/null 2>&1 || rc=$?
+  assert_succeeds "rollback fails on a missing rolled-back-to line" test "$rc" -ne 0
+  assert_succeeds "rollback still signals mutation-attempted on that failure" \
+    grep -qx 'mutation-attempted=true' "$rout"
+}
+
+# ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
@@ -1421,6 +1582,8 @@ main() {
   test_clear_provider_env_aliases
   test_toolchain_boundary
   test_config_push_argv
+  test_healthcheck_path
+  test_mutation_attempted_signal
   test_exit_propagation
   test_dirty_source_guard
   test_cache_key

@@ -16,6 +16,7 @@ set -euo pipefail
 #   EDGEZERO__FASTLY__SERVICE_ID          required  typed Fastly service id
 #   (plus the run-app-cli.sh Reads contract, which this delegates to)
 # Writes (outputs):
+#   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
 #   fastly-version                        the deployed/staged Fastly version
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -35,6 +36,12 @@ main() {
   export EDGEZERO__PROVIDER__ENV
 
   new_private_log
+  # Record that a provider mutation is being ATTEMPTED before the CLI runs. This
+  # output is written first so it survives a failed step (readable via
+  # `if: always()`): if the deploy succeeds but its canonical `version=` line is
+  # missing/malformed below, or the CLI fails after partially mutating, the caller
+  # can still reconcile provider state instead of assuming nothing happened.
+  append_output mutation-attempted true
   "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG"
 
   local version

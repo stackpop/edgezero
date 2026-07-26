@@ -244,6 +244,11 @@ pub struct HealthcheckArgs {
     /// contract always threads it.
     #[arg(long, required = true)]
     pub domain: String,
+    /// URL path to probe on the domain (must begin with '/'). Applies to
+    /// production and staging alike — staging reroutes the same URL to the
+    /// resolved staging IP. Defaults to '/'.
+    #[arg(long, default_value = "/")]
+    pub path: String,
     /// Total number of attempts before declaring the probe unhealthy.
     #[arg(long, default_value_t = 3)]
     pub retry: u32,

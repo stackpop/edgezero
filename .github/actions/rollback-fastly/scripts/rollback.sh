@@ -16,6 +16,7 @@ set -euo pipefail
 #   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 # Writes (outputs):
+#   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
 #   rolled-back-to                        the activated version (production only)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -52,6 +53,12 @@ main() {
   fi
 
   new_private_log
+  # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
+  # signal survives a failed step (readable via `if: always()`). A production
+  # rollback that activates the previous version but fails to emit its canonical
+  # `rolled-back-to=` line — or fails mid-activation — is still a state change the
+  # caller must reconcile rather than treat as a no-op.
+  append_output mutation-attempted true
   local rc=0
   "${argv[@]}" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
 

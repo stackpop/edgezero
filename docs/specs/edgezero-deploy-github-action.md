@@ -93,9 +93,13 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
 8. **No Python in tooling or CI.** Validation, metadata checks, and security
    scans run through Bash, `jq`, and pinned release binaries (`actionlint`,
    `zizmor`). No `python3` heredocs and no `pip install`.
-9. **Pin third-party actions to readable released tags.** Reusable third-party
-   actions are referenced by their published major/minor tag (for example
-   `actions/checkout@v4`), not opaque commit SHAs chosen ad hoc.
+9. **Pin third-party actions.** Third-party `uses:` in the repository's own
+   _workflows_ are referenced by their published major/minor tag (for example
+   `actions/checkout@v4`). Third-party `uses:` nested _inside a reusable action_
+   (`build-app-cli`, `deploy-fastly`, …) are pinned to a full commit SHA with a
+   readable version comment (`@<sha> # v4.6.2`): a consumer who SHA-pins one of
+   these actions cannot otherwise freeze a mutable child tag, so the action must
+   freeze it for them.
 10. **Safe by default.** Caching is opt-in, deploys require committed source, and
     provider credentials never reach outputs, summaries, caches, or
     action-global environment files.
@@ -304,12 +308,14 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 **`deploy-fastly` outputs**
 
-| Output             | Meaning                                                                                                                                      |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fastly-version`   | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4).                                                   |
-| `previous-version` | Production only: the version active BEFORE this deploy — the rollback target for `rollback-fastly`'s `rollback-to`. Empty on a first deploy. |
-| `source-revision`  | Passthrough from the engine.                                                                                                                 |
-| `app-cli-version`  | Passthrough from the engine.                                                                                                                 |
+| Output                 | Meaning                                                                                                                                               |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fastly-version`       | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4).                                                            |
+| `previous-version`     | Production only: the version active BEFORE this deploy — the rollback target for `rollback-fastly`'s `rollback-to`. Empty on a first deploy.          |
+| `source-revision`      | Passthrough from the engine.                                                                                                                          |
+| `app-cli-version`      | Passthrough from the engine.                                                                                                                          |
+| `provider-cli-version` | The pinned Fastly CLI version this action installed and ran.                                                                                          |
+| `mutation-attempted`   | `true` once the deploy CLI is invoked (emitted before it runs). On failure, read via `if: always()` to know a deploy may have occurred and reconcile. |
 
 The wrapper sets `adapter: fastly`, `target: wasm32-wasip1`, the action-owned
 `deploy-flags` (`--service-id …`, `--non-interactive`) so deployments cannot
@@ -331,12 +337,12 @@ subcommands.
 
 The capability is scaffolded into the CLI, not reproduced in action shell:
 
-| App-CLI invocation                                                                                | Fastly operations the adapter performs                                                                                                                              |
-| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<cli> deploy --adapter fastly --service-id <id>` (production, existing)                          | `fastly compute deploy` → builds, uploads, **activates**; emits the activated version.                                                                              |
-| `<cli> deploy --adapter fastly --service-id <id> --stage`                                         | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version. |
-| `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --domain <d> [--staging]`     | Production: `curl` the domain. Staging: resolve `staging_ips` for `<v>` on `<id>` via the Fastly API, then `curl --connect-to` that IP; emits healthy/status.       |
-| `<cli> rollback --adapter fastly --service-id <id> --version <v> [--rollback-to <p>] [--staging]` | Production: activate `<p>` on `<id>` (required — Fastly cannot infer the previous version). Staging: deactivate the staged `<v>` on `<id>`.                         |
+| App-CLI invocation                                                                                         | Fastly operations the adapter performs                                                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<cli> deploy --adapter fastly --service-id <id>` (production, existing)                                   | `fastly compute deploy` → builds, uploads, **activates**; emits the activated version.                                                                                                                        |
+| `<cli> deploy --adapter fastly --service-id <id> --stage`                                                  | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version.                                           |
+| `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --domain <d> [--path <p>] [--staging]` | Production: `curl` `https://<d><p>` (`<p>` defaults to `/`). Staging: resolve `staging_ips` for `<v>` on `<id>` via the Fastly API, then `curl --connect-to` that IP with the same URL; emits healthy/status. |
+| `<cli> rollback --adapter fastly --service-id <id> --version <v> [--rollback-to <p>] [--staging]`          | Production: activate `<p>` on `<id>` (required — Fastly cannot infer the previous version). Staging: deactivate the staged `<v>` on `<id>`.                                                                   |
 
 Every Fastly subcommand takes `--service-id <id>` (the service the operation
 targets). All of them read `FASTLY_API_TOKEN` from the environment EXCEPT a
@@ -371,17 +377,20 @@ a previous version (§5.4.3), the caller threads `previous-version` into
 - **`healthcheck-fastly`** — thin wrapper: downloads the CLI artifact, takes
   `fastly-api-token` (STAGING only — a production probe curls the public domain,
   needs no credential, and is passed none), `fastly-service-id`,
-  `fastly-version`, `domain`, `deploy-to` (`production`/`staging`),
+  `fastly-version`, `domain`, `path` (URL path to probe, default `/`, applied to
+  production and staging alike), `deploy-to` (`production`/`staging`),
   retry/timeout inputs; runs
-  `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
-  `FASTLY_API_TOKEN` in the step env; outputs `healthy` and `status-code`. It
+  `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --path <p> …`
+  with `FASTLY_API_TOKEN` in the step env; outputs `healthy` and `status-code`. It
   **exits non-zero after retries when the probe is unhealthy** (so a caller can
   gate rollback on `if: failure()`), while still emitting the outputs. Needs no
   application source or build.
 - **`rollback-fastly`** — thin wrapper: takes `fastly-api-token`,
   `fastly-service-id`, `fastly-version`, `rollback-to`, `deploy-to`; runs
   `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
-  `FASTLY_API_TOKEN` in the step env; on production emits `rolled-back-to`. A
+  `FASTLY_API_TOKEN` in the step env; on production emits `rolled-back-to`, and
+  always emits `mutation-attempted` (readable via `if: always()` on failure to
+  know the active version may have changed). A
   production rollback **requires** `rollback-to` — Fastly's version metadata
   cannot distinguish a previously-live version from a staged draft, so the target
   cannot be inferred. Capture it at deploy time from `deploy-fastly`'s
@@ -516,20 +525,26 @@ staged version keeps the inherited link (staged code, no config to isolate).
 
 #### 5.5.3 Inputs / outputs
 
-| Input               | Required | Default       | Meaning                                                                                                         |
-| ------------------- | -------- | ------------- | --------------------------------------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                                                                            |
-| `fastly-api-token`  | Yes      | —             | Injected only into the push step.                                                                               |
-| `working-directory` | No       | `.`           | App directory (holds the manifest + typed config).                                                              |
-| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact.                                                                                |
-| `manifest`          | No       | empty         | `edgezero.toml` path relative to `working-directory`.                                                           |
-| `app-config`        | No       | empty         | Typed config file path (default: resolved from the manifest).                                                   |
-| `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).                                                  |
-| `key`               | No       | empty         | Explicit base key for a production push (default: the logical store id). Not allowed with `deploy-to: staging`. |
-| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the same store.                                    |
+| Input               | Required | Default       | Meaning                                                                                                             |
+| ------------------- | -------- | ------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                                                                                |
+| `fastly-api-token`  | Yes      | —             | Injected only into the push step.                                                                                   |
+| `working-directory` | No       | `.`           | App directory (holds the manifest + typed config).                                                                  |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact.                                                                                    |
+| `manifest`          | No       | empty         | `edgezero.toml` path relative to `working-directory`.                                                               |
+| `app-config`        | No       | empty         | Typed config file path (default: resolved from the manifest). Exclusive with `app-config-inline`.                   |
+| `app-config-inline` | No       | empty         | Raw typed-config (TOML) inline — for config in a GitHub variable with no file on disk. Exclusive with `app-config`. |
+| `no-env`            | No       | `false`       | `true` passes `--no-env` (skip the `<APP_NAME>__…__<KEY>` env overlay before pushing).                              |
+| `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).                                                      |
+| `key`               | No       | empty         | Explicit base key for a production push (default: the logical store id). Not allowed with `deploy-to: staging`.     |
+| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the same store.                                        |
 
 Outputs: `pushed-key` (the key that was written — the base key, or the derived
-`_staging` variant), `store` (the resolved logical store id).
+`_staging` variant), `store` (the resolved logical store id),
+`provider-cli-version` (the installed Fastly CLI version), and
+`mutation-attempted` (`true` once the push CLI is invoked; readable via
+`if: always()` on failure so a caller can reconcile the config store rather than
+assume it is unchanged).
 
 A staged deploy plus a staged config push and a healthcheck compose the same way
 the lifecycle trio does (§5.4.4): push staging config, deploy the staged version,

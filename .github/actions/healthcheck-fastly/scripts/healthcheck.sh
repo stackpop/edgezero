@@ -13,6 +13,7 @@ set -euo pipefail
 #   EDGEZERO__LIFECYCLE__SERVICE_ID       required  Fastly service id
 #   EDGEZERO__LIFECYCLE__VERSION          required  version to probe
 #   EDGEZERO__LIFECYCLE__DOMAIN           required  domain to probe
+#   EDGEZERO__LIFECYCLE__PATH             optional  URL path to probe (default: /)
 #   FASTLY_API_TOKEN                      staging-only  provider token (staging-IP resolution)
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__LIFECYCLE__RETRY            optional  attempts before unhealthy (default: 3)
@@ -34,6 +35,16 @@ validate_inputs() {
   require_input_matching fastly-service-id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}" '^[A-Za-z0-9_-]+$'
   require_input_matching fastly-version "${EDGEZERO__LIFECYCLE__VERSION:-}" '^[0-9]+$'
   require_input_matching domain "${EDGEZERO__LIFECYCLE__DOMAIN:-}" '^[A-Za-z0-9._-]+$'
+  # The path is appended to https://<domain> as one curl argument (the CLI
+  # re-validates), so it must begin with '/' and carry no whitespace that would
+  # break the URL or smuggle a second token.
+  local probe_path="${EDGEZERO__LIFECYCLE__PATH:-/}"
+  case "$probe_path" in
+    /*) ;;
+    *) fail "input 'path' must begin with '/' (got '$probe_path')" ;;
+  esac
+  [[ "$probe_path" != *[[:space:]]* ]] ||
+    fail "input 'path' must not contain whitespace (got '$probe_path')"
   # `retry` is a TOTAL attempt count, so 0 is meaningless (the CLI would silently
   # clamp it to 1). Require at least one attempt rather than accept-and-coerce.
   require_input_matching retry "${EDGEZERO__LIFECYCLE__RETRY:-}" '^[1-9][0-9]*$'
@@ -63,6 +74,7 @@ main() {
     --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID"
     --version "$EDGEZERO__LIFECYCLE__VERSION"
     --domain "$EDGEZERO__LIFECYCLE__DOMAIN"
+    --path "${EDGEZERO__LIFECYCLE__PATH:-/}"
     --retry "$EDGEZERO__LIFECYCLE__RETRY"
     --retry-delay "$EDGEZERO__LIFECYCLE__RETRY_DELAY"
     --timeout "$EDGEZERO__LIFECYCLE__TIMEOUT"
