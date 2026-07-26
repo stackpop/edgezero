@@ -109,9 +109,11 @@ cannot be used as a supersession clock.
 - [x] `write_fastly_local_config_store(path, platform_name, entries, gc_roots)`:
   takes exact per-root keep-sets (`gc_roots`), snapshots each root's prior value
   before the upsert, and prunes `prior_chunk_keys − new_keys` in the **same**
-  in-memory rewrite before the single `fs::write`. A suspicious prior pointer
-  warns and prunes nothing. Sibling roots are untouched (canonical, root-scoped
-  keys).
+  in-memory rewrite, persisted by a single ATOMIC temp-file `rename`
+  (`atomically_replace_file`, preserving permissions and following symlinks)
+  under a cross-process advisory lock (`ManifestLock`) that serialises
+  concurrent pushes. A suspicious prior pointer warns and prunes nothing.
+  Sibling roots are untouched (canonical, root-scoped keys).
 - [x] `push_config_entries_local` threads per-root expansion, rejects reserved +
   duplicate keys, and reports best-effort dry-run orphan counts (degrading to
   `unknown` on malformed prior state, never newly failing the dry-run).

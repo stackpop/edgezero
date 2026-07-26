@@ -547,8 +547,12 @@ passed to the writer explicitly — never inferred from the flattened set:
   would drop live config. Such a key is KEPT with a warning, mirroring the
   cloud GC value-based protection. A real chunk payload is a raw fragment (not
   pointer-kind, not a valid envelope) and prunes normally. All within the one
-  `DocumentMut` that the trailing `fs::write` persists —
-  one in-memory rewrite, then one write.
+  `DocumentMut`, which is then persisted by a single ATOMIC replacement
+  (`atomically_replace_file`): the rendered document is written to a sibling
+  temp file whose permissions are copied from the manifest, then `rename`d over
+  the target (following a symlink to the real file). The whole
+  read-modify-write runs under a cross-process advisory lock (`ManifestLock`),
+  so concurrent local pushes serialise and neither loses the other's edit.
 - **Warnings.** `prior_chunk_keys` returning `Err` for a root → collect
   the message; the local push returns it as an extra status line. A
   removal is infallible on an in-memory table, so the only local

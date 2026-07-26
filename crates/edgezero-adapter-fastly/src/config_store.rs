@@ -1,5 +1,6 @@
 //! Fastly adapter config store: wraps `fastly::ConfigStore`.
 
+use std::cell::Cell;
 #[cfg(test)]
 use std::collections::HashMap;
 
@@ -25,21 +26,6 @@ impl FastlyConfigStore {
     fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
             inner: FastlyConfigStoreBackend::InMemory(entries.into_iter().collect()),
-        }
-    }
-
-    /// Synchronous key lookup used by the chunk-pointer resolver callback.
-    /// Returns `Ok(Some(value))`, `Ok(None)` (missing), or `Err(message)`.
-    fn get_sync(&self, key: &str) -> Result<Option<String>, String> {
-        match &self.inner {
-            FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(key).map_err(|err| {
-                // The `key` here is a pointer-controlled chunk key; the resolver
-                // adds a safe position locator, so it is not echoed. The platform
-                // `err` is a fastly SDK type that does not embed the stored value.
-                format!("config store lookup failed: {err}")
-            }),
-            #[cfg(test)]
-            FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(key).cloned()),
         }
     }
 
@@ -71,28 +57,65 @@ impl ConfigStore for FastlyConfigStore {
         let Some(value) = root_value else {
             return Ok(None);
         };
-        // Resolve chunk pointers transparently. Direct BlobEnvelope values
-        // pass through unchanged; pointer values fan out to chunk entries
-        // in the same store. Missing / malformed / hash-mismatched chunks
-        // are corrupt platform state — spec 9.3 (line 6272) calls this an
-        // internal config-store error with re-push remediation, NOT a
-        // transient unavailable. Mapping to `internal` surfaces as HTTP
-        // 500 and pushes operators toward `<app-cli> config push` instead
-        // of waiting for a 503 to clear.
-        let resolved = resolve_fastly_config_value(key, value, |chunk_key| {
-            self.get_sync(chunk_key)
+        // Resolve chunk pointers transparently. Direct BlobEnvelope values and
+        // any other raw value pass through; pointer values fan out to chunk
+        // entries in the same store.
+        //
+        // A chunk fetch can fail two ways, which must NOT collapse to one status:
+        //   - Corrupt state (missing chunk, hash mismatch, a bad/oversized
+        //     derived key) → Internal (HTTP 500) with re-push remediation, per
+        //     spec 9.3. Re-pushing rewrites the generation and fixes it.
+        //   - Transient (invalid store handle, lookup exhaustion, unclassified)
+        //     → Unavailable (HTTP 503). Re-pushing cannot fix request-scoped
+        //     lookup exhaustion, so it must read as retryable, exactly like the
+        //     ROOT lookup above. `transient` records whether any chunk lookup
+        //     hit that class so the outer result can pick the right status.
+        let transient = Cell::new(false);
+        let resolved = resolve_fastly_config_value(key, value, |chunk_key| match &self.inner {
+            FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(chunk_key).map_err(|err| {
+                if is_transient_lookup(&err) {
+                    transient.set(true);
+                }
+                // The pointer-controlled chunk key is not echoed (the resolver
+                // adds a safe position locator); the SDK `err` carries no value.
+                format!("config store lookup failed: {err}")
+            }),
+            #[cfg(test)]
+            FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(chunk_key).cloned()),
         })
         .map_err(|err| {
-            log::warn!(
-                "Fastly config-store chunk resolution failed for `{key}`: {err}. \
+            if transient.get() {
+                log::warn!(
+                    "Fastly config-store chunk lookup for `{key}` was transiently unavailable: {err}"
+                );
+                ConfigStoreError::unavailable("config store temporarily unavailable")
+            } else {
+                log::warn!(
+                    "Fastly config-store chunk resolution failed for `{key}`: {err}. \
                      Re-run `<app-cli> config push` to repair the store."
-            );
-            ConfigStoreError::internal(anyhow::anyhow!(
-                "config store entry is corrupt or incomplete; re-run config push to repair: {err}"
-            ))
+                );
+                ConfigStoreError::internal(anyhow::anyhow!(
+                    "config store entry is corrupt or incomplete; re-run config push to repair: {err}"
+                ))
+            }
         })?;
         Ok(Some(resolved))
     }
+}
+
+/// Is a CHUNK lookup failure environmental (retry) rather than corrupt config
+/// (`config push` to repair)? Mirrors the root lookup's split: a bad or oversized
+/// key/value names corrupt state a re-push rewrites, but an invalid store handle,
+/// lookup exhaustion, or an unclassified/future failure is transient — re-pushing
+/// cannot fix request-scoped lookup exhaustion.
+fn is_transient_lookup(err: &LookupError) -> bool {
+    // A bad or oversized key/value names corrupt state a re-push rewrites;
+    // everything else (invalid store handle, lookup exhaustion, or an
+    // unknown/future variant of this `non_exhaustive` enum) is transient.
+    !matches!(
+        err,
+        LookupError::KeyInvalid | LookupError::KeyTooLong | LookupError::ValueTooLong
+    )
 }
 
 fn map_lookup_error(err: &LookupError) -> ConfigStoreError {
@@ -135,6 +158,20 @@ mod tests {
     fn key_too_long_maps_to_invalid_key_error() {
         let err = map_lookup_error(&LookupError::KeyTooLong);
         assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
+    }
+
+    /// A CHUNK lookup that fails transiently (lookup exhaustion, an invalid
+    /// store handle, or an unclassified error) must keep Unavailable semantics —
+    /// re-pushing cannot repair request-scoped lookup exhaustion. A bad or
+    /// oversized derived key, by contrast, is corrupt state a re-push rewrites.
+    #[test]
+    fn transient_chunk_lookups_are_not_treated_as_corruption() {
+        assert!(is_transient_lookup(&LookupError::TooManyLookups));
+        assert!(is_transient_lookup(&LookupError::ConfigStoreInvalid));
+        assert!(is_transient_lookup(&LookupError::Other));
+        assert!(!is_transient_lookup(&LookupError::KeyInvalid));
+        assert!(!is_transient_lookup(&LookupError::KeyTooLong));
+        assert!(!is_transient_lookup(&LookupError::ValueTooLong));
     }
 
     /// Spec 9.3 (line 6272): missing chunks, hash mismatches, pointer

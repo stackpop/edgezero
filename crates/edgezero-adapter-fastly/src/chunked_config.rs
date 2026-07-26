@@ -64,10 +64,19 @@ struct FastlyChunkPointer {
 
 /// What a stored root value announces itself to be, via `edgezero_kind`.
 enum RootValueKind {
-    /// Not ours — a plain string, a direct `BlobEnvelope`, unrelated JSON, or
-    /// not JSON at all. The Config Store holds arbitrary values, so this is the
-    /// common case and it must be returned verbatim.
+    /// Definitely not ours — a plain string, a scalar, a `BlobEnvelope`, or a
+    /// COMPLETE, parseable JSON object that carries no `edgezero_kind`. The
+    /// Config Store holds arbitrary values, so the runtime returns these
+    /// verbatim, and GC can safely treat them as inert zero-reference roots.
     Foreign,
+    /// Starts like a JSON object (`{`) but does NOT parse. The runtime still
+    /// returns it verbatim, but GC must NOT assume it is inert: it could be a
+    /// TRUNCATED or corrupted chunk pointer whose (unreadable) chunk references
+    /// would be orphaned if we treated it as a zero-reference root. GC fails
+    /// closed on it. Chunk PAYLOADS also land here (a raw envelope fragment
+    /// starting `{"data"...` does not parse), which is why the chunk-shaped
+    /// delete-candidate path is decided before this ever matters.
+    MalformedObject,
     /// One of our v1 chunk pointers.
     Pointer,
     /// Carries our reserved `edgezero_kind` field but names a kind this build
@@ -383,8 +392,10 @@ where
     use edgezero_core::blob_envelope::BlobEnvelope;
 
     match classify_root_value(&root_value) {
-        // Not ours: hand the stored bytes back untouched.
-        RootValueKind::Foreign => return Ok(root_value),
+        // Not ours (a foreign value, or an object-shaped value that does not
+        // parse): the Config Store contract returns stored bytes untouched.
+        // Envelope integrity is the typed app-config layer's job downstream.
+        RootValueKind::Foreign | RootValueKind::MalformedObject => return Ok(root_value),
         RootValueKind::UnknownKind => {
             // The stored `edgezero_kind` is not echoed: it is a value-controlled
             // string on a path whose diagnostics are logged.
@@ -746,14 +757,17 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
 /// pointer. Chunk payloads are raw envelope fragments and essentially never
 /// parse as JSON, let alone carry `edgezero_kind`.
 fn classify_root_value(raw: &str) -> RootValueKind {
-    // Cheap reject before any parsing: one of our pointers is always a JSON
-    // OBJECT, so anything that cannot be one is foreign by inspection. This also
+    // One of our pointers is always a JSON OBJECT. A value that does not even
+    // start like one (a scalar, a string, `greeting = "hello"`) can never be a
+    // pointer, corrupt or otherwise, so it is unambiguously foreign -- and this
     // keeps ordinary string values off the JSON parser entirely.
     if !raw.trim_start().starts_with('{') {
         return RootValueKind::Foreign;
     }
+    // It LOOKS like an object. If it does not parse, it is a malformed object --
+    // possibly a truncated/corrupt pointer -- NOT a value GC may assume is inert.
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return RootValueKind::Foreign;
+        return RootValueKind::MalformedObject;
     };
     match value
         .get("edgezero_kind")
@@ -774,6 +788,18 @@ fn classify_root_value(raw: &str) -> RootValueKind {
 #[cfg(any(feature = "cli", test))]
 pub(crate) fn value_is_pointer_kind(raw: &str) -> bool {
     matches!(classify_root_value(raw), RootValueKind::Pointer)
+}
+
+/// Is this value one GC may safely treat as an INERT, zero-reference root?
+///
+/// True ONLY for a definitively foreign value — a scalar, a plain string, or a
+/// complete JSON object without our discriminator. It is deliberately FALSE for
+/// a malformed object (a possible truncated/corrupt pointer whose chunk
+/// references we cannot read), an unknown-kind value, and a pointer: those must
+/// fail closed, because assuming they reference no chunks could orphan live ones.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
+    matches!(classify_root_value(raw), RootValueKind::Foreign)
 }
 
 /// Classify a ROOT value for `config gc` — the live-set input on a DESTRUCTIVE
@@ -1624,6 +1650,96 @@ mod tests {
         let resolved =
             resolve_fastly_config_value("root", pointer, |key| Ok(chunk_map.get(key).cloned()))
                 .expect("a value stored by v1 must still resolve");
+        assert_eq!(resolved, envelope, "must reconstruct the original bytes");
+    }
+
+    /// FROZEN v1 MULTIBYTE WIRE FORMAT. Pins the codepoint-boundary RETREAT: a
+    /// 4-byte codepoint is placed so it straddles byte 7 000, and chunk 0 is
+    /// hand-split at the retreat boundary (the codepoint's start, 6 998) using a
+    /// frozen rule written out in the test -- never the production writer. If the
+    /// writer's retreat logic ever changes to split elsewhere, the resolver's own
+    /// exact-split replay no longer matches this frozen boundary and the test
+    /// fails, catching a wire-incompatible change that ASCII fixtures cannot.
+    #[test]
+    fn resolver_reads_a_frozen_v1_multibyte_pointer_split_mid_codepoint() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        /// v1 chunk payload boundary, in BYTES. Frozen.
+        const V1_SPLIT: usize = 7_000;
+        const V1_INFIX: &str = ".__edgezero_chunks.";
+        /// A 4-byte codepoint (U+1F980, the crab).
+        const CRAB: &str = "\u{1F980}";
+
+        // Locate where the `frozen` string VALUE begins in the serialised
+        // envelope. The prefix up to it is constant, so a probe measures it.
+        let marker = "\"frozen\":\"";
+        let probe = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "frozen": "" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("probe");
+        let content_start = probe.find(marker).expect("frozen marker") + marker.len();
+
+        // Place the crab so it occupies absolute bytes 6 998..7 002 -- byte 7 000
+        // falls INSIDE it. Pad after it so the envelope exceeds the entry limit.
+        let lead = V1_SPLIT.saturating_sub(2).saturating_sub(content_start);
+        let frozen = format!("{}{CRAB}{}", "v".repeat(lead), "v".repeat(2_000));
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "frozen": frozen }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        assert!(
+            envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT,
+            "fixture must be stored chunked"
+        );
+        assert!(
+            !envelope.is_char_boundary(V1_SPLIT),
+            "byte 7000 must fall mid-codepoint so retreat is exercised"
+        );
+
+        // Frozen retreat rule, hand-written: the largest codepoint boundary
+        // <= 7000. This is what a v1 writer did; it is NOT the production fn.
+        let mut boundary = V1_SPLIT;
+        while boundary > 0 && !envelope.is_char_boundary(boundary) {
+            boundary = boundary.saturating_sub(1);
+        }
+        assert_eq!(boundary, 6_998, "the crab starts at byte 6998");
+
+        let inner_sha = serde_json::from_str::<serde_json::Value>(&envelope)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .expect("envelope sha256");
+        let envelope_sha = sha256_hex(envelope.as_bytes());
+
+        let head = envelope.get(..boundary).expect("codepoint boundary");
+        let tail = envelope.get(boundary..).expect("codepoint boundary");
+        let key0 = format!("root{V1_INFIX}{envelope_sha}.0");
+        let key1 = format!("root{V1_INFIX}{envelope_sha}.1");
+        let pointer = json!({
+            "chunks": [
+                { "key": key0, "len": head.len(), "sha256": sha256_hex(head.as_bytes()) },
+                { "key": key1, "len": tail.len(), "sha256": sha256_hex(tail.as_bytes()) },
+            ],
+            "data_sha256": inner_sha,
+            "edgezero_kind": "fastly_config_chunks",
+            "envelope_len": envelope.len(),
+            "envelope_sha256": envelope_sha,
+            "version": 1_u8,
+        })
+        .to_string();
+
+        let chunk_map: HashMap<String, String> =
+            HashMap::from([(key0, head.to_owned()), (key1, tail.to_owned())]);
+        let resolved =
+            resolve_fastly_config_value("root", pointer, |key| Ok(chunk_map.get(key).cloned()))
+                .expect("a v1 multibyte value split mid-codepoint must resolve");
         assert_eq!(resolved, envelope, "must reconstruct the original bytes");
     }
 

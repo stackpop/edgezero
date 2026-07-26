@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunked_config::{
     CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, chunk_lengths, gc_classify_root,
     gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
-    resolve_fastly_config_value, sha256_hex, value_is_pointer_kind, verify_writer_split_layout,
+    resolve_fastly_config_value, sha256_hex, value_is_inert_foreign, value_is_pointer_kind,
+    verify_writer_split_layout,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -228,6 +229,19 @@ struct FastlyConfigGcPlan {
     /// Prior chunk keys to consider deleting, or a warning to surface
     /// (suspicious prior pointer) that skips GC for this root.
     prior_keys: Result<Vec<String>, String>,
+}
+
+/// An exclusive, cross-process advisory lock covering a local `fastly.toml`
+/// rewrite. Serialises concurrent pushes so their read-modify-write cycles
+/// cannot interleave and lose each other's edits.
+///
+/// The lock is a persistent sidecar file next to the manifest. It is never
+/// unlinked — deleting it would reintroduce a create/lock race between two
+/// processes each making their own lock file. Dropping the guard releases the
+/// OS lock (closing the file descriptor). `File::lock` is advisory, so it only
+/// coordinates other lockers, which is exactly the pushes we control.
+struct ManifestLock {
+    _file: fs::File,
 }
 
 // The three `validate_*` trait methods exist on `Adapter` because
@@ -877,6 +891,28 @@ impl Adapter for FastlyCliAdapter {
     }
 }
 
+impl ManifestLock {
+    fn acquire(manifest_path: &Path) -> Result<Self, String> {
+        let dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = manifest_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fastly.toml");
+        let lock_path = dir.join(format!(".{file_name}.edgezero-lock"));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|err| format!("failed to open lock file {}: {err}", lock_path.display()))?;
+        // Blocks until any other push holding the lock releases it.
+        file.lock()
+            .map_err(|err| format!("failed to lock {}: {err}", lock_path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Fetch a single entry value from a remote Fastly Config Store entry by
 /// key, using `fastly config-store-entry describe --store-id=<id> --key=<k>
 /// --json`. Used by the chunk-pointer resolver to fan out to chunk entries.
@@ -1163,6 +1199,13 @@ fn write_fastly_local_config_store(
 ) -> Result<Vec<String>, String> {
     use toml_edit::{DocumentMut, Item, Table, Value, table};
 
+    // Hold a cross-process advisory lock for the WHOLE read-modify-write. Two
+    // concurrent local pushes would otherwise both read the file, each apply
+    // their own edit, and the later rename would discard the earlier push's
+    // change. Serialising here makes each push read what the previous one wrote
+    // and build on it, so both edits survive. Released when `_lock` drops.
+    let _lock = ManifestLock::acquire(path)?;
+
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
@@ -1289,27 +1332,27 @@ fn write_fastly_local_config_store(
     Ok(warnings)
 }
 
-/// Replace `path`'s contents ATOMICALLY, refusing to clobber a concurrent edit.
+/// Replace `path`'s contents ATOMICALLY. Callers hold [`ManifestLock`] across the
+/// surrounding read-modify-write, so this is not racing another push; the
+/// re-read + compare below is a defence-in-depth corruption check, not the
+/// concurrency guard.
 ///
-/// The local push is a read-modify-write of the developer's `fastly.toml`, and
-/// writing back in place had two failure modes: an interrupted or disk-exhausted
-/// write truncated the real file, and a concurrent push silently dropped
-/// whichever sibling edit landed first.
+/// In order:
 ///
-/// So, in order:
+/// 1. Re-read and require the file to still hold the bytes this rewrite started
+///    from (`expected_before`). Under the lock this always matches; a mismatch
+///    means the file was mutated by something OUTSIDE our push path, so fail
+///    rather than overwrite it.
+/// 2. Resolve a symlinked manifest to its real target, so we update the file the
+///    link points at and leave the link itself intact instead of replacing it
+///    with a regular file.
+/// 3. Write the new contents to a temp file in the target's directory (so the
+///    rename cannot cross a filesystem boundary), copy the target's existing
+///    permissions onto it (so a 0600 manifest does not widen to the umask
+///    default), then `rename` it over the target. `rename` is atomic on POSIX,
+///    so a concurrent reader sees either the old file or the new one.
 ///
-/// 1. Re-read the file and require it to still hold the exact bytes this rewrite
-///    started from (`expected_before`). If another writer moved it in the
-///    meantime, fail WITHOUT writing rather than overwrite their edit. (This
-///    detects the conflict instead of locking it out — a lock file would leave
-///    stale state behind whenever a push is interrupted, which is the worse
-///    failure mode for a developer-facing command.)
-/// 2. Write the new contents to a temp file in the SAME directory, so the
-///    rename below cannot cross a filesystem boundary.
-/// 3. `rename` it over the target. That is atomic on POSIX, so a concurrent
-///    reader sees either the old file or the new one — never a partial write.
-///
-/// The temp file is cleaned up if the rename fails.
+/// The temp file is cleaned up on any failure after it is created.
 fn atomically_replace_file(
     path: &Path,
     expected_before: &str,
@@ -1328,17 +1371,30 @@ fn atomically_replace_file(
         ));
     }
 
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
+    // Follow a symlink to the real file; an absent path canonicalizes to itself.
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("fastly.toml");
     // The pid keeps two concurrent pushes off each other's temp file.
     let tmp = dir.join(format!(".{file_name}.edgezero-{}.tmp", process_id()));
     fs::write(&tmp, contents).map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, path) {
+    // Preserve the manifest's existing permissions so an atomic replace never
+    // broadens access (e.g. a 0600 file must not become the umask default).
+    if let Ok(meta) = fs::metadata(&target)
+        && let Err(err) = fs::set_permissions(&tmp, meta.permissions())
+    {
         let _cleanup = fs::remove_file(&tmp);
-        return Err(format!("failed to replace {}: {err}", path.display()));
+        return Err(format!(
+            "failed to preserve permissions on {}: {err}",
+            target.display()
+        ));
+    }
+    if let Err(err) = fs::rename(&tmp, &target) {
+        let _cleanup = fs::remove_file(&tmp);
+        return Err(format!("failed to replace {}: {err}", target.display()));
     }
     Ok(())
 }
@@ -1897,6 +1953,30 @@ fn classify_store_entries(
             Err(_) if is_chunk_shaped && !value_is_pointer_kind(&item.item_value) => {
                 continue; // a chunk payload: a delete candidate
             }
+            // A definitively FOREIGN entry at an ORDINARY key — a plain string
+            // like `greeting = "hello"`, a scalar, or a complete JSON object
+            // without our discriminator. The runtime returns it verbatim and it
+            // references no chunks, so protect it as a zero-reference root.
+            // Aborting here would let one ordinary sibling block reclamation of
+            // every generation in the store.
+            //
+            // Two guards keep this from ever masking corruption:
+            //   - the value must be provably inert (NOT a malformed object that
+            //     could be a truncated/corrupt pointer, NOT a value claiming our
+            //     namespace) -- otherwise we might orphan chunks a broken root
+            //     still references;
+            //   - the KEY must be outside our reserved `.__edgezero_chunks.`
+            //     namespace. A non-canonical key that still lives in that
+            //     namespace is not an ordinary sibling; we cannot say what it is,
+            //     so it fails closed below rather than being waved through.
+            Err(_)
+                if value_is_inert_foreign(&item.item_value)
+                    && !item.item_key.contains(CHUNK_KEY_INFIX) =>
+            {
+                roots = roots.saturating_add(1);
+                protected.insert(item.item_key.clone());
+                continue;
+            }
             Err(err) => {
                 return Err(format!(
                     "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
@@ -2288,8 +2368,10 @@ fn chunk_key_generation_any(key: &str) -> Option<String> {
 /// the fastly CLI on PATH; production calls it with a closure that
 /// shells out via `create_config_store_entry`. On success returns
 /// the count of committed entries; on failure returns an error
-/// string naming committed / failed / not-attempted keys so the
-/// operator can resume from a known boundary.
+/// string. The FAILED entry's outcome is UNKNOWN — Fastly may have
+/// committed it before returning the error — so the message does not
+/// claim a clean boundary; it directs the operator to re-run the whole
+/// idempotent push rather than hand-resume from a supposed cut point.
 fn push_entries_with_committer<F>(
     entries: &[(String, String)],
     mut committer: F,
@@ -2306,10 +2388,17 @@ where
                 .map(|(remaining_key, _)| remaining_key.as_str())
                 .collect();
             return Err(format!(
-                "fastly push failed at entry `{key}` after committing {committed} of {total} entries; the remaining {remaining_count} entries were NOT pushed.\n  Committed (safe to skip on retry): {pushed:?}\n  Failed: `{key}` — {err}\n  Not attempted (re-push these): {remaining:?}",
+                "fastly push failed at entry `{key}` while committing {committed} of {total} entries.\n  \
+                 The failed entry's outcome is UNKNOWN: Fastly may have committed it before the error \
+                 (a timeout can arrive after the write lands), including when it is the root pointer.\n  \
+                 Recovery: re-run the SAME `config push`. It is idempotent -- chunk keys are content-addressed \
+                 and writes use `--upsert` -- so entries already written are rewritten harmlessly and any \
+                 missing ones are filled. Do NOT hand-delete the failed key.\n  \
+                 Already written (a retry rewrites them): {pushed:?}\n  \
+                 Failed: `{key}` (outcome unknown) -- {err}\n  \
+                 Not attempted: {remaining:?}",
                 committed = pushed.len(),
                 total = entries.len(),
-                remaining_count = remaining.len()
             ));
         }
         pushed.push(key.clone());
@@ -2895,6 +2984,20 @@ mod tests {
             err.contains("committing 2 of 5 entries"),
             "committed/total count: {err}"
         );
+        // The failed entry's outcome is UNKNOWN and recovery is a full idempotent
+        // re-run, not a hand-resume from a claimed boundary.
+        assert!(
+            err.contains("UNKNOWN") && err.contains("outcome unknown"),
+            "failed outcome must be stated unknown: {err}"
+        );
+        assert!(
+            err.contains("re-run the SAME") && err.contains("idempotent"),
+            "recovery must be a full idempotent re-run: {err}"
+        );
+        assert!(
+            !err.contains("safe to skip on retry"),
+            "must not claim committed entries can be skipped from a known boundary: {err}"
+        );
     }
 
     #[test]
@@ -2933,8 +3036,8 @@ mod tests {
         .expect_err("last-entry failure");
         assert!(err.contains("committing 2 of 3"), "n-1 committed: {err}");
         assert!(
-            err.contains("the remaining 0 entries"),
-            "zero not-attempted when last fails: {err}"
+            err.contains("Not attempted: []"),
+            "zero not-attempted when the last entry fails: {err}"
         );
     }
 
@@ -6430,6 +6533,49 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
+    /// A legitimate FOREIGN sibling (the documented `greeting = "hello"`) must
+    /// NOT block store-wide GC. The runtime returns such a value verbatim, so GC
+    /// protects it as a zero-reference root and still reclaims an unrelated dead
+    /// generation, rather than aborting the whole pass.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reclaims_despite_a_foreign_sibling_value() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+
+        let mut listing = vec![
+            listed_root(TEST_CONFIG_ID, &live, 172_800),
+            // A plain, non-envelope, non-pointer sibling entry.
+            (
+                "greeting".to_owned(),
+                stamp_secs_ago(172_800),
+                "hello".to_owned(),
+            ),
+        ];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("a foreign sibling must not abort GC");
+        for key in &dead_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "the dead generation must still be reclaimed: `{key}`"
+            );
+        }
+        assert!(
+            !oplog_has(&oplog, "delete greeting"),
+            "the foreign sibling must never be deleted"
+        );
+    }
+
     /// A dry-run lists exactly what it would delete, and deletes nothing.
     #[cfg(unix)]
     #[test]
@@ -7028,6 +7174,59 @@ echo 'unexpected' >&2; exit 1
             before,
             "dry-run must not edit fastly.toml"
         );
+    }
+
+    /// Two concurrent local pushes must not lose each other's edit. Each thread
+    /// adds a DISTINCT key; the cross-process lock serialises the whole
+    /// read-modify-write, so the second push reads what the first wrote and both
+    /// keys survive. Without the lock, both would read the same base and the
+    /// later rename would discard the earlier key -- the silent data loss.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_local_pushes_do_not_lose_edits() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().expect("tempdir");
+        let path = Arc::new(dir.path().join("fastly.toml"));
+        fs::write(path.as_ref(), "name = \"demo\"\n").expect("seed");
+
+        // Many rounds to make the interleaving likely to hit the race window.
+        for round in 0_u32..25 {
+            let path_a = Arc::clone(&path);
+            let path_b = Arc::clone(&path);
+            let key_a = format!("alpha_{round}");
+            let key_b = format!("beta_{round}");
+            let (ka, kb) = (key_a.clone(), key_b.clone());
+            let ta = thread::spawn(move || {
+                write_fastly_local_config_store(
+                    &path_a,
+                    TEST_CONFIG_ID,
+                    &[(ka, "a".to_owned())],
+                    &[],
+                )
+            });
+            let tb = thread::spawn(move || {
+                write_fastly_local_config_store(
+                    &path_b,
+                    TEST_CONFIG_ID,
+                    &[(kb, "b".to_owned())],
+                    &[],
+                )
+            });
+            ta.join().expect("thread a").expect("push a");
+            tb.join().expect("thread b").expect("push b");
+
+            let after = fs::read_to_string(path.as_ref()).expect("read back");
+            assert!(
+                after.contains(&format!("{key_a} = \"a\"")),
+                "round {round}: `{key_a}` was lost by a concurrent push:\n{after}"
+            );
+            assert!(
+                after.contains(&format!("{key_b} = \"b\"")),
+                "round {round}: `{key_b}` was lost by a concurrent push:\n{after}"
+            );
+        }
     }
 
     /// A concurrent edit to `fastly.toml` between the push's read and its write

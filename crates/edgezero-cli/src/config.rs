@@ -3779,10 +3779,6 @@ ids = ["default"]
         GUARD.get_or_init(|| Mutex::new(()))
     }
 
-    /// Build a tempdir containing a `spin` script that emits fixed
-    /// stdout/stderr and exits with the given code. Payloads are written
-    /// to sidecar files so shell-active chars are never re-interpreted.
-    #[cfg(unix)]
     /// Build a tempdir containing a `fastly` script that APPENDS every
     /// invocation to `oplog` and fails. Injected via PATH so an ordering
     /// regression is caught as a recorded invocation instead of silently
@@ -3803,6 +3799,10 @@ ids = ["default"]
         tmp
     }
 
+    /// Build a tempdir containing a `spin` script that emits fixed
+    /// stdout/stderr and exits with the given code. Payloads are written
+    /// to sidecar files so shell-active chars are never re-interpreted.
+    #[cfg(unix)]
     fn fake_spin_returning(
         stdout_body: &str,
         stderr_body: &str,

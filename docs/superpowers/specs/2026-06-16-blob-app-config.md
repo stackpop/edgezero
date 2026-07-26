@@ -6311,27 +6311,39 @@ Fastly write algorithm:
    }
    ```
 
-Read algorithm:
+Read algorithm. The store layer resolves ONLY our own chunk pointers and
+returns every other value verbatim — a Config Store holds arbitrary
+entries, and the shared `ConfigStore` contract requires `get` to return
+what is stored. It does NOT parse or verify a direct `BlobEnvelope`;
+that is the typed app-config extractor's job (it deserialises and
+`verify()`s after the read), so the store treats a direct envelope as
+just another raw value.
 
 - Read `<KEY>`.
-- If it parses as a normal `BlobEnvelope`, verify the envelope. A
-  valid direct envelope is returned unchanged; a parsed envelope with
-  a SHA/version verification failure is an error.
-- Only when `<KEY>` does not parse as a `BlobEnvelope`, try parsing it
-  as `edgezero_kind = "fastly_config_chunks"`. Read each listed
-  chunk, verify each chunk hash and length, concatenate in pointer
-  order, verify `envelope_sha256` and `envelope_len`, then return the
-  reconstructed normal `BlobEnvelope` JSON string to the caller. Core
-  extraction, `config diff`, and skip-on-equal still operate on the
-  same `BlobEnvelope` shape as every other adapter.
+- If the value announces `edgezero_kind = "fastly_config_chunks"`, read
+  each listed chunk, verify each chunk hash and length, concatenate in
+  pointer order, verify `envelope_sha256`, `envelope_len`, and the exact
+  writer split layout, then return the reconstructed `BlobEnvelope` JSON
+  string. Core extraction, `config diff`, and skip-on-equal operate on
+  the same `BlobEnvelope` shape as every other adapter.
+- Any value WITHOUT that discriminator — a direct `BlobEnvelope`, an
+  unrelated raw string like `"hello"`, arbitrary JSON — is returned
+  VERBATIM, unparsed.
+- A value carrying an UNKNOWN `edgezero_kind` is an error: that field is
+  our reserved namespace, so an unrecognised value in it is corrupt or
+  future-versioned state, not an ordinary entry.
 
 Failure semantics:
 
-- A failed chunk write before the pointer update leaves the
-  previous root pointer/envelope active.
-- A failed root-pointer write leaves the previous config active;
-  retrying the same push is safe because chunk keys are content-
-  addressed.
+- Chunks are written first and the root pointer LAST. A failed chunk
+  write before the pointer update never touches the root pointer, so the
+  previous config still resolves; a re-run fills the missing chunk.
+- A failed root-pointer write has an UNKNOWN outcome — Fastly may have
+  committed it before returning the error (a timeout can arrive after the
+  write lands). Do NOT assume the previous config is still active. The
+  recovery is to re-run the SAME push: it is idempotent (chunk keys are
+  content-addressed and writes use `--upsert`), so it converges to the
+  intended state whether or not the pointer write actually landed.
 - Missing chunks, chunk-hash mismatches, pointer parse failures,
   or full-envelope hash mismatches are corrupt platform state.
   CLI read-back/diff errors must name the root key and the failed
