@@ -36,13 +36,22 @@ main() {
   export EDGEZERO__PROVIDER__ENV
 
   new_private_log
-  # Record that a provider mutation is being ATTEMPTED before the CLI runs. This
-  # output is written first so it survives a failed step (readable via
-  # `if: always()`): if the deploy succeeds but its canonical `version=` line is
-  # missing/malformed below, or the CLI fails after partially mutating, the caller
+  local rc=0
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+
+  # Signal a POSSIBLE provider mutation only if the CLI was actually invoked — the
+  # engine prints its `cli-invoked` marker immediately before running the CLI, so
+  # a failure during setup (binary resolve, cd, credential import) does NOT claim
+  # a mutation. Emitted regardless of the CLI's own exit so it survives a failed
+  # step (readable via `if: always()`): if the deploy then succeeds but its
+  # `version=` line is lost, or the CLI fails after partially mutating, the caller
   # can still reconcile provider state instead of assuming nothing happened.
-  append_output mutation-attempted true
-  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG"
+  if grep -qx '\[edgezero-action\] cli-invoked' "$LIFECYCLE_LOG"; then
+    append_output mutation-attempted true
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    fail_with "$rc" "deploy failed (CLI exit $rc or setup error before invocation)"
+  fi
 
   local version
   version=$(read_numeric_line version "$LIFECYCLE_LOG")

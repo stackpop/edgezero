@@ -711,33 +711,37 @@ else
 fi
 child() {
   local own="\${SECRET_TOKEN-unset}"
-  local anc="n/a" ghenv="n/a"
+  local anc="n/a" ghenv="n/a" ghout="n/a"
   if [[ -r "/proc/\$PPID/environ" ]]; then
-    if tr '\0' '\n' <"/proc/\$PPID/environ" | grep -q '^SECRET_TOKEN='; then anc="leaked"; else anc="clean"; fi
-    # GITHUB_ENV is NOT a provider credential and is never named in
-    # provider-env-clear, yet its real path must also be gone from the ancestor:
-    # otherwise a build script recovers it here and appends LD_PRELOAD to the real
-    # file, which the runner applies to a later, secret-bearing step.
-    if tr '\0' '\n' <"/proc/\$PPID/environ" | grep -q '^GITHUB_ENV='; then ghenv="leaked"; else ghenv="clean"; fi
+    local env_dump
+    env_dump=\$(tr '\0' '\n' <"/proc/\$PPID/environ")
+    if grep -q '^SECRET_TOKEN=' <<<"\$env_dump"; then anc="leaked"; else anc="clean"; fi
+    # The GitHub file-command channels are NOT provider credentials and are never
+    # named in provider-env-clear, yet their real paths must also be gone from the
+    # ancestor: otherwise a build script recovers one, derives the sibling
+    # GITHUB_ENV, and appends LD_PRELOAD to the real file for a later step.
+    if grep -q '^GITHUB_ENV=' <<<"\$env_dump"; then ghenv="leaked"; else ghenv="clean"; fi
+    if grep -q '^GITHUB_OUTPUT=' <<<"\$env_dump"; then ghout="leaked"; else ghout="clean"; fi
   fi
-  printf 'own=[%s] ancestor=[%s] ghenv=[%s]' "\$own" "\$anc" "\$ghenv"
+  printf 'own=[%s] anc=[%s] ghenv=[%s] ghout=[%s]' "\$own" "\$anc" "\$ghenv" "\$ghout"
 }
 export -f child
 bash -c child
 PROBE
   chmod +x "$probe"
 
-  # GITHUB_ENV is set in the environment but deliberately NOT in PROBE_CLEAR — only
-  # the unconditional file-command strip can remove it.
+  # GITHUB_ENV / GITHUB_OUTPUT are set in the environment but deliberately NOT in
+  # PROBE_CLEAR — only the unconditional file-command strip can remove them.
   local scrubbed
   scrubbed=$(SECRET_TOKEN=super-secret GITHUB_ENV="$WORK_DIR/fake-github-env" \
+    GITHUB_OUTPUT="$WORK_DIR/fake-github-output" \
     PROBE_CLEAR='["SECRET_TOKEN"]' bash "$probe")
   case "$scrubbed" in
-    'own=[unset] ancestor=[clean] ghenv=[clean]' | 'own=[unset] ancestor=[n/a] ghenv=[n/a]')
-      assert_equals "neither the credential nor GITHUB_ENV leaks from the scrubbed ancestor" "ok" "ok" ;;
+    'own=[unset] anc=[clean] ghenv=[clean] ghout=[clean]' | 'own=[unset] anc=[n/a] ghenv=[n/a] ghout=[n/a]')
+      assert_equals "no credential or GitHub file-command path leaks from the scrubbed ancestor" "ok" "ok" ;;
     *)
-      assert_equals "neither the credential nor GITHUB_ENV leaks from the scrubbed ancestor" \
-        "own=[unset] ancestor=[clean|n/a] ghenv=[clean|n/a]" "$scrubbed" ;;
+      assert_equals "no credential or GitHub file-command path leaks from the scrubbed ancestor" \
+        "own=[unset] anc=[clean|n/a] ghenv=[clean|n/a] ghout=[clean|n/a]" "$scrubbed" ;;
   esac
 
   # An unrelated variable must survive the re-exec.
@@ -1591,6 +1595,121 @@ test_mutation_attempted_signal() {
 }
 
 # ---------------------------------------------------------------------------
+# publish-outputs.sh — the trusted output boundary of the two-step build.
+# ---------------------------------------------------------------------------
+test_publish_outputs() {
+  section "publish-outputs (trusted output boundary)"
+  local dir="$WORK_DIR/publish"
+  rm -rf "$dir"
+  mkdir -p "$dir/rt"
+  local pub="$ACTIONS_DIR/build-app-cli/scripts/publish-outputs.sh"
+  touch "$dir/rt/edgezero-cli.tar"
+
+  # A valid handoff, with a TAMPERED trailing duplicate tarball-path: first wins.
+  {
+    printf 'app-cli-version=1.2.3\n'
+    printf 'app-cli-package=my-cli\n'
+    printf 'app-cli-bin=my-cli\n'
+    printf 'app-cli-artifact=edgezero-cli\n'
+    printf 'tarball-path=%s\n' "$dir/rt/edgezero-cli.tar"
+    printf 'tarball-path=/evil/hijack.tar\n'
+  } >"$dir/outputs.env"
+  local out="$dir/gh-output"
+  : >"$out"
+  RUNNER_TEMP="$dir/rt" EDGEZERO__BUILD__OUTPUTS_FILE="$dir/outputs.env" GITHUB_OUTPUT="$out" \
+    bash "$pub" >/dev/null 2>&1
+  assert_succeeds "publishes the legit tarball-path (first occurrence)" \
+    grep -qx "tarball-path=$dir/rt/edgezero-cli.tar" "$out"
+  assert_fails "ignores a tampered trailing duplicate tarball-path" \
+    grep -qx 'tarball-path=/evil/hijack.tar' "$out"
+  assert_succeeds "publishes the version" grep -qx 'app-cli-version=1.2.3' "$out"
+
+  # A tarball-path escaping the action-owned temp root is refused.
+  printf 'app-cli-version=1\napp-cli-package=p\napp-cli-bin=b\napp-cli-artifact=a\ntarball-path=/etc/passwd\n' \
+    >"$dir/escape.env"
+  assert_fails_with "a tarball-path outside RUNNER_TEMP is refused" \
+    "not beneath the action-owned temp root" \
+    env RUNNER_TEMP="$dir/rt" EDGEZERO__BUILD__OUTPUTS_FILE="$dir/escape.env" GITHUB_OUTPUT="$dir/o2" \
+    bash "$pub"
+
+  # A missing required output fails closed.
+  printf 'app-cli-version=1\n' >"$dir/partial.env"
+  assert_fails "a missing required output fails closed" \
+    env RUNNER_TEMP="$dir/rt" EDGEZERO__BUILD__OUTPUTS_FILE="$dir/partial.env" GITHUB_OUTPUT="$dir/o3" \
+    bash "$pub"
+
+  # The compile step must blank every GitHub file-command channel (structural
+  # guard against a regression that reintroduces one).
+  local yml="$ACTIONS_DIR/build-app-cli/action.yml" ch
+  for ch in GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY; do
+    assert_succeeds "compile step blanks $ch" grep -qE "^[[:space:]]+$ch: \"\"" "$yml"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# cleanup_sensitive_temps — a removal FAILURE must fail the action (§13), while
+# a real error code is preserved.
+# ---------------------------------------------------------------------------
+test_cleanup_sensitive_temps() {
+  section "sensitive temp cleanup surfaces failures"
+  local lib="$ACTIONS_DIR/deploy-core/scripts/common.sh"
+  local dir="$WORK_DIR/cleanup-sensitive"
+  rm -rf "$dir"
+  mkdir -p "$dir/undeletable"
+
+  local f="$dir/f" rc=0
+  : >"$f"
+  bash -c "source '$lib'; trap \"cleanup_sensitive_temps '$f'\" EXIT; exit 0" || rc=$?
+  assert_succeeds "a successful cleanup preserves exit 0" test "$rc" -eq 0
+  assert_fails "the sensitive file is removed" test -e "$f"
+
+  # `rm -f` cannot remove a directory, so this deterministically fails regardless
+  # of uid (root included).
+  rc=0
+  bash -c "source '$lib'; trap \"cleanup_sensitive_temps '$dir/undeletable'\" EXIT; exit 0" >/dev/null 2>&1 || rc=$?
+  assert_succeeds "a cleanup failure on a clean exit fails the action" test "$rc" -ne 0
+
+  rc=0
+  bash -c "source '$lib'; trap \"cleanup_sensitive_temps '$dir/undeletable'\" EXIT; exit 5" >/dev/null 2>&1 || rc=$?
+  assert_succeeds "a cleanup failure preserves the original non-zero exit" test "$rc" -eq 5
+}
+
+# ---------------------------------------------------------------------------
+# deploy.sh — mutation-attempted must reflect ACTUAL invocation, not setup.
+# ---------------------------------------------------------------------------
+test_deploy_signal_timing() {
+  section "deploy mutation-attempted timing"
+  local dir="$WORK_DIR/deploy-signal"
+  rm -rf "$dir"
+  mkdir -p "$dir/bin" "$dir/app" "$dir/rt"
+  printf '#!/usr/bin/env bash\necho "version=42"\n' >"$dir/bin/fakecli"
+  chmod +x "$dir/bin/fakecli"
+  printf 'FASTLY_API_TOKEN\0FASTLY_SERVICE_ID\0' >"$dir/clear.nul"
+
+  run_deploy() {
+    env -i PATH="$dir/bin:$PATH" RUNNER_TEMP="$dir/rt" GITHUB_OUTPUT="$dir/out" \
+      EDGEZERO__FASTLY__API_TOKEN=tok EDGEZERO__FASTLY__SERVICE_ID=svc123 \
+      EDGEZERO__APP__CLI__BIN="$1" EDGEZERO__ADAPTER=fastly \
+      EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
+      EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
+      bash "$ACTIONS_DIR/deploy-fastly/scripts/deploy.sh"
+  }
+
+  # The CLI is invoked and succeeds: both signal and version are emitted.
+  : >"$dir/out"
+  assert_succeeds "a successful deploy exits 0" run_deploy fakecli
+  assert_succeeds "an invoked deploy signals mutation-attempted" \
+    grep -qx 'mutation-attempted=true' "$dir/out"
+  assert_succeeds "an invoked deploy emits fastly-version" grep -qx 'fastly-version=42' "$dir/out"
+
+  # Setup fails BEFORE invocation (the CLI binary is missing): NO false signal.
+  : >"$dir/out"
+  assert_fails "a deploy that never reaches the CLI fails" run_deploy nonexistent-bin
+  assert_fails "a deploy that never reaches the CLI does NOT signal mutation-attempted" \
+    grep -qx 'mutation-attempted=true' "$dir/out"
+}
+
+# ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
@@ -1614,6 +1733,9 @@ main() {
   test_config_push_argv
   test_healthcheck_path
   test_mutation_attempted_signal
+  test_publish_outputs
+  test_cleanup_sensitive_temps
+  test_deploy_signal_timing
   test_exit_propagation
   test_dirty_source_guard
   test_cache_key

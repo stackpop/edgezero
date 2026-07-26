@@ -261,6 +261,9 @@ main() {
   tarball=$(canonical_path "$tarball")
 
   notice "built app CLI '$cli_bin' v$cli_version from package '$cli_package'"
+  # Start the outputs handoff file fresh so a retried compile step never leaves a
+  # previous run's lines for the publish step's first-occurrence-wins parse.
+  [[ -z "${EDGEZERO__ACTION__OUTPUT_FILE:-}" ]] || : >"${EDGEZERO__ACTION__OUTPUT_FILE}"
   append_output app-cli-version "$cli_version"
   append_output app-cli-package "$cli_package"
   append_output app-cli-bin "$cli_bin"

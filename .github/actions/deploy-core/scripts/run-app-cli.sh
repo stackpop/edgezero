@@ -192,6 +192,11 @@ main() {
   fi
 
   cd "$working_directory"
+  # A stable marker, emitted ONLY after all setup succeeded and immediately before
+  # the CLI runs. A wrapper greps for it to decide whether a provider mutation
+  # could have started — so a failure BEFORE this point (binary resolve, cd,
+  # credential import) never falsely claims the CLI was invoked.
+  echo "[edgezero-action] cli-invoked" >&2
   echo "[edgezero-action] running $cli_bin $mode for adapter $adapter" >&2
   "${ARGV[@]}"
 }

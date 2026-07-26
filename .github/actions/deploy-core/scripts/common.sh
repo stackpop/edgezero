@@ -206,7 +206,27 @@ new_private_log() {
   LIFECYCLE_LOG=$(mktemp "$dir/edgezero-lifecycle.XXXXXX")
   chmod 600 "$LIFECYCLE_LOG"
   # shellcheck disable=SC2064  # expand LIFECYCLE_LOG now, not at trap time
-  trap "rm -f -- '$LIFECYCLE_LOG'" EXIT
+  trap "cleanup_sensitive_temps '$LIFECYCLE_LOG'" EXIT
+}
+
+# EXIT-trap cleanup for sensitive temp files (the private log; an inline config).
+# A removal FAILURE must not be swallowed: these files can hold provider output
+# or raw config, so a leftover is a real exposure the spec requires the action to
+# surface (§13, "Cleanup fails → mark the action failed"). The original exit code
+# is preserved; only a clean (0) exit is escalated to 1, so a real error is never
+# masked. Re-installing callers pass ALL files to remove (a bare `trap` REPLACES).
+cleanup_sensitive_temps() {
+  local rc=$?
+  local file failed=0
+  for file in "$@"; do
+    [[ -e "$file" ]] || continue
+    rm -f -- "$file" || failed=1
+  done
+  if [[ "$failed" -ne 0 ]]; then
+    echo "::error::failed to remove a sensitive temporary file" >&2
+    [[ "$rc" -eq 0 ]] && rc=1
+  fi
+  exit "$rc"
 }
 
 # Read a canonical `<key>=<digits>` line from a log.

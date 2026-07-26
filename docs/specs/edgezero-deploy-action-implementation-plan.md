@@ -219,12 +219,15 @@ reference to port from. Most transfer with light changes:
    - `config-push-fastly` wrapper: a **thin** composite mirroring
      `healthcheck-fastly` / `rollback-fastly` (not the heavy `deploy` path).
      Inputs `app-cli-artifact`, `app-cli-bin`, `fastly-api-token`,
-     `working-directory`, `manifest`, `app-config`, `store`, `key`, `deploy-to`
+     `working-directory`, `manifest`, `app-config`, `app-config-inline` (raw TOML
+     with no file on disk — mutually exclusive with `app-config`), `no-env`
+     (`true` passes `--no-env`), `store`, `key`, `deploy-to`
      (`production`/`staging`, validated + fail-closed). Downloads the CLI artifact,
      installs the pinned Fastly CLI (the push shells out to
      `fastly config-store-entry update`), and calls the CLI directly with
      `FASTLY_API_TOKEN` in the step env — the adapter's own convention — with
-     every other `FASTLY_*` alias blanked. Outputs `pushed-key`, `store`.
+     every other `FASTLY_*` alias blanked. Outputs `pushed-key`, `store`,
+     `provider-cli-version`, and `mutation-attempted`.
    - Contract + smoke coverage: a `config-push.sh` argv test (staging appends
      `--staging`; production does not); the smoke fixture's fake `fastly` gains
      `config-store list` / `config-store-entry` handlers, and a staged push

@@ -53,8 +53,8 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Build application CLI package
-      id: build
+    - name: Compile application CLI package
+      id: compile
       shell: bash
       env:
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
@@ -63,6 +63,10 @@ runs:
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__PROJECT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
         EDGEZERO__APP__CLI__ARTIFACT: ${{ inputs['app-cli-artifact'] }}
+        # This step runs app-controlled code, so it emits NO outputs through the
+        # runner's GITHUB_OUTPUT (blanked below). It collects them into this
+        # action-owned file; the separate "Publish CLI outputs" step re-emits them.
+        EDGEZERO__ACTION__OUTPUT_FILE: ${{ runner.temp }}/edgezero-build-app-cli-outputs.env
         # This step runs APP-CONTROLLED code (cargo metadata/build, and the built
         # CLI's `--help`), which must never see a provider token.
         #
@@ -87,6 +91,21 @@ runs:
         # is sourced.
         BASH_ENV: ""
         ENV: ""
+        # Isolate the app-controlled build from the runner's command storage. The
+        # runner keeps GITHUB_ENV/OUTPUT/PATH/STATE/step-summary as files in ONE
+        # directory, so holding ANY of their real paths lets a build script derive
+        # the siblings and append (e.g.) LD_PRELOAD to the real GITHUB_ENV — which
+        # the runner then applies to a LATER, secret-bearing step. Blank them all
+        # here (and the re-exec strips them from the process image); outputs are
+        # emitted by the separate publish step. NOTE: this closes the env/proc
+        # vectors, but a fully malicious build can still enumerate the runner's
+        # command directory at the same uid — so a provider secret must never share
+        # a step or job with the build (see the guide's security notes).
+        GITHUB_OUTPUT: ""
+        GITHUB_ENV: ""
+        GITHUB_PATH: ""
+        GITHUB_STATE: ""
+        GITHUB_STEP_SUMMARY: ""
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
@@ -119,22 +138,58 @@ runs:
       # `provider-env-clear` names stripped.
       run: exec "$GITHUB_ACTION_PATH/scripts/build-app-cli.sh"
 
+    # The trusted output boundary: a step that runs NO app-controlled code reads
+    # the compile step's handoff file and re-emits the outputs to the real
+    # GITHUB_OUTPUT, re-validating each (first-occurrence-wins; tarball-path
+    # confined to the action-owned temp area). Its `id` is `build` so the action's
+    # `outputs:` mapping (steps.build.outputs.*) is unchanged for consumers.
+    - name: Publish CLI outputs
+      id: build
+      shell: bash
+      env:
+        EDGEZERO__BUILD__OUTPUTS_FILE: ${{ runner.temp }}/edgezero-build-app-cli-outputs.env
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      run: exec "$GITHUB_ACTION_PATH/scripts/publish-outputs.sh"
+
     # A script-level scrub cannot reach a LATER step: each step gets its own
     # process with the job environment re-applied. This non-provider step blanks
     # the SHIPPED aliases itself rather than inheriting them.
     #
     # A `uses:` step's `env:` is static, so it CANNOT blank a caller's custom
-    # `provider-env-clear` alias (only the build step, which runs a script, can do
-    # that dynamically). That is an accepted boundary: this step runs no
-    # application code — it hands a fixed tarball path to a pinned first-party
-    # action. And app-controlled build code cannot smuggle its own code INTO this
-    # step: the build step runs every app-controlled command (cargo, the built
-    # CLI) with the `$GITHUB_ENV`/`$GITHUB_PATH` file channels neutralized, so it
-    # cannot inject an environment variable (e.g. `LD_PRELOAD`) or PATH entry that
-    # this later step would apply. So even a custom secret reaching here is not
-    # exposed to attacker-controlled execution. A caller who must keep a custom
-    # secret out of EVERY step should scope it to the step that needs it rather
-    # than to job-level `env:`.
+    # `provider-env-clear` alias (only the compile step, which runs a script, can
+    # do that dynamically). That is an accepted boundary: this step runs no
+    # application code — it hands the publish step's confined tarball path to a
+    # pinned first-party action. The compile step runs every app-controlled command
+    # with all GitHub file-command channels blanked, so a build script cannot
+    # inject an environment variable (e.g. `LD_PRELOAD`) or PATH entry into this
+    # later step through them. That closes the demonstrated vectors, but is not a
+    # hard boundary against a fully malicious same-uid build (see the compile
+    # step's note): a custom provider secret should be scoped to the one step that
+    # needs it, never to job-level `env:` shared with the build.
     - name: Upload CLI artifact
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       env:

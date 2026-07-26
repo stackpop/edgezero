@@ -254,9 +254,14 @@ Workflow shape:
    `deploy-args: ["--comment", …]`; capture `fastly-version` and, for a
    production deploy, `previous-version` (the rollback target). If the deploy step
    FAILS but its `mutation-attempted` output is `true`, treat the service as
-   possibly mutated: reconcile (or run the rollback) rather than assume nothing
-   deployed — a lost/malformed `fastly-version` line fails the step even though
-   the deploy may have happened. Read `mutation-attempted` under `if: always()`;
+   possibly mutated rather than assume nothing deployed — a lost/malformed
+   `fastly-version` line fails the step even though the deploy may have happened.
+   Read `mutation-attempted` under `if: always()`; since you then lack the version
+   to roll back _from_, recover it from the provider — run `active-version`
+   (`<app-cli> active-version --adapter fastly --service-id <id>` prints
+   `version=<N>`), and if `<N>` differs from the pre-deploy `previous-version`,
+   call `rollback-fastly` with `fastly-version: <N>` and
+   `rollback-to: <previous-version>` (the deploy guide shows the exact steps);
 5. run `healthcheck-fastly` with the CLI artifact, `fastly-service-id`,
    `deploy-to`, `domain`, an optional `path` (default `/`; e.g. `/health` — it
    covers production and a staged version alike), and the captured

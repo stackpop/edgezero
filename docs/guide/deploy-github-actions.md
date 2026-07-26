@@ -175,10 +175,27 @@ in two layers:
   `BASH_ENV`/`ENV` are blanked as well, since a shell sources them at startup —
   before that scrub can run.
 
-Your build code also cannot _reach out_ of this step: it runs with the
-`$GITHUB_ENV`/`$GITHUB_PATH` file channels neutralized, so a malicious build
-script cannot append (for example) `LD_PRELOAD` and have a later step — such as
-the artifact upload — execute it.
+Your build code also cannot easily _reach out_ of this step. It runs with **every**
+GitHub file-command channel blanked (`GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH`,
+`GITHUB_STATE`, `GITHUB_STEP_SUMMARY`) — and the re-exec strips them from the
+process image too, so a build script cannot recover one path and derive the
+sibling `GITHUB_ENV` to append (for example) `LD_PRELOAD` for a later,
+secret-bearing step. Because the compile step emits nothing through
+`GITHUB_OUTPUT`, a **separate** publish step (which runs no application code)
+collects the build's outputs and emits them, re-validating each (`tarball-path`,
+which drives the upload, is confined to the action's own temp area).
+
+> **Security boundary — read this.** These layers defend against _accidental_
+> leakage and low-effort exfiltration; they are **not** a hard boundary against a
+> deliberately malicious build. Your build runs as the same OS user as the rest of
+> the job, so it can still reach the runner's command storage directly (for
+> example by listing `$RUNNER_TEMP/_runner_file_commands/`) or read other
+> job state on disk. The only robust rule is: **never expose a provider secret to
+> any step or job that also builds application code.** Pass provider tokens only to
+> the deploy / lifecycle steps (as this guide does), scope any custom secret to the
+> single step that needs it, and — if you must run a genuinely untrusted build —
+> run `build-app-cli` in a separate job from every secret-bearing step, or sandbox
+> the build.
 
 The default `provider-env-clear` list repeats the shipped aliases so the dynamic
 layer is self-contained. Add your own provider's aliases if you have one:
@@ -192,10 +209,10 @@ layer is self-contained. Add your own provider's aliases if you have one:
 ```
 
 The value must be a JSON array of non-empty variable names; anything else fails
-the build rather than silently scrubbing nothing. Note the boundary: a custom
-alias is guaranteed stripped from the build step (which runs your code); the
-upload step runs no application code, so if you must keep a secret out of _every_
-step, scope it to the step that needs it rather than to job-level `env:`.
+the build rather than silently scrubbing nothing. A custom alias is scrubbed from
+the compile step's environment, but — per the security boundary above — treat that
+as defense-in-depth, not a guarantee against a malicious build: keep the secret
+out of the build's job entirely, or scope it to the one step that needs it.
 
 ### `deploy-fastly`
 
@@ -221,6 +238,32 @@ CLI is invoked; if the action fails, read it via `if: always()` to know a deploy
 may have occurred and reconcile rather than assume nothing happened.
 Thread `previous-version` into `rollback-fastly`'s `rollback-to` so a later
 rollback has a real target (Fastly cannot infer one — see `rollback-fastly`).
+
+**If a deploy fails with `mutation-attempted=true` but no `fastly-version`** (the
+CLI ran and may have activated a version, but its version line was lost), you
+cannot roll back blindly — `rollback-fastly` needs the current version to roll
+back _from_. Recover it from the provider instead of guessing:
+
+1. Read the version that is live **now** — run `<app-cli> active-version --adapter
+fastly --service-id <id>` using the same `build-app-cli` artifact (it prints
+   `version=<N>`). That `<N>` is what the deploy activated.
+2. Compare it to the `previous-version` you captured _before_ the deploy. If they
+   are equal, nothing was activated and there is nothing to undo.
+3. If they differ, roll back: call `rollback-fastly` with `fastly-version: <N>`
+   (the current version, from step 1) and `rollback-to: <previous-version>`.
+
+```yaml
+- id: recover
+  if: failure() && steps.deploy.outputs['mutation-attempted'] == 'true'
+  run: |
+    "$CLI" active-version --adapter fastly --service-id "$SVC"   # prints version=<N>
+- if: failure() && steps.recover.outputs.version != steps.deploy.outputs['previous-version']
+  uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
+  with:
+    fastly-version: ${{ steps.recover.outputs.version }}
+    rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
+    # …credentials, service-id…
+```
 
 The action always adds `--non-interactive` to the deploy itself, so a deploy
 declared as an `edgezero.toml` command (`[adapters.fastly.commands] deploy =

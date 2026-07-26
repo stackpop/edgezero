@@ -38,8 +38,14 @@ append_output() {
   if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
     fail "output '$name' contains a newline or carriage return"
   fi
-  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-    printf '%s=%s\n' "$name" "$value" >>"$GITHUB_OUTPUT"
+  # The compile step runs app-controlled code, so its `env:` blanks every GitHub
+  # file-command channel — GITHUB_OUTPUT included — and instead names an
+  # action-owned file via EDGEZERO__ACTION__OUTPUT_FILE. A separate publish step
+  # (which runs no app code) re-emits the collected outputs to the real
+  # GITHUB_OUTPUT. When neither is set, fall back to stdout.
+  local dest="${EDGEZERO__ACTION__OUTPUT_FILE:-${GITHUB_OUTPUT:-}}"
+  if [[ -n "$dest" ]]; then
+    printf '%s=%s\n' "$name" "$value" >>"$dest"
   else
     printf '%s=%s\n' "$name" "$value"
   fi
@@ -173,21 +179,21 @@ exec_with_cleared_provider_env() {
   names_raw=$(provider_env_clear_names "$json") || exit 1
 
   local -a cmd=(env)
-  # Strip the GitHub Actions file-command channels from the process IMAGE, not
+  # Strip EVERY GitHub Actions file-command channel from the process IMAGE, not
   # just from the immediate child. Overriding them for the child alone is not
   # enough: this (re-exec'd) process is the parent of every app-controlled command
-  # (cargo, the built CLI), and its real `$GITHUB_ENV`/`$GITHUB_PATH` paths stay
-  # readable through `/proc/<ppid>/environ`. A build script could recover the real
-  # `$GITHUB_ENV` path that way and append `LD_PRELOAD=…` (or a `$GITHUB_PATH`
-  # entry) directly to it — which the runner then applies to a LATER step (e.g.
-  # the artifact upload) that still holds a caller's own provider token. Removing
-  # them here means no reachable ancestor holds the real paths.
-  #
-  # `$GITHUB_OUTPUT` is deliberately KEPT: build-app-cli.sh writes its own outputs
-  # through it, and — unlike env/path — a forged output is consumed as data, so it
-  # cannot inject executable behavior into a later step.
+  # (cargo, the built CLI), and any real channel path it holds stays readable
+  # through `/proc/<ppid>/environ`. A build script could recover one path that way
+  # and — because the runner keeps all of them in one directory — derive the
+  # sibling `$GITHUB_ENV` path, then append `LD_PRELOAD=…` (or a `$GITHUB_PATH`
+  # entry) to the real file, which the runner applies to a LATER, secret-bearing
+  # step (the artifact upload). GITHUB_OUTPUT is stripped too — the compile step
+  # collects its outputs into EDGEZERO__ACTION__OUTPUT_FILE, and a separate publish
+  # step (no app code) emits them. (This closes the /proc-derivation vector; see
+  # docs — a fully malicious build can still enumerate the runner's command
+  # directory at same-uid, so provider secrets must not share a step/job with it.)
   local ghvar
-  for ghvar in GITHUB_ENV GITHUB_PATH GITHUB_STATE; do
+  for ghvar in GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY; do
     cmd+=(-u "$ghvar")
   done
   local name
@@ -202,14 +208,12 @@ exec_with_cleared_provider_env() {
 # Run an APP-CONTROLLED command (a Cargo build script, or the built CLI) with the
 # GitHub Actions per-step file-command channels pointed away from the real files.
 #
-# The primary defense against a build script injecting `LD_PRELOAD` (or a PATH
-# entry) into a later step is the re-exec in `exec_with_cleared_provider_env`,
-# which removes `$GITHUB_ENV`/`$GITHUB_PATH`/`$GITHUB_STATE` from this whole
-# process image so their real paths are not recoverable from any ancestor's
-# `/proc/<pid>/environ`. This is the second layer: it also points the child's
-# `$GITHUB_OUTPUT` at `/dev/null` — which the parent legitimately keeps to emit
-# its own outputs — so the untrusted command cannot forge this action's outputs
-# through its own environment either.
+# The primary defenses are elsewhere: the compile step's `env:` blanks every
+# GitHub file-command channel, and `exec_with_cleared_provider_env` strips them
+# from the whole process image so their real paths are not recoverable from any
+# ancestor's `/proc/<pid>/environ`. This is a belt-and-suspenders third layer —
+# it also points the child's channels at `/dev/null`, so even if a channel were
+# ever reintroduced upstream, the untrusted command still writes nowhere real.
 run_untrusted() {
   env \
     GITHUB_ENV=/dev/null \
