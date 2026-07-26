@@ -70,6 +70,7 @@ main() {
   local app_config="${EDGEZERO__CONFIG_PUSH__APP_CONFIG:-}"
   local app_config_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE:-}"
   local no_env="${EDGEZERO__CONFIG_PUSH__NO_ENV:-false}"
+  local inline_file=""
 
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_cmd "$cli_bin"
@@ -115,11 +116,13 @@ main() {
   # ABSOLUTE path, which the CLI reads as-is. A checked-out path is confined to
   # the app directory as before.
   if [[ -n "$app_config_inline" ]]; then
-    local inline_file
     inline_file=$(mktemp "${RUNNER_TEMP:-/tmp}/edgezero-inline-config.XXXXXX") ||
       fail "could not create a temp file for inline config"
+    # Remove it on exit. This trap covers the window before new_private_log
+    # installs its OWN exit trap (which replaces this one); the combined trap is
+    # re-installed after new_private_log below.
     # shellcheck disable=SC2064  # expand $inline_file now, not at trap time
-    trap "rm -f '$inline_file'" EXIT
+    trap "rm -f -- '$inline_file'" EXIT
     chmod 600 "$inline_file"
     printf '%s' "$app_config_inline" >"$inline_file"
     app_config="$inline_file"
@@ -139,6 +142,13 @@ main() {
   argv+=(--yes --no-diff)
 
   new_private_log
+  # new_private_log installed an EXIT trap for its own log, REPLACING the
+  # inline-file trap set above. Re-install one that removes both so the raw inline
+  # config never survives the step (on success OR a CLI failure that exits here).
+  if [[ -n "$inline_file" ]]; then
+    # shellcheck disable=SC2064  # expand both paths now, not at trap time
+    trap "rm -f -- '$LIFECYCLE_LOG' '$inline_file'" EXIT
+  fi
   # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
   # signal survives a failed step (readable via `if: always()`). If the push
   # succeeds but its canonical `pushed-key=`/`pushed-store=` lines are missing

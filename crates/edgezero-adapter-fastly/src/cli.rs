@@ -2072,6 +2072,11 @@ fn build_curl_probe_args(
 ) -> Vec<String> {
     let mut args = vec![
         "-sS".to_owned(),
+        // Disable curl's URL globbing: a valid probe path may contain `[` `]` `{`
+        // `}` (e.g. `/health?ids[0]=1`), which curl would otherwise treat as a
+        // glob — failing with exit 3 or firing multiple requests, and so
+        // mis-reporting a healthy deployment as unhealthy.
+        "--globoff".to_owned(),
         "-o".to_owned(),
         "/dev/null".to_owned(),
         "-w".to_owned(),
@@ -3410,6 +3415,17 @@ mod tests {
         assert!(args.contains(&"https://example.com/".to_owned()));
         assert!(args.contains(&"--max-time".to_owned()));
         assert!(args.contains(&"10".to_owned()));
+        // Globbing must be off so bracket/brace characters in a path are literal.
+        assert!(args.contains(&"--globoff".to_owned()));
+    }
+
+    #[test]
+    fn build_curl_probe_args_path_with_glob_chars_is_literal() {
+        // A path with `[` `]` would be a curl glob without --globoff; here it must
+        // appear verbatim in the single URL argument, with globbing disabled.
+        let args = build_curl_probe_args("example.com", "/health?ids[0]=1", None, 10);
+        assert!(args.contains(&"--globoff".to_owned()));
+        assert!(args.contains(&"https://example.com/health?ids[0]=1".to_owned()));
     }
 
     #[test]

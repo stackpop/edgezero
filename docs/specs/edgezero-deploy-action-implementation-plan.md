@@ -165,22 +165,33 @@ reference to port from. Most transfer with light changes:
      dir on `PATH`) before sourcing the engine, so `<cli> deploy --adapter fastly`
      finds `fastly`. This is the wrapper's provider-tool responsibility; the
      engine assumes `fastly` is already on `PATH`.
-   - Output `fastly-version` (parsed from the app CLI). Source the shared
-     `deploy-core` scripts; no build, toolchain, or path logic of its own.
+   - Output `fastly-version` (parsed from the app CLI), `provider-cli-version`
+     (the installed Fastly CLI), and `mutation-attempted` (emitted before the CLI
+     runs, so a failed step whose `fastly-version` line was lost can still be
+     reconciled via `if: always()`). Source the shared `deploy-core` scripts; no
+     build, toolchain, or path logic of its own.
 
 4. **Fastly staging lifecycle actions (§5.4)**
    - `healthcheck-fastly`: thin wrapper — inputs `app-cli-artifact`, `app-cli-bin`,
      `fastly-api-token` (STAGING only — a production probe needs no token and is
-     passed none), `fastly-service-id`, `fastly-version`, `domain`,
+     passed none), `fastly-service-id`, `fastly-version`, `domain`, `path` (URL
+     path to probe, default `/`, applied to production and staging alike),
      `deploy-to` (`production`/`staging`), retry/timeout; runs
-     `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
-     `FASTLY_API_TOKEN` in the step env; outputs `healthy`, `status-code`.
+     `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --path <p> …`
+     with `FASTLY_API_TOKEN` in the step env; outputs `healthy`, `status-code`.
    - `rollback-fastly`: thin wrapper — inputs `app-cli-artifact`, `app-cli-bin`,
      `fastly-api-token`, `fastly-service-id`, `fastly-version`, `rollback-to`
      (production only — the version to re-activate, captured from
      `deploy-fastly`'s `previous-version`; Fastly cannot infer it), `deploy-to`;
      runs `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
-     `FASTLY_API_TOKEN` in the step env; outputs `rolled-back-to`.
+     `FASTLY_API_TOKEN` in the step env; outputs `rolled-back-to` and
+     `mutation-attempted` (readable via `if: always()` on failure).
+   - `config-push-fastly`: thin wrapper — pushes typed config. Beyond `app-config`
+     (a checked-out file path), it accepts `app-config-inline` (raw TOML content
+     with no file on disk — written to an action-owned temp file, mutually
+     exclusive with `app-config`) and `no-env` (`true` passes `--no-env` to skip
+     the `<APP_NAME>__…__<KEY>` overlay); outputs `pushed-key`, `store`,
+     `provider-cli-version`, and `mutation-attempted`.
    - Both map `fastly-service-id` → `--service-id` and `fastly-api-token` →
      step-scoped `FASTLY_API_TOKEN` — except a PRODUCTION healthcheck, which
      needs no credential and is passed an empty token. They reuse only the CLI-artifact download +

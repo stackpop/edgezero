@@ -252,18 +252,25 @@ Workflow shape:
 4. run `deploy-fastly` (set `stage: true` for staging) with the CLI artifact,
    `working-directory: trusted-server`, typed Fastly credentials, and optional
    `deploy-args: ["--comment", …]`; capture `fastly-version` and, for a
-   production deploy, `previous-version` (the rollback target);
+   production deploy, `previous-version` (the rollback target). If the deploy step
+   FAILS but its `mutation-attempted` output is `true`, treat the service as
+   possibly mutated: reconcile (or run the rollback) rather than assume nothing
+   deployed — a lost/malformed `fastly-version` line fails the step even though
+   the deploy may have happened. Read `mutation-attempted` under `if: always()`;
 5. run `healthcheck-fastly` with the CLI artifact, `fastly-service-id`,
-   `deploy-to`, `domain`, and the captured `fastly-version`. Pass
-   `fastly-api-token` ONLY for `deploy-to: staging` (it resolves the staged
-   version's IP); a production probe curls the public domain and needs no token,
-   so omitting it avoids exposing a production secret;
+   `deploy-to`, `domain`, an optional `path` (default `/`; e.g. `/health` — it
+   covers production and a staged version alike), and the captured
+   `fastly-version`. Pass `fastly-api-token` ONLY for `deploy-to: staging` (it
+   resolves the staged version's IP); a production probe curls the public domain
+   and needs no token, so omitting it avoids exposing a production secret;
 6. on failure, run `rollback-fastly` with the CLI artifact, typed Fastly
    credentials (`fastly-api-token`, `fastly-service-id`), the same `deploy-to` /
    `fastly-version`, and — for a **production** rollback — `rollback-to` set to
-   the captured `previous-version` (Fastly cannot infer it; staging ignores it);
-   and
-7. write a summary from the action outputs.
+   the captured `previous-version` (Fastly cannot infer it; staging ignores it).
+   Rollback also emits `mutation-attempted`, so a rollback step that fails after
+   activating the previous version is still recognisable as a state change; and
+7. write a summary from the action outputs (including `provider-cli-version`,
+   which `deploy-fastly` and `config-push-fastly` now surface).
 
 ### 6.4 Required deployer changes
 

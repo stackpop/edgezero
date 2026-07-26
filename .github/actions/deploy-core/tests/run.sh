@@ -711,25 +711,33 @@ else
 fi
 child() {
   local own="\${SECRET_TOKEN-unset}"
-  local anc="n/a"
+  local anc="n/a" ghenv="n/a"
   if [[ -r "/proc/\$PPID/environ" ]]; then
     if tr '\0' '\n' <"/proc/\$PPID/environ" | grep -q '^SECRET_TOKEN='; then anc="leaked"; else anc="clean"; fi
+    # GITHUB_ENV is NOT a provider credential and is never named in
+    # provider-env-clear, yet its real path must also be gone from the ancestor:
+    # otherwise a build script recovers it here and appends LD_PRELOAD to the real
+    # file, which the runner applies to a later, secret-bearing step.
+    if tr '\0' '\n' <"/proc/\$PPID/environ" | grep -q '^GITHUB_ENV='; then ghenv="leaked"; else ghenv="clean"; fi
   fi
-  printf 'own=[%s] ancestor=[%s]' "\$own" "\$anc"
+  printf 'own=[%s] ancestor=[%s] ghenv=[%s]' "\$own" "\$anc" "\$ghenv"
 }
 export -f child
 bash -c child
 PROBE
   chmod +x "$probe"
 
+  # GITHUB_ENV is set in the environment but deliberately NOT in PROBE_CLEAR — only
+  # the unconditional file-command strip can remove it.
   local scrubbed
-  scrubbed=$(SECRET_TOKEN=super-secret PROBE_CLEAR='["SECRET_TOKEN"]' bash "$probe")
+  scrubbed=$(SECRET_TOKEN=super-secret GITHUB_ENV="$WORK_DIR/fake-github-env" \
+    PROBE_CLEAR='["SECRET_TOKEN"]' bash "$probe")
   case "$scrubbed" in
-    'own=[unset] ancestor=[clean]' | 'own=[unset] ancestor=[n/a]')
-      assert_equals "a child cannot read the credential from the scrubbed ancestor" "ok" "ok" ;;
+    'own=[unset] ancestor=[clean] ghenv=[clean]' | 'own=[unset] ancestor=[n/a] ghenv=[n/a]')
+      assert_equals "neither the credential nor GITHUB_ENV leaks from the scrubbed ancestor" "ok" "ok" ;;
     *)
-      assert_equals "a child cannot read the credential from the scrubbed ancestor" \
-        "own=[unset] ancestor=[clean|n/a]" "$scrubbed" ;;
+      assert_equals "neither the credential nor GITHUB_ENV leaks from the scrubbed ancestor" \
+        "own=[unset] ancestor=[clean|n/a] ghenv=[clean|n/a]" "$scrubbed" ;;
   esac
 
   # An unrelated variable must survive the re-exec.
@@ -978,6 +986,28 @@ test_config_push_argv() {
     GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__CONFIG_PUSH__NO_ENV=yes \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
+
+  # The inline temp file must NOT survive the step. new_private_log installs its
+  # own EXIT trap AFTER the inline-file trap, so the cleanup must be re-installed
+  # — verify nothing is left in RUNNER_TEMP on the success path AND when the CLI
+  # fails and the script exits via fail_with.
+  local rt="$WORK_DIR/config-push/runner-temp" scenario cli
+  cli="$WORK_DIR/config-push/bin/fake-cli"
+  for scenario in success failure; do
+    rm -rf "$rt"
+    mkdir -p "$rt"
+    if [[ "$scenario" == failure ]]; then
+      printf '#!/usr/bin/env bash\nexit 7\n' >"$cli"
+      chmod +x "$cli"
+    fi
+    env PATH="$WORK_DIR/config-push/bin:$PATH" FAKE_ARGV_OUT="$rt/argv.txt" \
+      EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+      GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+      RUNNER_TEMP="$rt" EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE='a = 1' \
+      "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1 || true
+    assert_succeeds "the inline config temp file is removed ($scenario path)" \
+      bash -c "! ls '$rt'/edgezero-inline-config.* >/dev/null 2>&1"
+  done
 
   # A bad deploy-to must fail closed, never silently push to production.
   assert_fails "a non-{production,staging} deploy-to is rejected" \

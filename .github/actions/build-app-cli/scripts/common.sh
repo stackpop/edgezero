@@ -173,6 +173,23 @@ exec_with_cleared_provider_env() {
   names_raw=$(provider_env_clear_names "$json") || exit 1
 
   local -a cmd=(env)
+  # Strip the GitHub Actions file-command channels from the process IMAGE, not
+  # just from the immediate child. Overriding them for the child alone is not
+  # enough: this (re-exec'd) process is the parent of every app-controlled command
+  # (cargo, the built CLI), and its real `$GITHUB_ENV`/`$GITHUB_PATH` paths stay
+  # readable through `/proc/<ppid>/environ`. A build script could recover the real
+  # `$GITHUB_ENV` path that way and append `LD_PRELOAD=…` (or a `$GITHUB_PATH`
+  # entry) directly to it — which the runner then applies to a LATER step (e.g.
+  # the artifact upload) that still holds a caller's own provider token. Removing
+  # them here means no reachable ancestor holds the real paths.
+  #
+  # `$GITHUB_OUTPUT` is deliberately KEPT: build-app-cli.sh writes its own outputs
+  # through it, and — unlike env/path — a forged output is consumed as data, so it
+  # cannot inject executable behavior into a later step.
+  local ghvar
+  for ghvar in GITHUB_ENV GITHUB_PATH GITHUB_STATE; do
+    cmd+=(-u "$ghvar")
+  done
   local name
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -185,15 +202,14 @@ exec_with_cleared_provider_env() {
 # Run an APP-CONTROLLED command (a Cargo build script, or the built CLI) with the
 # GitHub Actions per-step file-command channels pointed away from the real files.
 #
-# `$GITHUB_ENV` and `$GITHUB_PATH` are files whose lines the runner applies to
-# EVERY LATER step. A malicious build script could append `LD_PRELOAD=…` (or any
-# variable / PATH entry) to `$GITHUB_ENV`, and the subsequent artifact-upload step
-# — a Node action that still holds the caller's own provider token — would then
-# execute that injected code with the credential in scope. `$GITHUB_OUTPUT` /
-# `$GITHUB_STATE` would likewise let it forge this action's outputs. Redirecting
-# all four to `/dev/null` discards whatever the untrusted command writes; the
-# build script's OWN outputs are written from the parent process, which keeps the
-# real `$GITHUB_OUTPUT` and never runs untrusted code.
+# The primary defense against a build script injecting `LD_PRELOAD` (or a PATH
+# entry) into a later step is the re-exec in `exec_with_cleared_provider_env`,
+# which removes `$GITHUB_ENV`/`$GITHUB_PATH`/`$GITHUB_STATE` from this whole
+# process image so their real paths are not recoverable from any ancestor's
+# `/proc/<pid>/environ`. This is the second layer: it also points the child's
+# `$GITHUB_OUTPUT` at `/dev/null` — which the parent legitimately keeps to emit
+# its own outputs — so the untrusted command cannot forge this action's outputs
+# through its own environment either.
 run_untrusted() {
   env \
     GITHUB_ENV=/dev/null \
