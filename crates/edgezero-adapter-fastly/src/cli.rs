@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunked_config::{
     CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, chunk_lengths, gc_classify_root,
     gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
-    resolve_fastly_config_value, sha256_hex, value_is_inert_foreign, value_is_pointer_kind,
-    verify_writer_split_layout,
+    resolve_fastly_config_value, sha256_hex, value_announces_our_kind, value_is_inert_foreign,
+    value_is_pointer_kind, verify_writer_split_layout,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -242,6 +242,15 @@ struct FastlyConfigGcPlan {
 /// coordinates other lockers, which is exactly the pushes we control.
 struct ManifestLock {
     _file: fs::File,
+    /// The REAL file the lock guards, resolved through any symlink. Callers read
+    /// and replace THIS path, so every alias operates on one target.
+    target: PathBuf,
+}
+
+/// Removes a staging temp file on drop unless disarmed — so every early return
+/// (permission failure, write failure, rename failure) cleans up after itself.
+struct TempFileGuard {
+    path: Option<PathBuf>,
 }
 
 // The three `validate_*` trait methods exist on `Adapter` because
@@ -893,8 +902,13 @@ impl Adapter for FastlyCliAdapter {
 
 impl ManifestLock {
     fn acquire(manifest_path: &Path) -> Result<Self, String> {
-        let dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = manifest_path
+        // Key the lock on the REAL target, so a symlinked manifest and a direct
+        // path to the same file acquire the SAME lock rather than two different
+        // sidecars. Every manifest writer (config push AND provision) takes this
+        // lock, so their read-modify-writes serialise instead of clobbering.
+        let target = canonical_manifest_target(manifest_path);
+        let dir = target.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = target
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("fastly.toml");
@@ -906,10 +920,51 @@ impl ManifestLock {
             .truncate(false)
             .open(&lock_path)
             .map_err(|err| format!("failed to open lock file {}: {err}", lock_path.display()))?;
-        // Blocks until any other push holding the lock releases it.
+        // Blocks until any other writer holding the lock releases it.
         file.lock()
             .map_err(|err| format!("failed to lock {}: {err}", lock_path.display()))?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            target,
+        })
+    }
+
+    /// The real file this lock guards. Callers read and replace THIS path.
+    fn target(&self) -> &Path {
+        &self.target
+    }
+}
+
+impl TempFileGuard {
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _cleanup = fs::remove_file(path);
+        }
+    }
+}
+
+/// Resolve a manifest path to the REAL file every alias shares, so a symlink and
+/// a direct path lock and replace the SAME target. An existing file (or symlink)
+/// canonicalizes directly; a not-yet-created file canonicalizes via its parent
+/// so a fresh `fastly.toml` still keys on a stable location.
+fn canonical_manifest_target(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let file_name = path.file_name().unwrap_or(path.as_os_str());
+    match fs::canonicalize(parent) {
+        Ok(real_parent) => real_parent.join(file_name),
+        Err(_) => path.to_owned(),
     }
 }
 
@@ -1146,15 +1201,21 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
     use toml_edit::{DocumentMut, Item, table};
 
-    let raw = match fs::read_to_string(path) {
+    // Provision writes the SAME manifest as `config push --local`; take the same
+    // lock so a concurrent provision and push serialise instead of clobbering
+    // each other's edit, and operate on the real target the lock resolved.
+    let lock = ManifestLock::acquire(path)?;
+    let target = lock.target();
+
+    let raw = match fs::read_to_string(target) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+        Err(err) => return Err(format!("failed to read {}: {err}", target.display())),
     };
     let mut doc: DocumentMut = raw.parse().map_err(|_err| {
         format!(
             "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
-            path.display()
+            target.display()
         )
     })?;
 
@@ -1179,8 +1240,7 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
         kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
     }
 
-    fs::write(path, doc.to_string())
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    atomically_replace_file(target, &raw, &doc.to_string())?;
     Ok(())
 }
 
@@ -1204,12 +1264,16 @@ fn write_fastly_local_config_store(
     // their own edit, and the later rename would discard the earlier push's
     // change. Serialising here makes each push read what the previous one wrote
     // and build on it, so both edits survive. Released when `_lock` drops.
-    let _lock = ManifestLock::acquire(path)?;
+    let lock = ManifestLock::acquire(path)?;
+    // Read and replace the REAL target the lock guards, so a symlinked manifest
+    // and a direct path never diverge between the read, the compare, and the
+    // rename.
+    let target = lock.target();
 
-    let raw = match fs::read_to_string(path) {
+    let raw = match fs::read_to_string(target) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+        Err(err) => return Err(format!("failed to read {}: {err}", target.display())),
     };
     // Redacted: `toml_edit`'s parse error quotes the offending source LINE, which
     // in a config-store `contents` table is a stored (possibly secret-bearing)
@@ -1217,7 +1281,7 @@ fn write_fastly_local_config_store(
     let mut doc: DocumentMut = raw.parse().map_err(|_err| {
         format!(
             "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
-            path.display()
+            target.display()
         )
     })?;
 
@@ -1328,74 +1392,103 @@ fn write_fastly_local_config_store(
         }
     }
 
-    atomically_replace_file(path, &raw, &doc.to_string())?;
+    atomically_replace_file(target, &raw, &doc.to_string())?;
     Ok(warnings)
 }
 
-/// Replace `path`'s contents ATOMICALLY. Callers hold [`ManifestLock`] across the
-/// surrounding read-modify-write, so this is not racing another push; the
-/// re-read + compare below is a defence-in-depth corruption check, not the
-/// concurrency guard.
+/// Replace an already-canonical `target`'s contents ATOMICALLY. Callers pass
+/// [`ManifestLock::target`] and hold the lock across the surrounding
+/// read-modify-write, so this is not racing another writer; the re-read + compare
+/// is a defence-in-depth corruption check, not the concurrency guard.
 ///
 /// In order:
 ///
-/// 1. Re-read and require the file to still hold the bytes this rewrite started
-///    from (`expected_before`). Under the lock this always matches; a mismatch
-///    means the file was mutated by something OUTSIDE our push path, so fail
-///    rather than overwrite it.
-/// 2. Resolve a symlinked manifest to its real target, so we update the file the
-///    link points at and leave the link itself intact instead of replacing it
-///    with a regular file.
-/// 3. Write the new contents to a temp file in the target's directory (so the
-///    rename cannot cross a filesystem boundary), copy the target's existing
-///    permissions onto it (so a 0600 manifest does not widen to the umask
-///    default), then `rename` it over the target. `rename` is atomic on POSIX,
-///    so a concurrent reader sees either the old file or the new one.
+/// 1. Re-read `target` and require it to still hold the bytes this rewrite
+///    started from (`expected_before`). A mismatch means something OUTSIDE our
+///    writers mutated it, so fail rather than overwrite.
+/// 2. Create a FRESH temp file in the target's directory with `create_new`
+///    (`O_EXCL`): this never follows a file or symlink someone pre-planted at the
+///    temp path, and successive names avoid collisions. The rename stays within
+///    one directory so it cannot cross a filesystem boundary.
+/// 3. Copy the target's existing permissions onto the temp BEFORE writing, so the
+///    config bytes are never briefly readable under wider permissions than the
+///    manifest allows, then write, then `rename` over the target. `rename` is
+///    atomic on POSIX, so a concurrent reader sees either the old file or the new.
 ///
-/// The temp file is cleaned up on any failure after it is created.
+/// A [`TempFileGuard`] removes the temp on any failure after it is created.
 fn atomically_replace_file(
-    path: &Path,
+    target: &Path,
     expected_before: &str,
     contents: &str,
 ) -> Result<(), String> {
-    let current = match fs::read_to_string(path) {
+    let current = match fs::read_to_string(target) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(format!("failed to re-read {}: {err}", path.display())),
+        Err(err) => return Err(format!("failed to re-read {}: {err}", target.display())),
     };
     if current != expected_before {
         return Err(format!(
-            "{} changed on disk while this push was preparing its rewrite; nothing was written. \
-             Re-run the push to pick up the other change.",
-            path.display()
+            "{} changed on disk while this write was preparing its rewrite; nothing was written. \
+             Re-run to pick up the other change.",
+            target.display()
         ));
     }
 
-    // Follow a symlink to the real file; an absent path canonicalizes to itself.
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("fastly.toml");
-    // The pid keeps two concurrent pushes off each other's temp file.
-    let tmp = dir.join(format!(".{file_name}.edgezero-{}.tmp", process_id()));
-    fs::write(&tmp, contents).map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
-    // Preserve the manifest's existing permissions so an atomic replace never
-    // broadens access (e.g. a 0600 file must not become the umask default).
-    if let Ok(meta) = fs::metadata(&target)
-        && let Err(err) = fs::set_permissions(&tmp, meta.permissions())
-    {
-        let _cleanup = fs::remove_file(&tmp);
-        return Err(format!(
-            "failed to preserve permissions on {}: {err}",
-            target.display()
+    // Create a staging file that CANNOT be an attacker's pre-planted symlink:
+    // `create_new` fails if the path already exists (regular file or symlink), so
+    // we retry successive names until we own a fresh inode.
+    let mut attempt = 0_u32;
+    let (tmp_path, mut tmp_file) = loop {
+        let candidate = dir.join(format!(
+            ".{file_name}.edgezero-{}-{attempt}.tmp",
+            process_id()
         ));
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                attempt = attempt.saturating_add(1);
+                if attempt > 1_024 {
+                    return Err(format!(
+                        "could not create a staging temp file next to {}",
+                        target.display()
+                    ));
+                }
+            }
+            Err(err) => return Err(format!("failed to create staging temp file: {err}")),
+        }
+    };
+    let mut guard = TempFileGuard {
+        path: Some(tmp_path.clone()),
+    };
+
+    // Match the target's permissions BEFORE writing any bytes, so config content
+    // never lands under wider permissions than the manifest already had. (A brand
+    // new manifest keeps the create default; there is nothing to preserve.)
+    if let Ok(meta) = fs::metadata(target) {
+        tmp_file
+            .set_permissions(meta.permissions())
+            .map_err(|err| format!("failed to set permissions on the staging temp file: {err}"))?;
     }
-    if let Err(err) = fs::rename(&tmp, &target) {
-        let _cleanup = fs::remove_file(&tmp);
-        return Err(format!("failed to replace {}: {err}", target.display()));
-    }
+    tmp_file
+        .write_all(contents.as_bytes())
+        .map_err(|err| format!("failed to write the staging temp file: {err}"))?;
+    // Flush to disk before the rename so a crash cannot leave a renamed-but-empty
+    // manifest; best-effort (not all filesystems support it).
+    let _durability = tmp_file.sync_all();
+    drop(tmp_file);
+
+    fs::rename(&tmp_path, target)
+        .map_err(|err| format!("failed to replace {}: {err}", target.display()))?;
+    guard.disarm();
     Ok(())
 }
 
@@ -1561,17 +1654,21 @@ fn local_orphan_counts_for_dry_run(
                                 Ok(prior) => Ok(prior
                                     .iter()
                                     .filter(|key| !new_keys.contains(*key))
-                                    // Match the real prune: an orphan whose value
-                                    // is a runtime-readable root is KEPT, so it is
-                                    // not counted as a deletion.
+                                    // Match the real prune exactly, so the count
+                                    // equals what would actually be deleted:
                                     .filter(|key| {
-                                        contents
-                                            .get(key)
-                                            .and_then(toml_edit::Item::as_str)
-                                            .is_none_or(|text| {
-                                                !value_is_pointer_kind(text)
-                                                    && gc_classify_root(key, text).is_err()
-                                            })
+                                        let Some(orphan_item) = contents.get(key) else {
+                                            // Already ABSENT: the real prune's
+                                            // remove() is a no-op, so this is not a
+                                            // deletion and must not be counted.
+                                            return false;
+                                        };
+                                        // Present: KEPT only if its value is a
+                                        // runtime-readable root (then not counted).
+                                        orphan_item.as_str().is_none_or(|text| {
+                                            !value_is_pointer_kind(text)
+                                                && gc_classify_root(key, text).is_err()
+                                        })
                                     })
                                     .count()),
                                 Err(_) => Err("suspicious prior pointer".to_owned()),
@@ -1763,16 +1860,25 @@ fn gc_fastly_config_store(
         out.push("nothing to reclaim".to_owned());
         return Ok(out);
     }
-    for (key, age) in doomed.iter().flatten() {
-        let verb = if dry_run { "would delete" } else { "deleting" };
-        out.push(format!("  {verb} `{key}` (age {age}s)"));
-    }
     if dry_run {
+        // A dry-run only PLANS: list every candidate and stop. Nothing is
+        // attempted, so there is no confirmed/failed/skipped distinction yet.
+        for (key, age) in doomed.iter().flatten() {
+            out.push(format!("  would delete `{key}` (age {age}s)"));
+        }
         out.push(format!(
-            "dry-run: {doomed_count} orphan chunk(s) would be deleted; re-run with --yes to apply"
+            "dry-run: {doomed_count} orphan chunk(s) planned for deletion; re-run with --yes to apply"
         ));
         return Ok(out);
     }
+    // Real run: `doomed_count` is the PLANNED count. Do NOT pre-print each key as
+    // "deleting" -- execution stops at a generation's first failure, so some
+    // planned keys are never attempted. `execute_gc_deletes` reports the real
+    // per-key outcome (deleted / FAILED / skipped) as it happens.
+    out.push(format!(
+        "reclaiming {doomed_count} planned orphan chunk(s) across {} generation(s)",
+        doomed.len()
+    ));
 
     let GcDeleteOutcome {
         deleted,
@@ -1831,8 +1937,13 @@ fn gc_fastly_config_store(
 /// Root keys are free-form (`--key <override>`), and a chunk key preserves its
 /// root, so a key can contain `$(...)`, spaces, or `;`. Pasting an unquoted
 /// command could execute or misparse it, so this is not cosmetic.
+///
+/// The escaping is POSIX/bash (Linux/macOS). A leading note makes that explicit,
+/// because Windows `cmd` and PowerShell quote differently — an operator on those
+/// shells must adapt the quoting rather than paste verbatim.
 fn recovery_commands(store_id: &str, keys: &[String]) -> String {
-    keys.iter()
+    let commands = keys
+        .iter()
         .map(|key| {
             format!(
                 "  fastly config-store-entry delete --store-id={} --key={} --auto-yes",
@@ -1841,7 +1952,11 @@ fn recovery_commands(store_id: &str, keys: &[String]) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    format!(
+        "  # POSIX/bash (Linux/macOS). On Windows cmd/PowerShell the quoting \
+         differs -- adapt it for your shell.\n{commands}"
+    )
 }
 
 /// Single-quote a value for a POSIX shell: wrap in `'...'` and rewrite each
@@ -1884,6 +1999,8 @@ fn execute_gc_deletes(
                 Ok(()) => {
                     outcome.deleted = outcome.deleted.saturating_add(1);
                     deleted_here.push(key.as_str());
+                    // CONFIRMED gone, per key, as it happens.
+                    out.push(format!("  deleted `{key}`"));
                 }
                 Err(err) => {
                     out.push(format!("  FAILED to delete `{key}` ({err})"));
@@ -1895,6 +2012,14 @@ fn execute_gc_deletes(
                         .map(|(member, _)| member.clone())
                         .filter(|member| !deleted_here.contains(&member.as_str()))
                         .collect();
+                    // Distinguish the ones we NEVER ATTEMPTED (after the stop)
+                    // from the failed key itself, so the report is not read as
+                    // "all of these were tried and failed".
+                    for skipped in unconfirmed.iter().filter(|member| *member != key) {
+                        out.push(format!(
+                            "  skipped `{skipped}` (not attempted: this generation's delete stopped at the failure above)"
+                        ));
+                    }
                     if deleted_here.is_empty() {
                         // No sibling is CONFIRMED gone. The failed delete's
                         // outcome is unknown: if it did not commit, the
@@ -1944,13 +2069,13 @@ fn classify_store_entries(
         let classified = match gc_classify_root(&item.item_key, &item.item_value) {
             Ok(classified) => classified,
             // A chunk-shaped key whose value we cannot classify is a genuine
-            // chunk fragment (a candidate) ONLY if that value is not itself
-            // root-like. A pointer-kind value is always root-like — the runtime
-            // reads it as a pointer — so an unclassifiable one (e.g. a
-            // cross-root pointer that fails this root's scope check) must FAIL
-            // CLOSED, never become a deletable candidate whose references we
-            // would orphan.
-            Err(_) if is_chunk_shaped && !value_is_pointer_kind(&item.item_value) => {
+            // chunk fragment (a candidate) ONLY if that value ANNOUNCES no kind.
+            // A real chunk payload is a raw envelope fragment that carries no
+            // `edgezero_kind`. Anything that DOES claim our namespace -- a pointer
+            // parked at a chunk-shaped key, or an unknown/future kind -- is
+            // root-like or suspicious, so it must fall through and FAIL CLOSED
+            // rather than become a deletable candidate whose references we orphan.
+            Err(_) if is_chunk_shaped && !value_announces_our_kind(&item.item_value) => {
                 continue; // a chunk payload: a delete candidate
             }
             // A definitively FOREIGN entry at an ORDINARY key — a plain string
@@ -7122,6 +7247,76 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// The dry-run count must EXCLUDE a prior chunk that is already absent from
+    /// the file: the real prune's `remove()` is a no-op there, so counting it
+    /// would over-report the number of deletions.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_excludes_already_missing_prior_chunks() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        // Seed a multi-chunk generation.
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(5_000));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), chunked)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed");
+
+        // Manually delete ONE chunk entry: a prior chunk that is already gone.
+        let mut doc: toml_edit::DocumentMut = fs::read_to_string(&fastly_toml)
+            .expect("read")
+            .parse()
+            .expect("parse");
+        let contents = doc["local_server"]["config_stores"][TEST_CONFIG_ID]["contents"]
+            .as_table_mut()
+            .expect("contents");
+        let chunk_keys: Vec<String> = contents
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .filter(|key| key.contains(CHUNK_KEY_INFIX))
+            .collect();
+        assert!(chunk_keys.len() >= 2, "seed must have chunked");
+        contents.remove(&chunk_keys[0]);
+        let present_after = chunk_keys.len().saturating_sub(1);
+        fs::write(&fastly_toml, doc.to_string()).expect("write");
+
+        // Dry-run a shrink-to-direct re-push: every remaining chunk is an orphan.
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run");
+
+        let reported = out
+            .join("\n")
+            .split("would delete ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("a numeric orphan count");
+        assert_eq!(
+            reported, present_after,
+            "the already-absent chunk must not be counted (reported {reported}, present {present_after})"
+        );
+    }
+
     /// Dry-run reports the orphan count and writes nothing.
     #[cfg(unix)]
     #[test]
@@ -7277,6 +7472,106 @@ echo 'unexpected' >&2; exit 1
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "no temp file may be left behind");
+    }
+
+    /// The atomic replace must PRESERVE the target's permissions: a 0600 manifest
+    /// must not widen to the umask default when it is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let manifest = dir.path().join("fastly.toml");
+        fs::write(&manifest, "before\n").expect("seed");
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        atomically_replace_file(&manifest, "before\n", "after\n").expect("replace");
+
+        let mode = fs::metadata(&manifest).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restrictive permissions must survive the replace"
+        );
+        assert_eq!(fs::read_to_string(&manifest).expect("read"), "after\n");
+    }
+
+    /// A symlinked manifest must be updated THROUGH the link: the real file's
+    /// contents change and the symlink itself is preserved (not replaced with a
+    /// regular file). The lock and the replace both resolve to the real target.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_follows_a_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let real = dir.path().join("real-fastly.toml");
+        let link = dir.path().join("fastly.toml");
+        fs::write(&real, "name = \"demo\"\n").expect("seed real");
+        symlink(&real, &link).expect("symlink");
+
+        write_fastly_local_config_store(
+            &link,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
+        )
+        .expect("push through symlink");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "the manifest symlink must be preserved, not replaced with a file"
+        );
+        assert!(
+            fs::read_to_string(&real)
+                .expect("read real")
+                .contains("greeting = \"hi\""),
+            "the real target behind the symlink must be updated"
+        );
+    }
+
+    /// A provision write and a local push serialise on the SAME manifest lock, so
+    /// neither loses the other's edit even though they are different writers.
+    #[cfg(unix)]
+    #[test]
+    fn provision_and_push_serialise_on_the_manifest_lock() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().expect("tempdir");
+        let manifest = Arc::new(dir.path().join("fastly.toml"));
+        fs::write(manifest.as_ref(), "name = \"demo\"\n").expect("seed");
+
+        for _round in 0_u32..25 {
+            let p_provision = Arc::clone(&manifest);
+            let p_push = Arc::clone(&manifest);
+            let provision =
+                thread::spawn(move || append_fastly_setup(&p_provision, "config", "app_config"));
+            let push = thread::spawn(move || {
+                write_fastly_local_config_store(
+                    &p_push,
+                    TEST_CONFIG_ID,
+                    &[("greeting".to_owned(), "hi".to_owned())],
+                    &[],
+                )
+            });
+            provision
+                .join()
+                .expect("provision thread")
+                .expect("provision");
+            push.join().expect("push thread").expect("push");
+
+            let after = fs::read_to_string(manifest.as_ref()).expect("read");
+            assert!(
+                after.contains("[setup.config_stores.app_config]"),
+                "provision's setup block must survive:\n{after}"
+            );
+            assert!(
+                after.contains("greeting = \"hi\""),
+                "push's config edit must survive:\n{after}"
+            );
+        }
     }
 
     /// PARITY: the dry-run's reported orphan count equals the number of chunk

@@ -14,6 +14,10 @@ target/
 .spin/
 .edgezero/
 
+# Fastly local config-push lock (a persistent advisory-lock sidecar next to
+# fastly.toml; serialises concurrent `config push --local` / `provision`).
+.fastly.toml.edgezero-lock
+
 # env
 .env
 

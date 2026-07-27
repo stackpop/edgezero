@@ -1611,9 +1611,19 @@ Pain points the blob model fixes:
   failure — PR #269 round 3 already added a partial-failure
   diagnostic, but the underlying non-atomicity stayed. The blob model
   gives every adapter one active root per typed config. Most adapters
-  store that root as one physical value. Fastly stores oversized
-  roots as immutable content chunks plus a root pointer written last,
-  so the active config still flips atomically at the root key.
+  store that root as one physical value, which flips atomically. Fastly
+  stores oversized roots as immutable content chunks plus a root pointer
+  written last: a SINGLE-value root flips atomically, but a CHUNKED root
+  does **not** — Config Store gives no cross-key atomicity and is
+  eventually consistent across POPs, so a POP can briefly observe the new
+  pointer before all of its chunks have propagated. Two properties keep
+  that window safe rather than a silent break: chunk keys are
+  content-addressed, so a new generation never overwrites the previous
+  one's chunks (only the pointer key is reused); and a referenced chunk
+  that is not yet visible resolves to a RETRYABLE `Unavailable` (HTTP
+  503), never a corruption `500`, so the read simply retries until
+  propagation completes. Operators pushing a chunked config should expect
+  a brief propagation window rather than an instantaneous global flip.
 - **Argv / size limits.** Per-leaf push has tripped argv-size caps
   (PR #269 F4) and forced `--stdin` plumbing. A single blob ends up
   smaller as a tarred JSON than as N separate `--key=…` argv tokens.
@@ -6344,12 +6354,18 @@ Failure semantics:
   recovery is to re-run the SAME push: it is idempotent (chunk keys are
   content-addressed and writes use `--upsert`), so it converges to the
   intended state whether or not the pointer write actually landed.
-- Missing chunks, chunk-hash mismatches, pointer parse failures,
-  or full-envelope hash mismatches are corrupt platform state.
-  CLI read-back/diff errors must name the root key and the failed
-  chunk. Runtime `FastlyConfigStore::get` returns an internal
-  config-store error with remediation text to re-run
-  `<app-cli> config push`.
+- Chunk-hash mismatches, pointer parse failures, and full-envelope
+  hash mismatches are corrupt platform state: runtime
+  `FastlyConfigStore::get` returns an INTERNAL config-store error (HTTP
+  500) with remediation text to re-run `<app-cli> config push`, and CLI
+  read-back/diff errors name the root key and the failed chunk.
+- A MISSING referenced chunk is instead treated as TRANSIENT
+  (`Unavailable`, HTTP 503, retryable), NOT corruption. The dominant
+  cause is cross-POP propagation lag right after a push (the flipped
+  pointer reached this POP before its content-addressed chunks). A retry
+  resolves the normal case; genuine lasting loss then shows as a
+  persistent 503 the operator repairs by re-pushing — strictly safer than
+  a spurious 500 during the propagation window.
 - If the pointer itself would exceed 8 000 characters because the
   config is extremely large, hard-error before any platform write.
   The error should recommend modelling the config as multiple typed
@@ -6359,11 +6375,16 @@ Failure semantics:
 - Old content-addressed chunks are inert once the root pointer moves
   away from them, so they are never a correctness problem. Reclaiming
   them for storage hygiene is now implemented (see the fastly-chunk-gc
-  spec): a re-push prunes the PRIOR generation's chunks in the same
-  writeback, and an explicit `config gc --adapter fastly --older-than`
-  deletes unreferenced `.__edgezero_chunks.` generations across the
-  store. Both decide root-vs-chunk by VALUE, never by key shape, and
-  never delete a key whose value is a runtime-readable root.
+  spec), and the two paths differ by target:
+  - A **`--local`** re-push prunes the PRIOR generation's chunks in the
+    same file rewrite.
+  - A **cloud** push only ever WRITES — it never deletes. Cloud orphans
+    are reclaimed exclusively by an explicit
+    `config gc --adapter fastly --older-than`, which deletes unreferenced
+    `.__edgezero_chunks.` generations across the store.
+
+  Both decide root-vs-chunk by VALUE, never by key shape, and never
+  delete a key whose value is a runtime-readable root.
 
 ### Q7. Diff against `--local` vs remote
 
@@ -6662,10 +6683,13 @@ Tests cover both storage forms:
   leaves the previous root envelope/pointer active.
   Retrying the same push is idempotent because chunk
   keys include the full-envelope SHA.
-- Missing chunk, chunk hash mismatch, full-envelope
-  hash mismatch, and a malformed POINTER all fail with an
-  actionable error naming the root key. These are
-  corrupt platform state, not "missing key".
+- A chunk hash mismatch, full-envelope hash mismatch, and a
+  malformed POINTER are corrupt platform state: they fail with an
+  actionable error naming the root key and map to INTERNAL (500),
+  not "missing key".
+- A MISSING referenced chunk maps to `Unavailable` (503, retryable),
+  not corruption — it is usually cross-POP propagation lag right
+  after a push, which a retry resolves.
 - **Raw values pass through untouched.** A Config Store holds
   arbitrary entries, so only a value announcing
   `edgezero_kind == "fastly_config_chunks"` is resolved.

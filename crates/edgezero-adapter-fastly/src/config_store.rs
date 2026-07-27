@@ -61,27 +61,45 @@ impl ConfigStore for FastlyConfigStore {
         // any other raw value pass through; pointer values fan out to chunk
         // entries in the same store.
         //
-        // A chunk fetch can fail two ways, which must NOT collapse to one status:
-        //   - Corrupt state (missing chunk, hash mismatch, a bad/oversized
-        //     derived key) → Internal (HTTP 500) with re-push remediation, per
-        //     spec 9.3. Re-pushing rewrites the generation and fixes it.
-        //   - Transient (invalid store handle, lookup exhaustion, unclassified)
-        //     → Unavailable (HTTP 503). Re-pushing cannot fix request-scoped
-        //     lookup exhaustion, so it must read as retryable, exactly like the
-        //     ROOT lookup above. `transient` records whether any chunk lookup
-        //     hit that class so the outer result can pick the right status.
+        // A chunk fetch can fail in two classes that must NOT collapse to one
+        // status:
+        //   - Corrupt state (a hash mismatch, a bad/oversized derived key) →
+        //     Internal (HTTP 500) with re-push remediation, per spec 9.3.
+        //     Re-pushing rewrites the generation and fixes it.
+        //   - Transient (invalid store handle, lookup exhaustion, an unclassified
+        //     error, a value that outgrew the read buffer, OR a referenced chunk
+        //     not yet visible at this POP) → Unavailable (HTTP 503, retryable).
+        //
+        // A MISSING referenced chunk is deliberately transient. Config Store is
+        // eventually consistent ACROSS keys, so right after a push the flipped
+        // root pointer can be visible at a POP before all of its
+        // content-addressed chunks have propagated there. That gap is not
+        // corruption — a retry moments later resolves it — so it must read as 503,
+        // not a re-push-me 500. (Genuine, lasting corruption then shows as a
+        // persistent 503 the operator repairs by re-pushing; that is strictly
+        // safer than a spurious 500 during the normal propagation window.)
+        // `transient` records whether any chunk fetch hit that class so the outer
+        // result can pick the right status.
         let transient = Cell::new(false);
-        let resolved = resolve_fastly_config_value(key, value, |chunk_key| match &self.inner {
-            FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(chunk_key).map_err(|err| {
-                if is_transient_lookup(&err) {
-                    transient.set(true);
-                }
-                // The pointer-controlled chunk key is not echoed (the resolver
-                // adds a safe position locator); the SDK `err` carries no value.
-                format!("config store lookup failed: {err}")
-            }),
-            #[cfg(test)]
-            FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(chunk_key).cloned()),
+        let resolved = resolve_fastly_config_value(key, value, |chunk_key| {
+            let got = match &self.inner {
+                FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(chunk_key).map_err(|err| {
+                    if is_transient_lookup(&err) {
+                        transient.set(true);
+                    }
+                    // The pointer-controlled chunk key is not echoed (the resolver
+                    // adds a safe position locator); the SDK `err` carries no value.
+                    format!("config store lookup failed: {err}")
+                })?,
+                #[cfg(test)]
+                FastlyConfigStoreBackend::InMemory(data) => data.get(chunk_key).cloned(),
+            };
+            if got.is_none() {
+                // Referenced chunk absent at this POP: treat as propagation lag
+                // (transient) rather than corruption.
+                transient.set(true);
+            }
+            Ok(got)
         })
         .map_err(|err| {
             if transient.get() {
@@ -104,18 +122,16 @@ impl ConfigStore for FastlyConfigStore {
 }
 
 /// Is a CHUNK lookup failure environmental (retry) rather than corrupt config
-/// (`config push` to repair)? Mirrors the root lookup's split: a bad or oversized
-/// key/value names corrupt state a re-push rewrites, but an invalid store handle,
-/// lookup exhaustion, or an unclassified/future failure is transient — re-pushing
-/// cannot fix request-scoped lookup exhaustion.
+/// (`config push` to repair)? Only a bad KEY names corrupt state a re-push
+/// rewrites; everything else — an invalid store handle, lookup exhaustion, an
+/// unclassified/future failure, or a value that outgrew the read buffer — is
+/// transient, because re-pushing cannot fix a request-scoped condition.
 fn is_transient_lookup(err: &LookupError) -> bool {
-    // A bad or oversized key/value names corrupt state a re-push rewrites;
-    // everything else (invalid store handle, lookup exhaustion, or an
-    // unknown/future variant of this `non_exhaustive` enum) is transient.
-    !matches!(
-        err,
-        LookupError::KeyInvalid | LookupError::KeyTooLong | LookupError::ValueTooLong
-    )
+    // `ValueTooLong` is TRANSIENT, not corruption: the SDK already retried with
+    // the reported buffer size, so a `ValueTooLong` reaching us means the value
+    // GREW between host calls (a concurrent write) — a race a retry resolves, not
+    // a re-push-me corruption.
+    !matches!(err, LookupError::KeyInvalid | LookupError::KeyTooLong)
 }
 
 fn map_lookup_error(err: &LookupError) -> ConfigStoreError {
@@ -161,17 +177,50 @@ mod tests {
     }
 
     /// A CHUNK lookup that fails transiently (lookup exhaustion, an invalid
-    /// store handle, or an unclassified error) must keep Unavailable semantics —
-    /// re-pushing cannot repair request-scoped lookup exhaustion. A bad or
-    /// oversized derived key, by contrast, is corrupt state a re-push rewrites.
+    /// store handle, an unclassified error, or a value that outgrew the read
+    /// buffer) must keep Unavailable semantics — re-pushing cannot repair a
+    /// request-scoped condition. Only a bad KEY is corrupt state a re-push fixes.
     #[test]
     fn transient_chunk_lookups_are_not_treated_as_corruption() {
         assert!(is_transient_lookup(&LookupError::TooManyLookups));
         assert!(is_transient_lookup(&LookupError::ConfigStoreInvalid));
         assert!(is_transient_lookup(&LookupError::Other));
+        // ValueTooLong is TRANSIENT: the SDK already retried at the reported size,
+        // so it reaching us means the value grew between host calls (a race).
+        assert!(is_transient_lookup(&LookupError::ValueTooLong));
         assert!(!is_transient_lookup(&LookupError::KeyInvalid));
         assert!(!is_transient_lookup(&LookupError::KeyTooLong));
-        assert!(!is_transient_lookup(&LookupError::ValueTooLong));
+    }
+
+    /// A referenced chunk that is ABSENT maps to Unavailable (HTTP 503), not
+    /// Internal. Config Store is eventually consistent across keys, so a flipped
+    /// root pointer can reach a POP before all its chunks propagate there; that
+    /// window is retryable, not a re-push-me corruption.
+    #[test]
+    fn a_missing_chunk_maps_to_unavailable_not_internal() {
+        use crate::chunked_config::prepare_fastly_config_entries;
+        use futures::executor::block_on;
+
+        // A real chunked value, but seed ONLY the root pointer -- the chunks it
+        // references are "not yet propagated" to this POP.
+        let envelope = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            serde_json::to_string(&BlobEnvelope::new(
+                json!({ "pad": "x".repeat(9_000) }),
+                "2026-01-01T00:00:00Z".to_owned(),
+            ))
+            .expect("envelope")
+        };
+        let entries = prepare_fastly_config_entries("app_config", &envelope).expect("expand");
+        let (root_key, pointer_json) = entries.last().expect("pointer").clone();
+        let store = FastlyConfigStore::from_entries([(root_key.clone(), pointer_json)]);
+
+        let err = block_on(store.get(&root_key)).expect_err("a missing chunk must error");
+        assert!(
+            matches!(err, ConfigStoreError::Unavailable { .. }),
+            "a not-yet-propagated chunk must be retryable (Unavailable), not Internal: {err:?}"
+        );
     }
 
     /// Spec 9.3 (line 6272): missing chunks, hash mismatches, pointer

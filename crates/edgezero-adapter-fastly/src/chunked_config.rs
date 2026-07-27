@@ -769,13 +769,15 @@ fn classify_root_value(raw: &str) -> RootValueKind {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return RootValueKind::MalformedObject;
     };
-    match value
-        .get("edgezero_kind")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some(kind) if kind == POINTER_KIND => RootValueKind::Pointer,
-        Some(_) => RootValueKind::UnknownKind,
+    // Discriminate on the PRESENCE of `edgezero_kind`, not just a string match. A
+    // field of ANY type claims our reserved namespace, so a non-string value
+    // (`edgezero_kind: 7`, an object, null) is `UnknownKind`, never `Foreign` --
+    // otherwise GC would wrongly treat it as an inert value and reclaim chunks a
+    // future/foreign format still references.
+    match value.get("edgezero_kind") {
         None => RootValueKind::Foreign,
+        Some(serde_json::Value::String(kind)) if kind == POINTER_KIND => RootValueKind::Pointer,
+        Some(_) => RootValueKind::UnknownKind,
     }
 }
 
@@ -800,6 +802,22 @@ pub(crate) fn value_is_pointer_kind(raw: &str) -> bool {
 #[cfg(any(feature = "cli", test))]
 pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
     matches!(classify_root_value(raw), RootValueKind::Foreign)
+}
+
+/// Does this value claim our reserved `edgezero_kind` namespace at all — the
+/// recognised pointer kind, an unknown kind, or a non-string kind?
+///
+/// GC uses this to keep a chunk-shaped key that holds a namespace-claiming value
+/// OUT of the plain chunk-payload delete path: a real chunk payload is a raw
+/// envelope fragment that announces nothing, so anything that DOES announce is
+/// suspicious (a parked pointer, a future-format value) and must be classified,
+/// not blindly treated as a deletable fragment.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn value_announces_our_kind(raw: &str) -> bool {
+    matches!(
+        classify_root_value(raw),
+        RootValueKind::Pointer | RootValueKind::UnknownKind
+    )
 }
 
 /// Classify a ROOT value for `config gc` — the live-set input on a DESTRUCTIVE
@@ -830,62 +848,73 @@ pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue,
             "root `{root_key}` has an empty value; refusing to reclaim (cannot tell what it references)"
         ));
     }
-    // Every diagnostic below is REDACTED: serde's Display quotes the offending
-    // input, `verify()`'s names the stored hashes, and BOTH are attacker- or
+    // Diagnostics are REDACTED: serde's Display quotes the offending input,
+    // `verify()`'s names the stored hashes, and BOTH are attacker- or
     // config-controlled strings that may hold credentials.
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|err| {
-        format!(
-            "root `{root_key}` is not valid JSON ({}); refusing to reclaim",
-            redact_json_err(&err)
-        )
-    })?;
-    if value
-        .get("edgezero_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some(POINTER_KIND)
-    {
-        let pointer: FastlyChunkPointer = serde_json::from_value(value).map_err(|err| {
-            format!(
-                "root `{root_key}` is a chunk pointer but is malformed ({}); refusing to reclaim",
-                redact_json_err(&err)
-            )
-        })?;
-        if pointer.version != 1 {
-            return Err(format!(
-                "root `{root_key}` chunk pointer has unsupported version {}; refusing to reclaim",
-                pointer.version
-            ));
+    //
+    // Discriminate on the SAME classifier the runtime uses, so GC and the runtime
+    // never disagree about what a value is. Critically, a value carrying an
+    // `edgezero_kind` this build does not recognise is NOT parsed as a direct
+    // envelope: `BlobEnvelope` ignores unknown fields, so a future-format pointer
+    // with envelope-shaped fields would otherwise classify as `Direct` (zero
+    // references) and its canonical chunks would be reclaimed. Fail closed.
+    match classify_root_value(raw) {
+        RootValueKind::Pointer => {
+            let pointer: FastlyChunkPointer = serde_json::from_str(raw).map_err(|err| {
+                format!(
+                    "root `{root_key}` is a chunk pointer but is malformed ({}); refusing to reclaim",
+                    redact_json_err(&err)
+                )
+            })?;
+            if pointer.version != 1 {
+                return Err(format!(
+                    "root `{root_key}` chunk pointer has unsupported version {}; refusing to reclaim",
+                    pointer.version
+                ));
+            }
+            validate_pointer_chunks(root_key, &pointer)?;
+            Ok(GcRootValue::Chunked(GcPointer {
+                chunks: pointer
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| GcChunkRef {
+                        key: chunk.key,
+                        len: chunk.len,
+                        sha256: chunk.sha256,
+                    })
+                    .collect(),
+                envelope_len: pointer.envelope_len,
+                envelope_sha256: pointer.envelope_sha256,
+            }))
         }
-        validate_pointer_chunks(root_key, &pointer)?;
-        return Ok(GcRootValue::Chunked(GcPointer {
-            chunks: pointer
-                .chunks
-                .into_iter()
-                .map(|chunk| GcChunkRef {
-                    key: chunk.key,
-                    len: chunk.len,
-                    sha256: chunk.sha256,
-                })
-                .collect(),
-            envelope_len: pointer.envelope_len,
-            envelope_sha256: pointer.envelope_sha256,
-        }));
+        RootValueKind::UnknownKind => Err(format!(
+            "root `{root_key}` carries an `edgezero_kind` this build does not recognise (value \
+             redacted); refusing to reclaim -- its chunks may belong to a newer format"
+        )),
+        RootValueKind::MalformedObject => Err(format!(
+            "root `{root_key}` is an object-shaped value that does not parse (possibly a truncated \
+             pointer); refusing to reclaim"
+        )),
+        // No `edgezero_kind`: it counts as a root only if it is a valid,
+        // integrity-checked direct envelope; anything else is left to the
+        // caller's inert-foreign handling.
+        RootValueKind::Foreign => {
+            let envelope: BlobEnvelope = serde_json::from_str(raw).map_err(|err| {
+                format!(
+                    "root `{root_key}` is neither a valid chunk pointer nor a valid config envelope \
+                     ({}); refusing to reclaim",
+                    redact_json_err(&err)
+                )
+            })?;
+            envelope.verify().map_err(|_err| {
+                format!(
+                    "root `{root_key}` envelope failed its integrity check (details redacted -- the \
+                     stored hashes are config-controlled); refusing to reclaim"
+                )
+            })?;
+            Ok(GcRootValue::Direct)
+        }
     }
-    // Otherwise it must be a valid, integrity-checked direct envelope.
-    let envelope: BlobEnvelope = serde_json::from_value(value).map_err(|err| {
-        format!(
-            "root `{root_key}` is neither a valid chunk pointer nor a valid config envelope ({}); \
-             refusing to reclaim",
-            redact_json_err(&err)
-        )
-    })?;
-    envelope.verify().map_err(|_err| {
-        format!(
-            "root `{root_key}` envelope failed its integrity check (details redacted -- the \
-             stored hashes are config-controlled); refusing to reclaim"
-        )
-    })?;
-    Ok(GcRootValue::Direct)
 }
 
 /// Check that `assembled` really is the generation named by `generation_sha`.
@@ -1414,6 +1443,83 @@ mod tests {
         assert!(!value_is_pointer_kind("not json at all"));
     }
 
+    /// The three GC-facing classifier predicates agree on every category, and --
+    /// the crux of the unknown-kind data-loss bug -- a value that claims our
+    /// namespace with an UNKNOWN or NON-STRING `edgezero_kind` is neither inert
+    /// foreign nor a pointer: it announces our kind, so GC classifies it (and
+    /// fails closed) rather than treating it as a deletable/ignorable value.
+    #[test]
+    fn classifier_predicates_agree_on_every_category() {
+        // (raw, is_pointer, is_inert_foreign, announces_our_kind)
+        let cases: &[(&str, bool, bool, bool)] = &[
+            (
+                r#"{"edgezero_kind":"fastly_config_chunks"}"#,
+                true,
+                false,
+                true,
+            ),
+            // Unknown STRING kind: claims our namespace, not inert, not our pointer.
+            (
+                r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
+                false,
+                false,
+                true,
+            ),
+            // NON-STRING kind: still claims the namespace -- must NOT be inert.
+            (r#"{"edgezero_kind":7}"#, false, false, true),
+            (r#"{"edgezero_kind":null}"#, false, false, true),
+            (r#"{"edgezero_kind":{"nested":true}}"#, false, false, true),
+            // Genuinely foreign: no discriminator.
+            (r#"{"unrelated":"json"}"#, false, true, false),
+            ("value_a", false, true, false),
+            ("", false, true, false),
+            // Object-shaped but unparseable (a possible truncated pointer): none.
+            (r#"{"edgezero_kind":"fastly_config"#, false, false, false),
+        ];
+        for &(raw, is_ptr, inert, announces) in cases {
+            assert_eq!(value_is_pointer_kind(raw), is_ptr, "pointer_kind: {raw:?}");
+            assert_eq!(value_is_inert_foreign(raw), inert, "inert_foreign: {raw:?}");
+            assert_eq!(
+                value_announces_our_kind(raw),
+                announces,
+                "announces_our_kind: {raw:?}"
+            );
+            // No value is ever BOTH inert-foreign and namespace-claiming.
+            assert!(!(inert && announces), "mutually exclusive: {raw:?}");
+        }
+    }
+
+    /// GC data-loss guard: a value carrying a FUTURE `edgezero_kind` but shaped
+    /// like a valid direct envelope must NOT classify as `Direct`. `BlobEnvelope`
+    /// ignores unknown fields, so without the discriminator check GC would call
+    /// it a zero-reference root and reclaim canonical chunks a newer format still
+    /// references. It must fail closed instead.
+    #[test]
+    fn gc_classify_root_fails_closed_on_a_future_kind_envelope() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+
+        // A real, integrity-valid envelope...
+        let envelope = BlobEnvelope::new(
+            serde_json::json!({ "k": "v" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        );
+        let mut object = serde_json::to_value(&envelope).expect("to value");
+        // ...with a future discriminator grafted on. Valid envelope fields remain.
+        object.as_object_mut().expect("object").insert(
+            "edgezero_kind".to_owned(),
+            serde_json::json!("fastly_config_chunks_v2"),
+        );
+        let raw = serde_json::to_string(&object).expect("serialise");
+
+        let Err(err) = gc_classify_root("app_config", &raw) else {
+            panic!("a future-kind value must not classify as a reclaimable Direct root")
+        };
+        assert!(
+            err.contains("does not recognise") && err.contains("refusing to reclaim"),
+            "must fail closed naming the unknown kind: {err}"
+        );
+    }
+
     /// The runtime resolver rejects a pointer shape the writer could never emit
     /// BEFORE fetching any chunk -- the same metadata validation the CLI/GC path
     /// runs, so invariant 14 holds on the read path too.
@@ -1593,6 +1699,21 @@ mod tests {
         const V1_SPLIT: usize = 7_000;
         /// v1 chunk-key infix. Frozen.
         const V1_INFIX: &str = ".__edgezero_chunks.";
+        // PRECOMPUTED wire hashes for this exact fixture, captured once. They are
+        // asserted below and fed into the pointer as LITERALS -- not recomputed --
+        // so a change to the envelope serialisation OR the SHA helper makes the
+        // live bytes disagree with these constants and the test fails, catching a
+        // v1 wire break that a self-recomputing fixture would hide.
+        const FROZEN_LEN: usize = 8_348;
+        const FROZEN_ENVELOPE_SHA: &str =
+            "a340975d23554e600cfb14fc5455da8ad83127440f3e11d7b526c140efb76c75";
+        const FROZEN_INNER_SHA: &str =
+            "24cc7f56c47fb2428171bc4fbf1ad2270488b8c5fb06c617050b68182eae6747";
+        const FROZEN_CHUNK0_SHA: &str =
+            "f1f1d19798b57ed4ebf2415ffec8d1a9fac6af372aa0e2592620d4f9e790bca5";
+        const FROZEN_CHUNK1_SHA: &str =
+            "f4c8a4d91bb29a6d395692591cb4b714336d83d0f95ca1688a49d6ad760a77ff";
+        const FROZEN_CHUNK1_LEN: usize = FROZEN_LEN - V1_SPLIT;
 
         // ASCII content only, so the v1 split lands on 7 000 exactly and this
         // fixture stays independent of the codepoint-boundary retreat.
@@ -1601,52 +1722,47 @@ mod tests {
             "2026-01-01T00:00:00Z".to_owned(),
         ))
         .expect("envelope");
-        assert!(
-            envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT,
-            "fixture must be over the entry limit so it is stored chunked"
+        // Freeze the wire: any drift in serialisation or hashing trips these.
+        assert_eq!(envelope.len(), FROZEN_LEN, "envelope byte length drifted");
+        assert_eq!(
+            sha256_hex(envelope.as_bytes()),
+            FROZEN_ENVELOPE_SHA,
+            "envelope wire bytes or the SHA helper drifted from the frozen v1 value"
         );
-        let inner_sha = serde_json::from_str::<serde_json::Value>(&envelope)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("sha256")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .expect("envelope sha256");
-        let envelope_sha = sha256_hex(envelope.as_bytes());
+        let head = envelope.get(..V1_SPLIT).expect("ascii boundary");
+        let tail = envelope.get(V1_SPLIT..).expect("ascii boundary");
+        assert_eq!(
+            sha256_hex(head.as_bytes()),
+            FROZEN_CHUNK0_SHA,
+            "chunk 0 drifted"
+        );
+        assert_eq!(
+            sha256_hex(tail.as_bytes()),
+            FROZEN_CHUNK1_SHA,
+            "chunk 1 drifted"
+        );
+        assert_eq!(tail.len(), FROZEN_CHUNK1_LEN);
 
-        // Split at the frozen boundary, by hand.
-        let mut chunk_entries: Vec<(String, String)> = Vec::new();
-        let mut start = 0_usize;
-        while start < envelope.len() {
-            let end = start.saturating_add(V1_SPLIT).min(envelope.len());
-            let piece = envelope.get(start..end).expect("ascii boundary");
-            let key = format!("root{V1_INFIX}{envelope_sha}.{}", chunk_entries.len());
-            chunk_entries.push((key, piece.to_owned()));
-            start = end;
-        }
-        assert!(chunk_entries.len() >= 2, "fixture must span several chunks");
-
-        // The frozen pointer, field names written out literally.
+        // The frozen pointer: field names, indexes, lengths, and the LITERAL
+        // precomputed hashes, all written out. The resolver checks the actual
+        // chunk bytes against these literals, so a drift is rejected on read.
+        let key0 = format!("root{V1_INFIX}{FROZEN_ENVELOPE_SHA}.0");
+        let key1 = format!("root{V1_INFIX}{FROZEN_ENVELOPE_SHA}.1");
         let pointer = json!({
-            "chunks": chunk_entries
-                .iter()
-                .map(|(key, value)| json!({
-                    "key": key,
-                    "len": value.len(),
-                    "sha256": sha256_hex(value.as_bytes()),
-                }))
-                .collect::<Vec<_>>(),
-            "data_sha256": inner_sha,
+            "chunks": [
+                { "key": key0, "len": V1_SPLIT, "sha256": FROZEN_CHUNK0_SHA },
+                { "key": key1, "len": FROZEN_CHUNK1_LEN, "sha256": FROZEN_CHUNK1_SHA },
+            ],
+            "data_sha256": FROZEN_INNER_SHA,
             "edgezero_kind": "fastly_config_chunks",
-            "envelope_len": envelope.len(),
-            "envelope_sha256": envelope_sha,
+            "envelope_len": FROZEN_LEN,
+            "envelope_sha256": FROZEN_ENVELOPE_SHA,
             "version": 1_u8,
         })
         .to_string();
 
-        let chunk_map: HashMap<String, String> = chunk_entries.into_iter().collect();
+        let chunk_map: HashMap<String, String> =
+            HashMap::from([(key0, head.to_owned()), (key1, tail.to_owned())]);
         let resolved =
             resolve_fastly_config_value("root", pointer, |key| Ok(chunk_map.get(key).cloned()))
                 .expect("a value stored by v1 must still resolve");
@@ -1670,6 +1786,21 @@ mod tests {
         const V1_INFIX: &str = ".__edgezero_chunks.";
         /// A 4-byte codepoint (U+1F980, the crab).
         const CRAB: &str = "\u{1F980}";
+        /// The crab starts here: the largest codepoint boundary <= 7 000.
+        const V1_BOUNDARY: usize = 6_998;
+        // PRECOMPUTED wire hashes for this exact fixture, captured once and fed in
+        // as LITERALS. A drift in serialisation, the SHA helper, or the retreat
+        // boundary makes the live bytes disagree with these and the test fails.
+        const FROZEN_LEN: usize = 9_131;
+        const FROZEN_ENVELOPE_SHA: &str =
+            "769140bf1a0c17cf64074ca182e9c07869d4100f1eb99d2b68a847022c1bbe13";
+        const FROZEN_INNER_SHA: &str =
+            "457e339ad691524cc35a69c0d2d947e9338b09f9e0d841945b184807279ab22f";
+        const FROZEN_CHUNK0_SHA: &str =
+            "edff7b12241b5b5640a5d9b2af8af43e3ff4ce95a45ef6f31a59c7631282b7c3";
+        const FROZEN_CHUNK1_SHA: &str =
+            "e4031d9aecd7374bb79ee535bc481d2e1b1b9d40385d9ee57fda7132c4dcb015";
+        const FROZEN_CHUNK1_LEN: usize = FROZEN_LEN - V1_BOUNDARY;
 
         // Locate where the `frozen` string VALUE begins in the serialised
         // envelope. The prefix up to it is constant, so a probe measures it.
@@ -1690,9 +1821,12 @@ mod tests {
             "2026-01-01T00:00:00Z".to_owned(),
         ))
         .expect("envelope");
-        assert!(
-            envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT,
-            "fixture must be stored chunked"
+        // Freeze the wire.
+        assert_eq!(envelope.len(), FROZEN_LEN, "envelope byte length drifted");
+        assert_eq!(
+            sha256_hex(envelope.as_bytes()),
+            FROZEN_ENVELOPE_SHA,
+            "envelope wire bytes or the SHA helper drifted from the frozen v1 value"
         );
         assert!(
             !envelope.is_char_boundary(V1_SPLIT),
@@ -1705,32 +1839,33 @@ mod tests {
         while boundary > 0 && !envelope.is_char_boundary(boundary) {
             boundary = boundary.saturating_sub(1);
         }
-        assert_eq!(boundary, 6_998, "the crab starts at byte 6998");
-
-        let inner_sha = serde_json::from_str::<serde_json::Value>(&envelope)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("sha256")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .expect("envelope sha256");
-        let envelope_sha = sha256_hex(envelope.as_bytes());
+        assert_eq!(boundary, V1_BOUNDARY, "the crab starts at byte 6998");
 
         let head = envelope.get(..boundary).expect("codepoint boundary");
         let tail = envelope.get(boundary..).expect("codepoint boundary");
-        let key0 = format!("root{V1_INFIX}{envelope_sha}.0");
-        let key1 = format!("root{V1_INFIX}{envelope_sha}.1");
+        assert_eq!(
+            sha256_hex(head.as_bytes()),
+            FROZEN_CHUNK0_SHA,
+            "chunk 0 drifted"
+        );
+        assert_eq!(
+            sha256_hex(tail.as_bytes()),
+            FROZEN_CHUNK1_SHA,
+            "chunk 1 drifted"
+        );
+        assert_eq!(tail.len(), FROZEN_CHUNK1_LEN);
+
+        let key0 = format!("root{V1_INFIX}{FROZEN_ENVELOPE_SHA}.0");
+        let key1 = format!("root{V1_INFIX}{FROZEN_ENVELOPE_SHA}.1");
         let pointer = json!({
             "chunks": [
-                { "key": key0, "len": head.len(), "sha256": sha256_hex(head.as_bytes()) },
-                { "key": key1, "len": tail.len(), "sha256": sha256_hex(tail.as_bytes()) },
+                { "key": key0, "len": V1_BOUNDARY, "sha256": FROZEN_CHUNK0_SHA },
+                { "key": key1, "len": FROZEN_CHUNK1_LEN, "sha256": FROZEN_CHUNK1_SHA },
             ],
-            "data_sha256": inner_sha,
+            "data_sha256": FROZEN_INNER_SHA,
             "edgezero_kind": "fastly_config_chunks",
-            "envelope_len": envelope.len(),
-            "envelope_sha256": envelope_sha,
+            "envelope_len": FROZEN_LEN,
+            "envelope_sha256": FROZEN_ENVELOPE_SHA,
             "version": 1_u8,
         })
         .to_string();
@@ -2000,7 +2135,6 @@ mod tests {
             "42",
             "   ",
             r#"{"unrelated":"json"}"#,
-            r#"{"edgezero_kind":null}"#,
             "{not even valid json",
         ] {
             let out = resolve_fastly_config_value("k", raw.to_owned(), |_chunk_key| {
@@ -2008,6 +2142,25 @@ mod tests {
             })
             .unwrap_or_else(|err| panic!("raw value {raw:?} must pass through: {err}"));
             assert_eq!(out, raw, "value must be returned verbatim");
+        }
+
+        // A value that CLAIMS our namespace but is not our pointer kind -- an
+        // unknown string OR a non-string `edgezero_kind` -- is NOT passed through:
+        // it is our reserved field, so an unrecognised value in it is an error,
+        // never an ordinary entry.
+        for raw in [
+            r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
+            r#"{"edgezero_kind":null}"#,
+            r#"{"edgezero_kind":7}"#,
+        ] {
+            let err = resolve_fastly_config_value("k", raw.to_owned(), |_chunk_key| {
+                Err("fetch must not be called".to_owned())
+            })
+            .expect_err(&format!("a namespace-claiming value must error: {raw}"));
+            assert!(
+                err.contains("unknown `edgezero_kind`"),
+                "must report an unknown kind: {err}"
+            );
         }
     }
 

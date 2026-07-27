@@ -74,10 +74,19 @@ jobs:
         include:
           - adapter: cloudflare
             target: wasm32-unknown-unknown
+            features: cloudflare
           - adapter: fastly
             target: wasm32-wasip1
+            features: fastly
+          # The `cli` feature is a valid wasip1 build combination (the CLI host
+          # code compiled for the guest target); gate it so a dead-code or
+          # portability regression there is caught, not only in the fastly-only build.
+          - adapter: fastly
+            target: wasm32-wasip1
+            features: fastly cli
           - adapter: spin
             target: wasm32-wasip2
+            features: spin
     steps:
       - uses: actions/checkout@v6
 
@@ -110,8 +119,8 @@ jobs:
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
-      - name: Clippy ${{ matrix.adapter }} on ${{ matrix.target }}
-        run: cargo clippy -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --all-targets -- -D warnings
+      - name: Clippy ${{ matrix.adapter }} (${{ matrix.features }}) on ${{ matrix.target }}
+        run: cargo clippy -p edgezero-adapter-${{ matrix.adapter }} --features "${{ matrix.features }}" --target ${{ matrix.target }} --all-targets -- -D warnings
 
   format-docs:
     runs-on: ubuntu-latest

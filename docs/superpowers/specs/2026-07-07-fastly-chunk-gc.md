@@ -325,8 +325,21 @@ Dry-run by default; deletes only with `--yes`.
    as "references nothing" and orphan the root's own **live** chunks.
    `gc_classify_root` therefore does NOT call it: it independently deserialises
    the value, accepts only a valid direct envelope or a valid v1 pointer, runs
-   `validate_pointer_chunks`, and errors on everything else (empty, truncated,
-   unrelated) — it never yields the dangerous `Ok([])`.
+   `validate_pointer_chunks`, and errors on everything else — it never yields the
+   dangerous `Ok([])`.
+
+   **A classification error is not always fatal.** The caller distinguishes two
+   cases. A value that is definitively FOREIGN — a scalar, a plain string like
+   the documented `greeting = "hello"`, or a complete JSON object with no
+   `edgezero_kind`, at a key OUTSIDE the reserved `.__edgezero_chunks.` namespace
+   — is a legitimate sibling the runtime returns verbatim; it references no
+   chunks, so GC protects it as a zero-reference root and store-wide GC
+   continues. Everything else that fails to classify — a value CLAIMING our
+   namespace (a malformed/unknown/non-string `edgezero_kind`, including a
+   future-format pointer), an object-shaped value that will not parse (a possible
+   truncated pointer), or any value at a reserved-namespace key — is not provably
+   inert and FAILS CLOSED (aborts the run), so a corrupt or future-format root's
+   chunks are never mistaken for orphans and deleted.
 
    A pointer must also be **internally consistent**, not merely well-typed: a
    non-empty chunk list, one generation matching `envelope_sha256`, indexes
@@ -500,7 +513,10 @@ prune (prior_chunk_keys - new_keys) inside the same fastly.toml rewrite
 # --- config gc (operator) ---
 list                 # bare array, non-empty fields, no duplicate keys, else abort
 live = union over roots of:
-    gc_classify_root(root, root_value)          # valid envelope | valid pointer, else abort
+    gc_classify_root(root, root_value)          # valid envelope | valid pointer
+    # on a classify error: an inert FOREIGN value (no edgezero_kind, ordinary
+    # key) is protected as a zero-reference root and GC continues; a
+    # namespace-claiming / malformed-object / reserved-namespace value ABORTS
     -> if chunked: reassemble its chunks from the listing and CHECK the bytes
        hash to envelope_sha256, else abort      # metadata alone is not proof
 doomed = whole GENERATIONS of non-live chunk entries that
@@ -555,8 +571,11 @@ passed to the writer explicitly — never inferred from the flattened set:
   so concurrent local pushes serialise and neither loses the other's edit.
 - **Warnings.** `prior_chunk_keys` returning `Err` for a root → collect
   the message; the local push returns it as an extra status line. A
-  removal is infallible on an in-memory table, so the only local
-  warnings are suspicious-pointer ones.
+  removal is infallible on an in-memory table, so the local warnings are
+  the value-based ones: a suspicious prior pointer that skips pruning, and
+  a candidate KEPT because its own value is a runtime-readable root (a
+  chunk-shaped key holding a whole envelope or pointer, protected rather
+  than pruned).
 - **Dry-run (offline, best-effort count).** `push_config_entries_local`'s
   dry-run (`cli.rs:459`) reads no remote state. Extend it to read the
   current `fastly.toml` and, per root, compute the orphan count as
