@@ -164,6 +164,14 @@ steps:
     parse the version — leaving no captured rollback target. The scaffolded
     template already calls it.
 - Provide typed provider credentials through wrapper inputs, not caller `env:`.
+- **Decide the build's trust boundary.** The examples above build and deploy in
+  one job, which is correct when you trust your build — including its dependencies
+  — with the deploy credential (the usual case for your own app). If you do not,
+  isolate `build-app-cli` in a **separate job** with no secrets and hand the CLI
+  artifact to the deploy job (`needs:` + a matching `app-cli-artifact`); a
+  same-uid build can otherwise reach the runner's command storage or detach a
+  process that survives into the secret-bearing step. See the deploy guide's
+  "Isolating an untrusted build" and its security boundary.
 - Ensure the deployed ref has committed source (no dirty working tree) and a
   `Cargo.lock` at your app's **Cargo workspace root** (the workspace that owns
   `app-cli-package` — in a nested-workspace monorepo this may be your app
@@ -256,12 +264,16 @@ Workflow shape:
    FAILS but its `mutation-attempted` output is `true`, treat the service as
    possibly mutated rather than assume nothing deployed — a lost/malformed
    `fastly-version` line fails the step even though the deploy may have happened.
-   Read `mutation-attempted` under `if: always()`; since you then lack the version
-   to roll back _from_, recover it from the provider — run `active-version`
-   (`<app-cli> active-version --adapter fastly --service-id <id>` prints
-   `version=<N>`), and if `<N>` differs from the pre-deploy `previous-version`,
-   call `rollback-fastly` with `fastly-version: <N>` and
-   `rollback-to: <previous-version>` (the deploy guide shows the exact steps);
+   Read `mutation-attempted` under `if: always()`. **Production:** since you then
+   lack the version to roll back _from_, recover it — download the CLI artifact and
+   run `active-version` (`<app-cli> active-version --adapter fastly --service-id
+<id>` prints `version=<N>`); if `<N>` differs from the pre-deploy
+   `previous-version`, call `rollback-fastly` with `fastly-version: <N>` and
+   `rollback-to: <previous-version>` (the deploy guide has a runnable snippet).
+   **Staging:** `active-version` reports the production-active version, so it
+   cannot identify a staged draft; a failed staged deploy may leave an inactive
+   (non-serving) draft to clean up manually — there is no automated staged
+   recovery here;
 5. run `healthcheck-fastly` with the CLI artifact, `fastly-service-id`,
    `deploy-to`, `domain`, an optional `path` (default `/`; e.g. `/health` — it
    covers production and a staged version alike), and the captured

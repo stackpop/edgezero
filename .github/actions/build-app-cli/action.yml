@@ -94,18 +94,17 @@ runs:
         # Isolate the app-controlled build from the runner's command storage. The
         # runner keeps GITHUB_ENV/OUTPUT/PATH/STATE/step-summary as files in ONE
         # directory, so holding ANY of their real paths lets a build script derive
-        # the siblings and append (e.g.) LD_PRELOAD to the real GITHUB_ENV — which
-        # the runner then applies to a LATER, secret-bearing step. Blank them all
-        # here (and the re-exec strips them from the process image); outputs are
-        # emitted by the separate publish step. NOTE: this closes the env/proc
-        # vectors, but a fully malicious build can still enumerate the runner's
-        # command directory at the same uid — so a provider secret must never share
-        # a step or job with the build (see the guide's security notes).
-        GITHUB_OUTPUT: ""
-        GITHUB_ENV: ""
-        GITHUB_PATH: ""
-        GITHUB_STATE: ""
-        GITHUB_STEP_SUMMARY: ""
+        # the siblings and append (e.g.) LD_PRELOAD to the real GITHUB_ENV, which
+        # the runner then applies to a LATER, secret-bearing step. The authoritative
+        # defense is the script's re-exec: it does `env -u` on all five channels, so
+        # the process that runs cargo (and every child) has none of their real
+        # paths in its environment or /proc. We do NOT blank them in this step's
+        # `env:` — the runner reinjects reserved GITHUB_* values after step-env
+        # evaluation, so that would be an ineffective no-op. Outputs are emitted by
+        # the separate publish step instead. NOTE: this closes the env/proc vectors,
+        # but a fully malicious build can still enumerate the runner's command
+        # directory at the same uid — so a provider secret must never share a step
+        # or job with the build (see the guide's security notes).
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""

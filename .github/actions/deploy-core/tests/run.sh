@@ -1389,7 +1389,13 @@ test_action_output_contracts() {
         continue
       fi
       # The named step's OWN script must emit it — not merely some other action.
+      # Exception: a script may DELEGATE the run to the shared run-app-cli.sh
+      # launcher (which emits `mutation-attempted` itself, right before it invokes
+      # the CLI); if the step's script calls it, that counts as emitting.
       emitted=$(grep -oE "append_output ${out_name}( |\$)" "$script" || true)
+      if [[ -z "$emitted" ]] && grep -q 'run-app-cli\.sh' "$script"; then
+        emitted=$(grep -oE "append_output ${out_name}( |\$)" "$CORE_SCRIPTS/run-app-cli.sh" || true)
+      fi
       if [[ -z "$emitted" ]]; then
         fail "$name_of output '$out_name' claims step '$step_id' ($(basename "$script")) emits it, but that script does not"
         missing=$((missing + 1))
@@ -1638,11 +1644,15 @@ test_publish_outputs() {
     env RUNNER_TEMP="$dir/rt" EDGEZERO__BUILD__OUTPUTS_FILE="$dir/partial.env" GITHUB_OUTPUT="$dir/o3" \
     bash "$pub"
 
-  # The compile step must blank every GitHub file-command channel (structural
-  # guard against a regression that reintroduces one).
-  local yml="$ACTIONS_DIR/build-app-cli/action.yml" ch
-  for ch in GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY; do
-    assert_succeeds "compile step blanks $ch" grep -qE "^[[:space:]]+$ch: \"\"" "$yml"
+  # The isolation of the GitHub file-command channels is proved at RUNTIME by the
+  # scrubbed-ancestor test (the re-exec strips them from the process image);
+  # blanking them in the step `env:` would be an ineffective no-op (the runner
+  # reinjects reserved GITHUB_* values), so this action must NOT rely on that. The
+  # re-exec must strip all five — guard against dropping one.
+  local common="$ACTIONS_DIR/build-app-cli/scripts/common.sh" ch
+  for ch in GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY; do
+    assert_succeeds "the re-exec strips $ch from the process image" \
+      grep -qE "for ghvar in .*\b$ch\b" "$common"
   done
 }
 
@@ -1682,12 +1692,24 @@ test_deploy_signal_timing() {
   local dir="$WORK_DIR/deploy-signal"
   rm -rf "$dir"
   mkdir -p "$dir/bin" "$dir/app" "$dir/rt"
-  printf '#!/usr/bin/env bash\necho "version=42"\n' >"$dir/bin/fakecli"
+  # The fake CLI records whether the signal was ALREADY in GITHUB_OUTPUT when it
+  # ran — proving the launcher publishes it BEFORE the mutation (so it survives a
+  # cancellation mid-mutation), not after the CLI returns.
+  cat >"$dir/bin/fakecli" <<'CLI'
+#!/usr/bin/env bash
+if grep -qx 'mutation-attempted=true' "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null; then
+  echo "signal-before-cli=yes" >"$PROBE"
+else
+  echo "signal-before-cli=no" >"$PROBE"
+fi
+echo "version=42"
+CLI
   chmod +x "$dir/bin/fakecli"
   printf 'FASTLY_API_TOKEN\0FASTLY_SERVICE_ID\0' >"$dir/clear.nul"
 
   run_deploy() {
     env -i PATH="$dir/bin:$PATH" RUNNER_TEMP="$dir/rt" GITHUB_OUTPUT="$dir/out" \
+      PROBE="$dir/probe" \
       EDGEZERO__FASTLY__API_TOKEN=tok EDGEZERO__FASTLY__SERVICE_ID=svc123 \
       EDGEZERO__APP__CLI__BIN="$1" EDGEZERO__ADAPTER=fastly \
       EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
@@ -1697,10 +1719,15 @@ test_deploy_signal_timing() {
 
   # The CLI is invoked and succeeds: both signal and version are emitted.
   : >"$dir/out"
+  : >"$dir/probe"
   assert_succeeds "a successful deploy exits 0" run_deploy fakecli
   assert_succeeds "an invoked deploy signals mutation-attempted" \
     grep -qx 'mutation-attempted=true' "$dir/out"
   assert_succeeds "an invoked deploy emits fastly-version" grep -qx 'fastly-version=42' "$dir/out"
+  # Durability: the signal was present BEFORE the CLI finished, so a cancel or
+  # timeout mid-mutation cannot lose it.
+  assert_equals "the signal is published before the CLI runs" \
+    "signal-before-cli=yes" "$(cat "$dir/probe")"
 
   # Setup fails BEFORE invocation (the CLI binary is missing): NO false signal.
   : >"$dir/out"

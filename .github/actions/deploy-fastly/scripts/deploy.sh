@@ -36,19 +36,12 @@ main() {
   export EDGEZERO__PROVIDER__ENV
 
   new_private_log
+  # run-app-cli.sh publishes `mutation-attempted=true` itself, immediately before
+  # it invokes the CLI — so a setup failure never falsely signals, and the signal
+  # is durable in GITHUB_OUTPUT before the mutation starts (surviving a cancel /
+  # timeout mid-mutation). This wrapper only threads the resulting version out.
   local rc=0
   "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
-
-  # Signal a POSSIBLE provider mutation only if the CLI was actually invoked — the
-  # engine prints its `cli-invoked` marker immediately before running the CLI, so
-  # a failure during setup (binary resolve, cd, credential import) does NOT claim
-  # a mutation. Emitted regardless of the CLI's own exit so it survives a failed
-  # step (readable via `if: always()`): if the deploy then succeeds but its
-  # `version=` line is lost, or the CLI fails after partially mutating, the caller
-  # can still reconcile provider state instead of assuming nothing happened.
-  if grep -qx '\[edgezero-action\] cli-invoked' "$LIFECYCLE_LOG"; then
-    append_output mutation-attempted true
-  fi
   if [[ "$rc" -ne 0 ]]; then
     fail_with "$rc" "deploy failed (CLI exit $rc or setup error before invocation)"
   fi

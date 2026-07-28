@@ -446,13 +446,18 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
 
 The `fastly-version != ''` guard skips rollback when the version was never
 captured — because `rollback-fastly` needs it. But that is not the same as "no
-mutation occurred": if the deploy/stage step FAILED with
-`mutation-attempted == 'true'` and no `fastly-version`, the CLI ran and may have
-changed the service. Do not silently skip — recover the current version from the
-provider first (`<app-cli> active-version --adapter fastly --service-id <id>`
-prints `version=<N>`), compare it to the pre-deploy `previous-version`, and roll
-back with that `<N>` as `fastly-version` if they differ. The adoption guide gives
-the concrete procedure.
+mutation occurred": if the step FAILED with `mutation-attempted == 'true'` and no
+`fastly-version`, the CLI ran and may have changed the service, so do not silently
+skip. Recovery differs by target:
+
+- **Production:** recover the current version — `<app-cli> active-version --adapter
+fastly --service-id <id>` prints `version=<N>` (the live version) — compare it to
+  the pre-deploy `previous-version`, and roll back with that `<N>` as
+  `fastly-version` if they differ. The guide gives a runnable snippet.
+- **Staging:** `active-version` returns the PRODUCTION-active version, so it cannot
+  identify a possibly-created staged draft. A staged draft is inactive (serves no
+  traffic); there is no automated staged recovery — inspect the service's versions
+  and remove the stray unactivated draft manually.
 
 Because these are Fastly-specific, future adapters do not inherit them; a new
 adapter adds its own lifecycle actions if its provider supports staging.

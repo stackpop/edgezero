@@ -26,8 +26,10 @@ set -euo pipefail
 #   EDGEZERO__DEPLOY__ARGS_FILE           optional  NUL-delimited passthrough (deploy)
 #   EDGEZERO__PROVIDER__ENV_CLEAR_FILE    optional  NUL-delimited alias names to clear
 #   EDGEZERO__PROVIDER__ENV               optional  JSON object of typed creds (deploy)
-# Writes:
-#   nothing — execs the app CLI, which owns stdout/stderr and the exit status.
+# Writes (outputs):
+#   mutation-attempted   deploy mode only: 'true', written immediately BEFORE the
+#                        CLI runs (durable reconcile signal; see below).
+# Otherwise runs the app CLI, which owns stdout/stderr and the exit status.
 #   EDGEZERO_MANIFEST is exported to the CLI; the whole EDGEZERO__* namespace is
 #   scrubbed first (see scrub_action_private_env).
 
@@ -192,11 +194,16 @@ main() {
   fi
 
   cd "$working_directory"
-  # A stable marker, emitted ONLY after all setup succeeded and immediately before
-  # the CLI runs. A wrapper greps for it to decide whether a provider mutation
-  # could have started — so a failure BEFORE this point (binary resolve, cd,
-  # credential import) never falsely claims the CLI was invoked.
-  echo "[edgezero-action] cli-invoked" >&2
+  # Publish the reconcile signal for a MUTATING invocation HERE — after all setup
+  # succeeded (binary resolve, credential import, cd) and immediately before the
+  # CLI runs. Writing it now, from the launcher itself, is what makes it correct on
+  # every axis: a setup failure ABOVE never falsely claims the CLI ran, and because
+  # it is durable in GITHUB_OUTPUT before the mutation starts, it survives even if
+  # the step is cancelled or times out mid-mutation. `build` is credential-free and
+  # mutates nothing, so it is not signalled.
+  if [[ "$mode" == "deploy" ]]; then
+    append_output mutation-attempted true
+  fi
   echo "[edgezero-action] running $cli_bin $mode for adapter $adapter" >&2
   "${ARGV[@]}"
 }

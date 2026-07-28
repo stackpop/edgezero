@@ -110,21 +110,27 @@ main() {
     is_under "$app_dir" "$default_manifest" ||
       fail "the default 'edgezero.toml' resolves outside the application directory — refusing to read a manifest that escapes it"
   fi
+  # Open the private log and install the sensitive-temp cleanup FIRST, so there is
+  # never a window where a temp file exists without a trap covering it (a cancel in
+  # such a window would leave raw config behind).
+  new_private_log
+
   # Inline config is caller-supplied CONTENT (from a GitHub variable), not a
   # checkout path, so it needs no path confinement — this step chooses the file.
   # It is written to an action-owned temp file (removed on exit) and passed by
   # ABSOLUTE path, which the CLI reads as-is. A checked-out path is confined to
   # the app directory as before.
   if [[ -n "$app_config_inline" ]]; then
-    inline_file=$(mktemp "${RUNNER_TEMP:-/tmp}/edgezero-inline-config.XXXXXX") ||
-      fail "could not create a temp file for inline config"
-    # Remove it on exit (surfacing a removal failure — the file holds raw config).
-    # This trap covers the window before new_private_log installs its OWN exit trap
-    # (which replaces this one); the combined trap is re-installed below.
-    # shellcheck disable=SC2064  # expand $inline_file now, not at trap time
-    trap "cleanup_sensitive_temps '$inline_file'" EXIT
-    chmod 600 "$inline_file"
-    printf '%s' "$app_config_inline" >"$inline_file"
+    # A deterministic per-process path so the combined trap can name the file
+    # BEFORE it is created — closing the create-then-trap race. config-push runs
+    # no app-controlled code, so a predictable name is not a tampering risk.
+    inline_file="${RUNNER_TEMP:-/tmp}/edgezero-inline-config.$$"
+    # shellcheck disable=SC2064  # expand both paths now, not at trap time
+    trap "cleanup_sensitive_temps '$LIFECYCLE_LOG' '$inline_file'" EXIT
+    (
+      umask 077
+      printf '%s' "$app_config_inline" >"$inline_file"
+    )
     app_config="$inline_file"
   elif [[ -n "$app_config" ]]; then
     app_config=$(confine_to_app "$app_config" "$app_dir" app-config)
@@ -141,14 +147,6 @@ main() {
   if [[ "$no_env" == "true" ]]; then argv+=(--no-env); fi
   argv+=(--yes --no-diff)
 
-  new_private_log
-  # new_private_log installed an EXIT trap for its own log, REPLACING the
-  # inline-file trap set above. Re-install one that removes both so the raw inline
-  # config never survives the step (on success OR a CLI failure that exits here).
-  if [[ -n "$inline_file" ]]; then
-    # shellcheck disable=SC2064  # expand both paths now, not at trap time
-    trap "cleanup_sensitive_temps '$LIFECYCLE_LOG' '$inline_file'" EXIT
-  fi
   # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
   # signal survives a failed step (readable via `if: always()`). If the push
   # succeeds but its canonical `pushed-key=`/`pushed-store=` lines are missing
