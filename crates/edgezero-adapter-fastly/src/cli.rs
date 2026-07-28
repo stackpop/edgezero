@@ -14,7 +14,7 @@ use crate::chunked_config::{
     CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, chunk_lengths, gc_classify_root,
     gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
     resolve_fastly_config_value, sha256_hex, value_announces_our_kind, value_is_inert_foreign,
-    value_is_pointer_kind, verify_writer_split_layout,
+    verify_writer_split_layout,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -741,10 +741,25 @@ impl Adapter for FastlyCliAdapter {
             // Resolve chunk pointers: if `value` is a direct BlobEnvelope it
             // passes through unchanged; if it is a chunk pointer the chunks
             // are fetched from the same store and reconstructed.
-            let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
+            //
+            // The `describe` above SUCCEEDED, so the entry exists and the store
+            // is reachable. A resolve failure here therefore means the stored
+            // value is CORRUPT (missing chunk, hash mismatch, malformed/foreign
+            // pointer) -- not an IO error. Surface that as `Corrupt` rather than
+            // erroring, so `config push` can OVERWRITE the broken generation: the
+            // runtime and spec both promise re-push repairs it, and erroring here
+            // would make that impossible (recovery would need manual Fastly
+            // edits). A genuine IO failure fails the `describe` above and still
+            // errors.
+            return match resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
                 fetch_remote_config_store_entry(&store_id, chunk_key)
-            })?;
-            return Ok(ReadConfigEntry::Present(resolved));
+            }) {
+                Ok(resolved) => Ok(ReadConfigEntry::Present(resolved)),
+                Err(_reason) => Ok(ReadConfigEntry::Corrupt(
+                    "remote prior value could not be resolved (corrupt or incomplete chunk \
+                     state); a push will overwrite it",
+                )),
+            };
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let lower = stderr.to_ascii_lowercase();
@@ -870,17 +885,15 @@ impl Adapter for FastlyCliAdapter {
                 });
                 match resolved {
                     Ok(body) => Ok(ReadConfigEntry::Present(body)),
-                    // A corrupt/invalid prior value must NOT block a local push.
-                    // The whole point of `config push --local` here is to
-                    // OVERWRITE that broken state, and the local writer already
-                    // fail-soft handles a suspicious prior pointer (overwrite,
-                    // warn, prune nothing). Reporting `Unsupported` — "cannot
-                    // diff against this" — lets the write proceed to that path
-                    // instead of aborting the whole command on the diff read.
-                    // (Local only: a single file we are about to replace. The
-                    // cloud read keeps erroring, since we must not overwrite
-                    // remote state we could not read.)
-                    Err(_reason) => Ok(ReadConfigEntry::Unsupported(
+                    // A corrupt/invalid prior value must NOT block a push. The
+                    // whole point of `config push` here is to OVERWRITE that
+                    // broken state (the runtime + spec promise re-push repairs
+                    // it), and the local writer fail-soft handles a suspicious
+                    // prior pointer (overwrite, warn, prune nothing). `Corrupt`
+                    // lets the write proceed to that path instead of aborting the
+                    // command on the diff read -- the SAME behaviour the cloud
+                    // read now gives, so recovery is uniform across targets.
+                    Err(_reason) => Ok(ReadConfigEntry::Corrupt(
                         "local prior value could not be resolved (corrupt or incomplete chunk \
                          state); it will be overwritten by this push",
                     )),
@@ -954,9 +967,32 @@ impl Drop for TempFileGuard {
 /// canonicalizes directly; a not-yet-created file canonicalizes via its parent
 /// so a fresh `fastly.toml` still keys on a stable location.
 fn canonical_manifest_target(path: &Path) -> PathBuf {
+    // An existing file, or a symlink to one: the real file.
     if let Ok(real) = fs::canonicalize(path) {
         return real;
     }
+    // A DANGLING symlink (points at a not-yet-created file): resolve WHERE it
+    // points and target THAT, so the write lands at the intended file and the
+    // symlink is preserved -- rather than replacing the symlink itself with a
+    // regular file and leaving its target absent.
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+        && let Ok(link) = fs::read_link(path)
+    {
+        let resolved = if link.is_absolute() {
+            link
+        } else {
+            path.parent().unwrap_or_else(|| Path::new(".")).join(link)
+        };
+        return canonicalize_parent_join(&resolved);
+    }
+    // A plain not-yet-created file: key on <canonical parent>/<file name>.
+    canonicalize_parent_join(path)
+}
+
+/// Canonicalize `path`'s PARENT (which should exist) and rejoin the file name,
+/// so a not-yet-created file still resolves to a stable absolute location.
+fn canonicalize_parent_join(path: &Path) -> PathBuf {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -1364,24 +1400,25 @@ fn write_fastly_local_config_store(
         match orphan_chunk_keys(plan) {
             Ok(orphans) => {
                 for key in orphans {
-                    // Never remove an orphan whose VALUE is itself a
-                    // runtime-readable root (a valid direct envelope or a
-                    // pointer). A chunk-shaped key can hold one — e.g. a small
-                    // envelope padded so its first chunk is a whole envelope —
-                    // and it is independently readable, so deleting it would drop
-                    // live config. Mirrors the cloud GC value-based protection: a
-                    // real chunk payload is a raw fragment (not pointer-kind, not
-                    // a valid envelope) and prunes normally.
-                    let is_root_like = contents_tbl
+                    // Never remove an orphan whose VALUE is itself a root or a
+                    // value that CLAIMS our namespace: a valid direct envelope, a
+                    // pointer, OR an unknown/future/non-string `edgezero_kind`
+                    // (which the cloud GC path also fails closed on). A
+                    // chunk-shaped key can hold any of these, and deleting one
+                    // would drop live or newer-format config. Only a raw chunk
+                    // PAYLOAD -- which announces no kind and is not a valid
+                    // envelope -- prunes normally.
+                    let is_protected = contents_tbl
                         .get(&key)
                         .and_then(toml_edit::Item::as_str)
                         .is_some_and(|value| {
-                            value_is_pointer_kind(value) || gc_classify_root(&key, value).is_ok()
+                            value_announces_our_kind(value) || gc_classify_root(&key, value).is_ok()
                         });
-                    if is_root_like {
+                    if is_protected {
                         warnings.push(format!(
-                            "warning: kept `{key}` -- its value is a runtime-readable root \
-                             (envelope or pointer), not a chunk payload"
+                            "warning: kept `{key}` -- its value is a runtime-readable root or \
+                             claims the `edgezero_kind` namespace (envelope, pointer, or an \
+                             unknown/future kind), not a chunk payload"
                         ));
                         continue;
                     }
@@ -1481,14 +1518,24 @@ fn atomically_replace_file(
     tmp_file
         .write_all(contents.as_bytes())
         .map_err(|err| format!("failed to write the staging temp file: {err}"))?;
-    // Flush to disk before the rename so a crash cannot leave a renamed-but-empty
-    // manifest; best-effort (not all filesystems support it).
-    let _durability = tmp_file.sync_all();
+    // Flush to disk BEFORE the rename. A writeback error (ENOSPC/EIO) must surface
+    // HERE, while the known-good manifest is still untouched -- NOT be swallowed
+    // so the command "succeeds" after installing content that never reached disk.
+    // The guard removes the temp on this error.
+    tmp_file
+        .sync_all()
+        .map_err(|err| format!("failed to flush the staging temp file to disk: {err}"))?;
     drop(tmp_file);
 
     fs::rename(&tmp_path, target)
         .map_err(|err| format!("failed to replace {}: {err}", target.display()))?;
     guard.disarm();
+    // Sync the containing directory so the rename entry itself survives a crash.
+    // Best-effort: opening a directory as a file is not portable (Windows), and
+    // the critical durability -- the file's contents -- is already flushed above.
+    if let Ok(dir_handle) = fs::File::open(dir) {
+        let _dir_sync = dir_handle.sync_all();
+    }
     Ok(())
 }
 
@@ -1663,10 +1710,12 @@ fn local_orphan_counts_for_dry_run(
                                             // deletion and must not be counted.
                                             return false;
                                         };
-                                        // Present: KEPT only if its value is a
-                                        // runtime-readable root (then not counted).
+                                        // Present: KEPT (not counted) if its value
+                                        // is a runtime-readable root OR claims our
+                                        // namespace -- exactly what the real prune
+                                        // protects, so the count matches deletions.
                                         orphan_item.as_str().is_none_or(|text| {
-                                            !value_is_pointer_kind(text)
+                                            !value_announces_our_kind(text)
                                                 && gc_classify_root(key, text).is_err()
                                         })
                                     })
@@ -2069,14 +2118,28 @@ fn classify_store_entries(
         let classified = match gc_classify_root(&item.item_key, &item.item_value) {
             Ok(classified) => classified,
             // A chunk-shaped key whose value we cannot classify is a genuine
-            // chunk fragment (a candidate) ONLY if that value ANNOUNCES no kind.
-            // A real chunk payload is a raw envelope fragment that carries no
-            // `edgezero_kind`. Anything that DOES claim our namespace -- a pointer
-            // parked at a chunk-shaped key, or an unknown/future kind -- is
-            // root-like or suspicious, so it must fall through and FAIL CLOSED
-            // rather than become a deletable candidate whose references we orphan.
-            Err(_) if is_chunk_shaped && !value_announces_our_kind(&item.item_value) => {
-                continue; // a chunk payload: a delete candidate
+            // chunk fragment (a candidate) ONLY if BOTH hold:
+            //   - the value ANNOUNCES no kind. A real chunk payload is a raw
+            //     envelope fragment (no `edgezero_kind`); anything that DOES claim
+            //     our namespace -- a parked pointer, an unknown/future kind -- is
+            //     root-like or suspicious and must fail closed below.
+            //   - NOTHING is nested beneath this key. A truncated/corrupt pointer
+            //     at a chunk-shaped key is ALSO an unparseable fragment, but if it
+            //     is a nested ROOT with its own generation, those nested chunks are
+            //     proven independently and would be deleted while their (unreadable)
+            //     root can no longer name them -- silent loss of a whole nested
+            //     generation. If any canonical chunk of THIS key exists, treat the
+            //     key as an unreadable nested root and FAIL CLOSED. A real leaf
+            //     payload never has nested chunks, so normal GC is unaffected.
+            Err(_)
+                if is_chunk_shaped
+                    && !value_announces_our_kind(&item.item_value)
+                    && !items.iter().any(|other| {
+                        other.item_key != item.item_key
+                            && chunk_key_generation(&item.item_key, &other.item_key).is_some()
+                    }) =>
+            {
+                continue; // a leaf chunk payload: a delete candidate
             }
             // A definitively FOREIGN entry at an ORDINARY key — a plain string
             // like `greeting = "hello"`, a scalar, or a complete JSON object
@@ -5058,7 +5121,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_errors_on_missing_chunk() {
+    fn read_config_entry_reports_corrupt_on_missing_chunk() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
@@ -5083,18 +5146,19 @@ echo 'unexpected' >&2; exit 1
             TEST_CONFIG_ID,
             &AdapterPushContext::new(),
         );
-        let Err(err) = result else {
-            panic!("missing chunk must error")
-        };
+        // The `describe` succeeded (entry exists); a missing chunk is CORRUPT
+        // stored state the push can repair by overwriting, so the CLI read
+        // reports `Corrupt`, not a hard error. (The RUNTIME path maps a missing
+        // chunk to a retryable Unavailable — see config_store.rs.)
         assert!(
-            err.contains("missing chunk"),
-            "error must mention missing chunk: {err}"
+            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
+            "a missing chunk at an existing entry must be Corrupt (repairable), not an error"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_errors_on_corrupt_chunk_hash() {
+    fn read_config_entry_reports_corrupt_on_chunk_hash_mismatch() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
@@ -5140,29 +5204,24 @@ echo 'unexpected' >&2; exit 1
             TEST_CONFIG_ID,
             &AdapterPushContext::new(),
         );
-        let Err(err) = result else {
-            panic!("corrupt chunk must error")
-        };
+        // A chunk-hash mismatch at an EXISTING entry is corrupt stored state the
+        // push repairs by overwriting, so the CLI read reports `Corrupt`. (The
+        // RUNTIME path keeps a hash mismatch as Internal — see config_store.rs.)
         assert!(
-            err.contains("does not match the SHA-256"),
-            "error must say what failed: {err}"
-        );
-        // identified by POSITION, and neither hash echoed -- the
-        // expected one comes from the stored pointer, so it is value-controlled.
-        assert!(
-            err.contains("chunk 0"),
-            "error must locate the failing chunk by position: {err}"
+            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
+            "a chunk-hash mismatch at an existing entry must be Corrupt (repairable), not an error"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_errors_on_malformed_pointer() {
+    fn read_config_entry_reports_corrupt_for_malformed_pointer() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Root value ANNOUNCES our chunk-pointer kind but is malformed. It must
-        // be pointer-kind: arbitrary JSON is a legitimate config-store value and
-        // now passes through untouched, so it would not reach the corrupt path.
+        // Root value ANNOUNCES our chunk-pointer kind but is malformed. The
+        // `describe` SUCCEEDS (the entry exists), so a resolve failure is CORRUPT
+        // stored state, not an IO error: the read must report `Corrupt` so a push
+        // can overwrite it (in-band repair), NOT hard-error and block recovery.
         let bad_json = r#"{"edgezero_kind":"fastly_config_chunks","some_field":"x"}"#;
         let item_json = format!(
             r#"{{"item_value":{}}}"#,
@@ -5179,12 +5238,9 @@ echo 'unexpected' >&2; exit 1
             "cfg",
             &AdapterPushContext::new(),
         );
-        let Err(err) = result else {
-            panic!("malformed pointer must error")
-        };
         assert!(
-            err.contains("neither a valid BlobEnvelope") || err.contains("chunk pointer"),
-            "error must describe parse failure: {err}"
+            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
+            "a malformed pointer at an EXISTING entry must be Corrupt (repairable), not an error"
         );
     }
 
@@ -5259,10 +5315,10 @@ echo 'unexpected' >&2; exit 1
     /// a corrupt/invalid prior value must NOT abort the
     /// local read, or the CLI push aborts on the diff read before the writer's
     /// fail-soft ("overwrite, warn, prune nothing") can repair the state.
-    /// `config push --local` is how an operator recovers, so the read reports
-    /// `Unsupported` ("cannot diff") and lets the write proceed.
+    /// `config push` is how an operator recovers, so the read reports `Corrupt`
+    /// ("cannot diff; will overwrite") and lets the write proceed.
     #[test]
-    fn read_config_entry_local_degrades_corrupt_prior_to_unsupported() {
+    fn read_config_entry_local_degrades_corrupt_prior_to_corrupt() {
         use crate::chunked_config::{CHUNK_KEY_INFIX, POINTER_KIND};
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
@@ -5293,8 +5349,8 @@ echo 'unexpected' >&2; exit 1
             )
             .expect("a corrupt local prior must NOT abort the read");
         assert!(
-            matches!(result, ReadConfigEntry::Unsupported(_)),
-            "a corrupt prior value must degrade to Unsupported so the push can overwrite it"
+            matches!(result, ReadConfigEntry::Corrupt(_)),
+            "a corrupt prior value must degrade to Corrupt so the push can overwrite it"
         );
     }
 
@@ -6051,6 +6107,63 @@ echo 'unexpected' >&2; exit 1
             assert!(
                 oplog_has(&oplog, &format!("delete {key}")),
                 "a nested orphan generation must be reclaimed, not silently dropped: `{key}`; \
+                 log:\n{log}"
+            );
+        }
+    }
+
+    /// FAIL CLOSED: a MALFORMED pointer sitting at a chunk-shaped root that HAS a
+    /// nested generation beneath it must abort GC, not let that nested generation
+    /// be reclaimed. The truncated pointer cannot announce its discriminator, so
+    /// it looks like a chunk fragment -- but its nested chunks are proven
+    /// independently and would be deleted while their (unreadable) root can no
+    /// longer name them. That is exactly the truncated-pointer data loss the
+    /// spec forbids, so the whole run must refuse.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_a_malformed_pointer_at_a_chunk_shaped_root_with_nested_chunks() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let nested_root = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "f".repeat(64));
+        let nested = gen_envelope("nested");
+        let nested_entries = prepare_fastly_config_entries(&nested_root, &nested).expect("expand");
+        let nested_chunks: Vec<String> = nested_entries[..nested_entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let live = gen_envelope("live");
+        let stamp = stamp_secs_ago(604_800);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        // A truncated pointer at the chunk-shaped nested root: it WAS a pointer,
+        // now cut off, so it cannot announce its `edgezero_kind`.
+        listing.push((
+            nested_root.clone(),
+            stamp.clone(),
+            r#"{"chunks":[{"key":"#.to_owned(),
+        ));
+        // ...its aged, independently-provable nested generation.
+        for (key, value) in &nested_entries[..nested_entries.len().saturating_sub(1)] {
+            listing.push((key.clone(), stamp.clone(), value.clone()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false)
+            .expect_err("an unreadable nested root must fail closed, not be reclaimed");
+        assert!(
+            err.contains("refusing to reclaim"),
+            "must fail closed, not delete: {err}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &nested_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a nested generation under an unreadable root must NOT be deleted: `{key}`; \
                  log:\n{log}"
             );
         }
@@ -7117,6 +7230,81 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// The local prune must NOT delete a prior chunk key whose value claims our
+    /// `edgezero_kind` namespace with an UNKNOWN/future kind. The cloud GC path
+    /// fails closed on such a value; local replacement must be symmetric, or it
+    /// would destroy a newer-format entry an older CLI cannot understand.
+    #[test]
+    fn push_config_entries_local_keeps_a_chunk_key_holding_an_unknown_kind() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        // Seed a real chunked generation, then overwrite ONE chunk value with a
+        // future-format value that claims our namespace but is not a v1 pointer.
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(5_000));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), chunked)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed");
+
+        let mut doc: toml_edit::DocumentMut = fs::read_to_string(&fastly_toml)
+            .expect("read")
+            .parse()
+            .expect("parse");
+        let contents = doc["local_server"]["config_stores"][TEST_CONFIG_ID]["contents"]
+            .as_table_mut()
+            .expect("contents");
+        let victim = contents
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .find(|key| key.contains(CHUNK_KEY_INFIX))
+            .expect("a chunk key");
+        contents.insert(
+            &victim,
+            toml_edit::value(r#"{"edgezero_kind":"fastly_config_chunks_v2","new":true}"#),
+        );
+        fs::write(&fastly_toml, doc.to_string()).expect("write");
+
+        // Re-push a direct value: every prior chunk becomes an orphan.
+        let direct = make_test_envelope(100);
+        let warnings = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("re-push");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let after_doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let present = after_doc["local_server"]["config_stores"][TEST_CONFIG_ID]["contents"]
+            .as_table()
+            .expect("contents")
+            .contains_key(&victim);
+        assert!(
+            present,
+            "an unknown/future-kind value must be KEPT (symmetric with cloud GC fail-closed): {after}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unknown/future kind")),
+            "the operator must be warned the namespace-claiming key was kept: {warnings:?}"
+        );
+    }
+
     /// `preflight_config_write` rejects an infeasible push BEFORE any provider
     /// I/O: a reserved key, an empty key, and a body whose DERIVED chunk keys
     /// would exceed the store limit (caught by running expansion offline).
@@ -7528,6 +7716,43 @@ echo 'unexpected' >&2; exit 1
                 .expect("read real")
                 .contains("greeting = \"hi\""),
             "the real target behind the symlink must be updated"
+        );
+    }
+
+    /// A DANGLING manifest symlink (points at a not-yet-created file) must be
+    /// FOLLOWED: the write creates the intended target and preserves the symlink,
+    /// rather than replacing the link with a regular file and leaving the target
+    /// absent.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_follows_a_dangling_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("real-fastly.toml"); // does NOT exist yet
+        let link = dir.path().join("fastly.toml");
+        symlink(&target, &link).expect("dangling symlink");
+        assert!(!target.exists(), "target must start absent");
+
+        write_fastly_local_config_store(
+            &link,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
+        )
+        .expect("push through dangling symlink");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "the symlink must be preserved, not replaced with a regular file"
+        );
+        assert!(
+            fs::read_to_string(&target)
+                .expect("target must now exist")
+                .contains("greeting = \"hi\""),
+            "the intended (formerly-missing) target must be created and written"
         );
     }
 

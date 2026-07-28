@@ -204,6 +204,15 @@ impl<'entry> TypedSecretEntry<'entry> {
 /// Outcome of a single-key read. See spec 9.0.
 #[non_exhaustive]
 pub enum ReadConfigEntry {
+    /// The entry EXISTS but its stored value cannot be resolved to a usable
+    /// envelope — a missing chunk, a hash mismatch, a malformed/foreign pointer.
+    /// Distinct from a read/IO failure (which still errors): the store WAS
+    /// reachable and the key WAS present, so a `config push` can safely overwrite
+    /// it. This is the runtime's "re-run config push to repair" contract made
+    /// real — the push treats it like an absent remote (proceeds to write) rather
+    /// than aborting, so a broken generation is recoverable in-band. The
+    /// `&'static str` carries a redacted, human-readable reason.
+    Corrupt(&'static str),
     /// The store exists but the key is absent (operator hasn't pushed yet,
     /// or pushed under a different key).
     MissingKey,

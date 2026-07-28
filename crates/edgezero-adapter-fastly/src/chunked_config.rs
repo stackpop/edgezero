@@ -787,7 +787,7 @@ fn classify_root_value(raw: &str) -> RootValueKind {
 /// GC must not decide root-vs-chunk by KEY SHAPE: the runtime resolver follows
 /// whatever pointer it is handed, so a pointer parked at a chunk-shaped key
 /// still makes its references live.
-#[cfg(any(feature = "cli", test))]
+#[cfg(test)]
 pub(crate) fn value_is_pointer_kind(raw: &str) -> bool {
     matches!(classify_root_value(raw), RootValueKind::Pointer)
 }

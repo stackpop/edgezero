@@ -424,10 +424,16 @@ above). Only the operator can make this assertion, so:
 **Fails closed** on: an unreadable listing, a listing that is not a bare JSON
 array (an `{"items":[...]}` envelope may carry pagination we do not follow, and a
 page that omitted a root would make its live chunks look orphaned), an empty
-`item_key`/`item_value`/`created_at`, a root value that is not *either* a valid
-direct envelope *or* a valid pointer (an empty or truncated pointer must not read
-as "references nothing"), a non-canonical referenced key, an unreadable
-`created_at`, or an incomplete listing — all abort with nothing deleted.
+`item_key`/`item_value`/`created_at`, a root value that CLAIMS our
+`edgezero_kind` namespace but does not classify (a malformed pointer, an
+unknown/future/non-string kind — its chunks may belong to a newer format), an
+object-shaped value that will not parse at a reserved-namespace key (a possible
+truncated pointer, which must not read as "references nothing"), a non-canonical
+referenced key, an unreadable `created_at`, or an incomplete listing — all abort
+with nothing deleted. A definitively FOREIGN value at an ORDINARY key (a scalar,
+a plain string, a complete JSON object with no discriminator) is NOT a failure:
+it references no chunks, so GC protects it as a zero-reference root and continues
+(see the classification note above).
 
 **Non-zero exit on delete failure.** Independent generations are all attempted,
 but deletion STOPS within a generation at its first failure (a half-deleted
@@ -486,8 +492,10 @@ validated and prefix-scoped to that root.
 - `Err(msg)` — pointer-*kind* but invalid (bad version, foreign-prefix key).
 
 Parsed `serde_json::Value`-first, so a pointer-kind value with missing fields
-reaches the error path instead of being silently dropped. In `config gc` an
-`Err` here **aborts the whole run** (we cannot know what that root references).
+reaches the error path instead of being silently dropped. This `Err` belongs to
+the LOCAL PUSH path: it warns and prunes nothing for that root. `config gc` does
+NOT call this helper (see the note above) — its own fail-closed behaviour comes
+from `gc_classify_root`, not from here.
 
 `chunk_key_generation` recognises only the canonical shape
 `<root>.__edgezero_chunks.<hex-sha>.<index>`, so a foreign or hand-edited key is

@@ -676,6 +676,14 @@ where
             );
             DiffOutcome::RemoteAbsent
         }
+        ReadConfigEntry::Corrupt(reason) => {
+            diff_info(&format!(
+                "# existing value at key `{key}` is unusable ({reason}); cannot diff it. \
+                 `<app-cli> config push --adapter {} --yes` will REPLACE it.",
+                args.adapter,
+            ));
+            DiffOutcome::RemoteAbsent
+        }
         ReadConfigEntry::Unsupported(reason) => {
             diff_info(&format!(
                 "config diff for {} is unsupported ({reason}). Re-run with --local for the \
@@ -723,14 +731,16 @@ fn dispatch_diff_format(
 /// Consent gate: 8.3 Spin Cloud four-branch UX when `remote` is
 /// `Unsupported`; 8.2 default flow otherwise.
 fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(), String> {
-    // The `Unsupported` branch below is Spin-Cloud-specific: a CLOUD read that
-    // cannot reach the backend, where a dry-run is genuinely impossible. A LOCAL
-    // read returns `Unsupported` only when the prior value could not be resolved
-    // (corrupt/incomplete chunk state) — a recoverable single-file overwrite, not
-    // an unreachable backend. That takes the NORMAL consent path, so a dry-run
-    // reaches the writer's report and a real write just needs `--yes`. Without
-    // this, a corrupt local prior would hit the Spin-Cloud dry-run rejection and
-    // the fail-soft ("overwrite, warn, prune nothing") would be unreachable.
+    // A CORRUPT remote (the value exists but does not resolve) is NOT handled
+    // here — it falls to the `else` NORMAL consent path below, so a push
+    // overwrites the broken generation with just `--yes`. That is the in-band
+    // repair the runtime and spec promise.
+    //
+    // The `Unsupported` branch below is for a read that could not be COMPUTED at
+    // all: a CLOUD read that cannot reach the backend (Spin Cloud), where a
+    // dry-run is genuinely impossible; or a LOCAL read of malformed on-disk state
+    // (unreadable/invalid TOML, a non-table parent) — a recoverable single-file
+    // overwrite that takes the normal consent path (`if args.local`).
     if let ReadConfigEntry::Unsupported(reason) = remote {
         if args.local {
             return require_consent(args, remote);
@@ -935,6 +945,24 @@ fn render_first_read_diff(
                 "(none)",
                 local_sha,
             );
+            Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
+        }
+        ReadConfigEntry::Corrupt(reason) => {
+            // The existing remote value is unreadable. We cannot diff against it,
+            // but the push repairs it by overwriting -- proceed like an absent
+            // remote, after telling the operator what happened.
+            push_info(&format!(
+                "# existing value at key `{key}` is unusable ({reason}); it will be REPLACED by \
+                 this push"
+            ));
+            if !no_diff {
+                print_unified_diff_inline(
+                    &serde_json::Value::Object(serde_json::Map::default()),
+                    &local_envelope.data,
+                    "(corrupt)",
+                    local_sha,
+                );
+            }
             Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
         }
         // Unsupported, MissingKey/MissingStore with no_diff, and future
@@ -1826,6 +1854,133 @@ mod tests {
                 "`--older-than {raw}` must be rejected as a no-op assertion, got: {err}"
             );
         }
+    }
+
+    /// Build a fake `fastly` that serves `list_json` for
+    /// `config-store-entry list` and logs each `delete` to `oplog`.
+    #[cfg(unix)]
+    fn fake_fastly_gc_list(list_json: &str, oplog: &Path) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let list_file = tmp.path().join("list.json");
+        fs::write(&list_file, list_json).expect("write list json");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then echo '[{{\"name\":\"app_config\",\"id\":\"store-1\"}}]'; exit 0; fi\n\
+             case \"$2\" in\n  list) cat '{list}'; exit 0;;\n  delete) echo \"delete $*\" >> '{log}'; exit 0;;\nesac\nexit 0\n",
+            list = list_file.display(),
+            log = oplog.display(),
+        );
+        let script_path = tmp.path().join("fastly");
+        fs::write(&script_path, &script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        tmp
+    }
+
+    const GC_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+"#;
+
+    /// COMMAND-LEVEL GC: a dry-run drives the whole wrapper — manifest load, store
+    /// resolution, adapter-registry dispatch, listing, classification, and
+    /// reporting — end to end. A store with only a live root and a foreign sibling
+    /// has nothing to reclaim, so the command SUCCEEDS and deletes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_dispatches_and_reports_nothing_to_reclaim() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+
+        let live = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "greeting": "hi" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let list = json!([
+            { "item_key": "app_config", "item_value": live, "created_at": "2026-07-01T00:00:00Z" },
+            { "item_key": "greeting", "item_value": "hello", "created_at": "2026-07-01T00:00:00Z" },
+        ])
+        .to_string();
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(&list, &oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: true,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        run_config_gc(&args).expect("a dry-run over a clean store must succeed end to end");
+        assert!(
+            !oplog.exists(),
+            "a dry-run (and a nothing-to-reclaim store) must delete nothing: {:?}",
+            fs::read_to_string(&oplog).unwrap_or_default()
+        );
+    }
+
+    /// COMMAND-LEVEL fail-closed regression: a store whose root claims an
+    /// UNKNOWN/future `edgezero_kind` must abort the whole command (nothing
+    /// deleted), driven through the real dispatch path, not just the internal
+    /// classifier.
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_fails_closed_on_unknown_kind_root() {
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+
+        let list = json!([
+            {
+                "item_key": "app_config",
+                "item_value": r#"{"edgezero_kind":"fastly_config_chunks_v2","data":{}}"#,
+                "created_at": "2026-07-01T00:00:00Z"
+            },
+        ])
+        .to_string();
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(&list, &oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: true,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        let err = run_config_gc(&args).expect_err("an unknown-kind root must fail closed");
+        assert!(
+            err.contains("refusing to reclaim") || err.contains("does not recognise"),
+            "must fail closed on the unknown kind: {err}"
+        );
+        assert!(!oplog.exists(), "a fail-closed run deletes nothing");
     }
 
     /// A dry-run (no `--yes`) is allowed without `--older-than`; it fails later,
@@ -3174,6 +3329,36 @@ ids = ["default"]
             "the body-aware preflight must reject BEFORE any `fastly` invocation; log: {:?}",
             fs::read_to_string(&oplog).unwrap_or_default()
         );
+    }
+
+    /// A CORRUPT remote (the value exists but does not resolve) must let the push
+    /// PROCEED to overwrite — the in-band repair contract. `render_first_read_diff`
+    /// returns `ProceedFromMissingOrUnsupported`, and the consent gate takes the
+    /// normal `--yes` path (not the Spin-Cloud Unsupported branch).
+    #[test]
+    fn corrupt_remote_proceeds_to_overwrite_not_abort() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let local = BlobEnvelope::new(json!({ "k": "v" }), "2026-01-01T00:00:00Z".to_owned());
+        let outcome = render_first_read_diff(
+            &ReadConfigEntry::Corrupt("corrupt or incomplete chunk state"),
+            "app_config",
+            &local,
+            &local.sha256,
+            true,
+        )
+        .expect("a corrupt remote must not error the diff read");
+        assert!(
+            matches!(outcome, FirstReadOutcome::ProceedFromMissingOrUnsupported),
+            "a corrupt remote must proceed to overwrite, not abort"
+        );
+
+        // Consent: with --yes the push proceeds (repair), and it does NOT take the
+        // Spin-Cloud Unsupported branch (which would mis-message a fastly repair).
+        let mut args = push_args(Path::new("unused.toml"), "fastly");
+        args.yes = true;
+        handle_consent(&args, &ReadConfigEntry::Corrupt("corrupt")).expect("--yes must proceed");
     }
 
     /// Serialise a string as a TOML basic-string literal (test helper).
