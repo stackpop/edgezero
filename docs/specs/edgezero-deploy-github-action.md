@@ -450,10 +450,10 @@ mutation occurred": if the step FAILED with `mutation-attempted == 'true'` and n
 `fastly-version`, the CLI ran and may have changed the service, so do not silently
 skip. Recovery differs by target:
 
-- **Production:** recover the current version — `<app-cli> active-version --adapter
-fastly --service-id <id>` prints `version=<N>` (the live version) — compare it to
-  the pre-deploy `previous-version`, and roll back with that `<N>` as
-  `fastly-version` if they differ. The guide gives a runnable snippet.
+- **Production:** recover the current version — the CLI's `active-version`
+  subcommand prints the live version — compare it to the pre-deploy
+  `previous-version`, and roll back with that version as `fastly-version` if they
+  differ. The guide gives a runnable snippet.
 - **Staging:** `active-version` returns the PRODUCTION-active version, so it cannot
   identify a possibly-created staged draft. A staged draft is inactive (serves no
   traffic); there is no automated staged recovery — inspect the service's versions

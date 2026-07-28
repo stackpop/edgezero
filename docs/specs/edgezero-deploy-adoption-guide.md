@@ -266,14 +266,13 @@ Workflow shape:
    `fastly-version` line fails the step even though the deploy may have happened.
    Read `mutation-attempted` under `if: always()`. **Production:** since you then
    lack the version to roll back _from_, recover it — download the CLI artifact and
-   run `active-version` (`<app-cli> active-version --adapter fastly --service-id
-<id>` prints `version=<N>`); if `<N>` differs from the pre-deploy
-   `previous-version`, call `rollback-fastly` with `fastly-version: <N>` and
-   `rollback-to: <previous-version>` (the deploy guide has a runnable snippet).
-   **Staging:** `active-version` reports the production-active version, so it
-   cannot identify a staged draft; a failed staged deploy may leave an inactive
-   (non-serving) draft to clean up manually — there is no automated staged
-   recovery here;
+   run its `active-version` subcommand, which prints the live version; if that
+   differs from the pre-deploy `previous-version`, call `rollback-fastly` with it
+   as `fastly-version` and `previous-version` as `rollback-to` (the deploy guide
+   has a runnable snippet). **Staging:** `active-version` reports the
+   production-active version, so it cannot identify a staged draft; a failed staged
+   deploy may leave an inactive (non-serving) draft to clean up manually — there is
+   no automated staged recovery here;
 5. run `healthcheck-fastly` with the CLI artifact, `fastly-service-id`,
    `deploy-to`, `domain`, an optional `path` (default `/`; e.g. `/health` — it
    covers production and a staged version alike), and the captured
