@@ -562,15 +562,23 @@ passed to the writer explicitly — never inferred from the flattened set:
   value from the existing `contents_tbl`. After inserting the new
   physical entries, for each `(root, new_keys)` compute
   `prior_chunk_keys(root, old_value)` and, for each orphan `k` in
-  `prior − new_keys`, `contents_tbl.remove(k)` **unless `k`'s current
-  value is itself a runtime-readable root** — a pointer
-  (`value_is_pointer_kind`) or a value that classifies as a root
-  (`gc_classify_root(k, value).is_ok()`). A chunk-shaped key can legitimately
-  hold a whole envelope or pointer (e.g. a small envelope whose first chunk is
-  a complete envelope), which the runtime resolves independently; deleting it
-  would drop live config. Such a key is KEPT with a warning, mirroring the
-  cloud GC value-based protection. A real chunk payload is a raw fragment (not
-  pointer-kind, not a valid envelope) and prunes normally. All within the one
+  `prior − new_keys`, `contents_tbl.remove(k)` **unless it is PROTECTED**.
+  `k` is protected when EITHER:
+  - its current value is a runtime-readable root or CLAIMS our namespace —
+    a value that classifies as a root (`gc_classify_root(k, value).is_ok()`)
+    OR announces any `edgezero_kind`, including an unknown/future/non-string
+    one (`value_announces_our_kind`) that the cloud GC path also fails closed
+    on; OR
+  - `k` has a canonical chunk nested BENEATH it — it is a (possibly
+    truncated/unreadable) nested root, and deleting it would orphan that
+    nested generation. This is symmetric with cloud GC's fail-closed rule.
+
+  A chunk-shaped key can legitimately hold a whole envelope or pointer (e.g. a
+  small envelope whose first chunk is a complete envelope), which the runtime
+  resolves independently; deleting it would drop live or newer-format config.
+  A protected key is KEPT with a warning. Only a raw chunk PAYLOAD — announcing
+  no kind, not a valid envelope, and with nothing nested under it — prunes
+  normally. All within the one
   `DocumentMut`, which is then persisted by a single ATOMIC replacement
   (`atomically_replace_file`): the rendered document is written to a sibling
   temp file whose permissions are copied from the manifest, then `rename`d over

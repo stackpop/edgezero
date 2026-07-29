@@ -820,6 +820,17 @@ pub(crate) fn value_announces_our_kind(raw: &str) -> bool {
     )
 }
 
+/// Does this value announce an `edgezero_kind` this build does NOT recognise — an
+/// unknown string kind, or a non-string kind (a NEWER or foreign format)?
+///
+/// The CLI read path refuses to OVERWRITE such a value: an older CLI clobbering a
+/// format it cannot read would lose the newer config. It is a hard read error
+/// (upgrade the CLI), never the repairable `Corrupt`.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn value_is_unknown_kind(raw: &str) -> bool {
+    matches!(classify_root_value(raw), RootValueKind::UnknownKind)
+}
+
 /// Classify a ROOT value for `config gc` — the live-set input on a DESTRUCTIVE
 /// path, so it is fail-closed. Unlike [`prior_chunk_keys`] (which is lenient for
 /// the push path and treats unrelated/empty JSON as "references nothing"), this
@@ -1450,13 +1461,14 @@ mod tests {
     /// fails closed) rather than treating it as a deletable/ignorable value.
     #[test]
     fn classifier_predicates_agree_on_every_category() {
-        // (raw, is_pointer, is_inert_foreign, announces_our_kind)
-        let cases: &[(&str, bool, bool, bool)] = &[
+        // (raw, is_pointer, is_inert_foreign, announces_our_kind, is_unknown_kind)
+        let cases: &[(&str, bool, bool, bool, bool)] = &[
             (
                 r#"{"edgezero_kind":"fastly_config_chunks"}"#,
                 true,
                 false,
                 true,
+                false,
             ),
             // Unknown STRING kind: claims our namespace, not inert, not our pointer.
             (
@@ -1464,19 +1476,32 @@ mod tests {
                 false,
                 false,
                 true,
+                true,
             ),
             // NON-STRING kind: still claims the namespace -- must NOT be inert.
-            (r#"{"edgezero_kind":7}"#, false, false, true),
-            (r#"{"edgezero_kind":null}"#, false, false, true),
-            (r#"{"edgezero_kind":{"nested":true}}"#, false, false, true),
+            (r#"{"edgezero_kind":7}"#, false, false, true, true),
+            (r#"{"edgezero_kind":null}"#, false, false, true, true),
+            (
+                r#"{"edgezero_kind":{"nested":true}}"#,
+                false,
+                false,
+                true,
+                true,
+            ),
             // Genuinely foreign: no discriminator.
-            (r#"{"unrelated":"json"}"#, false, true, false),
-            ("value_a", false, true, false),
-            ("", false, true, false),
+            (r#"{"unrelated":"json"}"#, false, true, false, false),
+            ("value_a", false, true, false, false),
+            ("", false, true, false, false),
             // Object-shaped but unparseable (a possible truncated pointer): none.
-            (r#"{"edgezero_kind":"fastly_config"#, false, false, false),
+            (
+                r#"{"edgezero_kind":"fastly_config"#,
+                false,
+                false,
+                false,
+                false,
+            ),
         ];
-        for &(raw, is_ptr, inert, announces) in cases {
+        for &(raw, is_ptr, inert, announces, unknown) in cases {
             assert_eq!(value_is_pointer_kind(raw), is_ptr, "pointer_kind: {raw:?}");
             assert_eq!(value_is_inert_foreign(raw), inert, "inert_foreign: {raw:?}");
             assert_eq!(
@@ -1484,6 +1509,7 @@ mod tests {
                 announces,
                 "announces_our_kind: {raw:?}"
             );
+            assert_eq!(value_is_unknown_kind(raw), unknown, "unknown_kind: {raw:?}");
             // No value is ever BOTH inert-foreign and namespace-claiming.
             assert!(!(inert && announces), "mutually exclusive: {raw:?}");
         }

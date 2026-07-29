@@ -4888,6 +4888,18 @@ pub enum ReadConfigEntry {
     /// comparison; the write side keeps the same consent
     /// gate every other adapter has.
     Unsupported(&'static str),
+    /// The entry EXISTS but its stored value cannot be
+    /// resolved to a valid, verifying envelope — a missing/
+    /// short/hash-mismatched chunk, a malformed pointer, a
+    /// malformed direct value, or a SHA mismatch. DISTINCT
+    /// from a read/IO failure (which stays an `Err`) and from
+    /// an unknown/future `edgezero_kind` (also an `Err` — an
+    /// older CLI must not overwrite a newer format). `config
+    /// push` treats `Corrupt` like an absent remote and
+    /// OVERWRITES it (the in-band repair the runtime and §9.3
+    /// promise); `config diff` reports it distinctly and exits
+    /// "could not compare" (never a clean/absent success).
+    Corrupt(&'static str),
 }
 ```
 

@@ -129,6 +129,10 @@ pub struct DiffExit {
 /// Internal outcome of a `config diff` run. Drives `apply_exit_code`.
 /// Variants are alphabetical per `clippy::arbitrary_source_item_ordering`.
 enum DiffOutcome {
+    /// The remote entry exists but is CORRUPT — no valid comparison was
+    /// possible. Reported distinctly (never as "no changes" or "all added") so a
+    /// scripted `config diff` cannot read it as a successful clean comparison.
+    CorruptRemote,
     /// Diff is present (remote != local, or remote absent).
     DiffPresent,
     /// SHA matched — no changes.
@@ -509,7 +513,10 @@ fn diff_info(msg: &str) {
 /// per Q10's table.
 fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
     let code = match (exit_code_flag, outcome) {
-        (_, DiffOutcome::Unsupported) => 2_i32,
+        // "Could not compare" (unsupported read-back, or a corrupt remote) is
+        // exit 2 REGARDLESS of --exit-code, so it is never mistaken for a clean
+        // comparison by a script.
+        (_, DiffOutcome::Unsupported | DiffOutcome::CorruptRemote) => 2_i32,
         (true, DiffOutcome::DiffPresent | DiffOutcome::RemoteAbsent) => 1_i32,
         // false + any, or true + NoChanges → no signal.
         _ => 0_i32,
@@ -678,11 +685,11 @@ where
         }
         ReadConfigEntry::Corrupt(reason) => {
             diff_info(&format!(
-                "# existing value at key `{key}` is unusable ({reason}); cannot diff it. \
+                "# existing value at key `{key}` is unusable ({reason}); NO diff was computed. \
                  `<app-cli> config push --adapter {} --yes` will REPLACE it.",
                 args.adapter,
             ));
-            DiffOutcome::RemoteAbsent
+            DiffOutcome::CorruptRemote
         }
         ReadConfigEntry::Unsupported(reason) => {
             diff_info(&format!(
@@ -838,8 +845,8 @@ fn recheck_before_write(
     approved_remote_sha: Option<&str>,
 ) -> Result<RecheckOutcome, String> {
     let remote_now = read_remote(adapter, args.local, paths, store, key)?;
-    if let ReadConfigEntry::Present(body_now) = remote_now {
-        let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now).map_err(|_err| {
+    if let ReadConfigEntry::Present(body_now) = &remote_now {
+        let remote_now_env: BlobEnvelope = serde_json::from_str(body_now).map_err(|_err| {
             "post-consent remote value is not a valid envelope (details redacted)".to_owned()
         })?;
         remote_now_env
@@ -863,6 +870,13 @@ fn recheck_before_write(
                 short_ref(&remote_now_env.sha256),
             ));
         }
+    } else if matches!(remote_now, ReadConfigEntry::Corrupt(_)) {
+        // The remote is (or became) CORRUPT: report it precisely instead of
+        // modelling it as a removal, then overwrite. A Present→Corrupt transition
+        // is a concurrent write that landed a broken value, not a deletion.
+        push_info(&format!(
+            "# remote value at key `{key}` is unusable at write time; overwriting to repair it"
+        ));
     } else if matches!(first_read, ReadConfigEntry::Present(_)) {
         // First read Present, second read MissingKey/MissingStore:
         // the remote was removed while we waited for consent. Warn
@@ -874,8 +888,8 @@ fn recheck_before_write(
             ));
         }
     } else {
-        // First read MissingKey/MissingStore, second also Missing —
-        // nothing changed; fall through to write silently.
+        // First read MissingKey/MissingStore/Corrupt, second also non-Present —
+        // nothing to compare; fall through to write.
     }
     Ok(RecheckOutcome::Write)
 }
@@ -948,21 +962,14 @@ fn render_first_read_diff(
             Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
         }
         ReadConfigEntry::Corrupt(reason) => {
-            // The existing remote value is unreadable. We cannot diff against it,
-            // but the push repairs it by overwriting -- proceed like an absent
-            // remote, after telling the operator what happened.
+            // The existing remote value is unreadable, so there is NO real prior
+            // to diff against. Do NOT fabricate a local-vs-empty diff (that reads
+            // as "the remote was empty"); just report the corruption and proceed
+            // to overwrite (the in-band repair).
             push_info(&format!(
-                "# existing value at key `{key}` is unusable ({reason}); it will be REPLACED by \
-                 this push"
+                "# existing value at key `{key}` is unusable ({reason}); NO diff was computed. It \
+                 will be REPLACED by this push."
             ));
-            if !no_diff {
-                print_unified_diff_inline(
-                    &serde_json::Value::Object(serde_json::Map::default()),
-                    &local_envelope.data,
-                    "(corrupt)",
-                    local_sha,
-                );
-            }
             Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
         }
         // Unsupported, MissingKey/MissingStore with no_diff, and future
@@ -1856,18 +1863,26 @@ mod tests {
         }
     }
 
-    /// Build a fake `fastly` that serves `list_json` for
-    /// `config-store-entry list` and logs each `delete` to `oplog`.
+    /// Build a fake `fastly` that maps store name→id via `config-store list`
+    /// (`store_list_json`), serves `entry_list_json` for `config-store-entry
+    /// list`, and logs every `config-store-entry` invocation's argv to `oplog`
+    /// (so a test can assert which store-id the resolved name flowed to, and any
+    /// delete arguments).
     #[cfg(unix)]
-    fn fake_fastly_gc_list(list_json: &str, oplog: &Path) -> tempfile::TempDir {
+    fn fake_fastly_gc_list(
+        store_list_json: &str,
+        entry_list_json: &str,
+        oplog: &Path,
+    ) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let list_file = tmp.path().join("list.json");
-        fs::write(&list_file, list_json).expect("write list json");
+        fs::write(&list_file, entry_list_json).expect("write entry list json");
         let script = format!(
             "#!/bin/sh\n\
-             if [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then echo '[{{\"name\":\"app_config\",\"id\":\"store-1\"}}]'; exit 0; fi\n\
-             case \"$2\" in\n  list) cat '{list}'; exit 0;;\n  delete) echo \"delete $*\" >> '{log}'; exit 0;;\nesac\nexit 0\n",
+             if [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then echo '{stores}'; exit 0; fi\n\
+             case \"$2\" in\n  list) echo \"list $*\" >> '{log}'; cat '{list}'; exit 0;;\n  delete) echo \"delete $*\" >> '{log}'; exit 0;;\nesac\nexit 0\n",
+            stores = store_list_json,
             list = list_file.display(),
             log = oplog.display(),
         );
@@ -1921,7 +1936,7 @@ ids = ["app_config"]
         ])
         .to_string();
         let oplog = dir.path().join("fastly-ops.log");
-        let fake = fake_fastly_gc_list(&list, &oplog);
+        let fake = fake_fastly_gc_list(r#"[{"name":"app_config","id":"store-1"}]"#, &list, &oplog);
         let _prepend = PathPrepend::new(fake.path());
 
         let args = ConfigGcArgs {
@@ -1934,10 +1949,10 @@ ids = ["app_config"]
             ..ConfigGcArgs::default()
         };
         run_config_gc(&args).expect("a dry-run over a clean store must succeed end to end");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
         assert!(
-            !oplog.exists(),
-            "a dry-run (and a nothing-to-reclaim store) must delete nothing: {:?}",
-            fs::read_to_string(&oplog).unwrap_or_default()
+            !log.contains("delete "),
+            "a dry-run (and a nothing-to-reclaim store) must delete nothing: {log}"
         );
     }
 
@@ -1963,7 +1978,7 @@ ids = ["app_config"]
         ])
         .to_string();
         let oplog = dir.path().join("fastly-ops.log");
-        let fake = fake_fastly_gc_list(&list, &oplog);
+        let fake = fake_fastly_gc_list(r#"[{"name":"app_config","id":"store-1"}]"#, &list, &oplog);
         let _prepend = PathPrepend::new(fake.path());
 
         let args = ConfigGcArgs {
@@ -1980,7 +1995,64 @@ ids = ["app_config"]
             err.contains("refusing to reclaim") || err.contains("does not recognise"),
             "must fail closed on the unknown kind: {err}"
         );
-        assert!(!oplog.exists(), "a fail-closed run deletes nothing");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.contains("delete "),
+            "a fail-closed run deletes nothing: {log}"
+        );
+    }
+
+    /// COMMAND-LEVEL store routing: the ENV-derived platform name
+    /// (`EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`) must drive store selection.
+    /// The gc resolves that name to a Fastly store id via `config-store list`,
+    /// then lists entries under that id. The fake only knows the env name, so a
+    /// wrong-store regression (ignoring the overlay) would fail resolution — and
+    /// we assert the resolved id flowed through to the entry listing.
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_selects_the_env_derived_store() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let _env = EnvOverride::set(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+            "shared_config",
+        );
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+
+        let live = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "greeting": "hi" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let entries = json!([
+            { "item_key": "app_config", "item_value": live, "created_at": "2026-07-01T00:00:00Z" },
+        ])
+        .to_string();
+        // The store list is keyed ONLY on the ENV name -> a specific id. If the
+        // overlay were ignored (logical "app_config" looked up), resolution fails.
+        let stores = r#"[{"name":"shared_config","id":"store-42"}]"#;
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(stores, &entries, &oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: false, // apply the EDGEZERO__* overlay
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        run_config_gc(&args).expect("the env-derived store must resolve and list");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            log.contains("--store-id=store-42"),
+            "the entry listing must run against the ENV-derived store id: {log}"
+        );
     }
 
     /// A dry-run (no `--yes`) is allowed without `--older-than`; it fails later,
@@ -3359,6 +3431,25 @@ ids = ["default"]
         let mut args = push_args(Path::new("unused.toml"), "fastly");
         args.yes = true;
         handle_consent(&args, &ReadConfigEntry::Corrupt("corrupt")).expect("--yes must proceed");
+    }
+
+    /// A read-only `config diff` against a CORRUPT remote must NOT read as a
+    /// clean/absent comparison: it exits 2 ("could not compare") regardless of
+    /// `--exit-code`, distinct from `NoChanges` (0) and `RemoteAbsent`/`DiffPresent`.
+    #[test]
+    fn corrupt_remote_diff_exits_could_not_compare() {
+        assert_eq!(
+            apply_exit_code(false, DiffOutcome::CorruptRemote).code,
+            2_i32
+        );
+        assert_eq!(
+            apply_exit_code(true, DiffOutcome::CorruptRemote).code,
+            2_i32
+        );
+        // For contrast: a clean match is 0, and an absent remote with --exit-code
+        // signals a change (1) -- neither is what a corrupt remote reports.
+        assert_eq!(apply_exit_code(false, DiffOutcome::NoChanges).code, 0_i32);
+        assert_eq!(apply_exit_code(true, DiffOutcome::RemoteAbsent).code, 1_i32);
     }
 
     /// Serialise a string as a TOML basic-string literal (test helper).
