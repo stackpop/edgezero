@@ -455,9 +455,11 @@ skip. Recovery differs by target:
   `previous-version`, and roll back with that version as `fastly-version` if they
   differ. The guide gives a runnable snippet.
 - **Staging:** `active-version` returns the PRODUCTION-active version, so it cannot
-  identify a possibly-created staged draft. A staged draft is inactive (serves no
-  traffic); there is no automated staged recovery — inspect the service's versions
-  and remove the stray unactivated draft manually.
+  identify a possibly-staged version. The staging CLI runs `service-version stage`
+  BEFORE it emits the version (§5.4), so a lost-version failure may leave a version
+  **already staged — serving staging traffic via the staging selector**, not merely
+  an unactivated draft. There is no automated staged recovery — list the service's
+  versions and un-stage/deactivate the stray one manually.
 
 Because these are Fastly-specific, future adapters do not inherit them; a new
 adapter adds its own lifecycle actions if its provider supports staging.
@@ -609,8 +611,11 @@ probe it, roll back on failure.
     `provider-env` and export only its values, and run:
 
     ```text
-    <app-cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>
+    <app-cli-bin> deploy --adapter <adapter> <deploy-flags…> -- <deploy-args…>
     ```
+
+    Typed adapter flags (e.g. `--service-id`, `--stage`) go BEFORE `--`; the
+    caller's allowlisted passthrough (`deploy-args`) goes after it.
 
     For adapters whose deploy also compiles the application (Fastly's default),
     this step builds application code with credentials in scope — see §10.1.
@@ -878,30 +883,30 @@ CLI artifact runs cleanup with `if: always()`.
 
 All validation and setup failures stop before invoking provider deployment.
 
-| Failure                                               | Required diagnostic                                                                                                                                                              |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Missing/unknown `app-cli-package`                     | State that the app must name a CLI package present in its own workspace.                                                                                                         |
-| Missing `app-cli-artifact`                            | State that a compiled CLI artifact from `build-app-cli` is required.                                                                                                             |
-| Malformed `adapter` token                             | Name the input and its allowed shape (the CLI validates support at run time).                                                                                                    |
-| Invalid boolean                                       | Name the input and allowed values.                                                                                                                                               |
-| Missing working directory                             | Print the workspace-relative requested path.                                                                                                                                     |
-| Path escapes workspace                                | Name the input; require paths under `github.workspace`.                                                                                                                          |
-| Missing explicit manifest                             | Print the workspace-relative requested path.                                                                                                                                     |
-| Invalid JSON arguments/env                            | Name the invalid input without printing its value.                                                                                                                               |
-| Non-string entry                                      | State that every array/object value must be a string.                                                                                                                            |
-| Disallowed deploy arg                                 | State the allowlist and rejected position without printing the array.                                                                                                            |
-| Rust toolchain cannot be resolved                     | List files checked and suggest explicit `rust-toolchain`.                                                                                                                        |
-| Dirty working tree                                    | State that deployments require committed source.                                                                                                                                 |
-| Missing `Cargo.lock` when cache enabled               | Explain the exact-key cache requirement.                                                                                                                                         |
-| Missing provider credential input                     | Name the missing input, never its value.                                                                                                                                         |
-| Build command fails                                   | Preserve exit status; state that deploy was not attempted.                                                                                                                       |
-| Deploy command fails                                  | Preserve exit status; emit `mutation-attempted=true` so an `if: always()` caller can reconcile a possibly-mutated service. Rollback is caller-owned.                             |
-| Deploy succeeds but the `fastly-version` line is lost | Fail the step (there is no version to thread), but `mutation-attempted=true` is already emitted so the caller reconciles rather than assumes a no-op.                            |
-| Staged deploy fails                                   | Preserve exit status; emit no `fastly-version`. `mutation-attempted=true` still signals the CLI ran, so a caller can reconcile a possibly-created draft rather than assume none. |
-| Missing `fastly-version` (healthcheck/rollback)       | State it is required, sourced from the deploy/stage output.                                                                                                                      |
-| Health check unhealthy after retries                  | Exit non-zero and set `healthy=false`/`status-code` so the caller can rollback.                                                                                                  |
-| Rollback command fails                                | Preserve exit status; state the version was not rolled back.                                                                                                                     |
-| Cleanup fails                                         | Mark the action failed; identify the area without printing secrets.                                                                                                              |
+| Failure                                               | Required diagnostic                                                                                                                                                                                                                                              |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Missing/unknown `app-cli-package`                     | State that the app must name a CLI package present in its own workspace.                                                                                                                                                                                         |
+| Missing `app-cli-artifact`                            | State that a compiled CLI artifact from `build-app-cli` is required.                                                                                                                                                                                             |
+| Malformed `adapter` token                             | Name the input and its allowed shape (the CLI validates support at run time).                                                                                                                                                                                    |
+| Invalid boolean                                       | Name the input and allowed values.                                                                                                                                                                                                                               |
+| Missing working directory                             | Print the workspace-relative requested path.                                                                                                                                                                                                                     |
+| Path escapes workspace                                | Name the input; require paths under `github.workspace`.                                                                                                                                                                                                          |
+| Missing explicit manifest                             | Print the workspace-relative requested path.                                                                                                                                                                                                                     |
+| Invalid JSON arguments/env                            | Name the invalid input without printing its value.                                                                                                                                                                                                               |
+| Non-string entry                                      | State that every array/object value must be a string.                                                                                                                                                                                                            |
+| Disallowed deploy arg                                 | State the allowlist and rejected position without printing the array.                                                                                                                                                                                            |
+| Rust toolchain cannot be resolved                     | List files checked and suggest explicit `rust-toolchain`.                                                                                                                                                                                                        |
+| Dirty working tree                                    | State that deployments require committed source.                                                                                                                                                                                                                 |
+| Missing `Cargo.lock` when cache enabled               | Explain the exact-key cache requirement.                                                                                                                                                                                                                         |
+| Missing provider credential input                     | Name the missing input, never its value.                                                                                                                                                                                                                         |
+| Build command fails                                   | Preserve exit status; state that deploy was not attempted.                                                                                                                                                                                                       |
+| Deploy command fails                                  | Preserve exit status; emit `mutation-attempted=true` so an `if: always()` caller can reconcile a possibly-mutated service. Rollback is caller-owned.                                                                                                             |
+| Deploy succeeds but the `fastly-version` line is lost | Fail the step (there is no version to thread), but `mutation-attempted=true` is already emitted so the caller reconciles rather than assumes a no-op.                                                                                                            |
+| Staged deploy fails                                   | Preserve exit status; emit no `fastly-version`. `mutation-attempted=true` still signals the CLI ran, so a caller can reconcile a possibly-created draft rather than assume none.                                                                                 |
+| Missing `fastly-version` (healthcheck/rollback)       | State it is required, sourced from the deploy/stage output.                                                                                                                                                                                                      |
+| Health check unhealthy after retries                  | Exit non-zero and set `healthy=false`/`status-code` so the caller can rollback.                                                                                                                                                                                  |
+| Rollback command fails                                | Surface the CLI exit status BEFORE writing any output (so an output-write failure cannot mask it); state the rollback did not complete and the active version may be indeterminate (reconcile via `mutation-attempted`) — do not claim it "was not rolled back". |
+| Cleanup fails                                         | Mark the action failed; identify the area without printing secrets.                                                                                                                                                                                              |
 
 Provider CLI stderr passes through so provider API errors stay actionable. The
 actions never construct error messages containing credentials.

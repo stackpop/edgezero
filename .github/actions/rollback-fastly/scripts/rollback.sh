@@ -44,8 +44,13 @@ main() {
   validate_inputs
 
   # `rollback` is manifest-independent (a pure Fastly-API call), so it runs from
-  # wherever the step is — no app-directory resolution needed.
-  local argv=("$(resolve_app_cli)" rollback --adapter fastly --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID" --version "$EDGEZERO__LIFECYCLE__VERSION")
+  # wherever the step is — no app-directory resolution needed. Resolve and VERIFY
+  # the CLI before signalling a mutation: a missing binary must not falsely claim a
+  # rollback was attempted.
+  local cli_bin
+  cli_bin=$(resolve_app_cli)
+  require_cmd "$cli_bin"
+  local argv=("$cli_bin" rollback --adapter fastly --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID" --version "$EDGEZERO__LIFECYCLE__VERSION")
   if [[ "$EDGEZERO__DEPLOY__TO" == "staging" ]]; then
     argv+=(--staging)
   else
@@ -53,22 +58,24 @@ main() {
   fi
 
   new_private_log
-  # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
-  # signal survives a failed step (readable via `if: always()`). A production
-  # rollback that activates the previous version but fails to emit its canonical
-  # `rolled-back-to=` line — or fails mid-activation — is still a state change the
-  # caller must reconcile rather than treat as a no-op.
+  # Record that a provider mutation is being ATTEMPTED after setup (CLI verified)
+  # and immediately before the CLI runs: a setup failure never falsely signals, and
+  # because it is durable in GITHUB_OUTPUT before the mutation starts it survives a
+  # cancel/timeout mid-activation (readable via `if: always()`).
   append_output mutation-attempted true
   local rc=0
   "${argv[@]}" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+
+  # Surface the CLI's exit status BEFORE writing any output, so an output-write
+  # failure can never replace the real provider result.
+  if [[ "$rc" -ne 0 ]]; then
+    fail_with "$rc" "rollback failed (CLI exit $rc)"
+  fi
 
   local rolled
   rolled=$(read_numeric_line rolled-back-to "$LIFECYCLE_LOG")
   append_output rolled-back-to "$rolled"
 
-  if [[ "$rc" -ne 0 ]]; then
-    fail_with "$rc" "rollback failed (CLI exit $rc)"
-  fi
   if [[ "$EDGEZERO__DEPLOY__TO" == "production" && -z "$rolled" ]]; then
     fail "production rollback reported success but did not emit rolled-back-to"
   fi

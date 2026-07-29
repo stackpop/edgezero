@@ -146,14 +146,27 @@ workspace may be the subdirectory itself), so a monorepo caches the right
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
-## Isolating an untrusted build
+## Keeping the credential out of the build phase
 
-The examples above build and deploy in **one job**, which is correct when you
-trust your build (including its dependencies) with your deploy credential — see
-the security boundary under [`build-app-cli`](#build-app-cli). If you do **not**,
-put the build in its own job with no secrets and hand the CLI artifact to a
-separate deploy job. `build-app-cli` already uploads the CLI as an artifact, so
-this needs only `needs:` and a matching `app-cli-artifact` name.
+**First, a limit you cannot design around: deploying an application runs its code
+with your provider token.** The deploy step executes the built CLI, and with
+Fastly's default `build-mode: never` the deploy _also recompiles the checked-out
+application_ (`fastly compute deploy` builds) — both with the token in scope. So
+you **must trust the application you deploy**, including its source and its
+dependencies. No workflow layout makes it safe to deploy code you do not trust; a
+malicious CLI artifact or source tree simply runs with the credential at deploy
+time.
+
+Given that, splitting the build into its own job does **not** make an untrusted
+app deployable. What it _does_ do is keep the credential entirely out of the long,
+dependency-heavy build phase, so a build-phase-only compromise (a build script
+that tries to read the environment) cannot reach a token that is not there, and
+the credential lives only in the minimal deploy job. That is worthwhile
+blast-radius reduction if you want the token's exposure as narrow as possible —
+build in one job with no secrets, deploy in another. `build-app-cli` already
+uploads the CLI as an artifact, so this needs only `needs:` and a **literal**
+`app-cli-artifact` name (step outputs like `steps.cli.outputs.*` do not cross job
+boundaries).
 
 ```yaml
 jobs:
@@ -188,8 +201,9 @@ jobs:
 ```
 
 The deploy job re-runs the checkout (to satisfy the committed-source guard) and
-downloads the prebuilt CLI; the untrusted build never shares a runner with the
-token.
+downloads the prebuilt CLI; the credential is never present while the build
+compiles. It is still present when the deploy runs the built CLI and recompiles
+the source — which is why "trust the app you deploy" remains the real boundary.
 
 ## Inputs and outputs
 
@@ -234,28 +248,27 @@ no application code) collects the build's outputs and emits them, re-validating
 each (`tarball-path`, which drives the upload, is confined to the action's own
 temp area).
 
-> **Security boundary — read this.** These layers defend against _accidental_
-> leakage and low-effort exfiltration; they are **not** a hard boundary against a
-> deliberately malicious build. Your build runs as the same OS user as the rest of
-> the job, so it can still reach the runner's command storage directly (for example
-> by listing `$RUNNER_TEMP/_runner_file_commands/`), read job state on disk, or
-> **detach a background process that survives into a later step** (the runner reaps
-> orphans at job cleanup, not between steps). So the real question is trust: **do
-> you trust everything your build compiles — including its dependencies — with your
-> deploy credential?**
+> **Security boundary — read this.** The build-step scrubbing here defends against
+> _accidental_ leakage and low-effort exfiltration; it is **not** a hard boundary
+> against a deliberately malicious build. Your build runs as the same OS user as the
+> rest of the job, so it can still reach the runner's command storage directly (for
+> example by listing `$RUNNER_TEMP/_runner_file_commands/`), read job state on disk,
+> or **detach a background process that survives into a later step** (the runner
+> reaps orphans at job cleanup, not between steps).
 >
-> - **Your own first-party app (the common case).** Yes — you are deploying exactly
->   what you built, so building and deploying it in one job (as the examples below
->   do) is fine. The scrubbing is defense-in-depth against mistakes, not a wall you
->   are relying on.
-> - **A build you do _not_ fully trust** (untrusted dependencies, third-party
->   source, a supply-chain threat model). Isolate it: run `build-app-cli` in a
->   **separate job** from every secret-bearing step (deploy `needs:` the build job
->   and consumes its uploaded artifact), or sandbox the build. Never put a provider
->   secret in the same job.
+> But the deeper point is that **deploying an app inherently runs its code with your
+> provider token** — the deploy executes the built CLI and (for Fastly's default
+> `build-mode`) recompiles the source, both with the credential. So you **must trust
+> the application you deploy**, dependencies included; the scrubbing does not change
+> that, and no layout lets you safely deploy code you do not trust. For your own
+> first-party app that is a given, and building + deploying in one job (as the
+> examples above) is fine. If you want to narrow _when_ the credential is present,
+> keep it out of the compile-heavy build phase — see
+> [Keeping the credential out of the build phase](#keeping-the-credential-out-of-the-build-phase).
 >
-> Either way, pass provider tokens only to the deploy / lifecycle steps, and scope
-> any custom secret to the single step that needs it — never to job-level `env:`.
+> Regardless of layout, pass provider tokens only to the deploy / lifecycle steps,
+> and scope any custom secret to the single step that needs it — never to job-level
+> `env:`.
 
 The default `provider-env-clear` list repeats the shipped aliases so the dynamic
 layer is self-contained. Add your own provider's aliases if you have one:
@@ -305,18 +318,29 @@ line was lost), you cannot roll back blindly — `rollback-fastly` needs the ver
 to roll back _from_. Recover it from the provider: `active-version` reports the
 version that is live **now** (the one the deploy activated); if it differs from
 the `previous-version` you captured before the deploy, roll back to that. There is
-no `active-version` action, so run the CLI yourself from the same artifact:
+no `active-version` action, so run the CLI yourself from the same artifact.
+
+Note the conditions below use `failure() || cancelled()`: a **cancel or timeout**
+mid-deploy is exactly when a version may have been activated with the line lost,
+and `failure()` alone does **not** cover cancellation. The artifact name is written
+as a literal (`edgezero-cli`) so this works whether the build ran in this job or a
+[separate one](#keeping-the-credential-out-of-the-build-phase) — `steps.cli.*` does
+not cross job boundaries.
 
 ```yaml
 - name: Fetch the app CLI for recovery
-  if: failure() && steps.deploy.outputs['mutation-attempted'] == 'true'
+  if: >-
+    (failure() || cancelled()) &&
+    steps.deploy.outputs['mutation-attempted'] == 'true'
   uses: actions/download-artifact@<sha>
   with:
-    name: ${{ steps.cli.outputs.app-cli-artifact }}
+    name: edgezero-cli # the same app-cli-artifact name the deploy used
     path: ${{ runner.temp }}/recover-cli
 - name: Read the currently-active version
   id: recover
-  if: failure() && steps.deploy.outputs['mutation-attempted'] == 'true'
+  if: >-
+    (failure() || cancelled()) &&
+    steps.deploy.outputs['mutation-attempted'] == 'true'
   env:
     FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }} # active-version calls the API
   run: |
@@ -326,13 +350,15 @@ no `active-version` action, so run the CLI yourself from the same artifact:
     v="$("$bin" active-version --adapter fastly \
           --service-id '${{ vars.FASTLY_SERVICE_ID }}' | sed -n 's/^version=//p')"
     echo "version=$v" >>"$GITHUB_OUTPUT"
-- name: Roll back only if the deploy activated a new version
+- name: Roll back only if the deploy activated a NEW version over a known previous one
   if: >-
-    failure() && steps.recover.outputs.version != '' &&
+    (failure() || cancelled()) &&
+    steps.deploy.outputs['previous-version'] != '' &&
+    steps.recover.outputs.version != '' &&
     steps.recover.outputs.version != steps.deploy.outputs['previous-version']
   uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
   with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+    app-cli-artifact: edgezero-cli
     deploy-to: production
     fastly-version: ${{ steps.recover.outputs.version }} # current (bad) version
     rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
@@ -340,13 +366,20 @@ no `active-version` action, so run the CLI yourself from the same artifact:
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
+**First-ever deploy** is the one case this cannot automate: if `previous-version`
+is empty there is no earlier version to activate, so `rollback-fastly` (which
+requires a numeric `rollback-to`) does not apply. If the recovered active version
+is non-empty in that case, the deploy activated the service's first version;
+undoing it is manual (deactivate or delete that version via the Fastly UI or CLI).
+
 **Staging is different.** `active-version` returns the _production_-active version,
-so it cannot reveal a staged draft. A staged deploy that fails with
-`mutation-attempted=true` but no `fastly-version` may have created an **inactive
-draft** — which serves no traffic, so there is nothing urgent to undo. It cannot
-be deactivated automatically here (you have no version to pass to
-`rollback-fastly --staging`); inspect the service's versions and remove the stray
-unactivated draft manually (Fastly UI or `fastly service-version list`).
+so it cannot reveal a staged version. And a staged deploy does not leave a merely
+"inactive draft": the CLI runs `service-version stage` before it emits the version,
+so a lost-version failure may leave a version that is **already staged — serving
+staging traffic via the staging selector**, not just an unactivated draft. There is
+no captured version to pass to `rollback-fastly --staging`, so recover manually:
+list the service's versions (`fastly service-version list`), identify the stray
+staged version, and un-stage/deactivate it.
 
 The action always adds `--non-interactive` to the deploy itself, so a deploy
 declared as an `edgezero.toml` command (`[adapters.fastly.commands] deploy =

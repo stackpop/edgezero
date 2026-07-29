@@ -1598,6 +1598,33 @@ test_mutation_attempted_signal() {
   assert_succeeds "rollback fails on a missing rolled-back-to line" test "$rc" -ne 0
   assert_succeeds "rollback still signals mutation-attempted on that failure" \
     grep -qx 'mutation-attempted=true' "$rout"
+
+  # A missing CLI must NOT signal a mutation — require_cmd fails before the emit.
+  : >"$rout"
+  rc=0
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=nonexistent-cli FASTLY_API_TOKEN=tok \
+    EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=9 \
+    EDGEZERO__LIFECYCLE__ROLLBACK_TO=8 EDGEZERO__DEPLOY__TO=production GITHUB_OUTPUT="$rout" \
+    "$ACTIONS_DIR/rollback-fastly/scripts/rollback.sh" >/dev/null 2>&1 || rc=$?
+  assert_succeeds "a rollback whose CLI is missing fails" test "$rc" -ne 0
+  assert_fails "a rollback whose CLI is missing does NOT signal mutation-attempted" \
+    grep -qx 'mutation-attempted=true' "$rout"
+
+  # On a CLI failure the exit status is surfaced BEFORE any output write, so
+  # rolled-back-to is not emitted (an output-write failure cannot mask the status).
+  printf '#!/usr/bin/env bash\necho "rolled-back-to=8"\nexit 3\n' >"$dir/bin/fake-cli"
+  chmod +x "$dir/bin/fake-cli"
+  : >"$rout"
+  rc=0
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=9 \
+    EDGEZERO__LIFECYCLE__ROLLBACK_TO=8 EDGEZERO__DEPLOY__TO=production GITHUB_OUTPUT="$rout" \
+    "$ACTIONS_DIR/rollback-fastly/scripts/rollback.sh" >/dev/null 2>&1 || rc=$?
+  assert_succeeds "a failing rollback CLI exits non-zero" test "$rc" -ne 0
+  assert_succeeds "a failing rollback still signals mutation-attempted" \
+    grep -qx 'mutation-attempted=true' "$rout"
+  assert_fails "a failing rollback does NOT write rolled-back-to (status not masked)" \
+    grep -qx 'rolled-back-to=8' "$rout"
 }
 
 # ---------------------------------------------------------------------------

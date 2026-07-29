@@ -164,14 +164,15 @@ steps:
     parse the version — leaving no captured rollback target. The scaffolded
     template already calls it.
 - Provide typed provider credentials through wrapper inputs, not caller `env:`.
-- **Decide the build's trust boundary.** The examples above build and deploy in
-  one job, which is correct when you trust your build — including its dependencies
-  — with the deploy credential (the usual case for your own app). If you do not,
-  isolate `build-app-cli` in a **separate job** with no secrets and hand the CLI
-  artifact to the deploy job (`needs:` + a matching `app-cli-artifact`); a
-  same-uid build can otherwise reach the runner's command storage or detach a
-  process that survives into the secret-bearing step. See the deploy guide's
-  "Isolating an untrusted build" and its security boundary.
+- **Trust the app you deploy.** Deploying runs the application's code with your
+  provider token — the deploy executes the built CLI and (for Fastly's default
+  `build-mode`) recompiles the checked-out source, both with the credential in
+  scope. No layout makes it safe to deploy code you do not trust (dependencies
+  included). Building + deploying your own app in one job is fine; if you want the
+  credential kept out of the compile-heavy build phase, run `build-app-cli` in a
+  **separate job** with no secrets and hand the artifact to the deploy job
+  (`needs:` + a literal `app-cli-artifact` name). See the deploy guide's "Keeping
+  the credential out of the build phase" and its security boundary.
 - Ensure the deployed ref has committed source (no dirty working tree) and a
   `Cargo.lock` at your app's **Cargo workspace root** (the workspace that owns
   `app-cli-package` — in a nested-workspace monorepo this may be your app
@@ -264,15 +265,20 @@ Workflow shape:
    FAILS but its `mutation-attempted` output is `true`, treat the service as
    possibly mutated rather than assume nothing deployed — a lost/malformed
    `fastly-version` line fails the step even though the deploy may have happened.
-   Read `mutation-attempted` under `if: always()`. **Production:** since you then
-   lack the version to roll back _from_, recover it — download the CLI artifact and
-   run its `active-version` subcommand, which prints the live version; if that
-   differs from the pre-deploy `previous-version`, call `rollback-fastly` with it
-   as `fastly-version` and `previous-version` as `rollback-to` (the deploy guide
-   has a runnable snippet). **Staging:** `active-version` reports the
-   production-active version, so it cannot identify a staged draft; a failed staged
-   deploy may leave an inactive (non-serving) draft to clean up manually — there is
-   no automated staged recovery here;
+   Read `mutation-attempted` under a `failure() || cancelled()` guard (plain
+   `failure()` does not fire on a cancel/timeout — the exact case the durable signal
+   exists for). **Production:** since you then lack the version to roll back _from_,
+   recover it — download the CLI artifact and run its `active-version` subcommand,
+   which prints the live version; if that differs from the pre-deploy
+   `previous-version`, call `rollback-fastly` with it as `fastly-version` and
+   `previous-version` as `rollback-to` (the deploy guide has a runnable snippet).
+   The first-ever deploy is the exception — with no `previous-version` there is
+   nothing to roll back to, so undo it manually. **Staging:** `active-version`
+   reports the production-active version, so it cannot identify a staged version;
+   and because the CLI stages the version before emitting it, a lost-version failure
+   may leave a version **already staged (serving staging traffic)**, not merely an
+   inactive draft — there is no automated staged recovery, so list the service's
+   versions and un-stage the stray one manually;
 5. run `healthcheck-fastly` with the CLI artifact, `fastly-service-id`,
    `deploy-to`, `domain`, an optional `path` (default `/`; e.g. `/health` — it
    covers production and a staged version alike), and the captured

@@ -140,8 +140,9 @@ reference to port from. Most transfer with light changes:
    - Deploy step only (its `env:` carries `provider-env`): clear the
      `provider-env-clear` aliases, parse `provider-env` and export only its
      values, then run
-     `<app-cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>` via
-     Bash arrays. Note the build-in-deploy caveat: Fastly's default `never`
+     `<app-cli-bin> deploy --adapter <adapter> <deploy-flags…> -- <deploy-args…>` via
+     Bash arrays (typed adapter flags BEFORE `--`, caller passthrough after). Note
+     the build-in-deploy caveat: Fastly's default `never`
      compiles the app during deploy with the token in scope, so require trusted
      immutable refs (spec §10.1).
    - Surface results to the wrapper: `source-revision`, `app-cli-version` (the
