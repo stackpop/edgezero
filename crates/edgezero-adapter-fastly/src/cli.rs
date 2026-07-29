@@ -2720,6 +2720,11 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
     let timeout = arg_value(args, "--timeout")
         .and_then(|value| value.parse().ok())
         .unwrap_or(10_u64);
+    // curl reads `--max-time 0` as "no limit", so a zero timeout lets a single
+    // probe run indefinitely. Require a positive value.
+    if timeout == 0 {
+        return Err("healthcheck --timeout must be a positive number of seconds".to_owned());
+    }
 
     let staging_ip = if arg_flag(args, "--staging") {
         let token = require_token()?;
@@ -3464,6 +3469,28 @@ mod tests {
         validate_probe_path("").expect_err("empty");
         validate_probe_path("/ with space").expect_err("whitespace");
         validate_probe_path("/inject\nHost: evil").expect_err("newline injection");
+    }
+
+    #[test]
+    fn healthcheck_rejects_zero_timeout() {
+        // A zero timeout becomes curl `--max-time 0` (no limit); reject it before
+        // any probe. The other required args are valid so we reach the check.
+        let args = [
+            "--adapter",
+            "fastly",
+            "--domain",
+            "example.com",
+            "--service-id",
+            "svc123",
+            "--version",
+            "1",
+            "--timeout",
+            "0",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let err = healthcheck(&args).expect_err("zero timeout must be rejected");
+        assert!(err.contains("timeout"), "unexpected error: {err}");
     }
 
     #[test]

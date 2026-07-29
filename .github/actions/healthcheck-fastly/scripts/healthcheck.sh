@@ -49,7 +49,10 @@ validate_inputs() {
   # clamp it to 1). Require at least one attempt rather than accept-and-coerce.
   require_input_matching retry "${EDGEZERO__LIFECYCLE__RETRY:-}" '^[1-9][0-9]*$'
   require_input_matching retry-delay "${EDGEZERO__LIFECYCLE__RETRY_DELAY:-}" '^[0-9]+$'
-  require_input_matching timeout "${EDGEZERO__LIFECYCLE__TIMEOUT:-}" '^[0-9]+$'
+  # `timeout` becomes curl `--max-time`, where 0 means "no limit" — a probe could
+  # then run until the whole step is externally cancelled. Require a positive value
+  # (retry-delay may be 0: no wait between attempts is legitimate).
+  require_input_matching timeout "${EDGEZERO__LIFECYCLE__TIMEOUT:-}" '^[1-9][0-9]*$'
   # A typo in deploy-to must never silently probe production.
   case "${EDGEZERO__DEPLOY__TO:-}" in
     production | staging) ;;

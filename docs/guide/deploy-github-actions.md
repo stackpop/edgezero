@@ -74,7 +74,8 @@ jobs:
         with:
           app-cli-package: my-app-cli # the CLI crate in your workspace
 
-      - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+      - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -114,7 +115,8 @@ steps:
       app-cli-package: my-app-cli
       working-directory: app
 
-  - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+  - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
+    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
     with:
       app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
       working-directory: app
@@ -136,7 +138,8 @@ workspace may be the subdirectory itself), so a monorepo caches the right
     app-cli-package: api-cli
     working-directory: apps/api
 
-- uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+- id: deploy # recovery/rollback below reads steps.deploy.outputs.*
+  uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
     app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     working-directory: apps/api
@@ -193,7 +196,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+      - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
           app-cli-artifact: edgezero-cli # the build job's artifact name
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -320,10 +324,29 @@ version that is live **now** (the one the deploy activated); if it differs from
 the `previous-version` you captured before the deploy, roll back to that. There is
 no `active-version` action, so run the CLI yourself from the same artifact.
 
-Note the conditions below use `failure() || cancelled()`: a **cancel or timeout**
-mid-deploy is exactly when a version may have been activated with the line lost,
-and `failure()` alone does **not** cover cancellation. The artifact name is written
-as a literal (`edgezero-cli`) so this works whether the build ran in this job or a
+Three things to know before you rely on this:
+
+- **The conditions use `failure() || cancelled()`.** A cancel or timeout mid-deploy
+  is exactly when a version may have been activated with the line lost, and
+  `failure()` alone does **not** cover cancellation.
+- **Cancellation recovery is best-effort, not guaranteed.** A step whose `if:`
+  includes `cancelled()` is _eligible_ to run after a cancel, but GitHub only grants
+  a cancelled job a short grace period, and a job `timeout-minutes` cut-off or the
+  runner being reclaimed can skip it entirely; no job or `needs:` structure changes
+  that. So treat the durable `mutation-attempted` output — visible in the run — as
+  the real backstop: if automated recovery does not complete, an **operator**
+  reconciles from it after the fact. (Set a generous job `timeout-minutes` to widen
+  the window.)
+- **It assumes a single mutation authority for the service.** The recovery treats
+  "the version active now" as the one _this run_ activated. If another deployment can
+  touch the same service concurrently, that is false and you could roll back
+  someone else's deploy — serialize deploys per service (a `concurrency` group, or a
+  single deploy pipeline; see
+  [Recommended job hardening](#recommended-job-hardening)) before enabling this.
+
+The `id: deploy` on your deploy step is what makes `steps.deploy.outputs.*` below
+resolve, and the artifact name is a literal (`edgezero-cli`) so this works whether
+the build ran in this job or a
 [separate one](#keeping-the-credential-out-of-the-build-phase) — `steps.cli.*` does
 not cross job boundaries.
 
@@ -343,6 +366,10 @@ not cross job boundaries.
     steps.deploy.outputs['mutation-attempted'] == 'true'
   env:
     FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }} # active-version calls the API
+  # Explicit `shell: bash` runs with `-eo pipefail`; the default shell omits
+  # pipefail, so a failing `active-version` in the pipe below would be masked by
+  # `sed` succeeding, silently yielding an empty version and skipping rollback.
+  shell: bash
   run: |
     dir="${{ runner.temp }}/recover-cli"
     tar -C "$dir" -xf "$dir"/*.tar
@@ -540,7 +567,8 @@ carry no orchestration policy of their own.
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
-- if: failure() && steps.stage.outputs.fastly-version != ''
+- if: >-
+    (failure() || cancelled()) && steps.stage.outputs.fastly-version != ''
   uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
   with:
     app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
@@ -574,7 +602,7 @@ re-activate. Capture the target at deploy time and thread it through:
 # ... run your production health checks here ...
 
 - if: >-
-    failure() && steps.deploy.outputs.fastly-version != '' &&
+    (failure() || cancelled()) && steps.deploy.outputs.fastly-version != '' &&
     steps.deploy.outputs.previous-version != ''
   uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
   with:
@@ -590,7 +618,10 @@ empty on a first-ever deploy (nothing to roll back to). `fastly-version` is empt
 when the deploy failed before/without reporting a version — in that case do **not**
 call rollback with an empty `fastly-version` (it would fail with a misleading
 secondary error); if `mutation-attempted` is `true`, follow the lost-version
-recovery above to obtain the current version first.
+recovery above to obtain the current version first. The `failure() || cancelled()`
+guard covers a cancel/timeout mid-deploy, but — as noted for recovery — that path
+is best-effort; the durable `mutation-attempted` signal is what a later reconcile
+relies on.
 
 ## Build behavior and caching
 

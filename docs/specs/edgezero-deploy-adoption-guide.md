@@ -48,7 +48,8 @@ jobs:
         with:
           app-cli-package: my-app-cli # the CLI crate in your app's workspace
 
-      - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+      - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -98,7 +99,8 @@ steps:
       app-cli-package: my-app-cli
       working-directory: app
 
-  - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+  - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
+    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
     with:
       app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
       working-directory: app
@@ -125,7 +127,8 @@ steps:
       app-cli-package: api-cli
       working-directory: apps/api
 
-  - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+  - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
+    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
     with:
       app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
       working-directory: apps/api
@@ -267,11 +270,15 @@ Workflow shape:
    `fastly-version` line fails the step even though the deploy may have happened.
    Read `mutation-attempted` under a `failure() || cancelled()` guard (plain
    `failure()` does not fire on a cancel/timeout — the exact case the durable signal
-   exists for). **Production:** since you then lack the version to roll back _from_,
-   recover it — download the CLI artifact and run its `active-version` subcommand,
-   which prints the live version; if that differs from the pre-deploy
-   `previous-version`, call `rollback-fastly` with it as `fastly-version` and
-   `previous-version` as `rollback-to` (the deploy guide has a runnable snippet).
+   exists for; note that cancellation-time recovery is best-effort, so the signal is
+   also what an operator reconciles from after the fact). **Production:** since you
+   then lack the version to roll back _from_, recover it — download the CLI artifact
+   and run its `active-version` subcommand, which prints the live version; if that
+   differs from the pre-deploy `previous-version`, call `rollback-fastly` with it as
+   `fastly-version` and `previous-version` as `rollback-to` (the deploy guide has a
+   runnable snippet). This assumes deploys to the service are serialized (§3, via a
+   `concurrency` group) — with a concurrent deploy, "the live version" may be
+   another run's, so do not auto-roll-back without that guarantee.
    The first-ever deploy is the exception — with no `previous-version` there is
    nothing to roll back to, so undo it manually. **Staging:** `active-version`
    reports the production-active version, so it cannot identify a staged version;

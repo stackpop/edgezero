@@ -155,9 +155,11 @@ reference to port from. Most transfer with light changes:
      `fastly-service-id`, plus forwarded `working-directory`, `manifest`,
      `build-mode`, `build-args`, `deploy-args`, `cache`, and `stage` (§5.4).
    - Map `fastly-api-token` → `provider-env: {FASTLY_API_TOKEN: …}` and
-     `fastly-service-id` → action-owned
-     `deploy-flags: ["--service-id", …, "--non-interactive"]`; when
-     `stage: true`, add `--stage`.
+     `fastly-service-id` → action-owned `deploy-flags: ["--service-id", …]` (typed
+     flags, placed BEFORE `--`); when `stage: true`, add `--stage`.
+     `--non-interactive` is NOT a deploy-flag — the engine adds it as a deploy-args
+     PREPEND (after `--`, ahead of caller `deploy-args`), and rejects it if a
+     caller passes it in `deploy-args`.
    - Set `adapter: fastly`, `target: wasm32-wasip1`, `deploy-arg-allow` =
      `--comment` only, `provider-env-clear` = Fastly auth/endpoint aliases
      (`FASTLY_API_TOKEN`, `FASTLY_SERVICE_ID`, `FASTLY_ENDPOINT`, …), Fastly

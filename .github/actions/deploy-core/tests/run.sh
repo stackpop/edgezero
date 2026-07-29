@@ -1553,6 +1553,16 @@ test_healthcheck_path() {
     EDGEZERO__DEPLOY__TO=production EDGEZERO__LIFECYCLE__RETRY=1 \
     EDGEZERO__LIFECYCLE__RETRY_DELAY=0 EDGEZERO__LIFECYCLE__TIMEOUT=1 \
     "$ACTIONS_DIR/healthcheck-fastly/scripts/healthcheck.sh"
+
+  # timeout=0 becomes curl --max-time 0 (no limit): must be rejected. retry-delay=0
+  # is legitimate (no wait), so only timeout is constrained to a positive integer.
+  assert_fails "a zero timeout is rejected (would disable curl's timeout)" \
+    env PATH="$WORK_DIR/healthcheck-argv/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli \
+    EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=7 \
+    EDGEZERO__LIFECYCLE__DOMAIN=www.example.com EDGEZERO__LIFECYCLE__PATH=/ \
+    EDGEZERO__DEPLOY__TO=production EDGEZERO__LIFECYCLE__RETRY=1 \
+    EDGEZERO__LIFECYCLE__RETRY_DELAY=0 EDGEZERO__LIFECYCLE__TIMEOUT=0 \
+    "$ACTIONS_DIR/healthcheck-fastly/scripts/healthcheck.sh"
 }
 
 # ---------------------------------------------------------------------------

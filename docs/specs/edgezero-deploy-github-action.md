@@ -256,7 +256,7 @@ The engine is parameterized by the values the wrapper passes to those scripts
 | `deploy-arg-allow`   | Adapter allowlist pattern for caller `deploy-args` (wrapper-provided; §9).                                                                                                                                                                         |
 | `provider-env`       | JSON object of provider credential names → values. Present **only in the deploy step's own environment** (step-scoped `env:`); the variable never reaches setup/build steps, and the engine parses it only inside the deploy step (§10).           |
 | `provider-env-clear` | JSON array of env var names (wrapper-provided) the engine unsets in non-deploy steps and clears + re-exports from `provider-env` inside the deploy step (§10). Defense-in-depth against inherited caller `env:`; keeps clearing provider-agnostic. |
-| `deploy-flags`       | JSON array of action-owned deploy flags the wrapper injects before caller `deploy-args` (`--service-id …`, `--non-interactive`).                                                                                                                   |
+| `deploy-flags`       | JSON array of action-owned TYPED adapter flags placed BEFORE `--` (e.g. `--service-id …`). `--non-interactive` is NOT here: it is an action-owned deploy-args PREPEND (after `--`, ahead of caller `deploy-args`) — see §10.1.                     |
 | `cache`              | Enable exact-key application `target/` caching (`true`/`false`).                                                                                                                                                                                   |
 
 The wrapper surfaces its outputs: `fastly-version`, `previous-version`
@@ -434,7 +434,8 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
-- if: failure() && steps.stage.outputs.fastly-version != ''
+- if: >-
+    (failure() || cancelled()) && steps.stage.outputs.fastly-version != ''
   uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
   with:
     app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
@@ -443,6 +444,14 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
+
+The condition is `failure() || cancelled()` because `failure()` alone does not run
+on a cancel/timeout — the exact case a version may have been activated with the
+line lost. That path is best-effort: GitHub grants a cancelled job only a short
+grace period, and a job timeout or reclaimed runner can skip it, so the durable
+`mutation-attempted` output (not any `if:`) is the guarantee an operator reconciles
+from. Recovery also assumes a single mutation authority per service (serialize deploys
+per service); otherwise "the active version" may belong to a concurrent run.
 
 The `fastly-version != ''` guard skips rollback when the version was never
 captured — because `rollback-fastly` needs it. But that is not the same as "no
@@ -717,16 +726,29 @@ Rules:
   provider names, so caller `env:` cannot override the typed contract.
 - `provider-env` values never reach `GITHUB_ENV`, `GITHUB_OUTPUT`, caches, or
   summaries.
-- **The engine's own private environment is scrubbed before the CLI is exec'd.**
+- **The engine's private namespace is cleared from what the CLI inherits.**
   The wrapper necessarily carries the token into the deploy step twice — once as
   `EDGEZERO__<PROVIDER>_API_TOKEN` (so the step's YAML can build the JSON without
   interpolating a secret into a `run:` block, itself a template-injection sink),
   and once inside `EDGEZERO__PROVIDER_ENV`. Both are secret-bearing. `run-app-cli.sh`
   therefore unsets its entire private namespace (§10.2) after reading it, so the
   app CLI — and every subprocess it spawns, including a manifest
-  `[adapters.*.commands]` shell command — receives **only** the typed provider
-  aliases plus `EDGEZERO_MANIFEST`. Without this, an `env`-dumping build script
-  would print the raw token under a name we never promised.
+  `[adapters.*.commands]` shell command — **inherits** only the typed provider
+  aliases plus `EDGEZERO_MANIFEST`, and an `env`-dumping build script prints no
+  token under a name we never promised.
+
+  This is `unset`, not a re-exec, so it is a scrub of the CHILD's inherited
+  environment, not a process-image boundary: on Linux the wrapper's original
+  environment stays readable through `/proc/<ppid>/environ` by same-uid code, so a
+  deliberate reader could still recover `EDGEZERO__PROVIDER__ENV` from the parent.
+  That is acceptable here — unlike the untrusted `build-app-cli` compile (which
+  re-execs with `env -u` precisely because it runs code we do not trust), the
+  deploy runs the application's OWN trusted CLI, which already receives the same
+  token as `FASTLY_API_TOKEN` to do its job. The scrub's purpose is hygiene (no
+  token under unpromised names, nothing to leak via an accidental `env` dump), not
+  a boundary against a malicious deploy CLI — which cannot exist, because deploying
+  means trusting that CLI with the credential (§14).
+
 - Every step of a wrapper — shell steps and third-party `uses:` steps alike —
   blanks the full alias list in its own `env:`. The list a wrapper blanks and the
   list it passes as `provider-env-clear` are the same list.

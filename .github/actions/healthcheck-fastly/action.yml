@@ -39,7 +39,7 @@ inputs:
     required: false
     default: "5"
   timeout:
-    description: Request timeout in seconds.
+    description: Per-attempt request timeout in seconds. Must be a positive integer (0 would disable curl's timeout).
     required: false
     default: "10"
 

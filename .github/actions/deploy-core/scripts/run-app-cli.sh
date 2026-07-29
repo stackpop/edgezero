@@ -150,6 +150,14 @@ build_deploy_argv() {
 # `EDGEZERO__` prefix: the boundary is then one rule with no list to keep in sync.
 # `EDGEZERO_MANIFEST` (SINGLE underscore) is deliberately outside it — that is the
 # CLI's own public contract, not ours, and it is the one variable we do pass on.
+#
+# This is `unset`, not a re-exec: it scrubs what the CLI INHERITS, so a token never
+# appears under an unpromised name or in an accidental `env` dump. It is NOT a
+# process-image boundary — on Linux this shell's original environment stays
+# readable via `/proc/<ppid>/environ`. That is acceptable here (unlike the
+# untrusted build in build-app-cli/common.sh, which re-execs with `env -u`): the
+# deploy runs the app's OWN trusted CLI, which already gets the same token as
+# FASTLY_API_TOKEN. Deploying means trusting that CLI with the credential.
 scrub_action_private_env() {
   local name
   while IFS= read -r name; do
