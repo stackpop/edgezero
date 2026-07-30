@@ -826,9 +826,49 @@ pub(crate) fn value_announces_our_kind(raw: &str) -> bool {
 /// The CLI read path refuses to OVERWRITE such a value: an older CLI clobbering a
 /// format it cannot read would lose the newer config. It is a hard read error
 /// (upgrade the CLI), never the repairable `Corrupt`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(test)]
 pub(crate) fn value_is_unknown_kind(raw: &str) -> bool {
     matches!(classify_root_value(raw), RootValueKind::UnknownKind)
+}
+
+/// Was this value written by a NEWER format this v1 reader cannot handle?
+///
+/// True for any of: an unknown/non-string `edgezero_kind`; OUR pointer kind with
+/// a bumped pointer `version`; a direct envelope (`data` + `sha256` +
+/// `generated_at` + `version`) with a bumped envelope `version`. Per the blob
+/// spec's v1-reader rule,
+/// these must FAIL CLOSED everywhere destructive -- the read path refuses to
+/// overwrite them, and GC / local prune never delete them -- so an older CLI
+/// cannot clobber config a newer writer produced. A MISSING version (a malformed
+/// v1 value) is NOT future: it stays repairable corruption.
+///
+/// Also compiled for the RUNTIME (`fastly`): the guest uses it to give the right
+/// remediation (redeploy an updated build, not re-push the same config).
+#[cfg(any(feature = "cli", feature = "fastly", test))]
+pub(crate) fn value_is_future_format(raw: &str) -> bool {
+    use edgezero_core::blob_envelope::ENVELOPE_VERSION_V1;
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let version_is_not = |expected: u64| {
+        obj.get("version")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|version| version != expected)
+    };
+    match obj.get("edgezero_kind") {
+        // Our pointer kind, but a newer POINTER version.
+        Some(serde_json::Value::String(kind)) if kind == POINTER_KIND => version_is_not(1),
+        // A discriminator we do not recognise (unknown string, or non-string).
+        Some(_) => true,
+        // No discriminator: a direct envelope from a newer writer.
+        None => {
+            let envelope_shaped = obj.contains_key("data")
+                && obj.contains_key("sha256")
+                && obj.contains_key("generated_at")
+                && obj.contains_key("version");
+            envelope_shaped && version_is_not(u64::from(ENVELOPE_VERSION_V1))
+        }
+    }
 }
 
 /// Classify a ROOT value for `config gc` — the live-set input on a DESTRUCTIVE
@@ -1513,6 +1553,52 @@ mod tests {
             // No value is ever BOTH inert-foreign and namespace-claiming.
             assert!(!(inert && announces), "mutually exclusive: {raw:?}");
         }
+    }
+
+    /// `value_is_future_format` catches a NEWER writer's output (an unknown kind,
+    /// or a bumped envelope/pointer version) but NOT ordinary v1 corruption -- so
+    /// a future format fails closed while a malformed v1 value stays repairable.
+    #[test]
+    fn future_format_detects_bumped_versions_but_not_v1_corruption() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let v1 = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "k": "v" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .unwrap();
+
+        // A v2 DIRECT envelope: envelope-shaped, version bumped -> future.
+        let mut v2_env: serde_json::Value = serde_json::from_str(&v1).unwrap();
+        v2_env["version"] = json!(2_u32);
+        assert!(value_is_future_format(&v2_env.to_string()), "v2 envelope");
+
+        // A v2 POINTER (our kind, bumped pointer version) -> future.
+        assert!(
+            value_is_future_format(
+                r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#
+            ),
+            "v2 pointer"
+        );
+        // Unknown/non-string kind -> future.
+        assert!(value_is_future_format(r#"{"edgezero_kind":"future"}"#));
+        assert!(value_is_future_format(r#"{"edgezero_kind":9}"#));
+
+        // A valid v1 envelope is NOT future.
+        assert!(!value_is_future_format(&v1), "v1 envelope");
+        // A v1 envelope with a WRONG sha (corrupt, version 1) is NOT future --
+        // it stays repairable corruption.
+        let mut bad_sha: serde_json::Value = serde_json::from_str(&v1).unwrap();
+        bad_sha["sha256"] = json!("0".repeat(64));
+        assert!(!value_is_future_format(&bad_sha.to_string()), "v1 bad sha");
+        // A malformed v1 pointer MISSING its version is NOT future (repairable).
+        assert!(!value_is_future_format(
+            r#"{"edgezero_kind":"fastly_config_chunks","chunks":[]}"#
+        ));
+        // A plain foreign value is not future.
+        assert!(!value_is_future_format(r#"{"unrelated":"json"}"#));
+        assert!(!value_is_future_format("not json"));
     }
 
     /// GC data-loss guard: a value carrying a FUTURE `edgezero_kind` but shaped

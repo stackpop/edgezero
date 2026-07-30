@@ -212,6 +212,14 @@ pub enum ReadConfigEntry {
     /// real — the push treats it like an absent remote (proceeds to write) rather
     /// than aborting, so a broken generation is recoverable in-band. The
     /// `&'static str` carries a redacted, human-readable reason.
+    ///
+    /// Adapters MAY, but need not, produce this: an adapter that returns a
+    /// corrupt value as `Present` still gets the same repair behaviour, because
+    /// the generic push layer classifies a `Present` body that does not verify as
+    /// an envelope and overwrites it (while a NEWER envelope version is refused
+    /// with an upgrade error, never overwritten). So the repair contract holds
+    /// for every adapter, and `Corrupt` is an optional precision an adapter adds
+    /// when it can cheaply tell corruption from a plain read.
     Corrupt(&'static str),
     /// The store exists but the key is absent (operator hasn't pushed yet,
     /// or pushed under a different key).

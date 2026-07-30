@@ -106,9 +106,10 @@ Per-adapter behaviour:
   fastly <kind>-store create --name=<platform-name>
   ```
 
-  using the same `<platform-name>` resolution, then appends
-  `[setup.<kind>_stores.<platform-name>]` + `[local_server.<kind>_stores.<platform-name>]`
-  tables to `fastly.toml`. Idempotent on the `[setup.*]` block presence.
+  using the same `<platform-name>` resolution, then appends the
+  `[setup.<kind>_stores.<platform-name>]` table to `fastly.toml`. Provision writes
+  ONLY `[setup.*]`; the `[local_server.*]` seeding is written later by
+  `config push --local` (config stores only). Idempotent on the `[setup.*]` block presence.
 
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
   by the Fermyon stack). For each KV id AND each `[stores.config]` id (both KV-backed

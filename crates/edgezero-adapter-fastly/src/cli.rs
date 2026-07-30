@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunked_config::{
     CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, chunk_lengths, gc_classify_root,
     gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
-    resolve_fastly_config_value, sha256_hex, value_announces_our_kind, value_is_inert_foreign,
-    value_is_unknown_kind, verify_writer_split_layout,
+    resolve_fastly_config_value, sha256_hex, value_announces_our_kind, value_is_future_format,
+    value_is_inert_foreign, verify_writer_split_layout,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -127,6 +127,12 @@ static FASTLY_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
 ];
 
 const FASTLY_INSTALL_HINT: &str = "install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again";
+
+/// Hard-error message for a value written by a NEWER format this v1 CLI must not
+/// overwrite. Shared by the read path so the wording stays consistent.
+const FUTURE_FORMAT_READ_ERROR: &str = "the remote value uses a config format this CLI version does not recognise (a newer \
+     `edgezero_kind` or envelope/pointer version); UPGRADE the CLI to push to this store rather \
+     than overwrite a newer format.";
 
 struct FastlyCliAdapter;
 
@@ -743,19 +749,23 @@ impl Adapter for FastlyCliAdapter {
             // passes through unchanged; if it is a chunk pointer the chunks
             // are fetched from the same store and reconstructed.
             //
-            // A chunk fetch can fail two very different ways, and only ONE is safe
-            // to treat as overwritable corruption:
-            //   - INFRASTRUCTURE (spawn/auth/schema/non-zero status): the read is
-            //     INCOMPLETE and we do not know the true remote state, so we must
-            //     NOT let a push overwrite it. Record the fetch error and keep it
-            //     a hard error.
-            //   - a genuinely ABSENT chunk (`Ok(None)`) or a bad chunk: real
-            //     corruption a push repairs. `classify_resolved_read` maps that,
-            //     plus a non-envelope direct value and an unknown-kind value.
+            // A referenced chunk that we cannot confidently retrieve makes the
+            // read INCOMPLETE, and a push must not overwrite healthy remote state
+            // on an incomplete read. Two ways this happens, both treated as a
+            // fetch failure (a HARD error, never overwritable `Corrupt`):
+            //   - an INFRASTRUCTURE error (spawn/auth/schema/non-zero status); and
+            //   - an ABSENT chunk (`Ok(None)`). The fastly CLI's "not found" text
+            //     is AMBIGUOUS -- a store/auth/server failure can produce it too
+            //     (the delete path already documents this) -- so we do NOT trust
+            //     it as a genuinely-missing chunk we could safely overwrite.
             let fetch_failed: Cell<bool> = Cell::new(false);
             let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
                 match fetch_remote_config_store_entry(&store_id, chunk_key) {
-                    Ok(found) => Ok(found),
+                    Ok(Some(found)) => Ok(Some(found)),
+                    Ok(None) => {
+                        fetch_failed.set(true);
+                        Ok(None)
+                    }
                     Err(err) => {
                         fetch_failed.set(true);
                         Err(err)
@@ -915,7 +925,13 @@ impl ManifestLock {
         // path to the same file acquire the SAME lock rather than two different
         // sidecars. Every manifest writer (config push AND provision) takes this
         // lock, so their read-modify-writes serialise instead of clobbering.
-        let target = canonical_manifest_target(manifest_path);
+        let target = canonical_manifest_target(manifest_path)?;
+        // A hard-linked manifest cannot be safely replaced: two hard links share
+        // one inode but have distinct pathnames, so they key DIFFERENT sidecar
+        // locks (no mutual exclusion), and the atomic rename swaps in a NEW inode,
+        // breaking the link. We cannot detect the other names, so fail closed
+        // rather than silently diverge or break the link.
+        reject_hard_linked_manifest(&target)?;
         let dir = target.parent().unwrap_or_else(|| Path::new("."));
         let file_name = target
             .file_name()
@@ -962,7 +978,11 @@ impl Drop for TempFileGuard {
 /// a direct path lock and replace the SAME target. An existing file (or symlink)
 /// canonicalizes directly; a not-yet-created file canonicalizes via its parent
 /// so a fresh `fastly.toml` still keys on a stable location.
-fn canonical_manifest_target(path: &Path) -> PathBuf {
+///
+/// FAILS CLOSED on an ambiguous chain: a symlink whose target cannot be read, or
+/// a chain too deep / cyclic, returns `Err` rather than falling back to a writable
+/// path that could replace an intermediate link.
+fn canonical_manifest_target(path: &Path) -> Result<PathBuf, String> {
     // Follow the WHOLE symlink chain to the final target -- each hop may itself be
     // a dangling symlink (fastly.toml -> middle.toml -> missing.toml). We write at
     // the final target, preserving every intermediate link, and a direct writer to
@@ -972,7 +992,7 @@ fn canonical_manifest_target(path: &Path) -> PathBuf {
     for _ in 0..40_u32 {
         // Fully resolvable => the real existing file.
         if let Ok(real) = fs::canonicalize(&current) {
-            return real;
+            return Ok(real);
         }
         // Otherwise, if this hop is a symlink, follow one link and continue.
         match fs::symlink_metadata(&current) {
@@ -988,14 +1008,24 @@ fn canonical_manifest_target(path: &Path) -> PathBuf {
                             .join(link)
                     };
                 }
-                Err(_) => break,
+                // A symlink we cannot read: refuse rather than guess a target.
+                Err(err) => {
+                    return Err(format!(
+                        "could not read the manifest symlink `{}` ({err}); refusing to write",
+                        current.display()
+                    ));
+                }
             },
             // Not a symlink -- a plain not-yet-created file, or the final dangling
             // target: this is where the write should land.
-            _ => break,
+            _ => return Ok(canonicalize_parent_join(&current)),
         }
     }
-    canonicalize_parent_join(&current)
+    // Exhausted the hop budget: a cyclic or absurdly deep chain. Fail closed.
+    Err(format!(
+        "the manifest symlink chain starting at `{}` is too deep or cyclic; refusing to write",
+        path.display()
+    ))
 }
 
 /// Canonicalize `path`'s PARENT (which should exist) and rejoin the file name,
@@ -1010,6 +1040,38 @@ fn canonicalize_parent_join(path: &Path) -> PathBuf {
         Ok(real_parent) => real_parent.join(file_name),
         Err(_) => path.to_owned(),
     }
+}
+
+/// Refuse to operate on a manifest that has MORE THAN ONE hard link. Such a file
+/// cannot be replaced safely: the atomic rename installs a new inode (breaking
+/// the link), and the path-based lock cannot serialise writers arriving via the
+/// other names. Fail closed with a fix. A not-yet-created file, or a filesystem
+/// that does not report a link count, is left alone.
+#[cfg_attr(
+    not(unix),
+    expect(
+        unused_variables,
+        clippy::unnecessary_wraps,
+        reason = "the hard-link check is unix-only; on other targets this is a no-op that still returns Result to keep one signature"
+    )
+)]
+fn reject_hard_linked_manifest(target: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Ok(meta) = fs::metadata(target)
+            && meta.nlink() > 1
+        {
+            return Err(format!(
+                "{} has multiple hard links (link count {}); refusing to replace it -- an atomic \
+                 rename would break the link and concurrent writers via the other names could \
+                 diverge. Remove the extra hard link(s), or use a symlink instead.",
+                target.display(),
+                meta.nlink()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Fetch a single entry value from a remote Fastly Config Store entry by
@@ -1093,35 +1155,36 @@ fn body_is_valid_envelope(body: &str) -> bool {
 /// Map a `resolve_fastly_config_value` result to a read outcome, distinguishing
 /// the cases that must NOT be treated as overwritable corruption:
 ///
-/// - `Ok(body)` that verifies as an envelope → `Present`.
-/// - `Ok(body)` that is NOT a valid envelope (a malformed direct value, a SHA
-///   mismatch, a foreign non-envelope) → `Corrupt` (repairable by overwrite).
+/// - a FUTURE format (unknown/newer `edgezero_kind`, or a bumped envelope/pointer
+///   `version`) → a hard error: overwriting a newer format with this v1 CLI would
+///   lose it. Checked FIRST, on the raw stored value, so it wins over `Corrupt`.
 /// - a resolve error where a chunk FETCH failed for infrastructure reasons
 ///   (`fetch_failed`) → a hard error: the read was incomplete, so a push must not
 ///   overwrite healthy remote state.
-/// - a resolve error on a value announcing an UNKNOWN/future `edgezero_kind` → a
-///   hard error: overwriting a newer format with this CLI would lose it.
+/// - `Ok(body)` that verifies as an envelope → `Present`.
+/// - `Ok(body)` that is NOT a valid envelope (a malformed direct value, a SHA
+///   mismatch, a foreign non-envelope) → `Corrupt` (repairable by overwrite).
 /// - any other resolve error (bad/missing chunk, malformed pointer) → `Corrupt`.
 fn classify_resolved_read(
     resolved: Result<String, String>,
     raw_value: &str,
     fetch_failed: bool,
 ) -> Result<ReadConfigEntry, String> {
+    // A newer format is refused BEFORE anything else, whether it passed through as
+    // a direct value or failed the resolver on a bumped pointer version.
+    if value_is_future_format(raw_value) {
+        return Err(FUTURE_FORMAT_READ_ERROR.to_owned());
+    }
     match resolved {
-        Ok(body) if body_is_valid_envelope(&body) => Ok(ReadConfigEntry::Present(body)),
-        Ok(_) => Ok(ReadConfigEntry::Corrupt(
-            "remote value is not a valid config envelope; a push will overwrite it",
-        )),
         Err(_) if fetch_failed => Err(
             "a chunk fetch failed while reading the remote value (details redacted); the remote \
              was not fully read, so nothing was changed. Fix connectivity/auth and retry."
                 .to_owned(),
         ),
-        Err(_) if value_is_unknown_kind(raw_value) => Err(
-            "the remote value uses a config format this CLI version does not recognise (a newer \
-             `edgezero_kind`); upgrade the CLI to push to this store rather than overwrite it."
-                .to_owned(),
-        ),
+        Ok(body) if body_is_valid_envelope(&body) => Ok(ReadConfigEntry::Present(body)),
+        Ok(_) => Ok(ReadConfigEntry::Corrupt(
+            "remote value is not a valid config envelope; a push will overwrite it",
+        )),
         Err(_) => Ok(ReadConfigEntry::Corrupt(
             "remote prior value could not be resolved (corrupt or incomplete chunk state); a push \
              will overwrite it",
@@ -1459,17 +1522,19 @@ fn write_fastly_local_config_store(
         match orphan_chunk_keys(plan) {
             Ok(orphans) => {
                 for key in orphans {
-                    // Never remove an orphan whose VALUE is itself a root or a
-                    // value that CLAIMS our namespace: a valid direct envelope, a
-                    // pointer, OR an unknown/future/non-string `edgezero_kind`
-                    // (which the cloud GC path also fails closed on). A
-                    // chunk-shaped key can hold any of these, and deleting one
-                    // would drop live or newer-format config.
+                    // Never remove an orphan whose VALUE is itself a root, claims
+                    // our namespace, or was written by a NEWER format: a valid
+                    // direct envelope, a pointer, an unknown/future `edgezero_kind`,
+                    // or a bumped envelope/pointer version (all of which the cloud
+                    // GC path also fails closed on). Deleting one would drop live
+                    // or newer-format config.
                     let value_protected = contents_tbl
                         .get(&key)
                         .and_then(toml_edit::Item::as_str)
                         .is_some_and(|value| {
-                            value_announces_our_kind(value) || gc_classify_root(&key, value).is_ok()
+                            value_announces_our_kind(value)
+                                || value_is_future_format(value)
+                                || gc_classify_root(&key, value).is_ok()
                         });
                     // Symmetric with cloud GC's fail-closed rule: a key that has
                     // any canonical chunk nested BENEATH it is a (possibly
@@ -1795,6 +1860,7 @@ fn local_orphan_counts_for_dry_run(
                                         let value_protected =
                                             orphan_item.as_str().is_some_and(|text| {
                                                 value_announces_our_kind(text)
+                                                    || value_is_future_format(text)
                                                     || gc_classify_root(key, text).is_ok()
                                             });
                                         let has_nested = contents.iter().any(|(other, _)| {
@@ -1999,8 +2065,12 @@ fn gc_fastly_config_store(
         for (key, age) in doomed.iter().flatten() {
             out.push(format!("  would delete `{key}` (age {age}s)"));
         }
+        // `--yes` ALWAYS requires an explicit non-zero `--older-than` (a
+        // destructive run must not guess the window), so the apply instruction
+        // names both -- "re-run with --yes" alone would be rejected.
         out.push(format!(
-            "dry-run: {doomed_count} orphan chunk(s) planned for deletion; re-run with --yes to apply"
+            "dry-run: {doomed_count} orphan chunk(s) planned for deletion; re-run with \
+             `--yes --older-than <dur>` (a non-zero window is required) to apply"
         ));
         return Ok(out);
     }
@@ -2218,6 +2288,7 @@ fn classify_store_entries(
             Err(_)
                 if is_chunk_shaped
                     && !value_announces_our_kind(&item.item_value)
+                    && !value_is_future_format(&item.item_value)
                     && !items.iter().any(|other| {
                         other.item_key != item.item_key
                             && chunk_key_generation(&item.item_key, &other.item_key).is_some()
@@ -5205,7 +5276,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_reports_corrupt_on_missing_chunk() {
+    fn read_config_entry_hard_errors_on_a_not_found_chunk() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
@@ -5230,13 +5301,16 @@ echo 'unexpected' >&2; exit 1
             TEST_CONFIG_ID,
             &AdapterPushContext::new(),
         );
-        // The `describe` succeeded (entry exists); a missing chunk is CORRUPT
-        // stored state the push can repair by overwriting, so the CLI read
-        // reports `Corrupt`, not a hard error. (The RUNTIME path maps a missing
-        // chunk to a retryable Unavailable — see config_store.rs.)
+        // A referenced chunk reported "not found" is AMBIGUOUS -- the fastly CLI
+        // uses that text for store/auth/server failures too -- so the read is
+        // INCOMPLETE and must be a HARD error, never an overwritable `Corrupt`. A
+        // push must not clobber healthy remote state after an incomplete read.
+        // (The RUNTIME path treats an absent chunk as a retryable Unavailable --
+        // see config_store.rs -- because a re-read there is cheap; the CLI is
+        // about to WRITE, so it fails closed.)
         assert!(
-            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
-            "a missing chunk at an existing entry must be Corrupt (repairable), not an error"
+            result.is_err(),
+            "a not-found chunk must be a hard error (incomplete read), not overwritable Corrupt"
         );
     }
 
@@ -5401,6 +5475,28 @@ echo 'unexpected' >&2; exit 1
             ),
             Ok(ReadConfigEntry::Corrupt(_))
         ));
+
+        // A future ENVELOPE version (passed through as Ok) is a hard error, NOT
+        // the repairable Corrupt -- an older CLI must not overwrite it.
+        let mut v2_value: serde_json::Value = serde_json::from_str(&envelope).expect("parse");
+        v2_value["version"] = json!(2_u32);
+        let v2_env = v2_value.to_string();
+        assert!(
+            classify_resolved_read(Ok(v2_env.clone()), &v2_env, false)
+                .as_ref()
+                .is_err_and(|err| err.contains("UPGRADE")),
+            "a v2 direct envelope must be a hard error, not Corrupt"
+        );
+
+        // A future POINTER version (resolve fails on the version check) is a hard
+        // error too -- the pointer kind is ours, but the version is newer.
+        let v2_ptr = r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#;
+        assert!(
+            classify_resolved_read(Err("unsupported version".to_owned()), v2_ptr, false)
+                .as_ref()
+                .is_err_and(|err| err.contains("UPGRADE")),
+            "a v2 pointer must be a hard error, not Corrupt"
+        );
     }
 
     // ---------- local read integration tests ----------
@@ -7389,6 +7485,82 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// The local prune must NOT delete a prior chunk key whose value was written
+    /// by a NEWER format -- a v2 direct envelope (bumped version) stored under a
+    /// chunk-shaped key. Cloud GC fails closed on it; local prune must be
+    /// symmetric, or an older CLI destroys config a newer writer produced.
+    #[test]
+    fn push_config_entries_local_keeps_a_chunk_key_holding_a_future_envelope() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(5_000));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), chunked)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed");
+
+        // A v2 direct envelope (version bumped) parked at a chunk key.
+        let mut v2_value: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&BlobEnvelope::new(
+                json!({ "k": "v" }),
+                "2026-01-01T00:00:00Z".to_owned(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        v2_value["version"] = json!(2_u32);
+        let v2 = v2_value.to_string();
+
+        let mut doc: toml_edit::DocumentMut = fs::read_to_string(&fastly_toml)
+            .expect("read")
+            .parse()
+            .expect("parse");
+        let contents = doc["local_server"]["config_stores"][TEST_CONFIG_ID]["contents"]
+            .as_table_mut()
+            .expect("contents");
+        let victim = contents
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .find(|key| key.contains(CHUNK_KEY_INFIX))
+            .expect("a chunk key");
+        contents.insert(&victim, toml_edit::value(v2));
+        fs::write(&fastly_toml, doc.to_string()).expect("write");
+
+        let direct = make_test_envelope(100);
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("re-push");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let after_doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        assert!(
+            after_doc["local_server"]["config_stores"][TEST_CONFIG_ID]["contents"]
+                .as_table()
+                .expect("contents")
+                .contains_key(&victim),
+            "a v2 (future-format) envelope must be KEPT, not pruned: {after}"
+        );
+    }
+
     /// The local prune must NOT delete a prior chunk key whose value claims our
     /// `edgezero_kind` namespace with an UNKNOWN/future kind. The cloud GC path
     /// fails closed on such a value; local replacement must be symmetric, or it
@@ -8028,9 +8200,40 @@ echo 'unexpected' >&2; exit 1
         // Symmetry: a direct write to the final target resolves to the same real
         // file the chain does, so both share one lock.
         assert_eq!(
-            canonical_manifest_target(&link),
-            canonical_manifest_target(&final_target),
+            canonical_manifest_target(&link).expect("chain resolves"),
+            canonical_manifest_target(&final_target).expect("direct resolves"),
             "the chain and a direct path must resolve to the same lock target"
+        );
+    }
+
+    /// A HARD-LINKED manifest cannot be replaced safely (rename breaks the link;
+    /// path-based locks miss the other names), so the writer FAILS CLOSED with a
+    /// fix rather than silently diverging.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_refuses_a_hard_linked_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = dir.path().join("fastly.toml");
+        let other = dir.path().join("other-name.toml");
+        fs::write(&manifest, "name = \"demo\"\n").expect("seed");
+        fs::hard_link(&manifest, &other).expect("hard link");
+
+        let err = write_fastly_local_config_store(
+            &manifest,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
+        )
+        .expect_err("a hard-linked manifest must be refused");
+        assert!(
+            err.contains("hard link"),
+            "must explain the hard-link refusal: {err}"
+        );
+        // Nothing was written -- the original content is intact.
+        assert_eq!(
+            fs::read_to_string(&manifest).expect("read"),
+            "name = \"demo\"\n",
+            "a refused write must not modify the manifest"
         );
     }
 

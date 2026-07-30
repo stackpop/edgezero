@@ -31,7 +31,7 @@ use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretField, SecretKind,
     SecretPathSegment,
 };
-use edgezero_core::blob_envelope::BlobEnvelope;
+use edgezero_core::blob_envelope::{BlobEnvelope, BlobEnvelopeError};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::Serialize;
@@ -44,6 +44,22 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 use toml::value::Table;
 use validator::Validate;
+
+/// Hard-error message shown when a push would overwrite a NEWER envelope format.
+const FUTURE_FORMAT_PUSH_ERROR: &str = "the remote value uses an envelope version this CLI does not recognise (a newer format); \
+     UPGRADE the CLI to push to this store rather than overwrite a newer format.";
+
+/// A `Present` remote body, classified for the push/diff flow.
+enum PresentBody {
+    /// The value exists but is corrupt (malformed, or a SHA mismatch). Treated
+    /// like `Corrupt`: the push OVERWRITES it (the in-band repair). This makes the
+    /// repair contract hold for EVERY adapter, not just Fastly -- axum, Cloudflare
+    /// and Spin return a raw stored value as `Present`, and the generic layer here
+    /// (not each adapter) turns an unverifiable one into a repairable overwrite.
+    Corrupt,
+    /// A valid, integrity-verified envelope to diff against.
+    Valid(Box<BlobEnvelope>),
+}
 
 /// Pre-loaded state for either push flow. Shares
 /// [`ValidationContext`] with the validate flows (manifest, raw
@@ -390,10 +406,10 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
     if dry_run {
         match args.older_than.as_deref() {
             Some(dur) => log::info!(
-                "[edgezero] dry-run (no --yes): nothing was deleted. Re-run with `--yes` to apply. `--older-than {dur}` asserts that NO root in this store changed within that window and that no writer is targeting it -- this sweeps the whole physical store, not just one config."
+                "[edgezero] dry-run (no --yes): nothing was deleted. Re-run with `--yes --older-than {dur}` to apply (a destructive run requires the explicit window). `--older-than {dur}` asserts that NO root in this store changed within that window and that no writer is targeting it -- this sweeps the whole physical store, not just one config."
             ),
             None => log::info!(
-                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since ANY root in this store last changed -- gc sweeps every root here, so a sibling you re-pushed recently also constrains the window. Then re-run with `--yes`."
+                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since ANY root in this store last changed -- gc sweeps every root here, so a sibling you re-pushed recently also constrains the window. Then re-run with `--yes --older-than <dur>` (a bare `--yes` is rejected)."
             ),
         }
     }
@@ -622,29 +638,32 @@ where
 
     // Branch per variant, render, determine outcome.
     let outcome: DiffOutcome = match &remote {
-        ReadConfigEntry::Present(body) => {
-            // Redacted: a serde parse error embeds the input (the stored blob,
-            // which may hold secrets); the verify error is redacted at source.
-            let remote_envelope: BlobEnvelope = serde_json::from_str(body).map_err(|_err| {
-                "remote value is not a valid envelope (details redacted)".to_owned()
-            })?;
-            remote_envelope
-                .verify()
-                .map_err(|err| format!("remote envelope {err}"))?;
-            if remote_envelope.sha256 == local_sha {
-                diff_info(&format!("# no changes (sha256 matches: {local_sha})"));
-                DiffOutcome::NoChanges
-            } else {
-                dispatch_diff_format(
-                    &remote_envelope.data,
-                    &local_envelope.data,
-                    &remote_envelope.sha256,
-                    &local_sha,
-                    &args.format,
-                );
-                DiffOutcome::DiffPresent
+        ReadConfigEntry::Present(body) => match classify_present_body(body)? {
+            // A future envelope version returns Err above (hard error).
+            PresentBody::Valid(remote_envelope) => {
+                if remote_envelope.sha256 == local_sha {
+                    diff_info(&format!("# no changes (sha256 matches: {local_sha})"));
+                    DiffOutcome::NoChanges
+                } else {
+                    dispatch_diff_format(
+                        &remote_envelope.data,
+                        &local_envelope.data,
+                        &remote_envelope.sha256,
+                        &local_sha,
+                        &args.format,
+                    );
+                    DiffOutcome::DiffPresent
+                }
             }
-        }
+            PresentBody::Corrupt => {
+                diff_info(&format!(
+                    "# existing value at key `{key}` is unusable; NO diff was computed. \
+                     `<app-cli> config push --adapter {} --yes` will REPLACE it.",
+                    args.adapter,
+                ));
+                DiffOutcome::CorruptRemote
+            }
+        },
         ReadConfigEntry::MissingKey => {
             let leaf_count = collect_changes(
                 &serde_json::Value::Object(serde_json::Map::default()),
@@ -845,13 +864,15 @@ fn recheck_before_write(
     approved_remote_sha: Option<&str>,
 ) -> Result<RecheckOutcome, String> {
     let remote_now = read_remote(adapter, args.local, paths, store, key)?;
-    if let ReadConfigEntry::Present(body_now) = &remote_now {
-        let remote_now_env: BlobEnvelope = serde_json::from_str(body_now).map_err(|_err| {
-            "post-consent remote value is not a valid envelope (details redacted)".to_owned()
-        })?;
-        remote_now_env
-            .verify()
-            .map_err(|err| format!("post-consent remote envelope {err}"))?;
+    // A Present body that no longer verifies (a concurrent write landed a corrupt
+    // value on any adapter) is handled like the `Corrupt` variant below: overwrite
+    // to repair. A FUTURE envelope version returns Err (hard error).
+    let present_now = if let ReadConfigEntry::Present(body_now) = &remote_now {
+        Some(classify_present_body(body_now)?)
+    } else {
+        None
+    };
+    if let Some(PresentBody::Valid(remote_now_env)) = &present_now {
         if remote_now_env.sha256 == local_sha {
             push_info(&format!(
                 "# concurrent push reached the same state (sha256 matches: {local_sha}); skipping write"
@@ -870,7 +891,9 @@ fn recheck_before_write(
                 short_ref(&remote_now_env.sha256),
             ));
         }
-    } else if matches!(remote_now, ReadConfigEntry::Corrupt(_)) {
+    } else if matches!(remote_now, ReadConfigEntry::Corrupt(_))
+        || matches!(present_now, Some(PresentBody::Corrupt))
+    {
         // The remote is (or became) CORRUPT: report it precisely instead of
         // modelling it as a removal, then overwrite. A Present→Corrupt transition
         // is a concurrent write that landed a broken value, not a deletion.
@@ -894,11 +917,29 @@ fn recheck_before_write(
     Ok(RecheckOutcome::Write)
 }
 
+/// Classify a `Present` body. `Err` for a FUTURE format (a bumped envelope
+/// version) — the push must refuse rather than overwrite a newer format.
+fn classify_present_body(body: &str) -> Result<PresentBody, String> {
+    match serde_json::from_str::<BlobEnvelope>(body) {
+        Ok(envelope) => match envelope.verify() {
+            Ok(()) => Ok(PresentBody::Valid(Box::new(envelope))),
+            // A bumped envelope version is a newer format: do NOT overwrite it.
+            Err(BlobEnvelopeError::UnknownVersion(_)) => Err(FUTURE_FORMAT_PUSH_ERROR.to_owned()),
+            // A SHA mismatch is corruption a push repairs.
+            Err(_) => Ok(PresentBody::Corrupt),
+        },
+        // Not a parseable envelope at all: corruption a push repairs.
+        Err(_) => Ok(PresentBody::Corrupt),
+    }
+}
+
 /// Render the first-read diff and return the outcome.
 ///
 /// - `Present` with matching SHA → `NoChange`.
 /// - `Present` with differing SHA → renders diff (when `!no_diff`) and
 ///   returns `ProceedFromPresent` with the remote SHA.
+/// - `Present` but unverifiable (corrupt) → proceeds to overwrite (repair);
+///   a FUTURE envelope version is a hard error instead.
 /// - `MissingKey` / `MissingStore` → renders "all leaves added" diff
 ///   (when `!no_diff`) and returns `ProceedFromMissingOrUnsupported`.
 /// - `Unsupported` → returns `ProceedFromMissingOrUnsupported` without
@@ -915,28 +956,33 @@ fn render_first_read_diff(
     no_diff: bool,
 ) -> Result<FirstReadOutcome, String> {
     match remote {
-        ReadConfigEntry::Present(body_str) => {
-            let remote_envelope: BlobEnvelope = serde_json::from_str(body_str).map_err(|_err| {
-                "remote value is not a valid envelope (details redacted)".to_owned()
-            })?;
-            remote_envelope
-                .verify()
-                .map_err(|err| format!("remote envelope {err}"))?;
-            if remote_envelope.sha256 == local_sha {
-                return Ok(FirstReadOutcome::NoChange);
+        ReadConfigEntry::Present(body_str) => match classify_present_body(body_str)? {
+            PresentBody::Valid(remote_envelope) => {
+                if remote_envelope.sha256 == local_sha {
+                    return Ok(FirstReadOutcome::NoChange);
+                }
+                if !no_diff {
+                    print_unified_diff_inline(
+                        &remote_envelope.data,
+                        &local_envelope.data,
+                        &remote_envelope.sha256,
+                        local_sha,
+                    );
+                }
+                Ok(FirstReadOutcome::ProceedFromPresent {
+                    approved_remote_sha: remote_envelope.sha256.clone(),
+                })
             }
-            if !no_diff {
-                print_unified_diff_inline(
-                    &remote_envelope.data,
-                    &local_envelope.data,
-                    &remote_envelope.sha256,
-                    local_sha,
-                );
+            PresentBody::Corrupt => {
+                // Corrupt on ANY adapter (an unverifiable Present value): no real
+                // prior to diff. Report it and overwrite -- the in-band repair.
+                push_info(&format!(
+                    "# existing value at key `{key}` is unusable; NO diff was computed. It will be \
+                     REPLACED by this push."
+                ));
+                Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
             }
-            Ok(FirstReadOutcome::ProceedFromPresent {
-                approved_remote_sha: remote_envelope.sha256.clone(),
-            })
-        }
+        },
         ReadConfigEntry::MissingKey if !no_diff => {
             push_info(&format!("# no remote at key `{key}`; all leaves added"));
             print_unified_diff_inline(
@@ -3450,6 +3496,62 @@ ids = ["default"]
         // signals a change (1) -- neither is what a corrupt remote reports.
         assert_eq!(apply_exit_code(false, DiffOutcome::NoChanges).code, 0_i32);
         assert_eq!(apply_exit_code(true, DiffOutcome::RemoteAbsent).code, 1_i32);
+    }
+
+    /// The repair contract is GENERIC, not Fastly-only: any adapter that returns a
+    /// malformed value as `Present` still gets the overwrite-to-repair behavior
+    /// (the generic layer classifies it), while a FUTURE envelope version is a
+    /// hard error the push refuses.
+    #[test]
+    fn present_body_classification_drives_generic_repair() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let valid = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "k": "v" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            classify_present_body(&valid),
+            Ok(PresentBody::Valid(_))
+        ));
+
+        // A malformed value returned as Present (axum/cloudflare/spin path) is
+        // repairable Corrupt -> the push overwrites it, on ANY adapter.
+        assert!(matches!(
+            classify_present_body("not an envelope"),
+            Ok(PresentBody::Corrupt)
+        ));
+        let mut bad_sha: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        bad_sha["sha256"] = json!("0".repeat(64));
+        assert!(matches!(
+            classify_present_body(&bad_sha.to_string()),
+            Ok(PresentBody::Corrupt)
+        ));
+
+        // A future envelope VERSION is a hard error -- never overwritten.
+        let mut v2: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        v2["version"] = json!(2);
+        assert!(
+            classify_present_body(&v2.to_string()).is_err_and(|err| err.contains("UPGRADE")),
+            "a future envelope version must refuse the push"
+        );
+
+        // And the first-read-diff flow proceeds to overwrite on a corrupt Present.
+        let local = BlobEnvelope::new(json!({ "k": "v2" }), "2026-01-01T00:00:00Z".to_owned());
+        let outcome = render_first_read_diff(
+            &ReadConfigEntry::Present("garbage".to_owned()),
+            "app_config",
+            &local,
+            &local.sha256,
+            true,
+        )
+        .expect("a corrupt Present must not abort the push");
+        assert!(matches!(
+            outcome,
+            FirstReadOutcome::ProceedFromMissingOrUnsupported
+        ));
     }
 
     /// Serialise a string as a TOML basic-string literal (test helper).

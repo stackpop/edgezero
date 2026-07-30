@@ -4,7 +4,7 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::collections::HashMap;
 
-use crate::chunked_config::resolve_fastly_config_value;
+use crate::chunked_config::{resolve_fastly_config_value, value_is_future_format};
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use fastly::ConfigStore as FastlyConfigStoreInner;
@@ -80,6 +80,11 @@ impl ConfigStore for FastlyConfigStore {
         // safer than a spurious 500 during the normal propagation window.)
         // `transient` records whether any chunk fetch hit that class so the outer
         // result can pick the right status.
+        // A value written by a NEWER format this guest does not understand needs a
+        // DIFFERENT remediation than corruption: re-pushing the same config will
+        // not help; the deployed build must be UPGRADED. Checked before `value` is
+        // moved into the resolver.
+        let future_format = value_is_future_format(&value);
         let transient = Cell::new(false);
         let resolved = resolve_fastly_config_value(key, value, |chunk_key| {
             let got = match &self.inner {
@@ -102,7 +107,17 @@ impl ConfigStore for FastlyConfigStore {
             Ok(got)
         })
         .map_err(|err| {
-            if transient.get() {
+            if future_format {
+                log::warn!(
+                    "Fastly config-store value for `{key}` uses a NEWER format than this build \
+                     understands: {err}. Re-pushing the same config will not help -- redeploy this \
+                     service with an updated EdgeZero build."
+                );
+                ConfigStoreError::internal(anyhow::anyhow!(
+                    "config store value uses a newer format than this build understands; redeploy \
+                     this service with an updated build (re-pushing will not help)"
+                ))
+            } else if transient.get() {
                 log::warn!(
                     "Fastly config-store chunk lookup for `{key}` was transiently unavailable: {err}"
                 );
@@ -251,6 +266,35 @@ mod tests {
                 .contains("re-run config push")
                 || err.to_string().to_lowercase().contains("corrupt"),
             "error message must point operators at the remediation: {err}"
+        );
+    }
+
+    /// A value written by a NEWER format (an unknown `edgezero_kind`, or a bumped
+    /// version) must map to Internal with an UPGRADE remediation, NOT the
+    /// re-push-to-repair message: re-pushing the same config cannot help a guest
+    /// that is older than the config.
+    #[test]
+    fn future_format_value_asks_to_redeploy_not_repush() {
+        use futures::executor::block_on;
+        let store = FastlyConfigStore::from_entries([(
+            "app_config".to_owned(),
+            r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#.to_owned(),
+        )]);
+        let err = block_on(store.get("app_config")).expect_err("a future format must error");
+        assert!(
+            matches!(err, ConfigStoreError::Internal { .. }),
+            "a future format is Internal, not transient: {err:?}"
+        );
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("redeploy") || message.contains("newer format"),
+            "must ask the operator to redeploy an updated build: {err}"
+        );
+        assert!(
+            !message.contains("re-run config push")
+                && !message.contains("re-push to repair")
+                && !message.contains("push to repair"),
+            "must NOT instruct the operator to re-push to repair a future format: {err}"
         );
     }
 }
