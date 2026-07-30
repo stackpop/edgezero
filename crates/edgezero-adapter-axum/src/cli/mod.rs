@@ -527,7 +527,8 @@ impl Adapter for AxumCliAdapter {
         // to locate `Cargo.toml`, and without the right count of
         // `..` it looks in `config/Cargo.toml` and fails
         // discovery.
-        let crate_dir = derive_axum_crate_dir(manifest_root, adapter_manifest_path);
+        let crate_dir =
+            derive_axum_crate_dir(manifest_root, adapter_manifest_path, adapter_crate_path);
         Ok(vec![(
             rel,
             run::synthesise_axum_toml(&crate_name, &crate_dir),
@@ -539,26 +540,35 @@ impl Adapter for AxumCliAdapter {
 /// this manifest layout: the relative path from the manifest's
 /// parent to the crate root (the dir carrying `Cargo.toml`).
 ///
-/// Falls back to `"."` when either:
-///   - `[adapters.axum.adapter].manifest` is unset (first-run
-///     scaffold — the crate hasn't been laid down yet), OR
-///   - no Cargo.toml is reachable along the upward walk from the
-///     manifest's parent to `manifest_root` (same fallback shape
-///     the crate-name lookup uses).
+/// The crate root is the AUTHORITATIVE declared
+/// `[adapters.axum.adapter].crate` when present (so `crate_dir` agrees
+/// with the crate NAME, which also honours `.crate`); it falls back to
+/// the nearest-ancestor `Cargo.toml` search only when `.crate` is
+/// undeclared. Without this, a nested package between the manifest and
+/// the intended crate could make the crate NAME and `crate_dir` name two
+/// DIFFERENT crates in the same `axum.toml`.
 ///
-/// Both fallbacks land at the pre-2026-07-13 default of
-/// `crate_dir = "."`, which is correct for the scaffold-convention
-/// layout `crates/<crate>/axum.toml`.
-fn derive_axum_crate_dir(manifest_root: &Path, adapter_manifest_path: Option<&str>) -> String {
+/// Falls back to `"."` when `.manifest` is unset (first-run scaffold),
+/// when no crate root can be resolved, or when the resolved crate root
+/// isn't a lexical ancestor of the manifest's parent (a `.crate` /
+/// `.manifest` misconfiguration) -- `"."` is the scaffold-convention
+/// default (`crates/<crate>/axum.toml`).
+fn derive_axum_crate_dir(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    adapter_crate_path: Option<&str>,
+) -> String {
     use std::iter;
     use std::path::Component;
     let Some(rel_str) = adapter_manifest_path else {
         return ".".to_owned();
     };
-    let Some(crate_root) =
-        cli_support::read_adapter_crate_root(manifest_root, adapter_manifest_path)
-    else {
-        return ".".to_owned();
+    let crate_root = match adapter_crate_path {
+        Some(cp) => manifest_root.join(cp),
+        None => match cli_support::read_adapter_crate_root(manifest_root, adapter_manifest_path) {
+            Some(root) => root,
+            None => return ".".to_owned(),
+        },
     };
     let manifest_abs = manifest_root.join(rel_str);
     let Some(manifest_parent) = manifest_abs.parent() else {
@@ -626,14 +636,15 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
         write_crate(root, "crates/server", "server");
-        // `crates/server/config/` is deliberately NOT created.
+        // `crates/server/config/` is deliberately NOT created. `None`
+        // crate path exercises the ancestor-search fallback.
         assert_eq!(
-            derive_axum_crate_dir(root, Some("crates/server/config/axum.toml")),
+            derive_axum_crate_dir(root, Some("crates/server/config/axum.toml"), None),
             "..",
             "a manifest one dir below the crate root needs `..`"
         );
         assert_eq!(
-            derive_axum_crate_dir(root, Some("crates/server/config/deep/axum.toml")),
+            derive_axum_crate_dir(root, Some("crates/server/config/deep/axum.toml"), None),
             "../..",
             "two dirs below the crate root needs `../..`"
         );
@@ -645,16 +656,38 @@ mod tests {
         let root = dir.path();
         write_crate(root, "crates/app", "app");
         assert_eq!(
-            derive_axum_crate_dir(root, Some("crates/app/axum.toml")),
+            derive_axum_crate_dir(root, Some("crates/app/axum.toml"), None),
             ".",
             "a manifest AT the crate root needs `.`"
         );
     }
 
     #[test]
+    fn derive_axum_crate_dir_prefers_declared_crate_over_nested_package() {
+        // A nested package sits BETWEEN the manifest and the intended
+        // crate. Ancestor search would stop at `crates/server/config`
+        // (crate_dir `.`), disagreeing with the crate NAME (which honours
+        // `.crate`). The declared `.crate` must win: `crate_dir = ".."`.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_crate(root, "crates/server", "server");
+        // Intervening nested package that ancestor search would wrongly pick.
+        write_crate(root, "crates/server/config", "server-config");
+        assert_eq!(
+            derive_axum_crate_dir(
+                root,
+                Some("crates/server/config/axum.toml"),
+                Some("crates/server"),
+            ),
+            "..",
+            "declared `.crate` must anchor crate_dir, not the nested package"
+        );
+    }
+
+    #[test]
     fn derive_axum_crate_dir_no_manifest_is_dot() {
         let dir = tempdir().expect("tempdir");
-        assert_eq!(derive_axum_crate_dir(dir.path(), None), ".");
+        assert_eq!(derive_axum_crate_dir(dir.path(), None, None), ".");
     }
 
     #[test]

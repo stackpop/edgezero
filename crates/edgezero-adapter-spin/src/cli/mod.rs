@@ -487,13 +487,17 @@ impl Adapter for SpinCliAdapter {
         let parsed = runtime_config::read(&runtime_config_path)?;
         push_local::verify_label_declared(platform, &parsed, &runtime_config_path)?;
 
-        // Resolve the SQLite path: honour any explicit `path` in a
-        // `type = "spin"` stanza; fall back to Spin's default otherwise
-        // (matches the write path at dispatch_push branch 1).
-        let explicit_path = match parsed.key_value_stores.get(platform) {
-            Some(runtime_config::KeyValueBackend::Spin { path }) => path.as_deref(),
-            _ => None,
-        };
+        // Resolve the SQLite path via the SAME backend check the write
+        // path uses: `type = "spin"` (honouring an explicit `path`) or an
+        // undeclared label reads SQLite; a Redis/Azure/unknown backend is
+        // REFUSED. Reading default SQLite for a non-SQLite label would
+        // diff stale local data against the wrong backend and report a
+        // false equality or false change.
+        let explicit_path = push_local::local_sqlite_path(
+            parsed.key_value_stores.get(platform),
+            platform,
+            store.logical.as_str(),
+        )?;
         let db_path = push_local::resolve_sqlite_path_guarded(
             spin_manifest_dir,
             runtime_config_dir,
@@ -894,6 +898,42 @@ mod tests {
     // not arbitrary strings.
     const TEST_KV_ID: &str = "sessions";
     const TEST_COMPONENT_ID: &str = "demo";
+
+    #[test]
+    fn read_config_entry_local_rejects_non_sqlite_backend() {
+        // The read/diff path must reject a Redis label the same way the
+        // write path does, or a diff would read stale default-SQLite as
+        // if it were the Redis backend's state.
+        use edgezero_adapter::registry::{AdapterPushContext, ResolvedStoreId};
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\n[[trigger.http]]\nroute = \"/...\"\ncomponent = \"demo\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"redis\"\nurl = \"redis://localhost\"\n",
+        )
+        .expect("write runtime-config");
+        let store = ResolvedStoreId::new("app_config".to_owned(), "app_config".to_owned());
+        let ctx = AdapterPushContext::new().with_local(true);
+        // `ReadConfigEntry` isn't `Debug`, so match rather than expect_err.
+        let Err(err) = SpinCliAdapter.read_config_entry_local(
+            dir.path(),
+            Some("spin.toml"),
+            None,
+            &store,
+            "greeting",
+            &ctx,
+        ) else {
+            panic!("a redis backend must be refused on the read/diff path");
+        };
+        assert!(
+            err.contains("redis") && err.contains("app_config"),
+            "error names the backend and label: {err}"
+        );
+    }
 
     #[test]
     fn is_valid_spin_key_accepts_lowercase_with_digits_and_underscores() {

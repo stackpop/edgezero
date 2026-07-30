@@ -613,18 +613,27 @@ where
         .filter(|pp| !pp.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let manifest_data = ctx.manifest();
-    let (adapter_manifest_path, component_selector) =
+    let (adapter_manifest_path, component_selector, deploy_cmd) =
         if let Some((_canonical, adapter_cfg)) = manifest_data.adapter_entry(&args.adapter) {
             (
                 adapter_cfg.adapter.manifest.clone(),
                 adapter_cfg.adapter.component.clone(),
+                adapter_cfg.commands.deploy.clone(),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
     let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(args.local);
     if let Some(path) = args.runtime_config.as_deref() {
         push_ctx = push_ctx.with_runtime_config_path(path);
+    }
+    // Thread the manifest's deploy command, exactly as `resolve_push_paths`
+    // does for push. Without it the Spin adapter's remote read can't tell a
+    // Fermyon Cloud config apart from local, and `config diff` would read
+    // local SQLite as if it were remote state -- producing a false diff or
+    // false "no changes" instead of the Cloud-unsupported signal.
+    if let Some(cmd) = deploy_cmd.as_deref() {
+        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(cmd);
     }
     let paths = PushPathRefs {
         manifest_root,

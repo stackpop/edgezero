@@ -37,6 +37,24 @@ pub(super) fn provision(
     };
     let wrangler_path = manifest_root.join(rel);
 
+    // Cloud provision MUTATES REMOTE ACCOUNT STATE (`wrangler kv namespace
+    // create`) and then records the namespace ids back into wrangler.toml.
+    // wrangler.toml is gitignored, so on a clean clone it is absent -- and
+    // creating remote namespaces first, then starting the writeback from
+    // an empty document, would orphan those namespaces behind a manifest
+    // that never declared them. Refuse BEFORE any account mutation (in
+    // dry-run too, so the preview models the real outcome), matching the
+    // Fastly adapter's preflight.
+    if !wrangler_path.exists() {
+        return Err(format!(
+            "{}: not found. Cloud provision records the KV namespaces it creates in wrangler.toml, \
+             and must not create remote resources against a manifest that does not exist yet. Run \
+             `provision --adapter cloudflare --local` first to synthesise the baseline manifest, \
+             then re-run cloud provision.",
+            wrangler_path.display()
+        ));
+    }
+
     let mut out = Vec::new();
     // Track logical -> namespace_id for freshly-created namespaces
     // so the CLI's writeback can persist them under
@@ -725,6 +743,42 @@ id = "00112233445566778899aabbccddeeff"
         assert!(
             err.contains("wrangler.toml"),
             "error names what's missing: {err}"
+        );
+    }
+
+    #[test]
+    fn cloud_provision_refuses_when_wrangler_toml_is_missing() {
+        // wrangler.toml is gitignored, so a clean clone has none. Creating
+        // remote namespaces first and then writing them back from an empty
+        // document would orphan them behind a manifest that never declared
+        // them. Refuse BEFORE any account mutation -- in dry-run too.
+        let dir = tempdir().expect("tempdir");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        for dry_run in [true, false] {
+            let err = CloudflareCliAdapter
+                .provision(
+                    dir.path(),
+                    Some("wrangler.toml"),
+                    None,
+                    &stores,
+                    None,
+                    ProvisionMode::Cloud,
+                    dry_run,
+                )
+                .expect_err("cloud provision must refuse without a baseline manifest");
+            assert!(
+                err.contains("provision --adapter cloudflare --local"),
+                "dry_run={dry_run}: error points at local provision: {err}"
+            );
+        }
+        assert!(
+            !dir.path().join("wrangler.toml").exists(),
+            "refusal must not materialise a manifest"
         );
     }
 

@@ -954,18 +954,19 @@ pub(crate) fn merge_deployed_into_manifest(
     // (`clippy::indexing_slicing`) that fires on `doc["adapters"]`.
     // If a sibling exists but isn't a table, we bail cleanly instead
     // of clobbering it — mirrors the fastly adapter's editor pattern.
+    // Use `TableLike` access at EVERY level (including top-level
+    // `adapters`) so a manifest that declares any of `adapters`, the
+    // per-adapter table, `deployed`, or a sub-table like `kv_namespaces`
+    // in inline `key = { … }` form is still editable. `as_table_mut()`
+    // matches only the `[header]` form and would reject valid inline
+    // state, stranding a just-created cloud resource uncheckpointed.
     let adapters_item = doc.entry("adapters").or_insert_with(table);
-    let adapters_tbl = adapters_item.as_table_mut().ok_or_else(|| {
+    let adapters_tbl = adapters_item.as_table_like_mut().ok_or_else(|| {
         format!(
             "{}: `adapters` exists but is not a table; refusing to edit in place",
             manifest_path.display()
         )
     })?;
-    // From here down use `TableLike` access so a manifest that declares
-    // `deployed` (or a sub-table like `kv_namespaces`) in inline
-    // `key = { … }` form is still editable -- `as_table_mut()` matches
-    // only the `[header]` form and would reject valid inline state,
-    // stranding a just-created cloud resource uncheckpointed.
     let named_tbl = get_or_insert_table_like(
         adapters_tbl,
         adapter_name,
@@ -3560,6 +3561,39 @@ deployed = { kv_namespaces = { sessions = "old-id" } }
             kv_ns.get("cache").and_then(|i| i.as_str()),
             Some("cache-id"),
             "new key added to the inline table: {raw}"
+        );
+    }
+
+    #[test]
+    fn merge_deployed_updates_top_level_inline_adapters_table() {
+        // The whole `adapters` table (and the per-adapter table) may be
+        // written inline. Writeback must edit it in place, not reject it
+        // with "adapters is not a table" and strand a created resource.
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let source = "[app]\nname = \"demo\"\n\nadapters = { cloudflare = { adapter = { crate = \"crates/cf\", manifest = \"crates/cf/wrangler.toml\" } } }\n";
+        fs::write(&manifest_path, source).unwrap();
+
+        let mut state = AdapterDeployedState::default();
+        let mut kv = BTreeMap::new();
+        kv.insert("sessions".to_owned(), "sess-id".to_owned());
+        state.sub_tables.insert("kv_namespaces".to_owned(), kv);
+
+        merge_deployed_into_manifest(
+            &manifest_path,
+            "cloudflare",
+            &state,
+            &["kv_namespaces", "preview_kv_namespaces"],
+            false,
+        )
+        .expect("inline top-level adapters table must be updatable");
+
+        let raw = fs::read_to_string(&manifest_path).unwrap();
+        let doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        assert_eq!(
+            doc["adapters"]["cloudflare"]["deployed"]["kv_namespaces"]["sessions"].as_str(),
+            Some("sess-id"),
+            "deployed id written into the inline adapters tree: {raw}"
         );
     }
 

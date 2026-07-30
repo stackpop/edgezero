@@ -26,19 +26,16 @@ SERVER_PID=""
 # (key name `demo_api_token`) through the AppConfig extractor, so every
 # adapter must have that secret seeded before boot or the endpoint errors.
 DEMO_SECRET_VALUE="resolved-token"
-# Path + backup of a `.dev.vars` this run overwrites (cloudflare only).
-# `.dev.vars` is gitignored but NOT regenerable, so we restore it.
+# Operator-owned files this smoke mutates. `.dev.vars` is gitignored but
+# NOT regenerable (provision writes only empty placeholders), and
+# `fastly.toml`, though regenerable, is edited in place by the push and
+# by warm-up. Both are backed up BEFORE warm-up runs (warm-up's
+# `provision --local` itself writes them) and restored on exit, so a run
+# never leaves a developer's tree changed regardless of success/failure.
 DEV_VARS_FILE=""
 DEV_VARS_BACKUP=""
-
-# Warm up per-adapter local state — provision --local synthesises
-# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
-# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
-# this because those adapter manifests are gitignored.
-# shellcheck source=lib/smoke_warmup.sh
-. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
-echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
-smoke_warmup_provision_local "$ADAPTER"
+FASTLY_TOML_FILE=""
+FASTLY_TOML_BACKUP=""
 
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
@@ -55,8 +52,44 @@ cleanup() {
       rm -f "$DEV_VARS_FILE"
     fi
   fi
+  if [ -n "$FASTLY_TOML_FILE" ]; then
+    if [ -n "$FASTLY_TOML_BACKUP" ] && [ -f "$FASTLY_TOML_BACKUP" ]; then
+      mv -f "$FASTLY_TOML_BACKUP" "$FASTLY_TOML_FILE"
+    else
+      rm -f "$FASTLY_TOML_FILE"
+    fi
+  fi
 }
+# Install the trap BEFORE warm-up so an abort mid-warm-up still restores.
 trap cleanup EXIT
+
+# Back up operator files BEFORE warm-up, because warm-up's
+# `provision --local` (and the later `config push`) write them.
+case "$ADAPTER" in
+  cloudflare|cf)
+    DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+    if [ -f "$DEV_VARS_FILE" ]; then
+      DEV_VARS_BACKUP=$(mktemp)
+      cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
+    fi
+    ;;
+  fastly)
+    FASTLY_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+    if [ -f "$FASTLY_TOML_FILE" ]; then
+      FASTLY_TOML_BACKUP=$(mktemp)
+      cp -p "$FASTLY_TOML_FILE" "$FASTLY_TOML_BACKUP"
+    fi
+    ;;
+esac
+
+# Warm up per-adapter local state — provision --local synthesises
+# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
+# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
+# this because those adapter manifests are gitignored.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
+smoke_warmup_provision_local "$ADAPTER"
 
 # -- Adapter-specific config ------------------------------------------------
 
@@ -114,13 +147,9 @@ case "$ADAPTER" in
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
       config push --adapter cloudflare --local --no-env --yes 2>&1)
     # wrangler dev does not inherit the shell env into the worker, so the
-    # `demo_api_token` secret must come through `.dev.vars`. Back up any
-    # operator file first (it is gitignored but not regenerable).
-    DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-    if [ -f "$DEV_VARS_FILE" ]; then
-      DEV_VARS_BACKUP=$(mktemp)
-      cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
-    fi
+    # `demo_api_token` secret must come through `.dev.vars`. It was backed
+    # up before warm-up (see the pre-warm-up backup block) and is restored
+    # on exit.
     printf 'demo_api_token="%s"\n' "$DEMO_SECRET_VALUE" > "$DEV_VARS_FILE"
     echo "==> Starting Cloudflare wrangler dev on port $PORT..."
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &

@@ -54,7 +54,7 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
     }
 
     let workspace_root = find_workspace_root(&crate_dir);
-    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name)?;
+    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name, ctx)?;
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
         .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
@@ -159,17 +159,27 @@ fn locate_artifact(
     workspace_root: &Path,
     manifest_dir: &Path,
     crate_name: &str,
+    ctx: &AdapterExecContext<'_>,
 ) -> Result<PathBuf, String> {
     let target_triple = "wasm32-wasip1";
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
-    if let Some(custom) = env::var_os("CARGO_TARGET_DIR") {
+    // Resolve `CARGO_TARGET_DIR` from the SAME source the build used: the
+    // ctx-applied env (manifest `[environment]`) takes precedence over
+    // the process env, mirroring `command.env(...)` in `build`. Reading
+    // only the process env would miss a manifest-set target dir and
+    // report a successful custom-target build as missing.
+    let custom = ctx
+        .env()
+        .iter()
+        .find(|(key, _)| key == "CARGO_TARGET_DIR")
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from));
+    if let Some(custom_dir) = custom {
         // Cargo resolves a RELATIVE `CARGO_TARGET_DIR` against its working
         // directory -- the crate dir, since the build runs with
         // `current_dir(crate_dir)`. Resolve it the same way here (against
-        // `manifest_dir`, the crate root), NOT against the CLI's process
-        // cwd, or a relative value points at the wrong tree.
-        let custom_dir = PathBuf::from(custom);
+        // `manifest_dir`, the crate root), NOT the process cwd.
         let base = if custom_dir.is_absolute() {
             custom_dir
         } else {
@@ -310,7 +320,8 @@ mod tests {
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "wasm").unwrap();
 
-        let located = locate_artifact(workspace, &manifest_dir, "demo").unwrap();
+        let located =
+            locate_artifact(workspace, &manifest_dir, "demo", &AdapterExecContext::new()).unwrap();
         assert_eq!(located, artifact);
     }
 

@@ -197,20 +197,19 @@ fn assert_adapter_declared_paths_safe(
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
-    use crate::provision_lock::ProvisionLock;
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
     assert_adapter_declared_paths_safe(manifest.as_ref(), &args.adapter)?;
-    // Deploy can mutate provision-owned local state (`fastly compute
-    // deploy` writes `service_id` back into fastly.toml). Hold the same
-    // cross-process advisory lock provision and `config push` use, so a
-    // concurrent provision's edgezero.toml/manifest writeback doesn't
-    // race the deploy's. No manifest root (standalone) => no lock to take.
-    let _lock = manifest
-        .as_ref()
-        .and_then(|loader| loader.manifest().root())
-        .map(ProvisionLock::acquire)
-        .transpose()?;
+    // NOTE: deploy deliberately does NOT take the cross-process provision
+    // lock. The deploy action runs an ARBITRARY, operator-defined command
+    // (`[adapters.<name>.commands].deploy`, or a vendor CLI), which may
+    // legitimately invoke `<app>-cli provision` / `config push`. Those run
+    // in a SEPARATE process and would block forever on the parent's
+    // non-reentrant file lock -- a self-deadlock. The narrow race the lock
+    // would guard (a concurrent provision vs `fastly compute deploy`'s
+    // `service_id` writeback into gitignored fastly.toml) is not worth
+    // deadlocking a composed deploy; provision/push reconcile a
+    // conflicting `service_id` in preflight when they next run.
     adapter::execute(
         &args.adapter,
         adapter::Action::Deploy,
@@ -261,18 +260,21 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
         && let Some(root) = loader.manifest().root()
     {
         let manifest_data = loader.manifest();
-        if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root)
-            && env_path.exists()
-        {
+        if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root) {
             // The env-file chain (e.g. `<root>/.edgezero/.env`) is NOT
             // covered by `assert_adapter_declared_paths_safe`, which only
-            // guards the declared `.manifest` / `.crate`. Refuse a
-            // symlinked `.edgezero` directory or `.env` file: either could
-            // redirect the read off-tree and inject externally-controlled
-            // application environment values into the spawned child.
+            // guards the declared `.manifest` / `.crate`. Guard it
+            // UNCONDITIONALLY -- the walk stops at the first missing
+            // component, so even with NO `.env` it still rejects a
+            // symlinked `.edgezero` directory, which Axum reads
+            // `local-config-*.json` from at request time. Gating this on
+            // `.env` existing left that config read able to follow a
+            // symlink off-tree and inject externally-controlled values.
             use edgezero_adapter::env_file::reject_symlink_components;
             reject_symlink_components(root, &env_path)?;
-            env_overlay = env_file::parse_env_overlay(&env_path)?;
+            if env_path.exists() {
+                env_overlay = env_file::parse_env_overlay(&env_path)?;
+            }
         }
     }
 
@@ -1130,6 +1132,59 @@ serve = 'sh -c "printf ran > {observed_path_display}"'
         assert!(
             !observed_path.exists(),
             "the child must NOT have spawned once the env chain was rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_serve_refuses_symlinked_edgezero_dir_even_without_env_file() {
+        // Regression: the symlink guard used to run only when `.env`
+        // existed. Axum reads `<root>/.edgezero/local-config-*.json` at
+        // request time, so a symlinked `.edgezero` must be refused even
+        // with NO `.env` inside it.
+        use std::os::unix::fs::symlink;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let observed_path = temp.path().join("child_observed.txt");
+        let observed_path_display = observed_path.to_string_lossy();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = format!(
+            r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/server"
+manifest = "crates/server/axum.toml"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = 'sh -c "printf ran > {observed_path_display}"'
+"#,
+        );
+        fs::write(&manifest_path, &manifest_body).expect("write manifest");
+        // `.edgezero` is a symlink to an out-of-tree dir holding config
+        // the operator does not control. Note: NO `.env` inside.
+        let outside = temp.path().join("attacker-edgezero");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        fs::write(
+            outside.join("local-config-app_config.json"),
+            "{\"greeting\":\"pwned\"}\n",
+        )
+        .expect("write outside config");
+        symlink(&outside, temp.path().join(".edgezero")).expect("symlink .edgezero");
+
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = ServeArgs {
+            adapter: "axum".to_owned(),
+        };
+        let err = run_serve(&args).expect_err("a symlinked .edgezero must be refused");
+        assert!(err.contains("symlink"), "error names the symlink: {err}");
+        assert!(
+            !observed_path.exists(),
+            "the child must NOT have spawned once the .edgezero chain was rejected"
         );
     }
 

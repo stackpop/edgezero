@@ -3848,7 +3848,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
   1. `std::fs::create_dir_all(<manifest_root>/.edgezero)`.
   2. Write `EDGEZERO__STORES__<KIND>__<LOGICAL_ID>__NAME=<platform>` lines and commented `__KEY` examples to `.edgezero/.env` via `edgezero_adapter::env_file::append_lines_dedup` (Task 16c).
-  3. **Do NOT** synthesise, merge, or touch `axum.toml`.
+  3. Synthesise `axum.toml` from `edgezero.toml` primitives via `synthesise_baseline_manifest`, exactly like the other four adapters. (Superseded by the 2026-07 amendment: `axum.toml` is a provision-generated, gitignored manifest — the earlier "do NOT touch axum.toml" carve-out is retired, and the `axum.toml` baseline is now the synthesiser's sole output.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 

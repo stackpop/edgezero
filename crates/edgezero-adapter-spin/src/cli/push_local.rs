@@ -133,6 +133,34 @@ fn guard_sqlite_path_symlinks(spin_manifest_dir: &Path, db_path: &Path) -> Resul
     Ok(())
 }
 
+/// Reject a resolved `SQLite` db that lands OUTSIDE the crate directory
+/// (`spin_manifest_dir`). Complements [`reject_offtree_sqlite_path`],
+/// which only inspects the `path` STRING: a clean-relative `path` still
+/// escapes when the directory it anchors against is external (e.g.
+/// `--runtime-config /tmp/rc.toml` with `path = "config.db"` →
+/// `/tmp/config.db`). Both operands are lexically absolutised (no
+/// filesystem access) before the containment check; `..` in the `path`
+/// is already rejected upstream, so `starts_with` can't be fooled.
+///
+/// # Errors
+/// Returns an error when the resolved db is not under the crate.
+fn assert_sqlite_write_in_tree(spin_manifest_dir: &Path, db_path: &Path) -> Result<(), String> {
+    use std::path::absolute;
+    let root = absolute(spin_manifest_dir).unwrap_or_else(|_| spin_manifest_dir.to_path_buf());
+    let db = absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    if !db.starts_with(&root) {
+        return Err(format!(
+            "the resolved local SQLite database `{}` is outside the adapter crate directory `{}`. \
+             `--local` state must stay in-tree; this usually means `--runtime-config` points \
+             outside the project (its directory is the base for a relative `path`). Use an \
+             in-tree runtime-config and store `path`.",
+            db.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a `runtime-config.toml` `path` that would place the local
 /// `SQLite` database OUTSIDE the project tree. `--local` state must stay
 /// in-tree, so an absolute path or one that climbs out with `..` is
@@ -583,10 +611,15 @@ pub(super) fn verify_label_declared(
 /// is REFUSED -- a `SQLite` write there lands in a database `spin up` never
 /// reads for this label.
 ///
+/// Shared by the write path (`dispatch_push`) AND the read/diff path
+/// (`read_config_entry_local`) so both agree on which labels `--local`
+/// can serve -- otherwise a diff could read stale default-SQLite for a
+/// Redis/Azure label the write would reject.
+///
 /// # Errors
 /// Returns an error naming the backend when it is not the local `SQLite`
 /// (`type = "spin"`) backend.
-fn local_sqlite_path<'backend>(
+pub(super) fn local_sqlite_path<'backend>(
     backend: Option<&'backend runtime_config::KeyValueBackend>,
     platform: &str,
     logical: &str,
@@ -629,6 +662,11 @@ fn write_sqlite(
     }
     let db_path =
         resolve_sqlite_path_guarded(spin_manifest_dir, runtime_config_dir, explicit_path)?;
+    // The `path` string can be clean-relative yet still escape when the
+    // BASE it anchors against is external -- e.g. `--runtime-config
+    // /tmp/runtime-config.toml` with `path = "config.db"` resolves to
+    // `/tmp/config.db`. Reject a resolved db that lands outside the crate.
+    assert_sqlite_write_in_tree(spin_manifest_dir, &db_path)?;
     if dry_run {
         let mut out = Vec::with_capacity(entries.len().saturating_add(1));
         out.push(format!(
@@ -1608,6 +1646,27 @@ mod tests {
     fn reject_offtree_sqlite_path_allows_in_tree_relative() {
         reject_offtree_sqlite_path(Path::new("db/kv.db"))
             .expect("an in-tree relative path is fine");
+    }
+
+    #[test]
+    fn assert_sqlite_write_in_tree_rejects_external_runtime_config_base() {
+        // `path = "config.db"` is a clean relative string, but anchored
+        // against an EXTERNAL runtime-config dir it escapes the crate.
+        let crate_dir = Path::new("/proj/crates/spin");
+        let external_db = Path::new("/tmp/config.db"); // runtime_config_dir=/tmp
+        let err = assert_sqlite_write_in_tree(crate_dir, external_db)
+            .expect_err("a db resolved outside the crate must be refused");
+        assert!(
+            err.contains("outside") && err.contains("runtime-config"),
+            "error explains the external-base escape: {err}"
+        );
+    }
+
+    #[test]
+    fn assert_sqlite_write_in_tree_allows_db_under_crate() {
+        let crate_dir = Path::new("/proj/crates/spin");
+        assert_sqlite_write_in_tree(crate_dir, Path::new("/proj/crates/spin/.spin/kv.db"))
+            .expect("a db under the crate is fine");
     }
 
     /// A symlinked INTERMEDIATE component (`.spin`) must be rejected --
