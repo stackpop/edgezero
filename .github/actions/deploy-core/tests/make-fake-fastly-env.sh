@@ -96,6 +96,24 @@ write_fake_curl() {
   local path="$1"
   cat >"$path" <<'SHIM'
 #!/usr/bin/env bash
+# install-fastly.sh downloads the (fake) archive with
+# `curl … <file://…> --output <path>`. Each invocation now uses a UNIQUE per-run
+# tool root (mktemp -d), so the archive is not pre-placed there — serve the
+# download by copying the file:// source to the output path, keeping the real
+# download+checksum+extract path intact.
+_out=""
+_url=""
+_prev=""
+for _a in "$@"; do
+  [ "$_prev" = "--output" ] && _out="$_a"
+  case "$_a" in file://*) _url="$_a" ;; esac
+  _prev="$_a"
+done
+if [ -n "$_out" ]; then
+  cp "${_url#file://}" "$_out"
+  exit 0
+fi
+
 # The versions this fake service has. The ACTIVE one is tracked separately (in
 # FAKE_ACTIVE_VERSION_FILE) and is always considered to exist.
 FAKE_KNOWN_VERSIONS="1 38 39 40 41 42"
