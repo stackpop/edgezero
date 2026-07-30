@@ -173,10 +173,10 @@ main() {
   # a fixed path: the action passes EDGEZERO__ACTION__WORKSPACE (a `mktemp -d` root
   # it also cleans up); a direct/test run mints its own.
   local runner_temp="${RUNNER_TEMP:-/tmp}"
-  local workspace="${EDGEZERO__ACTION__WORKSPACE:-}"
-  [[ -n "$workspace" ]] || workspace=$(mktemp -d "$runner_temp/edgezero-cli.XXXXXX")
-  local stage_root="$workspace/artifact"
-  local build_target_dir="$workspace/build"
+  local action_ws="${EDGEZERO__ACTION__WORKSPACE:-}"
+  [[ -n "$action_ws" ]] || action_ws=$(mktemp -d "$runner_temp/edgezero-cli.XXXXXX")
+  local stage_root="$action_ws/artifact"
+  local build_target_dir="$action_ws/build"
 
   require_linux_x86_64
   require_cmd cargo
