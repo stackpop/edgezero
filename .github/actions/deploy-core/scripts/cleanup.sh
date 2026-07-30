@@ -13,6 +13,7 @@ set -euo pipefail
 #
 # Reads (env):
 #   RUNNER_TEMP                           required  the only root anything may be removed beneath
+#   EDGEZERO__ACTION__WORKSPACE           optional  per-invocation workspace root to remove (covers all of the below)
 #   EDGEZERO__ACTION__STATE_DIR           optional  action-owned state dir to remove
 #   EDGEZERO__ACTION__TOOL_ROOT           optional  action-owned tool install to remove
 # Writes:
@@ -48,6 +49,10 @@ main() {
     return 0
   fi
 
+  # The per-invocation workspace root contains the state dir, tool root, and CLI
+  # download; removing it covers them all. The individual dirs are still removed
+  # (older callers, and defense-in-depth) — a no-op once the root is gone.
+  remove_owned_dir "${EDGEZERO__ACTION__WORKSPACE:-}" "$temp_root"
   remove_owned_dir "${EDGEZERO__ACTION__STATE_DIR:-}" "$temp_root"
   remove_owned_dir "${EDGEZERO__ACTION__TOOL_ROOT:-}" "$temp_root"
 }

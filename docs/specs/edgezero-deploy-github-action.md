@@ -318,8 +318,9 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 | `mutation-attempted`   | `true` once the deploy CLI is invoked (emitted before it runs). On failure, read via `if: always()` to know a deploy may have occurred and reconcile. |
 
 The wrapper sets `adapter: fastly`, `target: wasm32-wasip1`, the action-owned
-`deploy-flags` (`--service-id …`, `--non-interactive`) so deployments cannot
-prompt in CI or select an unintended service, and
+`deploy-flags` (`--service-id …`, before `--`) so a deploy cannot select an
+unintended service, plus an action-owned `--non-interactive` deploy-args PREPEND
+(after `--`) so a manifest-command deploy cannot block on a CI prompt, and
 `provider-env-clear: ["FASTLY_API_TOKEN", "FASTLY_SERVICE_ID", "FASTLY_ENDPOINT",
 "FASTLY_CARGO_PROFILE", …]` so the engine clears Fastly auth/endpoint aliases
 without the engine itself knowing Fastly's names. When `stage: true` it adds
@@ -383,8 +384,9 @@ a previous version (§5.4.3), the caller threads `previous-version` into
   `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --path <p> …`
   with `FASTLY_API_TOKEN` in the step env; outputs `healthy` and `status-code`. It
   **exits non-zero after retries when the probe is unhealthy** (so a caller can
-  gate rollback on `if: failure()`), while still emitting the outputs. Needs no
-  application source or build.
+  gate rollback on `if: failure() || cancelled()` — `failure()` alone skips a
+  cancel/timeout), while still emitting the outputs. Needs no application source or
+  build.
 - **`rollback-fastly`** — thin wrapper: takes `fastly-api-token`,
   `fastly-service-id`, `fastly-version`, `rollback-to`, `deploy-to`; runs
   `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
@@ -448,10 +450,17 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
 The condition is `failure() || cancelled()` because `failure()` alone does not run
 on a cancel/timeout — the exact case a version may have been activated with the
 line lost. That path is best-effort: GitHub grants a cancelled job only a short
-grace period, and a job timeout or reclaimed runner can skip it, so the durable
-`mutation-attempted` output (not any `if:`) is the guarantee an operator reconciles
-from. Recovery also assumes a single mutation authority per service (serialize deploys
-per service); otherwise "the active version" may belong to a concurrent run.
+grace period, and a job timeout or reclaimed runner can skip it.
+
+`mutation-attempted` is a best-effort POSITIVE signal, not a durable ledger: it is
+appended only to the runner-local `$GITHUB_OUTPUT`, so an abrupt runner loss can
+prevent it from being materialized even though the CLI ran. Its presence means
+"reconcile"; its ABSENCE is not proof of no mutation. The operator contract is
+therefore to reconcile provider state UNCONDITIONALLY whenever a deploy's outcome
+is indeterminate (no clean success, no clean output-bearing failure), regardless of
+whether the signal is readable. Recovery also assumes a single mutation authority
+per service (serialize deploys per service); otherwise "the active version" may
+belong to a concurrent run.
 
 The `fastly-version != ''` guard skips rollback when the version was never
 captured — because `rollback-fastly` needs it. But that is not the same as "no
@@ -730,7 +739,7 @@ Rules:
   The wrapper necessarily carries the token into the deploy step twice — once as
   `EDGEZERO__<PROVIDER>_API_TOKEN` (so the step's YAML can build the JSON without
   interpolating a secret into a `run:` block, itself a template-injection sink),
-  and once inside `EDGEZERO__PROVIDER_ENV`. Both are secret-bearing. `run-app-cli.sh`
+  and once inside `EDGEZERO__PROVIDER__ENV`. Both are secret-bearing. `run-app-cli.sh`
   therefore unsets its entire private namespace (§10.2) after reading it, so the
   app CLI — and every subprocess it spawns, including a manifest
   `[adapters.*.commands]` shell command — **inherits** only the typed provider
@@ -883,8 +892,13 @@ The deploy, healthcheck, and rollback wrappers tee the CLI's combined output to 
 file so they can parse a canonical `version=<N>` / `healthy=<bool>` line out of
 it. Provider CLIs print request URLs and service metadata, and under debug flags
 can print credential material — so that file is created with `mktemp` at mode
-`600` and removed by an `EXIT` trap whatever the outcome. It is never left behind
-in `RUNNER_TEMP` for a later step in the job to read.
+`600` and removed by an `EXIT` trap on normal exit, failure, and cancellation.
+This is best-effort, NOT a guarantee: a `SIGKILL`, runner shutdown, or hard
+job-timeout bypasses the trap (and the composite cleanup step), so on a persistent
+self-hosted runner a hard kill can leave the mode-`600` file behind. The supported
+runner model is therefore an **ephemeral** runner (GitHub-hosted, or self-hosted
+one-job-per-VM); on a persistent self-hosted runner, treat post-kill temp hygiene
+as your responsibility.
 
 Canonical lines are matched with a **fully anchored** pattern (`^<key>=[0-9]+$`).
 A prefix match reads `version=15.2.0` as `15` and `version=12abc` as `12` —

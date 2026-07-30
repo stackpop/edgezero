@@ -333,10 +333,17 @@ Three things to know before you rely on this:
   includes `cancelled()` is _eligible_ to run after a cancel, but GitHub only grants
   a cancelled job a short grace period, and a job `timeout-minutes` cut-off or the
   runner being reclaimed can skip it entirely; no job or `needs:` structure changes
-  that. So treat the durable `mutation-attempted` output — visible in the run — as
-  the real backstop: if automated recovery does not complete, an **operator**
-  reconciles from it after the fact. (Set a generous job `timeout-minutes` to widen
-  the window.)
+  that. (Set a generous job `timeout-minutes` to widen the window.)
+- **`mutation-attempted` is a best-effort POSITIVE signal, not a durable ledger.**
+  When it is `true`, a mutation may have occurred — reconcile. But its **absence is
+  not proof of no mutation**: it is only appended to the runner-local
+  `$GITHUB_OUTPUT`, and an abrupt runner loss (reclamation, SIGKILL, hard timeout)
+  can prevent that file from being processed, so the composite output never
+  materializes even though the CLI ran. **The operator contract is therefore:
+  whenever a deploy's outcome is indeterminate — it did not finish with a clean
+  success or a clean, output-bearing failure — reconcile provider state
+  unconditionally, whether or not the signal is readable.** Do not treat a missing
+  signal as "nothing happened."
 - **It assumes a single mutation authority for the service.** The recovery treats
   "the version active now" as the one _this run_ activated. If another deployment can
   touch the same service concurrently, that is false and you could roll back
@@ -366,16 +373,25 @@ not cross job boundaries.
     steps.deploy.outputs['mutation-attempted'] == 'true'
   env:
     FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }} # active-version calls the API
+    # Pass the service id through env, never interpolate `${{ vars.* }}` into the
+    # script — a value containing a quote could otherwise escape the argument.
+    SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
   # Explicit `shell: bash` runs with `-eo pipefail`; the default shell omits
-  # pipefail, so a failing `active-version` in the pipe below would be masked by
-  # `sed` succeeding, silently yielding an empty version and skipping rollback.
+  # pipefail, so a failing `active-version` in the pipe below would be masked and
+  # silently yield an empty version, skipping rollback.
   shell: bash
   run: |
+    case "$SERVICE_ID" in '' | *[!A-Za-z0-9_-]*)
+      echo "::error::FASTLY_SERVICE_ID is empty or malformed"; exit 1;; esac
     dir="${{ runner.temp }}/recover-cli"
     tar -C "$dir" -xf "$dir"/*.tar
     bin="$dir/$(jq -r '."app-cli-bin"' "$dir/app-cli-meta.json")"
-    v="$("$bin" active-version --adapter fastly \
-          --service-id '${{ vars.FASTLY_SERVICE_ID }}' | sed -n 's/^version=//p')"
+    out=$("$bin" active-version --adapter fastly --service-id "$SERVICE_ID")
+    # Require EXACTLY ONE canonical `version=<digits>` line — never trust an
+    # arbitrary or repeated match.
+    n=$(printf '%s\n' "$out" | grep -cE '^version=[0-9]+$' || true)
+    [ "$n" = "1" ] || { echo "::error::expected one 'version=<digits>' line, got $n"; exit 1; }
+    v=$(printf '%s\n' "$out" | grep -oE '^version=[0-9]+$' | cut -d= -f2)
     echo "version=$v" >>"$GITHUB_OUTPUT"
 - name: Roll back only if the deploy activated a NEW version over a known previous one
   if: >-
@@ -397,7 +413,8 @@ not cross job boundaries.
 is empty there is no earlier version to activate, so `rollback-fastly` (which
 requires a numeric `rollback-to`) does not apply. If the recovered active version
 is non-empty in that case, the deploy activated the service's first version;
-undoing it is manual (deactivate or delete that version via the Fastly UI or CLI).
+undoing it is manual — **deactivate** that version (Fastly does not support
+deleting an individual version; deletion only applies to the whole service).
 
 **Staging is different.** `active-version` returns the _production_-active version,
 so it cannot reveal a staged version. And a staged deploy does not leave a merely
@@ -427,12 +444,13 @@ and cannot — pass it through `deploy-args`.
 | `deploy-to`         | No       | `production`    | `staging` probes the staged version via its resolved edge IP.                                                  |
 | `retry`             | No       | `3`             | Attempts before declaring the deployment unhealthy.                                                            |
 | `retry-delay`       | No       | `5`             | Seconds between attempts.                                                                                      |
-| `timeout`           | No       | `10`            | Per-attempt timeout in seconds.                                                                                |
+| `timeout`           | No       | `10`            | Per-attempt timeout in seconds. Must be a positive integer (`0` would disable curl's timeout).                 |
 
 Outputs: `healthy`, `status-code`.
 
 **This action fails when the deployment is unhealthy** — that is the point. Gate
-your rollback on the step failing (`if: failure()`), not on the `healthy` output.
+your rollback on the step failing (`if: failure() || cancelled()` — `failure()`
+alone skips a cancel/timeout), not on the `healthy` output.
 
 ### `rollback-fastly`
 
@@ -620,8 +638,9 @@ call rollback with an empty `fastly-version` (it would fail with a misleading
 secondary error); if `mutation-attempted` is `true`, follow the lost-version
 recovery above to obtain the current version first. The `failure() || cancelled()`
 guard covers a cancel/timeout mid-deploy, but — as noted for recovery — that path
-is best-effort; the durable `mutation-attempted` signal is what a later reconcile
-relies on.
+is best-effort, and `mutation-attempted`'s absence is not proof of no mutation
+(runner loss can drop it); reconcile unconditionally when the outcome is
+indeterminate.
 
 ## Build behavior and caching
 

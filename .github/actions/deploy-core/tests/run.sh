@@ -414,6 +414,38 @@ test_fastly_versions() {
 # ---------------------------------------------------------------------------
 # cleanup.sh — it runs `rm -rf`, so confinement is the whole contract
 # ---------------------------------------------------------------------------
+test_workspace_isolation() {
+  section "per-invocation workspace isolation"
+  # Each action must mint a UNIQUE per-invocation root (mktemp -d) so two
+  # concurrent invocations in one job never share fixed temp paths — otherwise one
+  # could overwrite the other's CLI/state/flags and run them with the wrong token.
+  local a p
+  for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly; do
+    p="$ACTIONS_DIR/$a/action.yml"
+    assert_succeeds "$a: mints a mktemp -d workspace as its first step" \
+      grep -qF 'mktemp -d' "$p"
+    assert_fails "$a: leaves no fixed runner.temp/edgezero path" \
+      grep -qE 'runner\.temp \}\}/edgezero-' "$p"
+    assert_succeeds "$a: cleanup removes the workspace root" \
+      grep -qF 'EDGEZERO__ACTION__WORKSPACE:' "$p"
+  done
+
+  # cleanup.sh actually removes EDGEZERO__ACTION__WORKSPACE (confined to RUNNER_TEMP).
+  local rt="$WORK_DIR/ws-clean" ws
+  rm -rf "$rt"
+  mkdir -p "$rt"
+  ws=$(mktemp -d "$rt/edgezero.XXXXXX")
+  touch "$ws/file"
+  RUNNER_TEMP="$rt" EDGEZERO__ACTION__WORKSPACE="$ws" bash "$CORE_SCRIPTS/cleanup.sh" >/dev/null 2>&1
+  assert_fails "cleanup removes the per-invocation workspace" test -d "$ws"
+  # ...but refuses a workspace OUTSIDE RUNNER_TEMP (same confinement as the rest).
+  local outside="$WORK_DIR/ws-outside"
+  rm -rf "$outside"
+  mkdir -p "$outside"
+  RUNNER_TEMP="$rt" EDGEZERO__ACTION__WORKSPACE="$outside" bash "$CORE_SCRIPTS/cleanup.sh" >/dev/null 2>&1
+  assert_succeeds "cleanup refuses a workspace outside RUNNER_TEMP" test -d "$outside"
+}
+
 test_cleanup_confinement() {
   section "cleanup confinement"
   local temp_root="$WORK_DIR/cleanup-temp" outside="$WORK_DIR/cleanup-outside"
@@ -1786,6 +1818,7 @@ main() {
   test_resolve_app_cli
   test_fastly_versions
   test_cleanup_confinement
+  test_workspace_isolation
   test_action_env_scrub
   test_deploy_args_prepend
   test_provider_env_nul

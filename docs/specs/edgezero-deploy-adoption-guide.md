@@ -269,9 +269,12 @@ Workflow shape:
    possibly mutated rather than assume nothing deployed — a lost/malformed
    `fastly-version` line fails the step even though the deploy may have happened.
    Read `mutation-attempted` under a `failure() || cancelled()` guard (plain
-   `failure()` does not fire on a cancel/timeout — the exact case the durable signal
-   exists for; note that cancellation-time recovery is best-effort, so the signal is
-   also what an operator reconciles from after the fact). **Production:** since you
+   `failure()` does not fire on a cancel/timeout). `mutation-attempted` is a
+   best-effort POSITIVE signal only — it lives in the runner-local `$GITHUB_OUTPUT`,
+   so a runner loss can drop it; its ABSENCE is not proof of no mutation. The
+   operator contract is to reconcile provider state unconditionally whenever the
+   outcome is indeterminate, whether or not the signal is readable. **Production:**
+   since you
    then lack the version to roll back _from_, recover it — download the CLI artifact
    and run its `active-version` subcommand, which prints the live version; if that
    differs from the pre-deploy `previous-version`, call `rollback-fastly` with it as

@@ -54,6 +54,14 @@ outputs:
 runs:
   using: composite
   steps:
+    # A UNIQUE per-invocation workspace root under RUNNER_TEMP, so two concurrent
+    # invocations in one job (e.g. `background: true`) never collide on fixed temp
+    # paths (CLI download, extracted tools). The cleanup step removes it.
+    - name: Prepare action workspace
+      id: ws
+      shell: bash
+      run: echo "root=$(mktemp -d "${RUNNER_TEMP:-/tmp}/edgezero.XXXXXX")" >>"$GITHUB_OUTPUT"
+
     # GitHub does not enforce `required: true` on composite inputs, and an empty
     # artifact name makes actions/download-artifact fetch EVERY artifact in the
     # run — so the CLI we execute would be arbitrary. Check before downloading.
@@ -85,7 +93,7 @@ runs:
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: ${{ inputs['app-cli-artifact'] }}
-        path: ${{ runner.temp }}/edgezero-cli-download
+        path: ${{ steps.ws.outputs.root }}/cli-download
       env:
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
@@ -108,8 +116,8 @@ runs:
       id: cli
       shell: bash
       env:
-        EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
-        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ steps.ws.outputs.root }}/cli-download
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ steps.ws.outputs.root }}/tools
         EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_TOKEN: ""
@@ -168,7 +176,8 @@ runs:
       if: ${{ always() }}
       shell: bash
       env:
-        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ steps.ws.outputs.root }}/tools
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""

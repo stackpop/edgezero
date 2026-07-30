@@ -53,11 +53,21 @@ outputs:
 runs:
   using: composite
   steps:
+    # A UNIQUE per-invocation workspace root under RUNNER_TEMP. Two concurrent
+    # invocations in one job (e.g. `background: true`) must not share fixed temp
+    # paths, or one could overwrite the other's build/outputs. Every temp path
+    # below hangs off steps.ws.outputs.root; the cleanup step removes it.
+    - name: Prepare action workspace
+      id: ws
+      shell: bash
+      run: echo "root=$(mktemp -d "${RUNNER_TEMP:-/tmp}/edgezero.XXXXXX")" >>"$GITHUB_OUTPUT"
+
     - name: Compile application CLI package
       id: compile
       shell: bash
       env:
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
         EDGEZERO__APP__CLI__PACKAGE: ${{ inputs['app-cli-package'] }}
         EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
@@ -66,7 +76,7 @@ runs:
         # This step runs app-controlled code, so it emits NO outputs through the
         # runner's GITHUB_OUTPUT (blanked below). It collects them into this
         # action-owned file; the separate "Publish CLI outputs" step re-emits them.
-        EDGEZERO__ACTION__OUTPUT_FILE: ${{ runner.temp }}/edgezero-build-app-cli-outputs.env
+        EDGEZERO__ACTION__OUTPUT_FILE: ${{ steps.ws.outputs.root }}/outputs.env
         # This step runs APP-CONTROLLED code (cargo metadata/build, and the built
         # CLI's `--help`), which must never see a provider token.
         #
@@ -146,7 +156,7 @@ runs:
       id: build
       shell: bash
       env:
-        EDGEZERO__BUILD__OUTPUTS_FILE: ${{ runner.temp }}/edgezero-build-app-cli-outputs.env
+        EDGEZERO__BUILD__OUTPUTS_FILE: ${{ steps.ws.outputs.root }}/outputs.env
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
@@ -222,3 +232,12 @@ runs:
         path: ${{ steps.build.outputs['tarball-path'] }}
         if-no-files-found: error
         retention-days: 1
+
+    # Remove the per-invocation workspace (build/stage dirs, the outputs handoff)
+    # now that the artifact is uploaded. Runs no application code.
+    - name: Cleanup workspace
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh"

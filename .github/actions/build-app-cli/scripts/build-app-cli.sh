@@ -166,12 +166,17 @@ main() {
   local rust_toolchain_input="${EDGEZERO__PROJECT__RUST_TOOLCHAIN:-auto}"
   local artifact_name="${EDGEZERO__APP__CLI__ARTIFACT:-edgezero-cli}"
 
-  # These directories are `rm -rf`d below, so they must NEVER come from the
-  # inherited environment — a colliding job-level variable could otherwise point
-  # them at the checkout. Always derive them from the action-owned temp root.
+  # These directories are `rm -rf`d below, so they must stay under the action-owned
+  # temp root — the `reset_owned_dir` guard refuses anything not beneath it, so a
+  # colliding job-level variable can never point them at the checkout. They live in
+  # a PER-INVOCATION workspace so two concurrent builds in one job never collide on
+  # a fixed path: the action passes EDGEZERO__ACTION__WORKSPACE (a `mktemp -d` root
+  # it also cleans up); a direct/test run mints its own.
   local runner_temp="${RUNNER_TEMP:-/tmp}"
-  local stage_root="$runner_temp/edgezero-cli-artifact"
-  local build_target_dir="$runner_temp/edgezero-cli-build"
+  local workspace="${EDGEZERO__ACTION__WORKSPACE:-}"
+  [[ -n "$workspace" ]] || workspace=$(mktemp -d "$runner_temp/edgezero-cli.XXXXXX")
+  local stage_root="$workspace/artifact"
+  local build_target_dir="$workspace/build"
 
   require_linux_x86_64
   require_cmd cargo
