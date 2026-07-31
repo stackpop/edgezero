@@ -162,9 +162,14 @@ main() {
   # Anchored parses of the canonical lines the CLI emits. The store is whatever
   # the CLI RESOLVED from the manifest — not the optional raw input, which is
   # empty on the default path.
+  #
+  # The value is only anchored to a single line free of control characters — NOT a
+  # narrow character class. Fastly (and the CLI) accept keys the wrapper does not
+  # own (e.g. `release/canary`), so a stricter allowlist would reject a key AFTER
+  # the CLI already wrote it. `append_output` still rejects an embedded newline.
   local pushed resolved_store
-  pushed=$(grep -oE '^pushed-key=[A-Za-z0-9._-]+$' "$LIFECYCLE_LOG" | tail -n 1 | cut -d= -f2 || true)
-  resolved_store=$(grep -oE '^pushed-store=[A-Za-z0-9._-]+$' "$LIFECYCLE_LOG" | tail -n 1 | cut -d= -f2 || true)
+  pushed=$(grep -oE '^pushed-key=[^[:cntrl:]]+$' "$LIFECYCLE_LOG" | tail -n 1 | sed 's/^pushed-key=//' || true)
+  resolved_store=$(grep -oE '^pushed-store=[^[:cntrl:]]+$' "$LIFECYCLE_LOG" | tail -n 1 | sed 's/^pushed-store=//' || true)
   [[ -n "$pushed" ]] ||
     fail "config push reported success but emitted no canonical 'pushed-key=<key>' line"
   [[ -n "$resolved_store" ]] ||

@@ -230,22 +230,16 @@ main() {
   local pinned
   pinned=$(json_get "$action_dir/versions.json" fastly.version)
 
-  # Regression guard against the installer trust-by-version-text bypass: plant a
-  # DIFFERENT binary at the extract target that REPORTS the pinned version but
-  # errors on every real command. install-fastly.sh must overwrite it from the
-  # verified archive; if it ever went back to adopting a pre-seeded binary by its
-  # version text, THIS one would survive and the staged deploy's first real
-  # `fastly` call would exit non-zero — failing the smoke.
-  local provider_bin="$runner_temp/edgezero-action-tools/provider-bin"
-  mkdir -p "$provider_bin"
-  # `$1`/`$2` here are the PLANTED script's args, not this script's — intentionally
-  # literal (single-quoted printf format).
-  # shellcheck disable=SC2016
-  printf '#!/bin/sh\ncase "$1" in\n  version|--version) echo "Fastly CLI version v%s (planted, should have been overwritten)";;\n  *) echo "install-fastly adopted a planted binary instead of extracting the verified archive" >&2; exit 97;;\nesac\n' "$pinned" >"$provider_bin/fastly"
-  chmod +x "$provider_bin/fastly"
+  # NOTE: the installer's "always re-extract, never adopt a pre-existing binary"
+  # provenance guard is no longer exercised by planting a binary here. Each action
+  # invocation now installs into a UNIQUE mktemp workspace, so its provider-bin is
+  # always fresh — there is nothing to adopt, and this fixture cannot predict the
+  # path to plant into. The guarantee still holds structurally: install-fastly.sh
+  # extracts from the checksum-verified archive on every run (see it there).
 
-  # Package a fake `fastly` as the archive install-fastly.sh expects, pre-placed
-  # at its cache path so no network fetch happens.
+  # Package a fake `fastly` as the checksum-verified archive install-fastly.sh
+  # downloads. It lives at the fixed downloads path and is served to each
+  # invocation's unique tool root by the fake `curl`'s file:// copy above.
   local stage archive sha
   stage=$(mktemp -d)
   write_fake_fastly "$stage/fastly" "$pinned"

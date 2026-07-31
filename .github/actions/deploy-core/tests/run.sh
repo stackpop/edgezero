@@ -312,6 +312,13 @@ EOF
     else
       fail "download-app-cli did not emit app-cli-path"
     fi
+    # It must NOT prepend the app-bin dir to PATH: an app CLI legitimately named
+    # after a tool the action shells out to (e.g. `jq`) would otherwise shadow it.
+    if [[ ! -s "$WORK_DIR/download-path.txt" ]] || ! grep -q '/tools/bin' "$WORK_DIR/download-path.txt"; then
+      pass "does not prepend the app-bin dir to PATH"
+    else
+      fail "download-app-cli prepended the app-bin dir to GITHUB_PATH (can shadow jq etc.)"
+    fi
   else
     fail "download-app-cli failed to execute"
   fi
@@ -414,6 +421,33 @@ test_fastly_versions() {
 # ---------------------------------------------------------------------------
 # cleanup.sh — it runs `rm -rf`, so confinement is the whole contract
 # ---------------------------------------------------------------------------
+# Print the lines of the step whose `- ` header contains "$2", from that header
+# up to (but not including) the next top-level step.
+step_block() {
+  awk -v want="$2" '
+    /^    - / { inb = (index($0, want) > 0) }
+    inb { print }
+  ' "$1"
+}
+
+test_workspace_step_scrub() {
+  section "workspace steps scrub credentials"
+  # The prepare/cleanup steps run before validation, so — like every other step —
+  # they MUST blank the shipped aliases and BASH_ENV. Otherwise an inherited token
+  # plus a checkout-controlled BASH_ENV runs code with the token before the body.
+  local a p block
+  for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly; do
+    p="$ACTIONS_DIR/$a/action.yml"
+    block=$(step_block "$p" "Prepare action workspace")
+    assert_succeeds "$a: prepare step blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
+    assert_succeeds "$a: prepare step blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
+  done
+  # build-app-cli's own cleanup step (a run: step added with the workspace refactor).
+  block=$(step_block "$ACTIONS_DIR/build-app-cli/action.yml" "Cleanup workspace")
+  assert_succeeds "build-app-cli: cleanup step blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
+  assert_succeeds "build-app-cli: cleanup step blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
+}
+
 test_workspace_isolation() {
   section "per-invocation workspace isolation"
   # Each action must mint a UNIQUE per-invocation root (mktemp -d) so two
@@ -1001,6 +1035,19 @@ test_config_push_argv() {
   assert_succeeds "inline config threads --app-config" grep -qx -- '--app-config' <<<"$inline_argv"
   assert_equals "inline content is written to the file the CLI reads" \
     'greeting = "hi"' "$(cat "$WORK_DIR/config-push/argv.txt.appconfig" 2>/dev/null)"
+
+  # A key the wrapper does not own (contains '/') must be ACCEPTED, not rejected
+  # after the CLI already wrote it — Fastly constrains key length, not this charset.
+  local cpdir="$WORK_DIR/config-push"
+  printf '#!/usr/bin/env bash\necho "pushed-key=release/canary"\necho "pushed-store=app_config"\n' >"$cpdir/bin/fake-cli"
+  chmod +x "$cpdir/bin/fake-cli"
+  : >"$cpdir/ghout"
+  env PATH="$cpdir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    GITHUB_WORKSPACE="$cpdir" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    RUNNER_TEMP="$cpdir" GITHUB_OUTPUT="$cpdir/ghout" \
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1
+  assert_succeeds "a pushed key containing '/' is accepted, not rejected post-write" \
+    grep -qx 'pushed-key=release/canary' "$cpdir/ghout"
 
   # no-env: --no-env is appended only when requested.
   local noenv_argv
@@ -1762,8 +1809,9 @@ test_deploy_signal_timing() {
   rm -rf "$dir"
   mkdir -p "$dir/bin" "$dir/app" "$dir/rt"
   # The fake CLI records whether the signal was ALREADY in GITHUB_OUTPUT when it
-  # ran — proving the launcher publishes it BEFORE the mutation (so it survives a
-  # cancellation mid-mutation), not after the CLI returns.
+  # ran — proving the launcher publishes it BEFORE the mutation (so a cancel
+  # mid-mutation CAN preserve it; a hard runner loss can still drop it), not after
+  # the CLI returns.
   cat >"$dir/bin/fakecli" <<'CLI'
 #!/usr/bin/env bash
 if grep -qx 'mutation-attempted=true' "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null; then
@@ -1819,6 +1867,7 @@ main() {
   test_fastly_versions
   test_cleanup_confinement
   test_workspace_isolation
+  test_workspace_step_scrub
   test_action_env_scrub
   test_deploy_args_prepend
   test_provider_env_nul

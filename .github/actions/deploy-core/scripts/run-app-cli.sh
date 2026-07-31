@@ -204,11 +204,12 @@ main() {
   cd "$working_directory"
   # Publish the reconcile signal for a MUTATING invocation HERE — after all setup
   # succeeded (binary resolve, credential import, cd) and immediately before the
-  # CLI runs. Writing it now, from the launcher itself, is what makes it correct on
-  # every axis: a setup failure ABOVE never falsely claims the CLI ran, and because
-  # it is durable in GITHUB_OUTPUT before the mutation starts, it survives even if
-  # the step is cancelled or times out mid-mutation. `build` is credential-free and
-  # mutates nothing, so it is not signalled.
+  # CLI runs. Writing it now, from the launcher itself, means a setup failure ABOVE
+  # never falsely claims the CLI ran, and because it lands in GITHUB_OUTPUT before
+  # the mutation starts it CAN survive a cancel/timeout mid-mutation — best-effort,
+  # not guaranteed: a hard runner loss can still drop it, so its absence is not
+  # proof of no mutation (the reconcile contract is in the guide). `build` is
+  # credential-free and mutates nothing, so it is not signalled.
   if [[ "$mode" == "deploy" ]]; then
     append_output mutation-attempted true
   fi

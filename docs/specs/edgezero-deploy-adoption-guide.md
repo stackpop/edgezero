@@ -185,6 +185,11 @@ steps:
   reproducibility.
 - Use least-privilege permissions (`contents: read`), protected environments,
   `timeout-minutes`, and appropriate concurrency.
+- **Run on ephemeral runners** (GitHub-hosted, or self-hosted one-job-per-VM). The
+  lifecycle log and any inline config are removed by a best-effort `EXIT` trap; a
+  `SIGKILL`, runner shutdown, or hard timeout bypasses it, so on a persistent
+  self-hosted runner a hard kill can leave a mode-`600` credential-bearing file
+  behind. On such runners, post-kill temp hygiene is your responsibility.
 
 ## 4. Fastly staging lifecycle
 

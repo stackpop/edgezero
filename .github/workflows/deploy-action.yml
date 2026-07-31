@@ -278,9 +278,11 @@ jobs:
           app-cli-package: fixture-app-cli
           working-directory: fixture-app
 
-      # Seeds the action-owned tool root with a fake `fastly` reporting the
-      # pinned version, so install-fastly.sh adopts it and the staged path runs
-      # through the real wrapper without contacting Fastly.
+      # Packages a fake `fastly` as a checksum-verified archive and a fake `curl`
+      # that serves it to each invocation's unique tool root (file:// copy). So
+      # install-fastly.sh runs its REAL download+verify+extract path — never
+      # adopting a planted binary — and the staged path runs through the real
+      # wrapper without contacting Fastly.
       - name: Install fake fastly + curl
         run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
 

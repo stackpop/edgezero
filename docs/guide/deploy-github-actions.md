@@ -343,7 +343,9 @@ Three things to know before you rely on this:
   whenever a deploy's outcome is indeterminate — it did not finish with a clean
   success or a clean, output-bearing failure — reconcile provider state
   unconditionally, whether or not the signal is readable.** Do not treat a missing
-  signal as "nothing happened."
+  signal as "nothing happened." (This is why the recovery steps below do **not**
+  gate on `mutation-attempted`: they run on any non-success and let the idempotent
+  active-version check decide whether a rollback is actually needed.)
 - **It assumes a single mutation authority for the service.** The recovery treats
   "the version active now" as the one _this run_ activated. If another deployment can
   touch the same service concurrently, that is false and you could roll back
@@ -359,18 +361,22 @@ not cross job boundaries.
 
 ```yaml
 - name: Fetch the app CLI for recovery
-  if: >-
-    (failure() || cancelled()) &&
-    steps.deploy.outputs['mutation-attempted'] == 'true'
+  # Runs on ANY non-success — NOT gated on mutation-attempted, whose absence is
+  # not proof of no mutation (a lost signal must not skip reconciliation). The
+  # active-version check below is idempotent: it only rolls back if the live
+  # version actually differs from the pre-deploy one.
+  if: ${{ failure() || cancelled() }}
   uses: actions/download-artifact@<sha>
   with:
     name: edgezero-cli # the same app-cli-artifact name the deploy used
     path: ${{ runner.temp }}/recover-cli
 - name: Read the currently-active version
   id: recover
-  if: >-
-    (failure() || cancelled()) &&
-    steps.deploy.outputs['mutation-attempted'] == 'true'
+  # Runs on ANY non-success — NOT gated on mutation-attempted, whose absence is
+  # not proof of no mutation (a lost signal must not skip reconciliation). The
+  # active-version check below is idempotent: it only rolls back if the live
+  # version actually differs from the pre-deploy one.
+  if: ${{ failure() || cancelled() }}
   env:
     FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }} # active-version calls the API
     # Pass the service id through env, never interpolate `${{ vars.* }}` into the
@@ -682,6 +688,14 @@ serialize another repository's workflow, a `fastly` CLI run from a laptop, or a
 Fastly-console activation. If more than one authority can activate versions on
 the service, route them all through the same serialized workflow (or accept the
 residual race).
+
+**Run on ephemeral runners.** These actions tee the provider CLI's output to a
+mode-`600` temp file (it can contain credential material under debug flags) and
+remove it with a best-effort `EXIT` trap. A `SIGKILL`, runner shutdown, or hard
+`timeout-minutes` bypasses that trap, so on a **persistent self-hosted** runner a
+hard kill can leave that file — and any inline config — behind for another job to
+read. The supported model is an ephemeral runner (GitHub-hosted, or self-hosted
+one-job-per-VM); on a persistent runner, post-kill temp hygiene is on you.
 
 Add `timeout-minutes`, a protected GitHub Environment with required reviewers,
 and pin third-party actions to readable released tags (or full SHAs for

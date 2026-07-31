@@ -75,14 +75,15 @@ main() {
   env -i PATH="/usr/bin:/bin" HOME="${HOME:-/tmp}" "$cli_path" --help >/dev/null 2>&1 ||
     fail "downloaded CLI '$cli_bin' did not run '--help'"
 
-  printf '%s\n' "$tool_root/bin" >>"${GITHUB_PATH:-/dev/null}"
-  export PATH="$tool_root/bin:$PATH"
-
+  # The app CLI's directory is deliberately NOT prepended to PATH. Callers invoke
+  # it by the ABSOLUTE `app-cli-path` output below, and an app CLI may legitimately
+  # be named after a tool the action itself shells out to (e.g. `jq`) — prepending
+  # its dir would then SHADOW that system command and break later steps.
   notice "using app CLI '$cli_bin' v$cli_version from artifact"
   append_output app-cli-bin "$cli_bin"
   # The ABSOLUTE path, so callers invoke this exact binary rather than resolving
-  # the bare name through PATH. The provider CLI install prepends its own dir, so
-  # an app CLI legitimately named `fastly` would otherwise be shadowed by it.
+  # the bare name through PATH (immune to the provider-CLI dir the installer
+  # prepends, and to any same-named system tool).
   append_output app-cli-path "$cli_path"
   append_output app-cli-version "$cli_version"
   append_env EDGEZERO__ACTION__TOOL_ROOT "$tool_root"

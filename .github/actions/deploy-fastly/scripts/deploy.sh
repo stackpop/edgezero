@@ -38,8 +38,9 @@ main() {
   new_private_log
   # run-app-cli.sh publishes `mutation-attempted=true` itself, immediately before
   # it invokes the CLI — so a setup failure never falsely signals, and the signal
-  # is durable in GITHUB_OUTPUT before the mutation starts (surviving a cancel /
-  # timeout mid-mutation). This wrapper only threads the resulting version out.
+  # lands in GITHUB_OUTPUT before the mutation starts (best-effort durable across a
+  # cancel/timeout; a hard runner loss can still drop it). This wrapper only threads
+  # the resulting version out.
   local rc=0
   "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
