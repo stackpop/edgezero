@@ -28,7 +28,8 @@ set -euo pipefail
 #   EDGEZERO__PROVIDER__ENV               optional  JSON object of typed creds (deploy)
 # Writes (outputs):
 #   mutation-attempted   deploy mode only: 'true', written immediately BEFORE the
-#                        CLI runs (durable reconcile signal; see below).
+#                        CLI runs (best-effort reconcile signal — see below; a hard
+#                        runner loss can drop it, so absence is not proof of no-op).
 # Otherwise runs the app CLI, which owns stdout/stderr and the exit status.
 #   EDGEZERO_MANIFEST is exported to the CLI; the whole EDGEZERO__* namespace is
 #   scrubbed first (see scrub_action_private_env).

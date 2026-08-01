@@ -1774,9 +1774,14 @@ test_publish_outputs() {
   section "publish-outputs (trusted output boundary)"
   local dir="$WORK_DIR/publish"
   rm -rf "$dir"
-  mkdir -p "$dir/rt"
+  mkdir -p "$dir/rt/ws" "$dir/rt/sibling"
   local pub="$ACTIONS_DIR/build-app-cli/scripts/publish-outputs.sh"
-  touch "$dir/rt/edgezero-cli.tar"
+  local ws="$dir/rt/ws"
+  touch "$ws/edgezero-cli.tar"
+  touch "$dir/rt/sibling/cli.tar" # a SIBLING invocation's file: under RUNNER_TEMP, not our workspace
+  # The canonical path publish-outputs must emit (computed with its own helper).
+  local expected
+  expected=$(bash -c "source '$ACTIONS_DIR/build-app-cli/scripts/common.sh'; canonical_path '$ws/edgezero-cli.tar'")
 
   # A valid handoff, with a TAMPERED trailing duplicate tarball-path: first wins.
   {
@@ -1784,31 +1789,37 @@ test_publish_outputs() {
     printf 'app-cli-package=my-cli\n'
     printf 'app-cli-bin=my-cli\n'
     printf 'app-cli-artifact=edgezero-cli\n'
-    printf 'tarball-path=%s\n' "$dir/rt/edgezero-cli.tar"
+    printf 'tarball-path=%s\n' "$ws/edgezero-cli.tar"
     printf 'tarball-path=/evil/hijack.tar\n'
   } >"$dir/outputs.env"
   local out="$dir/gh-output"
   : >"$out"
-  RUNNER_TEMP="$dir/rt" EDGEZERO__BUILD__OUTPUTS_FILE="$dir/outputs.env" GITHUB_OUTPUT="$out" \
+  RUNNER_TEMP="$dir/rt" EDGEZERO__ACTION__WORKSPACE="$ws" \
+    EDGEZERO__BUILD__OUTPUTS_FILE="$dir/outputs.env" GITHUB_OUTPUT="$out" \
     bash "$pub" >/dev/null 2>&1
-  assert_succeeds "publishes the legit tarball-path (first occurrence)" \
-    grep -qx "tarball-path=$dir/rt/edgezero-cli.tar" "$out"
+  # Publishes the CANONICAL path (first occurrence) — a symlink cannot redirect the
+  # upload after the check.
+  assert_succeeds "publishes the canonical tarball-path (first occurrence)" \
+    grep -qx "tarball-path=$expected" "$out"
   assert_fails "ignores a tampered trailing duplicate tarball-path" \
     grep -qx 'tarball-path=/evil/hijack.tar' "$out"
   assert_succeeds "publishes the version" grep -qx 'app-cli-version=1.2.3' "$out"
 
-  # A tarball-path escaping the action-owned temp root is refused.
-  printf 'app-cli-version=1\napp-cli-package=p\napp-cli-bin=b\napp-cli-artifact=a\ntarball-path=/etc/passwd\n' \
-    >"$dir/escape.env"
-  assert_fails_with "a tarball-path outside RUNNER_TEMP is refused" \
-    "not beneath the action-owned temp root" \
-    env RUNNER_TEMP="$dir/rt" EDGEZERO__BUILD__OUTPUTS_FILE="$dir/escape.env" GITHUB_OUTPUT="$dir/o2" \
+  # A tarball-path under RUNNER_TEMP but in a SIBLING invocation's dir is refused —
+  # confinement is to THIS workspace, not the whole temp root.
+  printf 'app-cli-version=1\napp-cli-package=p\napp-cli-bin=b\napp-cli-artifact=a\ntarball-path=%s\n' \
+    "$dir/rt/sibling/cli.tar" >"$dir/sibling.env"
+  assert_fails_with "a tarball-path outside this invocation's workspace is refused" \
+    "not beneath this invocation's workspace" \
+    env RUNNER_TEMP="$dir/rt" EDGEZERO__ACTION__WORKSPACE="$ws" \
+    EDGEZERO__BUILD__OUTPUTS_FILE="$dir/sibling.env" GITHUB_OUTPUT="$dir/o2" \
     bash "$pub"
 
   # A missing required output fails closed.
   printf 'app-cli-version=1\n' >"$dir/partial.env"
   assert_fails "a missing required output fails closed" \
-    env RUNNER_TEMP="$dir/rt" EDGEZERO__BUILD__OUTPUTS_FILE="$dir/partial.env" GITHUB_OUTPUT="$dir/o3" \
+    env RUNNER_TEMP="$dir/rt" EDGEZERO__ACTION__WORKSPACE="$ws" \
+    EDGEZERO__BUILD__OUTPUTS_FILE="$dir/partial.env" GITHUB_OUTPUT="$dir/o3" \
     bash "$pub"
 
   # The isolation of the GitHub file-command channels is proved at RUNTIME by the

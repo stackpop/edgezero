@@ -391,8 +391,9 @@ a previous version (§5.4.3), the caller threads `previous-version` into
   `fastly-service-id`, `fastly-version`, `rollback-to`, `deploy-to`; runs
   `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
   `FASTLY_API_TOKEN` in the step env; on production emits `rolled-back-to`, and
-  always emits `mutation-attempted` (readable via `if: always()` on failure to
-  know the active version may have changed). A
+  emits `mutation-attempted` before the CLI runs — best-effort (a hard runner loss
+  can drop it), readable via `if: always()` on failure to know the active version
+  may have changed; its absence is not proof of a no-op. A
   production rollback **requires** `rollback-to` — Fastly's version metadata
   cannot distinguish a previously-live version from a staged draft, so the target
   cannot be inferred. Capture it at deploy time from `deploy-fastly`'s

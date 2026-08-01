@@ -1730,8 +1730,8 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 //     command; `emit_active_version` resolves the activated version.
 //   * healthcheck     → curl the domain (production) or the version's
 //     resolved staging IP (`--staging`); non-zero exit when unhealthy.
-//   * rollback        → activate `<v>-1` (production) or deactivate
-//     `<v>` (staging) via the Fastly API.
+//   * rollback        → activate the explicit `--rollback-to` version
+//     (production) or deactivate `<v>` (staging) via the Fastly API.
 //
 // **Version-output contract:** deploy/stage print a
 // single `version=<N>` line to stdout (via `log::info!`, which the CLI
@@ -2788,8 +2788,9 @@ fn curl_status(args: &[String]) -> Result<u16, String> {
     })
 }
 
-/// `rollback --adapter fastly ...`: production activates
-/// `<version> - 1`; staging deactivates `<version>`.
+/// `rollback --adapter fastly ...`: production activates the explicit
+/// `--rollback-to` version (Fastly cannot infer a previous version);
+/// staging deactivates `<version>`.
 fn rollback(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;

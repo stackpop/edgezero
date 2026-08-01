@@ -17,6 +17,9 @@ Composable actions:
 - `deploy-fastly` — deploy a checked-out Fastly application using the prebuilt
   CLI artifact, to production or (with `stage: true`) a staged draft version;
 - `healthcheck-fastly` / `rollback-fastly` — the Fastly staging lifecycle (§4);
+- `config-push-fastly` — push the application's typed config to a Fastly config
+  store (the production key, or the `_staging` twin), from a checked-out file or
+  inline content;
 - future `deploy-cloudflare` / `deploy-spin` wrappers over the same engine.
 
 The actions own repeatable deploy setup and the Fastly staging mechanisms. The

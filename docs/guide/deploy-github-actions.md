@@ -18,6 +18,7 @@ this page is the practical how-to.
 | `deploy-fastly`      | Deploy a checked-out Fastly app using that CLI artifact (production, or a staged draft).  |
 | `healthcheck-fastly` | Probe a deployed/staged version; exit non-zero when unhealthy so you can gate a rollback. |
 | `rollback-fastly`    | Production: activate the previous version. Staging: deactivate the staged version.        |
+| `config-push-fastly` | Push your app's typed config to a Fastly config store (production key, or staging twin).  |
 
 Under the hood a private `deploy-core` engine (a set of shared scripts) holds all
 provider-neutral behavior; the wrappers above are thin.
@@ -393,12 +394,16 @@ not cross job boundaries.
     tar -C "$dir" -xf "$dir"/*.tar
     bin="$dir/$(jq -r '."app-cli-bin"' "$dir/app-cli-meta.json")"
     out=$("$bin" active-version --adapter fastly --service-id "$SERVICE_ID")
-    # Require EXACTLY ONE canonical `version=<digits>` line — never trust an
-    # arbitrary or repeated match.
-    n=$(printf '%s\n' "$out" | grep -cE '^version=[0-9]+$' || true)
-    [ "$n" = "1" ] || { echo "::error::expected one 'version=<digits>' line, got $n"; exit 1; }
-    v=$(printf '%s\n' "$out" | grep -oE '^version=[0-9]+$' | cut -d= -f2)
-    echo "version=$v" >>"$GITHUB_OUTPUT"
+    # Require EXACTLY ONE `version=` line (a malformed or repeated line is an
+    # error), and accept an EMPTY value: active-version emits `version=` when the
+    # service has no active version yet (a first-ever deploy) — that is "nothing to
+    # roll back", not a failure. The value is the digits, or empty.
+    n=$(printf '%s\n' "$out" | grep -cE '^version=' || true)
+    [ "$n" = "1" ] || { echo "::error::expected exactly one 'version=' line, got $n"; exit 1; }
+    printf '%s\n' "$out" | grep -qE '^version=[0-9]*$' ||
+      { echo "::error::active-version emitted a malformed version line"; exit 1; }
+    v=$(printf '%s\n' "$out" | sed -n 's/^version=//p')
+    echo "version=$v" >>"$GITHUB_OUTPUT" # empty -> the rollback step's guard skips it
 - name: Roll back only if the deploy activated a NEW version over a known previous one
   if: >-
     (failure() || cancelled()) &&
@@ -509,6 +514,22 @@ print both `pushed-key=` and `pushed-store=`; the action fails if either is
 missing — but `mutation-attempted` is `true` once the push CLI is invoked, so on
 that failure you can read it via `if: always()` and reconcile the config store
 rather than assume it is unchanged.
+
+A production config push, using the same build artifact:
+
+```yaml
+- id: cli
+  uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
+  with:
+    app-cli-package: my-app-cli
+
+- uses: stackpop/edgezero/.github/actions/config-push-fastly@<ref>
+  with:
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+    # deploy-to: staging  # writes the <store>_staging twin instead
+    # app-config-inline: ${{ vars.APP_CONFIG_TOML }}  # or push inline content
+```
 
 **Staging config is the same store, a different key.** Fastly config stores are
 not versioned like staged service versions, so `deploy-to: staging` writes your

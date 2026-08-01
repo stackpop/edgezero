@@ -18,7 +18,7 @@ set -euo pipefail
 #
 # Reads (env):
 #   EDGEZERO__BUILD__OUTPUTS_FILE         required  file the compile step wrote (KEY=VALUE lines)
-#   RUNNER_TEMP                           optional  action-owned temp root (tarball confinement)
+#   EDGEZERO__ACTION__WORKSPACE           required  this invocation's workspace (tarball confinement)
 # Writes (outputs): app-cli-version, app-cli-package, app-cli-bin, app-cli-artifact, tarball-path
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -46,22 +46,23 @@ main() {
   artifact=$(read_build_output app-cli-artifact "$src")
   tarball=$(read_build_output tarball-path "$src")
 
-  # tarball-path drives the artifact upload, so confine it to the action-owned
-  # temp area and require it to exist: a tampered handoff cannot then redirect the
-  # upload to an arbitrary file.
-  local runner_temp runner_real tarball_real
-  runner_temp="${RUNNER_TEMP:-/tmp}"
-  runner_real=$(canonical_path "$runner_temp")
+  # tarball-path drives the artifact upload, so confine it to THIS invocation's
+  # unique workspace (not all of RUNNER_TEMP — a tampered handoff could otherwise
+  # select a SIBLING invocation's file) and require it to exist. Publish the
+  # CANONICAL path so a symlink cannot redirect the upload after this check.
+  local workspace workspace_real tarball_real
+  workspace="${EDGEZERO__ACTION__WORKSPACE:?EDGEZERO__ACTION__WORKSPACE is required}"
+  workspace_real=$(canonical_path "$workspace")
   tarball_real=$(canonical_path "$tarball")
-  is_under "$runner_real" "$tarball_real" ||
-    fail "tarball-path is not beneath the action-owned temp root; refusing to publish it"
+  is_under "$workspace_real" "$tarball_real" ||
+    fail "tarball-path is not beneath this invocation's workspace; refusing to publish it"
   [[ -f "$tarball_real" ]] || fail "tarball-path does not point at an existing file"
 
   append_output app-cli-version "$version"
   append_output app-cli-package "$package"
   append_output app-cli-bin "$bin"
   append_output app-cli-artifact "$artifact"
-  append_output tarball-path "$tarball"
+  append_output tarball-path "$tarball_real"
 }
 
 main "$@"

@@ -189,6 +189,10 @@ runs:
       shell: bash
       env:
         EDGEZERO__BUILD__OUTPUTS_FILE: ${{ steps.ws.outputs.root }}/outputs.env
+        # Confine the published tarball-path to THIS invocation's workspace, not all
+        # of RUNNER_TEMP (a tampered handoff could otherwise select a sibling
+        # invocation's file).
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
         # This step holds the REAL GITHUB_OUTPUT and is the handoff-validation
         # boundary. Blank BASH_ENV/ENV so a caller's job env cannot point them at
         # checkout code that runs at bash startup — before publish-outputs.sh — with
