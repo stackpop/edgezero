@@ -212,17 +212,35 @@ pub fn run_native_cli(program: &str, args: &[&str], install_hint: &str) -> Resul
 /// walks up from the platform manifest's parent and stops at the FIRST
 /// `Cargo.toml` it finds, this reads exactly the operator-declared crate
 /// root. A nested package that happens to sit between the platform
-/// manifest and the intended crate can't be mis-selected. Returns `None`
-/// when `.crate` is undeclared or its `Cargo.toml` is unreadable, so
-/// callers fall back to the ancestor search / scaffold convention.
+/// manifest and the intended crate can't be mis-selected.
+///
+/// Returns `Ok(None)` only when `.crate` is UNDECLARED, so callers fall
+/// back to the ancestor search / scaffold convention. Once `.crate` IS
+/// declared it is authoritative: an unreadable `Cargo.toml` at that path
+/// is a hard error (`Err`), not a silent fallback -- otherwise a
+/// mis-declared crate would quietly mispoint the synthesised
+/// runtime-authoritative fields at whatever ancestor package happens to
+/// sit above the manifest.
+///
+/// # Errors
+/// Returns `Err` when `.crate` is declared but the `Cargo.toml` at that
+/// path can't be read or parsed for a package name.
 #[inline]
-#[must_use]
 pub fn read_crate_name_at(
     manifest_root: &Path,
     adapter_crate_path: Option<&str>,
-) -> Option<String> {
-    let rel = adapter_crate_path?;
-    read_package_name(&manifest_root.join(rel).join("Cargo.toml")).ok()
+) -> Result<Option<String>, String> {
+    let Some(rel) = adapter_crate_path else {
+        return Ok(None);
+    };
+    let cargo_toml = manifest_root.join(rel).join("Cargo.toml");
+    read_package_name(&cargo_toml).map(Some).map_err(|err| {
+        format!(
+            "declared adapter crate `{rel}` has an unreadable Cargo.toml: {err}. Fix \
+             `[adapters.<name>.adapter].crate` or the crate's Cargo.toml; provision will not \
+             silently fall back to an ancestor package."
+        )
+    })
 }
 
 #[inline]
@@ -446,6 +464,43 @@ mod tests {
         let dir = tempdir().unwrap();
         let out = read_adapter_crate_name(dir.path(), None);
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn read_crate_name_at_returns_none_when_crate_undeclared() {
+        // No `.crate` declared -> caller falls back to ancestor / scaffold.
+        let dir = tempdir().unwrap();
+        assert_eq!(read_crate_name_at(dir.path(), None), Ok(None));
+    }
+
+    #[test]
+    fn read_crate_name_at_reads_declared_crate_package_name() {
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path().join("crates/server");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_crate_name_at(dir.path(), Some("crates/server")),
+            Ok(Some("server".to_owned()))
+        );
+    }
+
+    #[test]
+    fn read_crate_name_at_errors_when_declared_crate_cargo_toml_unreadable() {
+        // `.crate` is declared but its Cargo.toml is missing. This is a
+        // hard error, NOT a silent fallback that would mispoint the
+        // synthesised fields at an ancestor package.
+        let dir = tempdir().unwrap();
+        let err = read_crate_name_at(dir.path(), Some("crates/missing"))
+            .expect_err("a declared but unreadable crate must be fatal");
+        assert!(
+            err.contains("crates/missing") && err.contains("unreadable Cargo.toml"),
+            "error names the declared crate: {err}"
+        );
     }
 
     #[test]

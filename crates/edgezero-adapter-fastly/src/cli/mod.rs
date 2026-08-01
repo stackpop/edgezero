@@ -425,15 +425,17 @@ impl Adapter for FastlyCliAdapter {
         // the ancestor `Cargo.toml` search only when it's undeclared, and
         // finally to the scaffold convention. (An ancestor search alone
         // could pick a nested package between the manifest and the crate.)
-        let crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
-            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
-            .unwrap_or_else(|| {
-                if app_name.is_empty() {
-                    "app-adapter-fastly".to_owned()
-                } else {
-                    format!("{app_name}-adapter-fastly")
-                }
-            });
+        let crate_name = match cli_support::read_crate_name_at(manifest_root, adapter_crate_path)? {
+            Some(name) => name,
+            None => cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+                .unwrap_or_else(|| {
+                    if app_name.is_empty() {
+                        "app-adapter-fastly".to_owned()
+                    } else {
+                        format!("{app_name}-adapter-fastly")
+                    }
+                }),
+        };
         Ok(vec![(
             rel,
             run::synthesise_fastly_toml(&crate_name, deployed_service_id),

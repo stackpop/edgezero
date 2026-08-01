@@ -85,8 +85,19 @@ pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfi
     let store_id = match resolve_remote_config_store_id(name) {
         Ok(id) => id,
         Err(err) => {
-            // "not found" from resolve means the store doesn't exist.
             let lower = err.to_ascii_lowercase();
+            // The CLI-absent error (`fastly` not found on PATH) also
+            // contains "not found"; exclude it FIRST so a missing `fastly`
+            // binary propagates as a real error rather than being silently
+            // reported as a missing store -- otherwise a diff would claim
+            // "store absent" when the operator simply hasn't installed the
+            // fastly CLI.
+            if lower.contains("not found on path") {
+                return Err(err);
+            }
+            // A genuinely absent store is signalled by resolve's store
+            // markers; a generic "not found" from the list call is treated
+            // leniently too.
             if lower.contains("not found")
                 || lower.contains("did you run")
                 || lower.contains("no fastly config-store matches")
@@ -937,6 +948,37 @@ mod tests {
         assert!(
             matches!(result, ReadConfigEntry::MissingStore),
             "list not-found => MissingStore"
+        );
+    }
+
+    /// A missing `fastly` binary must NOT be misreported as a missing
+    /// store: the spawn error ("`fastly` not found on PATH") contains
+    /// "not found", but a diff has to surface it as a genuine error so the
+    /// operator installs the CLI rather than believing the store is absent.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_when_fastly_cli_absent() {
+        use edgezero_core::test_env::EnvOverride;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Replace PATH with a single empty dir so `fastly` cannot be
+        // spawned even when the host has it installed.
+        let empty = tempdir().expect("empty dir");
+        let _path = EnvOverride::set("PATH", empty.path());
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("a missing fastly CLI must be an error, not MissingStore");
+        };
+        assert!(
+            err.to_ascii_lowercase().contains("not found on path"),
+            "error names the absent CLI: {err}"
         );
     }
 

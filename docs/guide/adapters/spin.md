@@ -179,10 +179,11 @@ type = "spin"
 type = "spin"
 ```
 
-`edgezero new --adapter spin` scaffolds both files; `edgezero serve
---adapter spin` runs `spin up --runtime-config-file runtime-config.toml`
-so locally-declared labels resolve to the SQLite-backed Spin KV
-implementation. For production, swap `type = "spin"` for a managed
+`edgezero new <app>` scaffolds the project and synthesises both files at
+scaffold time (the same synthesiser `provision --local` uses); `edgezero
+serve --adapter spin` runs `spin up --runtime-config-file
+runtime-config.toml` so locally-declared labels resolve to the
+SQLite-backed Spin KV implementation. For production, swap `type = "spin"` for a managed
 backend (`type = "azure_cosmos"`, `type = "redis"`, …) per the
 [Spin runtime-config docs](https://spinframework.dev/v3/dynamic-configuration#key-value-store-runtime-configuration).
 

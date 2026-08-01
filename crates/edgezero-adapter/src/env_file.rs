@@ -111,10 +111,20 @@ pub fn append_lines_dedup_with_header(
         }
     }
 
-    // Nothing to do when there are neither new dedup'd lines nor a
-    // missing header to prepend. `dry_run` short-circuits any write.
-    // Either way, nothing was written -- report `false`.
-    if (to_append.is_empty() && header_needed.is_none()) || dry_run {
+    // `dry_run` previews only: never touch the file or its mode.
+    if dry_run {
+        return Ok(false);
+    }
+    // Nothing to append and no header to prepend -- content is already
+    // current. Still REPAIR the permissions of an existing file so an
+    // idempotent re-provision tightens a 0644 secret-carriage file left
+    // by an older run (before the 0600 tighten) or created out-of-band
+    // down to 0600. No content was written, so still report `false`.
+    if to_append.is_empty() && header_needed.is_none() {
+        #[cfg(unix)]
+        if path.exists() {
+            set_restrictive_mode(path)?;
+        }
         return Ok(false);
     }
     if let Some(parent) = path.parent()
@@ -483,6 +493,49 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "provision-written env files must be owner-read/write only; got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noop_reprovision_repairs_loose_permissions_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // A pre-existing env file left world-readable (0644) with content
+        // that is already current -- an idempotent re-provision has nothing
+        // to append, but must still tighten the mode to 0600.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".dev.vars");
+        fs::write(&path, "SECRET_KEY=placeholder\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let wrote =
+            append_lines_dedup(&path, &["SECRET_KEY=placeholder".to_owned()], false).unwrap();
+        assert!(
+            !wrote,
+            "no new content should be appended on a re-provision"
+        );
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a no-op re-provision must repair 0644 -> 0600; got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_noop_does_not_touch_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // dry-run previews only: it must not chmod the existing file.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".dev.vars");
+        fs::write(&path, "SECRET_KEY=placeholder\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        append_lines_dedup(&path, &["SECRET_KEY=placeholder".to_owned()], true).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "dry-run must leave permissions untouched; got {mode:o}"
         );
     }
 

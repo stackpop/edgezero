@@ -112,21 +112,33 @@ stop_server() {
   return "$rc"
 }
 
-# Restore tracked fixtures the smoke mutated in place. Called once
-# per row AFTER all assertions for that row have finished, and again
-# from the EXIT trap as a safety net.
+# Restore operator-owned files/dirs the smoke mutated in place. Called
+# once per row AFTER all assertions for that row have finished, and again
+# from the EXIT trap as a safety net. Restores in REVERSE order so a
+# nested path restores after its parent, and uses the recorded
+# existed-flag (NOT the backup's size) so a pre-existing EMPTY file/dir is
+# preserved, not deleted.
 restore_backups() {
-  for pair in "${BACKUPS[@]:-}"; do
+  local i pair orig existed back
+  for (( i=${#BACKUPS[@]}-1; i>=0; i-- )); do
+    pair="${BACKUPS[$i]}"
     [ -z "$pair" ] && continue
     orig="${pair%%::*}"
     back="${pair##*::}"
-    if [ -s "$back" ]; then
-      mv "$back" "$orig" 2>/dev/null || true
+    existed="${pair#*::}"; existed="${existed%%::*}"
+    # Clear whatever the smoke left in place (file OR dir).
+    rm -rf "$orig" 2>/dev/null || true
+    if [ "$existed" = "1" ]; then
+      if [ -d "$back" ]; then
+        mkdir -p "$orig"
+        cp -a "$back/." "$orig/" 2>/dev/null || true
+        rm -rf "$back" 2>/dev/null || true
+      else
+        mv "$back" "$orig" 2>/dev/null || true
+      fi
     else
-      # Empty marker file = the original didn't exist; remove what
-      # the smoke created.
-      rm -f "$back" 2>/dev/null || true
-      rm -f "$orig" 2>/dev/null || true
+      # Original was ABSENT: leave it absent, discard any placeholder.
+      rm -rf "$back" 2>/dev/null || true
     fi
   done
   BACKUPS=()
@@ -143,18 +155,25 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Record a backup of $1 (an in-tree file the smoke is about to mutate)
-# so `cleanup` can restore it.
+# Record a backup of $1 (an in-tree FILE or DIRECTORY the smoke is about
+# to mutate) so `cleanup` can restore it EXACTLY. Records the
+# original-existence flag separately, so an absent file and a
+# present-but-empty file are distinguishable on restore. Entry format:
+# `orig::existed::backup` (existed = 0|1; backup unused when existed=0).
 backup_in_tree() {
   local orig="$1"
-  local back
-  back=$(mktemp)
-  if [ -e "$orig" ]; then
-    cp -p "$orig" "$back"
-  else
-    : > "$back"  # marker that the file didn't exist
+  local back="" existed=0
+  if [ -e "$orig" ] || [ -L "$orig" ]; then
+    existed=1
+    if [ -d "$orig" ]; then
+      back=$(mktemp -d)
+      cp -a "$orig/." "$back/" 2>/dev/null || true
+    else
+      back=$(mktemp)
+      cp -p "$orig" "$back"
+    fi
   fi
-  BACKUPS+=("${orig}::${back}")
+  BACKUPS+=("${orig}::${existed}::${back}")
 }
 
 # Bash 3.2-portable upper-case (macOS ships /usr/bin/env bash as 3.2).
@@ -320,12 +339,8 @@ seed_secret_for_adapter() {
       ;;
     cloudflare)
       local dev_vars="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-      # `.dev.vars` is gitignored but NOT regenerable: provision only
-      # writes empty placeholders, so truncating it would destroy any
-      # real secrets the developer had. Back it up once per row (this
-      # runs before the boot-time re-seed, so the copy holds the
-      # operator's original) and let `restore_backups` put it back.
-      backup_in_tree "$dev_vars"
+      # `.dev.vars` was backed up BEFORE warm-up (see the per-row backup
+      # block), so it is safe to overwrite here; cleanup restores it.
       printf 'demo_api_token="resolved-token"\n' > "$dev_vars"
       return 0
       ;;
@@ -484,21 +499,39 @@ for suite in "${SUITES[@]}"; do
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
 
+  # Back up EVERY operator-owned file/dir this row touches BEFORE warm-up.
+  # `provision --local` (warm-up), the reset below, the secret seed, and
+  # the push all mutate these; backing up first captures the developer's
+  # ORIGINAL state (present or absent), and `restore_backups` returns it
+  # exactly on cleanup. The emulator-state DIRECTORIES (.edgezero /
+  # .wrangler / .spin) can hold real config / KV / SQLite state, so they
+  # must be preserved, not just the manifests.
+  case "$adapter" in
+    axum)
+      backup_in_tree "$DEMO_DIR/.edgezero"
+      ;;
+    cloudflare)
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      ;;
+    spin)
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+      ;;
+    fastly)
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+      ;;
+  esac
+
   # Warm up per-row local state — provision --local regenerates the
-  # gitignored adapter manifest + .env / .dev.vars. Those files are
-  # gitignored and regenerable, so the old fastly.toml backup_in_tree
-  # call is obsolete -- it protected a TRACKED copy that no longer
-  # exists. `.dev.vars` is still backed up: provision only writes empty
-  # placeholders, so it is not regenerable.
+  # gitignored adapter manifest + .env / .dev.vars.
   smoke_warmup_provision_local "$adapter"
 
-  # Reset the adapter's local emulator state so the smoke starts
-  # from a known-clean cutover state. The blob-model push read-back
-  # hard-fails if it finds a non-BlobEnvelope value at the target
-  # key (correct behaviour per the cutover spec); a developer's
-  # leftover .wrangler/ / .spin/ / .edgezero/ state from older
-  # smoke runs would otherwise trip that check. These directories
-  # are all gitignored and are regenerated by the push itself.
+  # Reset the adapter's local emulator state so the smoke starts from a
+  # known-clean cutover state. The blob-model push read-back hard-fails if
+  # it finds a non-BlobEnvelope value at the target key; a developer's
+  # leftover .wrangler/ / .spin/ / .edgezero/ state would trip that check.
+  # These dirs were backed up ABOVE, so cleanup restores the original.
   case "$adapter" in
     axum)
       rm -rf "$DEMO_DIR/.edgezero"
@@ -510,11 +543,7 @@ for suite in "${SUITES[@]}"; do
       rm -rf "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
       ;;
     fastly)
-      # fastly.toml IS the local store, and boot_runtime's
-      # `seed_fastly_runtime_env` mutates it in place. Back it up NOW
-      # (right after the warm-up regenerated it, before any mutation) so
-      # `restore_backups` returns it to its pre-smoke shape on cleanup.
-      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+      : # fastly.toml (already backed up) is the store; nothing to reset.
       ;;
   esac
 
@@ -603,13 +632,12 @@ else
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
 
-  # Warm up Fastly local state — provision --local synthesises
-  # fastly.toml. The `config push` below and boot_runtime's
-  # `seed_fastly_runtime_env` both edit it IN PLACE, so back it up now
-  # (right after warm-up regenerated it) and let `restore_backups` return
-  # it to its pre-smoke shape on cleanup.
-  smoke_warmup_provision_local fastly
+  # Back up fastly.toml BEFORE warm-up regenerates it (and before the
+  # push / `seed_fastly_runtime_env` edit it in place), so cleanup
+  # restores the developer's ORIGINAL, not the post-provision copy.
   backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+  # Warm up Fastly local state — provision --local synthesises fastly.toml.
+  smoke_warmup_provision_local fastly
 
   # Build an oversized greeting (>= 9 000 chars after envelope wrap)
   # so the chunked path fires.

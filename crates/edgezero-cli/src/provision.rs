@@ -2218,6 +2218,12 @@ ids = ["default"]
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
+        fs::write(
+            temp.path().join("crates/demo-axum/Cargo.toml"),
+            "[package]\nname = \"demo-axum\"\n",
+        )
+        .expect("write adapter crate Cargo.toml");
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
         // The env overlay: for logical id `sessions` in KV, resolve
@@ -2452,6 +2458,11 @@ ids = ["default"]
         // referenced by PROVISION_MANIFEST or staging errors before
         // dispatch reaches axum's Local arm.
         fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
+        fs::write(
+            temp.path().join("crates/demo-axum/Cargo.toml"),
+            "[package]\nname = \"demo-axum\"\n",
+        )
+        .expect("write adapter crate Cargo.toml");
         let _cwd = CwdGuard::set(temp.path()).expect("chdir into tempdir");
 
         // axum's Local arm now succeeds (writes .env into a
@@ -2480,6 +2491,11 @@ ids = ["default"]
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
         fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
+        fs::write(
+            temp.path().join("crates/demo-axum/Cargo.toml"),
+            "[package]\nname = \"demo-axum\"\n",
+        )
+        .expect("write adapter crate Cargo.toml");
 
         // same successful-Local-arm sentinel as the "_default"
         // sibling above.
@@ -4041,6 +4057,11 @@ ids = ["default"]
         fs::write(&manifest_path, manifest_body).expect("write manifest");
         fs::write(temp.path().join("demo-app.toml"), TYPED_APP_CONFIG).expect("write app config");
         fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
+        fs::write(
+            temp.path().join("crates/demo-axum/Cargo.toml"),
+            "[package]\nname = \"demo-axum\"\n",
+        )
+        .expect("write adapter crate Cargo.toml");
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
@@ -4118,6 +4139,12 @@ ids = ["default"]
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
+        fs::write(
+            temp.path().join("crates/demo-axum/Cargo.toml"),
+            "[package]\nname = \"demo-axum\"\n",
+        )
+        .expect("write adapter crate Cargo.toml");
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 

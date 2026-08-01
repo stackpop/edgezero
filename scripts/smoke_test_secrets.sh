@@ -20,33 +20,23 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
 ADAPTER="${1:-axum}"
 SERVER_PID=""
+# Operator-owned files/dirs this smoke mutates. `SMOKE_SECRET` is a
+# smoke-only allowlisted secret (NOT a typed config field), so provision
+# never declares it: the Fastly and Spin arms inject the declaration into
+# the generated fastly.toml / spin.toml before boot, and warm-up's
+# `provision --local` rewrites `.dev.vars` / `.edgezero`. All of these are
+# backed up BEFORE warm-up (an empty `*_BACKUP` means the original was
+# absent) and restored on exit, so a developer's tree is never changed.
 DEV_VARS_FILE=""
-# Path to a copy of the operator's pre-existing `.dev.vars`, if any.
-# Empty means the file did not exist before this run.
 DEV_VARS_BACKUP=""
-# `SMOKE_SECRET` is a smoke-only allowlisted secret, NOT a typed config
-# field, so provision never declares it in the generated fastly.toml /
-# spin.toml. The Fastly and Spin arms inject the declaration before boot
-# (axum's env-backed store needs no manifest entry). These manifests are
-# gitignored + regenerable, but we still restore them to keep the tree
-# clean after the run.
 FASTLY_TOML_FILE=""
 FASTLY_TOML_BACKUP=""
 SPIN_TOML_FILE=""
 SPIN_TOML_BACKUP=""
+EDGEZERO_DIR=""
+EDGEZERO_BACKUP=""
 SMOKE_SECRET_NAME="SMOKE_SECRET"
 MISSING_SECRET_NAME="SMOKE_SECRET_MISSING"
-
-# Warm up per-adapter local state — provision --local synthesises
-# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
-# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
-# this because those adapter manifests are gitignored. Crucial for
-# this smoke: the typed dispatch writes SPIN_VARIABLE_* /
-# .dev.vars placeholders that the emulator boot reads.
-# shellcheck source=lib/smoke_warmup.sh
-. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
-echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
-smoke_warmup_provision_local "$ADAPTER"
 DISALLOWED_SECRET_NAME="API_KEY"
 SMOKE_SECRET_VALUE="smoke-secret-$(date +%s)-$$"
 PASS=0
@@ -63,28 +53,85 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
 
-  # Restore the operator's `.dev.vars` rather than deleting it. The file
-  # is gitignored but NOT regenerable: provision only writes empty
-  # placeholders, so a developer's filled-in secrets would be destroyed.
-  # `DEV_VARS_BACKUP` is empty when the file did not exist before the
-  # smoke ran -- in that case removing it restores the original state.
+  # Restore each backed-up file. An empty `*_BACKUP` means the original
+  # was ABSENT -> remove whatever the smoke created. A non-empty backup
+  # (even a 0-byte file) is restored, so an empty original is preserved.
   if [ -n "$DEV_VARS_FILE" ]; then
-    if [ -n "$DEV_VARS_BACKUP" ] && [ -f "$DEV_VARS_BACKUP" ]; then
+    if [ -n "$DEV_VARS_BACKUP" ]; then
       mv -f "$DEV_VARS_BACKUP" "$DEV_VARS_FILE"
     else
       rm -f "$DEV_VARS_FILE"
     fi
   fi
-  # Restore the generated manifests we injected the SMOKE_SECRET
-  # declaration into.
-  if [ -n "$FASTLY_TOML_BACKUP" ] && [ -f "$FASTLY_TOML_BACKUP" ]; then
-    mv -f "$FASTLY_TOML_BACKUP" "$FASTLY_TOML_FILE"
+  if [ -n "$FASTLY_TOML_FILE" ]; then
+    if [ -n "$FASTLY_TOML_BACKUP" ]; then
+      mv -f "$FASTLY_TOML_BACKUP" "$FASTLY_TOML_FILE"
+    else
+      rm -f "$FASTLY_TOML_FILE"
+    fi
   fi
-  if [ -n "$SPIN_TOML_BACKUP" ] && [ -f "$SPIN_TOML_BACKUP" ]; then
-    mv -f "$SPIN_TOML_BACKUP" "$SPIN_TOML_FILE"
+  if [ -n "$SPIN_TOML_FILE" ]; then
+    if [ -n "$SPIN_TOML_BACKUP" ]; then
+      mv -f "$SPIN_TOML_BACKUP" "$SPIN_TOML_FILE"
+    else
+      rm -f "$SPIN_TOML_FILE"
+    fi
+  fi
+  if [ -n "$EDGEZERO_DIR" ]; then
+    rm -rf "$EDGEZERO_DIR"
+    if [ -n "$EDGEZERO_BACKUP" ] && [ -d "$EDGEZERO_BACKUP" ]; then
+      mkdir -p "$EDGEZERO_DIR"
+      cp -a "$EDGEZERO_BACKUP/." "$EDGEZERO_DIR/" 2>/dev/null || true
+      rm -rf "$EDGEZERO_BACKUP"
+    fi
   fi
 }
+# Install the trap BEFORE warm-up so an abort mid-warm-up still restores.
 trap cleanup EXIT
+
+# Back up operator files/dirs BEFORE warm-up (and the boot-time seeds)
+# mutate them, so cleanup restores the developer's ORIGINAL state.
+case "$ADAPTER" in
+  cloudflare)
+    DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+    if [ -f "$DEV_VARS_FILE" ]; then
+      DEV_VARS_BACKUP=$(mktemp)
+      cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
+    fi
+    ;;
+  fastly)
+    FASTLY_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+    if [ -f "$FASTLY_TOML_FILE" ]; then
+      FASTLY_TOML_BACKUP=$(mktemp)
+      cp -p "$FASTLY_TOML_FILE" "$FASTLY_TOML_BACKUP"
+    fi
+    ;;
+  spin)
+    SPIN_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+    if [ -f "$SPIN_TOML_FILE" ]; then
+      SPIN_TOML_BACKUP=$(mktemp)
+      cp -p "$SPIN_TOML_FILE" "$SPIN_TOML_BACKUP"
+    fi
+    ;;
+  axum)
+    EDGEZERO_DIR="$DEMO_DIR/.edgezero"
+    if [ -d "$EDGEZERO_DIR" ]; then
+      EDGEZERO_BACKUP=$(mktemp -d)
+      cp -a "$EDGEZERO_DIR/." "$EDGEZERO_BACKUP/" 2>/dev/null || true
+    fi
+    ;;
+esac
+
+# Warm up per-adapter local state — provision --local synthesises
+# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
+# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
+# this because those adapter manifests are gitignored. Crucial for
+# this smoke: the typed dispatch writes SPIN_VARIABLE_* /
+# .dev.vars placeholders that the emulator boot reads.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
+smoke_warmup_provision_local "$ADAPTER"
 
 section() {
   printf '\n--- %s ---\n' "$1"
@@ -142,10 +189,8 @@ start_server() {
       # Viceroy resolves `SMOKE_SECRET` verbatim from a
       # `[[local_server.secret_stores.default]]` entry. Provision only
       # declares typed secrets (demo_api_token), so inject this one and
-      # map it to the exported $SMOKE_SECRET env var.
-      FASTLY_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-      FASTLY_TOML_BACKUP=$(mktemp)
-      cp -p "$FASTLY_TOML_FILE" "$FASTLY_TOML_BACKUP"
+      # map it to the exported $SMOKE_SECRET env var. fastly.toml was
+      # backed up before warm-up; cleanup restores it.
       cat >> "$FASTLY_TOML_FILE" <<'TOML'
 
 [[local_server.secret_stores.default]]
@@ -162,13 +207,7 @@ TOML
         echo "wrangler is required. Install with 'npm i -g wrangler'" >&2
         exit 1
       }
-      DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-      # Preserve any real secrets the developer already had here; the
-      # trap restores this copy on exit.
-      if [ -f "$DEV_VARS_FILE" ]; then
-        DEV_VARS_BACKUP=$(mktemp)
-        cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
-      fi
+      # `.dev.vars` was backed up before warm-up; cleanup restores it.
       printf '%s=%s\n' "$SMOKE_SECRET_NAME" "$SMOKE_SECRET_VALUE" > "$DEV_VARS_FILE"
       echo "==> Starting Cloudflare wrangler dev on port $PORT..."
       (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
@@ -186,9 +225,7 @@ TOML
       # `smoke_secret` Spin variable. Provision only declares typed secrets,
       # so inject the variable declaration + a component binding into the
       # generated spin.toml before boot.
-      SPIN_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-      SPIN_TOML_BACKUP=$(mktemp)
-      cp -p "$SPIN_TOML_FILE" "$SPIN_TOML_BACKUP"
+      # spin.toml was backed up before warm-up; cleanup restores it.
       python3 - "$SPIN_TOML_FILE" <<'PY'
 import re
 import sys

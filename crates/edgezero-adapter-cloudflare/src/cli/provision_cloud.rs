@@ -66,6 +66,15 @@ pub(super) fn provision(
     // contribute nothing (no real wrangler invocation, no id to
     // record).
     let mut created_kv_ns: BTreeMap<String, String> = BTreeMap::new();
+    // Preflight EVERY store's deterministic preconditions (local/tracked id
+    // conflicts, writeback-shape validity) BEFORE the first `wrangler`
+    // call. Without this an earlier store could create a namespace remotely
+    // and only then a later store's knowable-up-front conflict aborts the
+    // run, orphaning the freshly-created namespace. All checks are pure
+    // local reads, so a bad manifest fails before any account mutation.
+    for store in stores.kv.iter().chain(stores.config.iter()) {
+        preflight_one_kv_store(store, &wrangler_path, deployed)?;
+    }
     let mut pending_error: Option<String> = None;
     for store in stores.kv.iter().chain(stores.config.iter()) {
         if let Err(err) = provision_one_kv_store(
@@ -167,23 +176,13 @@ fn provision_one_kv_store(
     let tracked_id = deployed
         .and_then(|state| state.sub_tables.get("kv_namespaces"))
         .and_then(|namespaces| namespaces.get(logical.as_str()));
-    let existing = existing_real_namespace_id(wrangler_path, binding)?;
+    // Deterministic, network-free reconciliation: detect a stale local vs
+    // committed id conflict and surface the local real id (if any). The
+    // caller preflights this for EVERY store before the first `wrangler`
+    // call, so a knowable conflict aborts before any remote mutation.
+    let existing = reconcile_kv_namespace_id(store, wrangler_path, deployed)?;
     if let Some(existing_id) = existing {
         match tracked_id {
-            // Local disagrees with the committed id: the gitignored
-            // file is stale or hand-edited. Refuse rather than let
-            // the writeback silently replace the team's id.
-            Some(tracked) if tracked != &existing_id => {
-                return Err(format!(
-                    "namespace id conflict for logical store `{logical}`: gitignored `{}` declares \
-                     `{existing_id}`, but tracked `[adapters.cloudflare.deployed].kv_namespaces.{logical}` \
-                     is `{tracked}`. wrangler.toml is per-machine, so provision will not overwrite the \
-                     committed id with it. Resolve by hand: delete the stale [[kv_namespaces]] entry for \
-                     binding `{binding}` (the committed id is restored on the next run), or update the \
-                     tracked value in edgezero.toml.",
-                    wrangler_path.display()
-                ));
-            }
             // Local matches the committed id: already the team's
             // source of truth, nothing to write back.
             Some(_) => {
@@ -267,6 +266,63 @@ fn provision_one_kv_store(
         "created KV namespace `{binding}` (logical id `{logical}`, namespace id={namespace_id}); written to {}",
         wrangler_path.display()
     ));
+    Ok(())
+}
+
+/// Deterministic, network-free reconciliation for one KV/config store:
+/// detect a stale local (gitignored `wrangler.toml`) vs committed
+/// (`[adapters.cloudflare.deployed]`) namespace-id conflict and return the
+/// local real id if one is present. Shared between the preflight pass and
+/// the mutating [`provision_one_kv_store`] so the conflict is a single
+/// source of truth and can be surfaced for every store BEFORE any remote
+/// mutation runs.
+fn reconcile_kv_namespace_id(
+    store: &ResolvedStoreId,
+    wrangler_path: &Path,
+    deployed: Option<&AdapterDeployedState>,
+) -> Result<Option<String>, String> {
+    let logical = &store.logical;
+    let binding = &store.platform;
+    let tracked_id = deployed
+        .and_then(|state| state.sub_tables.get("kv_namespaces"))
+        .and_then(|namespaces| namespaces.get(logical.as_str()));
+    let existing = existing_real_namespace_id(wrangler_path, binding)?;
+    if let (Some(existing_id), Some(tracked)) = (&existing, tracked_id) {
+        // Local disagrees with the committed id: the gitignored file is
+        // stale or hand-edited. Refuse rather than let the writeback
+        // silently replace the team's id.
+        if tracked != existing_id {
+            return Err(format!(
+                "namespace id conflict for logical store `{logical}`: gitignored `{}` declares \
+                 `{existing_id}`, but tracked `[adapters.cloudflare.deployed].kv_namespaces.{logical}` \
+                 is `{tracked}`. wrangler.toml is per-machine, so provision will not overwrite the \
+                 committed id with it. Resolve by hand: delete the stale [[kv_namespaces]] entry for \
+                 binding `{binding}` (the committed id is restored on the next run), or update the \
+                 tracked value in edgezero.toml.",
+                wrangler_path.display()
+            ));
+        }
+    }
+    Ok(existing)
+}
+
+/// Preflight one KV/config store's deterministic preconditions (id
+/// conflict and, when a writeback would occur, the manifest shape) using
+/// only local reads. Run for EVERY store before the first `wrangler`
+/// invocation so a knowable conflict or malformed manifest aborts before
+/// any earlier store has mutated remote account state.
+fn preflight_one_kv_store(
+    store: &ResolvedStoreId,
+    wrangler_path: &Path,
+    deployed: Option<&AdapterDeployedState>,
+) -> Result<(), String> {
+    // A present local real id means a skip (no writeback); reconcile still
+    // catches the local/tracked conflict. An absent id means either the
+    // restore or the create path runs, and both write back -- so the shape
+    // must be valid up front.
+    if reconcile_kv_namespace_id(store, wrangler_path, deployed)?.is_none() {
+        check_kv_namespaces_writeback_shape(wrangler_path)?;
+    }
     Ok(())
 }
 
@@ -895,7 +951,11 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &[],
         };
         let tracked = tracked_kv(TEST_KV_ID, "ffffffffffffffffffffffffffffffff");
-        let out = CloudflareCliAdapter
+        // A stale local vs tracked id is a deterministic precondition, so
+        // it is preflighted and aborts the whole provision before any
+        // remote mutation -- surfacing as a top-level Err, not an outcome
+        // that carries checkpointed ids.
+        let err = CloudflareCliAdapter
             .provision(
                 dir.path(),
                 Some("wrangler.toml"),
@@ -905,22 +965,50 @@ id = "00112233445566778899aabbccddeeff"
                 ProvisionMode::Cloud,
                 true,
             )
-            .expect("the conflict surfaces via outcome.error, not a top-level Err");
-        let err = out
-            .error
-            .as_deref()
-            .expect("a stale local namespace id must record a conflict error");
+            .expect_err("a stale local namespace id must abort provision");
         assert!(
             err.contains("00112233445566778899aabbccddeeff")
                 && err.contains("ffffffffffffffffffffffffffffffff")
                 && err.contains("conflict"),
             "error must name both ids: {err}"
         );
-        // A pure conflict creates nothing, so there is no id to checkpoint.
+    }
+
+    /// A conflict on a LATER store must abort the whole run in the
+    /// preflight, before an EARLIER store's create path can mutate remote
+    /// account state and orphan a freshly-created namespace.
+    #[test]
+    fn provision_aborts_before_creating_when_a_later_store_conflicts() {
+        let dir = tempdir().expect("tempdir");
+        // `cache` carries a real local id; `sessions` has none.
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"cache\"\nid = \"00112233445566778899aabbccddeeff\"\n",
+        );
+        // Provisioned in order: `sessions` (clean, would create) then
+        // `cache` (tracked id disagrees with the local id -> conflict).
+        let kv_ids: Vec<ResolvedStoreId> =
+            ResolvedStoreId::from_logicals(&[TEST_KV_ID, TEST_KV_ID_ALT]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let tracked = tracked_kv(TEST_KV_ID_ALT, "ffffffffffffffffffffffffffffffff");
+        let err = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                Some(&tracked),
+                ProvisionMode::Cloud,
+                true,
+            )
+            .expect_err("a later store's conflict must abort the whole run");
         assert!(
-            out.deployed.is_none(),
-            "conflict aborts before any create: {:?}",
-            out.deployed
+            err.contains("conflict") && err.contains(TEST_KV_ID_ALT),
+            "error must name the conflicting store: {err}"
         );
     }
 
@@ -1049,20 +1137,27 @@ id = "00112233445566778899aabbccddeeff"
     #[cfg(unix)]
     #[test]
     fn provision_keeps_earlier_created_ids_when_a_later_store_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
         let _guard = path_mutation_guard().lock().expect("path guard");
         let dir = tempdir().expect("tempdir");
-        // `cache` already carries a real (but stale) local id that
-        // conflicts with the tracked one -> its store aborts. `sessions`
-        // has no entry, so it is created first and must survive.
-        write_wrangler(
-            dir.path(),
-            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"cache\"\nid = \"aabbccddeeff00112233445566778899\"\n",
-        );
-        let stdout = "[[kv_namespaces]]\nbinding = \"ignored-by-parser\"\nid = \"00112233445566778899aabbccddeeff\"\n";
-        let fake = fake_wrangler_returning(stdout, "", 0);
-        let _path = PathPrepend::new(fake.path());
+        // Neither store has a local or tracked id, so both pass the
+        // deterministic preflight and reach the create path. The failure
+        // here is a NON-deterministic one the preflight cannot catch: the
+        // `wrangler kv namespace create` call for `cache` exits non-zero.
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        // A fake wrangler that succeeds for `sessions` (returning a real
+        // id) but fails the create for `cache`.
+        let shim_dir = tempdir().expect("shim dir");
+        let script_path = shim_dir.path().join("wrangler");
+        let script = "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"cache\" ]; then\n    echo 'create failed for cache' >&2\n    exit 1\n  fi\ndone\nprintf '[[kv_namespaces]]\\nbinding = \"ignored-by-parser\"\\nid = \"00112233445566778899aabbccddeeff\"\\n'\nexit 0\n";
+        fs::write(&script_path, script).expect("write wrangler script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        let _path = PathPrepend::new(shim_dir.path());
 
-        // `sessions` first (creates), then `cache` (conflict -> Err).
+        // `sessions` first (creates), then `cache` (create fails -> the
+        // durable id from `sessions` must survive).
         let kv_ids: Vec<ResolvedStoreId> =
             ResolvedStoreId::from_logicals(&[TEST_KV_ID, TEST_KV_ID_ALT]);
         let stores = ProvisionStores {
@@ -1070,14 +1165,13 @@ id = "00112233445566778899aabbccddeeff"
             kv: &kv_ids,
             secrets: &[],
         };
-        let tracked = tracked_kv(TEST_KV_ID_ALT, "ffffffffffffffffffffffffffffffff");
         let out = CloudflareCliAdapter
             .provision(
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
                 &stores,
-                Some(&tracked),
+                None,
                 ProvisionMode::Cloud,
                 false,
             )
@@ -1085,9 +1179,9 @@ id = "00112233445566778899aabbccddeeff"
         let err = out
             .error
             .as_deref()
-            .expect("the conflicting store records an error");
+            .expect("the failing store records an error");
         assert!(
-            err.contains("conflict") && err.contains(TEST_KV_ID_ALT),
+            err.contains("cache") || err.contains(TEST_KV_ID_ALT),
             "error names the failing store: {err}"
         );
         // The earlier create must still be checkpointed.

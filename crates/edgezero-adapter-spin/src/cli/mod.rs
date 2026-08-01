@@ -544,15 +544,18 @@ impl Adapter for SpinCliAdapter {
         // ancestor `Cargo.toml` search, then the scaffold convention.
         // (An ancestor search alone could pick a nested package sitting
         // between the manifest and the intended crate root.)
-        let derived_crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
-            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
-            .unwrap_or_else(|| {
-                if app_name.is_empty() {
-                    "app-adapter-spin".to_owned()
-                } else {
-                    format!("{app_name}-adapter-spin")
-                }
-            });
+        let derived_crate_name =
+            match cli_support::read_crate_name_at(manifest_root, adapter_crate_path)? {
+                Some(name) => name,
+                None => cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+                    .unwrap_or_else(|| {
+                        if app_name.is_empty() {
+                            "app-adapter-spin".to_owned()
+                        } else {
+                            format!("{app_name}-adapter-spin")
+                        }
+                    }),
+            };
         // `synthesise_spin_toml` needs the manifest's relative path
         // so it can compute the correct `../` prefix from
         // `[component.<id>].source` back to the workspace `target/`

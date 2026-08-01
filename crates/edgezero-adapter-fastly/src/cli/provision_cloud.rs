@@ -59,6 +59,15 @@ pub(super) fn provision(
     // reached the old post-create check) would miss it entirely.
     let service_id = reconcile_service_id(&fastly_path, deployed)?;
 
+    // Preflight the ENTIRE `[setup]` writeback shape BEFORE creating any
+    // remote store. `append_fastly_setup` requires `setup` and each
+    // `setup.<kind>_stores` to be standard tables; if a malformed (but
+    // syntactically valid) manifest has e.g. `setup = "x"`, the writeback
+    // would fail AFTER `fastly *-store create` already ran, orphaning the
+    // remote resource. Checking here means a bad manifest aborts before
+    // any account mutation, and dry-run predicts the same failure.
+    assert_setup_writeback_shape(&fastly_path)?;
+
     let mut out = Vec::new();
     for (kind, ids) in [
         ("kv", stores.kv),
@@ -399,6 +408,46 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
 /// `setup_block_present`'s doc for the schema rationale. The local-
 /// server seeding moved to `config push --local` (config-stores
 /// only), so provision only owns the remote / setup half.
+/// Validate that the `[setup]` writeback target is well-formed for EVERY
+/// store kind before any remote store is created. `append_fastly_setup`
+/// requires `setup` and each `setup.<kind>_stores` to be standard tables;
+/// this mirrors that requirement so a malformed-but-valid-TOML manifest is
+/// rejected up front rather than after a `fastly *-store create` orphans a
+/// remote resource. A missing file is fine -- the writeback creates it.
+fn assert_setup_writeback_shape(path: &Path) -> Result<(), String> {
+    use toml_edit::DocumentMut;
+
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+
+    let Some(setup) = doc.get("setup") else {
+        return Ok(());
+    };
+    let Some(setup_tbl) = setup.as_table() else {
+        return Err(format!(
+            "{}: `setup` exists but is not a table; refusing to create any remote store",
+            path.display()
+        ));
+    };
+    for plural in ["kv_stores", "config_stores", "secret_stores"] {
+        if let Some(item) = setup_tbl.get(plural)
+            && item.as_table().is_none()
+        {
+            return Err(format!(
+                "{}: `setup.{plural}` exists but is not a table; refusing to create any remote store",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
     use toml_edit::{DocumentMut, Item, table};
 
@@ -580,6 +629,44 @@ mod tests {
         assert!(
             !setup_block_present(&only_local, "kv", TEST_KV_ID).expect("probe"),
             "[local_server.*] alone is NOT a provisioned-setup signal"
+        );
+    }
+
+    // ---------- assert_setup_writeback_shape ----------
+
+    #[test]
+    fn assert_setup_writeback_shape_accepts_missing_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        assert_setup_writeback_shape(&path).expect("missing file is writeable");
+    }
+
+    #[test]
+    fn assert_setup_writeback_shape_accepts_well_formed_setup() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "[setup.kv_stores.cache]\n").expect("write");
+        assert_setup_writeback_shape(&path).expect("well-formed setup accepted");
+    }
+
+    #[test]
+    fn assert_setup_writeback_shape_rejects_non_table_setup() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "setup = \"nope\"\n").expect("write");
+        let err = assert_setup_writeback_shape(&path).expect_err("non-table setup rejected");
+        assert!(err.contains("`setup` exists but is not a table"), "{err}");
+    }
+
+    #[test]
+    fn assert_setup_writeback_shape_rejects_non_table_kind_stores() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "[setup]\nkv_stores = \"nope\"\n").expect("write");
+        let err = assert_setup_writeback_shape(&path).expect_err("non-table kind rejected");
+        assert!(
+            err.contains("`setup.kv_stores` exists but is not a table"),
+            "{err}"
         );
     }
 

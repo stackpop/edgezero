@@ -61,7 +61,7 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
     }
 
     let workspace_root = find_workspace_root(&crate_dir);
-    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name)?;
+    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name, ctx)?;
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
         .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
@@ -137,14 +137,32 @@ fn locate_artifact(
     workspace_root: &Path,
     manifest_dir: &Path,
     crate_name: &str,
+    ctx: &AdapterExecContext<'_>,
 ) -> Result<PathBuf, String> {
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
-    if let Some(custom) = env::var_os("CARGO_TARGET_DIR") {
-        let candidate = PathBuf::from(custom)
-            .join(TARGET_TRIPLE)
-            .join("release")
-            .join(&release_name);
+    // Resolve `CARGO_TARGET_DIR` from the SAME source the build used: the
+    // ctx-applied env (manifest `[environment]`) takes precedence over the
+    // process env, mirroring `command.env(...)` in `build`. Reading only
+    // the process env would miss a manifest-set target dir and report a
+    // successful custom-target build as missing.
+    let custom = ctx
+        .env()
+        .iter()
+        .find(|(key, _)| key == "CARGO_TARGET_DIR")
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from));
+    if let Some(custom_dir) = custom {
+        // Cargo resolves a RELATIVE `CARGO_TARGET_DIR` against its working
+        // directory -- the crate dir, since the build runs with
+        // `current_dir(crate_dir)`. Resolve it the same way here (against
+        // `manifest_dir`, the crate root), NOT the process cwd.
+        let base = if custom_dir.is_absolute() {
+            custom_dir
+        } else {
+            manifest_dir.join(custom_dir)
+        };
+        let candidate = base.join(TARGET_TRIPLE).join("release").join(&release_name);
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -428,7 +446,33 @@ mod tests {
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "wasm").unwrap();
 
-        let located = locate_artifact(workspace, &manifest_dir, TEST_COMPONENT_ID).unwrap();
+        let located = locate_artifact(
+            workspace,
+            &manifest_dir,
+            TEST_COMPONENT_ID,
+            &AdapterExecContext::new(),
+        )
+        .unwrap();
+        assert_eq!(located, artifact);
+    }
+
+    #[test]
+    fn locate_artifact_honors_ctx_env_cargo_target_dir() {
+        // The build runs with `CARGO_TARGET_DIR` applied from `ctx.env()`
+        // (manifest `[environment]`), so artifact discovery must read the
+        // SAME source -- not just the process env. A relative value is
+        // resolved against the crate root, matching cargo's own behavior.
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let manifest_dir = workspace.join("service");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        let artifact = manifest_dir.join("custom-target/wasm32-wasip2/release/demo.wasm");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "wasm").unwrap();
+
+        let env = [("CARGO_TARGET_DIR".to_owned(), "custom-target".to_owned())];
+        let ctx = AdapterExecContext::new().with_env(&env);
+        let located = locate_artifact(workspace, &manifest_dir, "demo", &ctx).unwrap();
         assert_eq!(located, artifact);
     }
 
@@ -444,7 +488,13 @@ mod tests {
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "wasm").unwrap();
 
-        let located = locate_artifact(workspace, &manifest_dir, "my-cool-crate").unwrap();
+        let located = locate_artifact(
+            workspace,
+            &manifest_dir,
+            "my-cool-crate",
+            &AdapterExecContext::new(),
+        )
+        .unwrap();
         assert_eq!(located, artifact);
     }
 

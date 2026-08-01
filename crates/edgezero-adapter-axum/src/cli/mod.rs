@@ -508,15 +508,17 @@ impl Adapter for AxumCliAdapter {
         // for the crate name; fall back to the ancestor `Cargo.toml`
         // search, then the scaffold convention. (An ancestor search alone
         // could pick a nested package between the manifest and the crate.)
-        let crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
-            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
-            .unwrap_or_else(|| {
-                if app_name.is_empty() {
-                    "app-adapter-axum".to_owned()
-                } else {
-                    format!("{app_name}-adapter-axum")
-                }
-            });
+        let crate_name = match cli_support::read_crate_name_at(manifest_root, adapter_crate_path)? {
+            Some(name) => name,
+            None => cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+                .unwrap_or_else(|| {
+                    if app_name.is_empty() {
+                        "app-adapter-axum".to_owned()
+                    } else {
+                        format!("{app_name}-adapter-axum")
+                    }
+                }),
+        };
         // Compute `crate_dir` (relative path from the manifest's
         // parent to the crate root). The scaffold convention
         // `crates/<crate>/axum.toml` puts the manifest INSIDE the

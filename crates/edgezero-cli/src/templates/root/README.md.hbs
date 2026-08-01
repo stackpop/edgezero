@@ -51,8 +51,10 @@ cargo run -p {{proj_cli}} -- config diff --adapter <name> --format json --exit-c
 Uncomment `[stores.config]` in `edgezero.toml`, then re-run
 `cargo run -p {{proj_cli}} -- provision --adapter <name> --local` to
 regenerate the per-adapter manifest with the new store binding, before
-running `config push`. The adapter manifest is a generated artefact --
-provision owns the binding, so you never hand-edit it.
+running `config push`. Provision owns the store bindings and keeps the
+generated manifest minimal, but it merges rather than overwrites: any
+hand-edits you make for richer customizations (custom build commands,
+alternate component shapes) are preserved across re-runs.
 
 Use `--key <name>` for per-environment overrides (staging / canary):
 the same `{{name}}.toml` can land under multiple keys, and the runtime

@@ -86,7 +86,70 @@ fn locate_project(ctx: &AdapterExecContext<'_>) -> Result<AxumProject, String> {
     let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
         find_axum_manifest(&cli_support::discovery_base(ctx)?)
     })?;
-    read_axum_project(&manifest)
+    let project = read_axum_project(&manifest)?;
+    // `axum.toml`'s `crate_dir` is operator-editable. Refuse to spawn
+    // cargo against it until we've confirmed it neither escapes the
+    // project nor contradicts the authoritative declared `.crate`.
+    validate_axum_crate_dir(ctx, &manifest, &project)?;
+    Ok(project)
+}
+
+/// Guard the operator-editable `axum.toml` `crate_dir` BEFORE `run_cargo`
+/// spawns cargo with `--manifest-path <crate_dir>/Cargo.toml` and
+/// `current_dir(<crate_dir>)`. `crate_dir` is CANONICALISED (it must
+/// already exist -- `read_axum_project` verified its `Cargo.toml`), which
+/// resolves BOTH `..` traversal AND symlinks to a real path, so this one
+/// check covers conflicts, `..` escapes, and symlink escapes:
+///   - when the CLI supplied the authoritative declared `.crate`
+///     (`ctx.adapter_crate()`), the resolved `crate_dir` MUST canonicalise
+///     to the same directory -- an operator who hand-edits `crate_dir` to
+///     a different crate (or symlinks it elsewhere) is refused rather than
+///     silently building that crate;
+///   - standalone (no declared `.crate`), `crate_dir` must stay under the
+///     workspace root, so a traversing/symlinked value can't point cargo
+///     at a crate outside the project.
+fn validate_axum_crate_dir(
+    ctx: &AdapterExecContext<'_>,
+    manifest: &Path,
+    project: &AxumProject,
+) -> Result<(), String> {
+    let crate_canon = project.crate_dir.canonicalize().map_err(|err| {
+        format!(
+            "cannot resolve axum.toml `crate_dir` `{}`: {err}",
+            project.crate_dir.display()
+        )
+    })?;
+    if let Some(declared) = ctx.adapter_crate() {
+        let declared_canon = declared.canonicalize().map_err(|err| {
+            format!(
+                "cannot resolve tracked `[adapters.axum.adapter].crate` `{}`: {err}",
+                declared.display()
+            )
+        })?;
+        if crate_canon != declared_canon {
+            return Err(format!(
+                "axum.toml `crate_dir` resolves to `{}`, but the tracked \
+                 `[adapters.axum.adapter].crate` points at `{}`. The declared crate is \
+                 authoritative; refusing to build a different crate. Fix `crate_dir` in axum.toml \
+                 (or `.crate` in edgezero.toml) so they agree.",
+                crate_canon.display(),
+                declared_canon.display()
+            ));
+        }
+    } else {
+        let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
+        let root = find_workspace_root(manifest_dir);
+        let root_canon = root.canonicalize().unwrap_or(root);
+        if !crate_canon.starts_with(&root_canon) {
+            return Err(format!(
+                "axum.toml `crate_dir` resolves to `{}`, which is OUTSIDE the project (`{}`). \
+                 Refusing to run cargo against a crate outside the workspace.",
+                crate_canon.display(),
+                root_canon.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run_cargo(
@@ -437,6 +500,94 @@ mod tests {
             "value round-trips through escaping: {rendered}"
         );
         assert_eq!(doc["adapter"]["crate_dir"].as_str(), Some("../up"));
+    }
+
+    fn project_with_crate_dir(crate_dir: PathBuf) -> AxumProject {
+        AxumProject {
+            addr: SocketAddr::new(addr::DEFAULT_HOST, addr::DEFAULT_PORT),
+            axum_host: None,
+            axum_manifest: PathBuf::new(),
+            axum_port: None,
+            cargo_manifest: crate_dir.join("Cargo.toml"),
+            crate_dir,
+            crate_name: "demo".to_owned(),
+            env_host: None,
+            env_port: None,
+        }
+    }
+
+    #[test]
+    fn validate_axum_crate_dir_rejects_conflict_with_declared_crate() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("crates/server")).unwrap();
+        fs::create_dir_all(root.join("crates/other")).unwrap();
+        // axum.toml points crate_dir at `crates/other`, but the tracked
+        // `.crate` is `crates/server` -- the declared crate wins.
+        let project = project_with_crate_dir(root.join("crates/other"));
+        let declared = root.join("crates/server");
+        let ctx = AdapterExecContext::new().with_adapter_crate(&declared);
+        let err = validate_axum_crate_dir(&ctx, &root.join("axum.toml"), &project)
+            .expect_err("crate_dir conflicting with declared .crate must be refused");
+        assert!(
+            err.contains("authoritative") && err.contains("crate_dir"),
+            "error explains the conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_axum_crate_dir_accepts_matching_declared_crate() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("crates/server")).unwrap();
+        let crate_dir = root.join("crates/server");
+        let ctx = AdapterExecContext::new().with_adapter_crate(&crate_dir);
+        validate_axum_crate_dir(
+            &ctx,
+            &root.join("crates/server/config/axum.toml"),
+            &project_with_crate_dir(crate_dir.clone()),
+        )
+        .expect("crate_dir matching the declared .crate is fine");
+    }
+
+    #[test]
+    fn validate_axum_crate_dir_rejects_escape_outside_workspace() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        // Workspace root under `base`; the escape target is a sibling of
+        // the workspace (so it exists for canonicalize but is off-tree).
+        let ws = base.join("ws");
+        fs::create_dir_all(ws.join("proj")).unwrap();
+        fs::write(ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::create_dir_all(base.join("outside")).unwrap();
+        // No declared `.crate` (standalone). `..` climbs out of the ws.
+        let escaping = ws.join("proj/../../outside");
+        let project = project_with_crate_dir(escaping);
+        let ctx = AdapterExecContext::new();
+        let err = validate_axum_crate_dir(&ctx, &ws.join("proj/axum.toml"), &project)
+            .expect_err("a crate_dir escaping the workspace must be refused");
+        assert!(err.contains("OUTSIDE"), "error explains the escape: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_axum_crate_dir_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let ws = base.join("ws");
+        fs::create_dir_all(ws.join("proj")).unwrap();
+        fs::write(ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        // Symlink target lives OUTSIDE the workspace; canonicalize
+        // resolves the link to it, so containment must reject.
+        let outside = base.join("outside-crate");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, ws.join("proj/link")).unwrap();
+        let project = project_with_crate_dir(ws.join("proj/link"));
+        let ctx = AdapterExecContext::new();
+        let err = validate_axum_crate_dir(&ctx, &ws.join("proj/axum.toml"), &project)
+            .expect_err("a symlinked crate_dir escaping the workspace must be refused");
+        assert!(err.contains("OUTSIDE"), "error explains the escape: {err}");
     }
 
     #[test]

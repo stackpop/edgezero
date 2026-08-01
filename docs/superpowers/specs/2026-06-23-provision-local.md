@@ -35,12 +35,13 @@ the config blob, leaving everything provision wrote intact.
   gitignored per a later section. If a manifest is missing,
   `provision --local`'s CLI-owned bootstrap synthesises a
   minimal valid file from `edgezero.toml` primitives via
-  `toml_edit::DocumentMut` (NOT from the scaffold `.hbs`
-  templates -- those carry generator-only placeholders that
-  aren't reconstructible from `edgezero.toml` alone; the
-  `.hbs` files remain in use only by `edgezero new`'s
-  scaffold path). The synthesiser's exact per-adapter output
-  is specified in the "Primitive synthesiser output" section.
+  `toml_edit::DocumentMut`. There is NO `.hbs` template for any
+  adapter manifest: `edgezero new` runs this same synthesiser at
+  scaffold time, so the synthesiser is the single source of truth
+  for these files. The remaining `.hbs` templates cover only
+  non-manifest scaffold files (`Cargo.toml`, `src/…`,
+  `.cargo/config.toml`, etc.). The synthesiser's exact per-adapter
+  output is specified in the "Primitive synthesiser output" section.
 - Never creates files outside the adapter crate's directory or
   the gitignored local-state directories (`.wrangler/`, `.spin/`,
   `.edgezero/`, `.dev.vars`, `.env`). This is enforced by the
@@ -1876,15 +1877,16 @@ git ls-files | rg '(^|/)runtime-config\.toml$' && exit 1 || true
   amendment folded `axum.toml` into the gitignored set alongside
   the other four adapter manifests; the CI gate at Task 37
   enforces all five.)
-- The richer per-adapter scaffold remains in the adapter
-  crates' `templates/` directories for `edgezero new`'s use —
-  except `axum.toml`, whose scaffold template was removed so
-  scaffold-time provision is the single writer.
-  For the steady-state dev loop, `provision --local`
-  synthesises the concrete files at the same paths from
+- No adapter manifest (`axum.toml`, `wrangler.toml`,
+  `fastly.toml`, `spin.toml`, `runtime-config.toml`) has a
+  scaffold `.hbs` template: all of them were removed so
+  scaffold-time provision is the single writer. Both
+  `edgezero new` and the steady-state `provision --local`
+  synthesise the concrete files at the same paths from
   `edgezero.toml` primitives via `toml_edit::DocumentMut`
-  (see "Primitive synthesiser output") -- not from those
-  `.hbs` templates.
+  (see "Primitive synthesiser output"). The adapter crates'
+  `templates/` directories retain only non-manifest scaffold
+  files (`Cargo.toml`, `src/…`, `.cargo/config.toml`).
 - Smoke scripts that previously `backup_in_tree`'d these files
   drop that machinery -- the files are no longer tracked, so
   worktree cleanliness checks ignore them anyway. Smoke calls

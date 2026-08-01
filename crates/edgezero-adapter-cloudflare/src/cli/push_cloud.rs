@@ -6,7 +6,8 @@ use std::process::Command;
 use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
 
 use super::WRANGLER_INSTALL_HINT;
-use super::provision_cloud::find_namespace_id;
+use super::provision_cloud::{find_namespace_id, is_real_namespace_id};
+use super::provision_local::read_namespace_id;
 
 /// Push `entries` to the remote KV namespace bound to `store` (looked
 /// up in `wrangler.toml`) via `wrangler kv bulk put <tempfile.json>
@@ -48,21 +49,26 @@ pub(super) fn write_entries(
     let wrangler_path = manifest_root.join(rel);
     let binding = store.platform.as_str();
     let logical = store.logical.as_str();
-    // Dry-run is lenient about a missing/unresolved binding so
-    // operators can preview the keyset BEFORE running provision.
-    // Real runs still err loudly so we don't silently push to
-    // a non-existent namespace.
+    // Dry-run is lenient about an UNPROVISIONED binding (no entry, or a
+    // scaffold placeholder id) so operators can preview the keyset BEFORE
+    // running provision. A MALFORMED wrangler.toml (unparseable, or a
+    // `kv_namespaces` of the wrong shape) is NOT suppressed: `?` propagates
+    // it so the dry-run fails loudly instead of printing a misleading
+    // `<unresolved>` preview. Real runs still err loudly so we don't
+    // silently push to a non-existent namespace.
     if dry_run {
-        let header = find_namespace_id(&wrangler_path, binding).map_or_else(
-            |_| format!(
-                "would run `wrangler kv bulk put <tempfile.json> --namespace-id=<unresolved> --remote` with {} entries for binding `{binding}` (logical id `{logical}`, binding not yet provisioned -- run `edgezero provision --adapter cloudflare` to resolve the namespace id)",
-                entries.len()
-            ),
-            |ns_id| format!(
+        let resolved =
+            read_namespace_id(&wrangler_path, binding)?.filter(|id| is_real_namespace_id(id));
+        let header = match resolved {
+            Some(ns_id) => format!(
                 "would run `wrangler kv bulk put <tempfile.json> --namespace-id={ns_id} --remote` with {} entries for binding `{binding}` (logical id `{logical}`)",
                 entries.len()
             ),
-        );
+            None => format!(
+                "would run `wrangler kv bulk put <tempfile.json> --namespace-id=<unresolved> --remote` with {} entries for binding `{binding}` (logical id `{logical}`, binding not yet provisioned -- run `edgezero provision --adapter cloudflare` to resolve the namespace id)",
+                entries.len()
+            ),
+        };
         let mut out = vec![header];
         for (key, _) in entries {
             out.push(format!("  would create entry `{key}`"));
@@ -457,6 +463,58 @@ mod tests {
         assert!(
             out.iter().any(|line| line.contains("`greeting`")),
             "dry-run still lists the entries it would push: {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_dry_run_fails_on_malformed_kv_namespaces_shape() {
+        // A `kv_namespaces` of the wrong shape is a MALFORMED manifest, not
+        // an unprovisioned binding. Dry-run must fail loudly rather than
+        // suppress it as a lenient `<unresolved>` preview.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\nkv_namespaces = \"nope\"\n");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let err = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect_err("a malformed manifest must fail dry-run, not preview <unresolved>");
+        assert!(
+            err.contains("kv_namespaces"),
+            "error names the malformed key: {err}"
+        );
+    }
+
+    #[test]
+    fn push_dry_run_is_lenient_on_scaffold_placeholder_id() {
+        // A placeholder id means "not yet provisioned" -- still a lenient
+        // preview, distinct from a malformed manifest.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"local-dev-placeholder\"\n",
+        );
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run is lenient for a placeholder id");
+        assert!(
+            out[0].contains("<unresolved>") && out[0].contains("provision"),
+            "placeholder id previews as unresolved: {out:?}"
         );
     }
 

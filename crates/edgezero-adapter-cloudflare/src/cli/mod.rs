@@ -402,15 +402,17 @@ impl Adapter for CloudflareCliAdapter {
         // fall back to the ancestor `Cargo.toml` search, then the scaffold
         // convention `<app>-adapter-cloudflare`. (An ancestor search alone
         // could pick a nested package between the manifest and the crate.)
-        let crate_name = cli_support::read_crate_name_at(manifest_root, adapter_crate_path)
-            .or_else(|| cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path))
-            .unwrap_or_else(|| {
-                if app_name.is_empty() {
-                    "app-adapter-cloudflare".to_owned()
-                } else {
-                    format!("{app_name}-adapter-cloudflare")
-                }
-            });
+        let crate_name = match cli_support::read_crate_name_at(manifest_root, adapter_crate_path)? {
+            Some(name) => name,
+            None => cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+                .unwrap_or_else(|| {
+                    if app_name.is_empty() {
+                        "app-adapter-cloudflare".to_owned()
+                    } else {
+                        format!("{app_name}-adapter-cloudflare")
+                    }
+                }),
+        };
         Ok(vec![(rel, run::synthesise_wrangler_toml(&crate_name))])
     }
 }
