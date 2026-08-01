@@ -224,5 +224,15 @@ jobs:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: cargo test -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --test contract
 
+      # The colocated runtime unit tests (config-store resolver, chunk
+      # remediation) need the `fastly` feature and only RUN under Viceroy — the
+      # `--test contract` line above never exercises them. Run the lib target so
+      # the runtime fail-closed/remediation behaviour is actually verified in CI.
+      - name: Run fastly wasm runtime unit tests
+        if: matrix.adapter == 'fastly'
+        env:
+          ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
+        run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --lib
+
       - name: Check ${{ matrix.adapter }} wasm target
         run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}

@@ -433,7 +433,11 @@ referenced key, an unreadable `created_at`, or an incomplete listing — all abo
 with nothing deleted. A definitively FOREIGN value at an ORDINARY key (a scalar,
 a plain string, a complete JSON object with no discriminator) is NOT a failure:
 it references no chunks, so GC protects it as a zero-reference root and continues
-(see the classification note above).
+(see the classification note above). The one exception is a value that looks
+foreign but is a FUTURE format — a direct envelope from a newer writer carries no
+`edgezero_kind`, yet a newer format may reference chunks under a scheme this build
+cannot read. GC does NOT wave it through as zero-reference; it fails closed with
+nothing deleted, exactly as it does for a future/unknown kind.
 
 **Non-zero exit on delete failure.** Independent generations are all attempted,
 but deletion STOPS within a generation at its first failure (a half-deleted

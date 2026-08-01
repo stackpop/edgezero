@@ -84,6 +84,39 @@ enum RootValueKind {
     UnknownKind,
 }
 
+/// Why resolving a stored root value failed. Keeping the future-format case
+/// DISTINCT from corruption is the whole point: a newer format must never be
+/// overwritten (CLI) or read as repairable corruption, whereas genuinely corrupt
+/// or incomplete state IS repairable by a push. The distinction has to survive
+/// pointer resolution — a v2 envelope reassembled from v1 chunks is only knowable
+/// AFTER the chunks are fetched — so it cannot be recovered from the raw value
+/// alone.
+pub(crate) enum ResolveFailure {
+    /// Corrupt or incomplete state a push can repair by overwriting. Carries a
+    /// redacted, human-readable message.
+    Corrupt(String),
+    /// The value (or the envelope it reconstructs to) uses a config format this
+    /// build does not recognise: an unknown/newer `edgezero_kind`, or a bumped
+    /// envelope/pointer `version`. Carries a redacted, human-readable message.
+    FutureFormat(String),
+}
+
+impl ResolveFailure {
+    /// The redacted, human-readable message, discarding the category.
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::FutureFormat(message) | Self::Corrupt(message) => message,
+        }
+    }
+
+    /// Is this a newer format this build must not overwrite (vs. repairable
+    /// corruption)?
+    #[cfg(any(feature = "cli", feature = "fastly", test))]
+    pub(crate) fn is_future_format(&self) -> bool {
+        matches!(self, Self::FutureFormat(_))
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct FastlyChunkRef {
     key: String,
@@ -374,35 +407,36 @@ pub(crate) fn chunk_lengths(chunks: &[GcChunkRef]) -> Vec<usize> {
 ///    concatenate in pointer order, verify `envelope_len` + `envelope_sha256`
 ///    and the exact writer split layout, then return the reconstructed envelope.
 /// 3. `edgezero_kind` present but naming a kind this build does not understand →
-///    an error. That field is our reserved namespace, so an unrecognised value
-///    in it is corrupt or future-versioned state, not an ordinary entry.
+///    a [`ResolveFailure::FutureFormat`] error. That field is our reserved
+///    namespace, so an unrecognised value in it is future-versioned state.
 ///
 /// # Errors
 ///
-/// Returns a descriptive error string naming the root key or the failing
-/// chunk POSITION when any integrity check fails.
-pub(crate) fn resolve_fastly_config_value<F>(
+/// Returns a typed [`ResolveFailure`] naming the root key or the failing chunk
+/// POSITION when any integrity check fails, distinguishing a NEWER format (must
+/// not be overwritten) from repairable corruption. [`resolve_fastly_config_value`]
+/// is the string-erased wrapper for callers that do not need the distinction.
+pub(crate) fn resolve_fastly_config_value_typed<F>(
     root_key: &str,
     root_value: String,
     mut fetch: F,
-) -> Result<String, String>
+) -> Result<String, ResolveFailure>
 where
     F: FnMut(&str) -> Result<Option<String>, String>,
 {
-    use edgezero_core::blob_envelope::BlobEnvelope;
-
     match classify_root_value(&root_value) {
         // Not ours (a foreign value, or an object-shaped value that does not
         // parse): the Config Store contract returns stored bytes untouched.
         // Envelope integrity is the typed app-config layer's job downstream.
         RootValueKind::Foreign | RootValueKind::MalformedObject => return Ok(root_value),
         RootValueKind::UnknownKind => {
-            // The stored `edgezero_kind` is not echoed: it is a value-controlled
-            // string on a path whose diagnostics are logged.
-            return Err(format!(
+            // An unrecognised `edgezero_kind` is a NEWER/foreign format, not
+            // repairable corruption. The stored kind is not echoed: it is a
+            // value-controlled string on a path whose diagnostics are logged.
+            return Err(ResolveFailure::FutureFormat(format!(
                 "value at key `{root_key}` has an unknown `edgezero_kind` (value redacted); \
                  expected `{POINTER_KIND}`"
-            ));
+            )));
         }
         RootValueKind::Pointer => {}
     }
@@ -413,33 +447,35 @@ where
     // front — this bounds how many chunk refs it can carry (hence the fetch
     // fan-out) before any further parsing.
     if root_value.len() > FASTLY_CONFIG_ENTRY_LIMIT {
-        return Err(format!(
+        return Err(ResolveFailure::Corrupt(format!(
             "chunk pointer at `{root_key}` is larger than the {FASTLY_CONFIG_ENTRY_LIMIT}-character \
              entry limit and so is not one this writer could have stored"
-        ));
+        )));
     }
     let pointer: FastlyChunkPointer = serde_json::from_str(&root_value).map_err(|err| {
-        format!(
+        ResolveFailure::Corrupt(format!(
             "value at key `{root_key}` announces itself as a chunk pointer but is not a valid \
              one ({})",
             redact_json_err(&err)
-        )
+        ))
     })?;
 
     if pointer.edgezero_kind != POINTER_KIND {
-        // The stored `edgezero_kind` is not echoed: it is a value-controlled
-        // string on a path whose diagnostics are logged.
-        return Err(format!(
+        // An unrecognised `edgezero_kind` is a NEWER/foreign format, not
+        // repairable corruption. The stored kind is not echoed: it is a
+        // value-controlled string on a path whose diagnostics are logged.
+        return Err(ResolveFailure::FutureFormat(format!(
             "chunk pointer at `{root_key}` has an unknown `edgezero_kind` (value redacted); \
              expected `{POINTER_KIND}`"
-        ));
+        )));
     }
     if pointer.version != 1 {
-        return Err(format!(
+        // A bumped POINTER version is a newer format, not corruption.
+        return Err(ResolveFailure::FutureFormat(format!(
             "chunk pointer at `{root_key}` has unsupported version \
              {}; expected 1",
             pointer.version
-        ));
+        )));
     }
     // Validate the pointer METADATA before fetching anything: a shape the writer
     // could never emit (non-canonical keys, mixed generations, gaps, per-chunk
@@ -447,7 +483,7 @@ where
     // or an `envelope_len` small enough to have been stored directly) is
     // rejected up front rather than driving a fan-out of chunk fetches whose
     // hashes could only fail at the end. Same validator the CLI/GC path uses.
-    validate_pointer_chunks(root_key, &pointer)?;
+    validate_pointer_chunks(root_key, &pointer).map_err(ResolveFailure::Corrupt)?;
 
     // Fetch, verify, and concatenate all chunks.
     //
@@ -461,32 +497,34 @@ where
             .map_err(|_err| {
                 // The callback's error carries the chunk KEY (pointer-controlled),
                 // so it is not propagated verbatim. Position locates the fault.
-                format!(
+                ResolveFailure::Corrupt(format!(
                     "chunk {position} referenced by pointer at `{root_key}` could not be fetched \
                      (details redacted)"
-                )
+                ))
             })?
             .ok_or_else(|| {
-                format!("missing chunk {position} referenced by pointer at `{root_key}`")
+                ResolveFailure::Corrupt(format!(
+                    "missing chunk {position} referenced by pointer at `{root_key}`"
+                ))
             })?;
 
         // Verify length.
         if chunk_value.len() != chunk_ref.len {
-            return Err(format!(
+            return Err(ResolveFailure::Corrupt(format!(
                 "chunk {position} (referenced by `{root_key}`) has length {} but the pointer \
                  records {}",
                 chunk_value.len(),
                 chunk_ref.len,
-            ));
+            )));
         }
 
         // Verify SHA. Neither hash is echoed: the expected one comes from the
         // stored pointer, so it is value-controlled.
         if sha256_hex(chunk_value.as_bytes()) != chunk_ref.sha256 {
-            return Err(format!(
+            return Err(ResolveFailure::Corrupt(format!(
                 "chunk {position} (referenced by `{root_key}`) does not match the SHA-256 the \
                  pointer records for it (hashes redacted)"
-            ));
+            )));
         }
 
         reconstructed.push_str(&chunk_value);
@@ -494,12 +532,12 @@ where
 
     // Verify total envelope length.
     if reconstructed.len() != pointer.envelope_len {
-        return Err(format!(
+        return Err(ResolveFailure::Corrupt(format!(
             "reconstructed envelope for `{root_key}` has length {} but pointer \
              records {}",
             reconstructed.len(),
             pointer.envelope_len,
-        ));
+        )));
     }
 
     // Verify total envelope SHA.
@@ -509,38 +547,74 @@ where
         // a stored, value-controlled string that a malformed pointer can set to
         // anything (a secret), and this runs on the read path where diagnostics
         // are logged.
-        return Err(format!(
+        return Err(ResolveFailure::Corrupt(format!(
             "reconstructed envelope for `{root_key}` does not match the pointer's \
              `envelope_sha256` (hashes redacted)"
-        ));
+        )));
     }
 
     let declared_lens: Vec<usize> = pointer.chunks.iter().map(|chunk| chunk.len).collect();
-    verify_writer_split_layout(root_key, &reconstructed, &declared_lens)?;
+    verify_writer_split_layout(root_key, &reconstructed, &declared_lens)
+        .map_err(ResolveFailure::Corrupt)?;
 
-    // Parse AND verify the inner envelope, exactly as the direct path does.
-    //
-    // The outer checks above only prove the chunks reassemble to the bytes the
-    // pointer names; they say nothing about the `BlobEnvelope` INSIDE. Without
-    // this, a reconstructed value whose embedded `sha256` is wrong (a secret)
-    // sails through the resolver, and core's own `verify()` then formats that
-    // stored hash into an HTTP 500. Redact to a category so the resolver
-    // guarantees -- on BOTH paths -- that whatever it returns is a verified
-    // envelope and no stored value escapes.
+    finalize_reconstructed_envelope(root_key, reconstructed)
+}
+
+/// The final gate the chunked path shares with the direct one: reject a NEWER
+/// inner envelope, then parse+verify the exact v1 `BlobEnvelope`.
+///
+/// Version detection runs BEFORE v1 deserialization: the outer pointer is a valid
+/// v1 pointer, so the raw value alone never reveals a bumped INNER envelope
+/// version, and a v2 envelope may not even deserialize as v1 -- which would
+/// otherwise erase into repairable corruption and let a downgrade push overwrite
+/// a newer format. Parsing+verifying then guarantees the resolver only ever
+/// returns a verified envelope, so no stored (possibly-secret) hash escapes into
+/// core's own `verify()` and out through an HTTP 500.
+fn finalize_reconstructed_envelope(
+    root_key: &str,
+    reconstructed: String,
+) -> Result<String, ResolveFailure> {
+    use edgezero_core::blob_envelope::BlobEnvelope;
+
+    if value_is_future_format(&reconstructed) {
+        return Err(ResolveFailure::FutureFormat(format!(
+            "reconstructed envelope at key `{root_key}` uses an envelope version this build does \
+             not recognise (a newer format); redeploy an updated build rather than overwrite it"
+        )));
+    }
     let envelope: BlobEnvelope = serde_json::from_str(&reconstructed).map_err(|err| {
-        format!(
+        ResolveFailure::Corrupt(format!(
             "reconstructed value at key `{root_key}` is not a valid config envelope ({})",
             redact_json_err(&err)
-        )
+        ))
     })?;
     envelope.verify().map_err(|_err| {
-        format!(
+        ResolveFailure::Corrupt(format!(
             "reconstructed envelope at key `{root_key}` failed its integrity check (details \
              redacted -- the stored hashes are value-controlled)"
-        )
+        ))
     })?;
-
     Ok(reconstructed)
+}
+
+/// String-erased wrapper over `resolve_fastly_config_value_typed` for the tests
+/// that do not need to tell a NEWER format from repairable corruption. Production
+/// callers use the typed form directly.
+///
+/// # Errors
+///
+/// Returns the redacted error message when any integrity check fails.
+#[cfg(test)]
+pub(crate) fn resolve_fastly_config_value<F>(
+    root_key: &str,
+    root_value: String,
+    fetch: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    resolve_fastly_config_value_typed(root_key, root_value, fetch)
+        .map_err(ResolveFailure::into_message)
 }
 
 /// Validate a prior root value and return the chunk keys it referenced,
@@ -844,7 +918,9 @@ pub(crate) fn value_is_unknown_kind(raw: &str) -> bool {
 ///
 /// Also compiled for the RUNTIME (`fastly`): the guest uses it to give the right
 /// remediation (redeploy an updated build, not re-push the same config).
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+///
+/// Always compiled: the resolver consults it on the reconstructed envelope, and
+/// the resolver is compiled regardless of feature set.
 pub(crate) fn value_is_future_format(raw: &str) -> bool {
     use edgezero_core::blob_envelope::ENVELOPE_VERSION_V1;
     let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) else {
@@ -1879,6 +1955,57 @@ mod tests {
             resolve_fastly_config_value("root", pointer, |key| Ok(chunk_map.get(key).cloned()))
                 .expect("a value stored by v1 must still resolve");
         assert_eq!(resolved, envelope, "must reconstruct the original bytes");
+    }
+
+    /// A valid v1 pointer whose chunks reassemble to a NEWER (v2) envelope is only
+    /// knowable AFTER reassembly -- the raw outer pointer is a healthy v1 value.
+    /// The resolver must type this `FutureFormat`, never erase it into an untyped
+    /// error the CLI would read as repairable corruption and OVERWRITE (a
+    /// downgrade clobbering a newer format).
+    #[test]
+    fn resolver_types_a_future_inner_envelope_as_future_format() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        // A LARGE v2 envelope, so the v1 writer chunks it (a small value stores
+        // direct). The writer chunks arbitrary bytes; the newer VERSION lives in
+        // the reassembled payload, not the (v1) pointer.
+        let mut v2: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&BlobEnvelope::new(
+                json!({ "x": "z".repeat(9_000) }),
+                "2026-01-01T00:00:00Z".to_owned(),
+            ))
+            .expect("envelope"),
+        )
+        .expect("parse");
+        v2["version"] = json!(2_u32);
+        let body = v2.to_string();
+
+        let entries = prepare_fastly_config_entries("root", &body).expect("chunk the v2 body");
+        assert!(entries.len() > 1, "the v2 body must be chunked, not direct");
+        let mut chunk_map: HashMap<String, String> = HashMap::new();
+        let mut found_pointer = None;
+        for (key, value) in entries {
+            if key == "root" {
+                found_pointer = Some(value);
+            } else {
+                chunk_map.insert(key, value);
+            }
+        }
+        let pointer_body = found_pointer.expect("a pointer entry at the root key");
+
+        let err = resolve_fastly_config_value_typed("root", pointer_body, |key| {
+            Ok(chunk_map.get(key).cloned())
+        })
+        .expect_err("a future inner envelope must not resolve to Ok");
+        assert!(
+            err.is_future_format(),
+            "a future INNER envelope must be typed FutureFormat, not corruption"
+        );
+        assert!(
+            err.into_message().contains("newer format"),
+            "the message must name the newer format"
+        );
     }
 
     /// FROZEN v1 MULTIBYTE WIRE FORMAT. Pins the codepoint-boundary RETREAT: a

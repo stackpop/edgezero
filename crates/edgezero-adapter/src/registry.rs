@@ -204,14 +204,24 @@ impl<'entry> TypedSecretEntry<'entry> {
 /// Outcome of a single-key read. See spec 9.0.
 #[non_exhaustive]
 pub enum ReadConfigEntry {
-    /// The entry EXISTS but its stored value cannot be resolved to a usable
-    /// envelope — a missing chunk, a hash mismatch, a malformed/foreign pointer.
+    /// The entry EXISTS but its stored value is PROVABLY unusable — a hash
+    /// mismatch, or a malformed/foreign pointer that resolves to a non-envelope.
     /// Distinct from a read/IO failure (which still errors): the store WAS
-    /// reachable and the key WAS present, so a `config push` can safely overwrite
-    /// it. This is the runtime's "re-run config push to repair" contract made
-    /// real — the push treats it like an absent remote (proceeds to write) rather
-    /// than aborting, so a broken generation is recoverable in-band. The
-    /// `&'static str` carries a redacted, human-readable reason.
+    /// reachable, the key WAS present, and the value was FULLY read, so a
+    /// `config push` can safely overwrite it. This is the runtime's "re-run config
+    /// push to repair" contract made real — the push treats it like an absent
+    /// remote (proceeds to write) rather than aborting, so a broken generation is
+    /// recoverable in-band. The `&'static str` carries a redacted, human-readable
+    /// reason.
+    ///
+    /// NOT this: a value that could not be FULLY read — e.g. a chunk pointer whose
+    /// referenced chunk is absent or unfetchable. Its absence is indistinguishable
+    /// from an incomplete read (an auth/network blip returns the same "not found"),
+    /// so overwriting on it could clobber a healthy generation mid-propagation.
+    /// Adapters MUST fail closed there (a hard read error the operator retries),
+    /// never report `Corrupt`. A NEWER format (an unknown/bumped envelope or
+    /// pointer version) is likewise NOT `Corrupt`: it is refused with an upgrade
+    /// error and never overwritten.
     ///
     /// Adapters MAY, but need not, produce this: an adapter that returns a
     /// corrupt value as `Present` still gets the same repair behaviour, because

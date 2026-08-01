@@ -31,7 +31,7 @@ use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretField, SecretKind,
     SecretPathSegment,
 };
-use edgezero_core::blob_envelope::{BlobEnvelope, BlobEnvelopeError};
+use edgezero_core::blob_envelope::{BlobEnvelope, BlobEnvelopeError, ENVELOPE_VERSION_V1};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::Serialize;
@@ -920,6 +920,13 @@ fn recheck_before_write(
 /// Classify a `Present` body. `Err` for a FUTURE format (a bumped envelope
 /// version) — the push must refuse rather than overwrite a newer format.
 fn classify_present_body(body: &str) -> Result<PresentBody, String> {
+    // Detect a NEWER envelope version BEFORE deserializing as the exact v1 schema.
+    // A v2 envelope may add/rename/retype fields and fail to deserialize as the v1
+    // `BlobEnvelope`, which would otherwise fall through to `Corrupt` and let a
+    // downgrade push overwrite a newer format. Version detection must come first.
+    if body_is_future_envelope(body) {
+        return Err(FUTURE_FORMAT_PUSH_ERROR.to_owned());
+    }
     match serde_json::from_str::<BlobEnvelope>(body) {
         Ok(envelope) => match envelope.verify() {
             Ok(()) => Ok(PresentBody::Valid(Box::new(envelope))),
@@ -931,6 +938,21 @@ fn classify_present_body(body: &str) -> Result<PresentBody, String> {
         // Not a parseable envelope at all: corruption a push repairs.
         Err(_) => Ok(PresentBody::Corrupt),
     }
+}
+
+/// Does `body` carry an envelope `version` field that is present but NOT 1?
+///
+/// A cheap, schema-agnostic pre-check: it parses only as a generic JSON object
+/// and inspects `version`, so it catches a newer envelope even when the value no
+/// longer deserializes as the exact v1 [`BlobEnvelope`]. A missing/absent version
+/// is NOT future (that stays repairable corruption).
+fn body_is_future_envelope(body: &str) -> bool {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    obj.get("version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version != u64::from(ENVELOPE_VERSION_V1))
 }
 
 /// Render the first-read diff and return the outcome.
@@ -3532,10 +3554,26 @@ ids = ["default"]
 
         // A future envelope VERSION is a hard error -- never overwritten.
         let mut v2: serde_json::Value = serde_json::from_str(&valid).unwrap();
-        v2["version"] = json!(2);
+        v2["version"] = json!(2_u32);
         assert!(
             classify_present_body(&v2.to_string()).is_err_and(|err| err.contains("UPGRADE")),
             "a future envelope version must refuse the push"
+        );
+
+        // A future envelope whose SCHEMA also changed (so it no longer
+        // deserializes as the exact v1 `BlobEnvelope`) is STILL refused: version
+        // detection runs BEFORE v1 deserialization, so it never falls through to
+        // repairable Corrupt and gets overwritten by a downgrade push.
+        let future_schema = json!({
+            "version": 2_u32,
+            "data": { "k": "v" },
+            "generated_at": "2026-01-01T00:00:00Z",
+            "sha256": 12_u32, // a NUMBER: v1 expects a string, so v1 deserialize fails
+        });
+        assert!(
+            classify_present_body(&future_schema.to_string())
+                .is_err_and(|err| err.contains("UPGRADE")),
+            "a future envelope that fails v1 deserialize must still refuse the push"
         );
 
         // And the first-read-diff flow proceeds to overwrite on a corrupt Present.

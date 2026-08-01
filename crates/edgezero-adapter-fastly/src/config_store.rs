@@ -4,7 +4,9 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::collections::HashMap;
 
-use crate::chunked_config::{resolve_fastly_config_value, value_is_future_format};
+use crate::chunked_config::{
+    ResolveFailure, resolve_fastly_config_value_typed, value_is_future_format,
+};
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use fastly::ConfigStore as FastlyConfigStoreInner;
@@ -84,18 +86,24 @@ impl ConfigStore for FastlyConfigStore {
         // DIFFERENT remediation than corruption: re-pushing the same config will
         // not help; the deployed build must be UPGRADED. Checked before `value` is
         // moved into the resolver.
+        // Computed on the RAW value: catches a DIRECT envelope from a newer writer,
+        // which the resolver passes through as a foreign value (an `Ok`, not an
+        // error) -- so it would otherwise reach core and surface as a generic
+        // integrity 500 instead of the upgrade/redeploy remediation.
         let future_format = value_is_future_format(&value);
         let transient = Cell::new(false);
-        let resolved = resolve_fastly_config_value(key, value, |chunk_key| {
+        let outcome = resolve_fastly_config_value_typed(key, value, |chunk_key| {
             let got = match &self.inner {
-                FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(chunk_key).map_err(|err| {
-                    if is_transient_lookup(&err) {
-                        transient.set(true);
-                    }
-                    // The pointer-controlled chunk key is not echoed (the resolver
-                    // adds a safe position locator); the SDK `err` carries no value.
-                    format!("config store lookup failed: {err}")
-                })?,
+                FastlyConfigStoreBackend::Fastly(inner) => {
+                    inner.try_get(chunk_key).map_err(|err| {
+                        if is_transient_lookup(&err) {
+                            transient.set(true);
+                        }
+                        // The pointer-controlled chunk key is not echoed (the resolver
+                        // adds a safe position locator); the SDK `err` carries no value.
+                        format!("config store lookup failed: {err}")
+                    })?
+                }
                 #[cfg(test)]
                 FastlyConfigStoreBackend::InMemory(data) => data.get(chunk_key).cloned(),
             };
@@ -105,34 +113,52 @@ impl ConfigStore for FastlyConfigStore {
                 transient.set(true);
             }
             Ok(got)
-        })
-        .map_err(|err| {
-            if future_format {
-                log::warn!(
-                    "Fastly config-store value for `{key}` uses a NEWER format than this build \
-                     understands: {err}. Re-pushing the same config will not help -- redeploy this \
-                     service with an updated EdgeZero build."
-                );
-                ConfigStoreError::internal(anyhow::anyhow!(
-                    "config store value uses a newer format than this build understands; redeploy \
-                     this service with an updated build (re-pushing will not help)"
-                ))
-            } else if transient.get() {
-                log::warn!(
-                    "Fastly config-store chunk lookup for `{key}` was transiently unavailable: {err}"
-                );
-                ConfigStoreError::unavailable("config store temporarily unavailable")
-            } else {
-                log::warn!(
-                    "Fastly config-store chunk resolution failed for `{key}`: {err}. \
-                     Re-run `<app-cli> config push` to repair the store."
-                );
-                ConfigStoreError::internal(anyhow::anyhow!(
-                    "config store entry is corrupt or incomplete; re-run config push to repair: {err}"
-                ))
+        });
+        // A NEWER format -- a direct future envelope (passed through as `Ok`), a
+        // future pointer/inner-envelope version, or an unknown `edgezero_kind`
+        // (all typed `FutureFormat` by the resolver) -- needs a DIFFERENT
+        // remediation than corruption: re-pushing the same config will not help;
+        // the deployed build must be UPGRADED.
+        let future = future_format
+            || outcome
+                .as_ref()
+                .err()
+                .is_some_and(ResolveFailure::is_future_format);
+        if future {
+            log::warn!(
+                "Fastly config-store value for `{key}` uses a NEWER format than this build \
+                 understands. Re-pushing the same config will not help -- redeploy this service \
+                 with an updated EdgeZero build."
+            );
+            return Err(ConfigStoreError::internal(anyhow::anyhow!(
+                "config store value uses a newer format than this build understands; redeploy this \
+                 service with an updated build (re-pushing will not help)"
+            )));
+        }
+        match outcome {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(err) => {
+                let message = err.into_message();
+                if transient.get() {
+                    log::warn!(
+                        "Fastly config-store chunk lookup for `{key}` was transiently \
+                         unavailable: {message}"
+                    );
+                    Err(ConfigStoreError::unavailable(
+                        "config store temporarily unavailable",
+                    ))
+                } else {
+                    log::warn!(
+                        "Fastly config-store chunk resolution failed for `{key}`: {message}. \
+                         Re-run `<app-cli> config push` to repair the store."
+                    );
+                    Err(ConfigStoreError::internal(anyhow::anyhow!(
+                        "config store entry is corrupt or incomplete; re-run config push to \
+                         repair: {message}"
+                    )))
+                }
             }
-        })?;
-        Ok(Some(resolved))
+        }
     }
 }
 
@@ -295,6 +321,36 @@ mod tests {
                 && !message.contains("re-push to repair")
                 && !message.contains("push to repair"),
             "must NOT instruct the operator to re-push to repair a future format: {err}"
+        );
+    }
+
+    /// A DIRECT envelope from a newer writer passes through the resolver as a
+    /// foreign value (an `Ok`, not an error), so the future-format remediation
+    /// must be applied on the SUCCESS path too -- otherwise the newer value would
+    /// reach core and surface as a generic integrity 500 instead of "redeploy".
+    #[test]
+    fn direct_future_envelope_asks_to_redeploy_not_repush() {
+        use futures::executor::block_on;
+        // A v2 direct envelope: envelope-shaped, no `edgezero_kind`, version 2.
+        let store = FastlyConfigStore::from_entries([(
+            "app_config".to_owned(),
+            r#"{"data":{"x":1},"sha256":"0000000000000000000000000000000000000000000000000000000000000000","generated_at":"2026-01-01T00:00:00Z","version":2}"#
+                .to_owned(),
+        )]);
+        let err =
+            block_on(store.get("app_config")).expect_err("a direct future envelope must error");
+        assert!(
+            matches!(err, ConfigStoreError::Internal { .. }),
+            "a future format is Internal, not transient: {err:?}"
+        );
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("redeploy") || message.contains("newer format"),
+            "must ask the operator to redeploy an updated build: {err}"
+        );
+        assert!(
+            !message.contains("re-run config push") && !message.contains("push to repair"),
+            "must NOT instruct the operator to re-push a future format: {err}"
         );
     }
 }

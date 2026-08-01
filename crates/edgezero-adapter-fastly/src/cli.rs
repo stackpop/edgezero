@@ -12,10 +12,10 @@ use std::process::id as process_id;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, chunk_lengths, gc_classify_root,
-    gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
-    resolve_fastly_config_value, sha256_hex, value_announces_our_kind, value_is_future_format,
-    value_is_inert_foreign, verify_writer_split_layout,
+    CHUNK_KEY_INFIX, GcPointer, GcRootValue, ResolveFailure, chunk_key_generation, chunk_lengths,
+    gc_classify_root, gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
+    resolve_fastly_config_value_typed, sha256_hex, value_announces_our_kind,
+    value_is_future_format, value_is_inert_foreign, verify_writer_split_layout,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -696,12 +696,14 @@ impl Adapter for FastlyCliAdapter {
         let store_id = match resolve_remote_config_store_id(name) {
             Ok(id) => id,
             Err(err) => {
-                // "not found" from resolve means the store doesn't exist.
-                let lower = err.to_ascii_lowercase();
-                if lower.contains("not found")
-                    || lower.contains("did you run")
-                    || lower.contains("no fastly config-store matches")
-                {
+                // Map to MissingStore ONLY on the resolver's OWN unambiguous
+                // "store is absent" signal. A bare "not found" must NOT qualify:
+                // `resolve_remote_config_store_id` returns "`fastly` not found on
+                // PATH" for a missing binary and surfaces list/auth/network stderr
+                // verbatim -- operational failures that must fail closed, never
+                // read as absence (an incomplete read that authorised an overwrite
+                // would clobber healthy remote state).
+                if err.contains("no fastly config-store matches") {
                     return Ok(ReadConfigEntry::MissingStore);
                 }
                 return Err(err);
@@ -759,7 +761,7 @@ impl Adapter for FastlyCliAdapter {
             //     (the delete path already documents this) -- so we do NOT trust
             //     it as a genuinely-missing chunk we could safely overwrite.
             let fetch_failed: Cell<bool> = Cell::new(false);
-            let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
+            let resolved = resolve_fastly_config_value_typed(key, value.to_owned(), |chunk_key| {
                 match fetch_remote_config_store_entry(&store_id, chunk_key) {
                     Ok(Some(found)) => Ok(Some(found)),
                     Ok(None) => {
@@ -776,7 +778,16 @@ impl Adapter for FastlyCliAdapter {
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let lower = stderr.to_ascii_lowercase();
-        if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404")
+        // A genuinely-absent entry is a legitimate MissingKey (the first-push
+        // case). But an OPERATIONAL failure (auth, network, server 5xx, rate
+        // limit) that merely happens to contain "not found"/"404" must NOT read as
+        // absence: two such incomplete reads could pass the pre-write recheck and
+        // authorise an overwrite of healthy remote state. Fail closed on any
+        // operational marker; only a clean absence signal maps to MissingKey.
+        if !stderr_signals_operational_failure(&lower)
+            && (lower.contains("not found")
+                || lower.contains("does not exist")
+                || lower.contains("404"))
         {
             return Ok(ReadConfigEntry::MissingKey);
         }
@@ -882,20 +893,21 @@ impl Adapter for FastlyCliAdapter {
                     ));
                 };
                 // Resolve chunk pointers using the same toml contents table.
-                let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
-                    match contents_tbl.get(chunk_key) {
-                        Some(chunk_item) => {
-                            let chunk_val = chunk_item.as_str().ok_or_else(|| {
-                                format!(
-                                    "chunk key `{chunk_key}` in {} is not a string",
-                                    fastly_path.display()
-                                )
-                            })?;
-                            Ok(Some(chunk_val.to_owned()))
+                let resolved =
+                    resolve_fastly_config_value_typed(key, value.to_owned(), |chunk_key| {
+                        match contents_tbl.get(chunk_key) {
+                            Some(chunk_item) => {
+                                let chunk_val = chunk_item.as_str().ok_or_else(|| {
+                                    format!(
+                                        "chunk key `{chunk_key}` in {} is not a string",
+                                        fastly_path.display()
+                                    )
+                                })?;
+                                Ok(Some(chunk_val.to_owned()))
+                            }
+                            None => Ok(None),
                         }
-                        None => Ok(None),
-                    }
-                });
+                    });
                 // Same taxonomy as the cloud read, so recovery is uniform across
                 // targets: a valid envelope is `Present`; a non-envelope or
                 // corrupt/incomplete value is `Corrupt` (the local writer's
@@ -1047,29 +1059,37 @@ fn canonicalize_parent_join(path: &Path) -> PathBuf {
 /// the link), and the path-based lock cannot serialise writers arriving via the
 /// other names. Fail closed with a fix. A not-yet-created file, or a filesystem
 /// that does not report a link count, is left alone.
-#[cfg_attr(
-    not(unix),
-    expect(
-        unused_variables,
-        clippy::unnecessary_wraps,
-        reason = "the hard-link check is unix-only; on other targets this is a no-op that still returns Result to keep one signature"
-    )
-)]
+///
+/// The link count is read via the platform `MetadataExt` -- `nlink()` on Unix,
+/// `number_of_links()` on Windows (both stable, no extra deps) -- so Windows
+/// hard-link aliases are caught too, not just Unix ones. On any other target the
+/// count is unknown and the file is left alone.
 fn reject_hard_linked_manifest(target: &Path) -> Result<(), String> {
     #[cfg(unix)]
-    {
+    let link_count: Option<u64> = {
         use std::os::unix::fs::MetadataExt as _;
-        if let Ok(meta) = fs::metadata(target)
-            && meta.nlink() > 1
-        {
-            return Err(format!(
-                "{} has multiple hard links (link count {}); refusing to replace it -- an atomic \
-                 rename would break the link and concurrent writers via the other names could \
-                 diverge. Remove the extra hard link(s), or use a symlink instead.",
-                target.display(),
-                meta.nlink()
-            ));
-        }
+        fs::metadata(target).ok().map(|meta| meta.nlink())
+    };
+    #[cfg(windows)]
+    let link_count: Option<u64> = {
+        use std::os::windows::fs::MetadataExt as _;
+        fs::metadata(target)
+            .ok()
+            .and_then(|meta| meta.number_of_links())
+            .map(u64::from)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let link_count: Option<u64> = None;
+
+    if let Some(count) = link_count
+        && count > 1
+    {
+        return Err(format!(
+            "{} has multiple hard links (link count {count}); refusing to replace it -- an atomic \
+             rename would break the link and concurrent writers via the other names could \
+             diverge. Remove the extra hard link(s), or use a symlink instead.",
+            target.display(),
+        ));
     }
     Ok(())
 }
@@ -1140,6 +1160,42 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
     ))
 }
 
+/// Does this lowercased Fastly stderr indicate an OPERATIONAL failure (auth,
+/// network, server, rate-limit) rather than a genuinely-absent entry/store?
+///
+/// The fastly CLI's not-found wording is AMBIGUOUS: a 401/403, a 5xx, a timeout,
+/// or a rate-limit can all carry "not found"/"404"-shaped text. Such a read is
+/// INCOMPLETE, so it must fail closed -- never read as absence, which would let a
+/// push overwrite healthy remote state it never actually saw.
+fn stderr_signals_operational_failure(lower: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "unauthor",
+        "forbidden",
+        "permission",
+        "denied",
+        "credential",
+        "token",
+        "timed out",
+        "timeout",
+        "could not connect",
+        "connection",
+        "network",
+        "temporarily",
+        "unavailable",
+        "rate limit",
+        "too many requests",
+        "internal server",
+        "bad gateway",
+        "gateway timeout",
+        "500",
+        "502",
+        "503",
+        "504",
+        "dns",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 /// Does `body` parse AND integrity-verify as a `BlobEnvelope`?
 ///
 /// The typed-config key must hold a valid envelope. A resolved chunk pointer
@@ -1157,7 +1213,11 @@ fn body_is_valid_envelope(body: &str) -> bool {
 ///
 /// - a FUTURE format (unknown/newer `edgezero_kind`, or a bumped envelope/pointer
 ///   `version`) → a hard error: overwriting a newer format with this v1 CLI would
-///   lose it. Checked FIRST, on the raw stored value, so it wins over `Corrupt`.
+///   lose it. Checked FIRST. Detected two ways: on the raw stored value (a direct
+///   future envelope, or a future pointer version), AND via a typed
+///   [`ResolveFailure::FutureFormat`] from the resolver -- the ONLY signal for a
+///   newer INNER envelope reassembled from v1 chunks, which the raw value alone
+///   cannot reveal.
 /// - a resolve error where a chunk FETCH failed for infrastructure reasons
 ///   (`fetch_failed`) → a hard error: the read was incomplete, so a push must not
 ///   overwrite healthy remote state.
@@ -1166,13 +1226,21 @@ fn body_is_valid_envelope(body: &str) -> bool {
 ///   mismatch, a foreign non-envelope) → `Corrupt` (repairable by overwrite).
 /// - any other resolve error (bad/missing chunk, malformed pointer) → `Corrupt`.
 fn classify_resolved_read(
-    resolved: Result<String, String>,
+    resolved: Result<String, ResolveFailure>,
     raw_value: &str,
     fetch_failed: bool,
 ) -> Result<ReadConfigEntry, String> {
-    // A newer format is refused BEFORE anything else, whether it passed through as
-    // a direct value or failed the resolver on a bumped pointer version.
-    if value_is_future_format(raw_value) {
+    // A newer format is refused BEFORE anything else: on the raw value (direct
+    // future envelope or future pointer version) OR when the resolver typed the
+    // failure as a newer format (a future inner envelope only knowable after the
+    // chunks are reassembled). Overwriting a newer format with this v1 CLI would
+    // lose it.
+    if value_is_future_format(raw_value)
+        || resolved
+            .as_ref()
+            .err()
+            .is_some_and(ResolveFailure::is_future_format)
+    {
         return Err(FUTURE_FORMAT_READ_ERROR.to_owned());
     }
     match resolved {
@@ -2303,17 +2371,23 @@ fn classify_store_entries(
             // Aborting here would let one ordinary sibling block reclamation of
             // every generation in the store.
             //
-            // Two guards keep this from ever masking corruption:
+            // Three guards keep this from ever masking corruption:
             //   - the value must be provably inert (NOT a malformed object that
             //     could be a truncated/corrupt pointer, NOT a value claiming our
             //     namespace) -- otherwise we might orphan chunks a broken root
             //     still references;
+            //   - it must NOT be a future format. A direct envelope from a newer
+            //     writer classifies as `Foreign` (no `edgezero_kind`), so without
+            //     this guard it would be waved through as a zero-reference root --
+            //     yet a newer format may reference chunks under a scheme this build
+            //     cannot read, and GC would plan them for deletion. Fail closed;
             //   - the KEY must be outside our reserved `.__edgezero_chunks.`
             //     namespace. A non-canonical key that still lives in that
             //     namespace is not an ordinary sibling; we cannot say what it is,
             //     so it fails closed below rather than being waved through.
             Err(_)
                 if value_is_inert_foreign(&item.item_value)
+                    && !value_is_future_format(&item.item_value)
                     && !item.item_key.contains(CHUNK_KEY_INFIX) =>
             {
                 roots = roots.saturating_add(1);
@@ -4418,12 +4492,16 @@ build = \"cargo build --release\"
     /// `MissingStore` without ever calling the describe subcommand.
     #[cfg(unix)]
     #[test]
-    fn read_remote_returns_missing_store_on_appropriate_stderr() {
+    fn read_remote_fails_closed_when_the_list_call_itself_errors() {
         use std::os::unix::fs::PermissionsExt as _;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Script that exits non-zero for the list call so resolve fails with
-        // a "not found" error, causing read_config_entry to return MissingStore.
+        // The list call EXITS NON-ZERO with "not found"-shaped stderr. That is an
+        // OPERATIONAL failure (auth/network/server), not proof the store is absent
+        // -- the absence signal is a SUCCESSFUL list that omits the store. So this
+        // must fail closed (a hard error the operator retries), NEVER MissingStore:
+        // reading it as absence could authorise an overwrite of a store we never
+        // actually queried.
         let fake_dir = tempdir().expect("tempdir");
         let stderr_file = fake_dir.path().join("stderr_payload.txt");
         fs::write(&stderr_file, "Error: config store not found for service").expect("write stderr");
@@ -4437,6 +4515,35 @@ build = \"cargo build --release\"
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod +x");
         let _path = PathPrepend::new(fake_dir.path());
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        assert!(
+            result.is_err(),
+            "a failed list call must fail closed, not read as MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_store_when_the_store_is_genuinely_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // The list call SUCCEEDS and returns a valid, empty store array. The store
+        // is genuinely absent -> `no fastly config-store matches` -> MissingStore.
+        let fake_dir = tempdir().expect("tempdir");
+        let script_path = fake_dir.path().join("fastly");
+        fs::write(&script_path, "#!/bin/sh\necho '[]'\nexit 0\n").expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        let _path = PathPrepend::new(fake_dir.path());
         let result = FastlyCliAdapter
             .read_config_entry(
                 dir.path(),
@@ -4446,10 +4553,10 @@ build = \"cargo build --release\"
                 "greeting",
                 &AdapterPushContext::new(),
             )
-            .expect("list failure with not-found maps to MissingStore (not Err)");
+            .expect("a successful list that omits the store maps to MissingStore");
         assert!(
             matches!(result, ReadConfigEntry::MissingStore),
-            "list not-found => MissingStore"
+            "store absent from a successful list => MissingStore"
         );
     }
 
@@ -5402,6 +5509,36 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// A not-found-shaped stderr that ALSO carries an operational marker (auth,
+    /// network, server 5xx, rate-limit) must be read as an operational failure,
+    /// never as a genuine absence -- so it fails closed instead of authorising an
+    /// overwrite. A clean absence has no such marker.
+    #[test]
+    fn operational_stderr_is_never_read_as_absence() {
+        for op in [
+            "error: 404 not found (401 unauthorized)",
+            "not found: connection reset",
+            "does not exist -- 503 service unavailable",
+            "not found; rate limit exceeded",
+            "request timed out; entry not found",
+        ] {
+            assert!(
+                stderr_signals_operational_failure(&op.to_ascii_lowercase()),
+                "must treat as operational (fail closed): {op}"
+            );
+        }
+        for absent in [
+            "error: config store entry not found",
+            "the item does not exist",
+            "404 page not found",
+        ] {
+            assert!(
+                !stderr_signals_operational_failure(&absent.to_ascii_lowercase()),
+                "a clean absence must not look operational: {absent}"
+            );
+        }
+    }
+
     /// The read taxonomy distinguishes repairable corruption from cases a push
     /// must NOT overwrite: an infrastructure fetch failure (incomplete read) and
     /// an unknown/future format both stay hard errors, while a malformed direct
@@ -5441,7 +5578,7 @@ echo 'unexpected' >&2; exit 1
         // A resolve error caused by an INFRASTRUCTURE fetch failure stays a HARD
         // error: the read was incomplete, so a push must not overwrite.
         let infra = classify_resolved_read(
-            Err("boom".to_owned()),
+            Err(ResolveFailure::Corrupt("boom".to_owned())),
             "{\"edgezero_kind\":\"fastly_config_chunks\"}",
             true,
         );
@@ -5455,7 +5592,7 @@ echo 'unexpected' >&2; exit 1
         // A value announcing an UNKNOWN/future kind is a HARD error (upgrade CLI),
         // never offered for overwrite.
         let unknown = classify_resolved_read(
-            Err("x".to_owned()),
+            Err(ResolveFailure::FutureFormat("x".to_owned())),
             r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
             false,
         );
@@ -5466,10 +5603,29 @@ echo 'unexpected' >&2; exit 1
             "an unknown/future kind must be a hard error"
         );
 
+        // A NEWER INNER envelope (a valid v1 pointer wrapping a v2 envelope) is
+        // only knowable AFTER reassembly: the raw value is a healthy v1 pointer,
+        // so the typed `FutureFormat` failure is the ONLY signal. It must be a
+        // hard error, never repairable Corrupt -- a downgrade push must not
+        // overwrite it.
+        let inner_future = classify_resolved_read(
+            Err(ResolveFailure::FutureFormat(
+                "newer inner envelope".to_owned(),
+            )),
+            r#"{"edgezero_kind":"fastly_config_chunks","version":1,"chunks":[]}"#,
+            false,
+        );
+        assert!(
+            inner_future
+                .as_ref()
+                .is_err_and(|err| err.contains("UPGRADE")),
+            "a future INNER envelope (typed FutureFormat) must be a hard error, not Corrupt"
+        );
+
         // An ordinary resolve error (bad/missing chunk) is repairable Corrupt.
         assert!(matches!(
             classify_resolved_read(
-                Err("bad chunk".to_owned()),
+                Err(ResolveFailure::Corrupt("bad chunk".to_owned())),
                 r#"{"edgezero_kind":"fastly_config_chunks","chunks":[]}"#,
                 false
             ),
@@ -5492,9 +5648,15 @@ echo 'unexpected' >&2; exit 1
         // error too -- the pointer kind is ours, but the version is newer.
         let v2_ptr = r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#;
         assert!(
-            classify_resolved_read(Err("unsupported version".to_owned()), v2_ptr, false)
-                .as_ref()
-                .is_err_and(|err| err.contains("UPGRADE")),
+            classify_resolved_read(
+                Err(ResolveFailure::FutureFormat(
+                    "unsupported version".to_owned()
+                )),
+                v2_ptr,
+                false
+            )
+            .as_ref()
+            .is_err_and(|err| err.contains("UPGRADE")),
             "a v2 pointer must be a hard error, not Corrupt"
         );
     }
@@ -7066,6 +7228,44 @@ echo 'unexpected' >&2; exit 1
         assert!(
             !oplog_has(&oplog, "delete greeting"),
             "the foreign sibling must never be deleted"
+        );
+    }
+
+    /// A DIRECT envelope from a NEWER writer at an ordinary key classifies as
+    /// `Foreign` (no `edgezero_kind`), so without the future-format guard GC would
+    /// wave it through as a zero-reference root and reclaim an otherwise-dead
+    /// generation -- yet the newer format may reference those chunks under a
+    /// scheme this build cannot read. GC must FAIL CLOSED and delete nothing.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_a_future_direct_envelope_at_an_ordinary_key() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let dead = gen_envelope("dead");
+
+        // Envelope-shaped, no discriminator, VERSION 2 -> a newer direct envelope.
+        let future = r#"{"data":{"x":1},"sha256":"0000000000000000000000000000000000000000000000000000000000000000","generated_at":"2026-01-01T00:00:00Z","version":2}"#;
+        let mut listing = vec![(
+            "app_config".to_owned(),
+            stamp_secs_ago(172_800),
+            future.to_owned(),
+        )];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = run_gc(dir.path(), 86_400, false);
+        assert!(
+            result.is_err(),
+            "a future direct envelope must abort GC (fail closed)"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "nothing may be deleted when GC fails closed; log:\n{log}"
         );
     }
 
