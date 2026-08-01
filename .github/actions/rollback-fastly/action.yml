@@ -66,7 +66,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: echo "root=$(mktemp -d "${RUNNER_TEMP:-/tmp}/edgezero.XXXXXX")" >>"$GITHUB_OUTPUT"
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh
 
     # GitHub does not enforce `required: true` on composite inputs, and an empty
     # artifact name makes actions/download-artifact fetch EVERY artifact in the

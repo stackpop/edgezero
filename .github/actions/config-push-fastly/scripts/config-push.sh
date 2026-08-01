@@ -147,6 +147,9 @@ main() {
   if [[ "$no_env" == "true" ]]; then argv+=(--no-env); fi
   argv+=(--yes --no-diff)
 
+  # Enter the app dir BEFORE signalling: a directory-entry failure here means the
+  # CLI was never invoked, so it must NOT falsely claim a mutation was attempted.
+  cd "$app_dir" || fail "could not enter working-directory '$app_dir'"
   # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
   # signal survives a failed step (readable via `if: always()`). If the push
   # succeeds but its canonical `pushed-key=`/`pushed-store=` lines are missing
@@ -154,7 +157,7 @@ main() {
   # store is unchanged.
   append_output mutation-attempted true
   local rc=0
-  (cd "$app_dir" && "${argv[@]}") 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+  "${argv[@]}" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail_with "$rc" "config push failed (CLI exit $rc)"
   fi

@@ -280,6 +280,16 @@ EOF
 # extracts it and surfaces the metadata.
 test_download_cli_metadata() {
   section "download-app-cli metadata"
+  # download-app-cli.sh checks require_linux_x86_64 (it runs the Linux artifact's
+  # --help), so main() only completes on a Linux x86-64 runner. CI's static-checks
+  # job is Linux and exercises it for real.
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64 | Linux-amd64) ;;
+    *)
+      pass "download-app-cli metadata (skipped: non-Linux runner)"
+      return
+      ;;
+  esac
 
   local artifact_dir="$WORK_DIR/artifact"
   local stage_dir="$artifact_dir/stage"
@@ -442,10 +452,15 @@ test_workspace_step_scrub() {
     assert_succeeds "$a: prepare step blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
     assert_succeeds "$a: prepare step blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
   done
-  # build-app-cli's own cleanup step (a run: step added with the workspace refactor).
-  block=$(step_block "$ACTIONS_DIR/build-app-cli/action.yml" "Cleanup workspace")
-  assert_succeeds "build-app-cli: cleanup step blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
-  assert_succeeds "build-app-cli: cleanup step blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
+  # Every build-app-cli run: bash step must blank BASH_ENV — including the publish
+  # step, which holds the REAL GITHUB_OUTPUT and is the handoff-validation boundary,
+  # and the cleanup step.
+  local step
+  for step in "Compile application CLI package" "Publish CLI outputs" "Cleanup workspace"; do
+    block=$(step_block "$ACTIONS_DIR/build-app-cli/action.yml" "$step")
+    assert_succeeds "build-app-cli: '$step' blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
+    assert_succeeds "build-app-cli: '$step' blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
+  done
 }
 
 test_workspace_isolation() {
@@ -456,13 +471,29 @@ test_workspace_isolation() {
   local a p
   for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly; do
     p="$ACTIONS_DIR/$a/action.yml"
-    assert_succeeds "$a: mints a mktemp -d workspace as its first step" \
-      grep -qF 'mktemp -d' "$p"
+    assert_succeeds "$a: mints its workspace via the shared prepare-workspace.sh" \
+      grep -qF 'deploy-core/scripts/prepare-workspace.sh' "$p"
     assert_fails "$a: leaves no fixed runner.temp/edgezero path" \
       grep -qE 'runner\.temp \}\}/edgezero-' "$p"
     assert_succeeds "$a: cleanup removes the workspace root" \
       grep -qF 'EDGEZERO__ACTION__WORKSPACE:' "$p"
   done
+
+  # prepare-workspace.sh mints a validated mktemp -d root under RUNNER_TEMP. The
+  # root is validated SEPARATELY (a masked mktemp failure would publish an empty
+  # root, escaping RUNNER_TEMP).
+  local prep="$CORE_SCRIPTS/prepare-workspace.sh"
+  assert_succeeds "prepare-workspace mints a mktemp -d root" grep -qF 'mktemp -d' "$prep"
+  assert_succeeds "prepare-workspace validates the root before publishing" \
+    grep -qF 'could not create the action workspace' "$prep"
+  local prt="$WORK_DIR/prep-rt" pout="$WORK_DIR/prep-out" minted
+  rm -rf "$prt"
+  mkdir -p "$prt"
+  : >"$pout"
+  RUNNER_TEMP="$prt" GITHUB_OUTPUT="$pout" bash "$prep"
+  minted=$(sed -n 's/^root=//p' "$pout")
+  assert_succeeds "prepare-workspace publishes a real dir under RUNNER_TEMP" \
+    bash -c "[ -d '$minted' ] && case '$minted' in '$prt'/*) exit 0;; *) exit 1;; esac"
 
   # cleanup.sh actually removes EDGEZERO__ACTION__WORKSPACE (confined to RUNNER_TEMP).
   local rt="$WORK_DIR/ws-clean" ws
@@ -478,6 +509,18 @@ test_workspace_isolation() {
   mkdir -p "$outside"
   RUNNER_TEMP="$rt" EDGEZERO__ACTION__WORKSPACE="$outside" bash "$CORE_SCRIPTS/cleanup.sh" >/dev/null 2>&1
   assert_succeeds "cleanup refuses a workspace outside RUNNER_TEMP" test -d "$outside"
+}
+
+test_no_inline_action_scripts() {
+  section "actions use script files, never inline run:"
+  # Every composite `run:` must invoke a `.sh` file — no inline shell in YAML, which
+  # would be neither shellcheck'd nor testable. A `run: |` block header (or any
+  # `run:` line without a `.sh`) fails this.
+  local p bad
+  for p in "$ACTIONS_DIR"/*/action.yml; do
+    bad=$(grep -nE '^[[:space:]]*run:' "$p" | grep -vF '.sh' || true)
+    assert_equals "$(basename "$(dirname "$p")"): every run: invokes a .sh script" "" "$bad"
+  done
 }
 
 test_cleanup_confinement() {
@@ -1048,6 +1091,14 @@ test_config_push_argv() {
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1
   assert_succeeds "a pushed key containing '/' is accepted, not rejected post-write" \
     grep -qx 'pushed-key=release/canary' "$cpdir/ghout"
+
+  # cd into the app dir must precede the mutation-attempted signal: a directory-
+  # entry failure means the CLI was never invoked, so it must not falsely signal.
+  local cp="$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" cd_line sig_line
+  cd_line=$(grep -n 'could not enter working-directory' "$cp" | head -1 | cut -d: -f1)
+  sig_line=$(grep -n 'append_output mutation-attempted' "$cp" | head -1 | cut -d: -f1)
+  assert_succeeds "config-push cd precedes the mutation-attempted signal" \
+    test "$cd_line" -lt "$sig_line"
 
   # no-env: --no-env is appended only when requested.
   local noenv_argv
@@ -1647,7 +1698,7 @@ test_healthcheck_path() {
 # ---------------------------------------------------------------------------
 # The mutation-attempted reconcile signal: a provider mutation whose canonical
 # output line is missing STILL fails the step (loud), but the signal is already
-# durable so an `if: always()` caller can reconcile provider state.
+# published (best-effort) so an `if: always()` caller can reconcile provider state.
 # ---------------------------------------------------------------------------
 test_mutation_attempted_signal() {
   section "mutation-attempted reconcile signal"
@@ -1841,8 +1892,9 @@ CLI
   assert_succeeds "an invoked deploy signals mutation-attempted" \
     grep -qx 'mutation-attempted=true' "$dir/out"
   assert_succeeds "an invoked deploy emits fastly-version" grep -qx 'fastly-version=42' "$dir/out"
-  # Durability: the signal was present BEFORE the CLI finished, so a cancel or
-  # timeout mid-mutation cannot lose it.
+  # Durability (best-effort): the signal was present BEFORE the CLI finished, so a
+  # cancel/timeout mid-mutation CAN preserve it — though a hard runner loss can
+  # still drop it, so its absence is not proof of no mutation.
   assert_equals "the signal is published before the CLI runs" \
     "signal-before-cli=yes" "$(cat "$dir/probe")"
 
@@ -1868,6 +1920,7 @@ main() {
   test_cleanup_confinement
   test_workspace_isolation
   test_workspace_step_scrub
+  test_no_inline_action_scripts
   test_action_env_scrub
   test_deploy_args_prepend
   test_provider_env_nul

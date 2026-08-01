@@ -92,7 +92,7 @@ runs:
         CF_ACCOUNT_ID: ""
         SPIN_AUTH_TOKEN: ""
         FERMYON_TOKEN: ""
-      run: echo "root=$(mktemp -d "${RUNNER_TEMP:-/tmp}/edgezero.XXXXXX")" >>"$GITHUB_OUTPUT"
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh
 
     - name: Compile application CLI package
       id: compile
@@ -189,6 +189,12 @@ runs:
       shell: bash
       env:
         EDGEZERO__BUILD__OUTPUTS_FILE: ${{ steps.ws.outputs.root }}/outputs.env
+        # This step holds the REAL GITHUB_OUTPUT and is the handoff-validation
+        # boundary. Blank BASH_ENV/ENV so a caller's job env cannot point them at
+        # checkout code that runs at bash startup — before publish-outputs.sh — with
+        # a custom provider alias in scope, and write forged outputs directly.
+        BASH_ENV: ""
+        ENV: ""
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""

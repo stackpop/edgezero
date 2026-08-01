@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # Extracts the build-app-cli artifact tar (downloaded by actions/download-artifact)
-# into an action-owned tool dir, preserving the executable bit, reads the
-# self-describing app-cli-meta.json, and prepends the dir to PATH for action steps.
-# A wrapper-supplied EDGEZERO__APP__CLI__BIN overrides the metadata's binary name.
+# into an action-owned tool dir, preserving the executable bit, and reads the
+# self-describing app-cli-meta.json. A wrapper-supplied EDGEZERO__APP__CLI__BIN
+# overrides the metadata's binary name. The binary's ABSOLUTE path is emitted as
+# `app-cli-path`; the dir is deliberately NOT added to PATH, so an app CLI named
+# after a tool the action shells out to (jq, fastly, …) cannot shadow it.
 #
 # Reads (env):
 #   EDGEZERO__APP__CLI__ARTIFACT_DIR      required  dir containing the downloaded tar
@@ -12,11 +14,10 @@ set -euo pipefail
 #   EDGEZERO__ACTION__TOOL_ROOT           optional  install dir (default: under RUNNER_TEMP)
 # Writes (outputs):
 #   app-cli-bin                           resolved binary name
+#   app-cli-path                          ABSOLUTE path to the binary (callers use this)
 #   app-cli-version                       version from app-cli-meta.json
 # Writes (env):
 #   EDGEZERO__ACTION__TOOL_ROOT           the install dir (for later steps + cleanup)
-# Writes (PATH):
-#   the install dir's bin/, so the app CLI is callable by name
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -48,6 +49,10 @@ main() {
   local cli_bin_override="${EDGEZERO__APP__CLI__BIN:-}"
   local tool_root="${EDGEZERO__ACTION__TOOL_ROOT:-${RUNNER_TEMP:-/tmp}/edgezero-action-tools}"
 
+  # The artifact is a Linux x86-64 binary, and this step runs its `--help` below.
+  # Check the runner FIRST so an unsupported runner gets the documented diagnostic
+  # rather than a misleading "did not run --help" from an exec-format failure.
+  require_linux_x86_64
   require_cmd jq
   require_cmd tar
   mkdir -p "$tool_root/bin"

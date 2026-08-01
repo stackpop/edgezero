@@ -595,8 +595,11 @@ probe it, roll back on failure.
 3. Validate exact boolean inputs.
 4. Download the `app-cli-artifact` (a tar) into an action-owned directory below
    `RUNNER_TEMP`, extract it preserving permissions (or `chmod +x <app-cli-bin>`),
-   read `app-cli-meta.json` for `app-cli-bin`/`app-cli-version` (a wrapper `app-cli-bin` input
-   overrides), and prepend the directory to `PATH` for action steps only.
+   read `app-cli-meta.json` for `app-cli-bin`/`app-cli-version` (a wrapper `app-cli-bin`
+   input overrides), and emit the binary's ABSOLUTE path as `app-cli-path`. The
+   directory is deliberately NOT prepended to `PATH`: callers invoke the exact
+   `app-cli-path`, so an app CLI legitimately named after a tool the action shells
+   out to (e.g. `jq`, `fastly`) cannot shadow it.
 5. Parse `build-args`, `deploy-args`, `deploy-flags`, `provider-env-clear` as
    JSON string arrays. **`provider-env` is not present in these steps** — it is
    scoped to the deploy step's own `env:` and parsed only there (step 17), so

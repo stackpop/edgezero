@@ -121,7 +121,9 @@ reference to port from. Most transfer with light changes:
      `provider-env-clear`.
    - Download the CLI artifact (tar) under `RUNNER_TEMP`, extract preserving the
      executable bit (or `chmod +x <app-cli-bin>`), read `app-cli-meta.json` for
-     `app-cli-bin`/`app-cli-version` (wrapper `app-cli-bin` overrides), and PATH-scope it.
+     `app-cli-bin`/`app-cli-version` (wrapper `app-cli-bin` overrides), and emit its
+     ABSOLUTE path as `app-cli-path`. It is NOT added to `PATH` — callers invoke the
+     absolute path, so an app CLI named after a system tool cannot shadow it.
    - Validate `adapter` well-formedness (no compiled-adapter enumeration — the
      CLI rejects unknown adapters itself), booleans, JSON arrays/object, NUL
      bytes.

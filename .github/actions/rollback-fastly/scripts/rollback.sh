@@ -60,8 +60,9 @@ main() {
   new_private_log
   # Record that a provider mutation is being ATTEMPTED after setup (CLI verified)
   # and immediately before the CLI runs: a setup failure never falsely signals, and
-  # because it is durable in GITHUB_OUTPUT before the mutation starts it survives a
-  # cancel/timeout mid-activation (readable via `if: always()`).
+  # because it lands in GITHUB_OUTPUT before the mutation starts it CAN survive a
+  # cancel/timeout mid-activation (best-effort — a hard runner loss can still drop
+  # it, so its absence is not proof of no mutation; read via `if: always()`).
   append_output mutation-attempted true
   local rc=0
   "${argv[@]}" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?

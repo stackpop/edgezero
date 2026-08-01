@@ -97,7 +97,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: echo "root=$(mktemp -d "${RUNNER_TEMP:-/tmp}/edgezero.XXXXXX")" >>"$GITHUB_OUTPUT"
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh
 
     - name: Validate inputs
       id: validate

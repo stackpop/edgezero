@@ -619,7 +619,9 @@ re-activate. Capture the target at deploy time and thread it through:
 - id: deploy
   uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+    # A literal artifact name works whether the build ran in this job or a
+    # separate one — steps.cli.* does not cross job boundaries.
+    app-cli-artifact: edgezero-cli
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
@@ -630,7 +632,7 @@ re-activate. Capture the target at deploy time and thread it through:
     steps.deploy.outputs.previous-version != ''
   uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
   with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+    app-cli-artifact: edgezero-cli
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
     fastly-version: ${{ steps.deploy.outputs.fastly-version }}
