@@ -563,7 +563,8 @@ impl Adapter for FastlyCliAdapter {
             }
             return Ok(out);
         }
-        let resolved_id = resolve_remote_config_store_id(name)?;
+        let resolved_id =
+            resolve_remote_config_store_id(name)?.ok_or_else(|| no_matching_store_error(name))?;
         // NOTE: a cloud push does NOT reclaim orphaned chunks.
         //
         // Fastly's config store is eventually consistent, so a generation may
@@ -693,21 +694,12 @@ impl Adapter for FastlyCliAdapter {
         // demand via `fastly config-store list --json`, then parse the
         // JSON response.
         let name = store.platform.as_str();
-        let store_id = match resolve_remote_config_store_id(name) {
-            Ok(id) => id,
-            Err(err) => {
-                // Map to MissingStore ONLY on the resolver's OWN unambiguous
-                // "store is absent" signal. A bare "not found" must NOT qualify:
-                // `resolve_remote_config_store_id` returns "`fastly` not found on
-                // PATH" for a missing binary and surfaces list/auth/network stderr
-                // verbatim -- operational failures that must fail closed, never
-                // read as absence (an incomplete read that authorised an overwrite
-                // would clobber healthy remote state).
-                if err.contains("no fastly config-store matches") {
-                    return Ok(ReadConfigEntry::MissingStore);
-                }
-                return Err(err);
-            }
+        // A TYPED absence: `Ok(None)` (list succeeded, no store matched) is the
+        // only path to MissingStore. Any operational failure stays `Err` and fails
+        // closed -- an incomplete read must never read as absence and authorise an
+        // overwrite of healthy remote state.
+        let Some(store_id) = resolve_remote_config_store_id(name)? else {
+            return Ok(ReadConfigEntry::MissingStore);
         };
         let store_arg = format!("--store-id={store_id}");
         let key_arg = format!("--key={key}");
@@ -728,7 +720,7 @@ impl Adapter for FastlyCliAdapter {
                 }
             })?;
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = strict_stdout(output.stdout, "config-store-entry describe --json")?;
             // Parse the JSON and extract the `item_value` field.
             let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
                 format!(
@@ -752,22 +744,21 @@ impl Adapter for FastlyCliAdapter {
             // are fetched from the same store and reconstructed.
             //
             // A referenced chunk that we cannot confidently retrieve makes the
-            // read INCOMPLETE, and a push must not overwrite healthy remote state
-            // on an incomplete read. Two ways this happens, both treated as a
-            // fetch failure (a HARD error, never overwritable `Corrupt`):
-            //   - an INFRASTRUCTURE error (spawn/auth/schema/non-zero status); and
-            //   - an ABSENT chunk (`Ok(None)`). The fastly CLI's "not found" text
-            //     is AMBIGUOUS -- a store/auth/server failure can produce it too
-            //     (the delete path already documents this) -- so we do NOT trust
-            //     it as a genuinely-missing chunk we could safely overwrite.
+            // read INCOMPLETE only when it could not be FULLY read. The two cases
+            // differ:
+            //   - an INFRASTRUCTURE error (spawn/auth/schema/non-zero status, or an
+            //     ambiguous not-found that carries an operational marker) → `Err`
+            //     → `fetch_failed`: an incomplete read that must be a HARD error,
+            //     never an overwritable value.
+            //   - a CONFIRMED-absent chunk (`Ok(None)`: a clean not-found, filtered
+            //     by `stderr_is_confirmed_absence`) is genuinely gone. The blob
+            //     spec makes persistent chunk loss REPAIRABLE by re-pushing, so it
+            //     resolves to a repairable `Corrupt`, NOT a hard error -- otherwise
+            //     `config push` could never overwrite to fix it.
             let fetch_failed: Cell<bool> = Cell::new(false);
             let resolved = resolve_fastly_config_value_typed(key, value.to_owned(), |chunk_key| {
                 match fetch_remote_config_store_entry(&store_id, chunk_key) {
-                    Ok(Some(found)) => Ok(Some(found)),
-                    Ok(None) => {
-                        fetch_failed.set(true);
-                        Ok(None)
-                    }
+                    Ok(found) => Ok(found),
                     Err(err) => {
                         fetch_failed.set(true);
                         Err(err)
@@ -778,17 +769,12 @@ impl Adapter for FastlyCliAdapter {
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let lower = stderr.to_ascii_lowercase();
-        // A genuinely-absent entry is a legitimate MissingKey (the first-push
-        // case). But an OPERATIONAL failure (auth, network, server 5xx, rate
-        // limit) that merely happens to contain "not found"/"404" must NOT read as
-        // absence: two such incomplete reads could pass the pre-write recheck and
-        // authorise an overwrite of healthy remote state. Fail closed on any
-        // operational marker; only a clean absence signal maps to MissingKey.
-        if !stderr_signals_operational_failure(&lower)
-            && (lower.contains("not found")
-                || lower.contains("does not exist")
-                || lower.contains("404"))
-        {
+        // Only a CONFIRMED clean absence (a not-found signal with no operational
+        // marker) is the legitimate first-push MissingKey. Any ambiguous or
+        // operational output (auth, network, 5xx, rate-limit, an HTML 404 page)
+        // stays a hard error: two such incomplete reads could otherwise pass the
+        // pre-write recheck and authorise an overwrite of healthy remote state.
+        if stderr_is_confirmed_absence(&lower) {
             return Ok(ReadConfigEntry::MissingKey);
         }
         Err(format!(
@@ -1126,7 +1112,7 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
             }
         })?;
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = strict_stdout(output.stdout, "config-store-entry describe --json")?;
         let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
             format!(
                 "failed to parse `fastly config-store-entry describe` JSON for key \
@@ -1149,7 +1135,12 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404") {
+    // Only a CONFIRMED clean absence maps to `Ok(None)` (the chunk is genuinely
+    // gone). An operational failure (auth, network, 5xx, rate-limit, an HTML 404
+    // page) stays `Err`: the caller treats a confirmed-absent chunk as a
+    // repairable value a re-push overwrites, but must fail closed on an
+    // ambiguous/incomplete read.
+    if stderr_is_confirmed_absence(&lower) {
         return Ok(None);
     }
     Err(format!(
@@ -1164,17 +1155,22 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
 /// network, server, rate-limit) rather than a genuinely-absent entry/store?
 ///
 /// The fastly CLI's not-found wording is AMBIGUOUS: a 401/403, a 5xx, a timeout,
-/// or a rate-limit can all carry "not found"/"404"-shaped text. Such a read is
-/// INCOMPLETE, so it must fail closed -- never read as absence, which would let a
-/// push overwrite healthy remote state it never actually saw.
+/// a rate-limit, or an HTML "page not found" from a proxy can all carry
+/// "not found"/"404"-shaped text. Such a read is INCOMPLETE, so it must fail
+/// closed -- never read as absence, which would let a push overwrite healthy
+/// remote state it never actually saw.
 fn stderr_signals_operational_failure(lower: &str) -> bool {
     const MARKERS: &[&str] = &[
         "unauthor",
+        "not authorized",
         "forbidden",
         "permission",
         "denied",
         "credential",
         "token",
+        "401",
+        "403",
+        "429",
         "timed out",
         "timeout",
         "could not connect",
@@ -1192,8 +1188,36 @@ fn stderr_signals_operational_failure(lower: &str) -> bool {
         "503",
         "504",
         "dns",
+        // A proxy/HTML 404 page ("404 page not found") is a routing/endpoint
+        // failure, NOT a genuine config-store-item absence.
+        "page not found",
     ];
     MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Is this lowercased Fastly stderr a CONFIRMED clean absence -- a not-found
+/// signal with NO operational marker? Only this maps a nonzero read to
+/// `MissingKey` / an absent chunk; any ambiguous or operational output stays a
+/// hard error (an incomplete read must never authorise an overwrite).
+fn stderr_is_confirmed_absence(lower: &str) -> bool {
+    !stderr_signals_operational_failure(lower)
+        && (lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("404"))
+}
+
+/// Convert `fastly` stdout to a `String`, FAILING CLOSED on invalid UTF-8 rather
+/// than substituting U+FFFD. A lossy replacement inside a JSON string could
+/// mutate a stored root value or chunk and yield parseable-but-WRONG data on a
+/// path that drives an overwrite or a deletion, violating the exact-read
+/// invariant. Diagnostics only ever see redacted output, so stderr stays lossy.
+fn strict_stdout(stdout: Vec<u8>, command: &str) -> Result<String, String> {
+    String::from_utf8(stdout).map_err(|_err| {
+        format!(
+            "`fastly {command}` returned non-UTF-8 output; refusing to act on it -- a lossy \
+             conversion could mutate a stored value. Nothing was changed."
+        )
+    })
 }
 
 /// Does `body` parse AND integrity-verify as a `BlobEnvelope`?
@@ -1244,15 +1268,20 @@ fn classify_resolved_read(
         return Err(FUTURE_FORMAT_READ_ERROR.to_owned());
     }
     match resolved {
-        Err(_) if fetch_failed => Err(
-            "a chunk fetch failed while reading the remote value (details redacted); the remote \
-             was not fully read, so nothing was changed. Fix connectivity/auth and retry."
-                .to_owned(),
-        ),
+        // An INFRASTRUCTURE fetch failure: the read was incomplete, so a push must
+        // not overwrite. The resolver's message is already redacted (it names only
+        // a chunk POSITION, never a value), so surface it for diagnostics.
+        Err(err) if fetch_failed => Err(format!(
+            "a chunk fetch failed while reading the remote value ({}); the remote was not fully \
+             read, so nothing was changed. Fix connectivity/auth and retry.",
+            err.into_message()
+        )),
         Ok(body) if body_is_valid_envelope(&body) => Ok(ReadConfigEntry::Present(body)),
         Ok(_) => Ok(ReadConfigEntry::Corrupt(
             "remote value is not a valid config envelope; a push will overwrite it",
         )),
+        // A confirmed-absent chunk, a hash mismatch, or a malformed pointer: the
+        // value was fully read and is provably unusable, so a push repairs it.
         Err(_) => Ok(ReadConfigEntry::Corrupt(
             "remote prior value could not be resolved (corrupt or incomplete chunk state); a push \
              will overwrite it",
@@ -1981,7 +2010,7 @@ fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, Str
             redact_stderr(&stderr)
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = strict_stdout(output.stdout, "config-store-entry list --json")?;
     let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
         format!(
             "failed to parse `fastly config-store-entry list` JSON (parse error redacted; \
@@ -2096,7 +2125,8 @@ fn gc_fastly_config_store(
                 .to_owned(),
         );
     }
-    let resolved_id = resolve_remote_config_store_id(store_name)?;
+    let resolved_id = resolve_remote_config_store_id(store_name)?
+        .ok_or_else(|| no_matching_store_error(store_name))?;
     let items = list_config_store_entries(&resolved_id)?;
     let plan = plan_gc_reclamation(&items, unix_now_secs(), older_than_secs)?;
     let GcPlan {
@@ -3056,7 +3086,12 @@ fn shape_summary(value: &serde_json::Value) -> &'static str {
 /// `fastly config-store list --json`, parse the JSON, match by
 /// `name`. The provision flow doesn't persist this id, so push
 /// has to re-fetch every time.
-fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
+///
+/// Returns a TYPED absence: `Ok(None)` ONLY when the list call SUCCEEDS and no
+/// store matches (a genuine absence). An operational failure (missing binary,
+/// spawn/list failure, schema drift) stays `Err` -- callers that read for a diff
+/// must not treat an operational failure as "store absent" and overwrite.
+fn resolve_remote_config_store_id(name: &str) -> Result<Option<String>, String> {
     let output = Command::new("fastly")
         .args(["config-store", "list", "--json"])
         .output()
@@ -3074,16 +3109,22 @@ fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = strict_stdout(output.stdout, "config-store list --json")?;
     match find_config_store_id(&stdout, name) {
-        ConfigStoreLookup::Found(id) => Ok(id),
-        ConfigStoreLookup::NotFound => Err(format!(
-            "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
-        )),
+        ConfigStoreLookup::Found(id) => Ok(Some(id)),
+        ConfigStoreLookup::NotFound => Ok(None),
         ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
             "could not parse `fastly config-store list --json` output: {detail}.\n  The fastly CLI may have changed its JSON schema in a recent version. Please file a bug report at https://github.com/stackpop/edgezero/issues with the fastly CLI version (`fastly version`) and the raw stdout. Workaround: pin to a known-compatible fastly CLI version."
         )),
     }
+}
+
+/// Message for a genuinely-absent store, for the write/GC callers that treat
+/// absence as a hard error (they cannot operate on a store that does not exist).
+fn no_matching_store_error(name: &str) -> String {
+    format!(
+        "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
+    )
 }
 
 /// # Errors
@@ -5383,7 +5424,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_hard_errors_on_a_not_found_chunk() {
+    fn read_config_entry_reports_corrupt_on_a_confirmed_absent_chunk() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
@@ -5391,7 +5432,8 @@ echo 'unexpected' >&2; exit 1
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
         let (_, pointer_json) = physical.last().unwrap();
-        // Only provide the root pointer; omit chunk responses so chunk fetch returns not-found.
+        // Only provide the root pointer; omit chunk responses so the chunk fetch
+        // gets a CLEAN not-found (`Error: item not found`, no operational marker).
         let ptr_resp = format!(
             r#"{{"item_value":{}}}"#,
             serde_json::to_string(pointer_json).unwrap()
@@ -5408,16 +5450,16 @@ echo 'unexpected' >&2; exit 1
             TEST_CONFIG_ID,
             &AdapterPushContext::new(),
         );
-        // A referenced chunk reported "not found" is AMBIGUOUS -- the fastly CLI
-        // uses that text for store/auth/server failures too -- so the read is
-        // INCOMPLETE and must be a HARD error, never an overwritable `Corrupt`. A
-        // push must not clobber healthy remote state after an incomplete read.
-        // (The RUNTIME path treats an absent chunk as a retryable Unavailable --
-        // see config_store.rs -- because a re-read there is cheap; the CLI is
-        // about to WRITE, so it fails closed.)
+        // A CONFIRMED-absent chunk (a clean not-found, filtered by
+        // `stderr_is_confirmed_absence`) is genuinely gone. The blob spec makes
+        // persistent chunk loss REPAIRABLE by re-pushing, so the read reports
+        // `Corrupt` (a push overwrites to repair), NOT a hard error -- otherwise
+        // `config push` could never fix it. An OPERATIONAL failure that merely
+        // carries not-found text stays a hard error (see the operational-marker
+        // tests), so an incomplete read still never authorises an overwrite.
         assert!(
-            result.is_err(),
-            "a not-found chunk must be a hard error (incomplete read), not overwritable Corrupt"
+            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
+            "a confirmed-absent chunk must be repairable Corrupt, not a hard error"
         );
     }
 
@@ -5515,26 +5557,43 @@ echo 'unexpected' >&2; exit 1
     /// overwrite. A clean absence has no such marker.
     #[test]
     fn operational_stderr_is_never_read_as_absence() {
+        // Not-found-shaped text that ALSO carries an operational marker must NOT
+        // be a confirmed absence -- it stays a hard error (fail closed). This
+        // includes numeric auth codes and an HTML "404 page not found" from a
+        // proxy, which are routing/auth failures, not a genuine item absence.
         for op in [
             "error: 404 not found (401 unauthorized)",
+            "not found (403 forbidden)",
             "not found: connection reset",
             "does not exist -- 503 service unavailable",
-            "not found; rate limit exceeded",
+            "not found; rate limit exceeded (429)",
             "request timed out; entry not found",
+            "404 page not found",
         ] {
+            let lower = op.to_ascii_lowercase();
             assert!(
-                stderr_signals_operational_failure(&op.to_ascii_lowercase()),
-                "must treat as operational (fail closed): {op}"
+                stderr_signals_operational_failure(&lower),
+                "must treat as operational: {op}"
+            );
+            assert!(
+                !stderr_is_confirmed_absence(&lower),
+                "operational output must not be a confirmed absence: {op}"
             );
         }
+        // A CLEAN not-found (no operational marker) is a confirmed absence.
         for absent in [
             "error: config store entry not found",
             "the item does not exist",
-            "404 page not found",
+            "error: record not found",
         ] {
+            let lower = absent.to_ascii_lowercase();
             assert!(
-                !stderr_signals_operational_failure(&absent.to_ascii_lowercase()),
+                !stderr_signals_operational_failure(&lower),
                 "a clean absence must not look operational: {absent}"
+            );
+            assert!(
+                stderr_is_confirmed_absence(&lower),
+                "a clean not-found must be a confirmed absence: {absent}"
             );
         }
     }

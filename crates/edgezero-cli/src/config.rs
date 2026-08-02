@@ -940,16 +940,26 @@ fn classify_present_body(body: &str) -> Result<PresentBody, String> {
     }
 }
 
-/// Does `body` carry an envelope `version` field that is present but NOT 1?
+/// Is `body` a NEWER format this CLI must not overwrite?
 ///
-/// A cheap, schema-agnostic pre-check: it parses only as a generic JSON object
-/// and inspects `version`, so it catches a newer envelope even when the value no
-/// longer deserializes as the exact v1 [`BlobEnvelope`]. A missing/absent version
-/// is NOT future (that stays repairable corruption).
+/// A cheap, schema-agnostic pre-check that parses only as a generic JSON object.
+/// True when EITHER:
+/// - it carries an `edgezero_kind` field. A v1 `BlobEnvelope` never has one; its
+///   presence means a chunk pointer or a newer discriminated format. serde would
+///   otherwise ignore the unknown field and deserialize a v1-shaped envelope with
+///   `edgezero_kind: "new_format"` as valid, letting a push overwrite it; or
+/// - it carries a `version` field that is present but NOT 1 -- a newer envelope
+///   even when it no longer deserializes as the exact v1 [`BlobEnvelope`].
+///
+/// A missing/absent version with no `edgezero_kind` is NOT future (that stays
+/// repairable corruption).
 fn body_is_future_envelope(body: &str) -> bool {
     let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
     };
+    if obj.contains_key("edgezero_kind") {
+        return true;
+    }
     obj.get("version")
         .and_then(serde_json::Value::as_u64)
         .is_some_and(|version| version != u64::from(ENVELOPE_VERSION_V1))
@@ -3574,6 +3584,18 @@ ids = ["default"]
             classify_present_body(&future_schema.to_string())
                 .is_err_and(|err| err.contains("UPGRADE")),
             "a future envelope that fails v1 deserialize must still refuse the push"
+        );
+
+        // An UNKNOWN `edgezero_kind` on a v1-SHAPED envelope must be refused, not
+        // overwritten: serde ignores the extra field and would otherwise accept it
+        // as a valid v1 envelope. Non-Fastly adapters return raw Present values, so
+        // this generic guard is the only thing standing between them and a
+        // downgrade overwrite of a newer discriminated format.
+        let mut kinded: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        kinded["edgezero_kind"] = json!("new_format");
+        assert!(
+            classify_present_body(&kinded.to_string()).is_err_and(|err| err.contains("UPGRADE")),
+            "a v1-shaped envelope carrying an unknown edgezero_kind must refuse the push"
         );
 
         // And the first-read-diff flow proceeds to overwrite on a corrupt Present.

@@ -4,9 +4,7 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::collections::HashMap;
 
-use crate::chunked_config::{
-    ResolveFailure, resolve_fastly_config_value_typed, value_is_future_format,
-};
+use crate::chunked_config::resolve_fastly_config_value_typed;
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use fastly::ConfigStore as FastlyConfigStoreInner;
@@ -82,15 +80,14 @@ impl ConfigStore for FastlyConfigStore {
         // safer than a spurious 500 during the normal propagation window.)
         // `transient` records whether any chunk fetch hit that class so the outer
         // result can pick the right status.
-        // A value written by a NEWER format this guest does not understand needs a
-        // DIFFERENT remediation than corruption: re-pushing the same config will
-        // not help; the deployed build must be UPGRADED. Checked before `value` is
-        // moved into the resolver.
-        // Computed on the RAW value: catches a DIRECT envelope from a newer writer,
-        // which the resolver passes through as a foreign value (an `Ok`, not an
-        // error) -- so it would otherwise reach core and surface as a generic
-        // integrity 500 instead of the upgrade/redeploy remediation.
-        let future_format = value_is_future_format(&value);
+        //
+        // A DIRECT value is returned VERBATIM (the resolver only touches our chunk
+        // pointers): the store layer must not parse or judge arbitrary values --
+        // that is the typed app-config extractor's job, which gives the
+        // upgrade/redeploy remediation for a newer DIRECT envelope. Only a value
+        // the resolver actually processes (an unknown `edgezero_kind`, or a
+        // future pointer/inner-envelope version -- typed `FutureFormat`) is handled
+        // here, because those ARE our reserved namespace.
         let transient = Cell::new(false);
         let outcome = resolve_fastly_config_value_typed(key, value, |chunk_key| {
             let got = match &self.inner {
@@ -114,29 +111,24 @@ impl ConfigStore for FastlyConfigStore {
             }
             Ok(got)
         });
-        // A NEWER format -- a direct future envelope (passed through as `Ok`), a
-        // future pointer/inner-envelope version, or an unknown `edgezero_kind`
-        // (all typed `FutureFormat` by the resolver) -- needs a DIFFERENT
-        // remediation than corruption: re-pushing the same config will not help;
-        // the deployed build must be UPGRADED.
-        let future = future_format
-            || outcome
-                .as_ref()
-                .err()
-                .is_some_and(ResolveFailure::is_future_format);
-        if future {
-            log::warn!(
-                "Fastly config-store value for `{key}` uses a NEWER format than this build \
-                 understands. Re-pushing the same config will not help -- redeploy this service \
-                 with an updated EdgeZero build."
-            );
-            return Err(ConfigStoreError::internal(anyhow::anyhow!(
-                "config store value uses a newer format than this build understands; redeploy this \
-                 service with an updated build (re-pushing will not help)"
-            )));
-        }
         match outcome {
             Ok(resolved) => Ok(Some(resolved)),
+            Err(err) if err.is_future_format() => {
+                // A NEWER format in OUR reserved namespace (an unknown
+                // `edgezero_kind`, or a future pointer/inner-envelope version):
+                // re-pushing the same config will not help; the deployed build
+                // must be UPGRADED.
+                log::warn!(
+                    "Fastly config-store value for `{key}` uses a NEWER format than this build \
+                     understands: {}. Re-pushing the same config will not help -- redeploy this \
+                     service with an updated EdgeZero build.",
+                    err.into_message()
+                );
+                Err(ConfigStoreError::internal(anyhow::anyhow!(
+                    "config store value uses a newer format than this build understands; redeploy \
+                     this service with an updated build (re-pushing will not help)"
+                )))
+            }
             Err(err) => {
                 let message = err.into_message();
                 if transient.get() {
@@ -324,33 +316,24 @@ mod tests {
         );
     }
 
-    /// A DIRECT envelope from a newer writer passes through the resolver as a
-    /// foreign value (an `Ok`, not an error), so the future-format remediation
-    /// must be applied on the SUCCESS path too -- otherwise the newer value would
-    /// reach core and surface as a generic integrity 500 instead of "redeploy".
+    /// The store layer returns arbitrary DIRECT values VERBATIM (the shared
+    /// `ConfigStore` contract): it must NOT parse or judge them -- a direct
+    /// envelope from a newer writer carries no `edgezero_kind`, so the resolver
+    /// passes it through as an `Ok`. Judging its version is the typed app-config
+    /// extractor's job, which gives the redeploy remediation. Reverts an earlier
+    /// store-layer inspection that broke the "return verbatim" contract.
     #[test]
-    fn direct_future_envelope_asks_to_redeploy_not_repush() {
+    fn direct_future_envelope_is_returned_verbatim() {
         use futures::executor::block_on;
         // A v2 direct envelope: envelope-shaped, no `edgezero_kind`, version 2.
-        let store = FastlyConfigStore::from_entries([(
-            "app_config".to_owned(),
-            r#"{"data":{"x":1},"sha256":"0000000000000000000000000000000000000000000000000000000000000000","generated_at":"2026-01-01T00:00:00Z","version":2}"#
-                .to_owned(),
-        )]);
-        let err =
-            block_on(store.get("app_config")).expect_err("a direct future envelope must error");
-        assert!(
-            matches!(err, ConfigStoreError::Internal { .. }),
-            "a future format is Internal, not transient: {err:?}"
-        );
-        let message = err.to_string().to_lowercase();
-        assert!(
-            message.contains("redeploy") || message.contains("newer format"),
-            "must ask the operator to redeploy an updated build: {err}"
-        );
-        assert!(
-            !message.contains("re-run config push") && !message.contains("push to repair"),
-            "must NOT instruct the operator to re-push a future format: {err}"
+        let raw = r#"{"data":{"x":1},"sha256":"0000000000000000000000000000000000000000000000000000000000000000","generated_at":"2026-01-01T00:00:00Z","version":2}"#;
+        let store = FastlyConfigStore::from_entries([("app_config".to_owned(), raw.to_owned())]);
+        let got = block_on(store.get("app_config"))
+            .expect("the store must return a direct value verbatim, not judge it");
+        assert_eq!(
+            got.as_deref(),
+            Some(raw),
+            "a direct value (even a future envelope) must be returned VERBATIM by the store layer"
         );
     }
 }

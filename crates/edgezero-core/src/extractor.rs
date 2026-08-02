@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use validator::Validate;
 
 use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
-use crate::blob_envelope::BlobEnvelope;
+use crate::blob_envelope::{BlobEnvelope, BlobEnvelopeError};
 use crate::config_store::ConfigStoreHandle;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
@@ -811,6 +811,24 @@ where
     }
 }
 
+/// The envelope `version` in `raw` when it is present but NOT the v1 this build
+/// understands — a NEWER format from a future writer.
+///
+/// A cheap, schema-agnostic pre-check that parses only as a generic JSON object,
+/// so it catches a newer envelope even when the value no longer deserializes as
+/// the exact v1 [`BlobEnvelope`]. A missing/absent version is `None` (that stays
+/// ordinary corruption). `version` is a plain integer, never a secret.
+fn future_envelope_version(raw: &str) -> Option<u64> {
+    use crate::blob_envelope::ENVELOPE_VERSION_V1;
+    let serde_json::Value::Object(obj) = serde_json::from_str::<serde_json::Value>(raw).ok()?
+    else {
+        return None;
+    };
+    obj.get("version")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|version| *version != u64::from(ENVELOPE_VERSION_V1))
+}
+
 /// Shared body: fetch + envelope + sha + secret walk + deserialise + validate.
 ///
 /// The `FromRequest` impl and the `named`/`from_store` inherent methods all
@@ -860,15 +878,33 @@ where
     // `BlobEnvelope` integrity failure names the stored hashes — both are
     // config-store values that may hold secrets, and this message reaches the
     // HTTP body. Report a category only.
+    //
+    // A value written by a NEWER envelope format needs a DIFFERENT remediation
+    // than corruption: re-pushing the same config cannot help a build older than
+    // its config; the deployed build must be UPGRADED. This is the typed
+    // app-config layer's job (the store returns arbitrary direct values verbatim),
+    // so the version is detected here, BEFORE the exact-v1 deserialize (a newer
+    // envelope may not even parse as v1). `version` is a plain integer, never a
+    // secret, so surfacing it is safe.
+    if let Some(version) = future_envelope_version(&raw) {
+        return Err(EdgeError::internal(anyhow::anyhow!(
+            "typed app-config blob uses envelope version {version}, which this build does not \
+             understand; redeploy this service with an updated build (re-pushing will not help)"
+        )));
+    }
     let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
         EdgeError::internal(anyhow::anyhow!(
             "typed app-config blob is not a valid envelope (details redacted)"
         ))
     })?;
-    envelope.verify().map_err(|_err| {
-        EdgeError::internal(anyhow::anyhow!(
+    envelope.verify().map_err(|err| match err {
+        BlobEnvelopeError::UnknownVersion(version) => EdgeError::internal(anyhow::anyhow!(
+            "typed app-config blob uses envelope version {version}, which this build does not \
+             understand; redeploy this service with an updated build (re-pushing will not help)"
+        )),
+        BlobEnvelopeError::ShaMismatch { .. } => EdgeError::internal(anyhow::anyhow!(
             "typed app-config blob failed its integrity check (details redacted)"
-        ))
+        )),
     })?;
     let mut data = envelope.into_data();
     // Secret walk per spec 3.3.3.
@@ -2366,6 +2402,46 @@ mod tests {
         assert!(
             err.message().contains("integrity check"),
             "message must still name the category: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_extractor_asks_to_redeploy_on_a_future_envelope_version() {
+        // The store returns a NEWER envelope version VERBATIM (its contract). The
+        // typed app-config layer -- NOT the store -- must give the upgrade/redeploy
+        // remediation, distinct from the corruption "re-push" path, because a
+        // build older than its config cannot be fixed by re-pushing the config.
+        struct FutureVersionStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for FutureVersionStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                // A v1-shaped envelope with the version bumped to 2.
+                let env = BlobEnvelope::new(
+                    serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
+                    "2026-01-01T00:00:00Z".into(),
+                );
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+                value["version"] = serde_json::json!(2_u32);
+                Ok(Some(value.to_string()))
+            }
+        }
+
+        let ctx = ctx_with_config_store(FutureVersionStore, "key");
+        let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
+            .expect_err("a future envelope version must error");
+        assert!(
+            matches!(err, EdgeError::Internal { .. }),
+            "a future version is Internal, not transient: {err:?}"
+        );
+        let message = err.message().to_lowercase();
+        assert!(
+            message.contains("redeploy") && message.contains("version 2"),
+            "must ask to redeploy an updated build and name the version: {err:?}"
+        );
+        assert!(
+            !message.contains("re-run config push") && !message.contains("push to repair"),
+            "must NOT tell the operator to re-push a future format: {err:?}"
         );
     }
 

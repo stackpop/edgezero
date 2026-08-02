@@ -442,6 +442,18 @@ where
     }
 
     // --- It is one of ours: resolve it. ---
+    // Detect a NEWER pointer version BEFORE deserializing the exact v1 struct: an
+    // incomplete future pointer (e.g. one that renamed/dropped fields) would
+    // otherwise fail the struct parse and read as repairable corruption a
+    // downgrade push could overwrite. Keys on `version` alone (schema-agnostic).
+    // This inspects OUR reserved namespace (a pointer), never an arbitrary direct
+    // value -- those are already returned verbatim above.
+    if value_is_future_format(&root_value) {
+        return Err(ResolveFailure::FutureFormat(format!(
+            "chunk pointer at `{root_key}` uses a pointer version this build does not recognise (a \
+             newer format)"
+        )));
+    }
     // The pointer entry itself is a single Config Store value, so the writer can
     // never emit one larger than the entry limit. Reject an over-limit pointer up
     // front — this bounds how many chunk refs it can carry (hence the fetch
@@ -908,13 +920,18 @@ pub(crate) fn value_is_unknown_kind(raw: &str) -> bool {
 /// Was this value written by a NEWER format this v1 reader cannot handle?
 ///
 /// True for any of: an unknown/non-string `edgezero_kind`; OUR pointer kind with
-/// a bumped pointer `version`; a direct envelope (`data` + `sha256` +
-/// `generated_at` + `version`) with a bumped envelope `version`. Per the blob
-/// spec's v1-reader rule,
-/// these must FAIL CLOSED everywhere destructive -- the read path refuses to
-/// overwrite them, and GC / local prune never delete them -- so an older CLI
-/// cannot clobber config a newer writer produced. A MISSING version (a malformed
-/// v1 value) is NOT future: it stays repairable corruption.
+/// a bumped pointer `version`; a JSON object carrying a `version` field that is
+/// present but NOT 1 (a newer format from a future writer). Per the blob spec's
+/// v1-reader rule, these must FAIL CLOSED everywhere destructive -- the read path
+/// refuses to overwrite them, and GC / local prune never delete them -- so an
+/// older CLI cannot clobber config a newer writer produced. A MISSING version (a
+/// malformed v1 value) is NOT future: it stays repairable corruption.
+///
+/// Version detection is deliberately SCHEMA-AGNOSTIC: it keys on the `version`
+/// field alone, NOT the presence of the four v1 fields. A future shape such as
+/// `{"version":2,"payload":...}` may drop or rename v1 fields, so requiring them
+/// would let it slip through as repairable corruption. This mirrors the generic
+/// classifier's `body_is_future_envelope`.
 ///
 /// Also compiled for the RUNTIME (`fastly`): the guest uses it to give the right
 /// remediation (redeploy an updated build, not re-push the same config).
@@ -926,24 +943,18 @@ pub(crate) fn value_is_future_format(raw: &str) -> bool {
     let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
     };
-    let version_is_not = |expected: u64| {
-        obj.get("version")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|version| version != expected)
-    };
+    let version_is_not_one = obj
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version != u64::from(ENVELOPE_VERSION_V1));
     match obj.get("edgezero_kind") {
         // Our pointer kind, but a newer POINTER version.
-        Some(serde_json::Value::String(kind)) if kind == POINTER_KIND => version_is_not(1),
+        Some(serde_json::Value::String(kind)) if kind == POINTER_KIND => version_is_not_one,
         // A discriminator we do not recognise (unknown string, or non-string).
         Some(_) => true,
-        // No discriminator: a direct envelope from a newer writer.
-        None => {
-            let envelope_shaped = obj.contains_key("data")
-                && obj.contains_key("sha256")
-                && obj.contains_key("generated_at")
-                && obj.contains_key("version");
-            envelope_shaped && version_is_not(u64::from(ENVELOPE_VERSION_V1))
-        }
+        // No discriminator: any object carrying a bumped `version` is a newer
+        // format, whatever else its shape (schema-agnostic).
+        None => version_is_not_one,
     }
 }
 
@@ -1649,6 +1660,13 @@ mod tests {
         let mut v2_env: serde_json::Value = serde_json::from_str(&v1).unwrap();
         v2_env["version"] = json!(2_u32);
         assert!(value_is_future_format(&v2_env.to_string()), "v2 envelope");
+
+        // SCHEMA-CHANGING v2: a future shape that DROPS the v1 fields must still be
+        // future -- detection keys on `version` alone, not the four v1 fields.
+        assert!(
+            value_is_future_format(r#"{"version":2,"payload":{"k":"v"}}"#),
+            "schema-changing v2 (no v1 fields)"
+        );
 
         // A v2 POINTER (our kind, bumped pointer version) -> future.
         assert!(
