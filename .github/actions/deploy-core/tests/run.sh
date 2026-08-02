@@ -1924,6 +1924,9 @@ test_recovery_version_parse() {
   # and FAILS the step (skipping rollback) whenever active-version prints extra
   # lines. This test runs the exact parse and pins each accept/reject case.
   local parse
+  # This is a script fed verbatim to `bash -c`; the `$(…)`/`$out` are meant to stay
+  # literal for the inner shell, so single quotes are correct here.
+  # shellcheck disable=SC2016
   parse='set -eo pipefail
 out=$(cat)
 n=$(grep -cE "^version=" <<<"$out" || true)
