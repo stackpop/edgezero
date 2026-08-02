@@ -53,7 +53,7 @@ outputs:
     description: The logical config-store id the CLI resolved (always emitted, not only when the `store` input was supplied).
     value: ${{ steps.push.outputs.store }}
   mutation-attempted:
-    description: "'true' once the config-push CLI is invoked (emitted before it runs). If the action fails, read this via `if: always()` to know the config store may have changed and reconcile — do not assume it is unchanged."
+    description: "'true', emitted immediately BEFORE the config-push CLI runs (so a cancel/timeout mid-mutation can preserve it; a hard runner loss can still drop it, so absence is not proof the store is unchanged, and a cancel in the tiny pre-run window is a conservative false positive). On failure, read this via `if: always()` and reconcile — do not assume the config store is unchanged."
     value: ${{ steps.push.outputs['mutation-attempted'] }}
   provider-cli-version:
     description: The pinned Fastly CLI version this action installed and ran.

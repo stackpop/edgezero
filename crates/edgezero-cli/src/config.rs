@@ -1124,7 +1124,7 @@ fn resolve_config_key(
 ) -> Result<String, String> {
     match (explicit, staging) {
         (Some(key), true) => Err(format!(
-            "`--key {key}` cannot be combined with `--staging`. The staging key is derived from the store's logical id (`{logical}_staging`) because that is what the staging selector store — written by `provision` — points a staged version at. An explicit key would be written to a key nothing reads.\n  Push the staged config without `--key`, or push to `--key {key}` without `--staging` and point the selector at it yourself."
+            "`--key {key}` cannot be combined with `--staging`. The staging key is derived from the store's logical id (`{logical}_staging`) because that is what the staging selector store — created and linked by a staged deploy — points a staged version at. An explicit key would be written to a key nothing reads.\n  Push the staged config without `--key`, or push to `--key {key}` without `--staging` and point the selector at it yourself."
         )),
         (Some(key), false) => Ok(key.to_owned()),
         (None, false) => Ok(logical.to_owned()),

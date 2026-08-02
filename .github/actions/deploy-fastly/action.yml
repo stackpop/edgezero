@@ -49,7 +49,7 @@ outputs:
     description: Fastly service version deployed (production) or staged.
     value: ${{ steps.deploy.outputs['fastly-version'] }}
   mutation-attempted:
-    description: "'true' once the deploy CLI is invoked (emitted before it runs). If the action fails, read this via `if: always()` to know a provider mutation may have occurred and reconcile — do not assume nothing was deployed."
+    description: "'true', emitted immediately BEFORE the deploy CLI runs (so a cancel/timeout mid-mutation can preserve it; a hard runner loss can still drop it, so absence is not proof nothing deployed, and a cancel in the tiny pre-run window is a conservative false positive). On failure, read this via `if: always()` and reconcile — do not assume nothing was deployed."
     value: ${{ steps.deploy.outputs['mutation-attempted'] }}
   provider-cli-version:
     description: The pinned Fastly CLI version this action installed and ran.

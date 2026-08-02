@@ -1916,6 +1916,45 @@ CLI
     grep -qx 'mutation-attempted=true' "$dir/out"
 }
 
+test_recovery_version_parse() {
+  section "recovery active-version parse (SIGPIPE-safe)"
+  # Mirrors the deploy guide's lost-version recovery snippet. It must extract the
+  # version with HERE-STRINGS, never `printf … | grep -q`: grep -q exits on the
+  # first match and SIGPIPEs the writer, which under `set -eo pipefail` returns 141
+  # and FAILS the step (skipping rollback) whenever active-version prints extra
+  # lines. This test runs the exact parse and pins each accept/reject case.
+  local parse
+  parse='set -eo pipefail
+out=$(cat)
+n=$(grep -cE "^version=" <<<"$out" || true)
+[ "$n" = "1" ] || { echo "ERR:count=$n"; exit 0; }
+grep -qE "^version=[0-9]*\$" <<<"$out" || { echo "ERR:malformed"; exit 0; }
+printf "version=%s" "$(sed -n "s/^version=//p" <<<"$out")"'
+
+  # A valid version FOLLOWED BY ~1 MB of output (far over the 64 KB pipe buffer) —
+  # the exact early-exit shape that SIGPIPEs a pipeline.
+  local big
+  big=$(printf 'version=42\n'; seq 1 40000 | sed 's/^/noise-line-of-some-length /')
+  assert_equals "a valid version before verbose output is recovered (no SIGPIPE)" \
+    "version=42" "$(printf '%s\n' "$big" | bash -c "$parse")"
+  assert_equals "an empty version is accepted (a first-ever deploy)" \
+    "version=" "$(printf 'version=\n' | bash -c "$parse")"
+  assert_equals "a malformed version is rejected" \
+    "ERR:malformed" "$(printf 'version=4x\n' | bash -c "$parse")"
+  assert_equals "two version lines are rejected" \
+    "ERR:count=2" "$(printf 'version=1\nversion=2\n' | bash -c "$parse")"
+
+  # Lock in WHY the recovery uses here-strings: the naive `printf | grep -q` aborts
+  # under pipefail on this same large output (SIGPIPE -> 141), which is exactly the
+  # spurious failure the here-string form avoids.
+  local rc=0
+  printf '%s\n' "$big" |
+    bash -c 'set -eo pipefail; out=$(cat); printf "%s\n" "$out" | grep -qE "^version="; echo reached-end' \
+    >/dev/null 2>&1 || rc=$?
+  assert_succeeds "the naive printf|grep -q pipeline aborts under pipefail (SIGPIPE)" \
+    test "$rc" -ne 0
+}
+
 # ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
@@ -1946,6 +1985,7 @@ main() {
   test_publish_outputs
   test_cleanup_sensitive_temps
   test_deploy_signal_timing
+  test_recovery_version_parse
   test_exit_propagation
   test_dirty_source_guard
   test_cache_key

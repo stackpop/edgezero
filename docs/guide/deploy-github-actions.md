@@ -383,9 +383,9 @@ not cross job boundaries.
     # Pass the service id through env, never interpolate `${{ vars.* }}` into the
     # script — a value containing a quote could otherwise escape the argument.
     SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
-  # Explicit `shell: bash` runs with `-eo pipefail`; the default shell omits
-  # pipefail, so a failing `active-version` in the pipe below would be masked and
-  # silently yield an empty version, skipping rollback.
+  # Explicit `shell: bash` runs with `-eo pipefail`, so a failing `active-version`
+  # (in the `$(…)` below) aborts rather than silently yielding an empty version and
+  # skipping rollback.
   shell: bash
   run: |
     case "$SERVICE_ID" in '' | *[!A-Za-z0-9_-]*)
@@ -398,11 +398,15 @@ not cross job boundaries.
     # error), and accept an EMPTY value: active-version emits `version=` when the
     # service has no active version yet (a first-ever deploy) — that is "nothing to
     # roll back", not a failure. The value is the digits, or empty.
-    n=$(printf '%s\n' "$out" | grep -cE '^version=' || true)
+    #
+    # Use HERE-STRINGS, never `printf … | grep -q`: grep -q exits on the first
+    # match and SIGPIPEs the writer, which under pipefail returns 141 and would fail
+    # this step (skipping rollback) when active-version prints extra lines.
+    n=$(grep -cE '^version=' <<<"$out" || true)
     [ "$n" = "1" ] || { echo "::error::expected exactly one 'version=' line, got $n"; exit 1; }
-    printf '%s\n' "$out" | grep -qE '^version=[0-9]*$' ||
+    grep -qE '^version=[0-9]*$' <<<"$out" ||
       { echo "::error::active-version emitted a malformed version line"; exit 1; }
-    v=$(printf '%s\n' "$out" | sed -n 's/^version=//p')
+    v=$(sed -n 's/^version=//p' <<<"$out")
     echo "version=$v" >>"$GITHUB_OUTPUT" # empty -> the rollback step's guard skips it
 - name: Roll back only if the deploy activated a NEW version over a known previous one
   if: >-

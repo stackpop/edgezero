@@ -32,7 +32,7 @@ outputs:
     description: The Fastly version that was activated (production only).
     value: ${{ steps.rollback.outputs['rolled-back-to'] }}
   mutation-attempted:
-    description: "'true' once the rollback CLI is invoked (emitted before it runs). If the action fails, read this via `if: always()` to know the active version may have changed and reconcile — do not assume the rollback was a no-op."
+    description: "'true', emitted immediately BEFORE the rollback CLI runs (so a cancel/timeout mid-mutation can preserve it; a hard runner loss can still drop it, so absence is not proof the active version is unchanged, and a cancel in the tiny pre-run window is a conservative false positive). On failure, read this via `if: always()` and reconcile — do not assume the rollback was a no-op."
     value: ${{ steps.rollback.outputs['mutation-attempted'] }}
 
 runs:
