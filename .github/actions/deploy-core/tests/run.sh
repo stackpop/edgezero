@@ -993,6 +993,32 @@ test_toolchain_boundary() {
   )
   assert_equals "a channel with a trailing comment parses" "stable" "$commented"
   rm -f "$ws/app/rust-toolchain.toml"
+
+  # Fail-closed: a `.tool-versions` that DECLARES `rust` but with no version is a
+  # MALFORMED pin, not "unpinned". It must fail rather than fall through to the
+  # deployer/repo fallback and compile with an unintended toolchain (spec §7).
+  printf 'nodejs 24.12.0\nrust\n' >"$ws/app/.tool-versions"
+  assert_fails_with "build-app-cli fails closed on a rust entry with no version" \
+    "malformed 'rust' entry" \
+    bash -c "
+      source '$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh'
+      resolve_rust_toolchain auto '$ws/app' '$ws' '$REPO_ROOT'
+    "
+  assert_fails_with "resolve-project fails closed on a rust entry with no version" \
+    "malformed 'rust' entry" \
+    bash -c "
+      source '$ACTIONS_DIR/deploy-core/scripts/resolve-project.sh'
+      resolve_rust_toolchain auto '$ws/app' '$ws' '$REPO_ROOT'
+    "
+  # A `.tool-versions` WITHOUT a rust line is legitimately "unpinned here" and must
+  # keep searching to the repo fallback — that is NOT a malformed file.
+  printf 'nodejs 24.12.0\n' >"$ws/app/.tool-versions"
+  assert_succeeds "a .tool-versions with no rust line falls through (not a failure)" \
+    bash -c "
+      source '$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh'
+      resolve_rust_toolchain auto '$ws/app' '$ws' '$REPO_ROOT'
+    "
+  rm -f "$ws/app/.tool-versions"
 }
 
 # ---------------------------------------------------------------------------

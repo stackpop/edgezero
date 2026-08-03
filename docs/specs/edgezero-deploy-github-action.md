@@ -514,7 +514,8 @@ means the **same config store, a different key**:
   _derived_, so `--key` is mutually exclusive with `--staging`.
 
 The CLI gains a `config push --staging` flag (the same `--staging` verb
-`deploy`/`healthcheck`/`rollback` already use); the wrapper exposes it as
+`healthcheck`/`rollback` already use — deploy's equivalent is `--stage`); the
+wrapper exposes it as
 `deploy-to: production | staging`, validated exactly and fail-closed like the
 lifecycle actions.
 
@@ -578,9 +579,9 @@ staged version keeps the inherited link (staged code, no config to isolate).
 Outputs: `pushed-key` (the key that was written — the base key, or the derived
 `_staging` variant), `store` (the resolved logical store id),
 `provider-cli-version` (the installed Fastly CLI version), and
-`mutation-attempted` (`true` once the push CLI is invoked; readable via
-`if: always()` on failure so a caller can reconcile the config store rather than
-assume it is unchanged).
+`mutation-attempted` (`true`, emitted immediately BEFORE the push CLI runs;
+readable via `if: always()` on failure so a caller can reconcile the config store
+rather than assume it is unchanged).
 
 A staged deploy plus a staged config push and a healthcheck compose the same way
 the lifecycle trio does (§5.4.4): push staging config, deploy the staged version,
@@ -942,7 +943,7 @@ All validation and setup failures stop before invoking provider deployment.
 | Build command fails                                   | Preserve exit status; state that deploy was not attempted.                                                                                                                                                                                                       |
 | Deploy command fails                                  | Preserve exit status; emit `mutation-attempted=true` so an `if: always()` caller can reconcile a possibly-mutated service. Rollback is caller-owned.                                                                                                             |
 | Deploy succeeds but the `fastly-version` line is lost | Fail the step (there is no version to thread), but `mutation-attempted=true` is already emitted so the caller reconciles rather than assumes a no-op.                                                                                                            |
-| Staged deploy fails                                   | Preserve exit status; emit no `fastly-version`. `mutation-attempted=true` still signals the CLI ran, so a caller can reconcile a possibly-created draft rather than assume none.                                                                                 |
+| Staged deploy fails                                   | Preserve exit status; emit no `fastly-version`. `mutation-attempted=true` still signals the CLI was about to run (and almost certainly did), so a caller can reconcile a possibly-created draft rather than assume none.                                         |
 | Missing `fastly-version` (healthcheck/rollback)       | State it is required, sourced from the deploy/stage output.                                                                                                                                                                                                      |
 | Health check unhealthy after retries                  | Exit non-zero and set `healthy=false`/`status-code` so the caller can rollback.                                                                                                                                                                                  |
 | Rollback command fails                                | Surface the CLI exit status BEFORE writing any output (so an output-write failure cannot mask it); state the rollback did not complete and the active version may be indeterminate (reconcile via `mutation-attempted`) — do not claim it "was not rolled back". |

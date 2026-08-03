@@ -47,7 +47,7 @@ outputs:
     description: The binary name inside the artifact.
     value: ${{ steps.build.outputs['app-cli-bin'] }}
   app-cli-artifact:
-    description: Artifact name the deploy, healthcheck, and rollback actions consume.
+    description: Artifact name the deploy, healthcheck, rollback, and config-push-fastly actions consume.
     value: ${{ steps.build.outputs['app-cli-artifact'] }}
 
 runs:

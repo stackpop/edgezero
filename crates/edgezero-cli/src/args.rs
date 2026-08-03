@@ -464,8 +464,9 @@ pub struct ConfigPushArgs {
     pub runtime_config: Option<PathBuf>,
     /// Push to staging: write the config under the `<logical-id>_staging` key
     /// in the SAME store, so it never overwrites the production key the live
-    /// service reads. The same `--staging` verb `deploy`/`healthcheck`/`rollback`
-    /// use. Mutually exclusive with `--key`: the staging key is derived from the
+    /// service reads. The same `--staging` verb `healthcheck`/`rollback` use
+    /// (deploy's equivalent is `--stage`). Mutually exclusive with `--key`: the
+    /// staging key is derived from the
     /// store's logical id because that is what the staging selector store (created
     /// and linked by a staged deploy) points a staged version at, so an explicit
     /// key would be written where nothing reads it.

@@ -73,7 +73,11 @@ resolve_rust_toolchain() {
       parse_toolchain_from_channel_file "$directory/rust-toolchain"
       return
     fi
-    if [[ -f "$directory/.tool-versions" ]] && value=$(read_tool_version "$directory/.tool-versions" rust) && [[ -n "$value" ]]; then
+    if [[ -f "$directory/.tool-versions" ]] && value=$(read_tool_version "$directory/.tool-versions" rust); then
+      # A `rust` line present with no version is a MALFORMED pin, not "unpinned":
+      # fail closed rather than fall through to a parent or the deployer's
+      # toolchain and silently run with a different compiler.
+      [[ -n "$value" ]] || fail "malformed 'rust' entry in $directory/.tool-versions: no version follows 'rust'"
       printf '%s\n' "$value"
       return
     fi
@@ -83,7 +87,8 @@ resolve_rust_toolchain() {
     [[ "$parent" == "$directory" ]] && break
     directory="$parent"
   done
-  if [[ -f "$action_root/.tool-versions" ]] && value=$(read_tool_version "$action_root/.tool-versions" rust) && [[ -n "$value" ]]; then
+  if [[ -f "$action_root/.tool-versions" ]] && value=$(read_tool_version "$action_root/.tool-versions" rust); then
+    [[ -n "$value" ]] || fail "malformed 'rust' entry in $action_root/.tool-versions: no version follows 'rust'"
     printf '%s\n' "$value"
     return
   fi

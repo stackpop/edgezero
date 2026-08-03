@@ -319,8 +319,8 @@ Thread `previous-version` into `rollback-fastly`'s `rollback-to` so a later
 rollback has a real target (Fastly cannot infer one — see `rollback-fastly`).
 
 **If a _production_ deploy fails with `mutation-attempted=true` but no
-`fastly-version`** (the CLI ran and may have activated a version, but its version
-line was lost), you cannot roll back blindly — `rollback-fastly` needs the version
+`fastly-version`** (the CLI almost certainly ran and may have activated a version,
+but its version line was lost), you cannot roll back blindly — `rollback-fastly` needs the version
 to roll back _from_. Recover it from the provider: `active-version` reports the
 version that is live **now** (the one the deploy activated); if it differs from
 the `previous-version` you captured before the deploy, roll back to that. There is
@@ -516,9 +516,9 @@ variant), `store` (the logical store id the CLI **resolved** — always emitted,
 not only when the `store` input was supplied), `provider-cli-version` (the Fastly
 CLI version this action installed), and `mutation-attempted`. Your app CLI must
 print both `pushed-key=` and `pushed-store=`; the action fails if either is
-missing — but `mutation-attempted` is `true` once the push CLI is invoked, so on
-that failure you can read it via `if: always()` and reconcile the config store
-rather than assume it is unchanged.
+missing — but `mutation-attempted` is `true`, emitted immediately _before_ the
+push CLI runs, so on that failure you can read it via `if: always()` and reconcile
+the config store rather than assume it is unchanged.
 
 A production config push, using the same build artifact:
 
