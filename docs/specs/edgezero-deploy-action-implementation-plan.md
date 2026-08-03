@@ -99,8 +99,13 @@ reference to port from. Most transfer with light changes:
      env/`/proc`-derivation vectors a build script would use to inject (e.g.)
      `LD_PRELOAD` into a later step. This is defense-in-depth, NOT a hard boundary:
      a fully malicious same-uid build can still enumerate the runner's command
-     directory (`$RUNNER_TEMP/_runner_file_commands`) directly, so a provider secret
-     must never share a step or job with the build (see build-app-cli/action.yml). A caller's OWN `provider-env-clear` alias is
+     directory (`$RUNNER_TEMP/_runner_file_commands`) directly. build-app-cli is
+     therefore credential-free by design, so a caller who must keep a provider
+     secret away from the compile-heavy build phase can run build-app-cli in a
+     SEPARATE job with no secrets and hand the artifact to the deploy. Deploying a
+     TRUSTED first-party app in the same job is fine — the deploy runs the app's
+     own code with the credential regardless, so trust is the real requirement (the
+     deploy guide covers both layouts). A caller's OWN `provider-env-clear` alias is
      re-exec'd out of the build step, but a `uses:` upload step can only blank
      statically; such a custom alias may remain in that step's `env:` — with no
      app-controlled code able to run there to read it. Never builds the EdgeZero

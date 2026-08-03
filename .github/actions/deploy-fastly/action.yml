@@ -23,6 +23,10 @@ inputs:
     description: Optional edgezero.toml path relative to working-directory.
     required: false
     default: ""
+  rust-toolchain:
+    description: Application Rust toolchain for the deploy build, or 'auto' to follow application discovery (see the toolchain precedence in the deploy spec).
+    required: false
+    default: auto
   build-mode:
     description: One of auto, always, or never. Fastly auto resolves to never.
     required: false
@@ -141,7 +145,7 @@ runs:
       run: $GITHUB_ACTION_PATH/scripts/validate.sh
 
     - name: Download CLI artifact
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      uses: actions/download-artifact@v4.3.0
       with:
         name: ${{ inputs['app-cli-artifact'] }}
         path: ${{ steps.ws.outputs.root }}/cli-download
@@ -196,7 +200,7 @@ runs:
         EDGEZERO__APP__CLI__VERSION: ${{ steps.cli.outputs['app-cli-version'] }}
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__PROJECT__MANIFEST: ${{ inputs.manifest }}
-        EDGEZERO__PROJECT__RUST_TOOLCHAIN: auto
+        EDGEZERO__PROJECT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
         EDGEZERO__PROJECT__TARGET: wasm32-wasip1
         EDGEZERO__BUILD__MODE: ${{ inputs['build-mode'] }}
         EDGEZERO__BUILD__CACHE: ${{ inputs.cache }}
@@ -221,7 +225,7 @@ runs:
     - name: Restore application target cache
       if: ${{ inputs.cache == 'true' }}
       id: cache-restore
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/restore@v4.3.0
       with:
         key: ${{ steps.resolve.outputs['cache-key'] }}
         path: ${{ steps.resolve.outputs['cache-path'] }}
@@ -248,7 +252,7 @@ runs:
       # who SHA-pins THIS action cannot otherwise freeze a mutable child tag, so
       # nested third-party uses are hash-pinned regardless of the tag-pin policy
       # that applies at the workflow level.
-      uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
       with:
         toolchain: ${{ steps.resolve.outputs['rust-toolchain'] }}
         target: wasm32-wasip1
@@ -378,7 +382,7 @@ runs:
 
     - name: Save application target cache
       if: ${{ inputs.cache == 'true' && steps.cache-restore.outputs['cache-hit'] != 'true' }}
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/save@v4.3.0
       with:
         key: ${{ steps.resolve.outputs['cache-key'] }}
         path: ${{ steps.resolve.outputs['cache-path'] }}

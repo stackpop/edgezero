@@ -1569,6 +1569,123 @@ test_action_output_contracts() {
   fi
 }
 
+# Print an action's public surface deterministically: `in <name> <required>
+# <has-default>` for every input (has-default = set|none), then `out <name>` for
+# every output — all sorted. Pins names, required flags, and default PRESENCE.
+parse_action_surface() {
+  awk '
+    function flush(){ if (sec == "in" && n != "") printf "in %s %s %s\n", n, req, def; n = "" }
+    /^inputs:/ { sec = "in"; next }
+    /^outputs:/ { flush(); sec = "out"; next }
+    /^runs:/ { flush(); sec = "" }
+    sec == "in" && /^  [a-z][a-z0-9-]*:/ { flush(); n = $1; sub(/:$/, "", n); req = "false"; def = "none" }
+    sec == "in" && /^    required:/ { req = $2 }
+    sec == "in" && /^    default:/ { def = "set" }
+    sec == "out" && /^  [a-z][a-z0-9-]*:/ { m = $1; sub(/:$/, "", m); print "out " m }
+    END { flush() }
+  ' "$1" | sort
+}
+
+test_action_public_surface() {
+  section "action public surface (names, required, defaults)"
+  # The GOLDEN public contract per action. test_action_metadata only checks that
+  # inputs HAVE descriptions and env keys are unique; test_action_output_contracts
+  # only checks output->script wiring. Neither pins the SET of input/output names,
+  # their required flags, or whether they carry a default — so a renamed input, a
+  # removed output, an added input, or a flipped required/default would pass
+  # silently. This asserts the exact documented surface. Every required input
+  # carries no default; every optional input carries one.
+  assert_equals "build-app-cli public surface" "$(
+    cat <<'EOF'
+in app-cli-artifact false set
+in app-cli-bin false set
+in app-cli-package true none
+in provider-env-clear false set
+in rust-toolchain false set
+in working-directory false set
+out app-cli-artifact
+out app-cli-bin
+out app-cli-package
+out app-cli-version
+EOF
+  )" "$(parse_action_surface "$ACTIONS_DIR/build-app-cli/action.yml")"
+
+  assert_equals "deploy-fastly public surface" "$(
+    cat <<'EOF'
+in app-cli-artifact true none
+in app-cli-bin false set
+in build-args false set
+in build-mode false set
+in cache false set
+in deploy-args false set
+in fastly-api-token true none
+in fastly-service-id true none
+in manifest false set
+in rust-toolchain false set
+in stage false set
+in working-directory false set
+out app-cli-version
+out fastly-version
+out mutation-attempted
+out previous-version
+out provider-cli-version
+out source-revision
+EOF
+  )" "$(parse_action_surface "$ACTIONS_DIR/deploy-fastly/action.yml")"
+
+  assert_equals "config-push-fastly public surface" "$(
+    cat <<'EOF'
+in app-cli-artifact true none
+in app-cli-bin false set
+in app-config false set
+in app-config-inline false set
+in deploy-to false set
+in fastly-api-token true none
+in key false set
+in manifest false set
+in no-env false set
+in store false set
+in working-directory false set
+out mutation-attempted
+out provider-cli-version
+out pushed-key
+out store
+EOF
+  )" "$(parse_action_surface "$ACTIONS_DIR/config-push-fastly/action.yml")"
+
+  assert_equals "rollback-fastly public surface" "$(
+    cat <<'EOF'
+in app-cli-artifact true none
+in app-cli-bin false set
+in deploy-to false set
+in fastly-api-token true none
+in fastly-service-id true none
+in fastly-version true none
+in rollback-to false set
+out mutation-attempted
+out rolled-back-to
+EOF
+  )" "$(parse_action_surface "$ACTIONS_DIR/rollback-fastly/action.yml")"
+
+  assert_equals "healthcheck-fastly public surface" "$(
+    cat <<'EOF'
+in app-cli-artifact true none
+in app-cli-bin false set
+in deploy-to false set
+in domain true none
+in fastly-api-token false set
+in fastly-service-id true none
+in fastly-version true none
+in path false set
+in retry false set
+in retry-delay false set
+in timeout false set
+out healthy
+out status-code
+EOF
+  )" "$(parse_action_surface "$ACTIONS_DIR/healthcheck-fastly/action.yml")"
+}
+
 # ---------------------------------------------------------------------------
 # capture-previous.sh — the production rollback-target capture. A first deploy
 # (no active version) must yield an EMPTY previous-version and still succeed; an
@@ -2032,6 +2149,7 @@ main() {
   test_app_repo_boundary
   test_action_metadata
   test_action_output_contracts
+  test_action_public_surface
 
   printf '\nPassed: %d  Failed: %d\n' "$tests_passed" "$tests_failed"
   [[ "$tests_failed" -eq 0 ]]
