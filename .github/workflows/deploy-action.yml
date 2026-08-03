@@ -128,6 +128,9 @@ jobs:
         with:
           app-cli-package: fixture-app-cli
           working-directory: fixture-app
+          # Distinct per job: parallel jobs each upload their own artifact, so a
+          # download-by-name never has to disambiguate between same-named uploads.
+          app-cli-artifact: edgezero-cli-composite
 
       # The production deploy runs a manifest-command deploy (fake-deploy.sh), but
       # deploy-fastly now also captures the rollback target first via a real
@@ -199,6 +202,9 @@ jobs:
         with:
           app-cli-package: fixture-app-cli
           working-directory: fixture-app
+          # Distinct per job: parallel jobs each upload their own artifact, so a
+          # download-by-name never has to disambiguate between same-named uploads.
+          app-cli-artifact: edgezero-cli-config-push
 
       - name: Install fake fastly + curl
         run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
@@ -277,6 +283,9 @@ jobs:
         with:
           app-cli-package: fixture-app-cli
           working-directory: fixture-app
+          # Distinct per job: parallel jobs each upload their own artifact, so a
+          # download-by-name never has to disambiguate between same-named uploads.
+          app-cli-artifact: edgezero-cli-lifecycle
 
       # Packages a fake `fastly` as a checksum-verified archive and a fake `curl`
       # that serves it to each invocation's unique tool root (file:// copy). So

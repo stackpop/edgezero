@@ -466,9 +466,9 @@ pub struct ConfigPushArgs {
     /// in the SAME store, so it never overwrites the production key the live
     /// service reads. The same `--staging` verb `deploy`/`healthcheck`/`rollback`
     /// use. Mutually exclusive with `--key`: the staging key is derived from the
-    /// store's logical id because that is what the staging selector store (from
-    /// `provision`) points a staged version at, so an explicit key would be
-    /// written where nothing reads it.
+    /// store's logical id because that is what the staging selector store (created
+    /// and linked by a staged deploy) points a staged version at, so an explicit
+    /// key would be written where nothing reads it.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to push to. Defaults to the

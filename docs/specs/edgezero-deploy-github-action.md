@@ -308,14 +308,14 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 **`deploy-fastly` outputs**
 
-| Output                 | Meaning                                                                                                                                               |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fastly-version`       | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4).                                                            |
-| `previous-version`     | Production only: the version active BEFORE this deploy — the rollback target for `rollback-fastly`'s `rollback-to`. Empty on a first deploy.          |
-| `source-revision`      | Passthrough from the engine.                                                                                                                          |
-| `app-cli-version`      | Passthrough from the engine.                                                                                                                          |
-| `provider-cli-version` | The pinned Fastly CLI version this action installed and ran.                                                                                          |
-| `mutation-attempted`   | `true` once the deploy CLI is invoked (emitted before it runs). On failure, read via `if: always()` to know a deploy may have occurred and reconcile. |
+| Output                 | Meaning                                                                                                                                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fastly-version`       | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4).                                                                                                                           |
+| `previous-version`     | Production only: the version active BEFORE this deploy — the rollback target for `rollback-fastly`'s `rollback-to`. Empty on a first deploy.                                                                         |
+| `source-revision`      | Passthrough from the engine.                                                                                                                                                                                         |
+| `app-cli-version`      | Passthrough from the engine.                                                                                                                                                                                         |
+| `provider-cli-version` | The pinned Fastly CLI version this action installed and ran.                                                                                                                                                         |
+| `mutation-attempted`   | `true`, emitted immediately BEFORE the deploy CLI runs (a cancel in the tiny pre-run window is a conservative false positive). On failure, read via `if: always()` to know a deploy may have occurred and reconcile. |
 
 The wrapper sets `adapter: fastly`, `target: wasm32-wasip1`, the action-owned
 `deploy-flags` (`--service-id …`, before `--`) so a deploy cannot select an
@@ -466,8 +466,8 @@ belong to a concurrent run.
 The `fastly-version != ''` guard skips rollback when the version was never
 captured — because `rollback-fastly` needs it. But that is not the same as "no
 mutation occurred": if the step FAILED with `mutation-attempted == 'true'` and no
-`fastly-version`, the CLI ran and may have changed the service, so do not silently
-skip. Recovery differs by target:
+`fastly-version`, the CLI was about to run (and almost certainly did) and may have
+changed the service, so do not silently skip. Recovery differs by target:
 
 - **Production:** recover the current version — the CLI's `active-version`
   subcommand prints the live version — compare it to the pre-deploy

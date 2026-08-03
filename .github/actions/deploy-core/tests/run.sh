@@ -1923,6 +1923,11 @@ test_recovery_version_parse() {
   # first match and SIGPIPEs the writer, which under `set -eo pipefail` returns 141
   # and FAILS the step (skipping rollback) whenever active-version prints extra
   # lines. This test runs the exact parse and pins each accept/reject case.
+  # Mirrors the guide's parse LOGIC verbatim, including its FAIL-CLOSED exits: a
+  # malformed or duplicated `version=` line must exit NON-ZERO (`exit 1`), so a
+  # future regression that recognises bad output but exits 0 — silently skipping
+  # rollback — is caught here, not just its sentinel text. `recover_version` prints
+  # the extracted digits and propagates that exit status.
   local parse
   # This is a script fed verbatim to `bash -c`; the `$(…)`/`$out` are meant to stay
   # literal for the inner shell, so single quotes are correct here.
@@ -1930,22 +1935,28 @@ test_recovery_version_parse() {
   parse='set -eo pipefail
 out=$(cat)
 n=$(grep -cE "^version=" <<<"$out" || true)
-[ "$n" = "1" ] || { echo "ERR:count=$n"; exit 0; }
-grep -qE "^version=[0-9]*\$" <<<"$out" || { echo "ERR:malformed"; exit 0; }
-printf "version=%s" "$(sed -n "s/^version=//p" <<<"$out")"'
+[ "$n" = "1" ] || { echo "::error::expected exactly one version= line, got $n" >&2; exit 1; }
+grep -qE "^version=[0-9]*$" <<<"$out" || { echo "::error::active-version emitted a malformed version line" >&2; exit 1; }
+sed -n "s/^version=//p" <<<"$out"'
+  recover_version() { printf '%s\n' "$1" | bash -c "$parse"; }
 
   # A valid version FOLLOWED BY ~1 MB of output (far over the 64 KB pipe buffer) —
   # the exact early-exit shape that SIGPIPEs a pipeline.
   local big
   big=$(printf 'version=42\n'; seq 1 40000 | sed 's/^/noise-line-of-some-length /')
   assert_equals "a valid version before verbose output is recovered (no SIGPIPE)" \
-    "version=42" "$(printf '%s\n' "$big" | bash -c "$parse")"
+    "42" "$(recover_version "$big")"
+  assert_succeeds "valid input exits 0 so the rollback proceeds" recover_version "$big"
   assert_equals "an empty version is accepted (a first-ever deploy)" \
-    "version=" "$(printf 'version=\n' | bash -c "$parse")"
-  assert_equals "a malformed version is rejected" \
-    "ERR:malformed" "$(printf 'version=4x\n' | bash -c "$parse")"
-  assert_equals "two version lines are rejected" \
-    "ERR:count=2" "$(printf 'version=1\nversion=2\n' | bash -c "$parse")"
+    "" "$(recover_version 'version=')"
+  assert_succeeds "empty version exits 0 (nothing to roll back, not an error)" \
+    recover_version 'version='
+  # Fail-closed: a bad line must exit NON-ZERO for the RIGHT reason, so rollback is
+  # never silently skipped on output the parser cannot trust.
+  assert_fails_with "a malformed version fails closed" \
+    "malformed version line" recover_version 'version=4x'
+  assert_fails_with "two version lines fail closed" \
+    "expected exactly one" recover_version $'version=1\nversion=2'
 
   # Lock in WHY the recovery uses here-strings: the naive `printf | grep -q` aborts
   # under pipefail on this same large output (SIGPIPE -> 141), which is exactly the

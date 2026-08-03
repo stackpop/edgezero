@@ -1113,7 +1113,7 @@ fn resolve_adapter_push_ctx(
 /// isolates staged config.
 ///
 /// `--key` and `--staging` are mutually exclusive, and that is not a style
-/// choice. The staging key is not merely a name we write: `provision` puts
+/// choice. The staging key is not merely a name we write: a staged deploy puts
 /// `<logical>_staging` into the staging selector store, and that selector is what
 /// a staged version READS. An explicit key would be written to a key nothing
 /// selects — a push that silently goes nowhere. Refuse instead.

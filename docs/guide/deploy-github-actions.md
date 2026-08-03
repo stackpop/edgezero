@@ -311,9 +311,10 @@ out of the build's job entirely, or scope it to the one step that needs it.
 Outputs: `fastly-version`, `source-revision`, `app-cli-version`,
 `provider-cli-version` (the Fastly CLI version this action installed),
 `mutation-attempted`, and (production only) `previous-version` — the version that
-was active _before_ this deploy. `mutation-attempted` is `true` once the deploy
-CLI is invoked; if the action fails, read it via `if: always()` to know a deploy
-may have occurred and reconcile rather than assume nothing happened.
+was active _before_ this deploy. `mutation-attempted` is `true`, emitted
+immediately _before_ the deploy CLI runs (a cancel in the tiny pre-run window is a
+conservative false positive); if the action fails, read it via `if: always()` to
+know a deploy may have occurred and reconcile rather than assume nothing happened.
 Thread `previous-version` into `rollback-fastly`'s `rollback-to` so a later
 rollback has a real target (Fastly cannot infer one — see `rollback-fastly`).
 
@@ -480,8 +481,8 @@ alone skips a cancel/timeout), not on the `healthy` output.
 | `deploy-to`         | No       | `production`    | `production` activates `rollback-to`; `staging` deactivates the staged one.                                                                                           |
 
 Outputs: `rolled-back-to` (production only — the version that was activated) and
-`mutation-attempted` (`true` once the rollback CLI is invoked; read it via
-`if: always()` on failure to know the active version may have changed).
+`mutation-attempted` (`true`, emitted immediately _before_ the rollback CLI runs;
+read it via `if: always()` on failure to know the active version may have changed).
 
 \* Fastly's version metadata cannot distinguish a previously-live version from a
 staged draft, so a production rollback **cannot infer its target** — you must
