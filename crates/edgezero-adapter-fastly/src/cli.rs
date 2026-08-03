@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
@@ -743,42 +743,52 @@ impl Adapter for FastlyCliAdapter {
             // passes through unchanged; if it is a chunk pointer the chunks
             // are fetched from the same store and reconstructed.
             //
-            // A referenced chunk that we cannot confidently retrieve makes the
-            // read INCOMPLETE only when it could not be FULLY read. The two cases
-            // differ:
-            //   - an INFRASTRUCTURE error (spawn/auth/schema/non-zero status, or an
-            //     ambiguous not-found that carries an operational marker) → `Err`
-            //     → `fetch_failed`: an incomplete read that must be a HARD error,
+            // A chunk describe that fails could not be FULLY read. Confirm whether
+            // the chunk is genuinely ABSENT against the complete store listing
+            // (authoritative), never the describe 404:
+            //   - CONFIRMED absent → resolve to a repairable `Corrupt`. The blob
+            //     spec makes persistent chunk loss repairable by re-pushing, so a
+            //     push can overwrite to fix it.
+            //   - present-but-unreadable, or the listing itself failed →
+            //     `fetch_failed`: an incomplete read that must be a HARD error,
             //     never an overwritable value.
-            //   - a CONFIRMED-absent chunk (`Ok(None)`: a clean not-found, filtered
-            //     by `stderr_is_confirmed_absence`) is genuinely gone. The blob
-            //     spec makes persistent chunk loss REPAIRABLE by re-pushing, so it
-            //     resolves to a repairable `Corrupt`, NOT a hard error -- otherwise
-            //     `config push` could never overwrite to fix it.
+            let store_keys: RefCell<Option<Result<HashSet<String>, String>>> = RefCell::new(None);
             let fetch_failed: Cell<bool> = Cell::new(false);
             let resolved = resolve_fastly_config_value_typed(key, value.to_owned(), |chunk_key| {
                 match fetch_remote_config_store_entry(&store_id, chunk_key) {
-                    Ok(found) => Ok(found),
-                    Err(err) => {
-                        fetch_failed.set(true);
-                        Err(err)
+                    Ok(found) => Ok(Some(found)),
+                    Err(_describe_err) => {
+                        match confirm_key_absent_cached(&store_keys, &store_id, chunk_key) {
+                            Ok(true) => Ok(None), // genuinely gone → repairable Corrupt
+                            Ok(false) => {
+                                fetch_failed.set(true);
+                                Err("a referenced chunk is present in the store but its value \
+                                     could not be read (incomplete read)"
+                                    .to_owned())
+                            }
+                            Err(list_err) => {
+                                fetch_failed.set(true);
+                                Err(list_err)
+                            }
+                        }
                     }
                 }
             });
             return classify_resolved_read(resolved, value, fetch_failed.get());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let lower = stderr.to_ascii_lowercase();
-        // Only a CONFIRMED clean absence (a not-found signal with no operational
-        // marker) is the legitimate first-push MissingKey. Any ambiguous or
-        // operational output (auth, network, 5xx, rate-limit, an HTML 404 page)
-        // stays a hard error: two such incomplete reads could otherwise pass the
-        // pre-write recheck and authorise an overwrite of healthy remote state.
-        if stderr_is_confirmed_absence(&lower) {
+        // The describe failed. Absence is CONFIRMED only by a complete listing
+        // that omits the key -- never by a describe 404, which a proxy/endpoint or
+        // auth failure produces just the same. A present key (or a listing that
+        // itself fails) is a hard error, so two such incomplete reads can never
+        // pass the pre-write recheck and authorise an overwrite.
+        if confirm_entry_absent(&store_id, key)? {
             return Ok(ReadConfigEntry::MissingKey);
         }
+        let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(
-            "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited with status {}\nstderr: {}",
+            "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited \
+             with status {} but the key IS present in the store listing (an operational failure, \
+             not absence); nothing was changed.\nstderr: {}",
             output.status,
             redact_stderr(&stderr)
         ))
@@ -1084,15 +1094,14 @@ fn reject_hard_linked_manifest(target: &Path) -> Result<(), String> {
 /// key, using `fastly config-store-entry describe --store-id=<id> --key=<k>
 /// --json`. Used by the chunk-pointer resolver to fan out to chunk entries.
 ///
-/// Returns:
-/// - `Ok(Some(value))` when the entry exists.
-/// - `Ok(None)` when the entry is absent (not-found / 404 / does not exist).
-/// - `Err(...)` on adapter or parse errors.
+/// `Ok(value)` when the entry exists; `Err` on ANY failure, INCLUDING a
+/// not-found. Absence is NOT decided here (a describe 404 is not proof) -- the
+/// caller confirms it against the complete store listing.
 ///
 /// # Errors
 /// Returns an error if `fastly` isn't on `PATH`, spawning fails, the JSON
-/// cannot be parsed, or the CLI exits with an unexpected non-zero status.
-fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<String>, String> {
+/// cannot be parsed, or the CLI exits with a non-zero status (not-found included).
+fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<String, String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
     let output = Command::new("fastly")
@@ -1131,18 +1140,13 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
                     redact_describe_response(&stdout)
                 )
             })?;
-        return Ok(Some(value.to_owned()));
+        return Ok(value.to_owned());
     }
+    // `Err` on ANY non-success, INCLUDING a not-found. A describe 404 alone is not
+    // proof of absence -- a proxy/endpoint 404, an auth 404, or a gateway error
+    // all look the same -- so the caller CONFIRMS a genuine absence against the
+    // complete store listing rather than trusting this stderr.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let lower = stderr.to_ascii_lowercase();
-    // Only a CONFIRMED clean absence maps to `Ok(None)` (the chunk is genuinely
-    // gone). An operational failure (auth, network, 5xx, rate-limit, an HTML 404
-    // page) stays `Err`: the caller treats a confirmed-absent chunk as a
-    // repairable value a re-push overwrites, but must fail closed on an
-    // ambiguous/incomplete read.
-    if stderr_is_confirmed_absence(&lower) {
-        return Ok(None);
-    }
     Err(format!(
         "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` \
          exited with status {}\nstderr: {}",
@@ -1151,59 +1155,101 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
     ))
 }
 
-/// Does this lowercased Fastly stderr indicate an OPERATIONAL failure (auth,
-/// network, server, rate-limit) rather than a genuinely-absent entry/store?
+/// The COMPLETE set of item keys in a store, via `config-store-entry list`.
 ///
-/// The fastly CLI's not-found wording is AMBIGUOUS: a 401/403, a 5xx, a timeout,
-/// a rate-limit, or an HTML "page not found" from a proxy can all carry
-/// "not found"/"404"-shaped text. Such a read is INCOMPLETE, so it must fail
-/// closed -- never read as absence, which would let a push overwrite healthy
-/// remote state it never actually saw.
-fn stderr_signals_operational_failure(lower: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "unauthor",
-        "not authorized",
-        "forbidden",
-        "permission",
-        "denied",
-        "credential",
-        "token",
-        "401",
-        "403",
-        "429",
-        "timed out",
-        "timeout",
-        "could not connect",
-        "connection",
-        "network",
-        "temporarily",
-        "unavailable",
-        "rate limit",
-        "too many requests",
-        "internal server",
-        "bad gateway",
-        "gateway timeout",
-        "500",
-        "502",
-        "503",
-        "504",
-        "dns",
-        // A proxy/HTML 404 page ("404 page not found") is a routing/endpoint
-        // failure, NOT a genuine config-store-item absence.
-        "page not found",
-    ];
-    MARKERS.iter().any(|marker| lower.contains(marker))
+/// Absence is CONFIRMED against this, never against a describe 404: the listing
+/// is completeness-strict (fails closed on a paginated / non-bare-array view and
+/// on a duplicate key), so a key's absence from it is authoritative. Tolerant of
+/// empty item VALUES -- only keys are needed to confirm presence.
+fn list_config_store_keys(store_id: &str) -> Result<HashSet<String>, String> {
+    let store_arg = format!("--store-id={store_id}");
+    let output = Command::new("fastly")
+        .args(["config-store-entry", "list", store_arg.as_str(), "--json"])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`fastly config-store-entry list --store-id={store_id} --json` exited with status {}\nstderr: {}",
+            output.status,
+            redact_stderr(&stderr)
+        ));
+    }
+    let stdout = strict_stdout(output.stdout, "config-store-entry list --json")?;
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
+        format!(
+            "failed to parse `fastly config-store-entry list` JSON (parse error redacted; \
+             response: {})",
+            redact_describe_response(&stdout)
+        )
+    })?;
+    let array = parsed.as_array().ok_or_else(|| {
+        format!(
+            "refusing to confirm absence: `fastly config-store-entry list --json` did not return a \
+             bare array (response: {}). A paginated or partial view could hide a present key and \
+             turn it into a false absence that authorises an overwrite.",
+            redact_describe_response(&stdout)
+        )
+    })?;
+    let mut keys = HashSet::with_capacity(array.len());
+    for (idx, entry) in array.iter().enumerate() {
+        let key = entry
+            .get("item_key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "`fastly config-store-entry list` entry #{idx} is missing a string `item_key`; \
+                     refusing to confirm absence on an unreadable listing"
+                )
+            })?;
+        if key.is_empty() {
+            return Err(format!(
+                "`fastly config-store-entry list` entry #{idx} has an empty `item_key`; refusing \
+                 to confirm absence on an unreadable listing"
+            ));
+        }
+        if !keys.insert(key.to_owned()) {
+            return Err(format!(
+                "`fastly config-store-entry list` returned duplicate key `{key}`; refusing to \
+                 confirm absence on an ambiguous listing"
+            ));
+        }
+    }
+    Ok(keys)
 }
 
-/// Is this lowercased Fastly stderr a CONFIRMED clean absence -- a not-found
-/// signal with NO operational marker? Only this maps a nonzero read to
-/// `MissingKey` / an absent chunk; any ambiguous or operational output stays a
-/// hard error (an incomplete read must never authorise an overwrite).
-fn stderr_is_confirmed_absence(lower: &str) -> bool {
-    !stderr_signals_operational_failure(lower)
-        && (lower.contains("not found")
-            || lower.contains("does not exist")
-            || lower.contains("404"))
+/// Confirm `key` is ABSENT from the store via a complete listing (authoritative).
+/// `Ok(true)` = the listing succeeded and omits the key. `Ok(false)` = the key IS
+/// present (so a describe failure on it was operational, not absence). `Err` = the
+/// listing itself failed. All three fail closed for the caller: only `Ok(true)`
+/// is a genuine absence.
+fn confirm_entry_absent(store_id: &str, key: &str) -> Result<bool, String> {
+    Ok(!list_config_store_keys(store_id)?.contains(key))
+}
+
+/// Cached form of [`confirm_entry_absent`] for chunk fetches: lists the store at
+/// most ONCE per read (a whole lost generation would otherwise list per chunk).
+fn confirm_key_absent_cached(
+    cache: &RefCell<Option<Result<HashSet<String>, String>>>,
+    store_id: &str,
+    key: &str,
+) -> Result<bool, String> {
+    let mut slot = cache.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(list_config_store_keys(store_id));
+    }
+    match slot.as_ref() {
+        Some(Ok(keys)) => Ok(!keys.contains(key)),
+        Some(Err(err)) => Err(err.clone()),
+        // Unreachable: populated just above. Fail closed rather than unwrap.
+        None => Err("internal error: store listing cache was not populated".to_owned()),
+    }
 }
 
 /// Convert `fastly` stdout to a `String`, FAILING CLOSED on invalid UTF-8 rather
@@ -1506,6 +1552,57 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
 /// values). Idempotent — re-running just rewrites `contents`. Other
 /// blocks in `fastly.toml` (setup, scripts, the actual `[local_server]`
 /// secret stores, etc.) are preserved via `toml_edit`.
+/// Force `format = "inline-toml"` on a local config-store entry: the inline
+/// `contents` this writer emits REQUIRE it. A pre-existing `format = "json"` /
+/// `"file"` (pointing at an external file) would otherwise SURVIVE next to the
+/// inline contents, leaving Viceroy with a contradictory store the command still
+/// reports as written. Returns a warning when it REPLACED an incompatible value.
+fn ensure_inline_toml_format(
+    store_tbl: &mut toml_edit::Table,
+    platform_name: &str,
+) -> Option<String> {
+    let existing = store_tbl
+        .get("format")
+        .and_then(toml_edit::Item::as_str)
+        .map(str::to_owned);
+    if existing.as_deref() == Some("inline-toml") {
+        return None;
+    }
+    let warning = existing.filter(|fmt| fmt != "inline-toml").map(|prev| {
+        format!(
+            "warning: `local_server.config_stores.{platform_name}` declared `format = \"{prev}\"`, \
+             which is incompatible with the inline `contents` written here; it was changed to \
+             `format = \"inline-toml\"`"
+        )
+    });
+    store_tbl.insert("format", toml_edit::value("inline-toml"));
+    warning
+}
+
+/// TOCTOU guard for the LOCAL writer: refuse to overwrite a root that now holds a
+/// NEWER format, classified HERE under the write lock. The generic push's
+/// pre-push future-format check ran BEFORE the lock, so a newer writer could have
+/// installed a v2 value in between; without this the old writer would clobber it.
+fn reject_future_local_roots(
+    contents_tbl: &toml_edit::Table,
+    gc_roots: &[(String, HashSet<String>)],
+) -> Result<(), String> {
+    for (root_key, _) in gc_roots {
+        if contents_tbl
+            .get(root_key)
+            .and_then(toml_edit::Item::as_str)
+            .is_some_and(value_is_future_format)
+        {
+            return Err(format!(
+                "refusing to overwrite `{root_key}`: the local store now holds a value in a newer \
+                 format this CLI does not recognise (installed since the pre-push check). Upgrade \
+                 the CLI rather than clobber a newer format. Nothing was changed."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_fastly_local_config_store(
     path: &Path,
     platform_name: &str,
@@ -1579,11 +1676,7 @@ fn write_fastly_local_config_store(
             path.display()
         )
     })?;
-    // Ensure the `format` key is present even on a pre-existing
-    // entry that omitted it.
-    if !store_tbl.contains_key("format") {
-        store_tbl.insert("format", toml_edit::value("inline-toml"));
-    }
+    let format_change_warning = ensure_inline_toml_format(store_tbl, platform_name);
     let contents_entry = store_tbl
         .entry("contents")
         .or_insert_with(|| Item::Table(Table::new()));
@@ -1593,6 +1686,7 @@ fn write_fastly_local_config_store(
             path.display()
         )
     })?;
+    reject_future_local_roots(contents_tbl, gc_roots)?;
     // Snapshot prior chunk keys per GC root BEFORE the upsert, using the
     // exact keep-set the caller computed for each root (no prefix scan).
     let mut plans: Vec<FastlyConfigGcPlan> = Vec::with_capacity(gc_roots.len());
@@ -1615,6 +1709,7 @@ fn write_fastly_local_config_store(
     // Prune orphans in the same in-memory rewrite; a suspicious prior
     // pointer (Err) warns and deletes nothing.
     let mut warnings = Vec::new();
+    warnings.extend(format_change_warning);
     for plan in &plans {
         match orphan_chunk_keys(plan) {
             Ok(orphans) => {
@@ -2444,6 +2539,21 @@ fn classify_store_entries(
         // the live set and becomes deletable. So reassemble what it references
         // and hold the bytes against its content-address.
         let assembled = assemble_pointer_chunks(&item.item_key, &pointer, value_by_key)?;
+        // The reassembled value may be a NEWER inner format (a bumped envelope
+        // version, or an unknown `edgezero_kind`) that `BlobEnvelope` deserialize
+        // silently ignores. Such a format can reference ADDITIONAL generations this
+        // build cannot see, so trusting only the outer pointer's chunks as the live
+        // set would let GC delete those as orphans. The runtime resolver rejects
+        // this case; GC must too. Fail closed.
+        if value_is_future_format(&assembled) {
+            return Err(format!(
+                "refusing to reclaim: root `{}` reconstructs to a value in a newer format this \
+                 build does not recognise. It may reference generations this build cannot see, so \
+                 treating its outer chunks as the whole live set could delete live data. Nothing \
+                 was deleted.",
+                item.item_key
+            ));
+        }
         gc_verify_generation(&pointer.envelope_sha256, &assembled).map_err(|err| {
             format!(
                 "refusing to reclaim: root `{}` names a chunk set that does not reconstruct the \
@@ -3781,6 +3891,45 @@ mod tests {
         assert!(after.contains("name = \"demo\""), "preserved: {after}");
     }
 
+    /// An existing `format = "json"` / `"file"` is INCOMPATIBLE with the inline
+    /// `contents` this writer emits. It must be overwritten to `inline-toml` (with
+    /// a warning), not left to survive and produce a contradictory store the
+    /// command still reports as written.
+    #[test]
+    fn write_fastly_local_config_store_replaces_incompatible_format() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            format!(
+                "name = \"demo\"\n\n[local_server.config_stores.{TEST_CONFIG_ID}]\nformat = \"json\"\nfile = \"cfg.json\"\n",
+            ),
+        )
+        .expect("write");
+        let warnings = write_fastly_local_config_store(
+            &path,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hello".to_owned())],
+            &[],
+        )
+        .expect("write");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("format = \"inline-toml\""),
+            "incompatible format must be replaced: {after}"
+        );
+        assert!(
+            !after.contains("format = \"json\""),
+            "the old incompatible format must not survive: {after}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("incompatible") && w.contains("inline-toml")),
+            "must warn that an incompatible format was replaced: {warnings:?}"
+        );
+    }
+
     #[test]
     fn write_fastly_local_config_store_replaces_existing_block_on_re_push() {
         let dir = tempdir().expect("tempdir");
@@ -4396,20 +4545,44 @@ build = \"cargo build --release\"
         stderr_body: &str,
         exit_code: i32,
     ) -> tempfile::TempDir {
+        fake_fastly_returning_with_keys(stdout_body, stderr_body, exit_code, &[])
+    }
+
+    /// As [`fake_fastly_returning`], but also serves `config-store-entry list`
+    /// with a bare array of the `entry_list_keys` as `item_key` entries. A
+    /// describe FAILURE is confirmed against this listing: keys present here read
+    /// as a present-but-unreadable hard error, keys absent read as `MissingKey`.
+    #[cfg(unix)]
+    fn fake_fastly_returning_with_keys(
+        stdout_body: &str,
+        stderr_body: &str,
+        exit_code: i32,
+        entry_list_keys: &[&str],
+    ) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempdir().expect("tempdir");
         let script_path = dir.path().join("fastly");
         let stdout_file = dir.path().join("stdout_payload.txt");
         let stderr_file = dir.path().join("stderr_payload.txt");
         let list_file = dir.path().join("list_payload.txt");
+        let entry_list_file = dir.path().join("entry_list_payload.txt");
         // Store-list JSON: bare array with one entry matching TEST_CONFIG_ID.
         let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        let entry_list_json = {
+            let items: Vec<String> = entry_list_keys
+                .iter()
+                .map(|key| format!(r#"{{"item_key":{}}}"#, serde_json::to_string(key).unwrap()))
+                .collect();
+            format!("[{}]", items.join(","))
+        };
         fs::write(&stdout_file, stdout_body).expect("write stdout payload");
         fs::write(&stderr_file, stderr_body).expect("write stderr payload");
         fs::write(&list_file, list_json).expect("write list payload");
+        fs::write(&entry_list_file, entry_list_json).expect("write entry list payload");
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\ncat '{}' >&2\nexit {exit_code}\n",
+            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\nif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\ncat '{}' >&2\nexit {exit_code}\n",
             list_file.display(),
+            entry_list_file.display(),
             stdout_file.display(),
             stderr_file.display(),
         );
@@ -4505,10 +4678,11 @@ build = \"cargo build --release\"
 
     #[cfg(unix)]
     #[test]
-    fn read_remote_returns_missing_key_on_not_found_stderr() {
+    fn read_remote_returns_missing_key_when_confirmed_absent() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // describe exits non-zero with "not found" in stderr → MissingKey.
+        // describe exits non-zero, and the complete store listing (empty here)
+        // CONFIRMS the key is absent → MissingKey (not decided by the 404 alone).
         let fake = fake_fastly_returning("", "Error: item not found", 1);
         let _path = PathPrepend::new(fake.path());
         let result = FastlyCliAdapter
@@ -4685,6 +4859,21 @@ build = \"cargo build --release\"
         let list_file = fake_dir.path().join("list.json");
         let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
         fs::write(&list_file, list_json).expect("write list");
+        // The `config-store-entry list` response: a bare array of the keys present
+        // in `key_responses`. Absence confirmation lists the store and checks
+        // membership, so a key omitted here reads as CONFIRMED absent. Only
+        // `item_key` is needed (the keys-only listing is value-tolerant).
+        let entry_list_file = fake_dir.path().join("entry_list.json");
+        let entries_json = {
+            let items: Vec<String> = key_responses
+                .iter()
+                .map(|(key, _)| {
+                    format!(r#"{{"item_key":{}}}"#, serde_json::to_string(key).unwrap())
+                })
+                .collect();
+            format!("[{}]", items.join(","))
+        };
+        fs::write(&entry_list_file, entries_json).expect("write entry list");
         // Write each key response to a named file.
         let mut dispatch_lines = String::new();
         for (key, response) in key_responses {
@@ -4700,11 +4889,13 @@ build = \"cargo build --release\"
             )
             .expect("write to String is infallible");
         }
-        // Fallback outputs "not found" so fetch_remote_config_store_entry
-        // maps it to Ok(None) rather than Err.
+        // `config-store` (store list) and `config-store-entry list` are served
+        // from their files; a `describe` for an unknown key exits 1 "not found",
+        // which the caller then CONFIRMS against the entry list.
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\n{dispatch_lines}echo 'Error: item not found' >&2\nexit 1\n",
-            list_file.display()
+            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\nif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  cat '{}'\n  exit 0\nfi\n{dispatch_lines}echo 'Error: item not found' >&2\nexit 1\n",
+            list_file.display(),
+            entry_list_file.display()
         );
         let script_path = fake_dir.path().join("fastly");
         fs::write(&script_path, &script).expect("write script");
@@ -4979,9 +5170,11 @@ echo 'unexpected' >&2; exit 1
         const SENTINEL: &str = "SUPER_SECRET_TOKEN_stderr1";
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Not a "not found" — a hard failure that echoes the value.
+        // A hard failure that echoes the value. The key IS present in the store
+        // listing, so absence confirmation fails and the read surfaces the
+        // (redacted) describe stderr on the hard-error path.
         let stderr = format!("Error: internal failure processing value {SENTINEL}");
-        let fake = fake_fastly_returning("", &stderr, 1);
+        let fake = fake_fastly_returning_with_keys("", &stderr, 1, &["cfg"]);
         let _path = PathPrepend::new(fake.path());
 
         let result = FastlyCliAdapter.read_config_entry(
@@ -5450,13 +5643,13 @@ echo 'unexpected' >&2; exit 1
             TEST_CONFIG_ID,
             &AdapterPushContext::new(),
         );
-        // A CONFIRMED-absent chunk (a clean not-found, filtered by
-        // `stderr_is_confirmed_absence`) is genuinely gone. The blob spec makes
+        // The chunk describe fails, and the complete store listing (which holds
+        // only the root pointer) CONFIRMS the chunk is absent. The blob spec makes
         // persistent chunk loss REPAIRABLE by re-pushing, so the read reports
         // `Corrupt` (a push overwrites to repair), NOT a hard error -- otherwise
-        // `config push` could never fix it. An OPERATIONAL failure that merely
-        // carries not-found text stays a hard error (see the operational-marker
-        // tests), so an incomplete read still never authorises an overwrite.
+        // `config push` could never fix it. Absence is confirmed by the listing,
+        // never by the describe 404 alone, so a proxy/auth failure (where the
+        // listing also fails, or shows the chunk present) stays a hard error.
         assert!(
             matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
             "a confirmed-absent chunk must be repairable Corrupt, not a hard error"
@@ -5549,53 +5742,6 @@ echo 'unexpected' >&2; exit 1
             matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
             "a malformed pointer at an EXISTING entry must be Corrupt (repairable), not an error"
         );
-    }
-
-    /// A not-found-shaped stderr that ALSO carries an operational marker (auth,
-    /// network, server 5xx, rate-limit) must be read as an operational failure,
-    /// never as a genuine absence -- so it fails closed instead of authorising an
-    /// overwrite. A clean absence has no such marker.
-    #[test]
-    fn operational_stderr_is_never_read_as_absence() {
-        // Not-found-shaped text that ALSO carries an operational marker must NOT
-        // be a confirmed absence -- it stays a hard error (fail closed). This
-        // includes numeric auth codes and an HTML "404 page not found" from a
-        // proxy, which are routing/auth failures, not a genuine item absence.
-        for op in [
-            "error: 404 not found (401 unauthorized)",
-            "not found (403 forbidden)",
-            "not found: connection reset",
-            "does not exist -- 503 service unavailable",
-            "not found; rate limit exceeded (429)",
-            "request timed out; entry not found",
-            "404 page not found",
-        ] {
-            let lower = op.to_ascii_lowercase();
-            assert!(
-                stderr_signals_operational_failure(&lower),
-                "must treat as operational: {op}"
-            );
-            assert!(
-                !stderr_is_confirmed_absence(&lower),
-                "operational output must not be a confirmed absence: {op}"
-            );
-        }
-        // A CLEAN not-found (no operational marker) is a confirmed absence.
-        for absent in [
-            "error: config store entry not found",
-            "the item does not exist",
-            "error: record not found",
-        ] {
-            let lower = absent.to_ascii_lowercase();
-            assert!(
-                !stderr_signals_operational_failure(&lower),
-                "a clean absence must not look operational: {absent}"
-            );
-            assert!(
-                stderr_is_confirmed_absence(&lower),
-                "a clean not-found must be a confirmed absence: {absent}"
-            );
-        }
     }
 
     /// The read taxonomy distinguishes repairable corruption from cases a push
@@ -7328,6 +7474,45 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// A valid v1 pointer whose chunks reassemble to a NEWER inner format. GC can
+    /// validate the outer pointer and reassemble the bytes, but the reassembled
+    /// value may reference generations this build cannot see, so trusting only the
+    /// outer chunks as the live set could delete live data. GC must fail closed --
+    /// `BlobEnvelope` deserialize alone would silently ignore the newer format.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_a_future_inner_generation() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // A v1 envelope, chunked, then its inner `version` bumped to 2. The v1
+        // pointer's content-address still matches the reassembled (v2) bytes.
+        let v1 = gen_envelope("live");
+        let mut v2_value: serde_json::Value = serde_json::from_str(&v1).expect("parse");
+        v2_value["version"] = serde_json::json!(2_u32);
+        let v2 = v2_value.to_string();
+
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &v2, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &v2, 172_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = run_gc(dir.path(), 86_400, false);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|err| err.contains("newer format")),
+            "a future inner generation must abort GC with a newer-format error: {result:?}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "nothing may be deleted when GC fails closed; log:\n{log}"
+        );
+    }
+
     /// A dry-run lists exactly what it would delete, and deletes nothing.
     #[cfg(unix)]
     #[test]
@@ -8047,7 +8232,7 @@ echo 'unexpected' >&2; exit 1
             "[local_server.config_stores.app_config]\n",
             "format = \"inline-toml\"\n\n",
             "[local_server.config_stores.app_config.contents]\n",
-            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":1}\"\n",
             "\"app_config.__edgezero_chunks.deadbeef.0\" = \"seeded-chunk-payload\"\n",
         );
         fs::write(&fastly_toml, seed).expect("seed");
@@ -8092,6 +8277,49 @@ echo 'unexpected' >&2; exit 1
                 .and_then(toml_edit::Item::as_str),
             Some(direct.as_str()),
             "new value still written"
+        );
+    }
+
+    /// TOCTOU guard: if the locked reread finds the root now holds a NEWER format
+    /// (installed between the pre-push check and the lock), the writer must REFUSE
+    /// to overwrite it -- an older writer must never clobber a newer format.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_refuses_to_overwrite_a_future_prior() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        // The root now holds a v2 direct envelope from a newer writer.
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n\n",
+            "[local_server.config_stores.app_config.contents]\n",
+            "app_config = \"{\\\"data\\\":{},\\\"sha256\\\":\\\"x\\\",\\\"generated_at\\\":\\\"t\\\",\\\"version\\\":2}\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("a future prior must abort the push under the lock");
+        assert!(
+            err.contains("newer format") && err.to_lowercase().contains("refusing"),
+            "must refuse to clobber a newer format: {err}"
+        );
+        // The v2 value must survive untouched.
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        assert!(
+            after.contains("\\\"version\\\":2"),
+            "the newer-format value must be left intact: {after}"
         );
     }
 
@@ -8655,7 +8883,7 @@ echo 'unexpected' >&2; exit 1
             "[local_server.config_stores.app_config]\n",
             "format = \"inline-toml\"\n\n",
             "[local_server.config_stores.app_config.contents]\n",
-            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":1}\"\n",
         );
         fs::write(&fastly_toml, seed).expect("seed");
 
@@ -8749,7 +8977,7 @@ echo 'unexpected' >&2; exit 1
             "[local_server.config_stores.app_config]\n",
             "format = \"inline-toml\"\n\n",
             "[local_server.config_stores.app_config.contents]\n",
-            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":1}\"\n",
         );
         fs::write(&fastly_toml, seed).expect("seed");
 

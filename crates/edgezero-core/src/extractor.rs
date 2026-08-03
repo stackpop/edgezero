@@ -811,22 +811,33 @@ where
     }
 }
 
-/// The envelope `version` in `raw` when it is present but NOT the v1 this build
-/// understands — a NEWER format from a future writer.
+/// A redacted reason when `raw` is a NEWER format this build must not apply, or
+/// `None` when it is not (that stays ordinary corruption).
 ///
 /// A cheap, schema-agnostic pre-check that parses only as a generic JSON object,
-/// so it catches a newer envelope even when the value no longer deserializes as
-/// the exact v1 [`BlobEnvelope`]. A missing/absent version is `None` (that stays
-/// ordinary corruption). `version` is a plain integer, never a secret.
-fn future_envelope_version(raw: &str) -> Option<u64> {
+/// so it catches a newer format even when the value no longer deserializes as the
+/// exact v1 [`BlobEnvelope`]. It is future when EITHER:
+/// - it carries an `edgezero_kind` field. A v1 `BlobEnvelope` never has one;
+///   serde silently ignores the unknown field, so without this a v1-shaped
+///   envelope tagged `edgezero_kind: "new_format"` would deserialize and apply on
+///   non-Fastly runtimes (the generic push already refuses that exact value); or
+/// - it carries a `version` field present but NOT 1.
+///
+/// The reason names only the integer version or the field name — never a value,
+/// so it is safe to surface in the (HTTP-visible) remediation message.
+fn future_format_reason(raw: &str) -> Option<String> {
     use crate::blob_envelope::ENVELOPE_VERSION_V1;
     let serde_json::Value::Object(obj) = serde_json::from_str::<serde_json::Value>(raw).ok()?
     else {
         return None;
     };
+    if obj.contains_key("edgezero_kind") {
+        return Some("an unrecognised `edgezero_kind` discriminator".to_owned());
+    }
     obj.get("version")
         .and_then(serde_json::Value::as_u64)
         .filter(|version| *version != u64::from(ENVELOPE_VERSION_V1))
+        .map(|version| format!("envelope version {version}"))
 }
 
 /// Shared body: fetch + envelope + sha + secret walk + deserialise + validate.
@@ -879,17 +890,18 @@ where
     // config-store values that may hold secrets, and this message reaches the
     // HTTP body. Report a category only.
     //
-    // A value written by a NEWER envelope format needs a DIFFERENT remediation
-    // than corruption: re-pushing the same config cannot help a build older than
-    // its config; the deployed build must be UPGRADED. This is the typed
-    // app-config layer's job (the store returns arbitrary direct values verbatim),
-    // so the version is detected here, BEFORE the exact-v1 deserialize (a newer
-    // envelope may not even parse as v1). `version` is a plain integer, never a
-    // secret, so surfacing it is safe.
-    if let Some(version) = future_envelope_version(&raw) {
+    // A value written by a NEWER format (a bumped envelope version OR an unknown
+    // `edgezero_kind` discriminator) needs a DIFFERENT remediation than
+    // corruption: re-pushing the same config cannot help a build older than its
+    // config; the deployed build must be UPGRADED. This is the typed app-config
+    // layer's job (the store returns arbitrary direct values verbatim), so it is
+    // detected here, BEFORE the exact-v1 deserialize (a newer format may not even
+    // parse as v1, and serde ignores an unknown discriminator). The reason names
+    // only the version/field, never a value, so surfacing it is safe.
+    if let Some(reason) = future_format_reason(&raw) {
         return Err(EdgeError::internal(anyhow::anyhow!(
-            "typed app-config blob uses envelope version {version}, which this build does not \
-             understand; redeploy this service with an updated build (re-pushing will not help)"
+            "typed app-config blob uses {reason}, which this build does not understand; redeploy \
+             this service with an updated build (re-pushing will not help)"
         )));
     }
     let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
@@ -2442,6 +2454,39 @@ mod tests {
         assert!(
             !message.contains("re-run config push") && !message.contains("push to repair"),
             "must NOT tell the operator to re-push a future format: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_extractor_asks_to_redeploy_on_an_unknown_edgezero_kind() {
+        // A v1-SHAPED envelope carrying an `edgezero_kind` discriminator. serde
+        // ignores the unknown field, so without the reason check the extractor
+        // would deserialize and APPLY it. It must instead ask to redeploy, matching
+        // the generic push's refusal of the same value.
+        struct KindTaggedStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for KindTaggedStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                let env = BlobEnvelope::new(
+                    serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
+                    "2026-01-01T00:00:00Z".into(),
+                );
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+                value["edgezero_kind"] = serde_json::json!("new_format");
+                Ok(Some(value.to_string()))
+            }
+        }
+
+        let ctx = ctx_with_config_store(KindTaggedStore, "key");
+        let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
+            .expect_err("an unknown edgezero_kind must error");
+        let message = err.message().to_lowercase();
+        assert!(
+            matches!(err, EdgeError::Internal { .. })
+                && message.contains("redeploy")
+                && message.contains("edgezero_kind"),
+            "an unknown discriminator must ask to redeploy: {err:?}"
         );
     }
 

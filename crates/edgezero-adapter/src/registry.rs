@@ -204,24 +204,25 @@ impl<'entry> TypedSecretEntry<'entry> {
 /// Outcome of a single-key read. See spec 9.0.
 #[non_exhaustive]
 pub enum ReadConfigEntry {
-    /// The entry EXISTS but its stored value is PROVABLY unusable — a hash
-    /// mismatch, or a malformed/foreign pointer that resolves to a non-envelope.
-    /// Distinct from a read/IO failure (which still errors): the store WAS
-    /// reachable, the key WAS present, and the value was FULLY read, so a
-    /// `config push` can safely overwrite it. This is the runtime's "re-run config
-    /// push to repair" contract made real — the push treats it like an absent
-    /// remote (proceeds to write) rather than aborting, so a broken generation is
-    /// recoverable in-band. The `&'static str` carries a redacted, human-readable
-    /// reason.
+    /// The entry EXISTS but its stored value is PROVABLY unusable, AND that was
+    /// established without an incomplete read — a hash mismatch, a malformed/foreign
+    /// pointer that resolves to a non-envelope, or a referenced chunk CONFIRMED
+    /// absent by an authoritative complete listing (persistent loss the blob spec
+    /// repairs by re-pushing). Distinct from a read/IO failure (which still
+    /// errors): a `config push` can safely overwrite it. This is the runtime's
+    /// "re-run config push to repair" contract made real — the push treats it like
+    /// an absent remote (proceeds to write) rather than aborting, so a broken
+    /// generation is recoverable in-band. The `&'static str` carries a redacted,
+    /// human-readable reason.
     ///
-    /// NOT this: a value that could not be FULLY read — e.g. a chunk pointer whose
-    /// referenced chunk is absent or unfetchable. Its absence is indistinguishable
-    /// from an incomplete read (an auth/network blip returns the same "not found"),
-    /// so overwriting on it could clobber a healthy generation mid-propagation.
-    /// Adapters MUST fail closed there (a hard read error the operator retries),
-    /// never report `Corrupt`. A NEWER format (an unknown/bumped envelope or
-    /// pointer version) is likewise NOT `Corrupt`: it is refused with an upgrade
-    /// error and never overwritten.
+    /// The critical qualifier is CONFIRMED. An absence inferred from a single
+    /// not-found/404 response is NOT `Corrupt`: a proxy/endpoint or auth failure
+    /// returns the same shape, so trusting it could clobber a healthy generation
+    /// on an incomplete read. An adapter reports a missing chunk as `Corrupt` ONLY
+    /// when a complete, unpaginated listing of the store omits it; otherwise it
+    /// fails closed (a hard read error the operator retries). A NEWER format (an
+    /// unknown `edgezero_kind`, or a bumped envelope/pointer version) is likewise
+    /// NOT `Corrupt`: it is refused with an upgrade error and never overwritten.
     ///
     /// Adapters MAY, but need not, produce this: an adapter that returns a
     /// corrupt value as `Present` still gets the same repair behaviour, because
