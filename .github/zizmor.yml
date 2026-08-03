@@ -1,0 +1,16 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/).
+#
+# unpinned-uses policy: this repo pins GitHub Actions to readable release VERSION
+# TAGS (e.g. `@v4.3.0`), not commit hashes. zizmor's default blanket policy requires
+# a full commit hash for third-party (non-GitHub) publishers, which would reject a
+# tag like `actions-rust-lang/setup-rust-toolchain@v1.17.0`. Relax the blanket policy
+# to `ref-pin` so a version tag satisfies the audit for every action.
+#
+# This does NOT permit floating refs: `check-action-pins.sh` still fails any
+# `@main`/`@master`/`@HEAD`, so every `uses:` must resolve to a concrete released tag
+# (or a hash, which also satisfies ref-pin).
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": ref-pin
