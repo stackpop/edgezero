@@ -125,7 +125,7 @@ build_deploy_argv() {
   local cli_bin="$1"
   local adapter="$2"
   ARGV=("$cli_bin" deploy --adapter "$adapter")
-  # Typed adapter flags (before `--`): e.g. --service-id <id>, --stage.
+  # Typed adapter flags (before `--`): e.g. --service-id <id>, --staging.
   collect_nul "${EDGEZERO__DEPLOY__FLAGS_FILE:-/dev/null}"
   ((${#COLLECTED[@]})) && ARGV+=("${COLLECTED[@]}")
   # Caller passthrough (after `--`): allowlisted deploy-args, e.g. --comment.

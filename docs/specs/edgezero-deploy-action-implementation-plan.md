@@ -161,7 +161,7 @@ reference to port from. Most transfer with light changes:
      `build-mode`, `build-args`, `deploy-args`, `cache`, and `stage` (§5.4).
    - Map `fastly-api-token` → `provider-env: {FASTLY_API_TOKEN: …}` and
      `fastly-service-id` → action-owned `deploy-flags: ["--service-id", …]` (typed
-     flags, placed BEFORE `--`); when `stage: true`, add `--stage`.
+     flags, placed BEFORE `--`); when `stage: true`, add `--staging`.
      `--non-interactive` is NOT a deploy-flag — the engine adds it as a deploy-args
      PREPEND (after `--`, ahead of caller `deploy-args`), and rejects it if a
      caller passes it in `deploy-args`.
@@ -275,7 +275,7 @@ reference to port from. Most transfer with light changes:
      CLIs expose `--version`. `build-app-cli` still reads the version from
      `cargo metadata` (authoritative, flag-independent) and smoke-checks with `--help`.
    - Fastly staging deploy: extend the Fastly adapter `deploy` path with
-     `--stage` → `fastly compute update --autoclone --version=active` +
+     `--staging` → `fastly compute update --autoclone --version=active` +
      `fastly service-version stage`; emit the service version in a parseable form.
    - Add `active-version`, `healthcheck`, and `rollback` CLI subcommands with a
      Fastly adapter implementation (`active-version` resolves the currently-active

@@ -255,7 +255,7 @@ EOF
   chmod +x "$bin_dir/fakecli"
 
   # NUL-delimited argument files, exactly as validate-inputs would emit them.
-  printf -- '--service-id\0abc\0--stage\0' >"$WORK_DIR/deploy-flags.nul"
+  printf -- '--service-id\0abc\0--staging\0' >"$WORK_DIR/deploy-flags.nul"
   printf -- '--comment\0hello\0' >"$WORK_DIR/deploy-args.nul"
 
   if env -i PATH="$bin_dir:$PATH" \
@@ -266,7 +266,7 @@ EOF
     EDGEZERO__DEPLOY__ARGS_FILE="$WORK_DIR/deploy-args.nul" \
     bash "$CORE_SCRIPTS/run-app-cli.sh" deploy >/dev/null 2>&1; then
     local expected
-    expected=$'deploy\n--adapter\nfastly\n--service-id\nabc\n--stage\n--\n--comment\nhello'
+    expected=$'deploy\n--adapter\nfastly\n--service-id\nabc\n--staging\n--\n--comment\nhello'
     assert_equals "flags precede --, passthrough follows --" "$expected" "$(cat "$argv_file")"
   else
     fail "run-cli deploy failed to execute"

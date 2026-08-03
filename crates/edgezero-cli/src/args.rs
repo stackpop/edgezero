@@ -162,16 +162,17 @@ pub struct DeployArgs {
     /// Platform service id the deploy targets. Consumed by the Fastly
     /// staging lifecycle: production deploy passes it
     /// through to `fastly compute deploy` and resolves the activated
-    /// version; `--stage` uses it to clone + stage a draft version.
+    /// version; `--staging` uses it to clone + stage a draft version.
     /// Adapters that don't need a service id ignore it.
     #[arg(long)]
     pub service_id: Option<String>,
     /// Stage a draft version instead of activating (Fastly only):
     /// builds and uploads to a new draft service version cloned
     /// from the active one, marks it staged, and emits the staged
-    /// version. Non-Fastly adapters reject `--stage`.
+    /// version. Non-Fastly adapters reject `--staging`. The same
+    /// `--staging` verb healthcheck/rollback/config-push/config-diff use.
     #[arg(long)]
-    pub stage: bool,
+    pub staging: bool,
 }
 
 /// Arguments for the `new` command.
@@ -464,8 +465,8 @@ pub struct ConfigPushArgs {
     pub runtime_config: Option<PathBuf>,
     /// Push to staging: write the config under the `<logical-id>_staging` key
     /// in the SAME store, so it never overwrites the production key the live
-    /// service reads. The same `--staging` verb `healthcheck`/`rollback` use
-    /// (deploy's equivalent is `--stage`). Mutually exclusive with `--key`: the
+    /// service reads. The same `--staging` verb `deploy`/`healthcheck`/`rollback`
+    /// use. Mutually exclusive with `--key`: the
     /// staging key is derived from the
     /// store's logical id because that is what the staging selector store (created
     /// and linked by a staged deploy) points a staged version at, so an explicit
@@ -798,20 +799,20 @@ mod tests {
     // ── Fastly staging lifecycle arg tests ─────────────────────────────
 
     #[test]
-    fn deploy_stage_flag_defaults_false() {
+    fn deploy_staging_flag_defaults_false() {
         let args = Args::try_parse_from(["edgezero", "deploy", "--adapter", "fastly"])
             .expect("parse deploy");
         let Command::Deploy(deploy) = args.cmd else {
             panic!("expected Command::Deploy");
         };
-        assert!(!deploy.stage);
+        assert!(!deploy.staging);
         assert!(deploy.service_id.is_none());
     }
 
     #[test]
-    fn deploy_parses_service_id_and_stage() {
+    fn deploy_parses_service_id_and_staging() {
         // Mirrors the Fastly staging lifecycle invocation:
-        // `<cli> deploy --adapter fastly --service-id <id> --stage`.
+        // `<cli> deploy --adapter fastly --service-id <id> --staging`.
         let args = Args::try_parse_from([
             "edgezero",
             "deploy",
@@ -819,19 +820,19 @@ mod tests {
             "fastly",
             "--service-id",
             "SVC123",
-            "--stage",
+            "--staging",
         ])
-        .expect("parse deploy --service-id --stage");
+        .expect("parse deploy --service-id --staging");
         let Command::Deploy(deploy) = args.cmd else {
             panic!("expected Command::Deploy");
         };
-        assert!(deploy.stage);
+        assert!(deploy.staging);
         assert_eq!(deploy.service_id.as_deref(), Some("SVC123"));
         assert!(deploy.adapter_args.is_empty());
     }
 
     #[test]
-    fn deploy_service_id_and_stage_coexist_with_passthrough() {
+    fn deploy_service_id_and_staging_coexist_with_passthrough() {
         let args = Args::try_parse_from([
             "edgezero",
             "deploy",
@@ -848,7 +849,7 @@ mod tests {
             panic!("expected Command::Deploy");
         };
         assert_eq!(deploy.service_id.as_deref(), Some("SVC123"));
-        assert!(!deploy.stage);
+        assert!(!deploy.staging);
         assert_eq!(deploy.adapter_args, vec!["--comment", "ci build"]);
     }
 

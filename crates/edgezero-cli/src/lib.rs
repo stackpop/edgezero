@@ -166,7 +166,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     // Thread `--service-id` into the adapter invocation
     // when provided, ahead of any operator passthrough args. Fastly
     // consumes it; adapters that don't need a service id ignore it.
-    let action = if args.stage {
+    let action = if args.staging {
         adapter::Action::DeployStaged
     } else {
         adapter::Action::Deploy
@@ -201,7 +201,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     }
     passthrough.extend_from_slice(&args.adapter_args);
 
-    if args.stage {
+    if args.staging {
         // Thread the app's declared config-store logical ids so the staged
         // relink knows which selectors to redirect to `<logical>_staging`. The
         // adapter reads config usage from THIS list, never a remote probe —
@@ -768,7 +768,7 @@ mod tests {
             adapter: "fastly".to_owned(),
             adapter_args: vec!["--non-interactive".to_owned()],
             service_id: Some("SVC1".to_owned()),
-            stage: false,
+            staging: false,
         };
         run_deploy(&args).expect("manifest deploy command runs");
 
@@ -831,7 +831,7 @@ mod tests {
             // skipped, so this test exercises only the
             // manifest `deploy` command path.
             service_id: None,
-            stage: false,
+            staging: false,
         };
         run_deploy(&args).expect("deploy command runs");
     }

@@ -38,7 +38,7 @@ impl fmt::Display for Action {
             Action::Build => "build",
             Action::Deploy => "deploy",
             Action::Serve => "serve",
-            Action::DeployStaged => "deploy --stage",
+            Action::DeployStaged => "deploy --staging",
             Action::EmitVersion => "deploy (version)",
             Action::Healthcheck => "healthcheck",
             Action::Rollback => "rollback",

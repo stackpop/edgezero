@@ -1720,7 +1720,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 // Fastly staging lifecycle
 // ===================================================================
 //
-// These entry points back the `deploy --stage`, `healthcheck`, and
+// These entry points back the `deploy --staging`, `healthcheck`, and
 // `rollback` app-CLI subcommands. They mirror the Fastly semantics of
 // `stackpop/trusted-server-actions`:
 //
@@ -2398,7 +2398,7 @@ fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())
 }
 
-/// `deploy --adapter fastly --service-id <id> --stage`:
+/// `deploy --adapter fastly --service-id <id> --staging`:
 /// build, upload to a new draft version (no activation), stage it, and
 /// emit `version=<N>`.
 fn deploy_staged(args: &[String]) -> Result<(), String> {

@@ -324,7 +324,7 @@ unintended service, plus an action-owned `--non-interactive` deploy-args PREPEND
 `provider-env-clear: ["FASTLY_API_TOKEN", "FASTLY_SERVICE_ID", "FASTLY_ENDPOINT",
 "FASTLY_CARGO_PROFILE", …]` so the engine clears Fastly auth/endpoint aliases
 without the engine itself knowing Fastly's names. When `stage: true` it adds
-`--stage` to the deploy flags (§5.4).
+`--staging` to the deploy flags (§5.4).
 
 ### 5.4 Fastly staging lifecycle (`deploy-fastly` stage mode, `healthcheck-fastly`, `rollback-fastly`)
 
@@ -341,7 +341,7 @@ The capability is scaffolded into the CLI, not reproduced in action shell:
 | App-CLI invocation                                                                                         | Fastly operations the adapter performs                                                                                                                                                                        |
 | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `<cli> deploy --adapter fastly --service-id <id>` (production, existing)                                   | `fastly compute deploy` → builds, uploads, **activates**; emits the activated version.                                                                                                                        |
-| `<cli> deploy --adapter fastly --service-id <id> --stage`                                                  | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version.                                           |
+| `<cli> deploy --adapter fastly --service-id <id> --staging`                                                | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version.                                           |
 | `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --domain <d> [--path <p>] [--staging]` | Production: `curl` `https://<d><p>` (`<p>` defaults to `/`). Staging: resolve `staging_ips` for `<v>` on `<id>` via the Fastly API, then `curl --connect-to` that IP with the same URL; emits healthy/status. |
 | `<cli> rollback --adapter fastly --service-id <id> --version <v> [--rollback-to <p>] [--staging]`          | Production: activate `<p>` on `<id>` (required — Fastly cannot infer the previous version). Staging: deactivate the staged `<v>` on `<id>`.                                                                   |
 
@@ -371,10 +371,10 @@ a previous version (§5.4.3), the caller threads `previous-version` into
 #### 5.4.3 The three actions
 
 - **`deploy-fastly` (`stage: true`)** — runs
-  `<cli> deploy --adapter fastly --service-id <id> --stage` (the wrapper injects
+  `<cli> deploy --adapter fastly --service-id <id> --staging` (the wrapper injects
   `--service-id` via `deploy-flags`); outputs `fastly-version` (the staged
   draft). Reuses the engine for build/source/credential scoping; only the
-  `--stage` flag differs.
+  `--staging` flag differs.
 - **`healthcheck-fastly`** — thin wrapper: downloads the CLI artifact, takes
   `fastly-api-token` (STAGING only — a production probe curls the public domain,
   needs no credential, and is passed none), `fastly-service-id`,
@@ -514,7 +514,7 @@ means the **same config store, a different key**:
   _derived_, so `--key` is mutually exclusive with `--staging`.
 
 The CLI gains a `config push --staging` flag (the same `--staging` verb
-`healthcheck`/`rollback` already use — deploy's equivalent is `--stage`); the
+`deploy`/`healthcheck`/`rollback` already use); the
 wrapper exposes it as
 `deploy-to: production | staging`, validated exactly and fail-closed like the
 lifecycle actions.
@@ -637,7 +637,7 @@ probe it, roll back on failure.
     <app-cli-bin> deploy --adapter <adapter> <deploy-flags…> -- <deploy-args…>
     ```
 
-    Typed adapter flags (e.g. `--service-id`, `--stage`) go BEFORE `--`; the
+    Typed adapter flags (e.g. `--service-id`, `--staging`) go BEFORE `--`; the
     caller's allowlisted passthrough (`deploy-args`) goes after it.
 
     For adapters whose deploy also compiles the application (Fastly's default),
@@ -702,12 +702,12 @@ deploy args are rejected so caller input cannot override typed service selection
 authentication, non-interactive mode, endpoint, profile, or debug behavior. The
 allowlist ships with accept/reject tests.
 
-### 9.1 `deploy-args` under `--stage`
+### 9.1 `deploy-args` under `--staging`
 
 A staged deploy does not run `fastly compute deploy`; it runs
 `fastly compute update` against a cloned draft version (§5.4). Flags that only
 exist on `compute deploy` — `--env`, `--domain`, `--status-check-*`, `--dir` /
-`-C`, `--no-default-domain` — are therefore **no-ops under `--stage`**: the
+`-C`, `--no-default-domain` — are therefore **no-ops under `--staging`**: the
 adapter drops them with a warning rather than passing an unsupported flag to
 `compute update`.
 
@@ -1036,7 +1036,7 @@ Fastly wrapper:
   present only in the provider-calling steps: deploy and the Fastly lifecycle
   steps such as rollback-target capture);
 - cache key construction and missing-lockfile failure;
-- staging lifecycle: `stage` flag adds `--stage`; `fastly-version` parsed from CLI
+- staging lifecycle: `stage` flag adds `--staging`; `fastly-version` parsed from CLI
   output; `healthcheck-fastly` / `rollback-fastly` pass `--service-id` + version
   and scope `FASTLY_API_TOKEN`; healthcheck exits non-zero on unhealthy; staging
   vs production argv;
@@ -1059,7 +1059,7 @@ dependencies each action actually uses:
   `fastly` CLI, so no fake `fastly` binary is involved.
 
 Assert CLI-artifact reuse, invocation order, working directory, argument
-boundaries (`--service-id`, `--stage`), `fastly-version` threading stage →
+boundaries (`--service-id`, `--staging`), `fastly-version` threading stage →
 healthcheck → rollback, cache behavior, credential scope, and public outputs.
 
 ### 15.4 Installer / live gates
