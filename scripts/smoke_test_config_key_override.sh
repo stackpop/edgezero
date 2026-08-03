@@ -53,9 +53,11 @@ SERVER_PID=""
 PORT=8787
 PASS=0
 FAIL=0
-# Per-row backup of files the smoke would otherwise mutate in place
-# in the checked-in app-demo tree. Cleanup restores them on exit.
-declare -a BACKUPS=()
+# Fail-closed backup/restore of files the smoke mutates in place. Defines
+# `BACKUPS`, `backup_in_tree`, and `restore_backups`; a failed capture
+# aborts before any mutation rather than recording a bad backup.
+# shellcheck source=lib/smoke_backup.sh
+. "$ROOT_DIR/scripts/lib/smoke_backup.sh"
 
 # Stop the running runtime without touching tracked-fixture backups.
 # Used between staging-blob and default-blob assertions in the same
@@ -112,38 +114,6 @@ stop_server() {
   return "$rc"
 }
 
-# Restore operator-owned files/dirs the smoke mutated in place. Called
-# once per row AFTER all assertions for that row have finished, and again
-# from the EXIT trap as a safety net. Restores in REVERSE order so a
-# nested path restores after its parent, and uses the recorded
-# existed-flag (NOT the backup's size) so a pre-existing EMPTY file/dir is
-# preserved, not deleted.
-restore_backups() {
-  local i pair orig existed back
-  for (( i=${#BACKUPS[@]}-1; i>=0; i-- )); do
-    pair="${BACKUPS[$i]}"
-    [ -z "$pair" ] && continue
-    orig="${pair%%::*}"
-    back="${pair##*::}"
-    existed="${pair#*::}"; existed="${existed%%::*}"
-    # Clear whatever the smoke left in place (file OR dir).
-    rm -rf "$orig" 2>/dev/null || true
-    if [ "$existed" = "1" ]; then
-      if [ -d "$back" ]; then
-        mkdir -p "$orig"
-        cp -a "$back/." "$orig/" 2>/dev/null || true
-        rm -rf "$back" 2>/dev/null || true
-      else
-        mv "$back" "$orig" 2>/dev/null || true
-      fi
-    else
-      # Original was ABSENT: leave it absent, discard any placeholder.
-      rm -rf "$back" 2>/dev/null || true
-    fi
-  done
-  BACKUPS=()
-}
-
 cleanup() {
   # `stop_server` can legitimately return non-zero (it sets FAIL and
   # returns 1 when a port won't free). Under `set -e` that would abort
@@ -154,27 +124,6 @@ cleanup() {
   restore_backups
 }
 trap cleanup EXIT INT TERM
-
-# Record a backup of $1 (an in-tree FILE or DIRECTORY the smoke is about
-# to mutate) so `cleanup` can restore it EXACTLY. Records the
-# original-existence flag separately, so an absent file and a
-# present-but-empty file are distinguishable on restore. Entry format:
-# `orig::existed::backup` (existed = 0|1; backup unused when existed=0).
-backup_in_tree() {
-  local orig="$1"
-  local back="" existed=0
-  if [ -e "$orig" ] || [ -L "$orig" ]; then
-    existed=1
-    if [ -d "$orig" ]; then
-      back=$(mktemp -d)
-      cp -a "$orig/." "$back/" 2>/dev/null || true
-    else
-      back=$(mktemp)
-      cp -p "$orig" "$back"
-    fi
-  fi
-  BACKUPS+=("${orig}::${existed}::${back}")
-}
 
 # Bash 3.2-portable upper-case (macOS ships /usr/bin/env bash as 3.2).
 # `${var^^}` is Bash 4+; tr is portable.

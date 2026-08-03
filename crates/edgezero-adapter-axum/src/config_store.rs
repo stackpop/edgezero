@@ -97,6 +97,18 @@ impl AxumConfigStore {
     /// exists but cannot be read or parsed.
     #[inline]
     pub fn from_path(path: &Path) -> Result<Self, ConfigStoreError> {
+        // Reject a symlinked final component before reading. `config push
+        // --adapter axum` / provision refuse to WRITE these files through a
+        // symlink; a legitimately-provisioned local config is therefore
+        // never a symlink, so one appearing here is anomalous. Rejecting it
+        // on the read path too keeps a single consistent final-path policy
+        // and stops a planted symlink from redirecting the runtime read.
+        if fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink()) {
+            return Err(ConfigStoreError::unavailable(format!(
+                "refusing to read `{}`: it is a symlink; EdgeZero-owned local config is never a symlink",
+                path.display()
+            )));
+        }
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -201,6 +213,26 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn from_path_rejects_symlinked_config_file() {
+        use std::os::unix::fs::symlink;
+        // A planted symlink where the local config is expected must be
+        // refused on the READ path, matching the write side.
+        let temp = tempdir().expect("tempdir");
+        let real = temp.path().join("real.json");
+        fs::write(&real, "{\"k\":\"v\"}").expect("write real");
+        let link = temp.path().join("local-config-app.json");
+        symlink(&real, &link).expect("symlink");
+        let Err(err) = AxumConfigStore::from_path(&link) else {
+            panic!("symlinked config must be refused, not silently followed");
+        };
+        assert!(
+            matches!(err, ConfigStoreError::Unavailable { .. }),
+            "symlinked config is Unavailable"
+        );
+    }
 
     #[test]
     fn axum_config_store_from_map_returns_values() {

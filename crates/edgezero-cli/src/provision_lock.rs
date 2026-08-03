@@ -22,19 +22,30 @@
 //! and never truncated so multiple runs can share the sentinel
 //! across time.
 
+use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 
 use fs4::fs_std::FileExt;
 
 use crate::path_safety::reject_symlink_components;
 
+/// Env var advertising the absolute lock path a lock-holding process tree
+/// already owns. `run_deploy` holds the lock and passes this to the deploy
+/// subprocess via `Command::env` (safe, child-only); a nested `<app>-cli
+/// provision` / `config push` invoked by that deploy inherits it and
+/// BORROWS the lock instead of dead-locking on the parent's non-reentrant
+/// file lock. An UNRELATED concurrent provision (a separate process tree,
+/// no inherited env) still serialises on the OS file lock.
+pub(crate) const LOCK_ENV: &str = "EDGEZERO_PROVISION_LOCK";
+
 /// Guard object representing an active advisory lock. Drop it to
 /// release; the OS will also release automatically on process exit.
 #[must_use = "the lock is released when this guard is dropped -- bind it to a `_lock` variable that lives for the critical section"]
 pub(crate) struct ProvisionLock {
-    // Kept alive; drop calls `unlock` implicitly via the OS.
-    file: File,
+    // `Some` when THIS guard owns the OS file lock; `None` when it merely
+    // BORROWS a lock an ancestor process already advertised via `LOCK_ENV`.
+    file: Option<File>,
     // Read by the cfg(test) `path()` getter only. In non-test builds
     // the field is still needed so error diagnostics can name the
     // lockfile path -- silence dead_code accordingly.
@@ -43,6 +54,13 @@ pub(crate) struct ProvisionLock {
 }
 
 impl ProvisionLock {
+    /// Absolute `.edgezero/provision.lock` path for `manifest_root`, for
+    /// advertising to a deploy subprocess via [`LOCK_ENV`].
+    pub(crate) fn lock_path_for(manifest_root: &Path) -> PathBuf {
+        let path = manifest_root.join(".edgezero").join("provision.lock");
+        absolute(&path).unwrap_or(path)
+    }
+
     /// Acquire an exclusive lock on `<manifest_root>/.edgezero/provision.lock`.
     /// Blocks until another concurrent invocation releases; the block
     /// is a bounded wait -- provision writes are fast (single-digit
@@ -72,6 +90,17 @@ impl ProvisionLock {
             &path,
             "the provision lock path `<project>/.edgezero/provision.lock`",
         )?;
+        // Reentrancy: if an ANCESTOR process (a `deploy` holding the lock)
+        // advertised this exact path via `LOCK_ENV`, borrow it -- take no
+        // OS lock -- so a composed deploy that shells `provision` /
+        // `config push` doesn't self-deadlock on the parent's lock. Only a
+        // READ of the inherited env is needed (no unsafe mutation); the
+        // advertisement is set on the child's environment by `run_deploy`
+        // via `Command::env`.
+        let abs = absolute(&path).unwrap_or_else(|_| path.clone());
+        if env::var_os(LOCK_ENV).is_some_and(|held| Path::new(&held) == abs) {
+            return Ok(Self { file: None, path });
+        }
         fs::create_dir_all(&dot_edgezero).map_err(|err| {
             format!(
                 "failed to create {} for provision lock: {err}",
@@ -96,7 +125,10 @@ impl ProvisionLock {
                 path.display()
             )
         })?;
-        Ok(Self { file, path })
+        Ok(Self {
+            file: Some(file),
+            path,
+        })
     }
 
     #[cfg(test)]
@@ -109,8 +141,11 @@ impl Drop for ProvisionLock {
     fn drop(&mut self) {
         // The OS releases the lock on descriptor close, but call
         // `unlock` explicitly so double-close-in-drop doesn't leave a
-        // stray flock reference in error paths.
-        drop(FileExt::unlock(&self.file));
+        // stray flock reference in error paths. A BORROWED guard owns no
+        // descriptor -- nothing to unlock.
+        if let Some(file) = &self.file {
+            drop(FileExt::unlock(file));
+        }
         // Note: we do NOT delete the lock file. Deletion races with
         // a peer that has the descriptor open (they'd hold a lock on
         // a nameless file for the rest of their lifetime). Leaving
@@ -127,6 +162,52 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    #[test]
+    fn acquire_borrows_under_matching_advertised_lock_env() {
+        // When `LOCK_ENV` advertises THIS lock path (as a `deploy` parent
+        // sets on its child), acquire BORROWS -- takes no OS lock -- so two
+        // acquires coexist without the second blocking on the first. This
+        // is what stops a composed deploy's nested provision from self-
+        // dead-locking.
+        use crate::test_support::{EnvOverride, manifest_guard};
+        use std::sync::PoisonError;
+        let _g = manifest_guard()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let advert = ProvisionLock::lock_path_for(temp.path());
+        let _env = EnvOverride::set(super::LOCK_ENV, advert.as_os_str());
+        let start = Instant::now();
+        let _l1 = ProvisionLock::acquire(temp.path()).expect("borrow 1");
+        let _l2 = ProvisionLock::acquire(temp.path()).expect("borrow 2");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "borrowed acquires must not block on each other"
+        );
+    }
+
+    #[test]
+    fn acquire_does_not_borrow_when_advertised_path_differs() {
+        // A `LOCK_ENV` for a DIFFERENT project must not make this acquire
+        // borrow -- it takes the real OS lock (and creates the lockfile).
+        use crate::test_support::{EnvOverride, manifest_guard};
+        use std::sync::PoisonError;
+        let _g = manifest_guard()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let other = TempDir::new().expect("tempdir");
+        let _env = EnvOverride::set(
+            super::LOCK_ENV,
+            ProvisionLock::lock_path_for(other.path()).as_os_str(),
+        );
+        let lock = ProvisionLock::acquire(temp.path()).expect("real acquire");
+        assert!(
+            lock.path().exists(),
+            "a mismatched advertisement must not borrow: the real lockfile is created"
+        );
+    }
 
     #[test]
     fn acquire_creates_lockfile_under_dot_edgezero_dir() {

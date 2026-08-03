@@ -600,6 +600,16 @@ impl Adapter for SpinCliAdapter {
         })?;
         let parsed: toml::Value = toml::from_str(&raw)
             .map_err(|err| format!("failed to parse {} as TOML: {err}", spin_path.display()))?;
+        // The `toml` crate parse above can't distinguish an inline
+        // `[component]` table from a standard one, but provision CAN only
+        // edit standard tables. Reject inline/scalar component tables here
+        // too (via the same helper provision uses) so validation and
+        // provision agree instead of validation passing what provision
+        // then rejects.
+        let edit_doc: toml_edit::DocumentMut = raw
+            .parse()
+            .map_err(|err| format!("failed to parse {} as TOML: {err}", spin_path.display()))?;
+        provision_local::reject_inline_component_tables(&edit_doc, &spin_path)?;
         let component_ids = collect_spin_component_ids(&parsed);
 
         if component_ids.is_empty() {

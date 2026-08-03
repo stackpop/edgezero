@@ -225,11 +225,58 @@ fn build_provision_status_lines(
 /// Returns the resolved id and whether the doc was mutated (a rename),
 /// so the caller can flag `spin_changed` and persist it. Takes `&mut`
 /// so the refresh rename happens on the same doc the writer flushes.
+/// Reject an INLINE (or scalar) `[component]` / `[component.<id>]` in
+/// `spin.toml`. Provision writes key-value bindings INTO these tables via
+/// `as_table_mut`, which only accepts standard tables; the `config
+/// validate` preflight (which parses with the `toml` crate, where inline
+/// and standard tables are indistinguishable) would otherwise pass a
+/// manifest that provision then fails on with a misleading "no
+/// [component.*] declarations" error. Rejecting here -- and from
+/// validation via the same helper -- keeps the two in agreement with a
+/// clear message.
+///
+/// A MISSING `component` key is not this helper's concern (callers handle
+/// the "no components" case).
+///
+/// # Errors
+/// Returns an error naming the inline/scalar component that must be
+/// converted to a standard `[component.<id>]` block.
+pub(super) fn reject_inline_component_tables(
+    doc: &toml_edit::DocumentMut,
+    spin_path: &Path,
+) -> Result<(), String> {
+    let Some(component) = doc.get("component") else {
+        return Ok(());
+    };
+    let Some(tbl) = component.as_table() else {
+        return Err(format!(
+            "{}: `[component]` must be declared as standard `[component.<id>]` tables, not an \
+             inline table or scalar; provision writes key-value bindings into these tables and \
+             cannot edit an inline form. Convert to `[component.<id>]` blocks.",
+            spin_path.display()
+        ));
+    };
+    for (id, item) in tbl {
+        if item.as_table().is_none() {
+            return Err(format!(
+                "{}: `[component.{id}]` must be a standard table, not an inline table or scalar; \
+                 provision writes key-value bindings into it. Convert it to a `[component.{id}]` \
+                 block.",
+                spin_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_component_id(
     doc: &mut toml_edit::DocumentMut,
     selector: Option<&str>,
     spin_path: &Path,
 ) -> Result<(String, bool), String> {
+    // Fail fast (with a clear message) on inline/scalar component tables
+    // that `as_table` below would otherwise silently read as "none".
+    reject_inline_component_tables(doc, spin_path)?;
     let component_ids: Vec<String> = doc
         .get("component")
         .and_then(toml_edit::Item::as_table)
@@ -691,6 +738,37 @@ mod tests {
     // not arbitrary strings.
     const TEST_KV_ID: &str = "sessions";
     const TEST_KV_ID_ALT: &str = "cache";
+
+    #[test]
+    fn reject_inline_component_tables_rejects_inline_parent() {
+        let doc: toml_edit::DocumentMut = "component = { my_app = { source = \"a.wasm\" } }\n"
+            .parse()
+            .unwrap();
+        let err = super::reject_inline_component_tables(&doc, Path::new("spin.toml"))
+            .expect_err("inline `component` must be rejected");
+        assert!(
+            err.contains("standard"),
+            "error explains the requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_inline_component_tables_rejects_inline_child() {
+        let doc: toml_edit::DocumentMut = "[component]\nmy_app = { source = \"a.wasm\" }\n"
+            .parse()
+            .unwrap();
+        let err = super::reject_inline_component_tables(&doc, Path::new("spin.toml"))
+            .expect_err("inline `component.<id>` must be rejected");
+        assert!(err.contains("my_app"), "error names the component: {err}");
+    }
+
+    #[test]
+    fn reject_inline_component_tables_accepts_standard_tables() {
+        let doc: toml_edit::DocumentMut =
+            "[component.my_app]\nsource = \"a.wasm\"\n".parse().unwrap();
+        super::reject_inline_component_tables(&doc, Path::new("spin.toml"))
+            .expect("standard component tables are accepted");
+    }
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
     const TEST_COMPONENT_ID: &str = "demo";

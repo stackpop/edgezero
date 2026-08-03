@@ -3,7 +3,6 @@
 //! `synthesise_*_toml` baselines emitted by the CLI's `provision`
 //! bootstrap.
 
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +10,7 @@ use std::process::Command;
 use edgezero_adapter::cli_support::{
     self, find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::env_file::reject_symlinked_target;
 use edgezero_adapter::registry::AdapterExecContext;
 use walkdir::WalkDir;
 
@@ -61,7 +61,7 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
     }
 
     let workspace_root = find_workspace_root(&crate_dir);
-    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name, ctx)?;
+    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name, extra_args, ctx)?;
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
         .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
@@ -135,61 +135,53 @@ fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
 
 fn locate_artifact(
     workspace_root: &Path,
-    manifest_dir: &Path,
+    crate_dir: &Path,
     crate_name: &str,
+    build_args: &[String],
     ctx: &AdapterExecContext<'_>,
 ) -> Result<PathBuf, String> {
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
-    // Resolve `CARGO_TARGET_DIR` from the SAME source the build used: the
-    // ctx-applied env (manifest `[environment]`) takes precedence over the
-    // process env, mirroring `command.env(...)` in `build`. Reading only
-    // the process env would miss a manifest-set target dir and report a
-    // successful custom-target build as missing.
-    let custom = ctx
-        .env()
-        .iter()
-        .find(|(key, _)| key == "CARGO_TARGET_DIR")
-        .map(|(_, value)| PathBuf::from(value))
-        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from));
-    if let Some(custom_dir) = custom {
-        // Cargo resolves a RELATIVE `CARGO_TARGET_DIR` against its working
-        // directory -- the crate dir, since the build runs with
-        // `current_dir(crate_dir)`. Resolve it the same way here (against
-        // `manifest_dir`, the crate root), NOT the process cwd.
-        let base = if custom_dir.is_absolute() {
-            custom_dir
-        } else {
-            manifest_dir.join(custom_dir)
-        };
-        let candidate = base.join(TARGET_TRIPLE).join("release").join(&release_name);
-        if candidate.exists() {
-            return Ok(candidate);
+    // Resolve cargo's effective target dir the SAME way the build did
+    // (`--target-dir` arg, then `CARGO_TARGET_DIR`, then a
+    // `.cargo/config.toml` `[build] target-dir`). When an override is in
+    // play, look ONLY there -- falling back to the conventional `target/`
+    // paths could package a STALE artifact from an earlier default build.
+    match cli_support::resolve_cargo_target_dir(crate_dir, build_args, ctx) {
+        cli_support::CargoTargetDir::Explicit(dir) => {
+            let candidate = dir.join(TARGET_TRIPLE).join("release").join(&release_name);
+            if candidate.exists() {
+                Ok(candidate)
+            } else {
+                Err(format!(
+                    "compiled artifact `{release_name}` not found in the requested target directory {} (a custom target dir was set via --target-dir, CARGO_TARGET_DIR, or .cargo/config.toml); refusing to fall back to a conventional target path to avoid packaging a stale artifact",
+                    candidate.display()
+                ))
+            }
+        }
+        cli_support::CargoTargetDir::Conventional => {
+            let manifest_target = crate_dir
+                .join("target")
+                .join(TARGET_TRIPLE)
+                .join("release")
+                .join(&release_name);
+            if manifest_target.exists() {
+                return Ok(manifest_target);
+            }
+            let workspace_target = workspace_root
+                .join("target")
+                .join(TARGET_TRIPLE)
+                .join("release")
+                .join(&release_name);
+            if workspace_target.exists() {
+                return Ok(workspace_target);
+            }
+            Err(format!(
+                "compiled artifact not found (looked in {} and workspace target)",
+                crate_dir.display()
+            ))
         }
     }
-
-    let manifest_target = manifest_dir
-        .join("target")
-        .join(TARGET_TRIPLE)
-        .join("release")
-        .join(&release_name);
-    if manifest_target.exists() {
-        return Ok(manifest_target);
-    }
-
-    let workspace_target = workspace_root
-        .join("target")
-        .join(TARGET_TRIPLE)
-        .join("release")
-        .join(&release_name);
-    if workspace_target.exists() {
-        return Ok(workspace_target);
-    }
-
-    Err(format!(
-        "compiled artifact not found (looked in {} and workspace target)",
-        manifest_dir.display()
-    ))
 }
 
 /// # Errors
@@ -215,6 +207,10 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
     // errors.
     let runtime_config = manifest_dir.join("runtime-config.toml");
     if runtime_config.exists() {
+        // Reject a symlinked final component before handing it to `spin
+        // up`, matching the write side (provision refuses to create it
+        // through a symlink) -- one consistent final-path policy.
+        reject_symlinked_target(&runtime_config)?;
         command.arg("--runtime-config-file").arg(&runtime_config);
     }
     command.args(extra_args).current_dir(manifest_dir);
@@ -450,6 +446,7 @@ mod tests {
             workspace,
             &manifest_dir,
             TEST_COMPONENT_ID,
+            &[],
             &AdapterExecContext::new(),
         )
         .unwrap();
@@ -472,8 +469,89 @@ mod tests {
 
         let env = [("CARGO_TARGET_DIR".to_owned(), "custom-target".to_owned())];
         let ctx = AdapterExecContext::new().with_env(&env);
-        let located = locate_artifact(workspace, &manifest_dir, "demo", &ctx).unwrap();
+        let located = locate_artifact(workspace, &manifest_dir, "demo", &[], &ctx).unwrap();
         assert_eq!(located, artifact);
+    }
+
+    #[test]
+    fn locate_artifact_honors_target_dir_build_arg_over_stale_default() {
+        // A `--target-dir` build arg redirects cargo's output. Discovery
+        // must look ONLY there, even when a STALE artifact sits at the
+        // conventional workspace target from an earlier default build.
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let crate_dir = workspace.join("service");
+        fs::create_dir_all(&crate_dir).unwrap();
+        // Stale default-target artifact that must NOT be selected.
+        let stale = workspace.join("target/wasm32-wasip2/release/demo.wasm");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "stale").unwrap();
+        // Fresh custom-target artifact.
+        let fresh = crate_dir.join("custom/wasm32-wasip2/release/demo.wasm");
+        fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        fs::write(&fresh, "fresh").unwrap();
+
+        let build_args = ["--target-dir".to_owned(), "custom".to_owned()];
+        let located = locate_artifact(
+            workspace,
+            &crate_dir,
+            "demo",
+            &build_args,
+            &AdapterExecContext::new(),
+        )
+        .unwrap();
+        assert_eq!(located, fresh, "must select the custom-target artifact");
+    }
+
+    #[test]
+    fn locate_artifact_errors_when_explicit_target_dir_has_no_artifact() {
+        // An explicit target dir with no artifact must error rather than
+        // silently fall back to a stale conventional artifact.
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let crate_dir = workspace.join("service");
+        fs::create_dir_all(&crate_dir).unwrap();
+        let stale = workspace.join("target/wasm32-wasip2/release/demo.wasm");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "stale").unwrap();
+
+        let build_args = ["--target-dir=custom".to_owned()];
+        let err = locate_artifact(
+            workspace,
+            &crate_dir,
+            "demo",
+            &build_args,
+            &AdapterExecContext::new(),
+        )
+        .expect_err("must not fall back to the stale conventional artifact");
+        assert!(err.contains("stale"), "error explains the refusal: {err}");
+    }
+
+    #[test]
+    fn locate_artifact_honors_cargo_config_target_dir() {
+        // `.cargo/config.toml` `[build] target-dir` also redirects cargo.
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let crate_dir = workspace.join("service");
+        fs::create_dir_all(crate_dir.join(".cargo")).unwrap();
+        fs::write(
+            crate_dir.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"cfg-target\"\n",
+        )
+        .unwrap();
+        let fresh = crate_dir.join("cfg-target/wasm32-wasip2/release/demo.wasm");
+        fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        fs::write(&fresh, "fresh").unwrap();
+
+        let located = locate_artifact(
+            workspace,
+            &crate_dir,
+            "demo",
+            &[],
+            &AdapterExecContext::new(),
+        )
+        .unwrap();
+        assert_eq!(located, fresh);
     }
 
     #[test]
@@ -492,6 +570,7 @@ mod tests {
             workspace,
             &manifest_dir,
             "my-cool-crate",
+            &[],
             &AdapterExecContext::new(),
         )
         .unwrap();

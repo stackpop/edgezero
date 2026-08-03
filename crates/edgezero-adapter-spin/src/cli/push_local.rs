@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use edgezero_adapter::cli_support;
 use edgezero_adapter::env_file::{reject_symlink_components, reject_symlinked_target};
 use edgezero_adapter::registry::{AdapterPushContext, ReadConfigEntry, ResolvedStoreId};
 use rusqlite::{Connection, params};
@@ -133,21 +134,50 @@ fn guard_sqlite_path_symlinks(spin_manifest_dir: &Path, db_path: &Path) -> Resul
     Ok(())
 }
 
-/// Reject a resolved `SQLite` db that lands OUTSIDE the crate directory
-/// (`spin_manifest_dir`). Complements [`reject_offtree_sqlite_path`],
-/// which only inspects the `path` STRING: a clean-relative `path` still
-/// escapes when the directory it anchors against is external (e.g.
-/// `--runtime-config /tmp/rc.toml` with `path = "config.db"` →
-/// `/tmp/config.db`). Both operands are lexically absolutised (no
-/// filesystem access) before the containment check; `..` in the `path`
-/// is already rejected upstream, so `starts_with` can't be fooled.
+/// Collapse `.` and `..` components lexically (no filesystem access), so a
+/// containment `starts_with` check can't be fooled by a `..` segment that
+/// hasn't been folded. Leading `..` in a relative path is preserved; `..`
+/// at an absolute root is dropped (can't climb above `/`).
+fn normalise_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match stack.last() {
+                Some(Component::Normal(_)) => {
+                    stack.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => stack.push(comp),
+            },
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => stack.push(comp),
+        }
+    }
+    let mut out = PathBuf::new();
+    for comp in &stack {
+        out.push(comp.as_os_str());
+    }
+    out
+}
+
+/// Reject a resolved `SQLite` db that lands OUTSIDE the adapter CRATE root.
+/// The crate root -- not the manifest's parent -- is the boundary, so a
+/// NESTED manifest like `crates/server/config/spin.toml` may legitimately
+/// resolve `path = "../.spin/config.db"` to `crates/server/.spin/config.db`
+/// (inside the crate). A clean-relative `path` still escapes when the
+/// directory it anchors against is external (e.g. `--runtime-config
+/// /tmp/rc.toml` with `path = "config.db"` → `/tmp/config.db`). Both
+/// operands are absolutised then lexically normalised (folding `..`) so
+/// `starts_with` reflects the real resolved location.
 ///
 /// # Errors
-/// Returns an error when the resolved db is not under the crate.
-fn assert_sqlite_write_in_tree(spin_manifest_dir: &Path, db_path: &Path) -> Result<(), String> {
+/// Returns an error when the resolved db is not under the crate root.
+fn assert_sqlite_write_in_tree(crate_root: &Path, db_path: &Path) -> Result<(), String> {
     use std::path::absolute;
-    let root = absolute(spin_manifest_dir).unwrap_or_else(|_| spin_manifest_dir.to_path_buf());
-    let db = absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let root =
+        normalise_lexical(&absolute(crate_root).unwrap_or_else(|_| crate_root.to_path_buf()));
+    let db = normalise_lexical(&absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
     if !db.starts_with(&root) {
         return Err(format!(
             "the resolved local SQLite database `{}` is outside the adapter crate directory `{}`. \
@@ -161,31 +191,22 @@ fn assert_sqlite_write_in_tree(spin_manifest_dir: &Path, db_path: &Path) -> Resu
     Ok(())
 }
 
-/// Reject a `runtime-config.toml` `path` that would place the local
-/// `SQLite` database OUTSIDE the project tree. `--local` state must stay
-/// in-tree, so an absolute path or one that climbs out with `..` is
-/// refused before it reaches `SQLite` (which would happily open it).
+/// Reject an ABSOLUTE `runtime-config.toml` `path` for a local `SQLite`
+/// store. `--local` state must stay in-tree; an absolute path is refused
+/// up front for a clear message. A RELATIVE `path` -- including one with
+/// `..` -- is allowed here and validated by [`assert_sqlite_write_in_tree`]
+/// against the crate root, so a nested manifest's `../.spin/config.db`
+/// (which stays inside the crate) is accepted while an actual escape is
+/// still rejected.
 ///
 /// # Errors
-/// Returns an error naming the offending `path`.
+/// Returns an error when `explicit_path` is absolute.
 fn reject_offtree_sqlite_path(explicit_path: &Path) -> Result<(), String> {
-    use std::path::Component;
     if explicit_path.is_absolute() {
         return Err(format!(
             "runtime-config.toml sets an absolute `path = \"{}\"` for a `type = \"spin\"` \
              key_value_store, but `--local` requires the SQLite database to live inside the \
              project tree. Use a project-relative path.",
-            explicit_path.display()
-        ));
-    }
-    if explicit_path
-        .components()
-        .any(|comp| matches!(comp, Component::ParentDir))
-    {
-        return Err(format!(
-            "runtime-config.toml `path = \"{}\"` for a `type = \"spin\"` key_value_store climbs \
-             out of the project tree with `..`, but `--local` requires the SQLite database to \
-             stay in-tree. Remove the `..` segments.",
             explicit_path.display()
         ));
     }
@@ -453,6 +474,13 @@ pub(super) fn dispatch_push(
             "[adapters.spin.adapter].manifest must point at spin.toml for config push".to_owned()
         })?;
     let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
+    // The crate ROOT is the in-tree boundary for local SQLite state -- NOT
+    // the manifest's own dir, which for a nested manifest like
+    // `crates/server/config/spin.toml` sits below the crate. Resolve the
+    // nearest ancestor `Cargo.toml`, falling back to the manifest dir (flat
+    // scaffold layout, or a fixture with no Cargo.toml).
+    let crate_root = cli_support::read_adapter_crate_root(manifest_root, adapter_manifest_path)
+        .unwrap_or_else(|| spin_manifest_dir.to_path_buf());
 
     // --runtime-config wins; otherwise default to
     // `runtime-config.toml` next to the spin manifest. Path math
@@ -485,6 +513,7 @@ pub(super) fn dispatch_push(
         let explicit_path =
             local_sqlite_path(parsed.key_value_stores.get(platform), platform, logical)?;
         return write_sqlite(
+            &crate_root,
             spin_manifest_dir,
             runtime_config_dir,
             explicit_path,
@@ -553,6 +582,7 @@ pub(super) fn dispatch_push(
             runtime_config_path.display()
         )),
         Some(runtime_config::KeyValueBackend::Spin { path }) => write_sqlite(
+            &crate_root,
             spin_manifest_dir,
             runtime_config_dir,
             path.as_deref(),
@@ -570,6 +600,7 @@ pub(super) fn dispatch_push(
             // file the running app can't open.
             verify_label_declared(platform, &parsed, &runtime_config_path)?;
             write_sqlite(
+                &crate_root,
                 spin_manifest_dir,
                 runtime_config_dir,
                 None,
@@ -646,7 +677,12 @@ pub(super) fn local_sqlite_path<'backend>(
 /// any explicit `path` from `runtime-config.toml`), then either prints
 /// a dry-run preview or actually writes the batch through
 /// [`write_batch`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the crate-root containment boundary, the manifest/runtime-config dirs, the explicit path, and the store identity + entries are all distinct inputs the resolution needs; bundling them into a struct would not clarify the call sites"
+)]
 fn write_sqlite(
+    crate_root: &Path,
     spin_manifest_dir: &Path,
     runtime_config_dir: &Path,
     explicit_path: Option<&Path>,
@@ -655,18 +691,23 @@ fn write_sqlite(
     entries: &[(String, String)],
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
-    // `--local` writes MUST stay in-tree: refuse an absolute or `..`
-    // `path` before it reaches SQLite (which would create the db there).
+    // `--local` writes MUST stay in-tree: refuse an absolute `path` before
+    // it reaches SQLite (a relative `..` that stays in-crate is fine and is
+    // validated by the containment check below).
     if let Some(custom) = explicit_path {
         reject_offtree_sqlite_path(custom)?;
     }
-    let db_path =
-        resolve_sqlite_path_guarded(spin_manifest_dir, runtime_config_dir, explicit_path)?;
+    // Resolve the db path (default anchors at the manifest dir per Spin;
+    // an explicit relative path anchors at the runtime-config dir), then
+    // guard symlinked components from the CRATE ROOT so a nested layout's
+    // db (which sits outside the manifest's own dir) is still covered.
+    let db_path = resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, explicit_path);
+    guard_sqlite_path_symlinks(crate_root, &db_path)?;
     // The `path` string can be clean-relative yet still escape when the
     // BASE it anchors against is external -- e.g. `--runtime-config
     // /tmp/runtime-config.toml` with `path = "config.db"` resolves to
     // `/tmp/config.db`. Reject a resolved db that lands outside the crate.
-    assert_sqlite_write_in_tree(spin_manifest_dir, &db_path)?;
+    assert_sqlite_write_in_tree(crate_root, &db_path)?;
     if dry_run {
         let mut out = Vec::with_capacity(entries.len().saturating_add(1));
         out.push(format!(
@@ -1636,16 +1677,35 @@ mod tests {
     }
 
     #[test]
-    fn reject_offtree_sqlite_path_rejects_parent_traversal() {
-        let err = reject_offtree_sqlite_path(Path::new("../../outside.db"))
-            .expect_err("a `..` SQLite path must be refused for --local");
-        assert!(err.contains(".."), "error names the traversal: {err}");
+    fn reject_offtree_sqlite_path_allows_relative_including_parent_dir() {
+        // A `..` is no longer blanket-rejected here -- containment against
+        // the crate root (assert_sqlite_write_in_tree) decides. A nested
+        // manifest's `../.spin/kv.db` stays in-crate and must be allowed.
+        reject_offtree_sqlite_path(Path::new("db/kv.db")).expect("in-tree relative is fine");
+        reject_offtree_sqlite_path(Path::new("../.spin/kv.db"))
+            .expect("a relative `..` is decided by the containment check, not rejected here");
     }
 
     #[test]
-    fn reject_offtree_sqlite_path_allows_in_tree_relative() {
-        reject_offtree_sqlite_path(Path::new("db/kv.db"))
-            .expect("an in-tree relative path is fine");
+    fn assert_sqlite_write_in_tree_allows_nested_manifest_parent_dir_db() {
+        // Nested layout: manifest at crates/server/config/, runtime-config
+        // there too, `path = "../.spin/config.db"` resolves to
+        // crates/server/.spin/config.db -- INSIDE the crate root.
+        let crate_root = Path::new("/proj/crates/server");
+        let db = Path::new("/proj/crates/server/config/../.spin/config.db");
+        assert_sqlite_write_in_tree(crate_root, db)
+            .expect("a `..` db that stays inside the crate root is allowed");
+    }
+
+    #[test]
+    fn assert_sqlite_write_in_tree_rejects_parent_dir_escape() {
+        // `..` that actually climbs OUT of the crate is still refused --
+        // the lexical normalisation folds the `..` so starts_with is honest.
+        let crate_root = Path::new("/proj/crates/server");
+        let db = Path::new("/proj/crates/server/config/../../../etc/passwd");
+        let err = assert_sqlite_write_in_tree(crate_root, db)
+            .expect_err("a `..` db that escapes the crate must be refused");
+        assert!(err.contains("outside"), "error explains the escape: {err}");
     }
 
     #[test]

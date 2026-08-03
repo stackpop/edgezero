@@ -1192,6 +1192,23 @@ pub(crate) fn default_adapter_manifest_for(adapter_lower: &str) -> &'static str 
     }
 }
 
+/// Permission delta (`project_mode`, `staged_mode`) between a project file
+/// and its staged twin, in the low 9 mode bits, or `None` when they match
+/// (or either mode can't be read). Lets the dry-run preview a
+/// permission-only repair the content diff would otherwise hide.
+#[cfg(unix)]
+fn staged_mode_change(proj_path: &Path, staged_path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let proj = fs::metadata(proj_path).ok()?.permissions().mode() & 0o777;
+    let staged = fs::metadata(staged_path).ok()?.permissions().mode() & 0o777;
+    (proj != staged).then_some((proj, staged))
+}
+
+#[cfg(not(unix))]
+fn staged_mode_change(_proj_path: &Path, _staged_path: &Path) -> Option<(u32, u32)> {
+    None
+}
+
 /// Render the dry-run report: rewritten status lines + per-file
 /// unified diff. Status-line rewriting (`wrote X` → `would write X`)
 /// uses only the (`project_root`, `staged_root`) prefix swap plus a
@@ -1228,6 +1245,19 @@ pub(crate) fn render_dry_run_report(
         let new = fs::read_to_string(staged_path).unwrap_or_default();
         let old = fs::read_to_string(proj_path).unwrap_or_default();
         if old == new {
+            // Content is identical, but a PERMISSION-only repair (e.g.
+            // tightening a 0644 secret-carriage file to 0600) is still a
+            // real mutation the operator must see. The staged copy carries
+            // the mode the real run would apply, so a mode delta here means
+            // the live run would chmod the file -- preview it instead of
+            // silently skipping.
+            if let Some((from, to)) = staged_mode_change(proj_path, staged_path) {
+                let display = proj_path.display();
+                let mode_line = format!(
+                    "\n--- {display}\n+++ {display}\n  would change file mode {from:04o} -> {to:04o}\n"
+                );
+                out.push_str(&mode_line);
+            }
             continue;
         }
         // Env / secret carriage files (`.env`, `.dev.vars`) hold
@@ -2770,6 +2800,32 @@ ids = ["default"]
     }
 
     // ---------- dry-run allow-list + report rendering ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_previews_a_permission_only_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Identical content, but the staged twin carries the tightened
+        // 0600 an idempotent real provision would apply. The dry-run must
+        // surface that mode change, not silently skip it.
+        let temp = TempDir::new().expect("temp dir");
+        let proj = temp.path().join(".dev.vars");
+        let staged = temp.path().join("staged.dev.vars");
+        fs::write(&proj, "SECRET=x\n").expect("write proj");
+        fs::write(&staged, "SECRET=x\n").expect("write staged");
+        fs::set_permissions(&proj, fs::Permissions::from_mode(0o644)).expect("chmod proj");
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).expect("chmod staged");
+
+        let allow_list = DryRunAllowList {
+            pairs: vec![(proj.clone(), staged.clone())],
+        };
+        let outcome = ProvisionOutcome::from_status_lines(vec![]);
+        let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome);
+        assert!(
+            report.contains("would change file mode 0644 -> 0600"),
+            "a permission-only repair must be previewed: {report}"
+        );
+    }
 
     #[test]
     fn dry_run_status_lines_use_would_write_verb() {

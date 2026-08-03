@@ -109,6 +109,12 @@ pub(super) fn write_entries(
             namespace_arg.as_str(),
             "--remote",
         ])
+        // Anchor at the DECLARED manifest. Without `--config`, wrangler
+        // discovers the default `wrangler.toml` in `project_dir`, which for
+        // a declared `config/cloudflare.prod.toml` sitting beside a plain
+        // `wrangler.toml` would push to the WRONG account / namespace.
+        .arg("--config")
+        .arg(&wrangler_path)
         .output()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
@@ -205,6 +211,10 @@ pub(super) fn write_entries_local(
             binding,
             "--local",
         ])
+        // Anchor at the DECLARED manifest so a non-default filename beside
+        // a plain `wrangler.toml` seeds the right local namespace.
+        .arg("--config")
+        .arg(&wrangler_path)
         .output()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
@@ -269,6 +279,11 @@ pub(super) fn read_wrangler_kv_key(
     let project_dir = wrangler_path.parent().unwrap_or(manifest_root);
     let output = Command::new("wrangler")
         .args(["kv", "key", "get", "--binding", binding, key, locality])
+        // Anchor at the DECLARED manifest so diff/read resolves the same
+        // account / namespace a push would target, not a sibling default
+        // `wrangler.toml`.
+        .arg("--config")
+        .arg(&wrangler_path)
         .current_dir(project_dir)
         .output()
         .map_err(|err| {
@@ -798,6 +813,76 @@ mod tests {
         assert!(
             !captured.contains("--remote"),
             "read_local must NOT pass --remote; got argv:\n{captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_anchors_wrangler_at_the_declared_non_default_manifest() {
+        // A declared manifest with a NON-default filename sitting beside a
+        // plain `wrangler.toml` must be targeted via `--config`, or wrangler
+        // would discover the sibling default and read the wrong project.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"decoy\"\n");
+        fs::write(
+            project_dir.path().join("cloudflare.prod.toml"),
+            "name = \"prod\"\n",
+        )
+        .expect("write declared manifest");
+        let argv_log = project_dir.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        CloudflareCliAdapter
+            .read_config_entry_local(
+                project_dir.path(),
+                Some("cloudflare.prod.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read succeeds");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains("--config"),
+            "read must anchor wrangler with --config; got argv:\n{captured}"
+        );
+        assert!(
+            captured.contains("cloudflare.prod.toml"),
+            "read must point --config at the DECLARED manifest; got argv:\n{captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_push_anchors_wrangler_at_the_declared_non_default_manifest() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"decoy\"\n");
+        fs::write(
+            project_dir.path().join("cloudflare.prod.toml"),
+            "name = \"prod\"\n",
+        )
+        .expect("write declared manifest");
+        let argv_log = project_dir.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        CloudflareCliAdapter
+            .push_config_entries_local(
+                project_dir.path(),
+                Some("cloudflare.prod.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "hello".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("local push succeeds");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains("--config") && captured.contains("cloudflare.prod.toml"),
+            "local push must anchor --config at the DECLARED manifest; got argv:\n{captured}"
         );
     }
 

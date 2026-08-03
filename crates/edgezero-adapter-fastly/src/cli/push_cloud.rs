@@ -95,12 +95,21 @@ pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfi
             if lower.contains("not found on path") {
                 return Err(err);
             }
-            // A genuinely absent store is signalled by resolve's store
-            // markers; a generic "not found" from the list call is treated
-            // leniently too.
-            if lower.contains("not found")
-                || lower.contains("did you run")
+            // A genuinely absent store is signalled by resolve's own store
+            // markers, or by a not-found phrase that specifically mentions
+            // the config store. A BARE "not found" is NOT enough -- an
+            // unrelated failure like "profile not found" would otherwise be
+            // misreported as a missing store, and a diff would then claim
+            // everything was added. Match the SPACED "config store" phrase
+            // only: the hyphenated "config-store" appears in the command
+            // name inside every error string and would over-match.
+            let mentions_store = lower.contains("config store");
+            let not_found = lower.contains("not found")
+                || lower.contains("does not exist")
+                || lower.contains("404");
+            if lower.contains("did you run")
                 || lower.contains("no fastly config-store matches")
+                || (mentions_store && not_found)
             {
                 return Ok(ReadConfigEntry::MissingStore);
             }
@@ -152,7 +161,13 @@ pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfi
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404") {
+    // A genuinely absent ENTRY is a 404, or a not-found phrase that
+    // mentions the item/entry/key. A bare "not found" (e.g. "profile not
+    // found" from an auth failure) must NOT be misreported as a missing
+    // key -- it is surfaced as an error instead.
+    let mentions_entry = lower.contains("item") || lower.contains("entry") || lower.contains("key");
+    let not_found = lower.contains("not found") || lower.contains("does not exist");
+    if lower.contains("404") || (not_found && mentions_entry) {
         return Ok(ReadConfigEntry::MissingKey);
     }
     Err(format!(
@@ -948,6 +963,46 @@ mod tests {
         assert!(
             matches!(result, ReadConfigEntry::MissingStore),
             "list not-found => MissingStore"
+        );
+    }
+
+    /// An UNRELATED failure whose stderr merely contains "not found" (e.g.
+    /// an auth "profile not found") must NOT be misreported as a missing
+    /// store -- it is surfaced as a real error so a diff doesn't claim the
+    /// whole store was added.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_unrelated_not_found() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let fake_dir = tempdir().expect("tempdir");
+        let stderr_file = fake_dir.path().join("stderr_payload.txt");
+        fs::write(&stderr_file, "Error: profile 'user' not found").expect("write stderr");
+        let script_path = fake_dir.path().join("fastly");
+        let script = format!(
+            "#!/bin/sh\ncat '{stderr}' >&2\nexit 1\n",
+            stderr = stderr_file.display(),
+        );
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        let _path = PathPrepend::new(fake_dir.path());
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("an unrelated 'not found' must be an error, not MissingStore");
+        };
+        assert!(
+            err.contains("profile"),
+            "error surfaces the real failure: {err}"
         );
     }
 

@@ -25,16 +25,14 @@ SERVER_PID=""
 # never declares it: the Fastly and Spin arms inject the declaration into
 # the generated fastly.toml / spin.toml before boot, and warm-up's
 # `provision --local` rewrites `.dev.vars` / `.edgezero`. All of these are
-# backed up BEFORE warm-up (an empty `*_BACKUP` means the original was
-# absent) and restored on exit, so a developer's tree is never changed.
+# backed up FAIL-CLOSED BEFORE warm-up and restored on exit, so a
+# developer's tree is never changed regardless of success/failure.
+# shellcheck source=lib/smoke_backup.sh
+. "$ROOT_DIR/scripts/lib/smoke_backup.sh"
+# Path vars the seed arms below write to (set in the backup case block).
 DEV_VARS_FILE=""
-DEV_VARS_BACKUP=""
 FASTLY_TOML_FILE=""
-FASTLY_TOML_BACKUP=""
 SPIN_TOML_FILE=""
-SPIN_TOML_BACKUP=""
-EDGEZERO_DIR=""
-EDGEZERO_BACKUP=""
 SMOKE_SECRET_NAME="SMOKE_SECRET"
 MISSING_SECRET_NAME="SMOKE_SECRET_MISSING"
 DISALLOWED_SECRET_NAME="API_KEY"
@@ -52,75 +50,34 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-
-  # Restore each backed-up file. An empty `*_BACKUP` means the original
-  # was ABSENT -> remove whatever the smoke created. A non-empty backup
-  # (even a 0-byte file) is restored, so an empty original is preserved.
-  if [ -n "$DEV_VARS_FILE" ]; then
-    if [ -n "$DEV_VARS_BACKUP" ]; then
-      mv -f "$DEV_VARS_BACKUP" "$DEV_VARS_FILE"
-    else
-      rm -f "$DEV_VARS_FILE"
-    fi
-  fi
-  if [ -n "$FASTLY_TOML_FILE" ]; then
-    if [ -n "$FASTLY_TOML_BACKUP" ]; then
-      mv -f "$FASTLY_TOML_BACKUP" "$FASTLY_TOML_FILE"
-    else
-      rm -f "$FASTLY_TOML_FILE"
-    fi
-  fi
-  if [ -n "$SPIN_TOML_FILE" ]; then
-    if [ -n "$SPIN_TOML_BACKUP" ]; then
-      mv -f "$SPIN_TOML_BACKUP" "$SPIN_TOML_FILE"
-    else
-      rm -f "$SPIN_TOML_FILE"
-    fi
-  fi
-  if [ -n "$EDGEZERO_DIR" ]; then
-    rm -rf "$EDGEZERO_DIR"
-    if [ -n "$EDGEZERO_BACKUP" ] && [ -d "$EDGEZERO_BACKUP" ]; then
-      mkdir -p "$EDGEZERO_DIR"
-      cp -a "$EDGEZERO_BACKUP/." "$EDGEZERO_DIR/" 2>/dev/null || true
-      rm -rf "$EDGEZERO_BACKUP"
-    fi
-  fi
+  restore_backups
 }
-# Install the trap BEFORE warm-up so an abort mid-warm-up still restores.
-trap cleanup EXIT
 
-# Back up operator files/dirs BEFORE warm-up (and the boot-time seeds)
-# mutate them, so cleanup restores the developer's ORIGINAL state.
+# Back up operator files/dirs BEFORE arming the restore trap and BEFORE
+# warm-up (and the boot-time seeds) mutate them. A failed backup aborts
+# HERE -- before the trap is armed and before any mutation -- so the tree
+# is never left half-restored.
 case "$ADAPTER" in
   cloudflare)
     DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-    if [ -f "$DEV_VARS_FILE" ]; then
-      DEV_VARS_BACKUP=$(mktemp)
-      cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
-    fi
+    backup_in_tree "$DEV_VARS_FILE"
     ;;
   fastly)
     FASTLY_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-    if [ -f "$FASTLY_TOML_FILE" ]; then
-      FASTLY_TOML_BACKUP=$(mktemp)
-      cp -p "$FASTLY_TOML_FILE" "$FASTLY_TOML_BACKUP"
-    fi
+    backup_in_tree "$FASTLY_TOML_FILE"
     ;;
   spin)
     SPIN_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-    if [ -f "$SPIN_TOML_FILE" ]; then
-      SPIN_TOML_BACKUP=$(mktemp)
-      cp -p "$SPIN_TOML_FILE" "$SPIN_TOML_BACKUP"
-    fi
+    backup_in_tree "$SPIN_TOML_FILE"
     ;;
   axum)
-    EDGEZERO_DIR="$DEMO_DIR/.edgezero"
-    if [ -d "$EDGEZERO_DIR" ]; then
-      EDGEZERO_BACKUP=$(mktemp -d)
-      cp -a "$EDGEZERO_DIR/." "$EDGEZERO_BACKUP/" 2>/dev/null || true
-    fi
+    backup_in_tree "$DEMO_DIR/.edgezero"
     ;;
 esac
+
+# Install the trap AFTER a successful backup so an abort mid-warm-up still
+# restores, while a failed backup aborts before the trap can run.
+trap cleanup EXIT
 
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml

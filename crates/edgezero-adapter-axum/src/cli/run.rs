@@ -189,12 +189,22 @@ fn run_cargo(
     for (key, value) in ctx.env() {
         command.env(key, value);
     }
-    // Canonical env vars. The runtime's `EnvConfig` reads only the
-    // `EDGEZERO__*` form (see `crates/edgezero-core/src/env_config.rs`);
-    // setting the legacy `EDGEZERO_HOST` / `EDGEZERO_PORT` here would be a
-    // no-op for the child process.
-    command.env("EDGEZERO__ADAPTER__HOST", bind_addr.ip().to_string());
-    command.env("EDGEZERO__ADAPTER__PORT", bind_addr.port().to_string());
+    // Canonical HOST/PORT fall back to this adapter's address resolution
+    // (axum.toml + edgezero.toml). But the resolved CONTEXT environment
+    // (`.edgezero/.env` overlay + manifest `[environment.variables]`,
+    // applied above) has HIGHER precedence and must reach the child
+    // UNCHANGED -- `resolve_subprocess_addr` only reads the process env, so
+    // it can't see a ctx-provided value. Set the derived address ONLY when
+    // ctx did not already provide it, or the ctx value would silently lose
+    // to axum.toml. The runtime's `EnvConfig` reads only the `EDGEZERO__*`
+    // form (see `crates/edgezero-core/src/env_config.rs`).
+    let ctx_sets = |name: &str| ctx.env().iter().any(|(key, _)| key == name);
+    if !ctx_sets("EDGEZERO__ADAPTER__HOST") {
+        command.env("EDGEZERO__ADAPTER__HOST", bind_addr.ip().to_string());
+    }
+    if !ctx_sets("EDGEZERO__ADAPTER__PORT") {
+        command.env("EDGEZERO__ADAPTER__PORT", bind_addr.port().to_string());
+    }
     let status = command
         .status()
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
@@ -514,6 +524,55 @@ mod tests {
             env_host: None,
             env_port: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cargo_lets_ctx_env_host_port_win_over_axum_resolution() {
+        use edgezero_core::test_env::PathPrepend;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path().join("crate");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(crate_dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+        // A fake `cargo` that records the HOST/PORT env it was handed.
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let env_log = dir.path().join("child_env.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf 'HOST=%s\\nPORT=%s\\n' \"$EDGEZERO__ADAPTER__HOST\" \"$EDGEZERO__ADAPTER__PORT\" > '{}'\nexit 0\n",
+            env_log.display()
+        );
+        let cargo = bin.join("cargo");
+        fs::write(&cargo, script).unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = PathPrepend::new(&bin);
+
+        // The project's own resolution derives 9.9.9.9:1234 from axum.toml.
+        let mut project = project_with_crate_dir(crate_dir.clone());
+        project.addr = SocketAddr::new("9.9.9.9".parse().unwrap(), 1234);
+        project.axum_host = Some("9.9.9.9".to_owned());
+        project.axum_port = Some(1234);
+
+        // The resolved context env sets DIFFERENT values -- they must reach
+        // the child UNCHANGED (they have higher precedence than axum.toml).
+        let env = [
+            ("EDGEZERO__ADAPTER__HOST".to_owned(), "1.2.3.4".to_owned()),
+            ("EDGEZERO__ADAPTER__PORT".to_owned(), "5678".to_owned()),
+        ];
+        let ctx = AdapterExecContext::new().with_env(&env);
+        run_cargo(&project, "build", &[], &ctx).expect("fake cargo runs");
+
+        let logged = fs::read_to_string(&env_log).unwrap();
+        assert!(
+            logged.contains("HOST=1.2.3.4"),
+            "ctx HOST must reach the child unchanged, not lose to axum.toml: {logged}"
+        );
+        assert!(
+            logged.contains("PORT=5678"),
+            "ctx PORT must reach the child unchanged, not lose to axum.toml: {logged}"
+        );
     }
 
     #[test]

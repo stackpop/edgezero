@@ -120,6 +120,16 @@ pub(super) fn read_entry(
     else {
         return Ok(ReadConfigEntry::MissingStore);
     };
+    // `contents` must be a table of `key = "value"` pairs. A scalar or
+    // array here is CORRUPT local state, not a missing key -- surface it
+    // as an error rather than silently reporting every key absent (which a
+    // diff would then read as "everything was added").
+    if contents.as_table_like().is_none() {
+        return Err(format!(
+            "`[local_server.config_stores.{name}.contents]` in {} is not a table; the local Fastly config-store state is malformed. Re-run `config push --adapter fastly --local` to rewrite it.",
+            fastly_path.display()
+        ));
+    }
     // The contents table is `key = "value"` pairs.
     match contents.get(key) {
         Some(item) => {
@@ -272,6 +282,40 @@ mod tests {
         assert!(
             matches!(result, ReadConfigEntry::MissingKey),
             "key absent from contents => MissingKey"
+        );
+    }
+
+    #[test]
+    fn read_local_errors_when_contents_is_a_scalar() {
+        // A malformed `contents = "oops"` (scalar, not a table) is corrupt
+        // local state, NOT a missing key -- surface it as an error so a
+        // diff doesn't read every key as "added".
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            format!(
+                "name = \"demo\"\n\
+                 [local_server.config_stores.{TEST_CONFIG_ID}]\n\
+                 format = \"inline-toml\"\n\
+                 contents = \"oops\"\n"
+            ),
+        )
+        .expect("write");
+        let result = FastlyCliAdapter.read_config_entry_local(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("a scalar `contents` must be an error, not MissingKey");
+        };
+        assert!(
+            err.contains("is not a table"),
+            "error names the malformed state: {err}"
         );
     }
 

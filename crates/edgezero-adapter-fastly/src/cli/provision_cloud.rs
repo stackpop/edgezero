@@ -436,13 +436,28 @@ fn assert_setup_writeback_shape(path: &Path) -> Result<(), String> {
         ));
     };
     for plural in ["kv_stores", "config_stores", "secret_stores"] {
-        if let Some(item) = setup_tbl.get(plural)
-            && item.as_table().is_none()
-        {
+        let Some(item) = setup_tbl.get(plural) else {
+            continue;
+        };
+        let Some(kind_tbl) = item.as_table() else {
             return Err(format!(
                 "{}: `setup.{plural}` exists but is not a table; refusing to create any remote store",
                 path.display()
             ));
+        };
+        // Validate EVERY managed child too. `setup_block_present` treats any
+        // existing `setup.<plural>.<name>` value as "already provisioned"
+        // and skips it -- so a malformed scalar like `sessions = "broken"`
+        // would be silently skipped AFTER an earlier store was already
+        // created remotely, leaving partial state. A legitimate setup entry
+        // is a `[setup.<plural>.<name>]` block (standard or inline table).
+        for (name, child) in kind_tbl {
+            if child.as_table_like().is_none() {
+                return Err(format!(
+                    "{}: `setup.{plural}.{name}` is not a table; a store setup entry must be a `[setup.{plural}.{name}]` block. Refusing to create any remote store against a malformed manifest.",
+                    path.display()
+                ));
+            }
         }
     }
     Ok(())
@@ -668,6 +683,31 @@ mod tests {
             err.contains("`setup.kv_stores` exists but is not a table"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn assert_setup_writeback_shape_rejects_scalar_child_entry() {
+        // A scalar child (`sessions = "broken"`) would be misread by
+        // `setup_block_present` as an already-provisioned store and skipped
+        // -- after earlier stores were created remotely. The preflight must
+        // reject it before the first remote mutation.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "[setup.kv_stores]\nsessions = \"broken\"\n").expect("write");
+        let err = assert_setup_writeback_shape(&path).expect_err("scalar child rejected");
+        assert!(
+            err.contains("`setup.kv_stores.sessions` is not a table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn assert_setup_writeback_shape_accepts_inline_table_child() {
+        // An inline-table child is a legitimate declaration.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "[setup.kv_stores]\nsessions = {}\n").expect("write");
+        assert_setup_writeback_shape(&path).expect("inline-table child accepted");
     }
 
     // ---------- append_fastly_setup ----------

@@ -200,21 +200,33 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
     assert_adapter_declared_paths_safe(manifest.as_ref(), &args.adapter)?;
-    // NOTE: deploy deliberately does NOT take the cross-process provision
-    // lock. The deploy action runs an ARBITRARY, operator-defined command
-    // (`[adapters.<name>.commands].deploy`, or a vendor CLI), which may
-    // legitimately invoke `<app>-cli provision` / `config push`. Those run
-    // in a SEPARATE process and would block forever on the parent's
-    // non-reentrant file lock -- a self-deadlock. The narrow race the lock
-    // would guard (a concurrent provision vs `fastly compute deploy`'s
-    // `service_id` writeback into gitignored fastly.toml) is not worth
-    // deadlocking a composed deploy; provision/push reconcile a
-    // conflicting `service_id` in preflight when they next run.
-    adapter::execute(
+    // Hold the cross-process provision lock across the deploy so a vendor
+    // `service_id` writeback (e.g. `fastly compute deploy` rewriting the
+    // gitignored `fastly.toml`) can't interleave with a concurrent
+    // `provision` / `config push` and lose one side's edits -- the
+    // reconcile-on-next-run fallback can't recover a value already
+    // discarded. The deploy command may itself invoke `<app>-cli provision`
+    // in a child process; `acquire_for_deploy` advertises the lock via an
+    // inherited env var so that child BORROWS it instead of self-dead-
+    // locking, while an unrelated concurrent provision still serialises.
+    let lock_root = manifest_root_for_lock();
+    let _lock = provision_lock::ProvisionLock::acquire(&lock_root)?;
+    // Advertise the held lock to the deploy subprocess (and its children)
+    // via the child's own environment -- NOT the parent's global env, which
+    // edition-2024 `set_var` would make unsafe and the workspace forbids.
+    // A nested `<app>-cli provision` / `config push` inherits this and
+    // BORROWS the lock instead of self-dead-locking.
+    let advert = provision_lock::ProvisionLock::lock_path_for(&lock_root);
+    let overlay = vec![(
+        provision_lock::LOCK_ENV.to_owned(),
+        advert.to_string_lossy().into_owned(),
+    )];
+    adapter::execute_with_env_overlay(
         &args.adapter,
         adapter::Action::Deploy,
         manifest.as_ref(),
         &args.adapter_args,
+        &overlay,
     )
 }
 
@@ -424,6 +436,18 @@ fn ensure_adapter_defined(
 }
 
 #[cfg(feature = "cli")]
+/// Directory whose `.edgezero/provision.lock` guards this project, derived
+/// from the same manifest source `load_manifest_optional` uses so the
+/// deploy lock and the provision/push locks target the same sentinel.
+#[cfg(feature = "cli")]
+fn manifest_root_for_lock() -> PathBuf {
+    let path = env::var("EDGEZERO_MANIFEST")
+        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
 fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
     let (path, explicit) = env::var("EDGEZERO_MANIFEST").map_or_else(
         |_| (PathBuf::from("edgezero.toml"), false),

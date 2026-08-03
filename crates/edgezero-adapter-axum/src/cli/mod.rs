@@ -466,6 +466,11 @@ impl Adapter for AxumCliAdapter {
         let path = manifest_root
             .join(".edgezero")
             .join(format!("local-config-{}.json", store.logical));
+        // Reject a symlinked final component before reading, matching the
+        // write side (`push_config_entries` / provision refuse to create
+        // these files through a symlink). Keeps one consistent final-path
+        // policy so a planted symlink can't redirect diff off the tree.
+        reject_symlinked_target(&path)?;
         match fs::read_to_string(&path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ReadConfigEntry::MissingStore),
             Err(err) => Err(format!("failed to read {}: {err}", path.display())),

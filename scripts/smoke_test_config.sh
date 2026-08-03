@@ -26,16 +26,12 @@ SERVER_PID=""
 # (key name `demo_api_token`) through the AppConfig extractor, so every
 # adapter must have that secret seeded before boot or the endpoint errors.
 DEMO_SECRET_VALUE="resolved-token"
-# Operator-owned files this smoke mutates. `.dev.vars` is gitignored but
-# NOT regenerable (provision writes only empty placeholders), and
-# `fastly.toml`, though regenerable, is edited in place by the push and
-# by warm-up. Both are backed up BEFORE warm-up runs (warm-up's
-# `provision --local` itself writes them) and restored on exit, so a run
-# never leaves a developer's tree changed regardless of success/failure.
-DEV_VARS_FILE=""
-DEV_VARS_BACKUP=""
-FASTLY_TOML_FILE=""
-FASTLY_TOML_BACKUP=""
+# Fail-closed backup/restore of the operator-owned files this smoke
+# mutates in place. `.dev.vars` is gitignored but NOT regenerable
+# (provision writes only empty placeholders), and `fastly.toml`, though
+# regenerable, is edited in place by the push and by warm-up.
+# shellcheck source=lib/smoke_backup.sh
+. "$ROOT_DIR/scripts/lib/smoke_backup.sh"
 
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
@@ -45,42 +41,25 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  if [ -n "$DEV_VARS_FILE" ]; then
-    if [ -n "$DEV_VARS_BACKUP" ] && [ -f "$DEV_VARS_BACKUP" ]; then
-      mv -f "$DEV_VARS_BACKUP" "$DEV_VARS_FILE"
-    else
-      rm -f "$DEV_VARS_FILE"
-    fi
-  fi
-  if [ -n "$FASTLY_TOML_FILE" ]; then
-    if [ -n "$FASTLY_TOML_BACKUP" ] && [ -f "$FASTLY_TOML_BACKUP" ]; then
-      mv -f "$FASTLY_TOML_BACKUP" "$FASTLY_TOML_FILE"
-    else
-      rm -f "$FASTLY_TOML_FILE"
-    fi
-  fi
+  restore_backups
 }
-# Install the trap BEFORE warm-up so an abort mid-warm-up still restores.
-trap cleanup EXIT
 
-# Back up operator files BEFORE warm-up, because warm-up's
-# `provision --local` (and the later `config push`) write them.
+# Back up operator files BEFORE arming the restore trap and BEFORE warm-up
+# (warm-up's `provision --local` and the later `config push` write them).
+# A failed backup aborts HERE, before the trap is armed and before any
+# mutation, so the tree is never left in a half-restored state.
 case "$ADAPTER" in
   cloudflare|cf)
-    DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-    if [ -f "$DEV_VARS_FILE" ]; then
-      DEV_VARS_BACKUP=$(mktemp)
-      cp -p "$DEV_VARS_FILE" "$DEV_VARS_BACKUP"
-    fi
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
     ;;
   fastly)
-    FASTLY_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-    if [ -f "$FASTLY_TOML_FILE" ]; then
-      FASTLY_TOML_BACKUP=$(mktemp)
-      cp -p "$FASTLY_TOML_FILE" "$FASTLY_TOML_BACKUP"
-    fi
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
     ;;
 esac
+
+# Install the trap AFTER a successful backup so an abort mid-warm-up still
+# restores, while a failed backup aborts before the trap can run.
+trap cleanup EXIT
 
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
@@ -150,7 +129,8 @@ case "$ADAPTER" in
     # `demo_api_token` secret must come through `.dev.vars`. It was backed
     # up before warm-up (see the pre-warm-up backup block) and is restored
     # on exit.
-    printf 'demo_api_token="%s"\n' "$DEMO_SECRET_VALUE" > "$DEV_VARS_FILE"
+    printf 'demo_api_token="%s"\n' "$DEMO_SECRET_VALUE" \
+      > "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
     echo "==> Starting Cloudflare wrangler dev on port $PORT..."
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!

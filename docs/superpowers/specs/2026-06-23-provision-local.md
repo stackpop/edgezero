@@ -1841,13 +1841,18 @@ Rationale:
   "Where durable identifiers live"). `provision --local`
   synthesises the per-adapter manifest from those primitives
   via `toml_edit::DocumentMut` so a clean `git clone` plus
-  `provision --local` is always reproducible. The richer
-  scaffold `.hbs` templates under
+  `provision --local` is always reproducible. NO adapter
+  manifest (`axum.toml`, `wrangler.toml`, `fastly.toml`,
+  `spin.toml`, `runtime-config.toml`) has a scaffold `.hbs`
+  template: `edgezero new` runs the SAME synthesiser at
+  scaffold time, so the synthesiser is the single writer for
+  those files. The `.hbs` templates that remain under
   `crates/edgezero-cli/src/templates/` and
-  `crates/edgezero-adapter-*/src/templates/` are used only
-  by `edgezero new`'s first-time generation -- they carry
-  generator-only placeholders (`{{proj_spin}}` etc.) that
-  the steady-state dev loop can't reconstruct.
+  `crates/edgezero-adapter-*/src/templates/` cover only
+  NON-manifest scaffold files (`Cargo.toml`, `src/…`,
+  `.cargo/config.toml`) with generator-only placeholders
+  (`{{proj_spin}}` etc.) that the steady-state dev loop
+  doesn't reconstruct.
 - Operator-authored values (custom `[scripts]`, deploy commands,
   service ids) live alongside generated content; the merge
   mechanics above preserve unknown / pre-existing keys when

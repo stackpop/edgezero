@@ -20,6 +20,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use edgezero_adapter::env_file::reject_symlinked_target;
+
 use serde::Deserialize;
 use serde::de::Error as DeError;
 
@@ -109,6 +111,10 @@ pub(crate) struct ParsedRuntimeConfig {
 /// Returns a human-readable error string if the file exists but is
 /// malformed TOML or doesn't deserialise into the expected shape.
 pub(crate) fn read(path: &Path) -> Result<ParsedRuntimeConfig, String> {
+    // Reject a symlinked final component before reading, matching the
+    // write side (provision refuses to create `runtime-config.toml`
+    // through a symlink) -- one consistent final-path policy.
+    reject_symlinked_target(path)?;
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -140,6 +146,19 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let parsed = read(&dir.path().join("absent.toml")).expect("missing file is fine");
         assert!(parsed.key_value_stores.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_symlinked_runtime_config() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let real = dir.path().join("real.toml");
+        fs::write(&real, "[key_value_store.app_config]\ntype = \"spin\"\n").expect("write");
+        let link = dir.path().join("runtime-config.toml");
+        symlink(&real, &link).expect("symlink");
+        let err = read(&link).expect_err("symlinked runtime-config must be refused");
+        assert!(err.contains("symlink"), "error names the symlink: {err}");
     }
 
     #[test]

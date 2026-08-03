@@ -127,6 +127,111 @@ pub fn find_workspace_root(dir: &Path) -> PathBuf {
     candidate.unwrap_or_else(|| dir.to_path_buf())
 }
 
+/// The effective cargo target directory for build-artifact discovery.
+pub enum CargoTargetDir {
+    /// An explicit override was requested -- via a `--target-dir` build
+    /// argument, `CARGO_TARGET_DIR`, or a `.cargo/config.toml`
+    /// `[build] target-dir`. Artifact discovery must look ONLY here:
+    /// falling back to the conventional `target/` directories could select
+    /// a STALE artifact from an earlier default-target build after a
+    /// successful custom-target one.
+    Explicit(PathBuf),
+    /// No override; use the conventional crate/workspace `target/` search.
+    Conventional,
+}
+
+/// Resolve cargo's effective target directory for locating a build
+/// artifact, mirroring cargo's own precedence: an explicit `--target-dir`
+/// build argument, then `CARGO_TARGET_DIR` (the ctx-applied env the build
+/// used, then the process env), then a `.cargo/config.toml`
+/// `[build] target-dir` walking from the crate root up to the workspace
+/// root. Relative values follow cargo: `--target-dir` / `CARGO_TARGET_DIR`
+/// resolve against the build's working directory (`crate_dir`); a config
+/// `target-dir` resolves against the directory that contains the `.cargo`
+/// directory.
+///
+/// Returning [`CargoTargetDir::Explicit`] signals the caller must not fall
+/// back to the conventional paths, which is what prevents a stale
+/// default-target artifact from being packaged or deployed.
+#[inline]
+#[must_use]
+pub fn resolve_cargo_target_dir(
+    crate_dir: &Path,
+    build_args: &[String],
+    ctx: &AdapterExecContext<'_>,
+) -> CargoTargetDir {
+    // 1. `--target-dir <v>` / `--target-dir=<v>` in the build args.
+    if let Some(dir) = target_dir_from_args(build_args) {
+        return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
+    }
+    // 2. `CARGO_TARGET_DIR`: the ctx-applied env the build ran with takes
+    //    precedence over the process env, mirroring `command.env(...)`.
+    let env_dir = ctx
+        .env()
+        .iter()
+        .find(|(key, _)| key == "CARGO_TARGET_DIR")
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from));
+    if let Some(dir) = env_dir {
+        return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
+    }
+    // 3. Nearest `.cargo/config.toml` (or `.cargo/config`) `[build]
+    //    target-dir`, from the crate root up to the workspace root.
+    let workspace_root = find_workspace_root(crate_dir);
+    let mut dir = crate_dir;
+    loop {
+        for name in ["config.toml", "config"] {
+            if let Some(target) = config_build_target_dir(&dir.join(".cargo").join(name)) {
+                return CargoTargetDir::Explicit(resolve_dir_against(dir, &target));
+            }
+        }
+        if dir == workspace_root {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+    CargoTargetDir::Conventional
+}
+
+/// Extract the value of a `--target-dir` build argument (`--target-dir X`
+/// or `--target-dir=X`), if present.
+fn target_dir_from_args(args: &[String]) -> Option<PathBuf> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--target-dir=") {
+            return Some(PathBuf::from(value));
+        }
+        if arg == "--target-dir" {
+            return iter.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+/// Resolve a possibly-relative target dir against `base` (absolute values
+/// pass through unchanged), matching how cargo resolves the corresponding
+/// path.
+fn resolve_dir_against(base: &Path, dir: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        base.join(dir)
+    }
+}
+
+/// Read `[build] target-dir` from a cargo config file, if it declares one.
+fn config_build_target_dir(config_path: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(config_path).ok()?;
+    let doc: toml::Value = toml::from_str(&raw).ok()?;
+    doc.get("build")?
+        .get("target-dir")?
+        .as_str()
+        .map(PathBuf::from)
+}
+
 /// Calculates the path distance between two directories based on shared leading components.
 #[inline]
 #[must_use]
@@ -347,6 +452,72 @@ mod tests {
     use super::*;
     use crate::registry::AdapterExecContext;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolve_target_dir_prefers_build_arg_over_env_and_config() {
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join(".cargo")).unwrap();
+        fs::write(
+            crate_dir.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"from-config\"\n",
+        )
+        .unwrap();
+        let env = [("CARGO_TARGET_DIR".to_owned(), "from-env".to_owned())];
+        let ctx = AdapterExecContext::new().with_env(&env);
+        let args = ["--target-dir".to_owned(), "from-arg".to_owned()];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("from-arg")),
+            CargoTargetDir::Conventional => panic!("expected explicit from the build arg"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_prefers_env_over_config() {
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join(".cargo")).unwrap();
+        fs::write(
+            crate_dir.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"from-config\"\n",
+        )
+        .unwrap();
+        let env = [("CARGO_TARGET_DIR".to_owned(), "/abs-env".to_owned())];
+        let ctx = AdapterExecContext::new().with_env(&env);
+        match resolve_cargo_target_dir(crate_dir, &[], &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, PathBuf::from("/abs-env")),
+            CargoTargetDir::Conventional => panic!("expected explicit from the env"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_reads_config_when_no_arg_or_env() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let crate_dir = workspace.join("crates/server");
+        fs::create_dir_all(crate_dir.join(".cargo")).unwrap();
+        fs::write(
+            crate_dir.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"cfg-out\"\n",
+        )
+        .unwrap();
+        let ctx = AdapterExecContext::new();
+        match resolve_cargo_target_dir(&crate_dir, &[], &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("cfg-out")),
+            CargoTargetDir::Conventional => panic!("expected explicit from config.toml"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_is_conventional_without_any_override() {
+        let dir = tempdir().unwrap();
+        let ctx = AdapterExecContext::new();
+        assert!(matches!(
+            resolve_cargo_target_dir(dir.path(), &[], &ctx),
+            CargoTargetDir::Conventional
+        ));
+    }
 
     #[test]
     fn declared_manifest_wins_over_ambient_discovery() {
