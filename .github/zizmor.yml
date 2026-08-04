@@ -6,9 +6,11 @@
 # tag like `actions-rust-lang/setup-rust-toolchain@v1.17.0`. Relax the blanket policy
 # to `ref-pin` so a version tag satisfies the audit for every action.
 #
-# This does NOT permit floating refs: `check-action-pins.sh` still fails any
-# `@main`/`@master`/`@HEAD`, so every `uses:` must resolve to a concrete released tag
-# (or a hash, which also satisfies ref-pin).
+# This does NOT permit floating refs: zizmor's `ref-pin` alone would accept a
+# branch, but `check-action-pins.sh` rejects any ref that is not a full commit SHA
+# or a release version tag (so `@main`, `@develop`, `@latest`, etc. all fail). The
+# two gates together mean every `uses:` resolves to an immutable SHA or a released
+# version tag.
 rules:
   unpinned-uses:
     config:

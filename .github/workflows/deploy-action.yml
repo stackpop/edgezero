@@ -11,6 +11,7 @@ on:
       - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
       - .github/workflows/fastly-installer-check.yml
+      - .github/zizmor.yml
       - scripts/install-actionlint.sh
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
@@ -28,6 +29,7 @@ on:
       - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
       - .github/workflows/fastly-installer-check.yml
+      - .github/zizmor.yml
       - scripts/install-actionlint.sh
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**

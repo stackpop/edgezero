@@ -39,7 +39,7 @@ enum Cmd {
     /// Inspect or mutate the typed `app-demo.toml` app config.
     #[command(subcommand)]
     Config(AppDemoConfigCmd),
-    /// Deploy to a target edge (supports `--stage` for a staged draft).
+    /// Deploy to a target edge (supports `--staging` for a staged draft).
     Deploy(DeployArgs),
     /// Probe a deployed/staged version's health (Fastly staging
     /// lifecycle). Exits non-zero when unhealthy after retries.

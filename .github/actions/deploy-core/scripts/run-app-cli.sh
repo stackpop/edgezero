@@ -93,6 +93,12 @@ import_provider_env() {
   # that is quietly wrong is worse than one that is rejected.
   printf '%s' "$json" | jq -e 'all(.[]; contains("\u0000") | not)' >/dev/null 2>&1 ||
     fail "EDGEZERO__PROVIDER__ENV values must not contain NUL bytes"
+  # A trailing CR/LF cannot survive the boundary either: the `$(…)` that decodes each
+  # base64 value below strips trailing newlines, so a value ending in a newline would
+  # be silently truncated. Reject CR/LF outright — a quietly-wrong credential is worse
+  # than one that is rejected.
+  printf '%s' "$json" | jq -e 'all(.[]; (contains("\n") or contains("\r")) | not)' >/dev/null 2>&1 ||
+    fail "EDGEZERO__PROVIDER__ENV values must not contain CR or LF bytes"
 
   # One "NAME BASE64VALUE" line per entry. Base64 keeps values line-safe
   # (newlines, spaces, quotes cannot break the read loop) and opaque.

@@ -302,6 +302,7 @@ out of the build's job entirely, or scope it to the one step that needs it.
 | `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                             |
 | `working-directory` | No       | `.`             | App directory.                                                                               |
 | `manifest`          | No       | empty           | Optional `edgezero.toml` path relative to `working-directory`.                               |
+| `rust-toolchain`    | No       | `auto`          | Rust toolchain for the deploy build; `auto` follows discovery (§7).                          |
 | `build-mode`        | No       | `auto`          | `auto` (→ `never` for Fastly), `always`, or `never`.                                         |
 | `build-args`        | No       | `[]`            | JSON array passed to `<cli> build`. No secrets.                                              |
 | `deploy-args`       | No       | `[]`            | JSON array — allowlisted to `--comment` for Fastly. No secrets.                              |

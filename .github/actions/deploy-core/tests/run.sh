@@ -660,6 +660,15 @@ test_provider_env_nul() {
     run_with_env '{"FASTLY_API_TOKEN":"tok with spaces"}'
   assert_succeeds "a plain token is accepted" \
     run_with_env '{"FASTLY_API_TOKEN":"abc123"}'
+
+  # CR/LF are rejected too: the `$(base64 --decode)` step strips trailing newlines,
+  # so a value ending in one would be silently truncated to a wrong credential.
+  assert_fails "an LF-bearing provider value is rejected" \
+    run_with_env "$(jq -nc '{FASTLY_API_TOKEN: "abc\ndef"}')"
+  assert_fails "a trailing-newline provider value is rejected" \
+    run_with_env "$(jq -nc '{FASTLY_API_TOKEN: "abc\n"}')"
+  assert_fails "a CR-bearing provider value is rejected" \
+    run_with_env "$(jq -nc '{FASTLY_API_TOKEN: "abc\rdef"}')"
 }
 
 test_lifecycle_helpers() {
@@ -1570,17 +1579,30 @@ test_action_output_contracts() {
 }
 
 # Print an action's public surface deterministically: `in <name> <required>
-# <has-default>` for every input (has-default = set|none), then `out <name>` for
-# every output — all sorted. Pins names, required flags, and default PRESENCE.
+# <default>` for every input (default = `none` when absent, else the normalized
+# default VALUE — the scalar as written, or the joined content of a folded/literal
+# block), then `out <name>` for every output — all sorted. Pins names, required
+# flags, AND default values, so a flip like `stage: false` -> `true` is caught.
 parse_action_surface() {
   awk '
+    function trim(s){ sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
     function flush(){ if (sec == "in" && n != "") printf "in %s %s %s\n", n, req, def; n = "" }
     /^inputs:/ { sec = "in"; next }
-    /^outputs:/ { flush(); sec = "out"; next }
-    /^runs:/ { flush(); sec = "" }
-    sec == "in" && /^  [a-z][a-z0-9-]*:/ { flush(); n = $1; sub(/:$/, "", n); req = "false"; def = "none" }
+    /^outputs:/ { flush(); sec = "out"; collecting = 0; next }
+    /^runs:/ { flush(); sec = ""; collecting = 0 }
+    sec == "in" && collecting {
+      # Continuation lines of a folded/literal default are indented deeper than the
+      # `default:` key (>4 spaces); join them. A dedent ends the block.
+      if ($0 ~ /^      /) { def = (def == "" ? trim($0) : def " " trim($0)); next }
+      else { collecting = 0 }
+    }
+    sec == "in" && /^  [a-z][a-z0-9-]*:/ { flush(); n = $1; sub(/:$/, "", n); req = "false"; def = "none"; collecting = 0 }
     sec == "in" && /^    required:/ { req = $2 }
-    sec == "in" && /^    default:/ { def = "set" }
+    sec == "in" && /^    default:/ {
+      rest = $0; sub(/^    default:[ \t]*/, "", rest); rest = trim(rest)
+      if (rest == "" || rest == ">-" || rest == "|" || rest == ">" || rest == "|-" || rest == ">+" || rest == "|+") { def = ""; collecting = 1 }
+      else { def = rest }
+    }
     sec == "out" && /^  [a-z][a-z0-9-]*:/ { m = $1; sub(/:$/, "", m); print "out " m }
     END { flush() }
   ' "$1" | sort
@@ -1591,18 +1613,19 @@ test_action_public_surface() {
   # The GOLDEN public contract per action. test_action_metadata only checks that
   # inputs HAVE descriptions and env keys are unique; test_action_output_contracts
   # only checks output->script wiring. Neither pins the SET of input/output names,
-  # their required flags, or whether they carry a default — so a renamed input, a
-  # removed output, an added input, or a flipped required/default would pass
-  # silently. This asserts the exact documented surface. Every required input
-  # carries no default; every optional input carries one.
+  # their required flags, or their DEFAULT VALUES — so a renamed input, a removed
+  # output, an added input, or a flipped default (e.g. `stage: false` -> `true`,
+  # `deploy-to: production` -> `staging`) would pass silently. This asserts the
+  # exact documented surface, default values included. Every required input carries
+  # no default; every optional input carries one.
   assert_equals "build-app-cli public surface" "$(
     cat <<'EOF'
-in app-cli-artifact false set
-in app-cli-bin false set
+in app-cli-artifact false edgezero-cli
+in app-cli-bin false ""
 in app-cli-package true none
-in provider-env-clear false set
-in rust-toolchain false set
-in working-directory false set
+in provider-env-clear false ["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_CARGO_PROFILE","FASTLY_HOME","CLOUDFLARE_API_TOKEN","CLOUDFLARE_API_KEY","CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_EMAIL","CF_API_TOKEN","CF_API_KEY","CF_ACCOUNT_ID","SPIN_AUTH_TOKEN","FERMYON_TOKEN"]
+in rust-toolchain false auto
+in working-directory false .
 out app-cli-artifact
 out app-cli-bin
 out app-cli-package
@@ -1613,17 +1636,17 @@ EOF
   assert_equals "deploy-fastly public surface" "$(
     cat <<'EOF'
 in app-cli-artifact true none
-in app-cli-bin false set
-in build-args false set
-in build-mode false set
-in cache false set
-in deploy-args false set
+in app-cli-bin false ""
+in build-args false "[]"
+in build-mode false auto
+in cache false "false"
+in deploy-args false "[]"
 in fastly-api-token true none
 in fastly-service-id true none
-in manifest false set
-in rust-toolchain false set
-in stage false set
-in working-directory false set
+in manifest false ""
+in rust-toolchain false auto
+in stage false "false"
+in working-directory false .
 out app-cli-version
 out fastly-version
 out mutation-attempted
@@ -1636,16 +1659,16 @@ EOF
   assert_equals "config-push-fastly public surface" "$(
     cat <<'EOF'
 in app-cli-artifact true none
-in app-cli-bin false set
-in app-config false set
-in app-config-inline false set
-in deploy-to false set
+in app-cli-bin false ""
+in app-config false ""
+in app-config-inline false ""
+in deploy-to false production
 in fastly-api-token true none
-in key false set
-in manifest false set
-in no-env false set
-in store false set
-in working-directory false set
+in key false ""
+in manifest false ""
+in no-env false "false"
+in store false ""
+in working-directory false .
 out mutation-attempted
 out provider-cli-version
 out pushed-key
@@ -1656,12 +1679,12 @@ EOF
   assert_equals "rollback-fastly public surface" "$(
     cat <<'EOF'
 in app-cli-artifact true none
-in app-cli-bin false set
-in deploy-to false set
+in app-cli-bin false ""
+in deploy-to false production
 in fastly-api-token true none
 in fastly-service-id true none
 in fastly-version true none
-in rollback-to false set
+in rollback-to false ""
 out mutation-attempted
 out rolled-back-to
 EOF
@@ -1670,16 +1693,16 @@ EOF
   assert_equals "healthcheck-fastly public surface" "$(
     cat <<'EOF'
 in app-cli-artifact true none
-in app-cli-bin false set
-in deploy-to false set
+in app-cli-bin false ""
+in deploy-to false production
 in domain true none
-in fastly-api-token false set
+in fastly-api-token false ""
 in fastly-service-id true none
 in fastly-version true none
-in path false set
-in retry false set
-in retry-delay false set
-in timeout false set
+in path false "/"
+in retry false "3"
+in retry-delay false "5"
+in timeout false "10"
 out healthy
 out status-code
 EOF

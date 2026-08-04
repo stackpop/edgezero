@@ -145,8 +145,11 @@ runs:
         # evaluation, so that would be an ineffective no-op. Outputs are emitted by
         # the separate publish step instead. NOTE: this closes the env/proc vectors,
         # but a fully malicious build can still enumerate the runner's command
-        # directory at the same uid — so a provider secret must never share a step
-        # or job with the build (see the guide's security notes).
+        # directory at the same uid. This step is therefore credential-free by design,
+        # so a caller who must keep a provider secret away from the compile-heavy
+        # build can isolate it in a separate job; deploying a trusted first-party app
+        # in the same job is fine, since the deploy runs the app's own code with the
+        # credential regardless (see the guide's security notes).
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
@@ -273,7 +276,9 @@ runs:
         name: ${{ steps.build.outputs['app-cli-artifact'] }}
         path: ${{ steps.build.outputs['tarball-path'] }}
         if-no-files-found: error
-        retention-days: 1
+        # No forced retention: the repository/org default applies, so the artifact
+        # survives an environment-approval gate that delays the deploy job past a day
+        # (a forced `retention-days: 1` would expire the CLI before it downloads).
 
     # Remove the per-invocation workspace (build/stage dirs, the outputs handoff)
     # now that the artifact is uploaded. Runs no application code.

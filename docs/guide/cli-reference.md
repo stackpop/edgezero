@@ -155,12 +155,24 @@ edgezero deploy --adapter <name>
 **Arguments:**
 
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`)
+- `--service-id <id>` - Platform service id the deploy targets (Fastly). Passed
+  through to the provider; adapters that don't need one ignore it.
+- `--staging` - Deploy to a **staged** draft version instead of activating
+  production (Fastly staging lifecycle). Non-Fastly adapters reject it. This is the
+  same `--staging` verb `healthcheck`/`rollback`/`config push` use.
+- `-- <passthrough...>` - Args after `--` are forwarded verbatim to the adapter
+  deploy command (e.g. `-- --comment "ci build"`). A hyphenated token before `--`
+  is rejected, so a mistyped flag can never silently route a staging deploy to
+  production.
 
 **Examples:**
 
 ```bash
 # Deploy to Fastly
 edgezero deploy --adapter fastly
+
+# Stage a Fastly draft version (no activation)
+edgezero deploy --adapter fastly --service-id "$FASTLY_SERVICE_ID" --staging
 
 # Deploy to Cloudflare
 edgezero deploy --adapter cloudflare

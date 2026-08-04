@@ -156,8 +156,12 @@ pub struct DeployArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
-    /// Arguments passed through to the adapter deploy command.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    /// Passthrough args for the adapter deploy command. These MUST follow a `--`
+    /// separator: an unknown hyphenated token before `--` is rejected, not captured
+    /// here. This is a safety boundary — otherwise a stray `--stage` (or any typo'd
+    /// flag) would slip through as passthrough, leave `--staging` false, and route a
+    /// staging-intended deploy to PRODUCTION.
+    #[arg(last = true)]
     pub adapter_args: Vec<String>,
     /// Platform service id the deploy targets. Consumed by the Fastly
     /// staging lifecycle: production deploy passes it
@@ -851,6 +855,44 @@ mod tests {
         assert_eq!(deploy.service_id.as_deref(), Some("SVC123"));
         assert!(!deploy.staging);
         assert_eq!(deploy.adapter_args, vec!["--comment", "ci build"]);
+    }
+
+    #[test]
+    fn deploy_rejects_unknown_flag_before_separator() {
+        use clap::error::ErrorKind;
+        // FAIL CLOSED at parse time, before any deploy action runs: an unknown
+        // hyphenated token (here the renamed-away `--stage`) must NOT be captured as
+        // passthrough. If it were, `--staging` would stay false and a staging-
+        // intended deploy would route to PRODUCTION. Passthrough is only accepted
+        // after `--`, so a bare `--stage` is an UnknownArgument.
+        let err = Args::try_parse_from([
+            "edgezero",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "x",
+            "--stage",
+        ])
+        .expect_err("`deploy ... --stage` must be rejected, not routed to production");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+
+        // The same is true for any typo'd flag before `--`.
+        assert!(
+            Args::try_parse_from(["edgezero", "deploy", "--adapter", "fastly", "--staeg"]).is_err(),
+            "a typo'd flag must be rejected, not silently forwarded"
+        );
+
+        // And passthrough AFTER `--` still works — including a literal `--stage` a
+        // caller genuinely means for the adapter command.
+        let args =
+            Args::try_parse_from(["edgezero", "deploy", "--adapter", "fastly", "--", "--stage"])
+                .expect("passthrough after -- is accepted verbatim");
+        let Command::Deploy(deploy) = args.cmd else {
+            panic!("expected Command::Deploy");
+        };
+        assert!(!deploy.staging);
+        assert_eq!(deploy.adapter_args, vec!["--stage"]);
     }
 
     #[test]
