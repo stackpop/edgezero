@@ -723,11 +723,23 @@ in the `cli.rs` test module.
 - **Sibling coexistence preserved**: a push of `app_config` must not
   remove `app_config_staging` chunk keys (Spec 12.7 coexistence).
 - **Suspicious prior pointer (real push)**: seed the root with a
-  pointer-kind-but-invalid value (e.g. `version: 2`) **and** pre-seed
-  real chunk-like keys under the root namespace (so "no deletes" is
-  non-vacuous); a real local push of a new config returns a
-  suspicious-pointer warning, leaves the pre-seeded chunk keys present,
-  and still writes the new value.
+  pointer-kind-but-invalid v1 value (our `edgezero_kind`, `version: 1`,
+  missing required fields) **and** pre-seed real chunk-like keys under
+  the root namespace (so "no deletes" is non-vacuous); a real local push
+  of a new config returns a suspicious-pointer warning, leaves the
+  pre-seeded chunk keys present, and still writes the new value. (Use a
+  v1 value here: a `version: 2` prior is a NEWER format and is REFUSED,
+  not overwritten — see the next bullet.)
+- **Downgrade refused (real push)**: an OLDER CLI must never clobber a
+  NEWER format. If the locked reread finds the root now holds a future
+  value — a bumped envelope/pointer `version` (any present `version` that
+  is not exactly the JSON integer `1`, including `"2"`, `-1`, `2.5`), an
+  unknown `edgezero_kind`, OR a valid v1 pointer whose reconstructed
+  INNER envelope is a newer version — the push HARD-ERRORS before any
+  mutation and the store is left untouched. This runs under the write
+  lock (the pre-push check is advisory only, since a newer writer can
+  land between it and the lock). An existing non-inline store
+  (`format = "json"` / `"file"`) is likewise REFUSED, not converted.
 - **Reserved key rejected**: `push_config_entries_local` with a logical
   key containing `.__edgezero_chunks.` returns `Err` before touching
   `fastly.toml` (file unchanged / not created).

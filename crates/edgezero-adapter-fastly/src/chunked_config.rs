@@ -943,10 +943,13 @@ pub(crate) fn value_is_future_format(raw: &str) -> bool {
     let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
     };
+    // A `version` field that is PRESENT but not EXACTLY the JSON integer 1 is a
+    // newer format. Keying on `as_u64()` alone fails open: `"2"`, `-1`, `2.5`, or
+    // `1.0` all yield `None` and would slip through as repairable corruption. Any
+    // present-and-not-integer-1 version fails closed.
     let version_is_not_one = obj
         .get("version")
-        .and_then(serde_json::Value::as_u64)
-        .is_some_and(|version| version != u64::from(ENVELOPE_VERSION_V1));
+        .is_some_and(|version| version.as_u64() != Some(u64::from(ENVELOPE_VERSION_V1)));
     match obj.get("edgezero_kind") {
         // Our pointer kind, but a newer POINTER version.
         Some(serde_json::Value::String(kind)) if kind == POINTER_KIND => version_is_not_one,
@@ -1667,6 +1670,24 @@ mod tests {
             value_is_future_format(r#"{"version":2,"payload":{"k":"v"}}"#),
             "schema-changing v2 (no v1 fields)"
         );
+
+        // A `version` PRESENT but not EXACTLY the JSON integer 1 is future,
+        // whatever its JSON type -- `as_u64()` alone would let these slip through.
+        for raw in [
+            r#"{"version":"2"}"#,  // string
+            r#"{"version":-1}"#,   // negative integer
+            r#"{"version":2.5}"#,  // float
+            r#"{"version":1.0}"#,  // float, not the integer 1
+            r#"{"version":null}"#, // present but null
+        ] {
+            assert!(
+                value_is_future_format(raw),
+                "a non-integer-1 version must be future: {raw}"
+            );
+        }
+        // The exact JSON integer 1 (and an absent version) is NOT future.
+        assert!(!value_is_future_format(r#"{"version":1,"greeting":"hi"}"#));
+        assert!(!value_is_future_format(r#"{"greeting":"hi"}"#));
 
         // A v2 POINTER (our kind, bumped pointer version) -> future.
         assert!(

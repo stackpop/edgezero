@@ -326,8 +326,10 @@ sqlite3 .spin/sqlite_key_value.db "SELECT key FROM spin_key_value WHERE store='<
 
 ### Reclaiming orphaned chunk entries (Fastly, oversized configs)
 
-If your app-config blob exceeds Fastly's 8 000-character entry limit it is stored
-as content-addressed chunks, and every re-push orphans the previous generation.
+If your app-config blob exceeds Fastly's 8 000-**byte** entry limit (the adapter
+applies a conservative UTF-8 byte check — see the storage-model note above — so
+the trigger is stable regardless of multi-byte characters) it is stored as
+content-addressed chunks, and every re-push orphans the previous generation.
 `config gc` reclaims them safely — it derives the live set from the store and
 deletes only unreferenced chunk entries you have asserted are old enough:
 
@@ -347,7 +349,7 @@ compare-and-swap). Cloudflare/Spin orphan cleanup remains manual.
 ### Fastly chunk-pointer hygiene
 
 If your envelope ever pushed as chunked, then later shrinks back
-under 8,000 characters, the old chunks remain in the store unreferenced
+under the 8 000-byte trigger, the old chunks remain in the store unreferenced
 (the root pointer is the only active commit record). To find them:
 
 ```sh

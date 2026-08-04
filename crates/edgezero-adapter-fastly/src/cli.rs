@@ -580,6 +580,13 @@ impl Adapter for FastlyCliAdapter {
         // operator supplies the one fact the platform cannot -- that the current
         // config has been live long enough that nothing is serving the old
         // pointers. See the spec's "Cloud reclamation".
+        // Preflight: refuse if a generated chunk key would clobber an existing
+        // root-like sibling in the remote store. Uses a completeness-strict key
+        // listing (value-tolerant) and describes only the rare colliding keys.
+        let remote_keys = list_config_store_keys(&resolved_id)?;
+        reject_generated_key_collisions(&physical_entries, &remote_keys, |chunk_key| {
+            fetch_remote_config_store_entry(&resolved_id, chunk_key).map(Some)
+        })?;
         push_entries_with_committer(&physical_entries, |key, value| {
             create_config_store_entry(&resolved_id, key, value)
         })?;
@@ -956,6 +963,10 @@ impl ManifestLock {
         // Blocks until any other writer holding the lock releases it.
         file.lock()
             .map_err(|err| format!("failed to lock {}: {err}", lock_path.display()))?;
+        // Re-check AFTER the (possibly long) lock wait: a hard link created while
+        // we blocked would not have been visible to the pre-lock check above. The
+        // replacement path re-checks once more immediately before the rename.
+        reject_hard_linked_manifest(&target)?;
         Ok(Self {
             _file: file,
             target,
@@ -1552,47 +1563,129 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
 /// values). Idempotent — re-running just rewrites `contents`. Other
 /// blocks in `fastly.toml` (setup, scripts, the actual `[local_server]`
 /// secret stores, etc.) are preserved via `toml_edit`.
-/// Force `format = "inline-toml"` on a local config-store entry: the inline
-/// `contents` this writer emits REQUIRE it. A pre-existing `format = "json"` /
-/// `"file"` (pointing at an external file) would otherwise SURVIVE next to the
-/// inline contents, leaving Viceroy with a contradictory store the command still
-/// reports as written. Returns a warning when it REPLACED an incompatible value.
+/// Refuse before writing if any GENERATED chunk key would clobber an existing
+/// value that is itself ROOT-LIKE (announces our `edgezero_kind`, is a newer
+/// format, or classifies as a valid root) or that has a NESTED generation beneath
+/// it. Chunk keys are content-addressed, so such a collision is pathological, but
+/// overwriting one would destroy live or foreign config -- so fail closed.
+///
+/// Logical ROOT keys are excluded here; overwriting a root is governed by the
+/// downgrade/future guards. `sibling_keys` is the complete set of existing store
+/// keys (for the nested-generation check); `existing_value_at` fetches the value
+/// at a colliding key (only called for keys already present).
+fn reject_generated_key_collisions(
+    entries: &[(String, String)],
+    sibling_keys: &HashSet<String>,
+    mut existing_value_at: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    for (key, _) in entries {
+        if !key.contains(CHUNK_KEY_INFIX) {
+            continue; // a logical root; the root-overwrite guards cover it
+        }
+        let has_nested_generation = sibling_keys
+            .iter()
+            .any(|other| other != key && chunk_key_generation(key, other).is_some());
+        let clobbers_root_like = sibling_keys.contains(key)
+            && existing_value_at(key)?.is_some_and(|value| {
+                value_announces_our_kind(&value)
+                    || value_is_future_format(&value)
+                    || gc_classify_root(key, &value).is_ok()
+            });
+        if has_nested_generation || clobbers_root_like {
+            return Err(format!(
+                "refusing to push: the generated chunk key `{key}` already holds a value that is \
+                 itself a root (or has a nested generation beneath it); overwriting it could \
+                 destroy live or foreign config. Nothing was changed."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`reject_generated_key_collisions`] against a local `contents` table.
+fn reject_local_generated_key_collisions(
+    contents_tbl: &toml_edit::Table,
+    entries: &[(String, String)],
+) -> Result<(), String> {
+    let sibling_keys: HashSet<String> = contents_tbl
+        .iter()
+        .map(|(existing_key, _)| existing_key.to_owned())
+        .collect();
+    reject_generated_key_collisions(entries, &sibling_keys, |chunk_key| {
+        Ok(contents_tbl
+            .get(chunk_key)
+            .and_then(toml_edit::Item::as_str)
+            .map(str::to_owned))
+    })
+}
+
+/// Ensure a local config-store entry is `format = "inline-toml"` -- the only
+/// format compatible with the inline `contents` this writer emits.
+///
+/// REFUSES an existing non-inline store rather than converting it. A
+/// `format = "json"` / `"file"` store points at an EXTERNAL file that this writer
+/// cannot safely rewrite: leaving `file` in place produces a manifest Viceroy
+/// rejects ("unrecognized key 'file'"), and removing it would silently discard
+/// the sibling entries that file holds (this writer only inserts the pushed
+/// root). Migration is the operator's explicit choice, not a silent side effect.
 fn ensure_inline_toml_format(
     store_tbl: &mut toml_edit::Table,
     platform_name: &str,
-) -> Option<String> {
-    let existing = store_tbl
-        .get("format")
-        .and_then(toml_edit::Item::as_str)
-        .map(str::to_owned);
-    if existing.as_deref() == Some("inline-toml") {
-        return None;
+) -> Result<(), String> {
+    let existing = store_tbl.get("format").and_then(toml_edit::Item::as_str);
+    match existing {
+        Some("inline-toml") => Ok(()),
+        Some(other) => Err(format!(
+            "refusing to push: `local_server.config_stores.{platform_name}` uses `format = \
+             \"{other}\"` (an external-file store), which is incompatible with the inline \
+             `contents` this command writes. Converting it here would either produce a manifest \
+             the local server rejects or silently discard the sibling entries the external file \
+             holds. Migrate the store to `format = \"inline-toml\"` (or a fresh store id) yourself, \
+             then re-run. Nothing was changed."
+        )),
+        None => {
+            // A brand-new or format-less entry: this writer owns it, so stamp the
+            // inline format it is about to fill.
+            store_tbl.insert("format", toml_edit::value("inline-toml"));
+            Ok(())
+        }
     }
-    let warning = existing.filter(|fmt| fmt != "inline-toml").map(|prev| {
-        format!(
-            "warning: `local_server.config_stores.{platform_name}` declared `format = \"{prev}\"`, \
-             which is incompatible with the inline `contents` written here; it was changed to \
-             `format = \"inline-toml\"`"
-        )
-    });
-    store_tbl.insert("format", toml_edit::value("inline-toml"));
-    warning
 }
 
 /// TOCTOU guard for the LOCAL writer: refuse to overwrite a root that now holds a
 /// NEWER format, classified HERE under the write lock. The generic push's
 /// pre-push future-format check ran BEFORE the lock, so a newer writer could have
 /// installed a v2 value in between; without this the old writer would clobber it.
+///
+/// The raw value alone does not reveal a future INNER envelope hidden behind a
+/// valid v1 pointer -- that is only knowable after reconstruction. So each root
+/// that is one of our pointers is RESOLVED against the locked `contents` table
+/// (its chunks live there too); a typed `FutureFormat` from the resolver is
+/// refused just like a raw future value.
 fn reject_future_local_roots(
     contents_tbl: &toml_edit::Table,
     gc_roots: &[(String, HashSet<String>)],
 ) -> Result<(), String> {
     for (root_key, _) in gc_roots {
-        if contents_tbl
-            .get(root_key)
-            .and_then(toml_edit::Item::as_str)
-            .is_some_and(value_is_future_format)
-        {
+        let Some(existing) = contents_tbl.get(root_key).and_then(toml_edit::Item::as_str) else {
+            continue;
+        };
+        // Raw check: a direct future envelope, a future pointer version, or an
+        // unknown `edgezero_kind`.
+        let mut is_future = value_is_future_format(existing);
+        if !is_future {
+            // Resolve against the locked contents to catch a future INNER envelope
+            // behind a valid v1 pointer. Only `FutureFormat` blocks the write; a
+            // corrupt/incomplete v1 prior stays overwritable.
+            let resolved = resolve_fastly_config_value_typed(root_key, existing.to_owned(), |ck| {
+                Ok(contents_tbl
+                    .get(ck)
+                    .and_then(toml_edit::Item::as_str)
+                    .map(str::to_owned))
+            });
+            is_future = matches!(resolved, Err(err) if err.is_future_format());
+        }
+        if is_future {
             return Err(format!(
                 "refusing to overwrite `{root_key}`: the local store now holds a value in a newer \
                  format this CLI does not recognise (installed since the pre-push check). Upgrade \
@@ -1676,7 +1769,7 @@ fn write_fastly_local_config_store(
             path.display()
         )
     })?;
-    let format_change_warning = ensure_inline_toml_format(store_tbl, platform_name);
+    ensure_inline_toml_format(store_tbl, platform_name)?;
     let contents_entry = store_tbl
         .entry("contents")
         .or_insert_with(|| Item::Table(Table::new()));
@@ -1687,6 +1780,7 @@ fn write_fastly_local_config_store(
         )
     })?;
     reject_future_local_roots(contents_tbl, gc_roots)?;
+    reject_local_generated_key_collisions(contents_tbl, entries)?;
     // Snapshot prior chunk keys per GC root BEFORE the upsert, using the
     // exact keep-set the caller computed for each root (no prefix scan).
     let mut plans: Vec<FastlyConfigGcPlan> = Vec::with_capacity(gc_roots.len());
@@ -1709,7 +1803,6 @@ fn write_fastly_local_config_store(
     // Prune orphans in the same in-memory rewrite; a suspicious prior
     // pointer (Err) warns and deletes nothing.
     let mut warnings = Vec::new();
-    warnings.extend(format_change_warning);
     for plan in &plans {
         match orphan_chunk_keys(plan) {
             Ok(orphans) => {
@@ -1859,6 +1952,12 @@ fn atomically_replace_file(
         .sync_all()
         .map_err(|err| format!("failed to flush the staging temp file to disk: {err}"))?;
     drop(tmp_file);
+
+    // Re-check the hard-link count IMMEDIATELY before the rename. The lock-acquire
+    // check ran before this write blocked on the lock, and a hard link created
+    // during that wait (or since) would survive the byte comparison above only for
+    // the rename to break the alias. This is the last moment we can fail closed.
+    reject_hard_linked_manifest(target)?;
 
     fs::rename(&tmp_path, target)
         .map_err(|err| format!("failed to replace {}: {err}", target.display()))?;
@@ -2185,10 +2284,22 @@ fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, Str
     Ok(items)
 }
 
-/// RFC 3339 (`2026-07-13T03:27:42Z`) -> unix seconds.
+/// RFC 3339 (`2026-07-13T03:27:42Z`) -> unix seconds, rounded UP on any fraction.
+///
+/// `timestamp()` FLOORS the sub-second part, and the current time the age gate
+/// compares against is also floored. A creation floored DOWN makes a key look
+/// OLDER: a true age of 59.002s (created `...:42.998Z`) would compute as 60s and
+/// pass a 60s `--older-than` almost a full second early. Rounding creation UP
+/// keeps the computed age conservative -- a key never ages into deletion early.
 fn parse_rfc3339_secs(raw: &str) -> Option<u64> {
     let stamp = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
-    u64::try_from(stamp.timestamp()).ok()
+    let secs = stamp.timestamp();
+    let rounded_up = if stamp.timestamp_subsec_nanos() > 0 {
+        secs.checked_add(1)?
+    } else {
+        secs
+    };
+    u64::try_from(rounded_up).ok()
 }
 
 /// `config gc` for Fastly: delete chunk entries that no LIVE root pointer
@@ -3105,32 +3216,40 @@ fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
             shape_summary(&parsed)
         ));
     };
-    let mut any_well_formed = false;
-    for entry in array {
-        let entry_name = entry.get("name").and_then(serde_json::Value::as_str);
-        let entry_id = entry.get("id").and_then(serde_json::Value::as_str);
-        if entry_name.is_some() && entry_id.is_some() {
-            any_well_formed = true;
+    // FAIL CLOSED on any malformed or duplicate row: a `NotFound` here becomes a
+    // MissingStore that AUTHORISES an overwrite, so a listing we cannot read
+    // exactly must never look like a definite absence. A malformed row could BE
+    // the requested store (its unreadable `name` might have matched), and a
+    // duplicate name means we are not reading the store we think we are. Every row
+    // must carry a non-empty string `name` and `id`, and names must be unique.
+    let mut seen_names = HashSet::with_capacity(array.len());
+    let mut found: Option<String> = None;
+    for (idx, entry) in array.iter().enumerate() {
+        let name_field = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let id_field = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let (Some(entry_name), Some(entry_id)) = (name_field, id_field) else {
+            return ConfigStoreLookup::SchemaDrift(format!(
+                "store-list entry #{idx} is missing a non-empty string `name` or `id`; refusing to \
+                 treat a store as absent on a listing this build cannot read exactly"
+            ));
+        };
+        if !seen_names.insert(entry_name.to_owned()) {
+            return ConfigStoreLookup::SchemaDrift(format!(
+                "store-list has a duplicate `name` (`{entry_name}`); refusing to resolve a store id \
+                 on an ambiguous listing"
+            ));
         }
-        if entry_name == Some(name) {
-            return entry_id.map_or_else(
-                || {
-                    ConfigStoreLookup::SchemaDrift(format!(
-                        "entry matched name `{name}` but is missing a string `id` field"
-                    ))
-                },
-                |id| ConfigStoreLookup::Found(id.to_owned()),
-            );
+        if entry_name == name {
+            found = Some(entry_id.to_owned());
         }
     }
-    if array.is_empty() || any_well_formed {
-        ConfigStoreLookup::NotFound
-    } else {
-        ConfigStoreLookup::SchemaDrift(
-            "no entry has both string `name` and `id` fields -- fastly CLI may have changed its output schema"
-                .to_owned(),
-        )
-    }
+    found.map_or(ConfigStoreLookup::NotFound, ConfigStoreLookup::Found)
 }
 
 /// Summarise a `fastly ... describe` response for diagnostics WITHOUT
@@ -3891,43 +4010,32 @@ mod tests {
         assert!(after.contains("name = \"demo\""), "preserved: {after}");
     }
 
-    /// An existing `format = "json"` / `"file"` is INCOMPATIBLE with the inline
-    /// `contents` this writer emits. It must be overwritten to `inline-toml` (with
-    /// a warning), not left to survive and produce a contradictory store the
-    /// command still reports as written.
+    /// An existing `format = "json"` / `"file"` store points at an EXTERNAL file.
+    /// Converting it here would either produce a manifest the local server rejects
+    /// (a stray `file` key) or silently discard the sibling entries that file
+    /// holds. The push must REFUSE and leave the manifest untouched, not convert.
     #[test]
-    fn write_fastly_local_config_store_replaces_incompatible_format() {
+    fn write_fastly_local_config_store_refuses_incompatible_format() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
-            format!(
-                "name = \"demo\"\n\n[local_server.config_stores.{TEST_CONFIG_ID}]\nformat = \"json\"\nfile = \"cfg.json\"\n",
-            ),
-        )
-        .expect("write");
-        let warnings = write_fastly_local_config_store(
+        let before = format!(
+            "name = \"demo\"\n\n[local_server.config_stores.{TEST_CONFIG_ID}]\nformat = \"json\"\nfile = \"cfg.json\"\n",
+        );
+        fs::write(&path, &before).expect("write");
+        let err = write_fastly_local_config_store(
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hello".to_owned())],
             &[],
         )
-        .expect("write");
+        .expect_err("a non-inline store must be refused, not converted");
+        assert!(
+            err.contains("refusing to push") && err.contains("inline-toml"),
+            "must refuse and point at migration: {err}"
+        );
+        // The manifest is left exactly as it was.
         let after = fs::read_to_string(&path).expect("read back");
-        assert!(
-            after.contains("format = \"inline-toml\""),
-            "incompatible format must be replaced: {after}"
-        );
-        assert!(
-            !after.contains("format = \"json\""),
-            "the old incompatible format must not survive: {after}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("incompatible") && w.contains("inline-toml")),
-            "must warn that an incompatible format was replaced: {warnings:?}"
-        );
+        assert_eq!(after, before, "the manifest must be untouched on refusal");
     }
 
     #[test]
@@ -4273,6 +4381,37 @@ build = \"cargo build --release\"
     }
 
     #[test]
+    fn find_config_store_id_fails_closed_on_a_malformed_row() {
+        // A row that lacks a non-empty `name`/`id` could BE the requested store
+        // (its unreadable name might have matched). Treating the listing as a
+        // definite NotFound would authorise an overwrite of a store that exists,
+        // so a malformed row must be SchemaDrift (a hard error), not NotFound --
+        // even when another row is well-formed.
+        let stdout = format!(
+            r#"[{{"name": "", "id": "abc"}}, {{"name": "{TEST_CONFIG_ID}", "id": "store-1"}}]"#
+        );
+        let drift = find_config_store_id(&stdout, "some-other-store");
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "an empty-name row must fail closed, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_rejects_duplicate_names() {
+        // A duplicate name means we are not reading one consistent view of the
+        // store, so resolving an id off it is ambiguous -> fail closed.
+        let stdout = format!(
+            r#"[{{"name": "{TEST_CONFIG_ID}", "id": "a"}}, {{"name": "{TEST_CONFIG_ID}", "id": "b"}}]"#
+        );
+        let drift = find_config_store_id(&stdout, TEST_CONFIG_ID);
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "a duplicate name must fail closed, got {drift:?}"
+        );
+    }
+
+    #[test]
     fn find_config_store_id_returns_not_found_for_empty_array() {
         // Empty array IS a valid "store doesn't exist yet" signal,
         // not schema drift — fastly CLI legitimately returns `[]`
@@ -4282,6 +4421,25 @@ build = \"cargo build --release\"
             matches!(drift, ConfigStoreLookup::NotFound),
             "empty array must be NotFound, got {drift:?}"
         );
+    }
+
+    #[test]
+    fn parse_rfc3339_secs_rounds_a_fraction_up() {
+        let whole = parse_rfc3339_secs("2026-01-01T00:00:42Z").expect("whole");
+        // A fractional second rounds UP to the next whole second, so the computed
+        // age stays conservative and a key never ages into deletion early.
+        assert_eq!(
+            parse_rfc3339_secs("2026-01-01T00:00:42.998Z"),
+            Some(whole + 1),
+            "a fractional creation time must round UP, not floor"
+        );
+        // Even a tiny fraction rounds up.
+        assert_eq!(
+            parse_rfc3339_secs("2026-01-01T00:00:42.000001Z"),
+            Some(whole + 1)
+        );
+        // A whole-second stamp is unchanged.
+        assert_eq!(parse_rfc3339_secs("2026-01-01T00:00:42.000Z"), Some(whole));
     }
 
     // ---------- push_config_entries (dry-run + error paths) ----------
@@ -4618,7 +4776,7 @@ build = \"cargo build --release\"
         fs::write(&list_file, list_json).expect("write list payload");
         fs::write(&entry_file, &entry_json).expect("write entry payload");
         let script = format!(
-            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\nif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[]'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
             out_path.display(),
             list_file.display(),
             entry_file.display(),
@@ -8320,6 +8478,88 @@ echo 'unexpected' >&2; exit 1
         assert!(
             after.contains("\\\"version\\\":2"),
             "the newer-format value must be left intact: {after}"
+        );
+    }
+
+    /// The locked downgrade guard must catch a future INNER envelope hidden behind
+    /// a VALID v1 pointer -- only knowable after reconstruction against the locked
+    /// contents. The raw pointer looks like healthy v1.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_refuses_a_future_inner_prior() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        // A large v1 envelope, chunked, with its inner version bumped to 2. Seed
+        // the pointer + chunks as the prior local state.
+        let v1 = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let mut v2_value: serde_json::Value = serde_json::from_str(&v1).expect("parse");
+        v2_value["version"] = serde_json::json!(2_u32);
+        let v2 = v2_value.to_string();
+        let seed_entries = prepare_fastly_config_entries(TEST_CONFIG_ID, &v2).expect("chunk");
+        write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &seed_entries, &[])
+            .expect("seed the prior v2-inner generation");
+
+        let direct = make_test_envelope(100);
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("a future INNER prior must abort the push under the lock");
+        assert!(
+            err.contains("newer format") && err.to_lowercase().contains("refusing"),
+            "must refuse to clobber a future inner envelope: {err}"
+        );
+    }
+
+    /// A generated chunk key must never clobber an existing root-like sibling.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_refuses_clobbering_a_root_like_chunk_sibling() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        // The chunk keys the push will generate for this body.
+        let body = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let generated = prepare_fastly_config_entries(TEST_CONFIG_ID, &body).expect("chunk");
+        let chunk_key = generated
+            .iter()
+            .map(|(key, _)| key.clone())
+            .find(|key| key.contains(CHUNK_KEY_INFIX))
+            .expect("a generated chunk key");
+
+        // Pre-seed that EXACT key with a root-like value (a valid direct envelope).
+        let root_like = make_test_envelope(100);
+        write_fastly_local_config_store(
+            &fastly_toml,
+            TEST_CONFIG_ID,
+            &[(chunk_key.clone(), root_like)],
+            &[],
+        )
+        .expect("seed a root-like value at a chunk-shaped key");
+
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), body)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("a generated chunk key clobbering a root-like sibling must abort");
+        assert!(
+            err.contains("refusing to push") && err.contains(&chunk_key),
+            "must refuse and name the colliding chunk key: {err}"
         );
     }
 

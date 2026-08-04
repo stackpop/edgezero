@@ -52,6 +52,16 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # The all-features build unifies the fastly adapter's `cli` and `fastly`
+      # features, which can MASK a dead-code or cfg mistake that only surfaces in
+      # one supported mode. Gate the two the matrix above does not: `cli` alone
+      # (native CLI host code) and no features at all (the declared default).
+      - name: Run cargo clippy (fastly adapter, cli feature only)
+        run: cargo clippy -p edgezero-adapter-fastly --features cli --all-targets -- -D warnings
+
+      - name: Run cargo clippy (fastly adapter, no default features)
+        run: cargo clippy -p edgezero-adapter-fastly --no-default-features --lib -- -D warnings
+
       # Plan task 8.3 corollary: `examples/app-demo` is excluded
       # from the root workspace, so the fmt/clippy steps above
       # don't cover it. Run the same gates against it explicitly

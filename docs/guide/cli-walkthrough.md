@@ -17,6 +17,8 @@ myapp-cli auth        # sign in / out / status against the platform CLI
 myapp-cli provision   # create the platform resources backing your stores
 myapp-cli config validate  # typed validate of edgezero.toml + myapp.toml
 myapp-cli config push      # typed push of myapp.toml to the platform config store
+myapp-cli config diff      # preview the push: local vs the remote config store
+myapp-cli config gc        # reclaim orphaned chunk entries (Fastly oversized configs)
 ```
 
 The default `edgezero` binary exposes the same commands but has no typed app-config

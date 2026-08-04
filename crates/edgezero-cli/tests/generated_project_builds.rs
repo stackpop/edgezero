@@ -17,7 +17,7 @@
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::process::Command;
+    use std::process::{Command, ExitStatus};
 
     /// Targets installed for the toolchain that builds `project`. A wasm
     /// check is skipped when its target is absent (e.g. a local run where
@@ -30,6 +30,16 @@ mod tests {
             .output()
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
             .unwrap_or_default()
+    }
+
+    /// Run the generated `scaffold-probe-cli` with `args` in `project`.
+    fn run_scaffold_probe(project: &Path, args: &[&str]) -> ExitStatus {
+        Command::new(env!("CARGO"))
+            .args(["run", "-p", "scaffold-probe-cli", "--quiet", "--"])
+            .args(args)
+            .current_dir(project)
+            .status()
+            .unwrap_or_else(|err| panic!("run generated CLI with {args:?}: {err}"))
     }
 
     #[test]
@@ -106,23 +116,16 @@ mod tests {
         // step, template drift that compiles but produces an invalid
         // typed config (e.g. `#[secret]` on a non-scalar field) would
         // slip through.
-        let typed_validate = Command::new(env!("CARGO"))
-            .args([
-                "run",
-                "-p",
-                "scaffold-probe-cli",
-                "--quiet",
-                "--",
-                "config",
-                "validate",
-                "--strict",
-            ])
-            .current_dir(&project)
-            .status()
-            .expect("run the generated typed CLI `config validate --strict`");
         assert!(
-            typed_validate.success(),
+            run_scaffold_probe(&project, &["config", "validate", "--strict"]).success(),
             "generated typed CLI should pass `config validate --strict`",
+        );
+        // Exercise the `config gc` subcommand PARSER (clap arg definitions), not
+        // just its compilation: template drift that broke the gc args would compile
+        // but fail to parse. `config diff` is covered by the push/diff flow.
+        assert!(
+            run_scaffold_probe(&project, &["config", "gc", "--help"]).success(),
+            "generated typed CLI should parse `config gc --help`",
         );
 
         // Per-adapter wasm targets: where target-gated template code lives

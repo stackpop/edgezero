@@ -834,10 +834,18 @@ fn future_format_reason(raw: &str) -> Option<String> {
     if obj.contains_key("edgezero_kind") {
         return Some("an unrecognised `edgezero_kind` discriminator".to_owned());
     }
-    obj.get("version")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|version| *version != u64::from(ENVELOPE_VERSION_V1))
-        .map(|version| format!("envelope version {version}"))
+    // A `version` PRESENT but not EXACTLY integer 1 is a newer format. `as_u64()`
+    // alone fails open on `"2"`, `-1`, `2.5`, or `1.0`. A non-integer version is
+    // value-controlled, so it is NOT echoed -- only a plain integer is named.
+    match obj.get("version") {
+        Some(version) if version.as_u64() != Some(u64::from(ENVELOPE_VERSION_V1)) => {
+            Some(match version.as_u64() {
+                Some(number) => format!("envelope version {number}"),
+                None => "an unrecognised envelope version".to_owned(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Shared body: fetch + envelope + sha + secret walk + deserialise + validate.

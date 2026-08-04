@@ -960,9 +960,10 @@ fn body_is_future_envelope(body: &str) -> bool {
     if obj.contains_key("edgezero_kind") {
         return true;
     }
+    // A `version` PRESENT but not EXACTLY integer 1 is a newer format. `as_u64()`
+    // alone fails open on `"2"`, `-1`, `2.5`, or `1.0`.
     obj.get("version")
-        .and_then(serde_json::Value::as_u64)
-        .is_some_and(|version| version != u64::from(ENVELOPE_VERSION_V1))
+        .is_some_and(|version| version.as_u64() != Some(u64::from(ENVELOPE_VERSION_V1)))
 }
 
 /// Render the first-read diff and return the outcome.
