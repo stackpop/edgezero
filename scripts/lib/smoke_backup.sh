@@ -53,45 +53,83 @@ backup_in_tree() {
 
 # Restore every recorded backup in REVERSE order (a nested path restores
 # after its parent). Uses the recorded existed-flag -- NOT the backup's
-# size -- so a pre-existing EMPTY file/dir is preserved, not deleted. A
-# backup that fails to apply is KEPT (and warned about) rather than
-# discarded, so the original stays recoverable.
+# size -- so a pre-existing EMPTY file/dir is preserved, not deleted.
+#
+# Fail-closed: the restore is STAGED into a sibling temp path and only then
+# ATOMICALLY swapped into place, so a copy failure NEVER leaves the live
+# path deleted. On any failure the live state is left intact (or rolled
+# back) and a non-zero status is returned so the caller can surface it --
+# the earlier version deleted the directory first and returned success even
+# when the copy failed.
 restore_backups() {
-  local i entry orig existed back
+  local i entry orig existed back rc=0
   for (( i=${#BACKUPS[@]}-1; i>=0; i-- )); do
     entry="${BACKUPS[$i]}"
     [ -z "$entry" ] && continue
     orig="${entry%%::*}"
     back="${entry##*::}"
     existed="${entry#*::}"; existed="${existed%%::*}"
-    if [ "$existed" = "1" ]; then
-      if [ -d "$back" ]; then
-        # Clear whatever the smoke left (to drop files it ADDED) then
-        # restore the captured tree.
-        rm -rf "$orig" 2>/dev/null || true
-        mkdir -p "$orig"
-        if cp -a "$back/." "$orig/"; then
-          rm -rf "$back"
-        else
-          printf '  WARN  restore_backups: failed to restore directory %s from %s; backup kept for manual recovery\n' "$orig" "$back" >&2
-        fi
-      else
-        # File (possibly empty). `cp -pf` overwrites whatever the smoke
-        # left; the backup is discarded ONLY on success.
-        if cp -pf "$back" "$orig"; then
-          rm -f "$back"
-        else
-          printf '  WARN  restore_backups: failed to restore %s from %s; backup kept for manual recovery\n' "$orig" "$back" >&2
-        fi
-      fi
-    else
+    if [ "$existed" != "1" ]; then
       # Original was ABSENT: remove whatever the smoke created, discard
       # any placeholder backup.
       rm -rf "$orig" 2>/dev/null || true
       if [ -n "$back" ]; then
         rm -rf "$back" 2>/dev/null || true
       fi
+      continue
+    fi
+
+    # Stage the restore in a SIBLING temp (same filesystem, so the final
+    # swap is an atomic rename), proving the copy succeeds BEFORE the live
+    # path is touched.
+    local staged
+    if [ -d "$back" ]; then
+      staged=$(mktemp -d "${orig}.restore.XXXXXX" 2>/dev/null) || {
+        printf '  FAIL  restore_backups: mktemp -d failed staging %s\n' "$orig" >&2
+        rc=1
+        continue
+      }
+      if ! cp -a "$back/." "$staged/"; then
+        rm -rf "$staged" 2>/dev/null || true
+        printf '  FAIL  restore_backups: could not stage restore of %s; live state left intact\n' "$orig" >&2
+        rc=1
+        continue
+      fi
+    else
+      staged=$(mktemp "${orig}.restore.XXXXXX" 2>/dev/null) || {
+        printf '  FAIL  restore_backups: mktemp failed staging %s\n' "$orig" >&2
+        rc=1
+        continue
+      }
+      if ! cp -pf "$back" "$staged"; then
+        rm -f "$staged" 2>/dev/null || true
+        printf '  FAIL  restore_backups: could not stage restore of %s; live state left intact\n' "$orig" >&2
+        rc=1
+        continue
+      fi
+    fi
+
+    # Atomic swap: move the live path aside, move the staged restore in,
+    # drop the aside copy. Roll back on failure so the original survives.
+    local aside="${orig}.prev.$$"
+    if { [ -e "$orig" ] || [ -L "$orig" ]; } && ! mv "$orig" "$aside" 2>/dev/null; then
+      rm -rf "$staged" 2>/dev/null || true
+      printf '  FAIL  restore_backups: could not move current %s aside; live state left intact\n' "$orig" >&2
+      rc=1
+      continue
+    fi
+    if mv "$staged" "$orig" 2>/dev/null; then
+      rm -rf "$aside" "$back" 2>/dev/null || true
+    else
+      # Swap failed: roll the live path back from the aside copy.
+      if [ -e "$aside" ] || [ -L "$aside" ]; then
+        mv "$aside" "$orig" 2>/dev/null || true
+      fi
+      rm -rf "$staged" 2>/dev/null || true
+      printf '  FAIL  restore_backups: could not swap restored %s into place; original left intact\n' "$orig" >&2
+      rc=1
     fi
   done
   BACKUPS=()
+  return "$rc"
 }

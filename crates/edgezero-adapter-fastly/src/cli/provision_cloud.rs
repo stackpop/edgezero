@@ -88,10 +88,20 @@ pub(super) fn provision(
             // the real invocation skips the store, and dry-run must
             // report "would skip", not "would create".
             if setup_block_present(&fastly_path, kind, name)? {
-                out.push(format!(
+                let mut line = format!(
                     "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] block AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
                     fastly_path.display()
-                ));
+                );
+                // Convergence: if the service is already deployed, `[setup]`
+                // is never re-run, so a store declared-but-not-linked stays
+                // unlinked. Re-emit the resource-link remediation on EVERY
+                // skip run so an operator who missed the first message can
+                // still recover -- provision is otherwise a dead end here.
+                if let Some(note) = resource_link_note(service_id.as_deref(), kind, name) {
+                    line.push('\n');
+                    line.push_str(&note);
+                }
+                out.push(line);
                 continue;
             }
             if dry_run {
@@ -920,6 +930,39 @@ mod tests {
         assert!(
             err.contains("fastly.toml"),
             "error names what's missing: {err}"
+        );
+    }
+
+    #[test]
+    fn provision_skip_path_emits_resource_link_note_on_existing_service() {
+        // A store already declared in `[setup]` on an already-deployed
+        // service (service_id present) is SKIPPED -- but `[setup]` is never
+        // re-run, so the store stays unlinked. The skip line must re-emit
+        // the resource-link remediation so an operator who missed the first
+        // run can still recover.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "name = \"demo\"\nservice_id = \"SVC1\"\n\n[setup.kv_stores.sessions]\n",
+        )
+        .expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let outcome = provision(dir.path(), Some("fastly.toml"), &stores, None, true)
+            .expect("dry-run provision succeeds");
+        let joined = outcome.status_lines.join("\n");
+        assert!(
+            joined.contains("skipping"),
+            "the store must be skipped: {joined}"
+        );
+        assert!(
+            joined.contains("resource-link create") && joined.contains("SVC1"),
+            "the skip path must re-emit the resource-link remediation: {joined}"
         );
     }
 

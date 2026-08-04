@@ -60,9 +60,9 @@ check "dir-file-reverted" "$(cat "$work/d/a")" "a"
 check "dir-deleted-restored" "$(cat "$work/d/sub/b")" "b"
 check "dir-added-dropped" "$([ -e "$work/d/added" ] && echo yes || echo no)" "no"
 
-# 5. FAIL-CLOSED: a failing `cp` must abort (exit 1) and leave the original
-#    UNTOUCHED -- never record an empty/partial backup that restore could
-#    later write back over the file.
+# 5. FAIL-CLOSED backup: a failing `cp` must abort (exit 1) and leave the
+#    original UNTOUCHED -- never record an empty/partial backup that restore
+#    could later write back over the file.
 printf 'precious\n' > "$work/g"
 (
   # Shadow `cp` so the capture fails; the subshell isolates the exit 1.
@@ -73,6 +73,23 @@ printf 'precious\n' > "$work/g"
 rc=$?
 check "fail-closed-exit-nonzero" "$rc" "1"
 check "fail-closed-original-intact" "$(cat "$work/g")" "precious"
+
+# 6. FAIL-CLOSED restore: a failing restore copy must NOT delete the live
+#    directory and must RETURN NON-ZERO (the earlier version deleted first
+#    and returned success).
+mkdir -p "$work/live/sub"
+printf 'live-a\n' > "$work/live/a"
+BACKUPS=(); backup_in_tree "$work/live"
+printf 'mutated\n' > "$work/live/a"
+restore_rc=0
+(
+  # Shadow `cp` so the restore staging fails.
+  cp() { return 1; }
+  restore_backups
+) 2>/dev/null || restore_rc=$?
+check "restore-failure-returns-nonzero" "$restore_rc" "1"
+check "restore-failure-keeps-live-dir" "$([ -d "$work/live" ] && echo yes || echo no)" "yes"
+check "restore-failure-live-content-intact" "$([ -f "$work/live/a" ] && echo yes || echo no)" "yes"
 
 rm -rf "$work"
 

@@ -62,14 +62,52 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
 
     let workspace_root = find_workspace_root(&crate_dir);
     let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name, extra_args, ctx)?;
+    let underscored = format!("{}.wasm", crate_name.replace('-', "_"));
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
         .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
-    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
+    let dest = pkg_dir.join(&underscored);
     fs::copy(&artifact, &dest)
         .map_err(|err| format!("failed to copy artifact to {}: {err}", dest.display()))?;
 
+    // Also refresh the CONVENTIONAL workspace target path that the
+    // synthesised `spin.toml` `source` references. `spin up` / `spin
+    // deploy` read `source`, so a build redirected to a custom target dir
+    // would otherwise leave a STALE module there.
+    refresh_conventional_source(&workspace_root, &underscored, &artifact)?;
+
     Ok(dest)
+}
+
+/// Copy the freshly-located `artifact` to the CONVENTIONAL workspace target
+/// path the synthesised `spin.toml` `source` references
+/// (`<workspace>/target/<triple>/release/<crate>.wasm`), so `spin up` /
+/// `spin deploy` never read a stale module after a custom-target build. A
+/// no-op when the artifact is already at that path (the default case).
+fn refresh_conventional_source(
+    workspace_root: &Path,
+    underscored_wasm: &str,
+    artifact: &Path,
+) -> Result<(), String> {
+    let source_path = workspace_root
+        .join("target")
+        .join(TARGET_TRIPLE)
+        .join("release")
+        .join(underscored_wasm);
+    if artifact == source_path {
+        return Ok(());
+    }
+    if let Some(parent) = source_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    fs::copy(artifact, &source_path).map_err(|err| {
+        format!(
+            "failed to refresh spin.toml source path {}: {err}",
+            source_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// # Errors
@@ -471,6 +509,48 @@ mod tests {
         let ctx = AdapterExecContext::new().with_env(&env);
         let located = locate_artifact(workspace, &manifest_dir, "demo", &[], &ctx).unwrap();
         assert_eq!(located, artifact);
+    }
+
+    #[test]
+    fn refresh_conventional_source_copies_custom_artifact_to_source_path() {
+        // A custom-target build leaves the fresh artifact outside the
+        // conventional target/ that spin.toml `source` reads. The refresh
+        // must copy it there so serve/deploy don't use a stale module.
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        // Stale conventional artifact.
+        let source = workspace
+            .join("target")
+            .join(TARGET_TRIPLE)
+            .join("release/demo.wasm");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "stale").unwrap();
+        // Fresh custom-target artifact.
+        let fresh = workspace.join("custom/release/demo.wasm");
+        fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        fs::write(&fresh, "fresh").unwrap();
+
+        refresh_conventional_source(workspace, "demo.wasm", &fresh).unwrap();
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "fresh",
+            "the conventional source path must be refreshed with the fresh artifact"
+        );
+    }
+
+    #[test]
+    fn refresh_conventional_source_is_a_noop_when_already_at_source() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let source = workspace
+            .join("target")
+            .join(TARGET_TRIPLE)
+            .join("release/demo.wasm");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fresh").unwrap();
+        // Passing the source path itself must not error (no self-copy).
+        refresh_conventional_source(workspace, "demo.wasm", &source).unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fresh");
     }
 
     #[test]

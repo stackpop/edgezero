@@ -506,12 +506,12 @@ already rejected `..`, normalisation is purely
    regressions where an adapter write follows a symlink
    back into the project tree.
 
-   The bootstrap synthesiser does NOT re-render the
-   per-adapter manifest from `.hbs` templates -- those
-   carry generator-only placeholders (`{{proj_spin}}`,
-   `{{target_dir_spin}}`, `{{proj_spin_underscored}}`)
-   that aren't reconstructible from `edgezero.toml` alone.
-   Instead the bootstrap builds the manifest from
+   There is NO `.hbs` template for any adapter manifest --
+   they were all removed, and `edgezero new` runs this SAME
+   synthesiser at scaffold time (the `.hbs` templates that
+   remain cover only non-manifest scaffold files like
+   `Cargo.toml` / `src/…` / `.cargo/config.toml`). The
+   bootstrap builds the manifest from
    primitives via `toml_edit::DocumentMut`, writing only
    the structural keys the adapter's `provision` step is
    about to populate (e.g. for Spin: `spin_manifest_version = 2`,

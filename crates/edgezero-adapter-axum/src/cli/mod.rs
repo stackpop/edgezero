@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use ctor::ctor;
 use edgezero_adapter::cli_support;
 use edgezero_adapter::env_file::{
-    EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, reject_symlinked_target,
+    EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, reject_symlink_components,
+    reject_symlinked_target,
 };
 use edgezero_adapter::registry::{
     Adapter, AdapterAction, AdapterDeployedState, AdapterExecContext, AdapterPushContext,
@@ -466,11 +467,11 @@ impl Adapter for AxumCliAdapter {
         let path = manifest_root
             .join(".edgezero")
             .join(format!("local-config-{}.json", store.logical));
-        // Reject a symlinked final component before reading, matching the
-        // write side (`push_config_entries` / provision refuse to create
-        // these files through a symlink). Keeps one consistent final-path
-        // policy so a planted symlink can't redirect diff off the tree.
-        reject_symlinked_target(&path)?;
+        // Reject a symlink at ANY component from `manifest_root` down to the
+        // JSON file -- not just the final one -- so a symlinked `.edgezero`
+        // directory can't redirect the diff read off the tree either.
+        // Matches the write side's containment policy.
+        reject_symlink_components(manifest_root, &path)?;
         match fs::read_to_string(&path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ReadConfigEntry::MissingStore),
             Err(err) => Err(format!("failed to read {}: {err}", path.display())),
@@ -977,6 +978,34 @@ mod tests {
     }
 
     // ---------- read_config_entry / read_config_entry_local ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_local_rejects_a_symlinked_edgezero_dir() {
+        // The diff/read path must reject a symlinked INTERMEDIATE `.edgezero`
+        // dir, not just the final JSON, so a planted directory symlink can't
+        // redirect the read off the tree.
+        use std::fs::create_dir_all;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("proj");
+        create_dir_all(&root).expect("mkdir proj");
+        let outside = dir.path().join("outside");
+        create_dir_all(&outside).expect("mkdir outside");
+        symlink(&outside, root.join(".edgezero")).expect("symlink .edgezero");
+
+        let Err(err) = AxumCliAdapter.read_config_entry_local(
+            &root,
+            None,
+            None,
+            &ResolvedStoreId::from_logical("app_config"),
+            "greeting",
+            &AdapterPushContext::new(),
+        ) else {
+            panic!("a symlinked .edgezero must be refused, not read through");
+        };
+        assert!(err.contains("symlink"), "error names the symlink: {err}");
+    }
 
     #[test]
     fn read_config_entry_local_returns_missing_store_when_file_absent() {

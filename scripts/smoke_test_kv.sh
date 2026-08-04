@@ -16,14 +16,13 @@ DEMO_DIR="$ROOT_DIR/examples/app-demo"
 ADAPTER="${1:-axum}"
 SERVER_PID=""
 
-# Warm up per-adapter local state — provision --local synthesises
-# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
-# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
-# this because those adapter manifests are gitignored.
-# shellcheck source=lib/smoke_warmup.sh
-. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
-echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
-smoke_warmup_provision_local "$ADAPTER"
+# Fail-closed backup/restore of the operator files + emulator state this
+# smoke mutates. Warm-up (`provision --local`) rewrites the manifests /
+# `.env` / `.dev.vars`, and the KV pushes seed the persistent emulator
+# stores (`.edgezero` / `.wrangler` / `.spin`); without a backup a run
+# would leave a developer's tree changed.
+# shellcheck source=lib/smoke_backup.sh
+. "$ROOT_DIR/scripts/lib/smoke_backup.sh"
 
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
@@ -34,8 +33,40 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  restore_backups
 }
+
+# Back up BEFORE arming the restore trap and BEFORE warm-up: a failed
+# backup aborts here, before any mutation, so the tree is never left in a
+# half-restored state.
+case "$ADAPTER" in
+  axum)
+    backup_in_tree "$DEMO_DIR/.edgezero"
+    ;;
+  cloudflare|cf)
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
+    ;;
+  fastly)
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+    ;;
+  spin)
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/runtime-config.toml"
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
+    ;;
+esac
+# Arm the trap only AFTER a successful backup.
 trap cleanup EXIT
+
+# Warm up per-adapter local state — provision --local synthesises
+# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
+# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
+# this because those adapter manifests are gitignored.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
+smoke_warmup_provision_local "$ADAPTER"
 
 # -- Adapter-specific config ------------------------------------------------
 

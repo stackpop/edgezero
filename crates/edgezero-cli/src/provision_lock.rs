@@ -90,17 +90,6 @@ impl ProvisionLock {
             &path,
             "the provision lock path `<project>/.edgezero/provision.lock`",
         )?;
-        // Reentrancy: if an ANCESTOR process (a `deploy` holding the lock)
-        // advertised this exact path via `LOCK_ENV`, borrow it -- take no
-        // OS lock -- so a composed deploy that shells `provision` /
-        // `config push` doesn't self-deadlock on the parent's lock. Only a
-        // READ of the inherited env is needed (no unsafe mutation); the
-        // advertisement is set on the child's environment by `run_deploy`
-        // via `Command::env`.
-        let abs = absolute(&path).unwrap_or_else(|_| path.clone());
-        if env::var_os(LOCK_ENV).is_some_and(|held| Path::new(&held) == abs) {
-            return Ok(Self { file: None, path });
-        }
         fs::create_dir_all(&dot_edgezero).map_err(|err| {
             format!(
                 "failed to create {} for provision lock: {err}",
@@ -119,6 +108,34 @@ impl ProvisionLock {
                     path.display()
                 )
             })?;
+        // Reentrancy: if an ANCESTOR process (a `deploy` holding the lock)
+        // advertised this exact path via `LOCK_ENV`, we MAY borrow it -- but
+        // only after PROVING a lock is actually held. The env is inherited
+        // and could be forged, stale (the ancestor already released), or
+        // leaked to an unrelated child; trusting it blindly would let a
+        // concurrent provision/push skip serialisation. So attempt a
+        // NON-BLOCKING lock: if it would block, a real holder exists and we
+        // borrow; if we acquire it, the advertisement was false and we KEEP
+        // the lock (own it) rather than run unserialized.
+        let abs = absolute(&path).unwrap_or_else(|_| path.clone());
+        if env::var_os(LOCK_ENV).is_some_and(|held| Path::new(&held) == abs) {
+            let acquired = file.try_lock_exclusive().map_err(|err| {
+                format!(
+                    "failed to test the advertised provision lock on {}: {err}",
+                    path.display()
+                )
+            })?;
+            if acquired {
+                // No real holder despite the advertisement -- own it.
+                return Ok(Self {
+                    file: Some(file),
+                    path,
+                });
+            }
+            // A holder exists (our ancestor deploy) -- borrow without an OS
+            // lock so a composed deploy doesn't self-deadlock.
+            return Ok(Self { file: None, path });
+        }
         file.lock_exclusive().map_err(|err| {
             format!(
                 "failed to acquire exclusive provision lock on {}: {err} -- another `edgezero provision` or `edgezero config push` may be running against the same tree",
@@ -134,6 +151,13 @@ impl ProvisionLock {
     #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// `true` when this guard owns the OS file lock; `false` when it merely
+    /// borrows an ancestor's advertised (and PROVEN-held) lock.
+    #[cfg(test)]
+    pub(crate) fn owns_os_lock(&self) -> bool {
+        self.file.is_some()
     }
 }
 
@@ -164,12 +188,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn acquire_borrows_under_matching_advertised_lock_env() {
-        // When `LOCK_ENV` advertises THIS lock path (as a `deploy` parent
-        // sets on its child), acquire BORROWS -- takes no OS lock -- so two
-        // acquires coexist without the second blocking on the first. This
-        // is what stops a composed deploy's nested provision from self-
-        // dead-locking.
+    fn acquire_borrows_only_when_a_real_lock_backs_the_advertisement() {
+        // With `LOCK_ENV` advertising THIS path AND a real lock held (the
+        // first acquire owns it), a second acquire BORROWS -- no OS lock, no
+        // block -- so a composed deploy's nested provision doesn't self-
+        // dead-lock.
         use crate::test_support::{EnvOverride, manifest_guard};
         use std::sync::PoisonError;
         let _g = manifest_guard()
@@ -179,11 +202,40 @@ mod tests {
         let advert = ProvisionLock::lock_path_for(temp.path());
         let _env = EnvOverride::set(super::LOCK_ENV, advert.as_os_str());
         let start = Instant::now();
-        let _l1 = ProvisionLock::acquire(temp.path()).expect("borrow 1");
-        let _l2 = ProvisionLock::acquire(temp.path()).expect("borrow 2");
+        let l1 = ProvisionLock::acquire(temp.path()).expect("first acquire");
+        assert!(
+            l1.owns_os_lock(),
+            "the first acquire must OWN the lock (nothing held it yet)"
+        );
+        let l2 = ProvisionLock::acquire(temp.path()).expect("second acquire");
+        assert!(
+            !l2.owns_os_lock(),
+            "the second acquire must BORROW the lock the first proved held"
+        );
         assert!(
             start.elapsed() < Duration::from_millis(100),
-            "borrowed acquires must not block on each other"
+            "the borrow must not block on the owner"
+        );
+    }
+
+    #[test]
+    fn forged_lock_env_does_not_bypass_serialization() {
+        // A matching `LOCK_ENV` with NO real lock behind it (forged, stale,
+        // or leaked to an unrelated child) must NOT let acquire skip the OS
+        // lock -- it takes the real lock instead, so serialization holds.
+        use crate::test_support::{EnvOverride, manifest_guard};
+        use std::sync::PoisonError;
+        let _g = manifest_guard()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let advert = ProvisionLock::lock_path_for(temp.path());
+        let _env = EnvOverride::set(super::LOCK_ENV, advert.as_os_str());
+        // No lock is held anywhere; the env is the only "proof".
+        let lock = ProvisionLock::acquire(temp.path()).expect("acquire");
+        assert!(
+            lock.owns_os_lock(),
+            "a forged advertisement must not be trusted: acquire must own the real lock"
         );
     }
 

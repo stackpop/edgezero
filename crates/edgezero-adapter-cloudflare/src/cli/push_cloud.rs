@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf, absolute};
 use std::process::Command;
 
 use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
@@ -8,6 +8,15 @@ use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
 use super::WRANGLER_INSTALL_HINT;
 use super::provision_cloud::{find_namespace_id, is_real_namespace_id};
 use super::provision_local::read_namespace_id;
+
+/// Absolute `--config` argument for wrangler. The commands run with
+/// `current_dir(project_dir)` (the manifest's parent), so a
+/// manifest-root-relative `wrangler_path` would be resolved a SECOND time
+/// against that cwd (`crates/cf/wrangler.toml` -> `crates/cf/crates/cf/…`).
+/// Absolutising it makes the anchor independent of the child's cwd.
+fn wrangler_config_arg(wrangler_path: &Path) -> PathBuf {
+    absolute(wrangler_path).unwrap_or_else(|_| wrangler_path.to_path_buf())
+}
 
 /// Push `entries` to the remote KV namespace bound to `store` (looked
 /// up in `wrangler.toml`) via `wrangler kv bulk put <tempfile.json>
@@ -114,7 +123,7 @@ pub(super) fn write_entries(
         // a declared `config/cloudflare.prod.toml` sitting beside a plain
         // `wrangler.toml` would push to the WRONG account / namespace.
         .arg("--config")
-        .arg(&wrangler_path)
+        .arg(wrangler_config_arg(&wrangler_path))
         .output()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
@@ -214,7 +223,7 @@ pub(super) fn write_entries_local(
         // Anchor at the DECLARED manifest so a non-default filename beside
         // a plain `wrangler.toml` seeds the right local namespace.
         .arg("--config")
-        .arg(&wrangler_path)
+        .arg(wrangler_config_arg(&wrangler_path))
         .output()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
@@ -283,7 +292,7 @@ pub(super) fn read_wrangler_kv_key(
         // account / namespace a push would target, not a sibling default
         // `wrangler.toml`.
         .arg("--config")
-        .arg(&wrangler_path)
+        .arg(wrangler_config_arg(&wrangler_path))
         .current_dir(project_dir)
         .output()
         .map_err(|err| {
@@ -312,17 +321,42 @@ pub(super) fn read_wrangler_kv_key(
         return Ok(ReadConfigEntry::Present(body));
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("not found") || stderr.contains("does not exist") {
-        return Ok(ReadConfigEntry::MissingKey);
-    }
-    if stderr.contains("binding") || stderr.contains("Binding") {
+    let lower = stderr.to_ascii_lowercase();
+    // A missing BINDING (the KV namespace itself) is a missing store --
+    // check it FIRST so "binding ... not found" isn't misread as a missing
+    // key.
+    if lower.contains("binding") {
         return Ok(ReadConfigEntry::MissingStore);
+    }
+    // A genuinely absent KEY is a not-found -- but NEVER an auth/config
+    // failure like "API token not found", which is surfaced as an error so
+    // a diff doesn't report everything as added.
+    if !is_wrangler_auth_or_config_error(&lower)
+        && (lower.contains("not found") || lower.contains("does not exist"))
+    {
+        return Ok(ReadConfigEntry::MissingKey);
     }
     Err(format!(
         "`wrangler kv key get --binding {binding} {key} {locality}` exited with status {}\nstderr: {}",
         output.status,
         stderr.trim()
     ))
+}
+
+/// Detect an AUTHENTICATION / CONFIGURATION failure in a (lowercased)
+/// wrangler error, so a message like "API token not found" is NOT misread
+/// as an absent key (which would let a diff report everything as added).
+fn is_wrangler_auth_or_config_error(lower: &str) -> bool {
+    lower.contains("api token")
+        || lower.contains("api key")
+        || lower.contains("token")
+        || lower.contains("credential")
+        || lower.contains("unauthor")
+        || lower.contains("forbidden")
+        || lower.contains("403")
+        || lower.contains("permission")
+        || lower.contains("account_id")
+        || lower.contains("account id")
 }
 
 #[cfg(test)]
@@ -718,6 +752,33 @@ mod tests {
         );
     }
 
+    /// An auth failure ("API token not found") must NOT be masked as a
+    /// missing key -- it is surfaced as an error.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_auth_token_not_found() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: API token not found", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter.read_config_entry(
+            project_dir.path(),
+            Some("wrangler.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("an auth failure must be an error, not MissingKey");
+        };
+        assert!(
+            err.contains("API token"),
+            "the auth failure must surface: {err}"
+        );
+    }
+
     /// Wrangler 4.x (verified 4.64.0) returns exit 0 + stdout
     /// `"Value not found"` for a missing key instead of exit 1 +
     /// stderr. The previous read path treated every exit-0 stdout
@@ -851,6 +912,44 @@ mod tests {
         assert!(
             captured.contains("cloudflare.prod.toml"),
             "read must point --config at the DECLARED manifest; got argv:\n{captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_arg_is_not_doubled_for_a_nested_manifest() {
+        // The command runs with cwd = the manifest's parent, so a
+        // manifest-root-relative `--config` would be resolved AGAIN against
+        // that cwd (`crates/cf/wrangler.toml` -> `crates/cf/crates/cf/…`).
+        // The anchor must be absolute so no segment is doubled.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let root = tempdir().expect("tempdir");
+        let nested = root.path().join("crates/cf");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        write_wrangler(&nested, "name = \"prod\"\n");
+        let argv_log = root.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        CloudflareCliAdapter
+            .read_config_entry_local(
+                root.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read succeeds");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            !captured.contains("crates/cf/crates/cf"),
+            "the --config path must not be doubled under the changed cwd; got argv:\n{captured}"
+        );
+        assert!(
+            captured
+                .lines()
+                .any(|line| line.ends_with("/crates/cf/wrangler.toml")),
+            "the --config anchor must be the absolute declared manifest; got argv:\n{captured}"
         );
     }
 

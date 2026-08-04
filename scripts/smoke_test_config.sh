@@ -49,11 +49,22 @@ cleanup() {
 # A failed backup aborts HERE, before the trap is armed and before any
 # mutation, so the tree is never left in a half-restored state.
 case "$ADAPTER" in
+  axum)
+    # `config push --local` / provision write `.edgezero/` (local config
+    # JSON + `.env`); back the whole dir up so operator state survives.
+    backup_in_tree "$DEMO_DIR/.edgezero"
+    ;;
   cloudflare|cf)
     backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+    # `config push --local` seeds Miniflare state under `.wrangler/`.
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
     ;;
   fastly)
     backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+    ;;
+  spin)
+    # `config push --local` writes the SQLite store under `.spin/`.
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
     ;;
 esac
 

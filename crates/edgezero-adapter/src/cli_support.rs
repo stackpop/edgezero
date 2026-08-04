@@ -142,13 +142,14 @@ pub enum CargoTargetDir {
 
 /// Resolve cargo's effective target directory for locating a build
 /// artifact, mirroring cargo's own precedence: an explicit `--target-dir`
-/// build argument, then `CARGO_TARGET_DIR` (the ctx-applied env the build
-/// used, then the process env), then a `.cargo/config.toml`
+/// build argument, then a `--config build.target-dir=…` build argument,
+/// then `CARGO_TARGET_DIR` / `CARGO_BUILD_TARGET_DIR` (the ctx-applied env
+/// the build used, then the process env), then a `.cargo/config.toml`
 /// `[build] target-dir` walking from the crate root up to the workspace
-/// root. Relative values follow cargo: `--target-dir` / `CARGO_TARGET_DIR`
-/// resolve against the build's working directory (`crate_dir`); a config
-/// `target-dir` resolves against the directory that contains the `.cargo`
-/// directory.
+/// root. Relative values follow cargo: `--target-dir` /
+/// `--config build.target-dir` / the env vars resolve against the build's
+/// working directory (`crate_dir`); a config-file `target-dir` resolves
+/// against the directory that contains the `.cargo` directory.
 ///
 /// Returning [`CargoTargetDir::Explicit`] signals the caller must not fall
 /// back to the conventional paths, which is what prevents a stale
@@ -160,20 +161,27 @@ pub fn resolve_cargo_target_dir(
     build_args: &[String],
     ctx: &AdapterExecContext<'_>,
 ) -> CargoTargetDir {
-    // 1. `--target-dir <v>` / `--target-dir=<v>` in the build args.
+    // 1. `--target-dir <v>` / `--target-dir=<v>`, then a
+    //    `--config build.target-dir="…"` override, in the build args.
     if let Some(dir) = target_dir_from_args(build_args) {
         return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
     }
-    // 2. `CARGO_TARGET_DIR`: the ctx-applied env the build ran with takes
-    //    precedence over the process env, mirroring `command.env(...)`.
-    let env_dir = ctx
-        .env()
-        .iter()
-        .find(|(key, _)| key == "CARGO_TARGET_DIR")
-        .map(|(_, value)| PathBuf::from(value))
-        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from));
-    if let Some(dir) = env_dir {
+    if let Some(dir) = config_target_dir_from_args(build_args) {
         return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
+    }
+    // 2. `CARGO_TARGET_DIR`, then its `[build] target-dir` env alias
+    //    `CARGO_BUILD_TARGET_DIR`. The ctx-applied env the build ran with
+    //    takes precedence over the process env, mirroring `command.env`.
+    for key in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+        let env_dir = ctx
+            .env()
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| PathBuf::from(value))
+            .or_else(|| env::var_os(key).map(PathBuf::from));
+        if let Some(dir) = env_dir {
+            return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
+        }
     }
     // 3. Nearest `.cargo/config.toml` (or `.cargo/config`) `[build]
     //    target-dir`, from the crate root up to the workspace root.
@@ -206,6 +214,30 @@ fn target_dir_from_args(args: &[String]) -> Option<PathBuf> {
         }
         if arg == "--target-dir" {
             return iter.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+/// Extract a `--config build.target-dir="…"` override from the build args
+/// (`--config KEY=VAL` or `--config=KEY=VAL`). Cargo parses the value as
+/// TOML, so a quoted string is unwrapped.
+fn config_target_dir_from_args(args: &[String]) -> Option<PathBuf> {
+    const KEY: &str = "build.target-dir=";
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let payload = if arg == "--config" {
+            iter.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=")
+        };
+        if let Some(config_kv) = payload
+            && let Some(value) = config_kv.trim().strip_prefix(KEY)
+        {
+            let unquoted = value.trim().trim_matches(|ch| ch == '"' || ch == '\'');
+            if !unquoted.is_empty() {
+                return Some(PathBuf::from(unquoted));
+            }
         }
     }
     None
@@ -517,6 +549,38 @@ mod tests {
             resolve_cargo_target_dir(dir.path(), &[], &ctx),
             CargoTargetDir::Conventional
         ));
+    }
+
+    #[test]
+    fn resolve_target_dir_reads_config_build_target_dir_arg() {
+        // `cargo build --config build.target-dir="custom"` redirects output
+        // exactly like `--target-dir`; the value is TOML (quoted).
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        let ctx = AdapterExecContext::new();
+        let args = [
+            "--config".to_owned(),
+            "build.target-dir=\"custom\"".to_owned(),
+        ];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("custom")),
+            CargoTargetDir::Conventional => panic!("expected explicit from --config"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_reads_cargo_build_target_dir_env() {
+        // `CARGO_BUILD_TARGET_DIR` is the `[build] target-dir` env alias.
+        let dir = tempdir().unwrap();
+        let env = [(
+            "CARGO_BUILD_TARGET_DIR".to_owned(),
+            "/abs-build-env".to_owned(),
+        )];
+        let ctx = AdapterExecContext::new().with_env(&env);
+        match resolve_cargo_target_dir(dir.path(), &[], &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, PathBuf::from("/abs-build-env")),
+            CargoTargetDir::Conventional => panic!("expected explicit from CARGO_BUILD_TARGET_DIR"),
+        }
     }
 
     #[test]

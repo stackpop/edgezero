@@ -223,12 +223,17 @@ fn reject_offtree_sqlite_path(explicit_path: &Path) -> Result<(), String> {
 /// # Errors
 /// Propagates a symlinked-component rejection.
 pub(super) fn resolve_sqlite_path_guarded(
+    crate_root: &Path,
     spin_manifest_dir: &Path,
     runtime_config_dir: &Path,
     explicit_path: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let db_path = resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, explicit_path);
-    guard_sqlite_path_symlinks(spin_manifest_dir, &db_path)?;
+    // Walk symlinks from the CRATE ROOT, not the manifest's own dir: a
+    // nested manifest (`crates/server/config/spin.toml`) can resolve the db
+    // to `crates/server/.spin/...`, ABOVE the manifest dir -- guarding from
+    // the manifest dir would skip the check entirely for that layout.
+    guard_sqlite_path_symlinks(crate_root, &db_path)?;
     Ok(db_path)
 }
 
@@ -1743,8 +1748,36 @@ mod tests {
         fs::create_dir_all(&outside).expect("mkdir outside");
         symlink(&outside, manifest_dir.join(".spin")).expect("symlink .spin");
 
-        let err = resolve_sqlite_path_guarded(&manifest_dir, &manifest_dir, None)
+        let err = resolve_sqlite_path_guarded(&manifest_dir, &manifest_dir, &manifest_dir, None)
             .expect_err("symlinked .spin intermediate must be rejected");
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    /// A NESTED manifest resolves the db ABOVE the manifest's own dir
+    /// (`crate_root/.spin/...`); the symlink guard must still fire there --
+    /// walking from the CRATE ROOT, not the manifest dir.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_sqlite_path_guarded_covers_nested_layout_above_manifest_dir() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let crate_root = dir.path().join("crate");
+        let manifest_dir = crate_root.join("config");
+        fs::create_dir_all(&manifest_dir).expect("mkdir nested manifest");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        // The db resolves to `crate_root/.spin/...` via a runtime-config in
+        // the manifest dir with `path = "../.spin/kv.db"`; plant a symlinked
+        // `.spin` at the crate root.
+        symlink(&outside, crate_root.join(".spin")).expect("symlink .spin");
+
+        let err = resolve_sqlite_path_guarded(
+            &crate_root,
+            &manifest_dir,
+            &manifest_dir,
+            Some(Path::new("../.spin/kv.db")),
+        )
+        .expect_err("a symlinked .spin above the manifest dir must be rejected");
         assert!(err.contains("symlink"), "{err}");
     }
 

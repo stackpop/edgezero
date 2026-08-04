@@ -636,16 +636,26 @@ fn run_local_dry_run_typed(
                     false,
                 )
                 .map_err(&sanitize)?;
-            let typed = adapter
-                .provision_typed(
-                    staged_root,
-                    adapter_manifest_rel,
-                    adapter_component,
-                    entries,
-                    adapter_registry::ProvisionMode::Local,
-                    false,
-                )
-                .map_err(&sanitize)?;
+            // Mirror real execution: `run_provision_inner` returns Err on a
+            // base PARTIAL failure BEFORE typed provision runs, so typed
+            // mutations never happen. In dry-run, previewing them anyway
+            // would advertise writes the real command won't perform --
+            // skip typed when the base failed and let the base error
+            // propagate through the merge.
+            let typed = if base.error.is_some() {
+                adapter_registry::ProvisionOutcome::from_status_lines(Vec::new())
+            } else {
+                adapter
+                    .provision_typed(
+                        staged_root,
+                        adapter_manifest_rel,
+                        adapter_component,
+                        entries,
+                        adapter_registry::ProvisionMode::Local,
+                        false,
+                    )
+                    .map_err(&sanitize)?
+            };
             // Merge, prepend baseline lines, and render. The report and
             // any partial-failure error travel out together so the caller
             // can propagate the error after logging the report.
@@ -1691,6 +1701,11 @@ serve = "echo"
     static RECORDED_TYPED_ENTRIES: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
     static SYNTH_CALLED: AtomicBool = AtomicBool::new(false);
     static VALIDATE_SAW_FILE: AtomicBool = AtomicBool::new(false);
+    // When set, the fake's base `provision` returns a partial-failure
+    // (`with_error`) outcome; `TYPED_CALLED` records whether the typed arm
+    // ran, so a dry-run test can prove it is skipped after a base failure.
+    static PROVISION_SHOULD_ERROR: AtomicBool = AtomicBool::new(false);
+    static TYPED_CALLED: AtomicBool = AtomicBool::new(false);
 
     /// RAII guard: on `set`, chdir into `new_cwd`; on drop, restore
     /// the previous cwd. Callers MUST hold `manifest_guard()` while
@@ -1754,6 +1769,9 @@ serve = "echo"
             dry_run: bool,
         ) -> Result<ProvisionOutcome, String> {
             RECORDED_DRY_RUN.store(dry_run, Ordering::SeqCst);
+            if PROVISION_SHOULD_ERROR.load(Ordering::SeqCst) {
+                return Ok(ProvisionOutcome::default().with_error("base store failed".to_owned()));
+            }
             Ok(ProvisionOutcome::default())
         }
 
@@ -1766,6 +1784,7 @@ serve = "echo"
             _mode: ProvisionMode,
             _dry_run: bool,
         ) -> Result<ProvisionOutcome, String> {
+            TYPED_CALLED.store(true, Ordering::SeqCst);
             if let Ok(mut slot) = RECORDED_TYPED_ENTRIES.lock() {
                 slot.clear();
                 slot.extend(typed_secrets.iter().map(|entry| {
@@ -1872,6 +1891,8 @@ serve = "echo"
         }
         SYNTH_CALLED.store(false, Ordering::SeqCst);
         VALIDATE_SAW_FILE.store(false, Ordering::SeqCst);
+        PROVISION_SHOULD_ERROR.store(false, Ordering::SeqCst);
+        TYPED_CALLED.store(false, Ordering::SeqCst);
     }
 
     /// Walks the tree at `root` and returns a sorted `Vec<(relative
@@ -4016,6 +4037,56 @@ default = "default"
         assert!(
             !SYNTH_CALLED.load(Ordering::SeqCst),
             "capability gate must fire BEFORE staging (synth not called)"
+        );
+    }
+
+    #[test]
+    fn typed_dry_run_skips_typed_provision_when_base_partially_fails() {
+        // Real execution stops (returns Err) on a base partial failure
+        // BEFORE typed provision runs, so the typed writes never happen.
+        // The dry-run must mirror that: it must NOT preview typed mutations
+        // and must surface the base error.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        PROVISION_SHOULD_ERROR.store(true, Ordering::SeqCst);
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.__test_bootstrap_fake__.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.__test_bootstrap_fake__.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+default = "default"
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(temp.path().join("demo-app.toml"), TYPED_APP_CONFIG).expect("write app config");
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+
+        let err = run_provision_typed::<TypedTestConfig>(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("a base partial failure must fail the typed dry-run");
+        assert!(
+            err.contains("base store failed"),
+            "the base error must surface: {err}"
+        );
+        assert!(
+            !TYPED_CALLED.load(Ordering::SeqCst),
+            "typed provision must NOT run after a base partial failure (real execution stops first)"
         );
     }
 

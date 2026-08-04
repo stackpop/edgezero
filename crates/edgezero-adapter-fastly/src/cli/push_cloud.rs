@@ -7,6 +7,23 @@ use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config
 
 use super::{ConfigStoreLookup, FASTLY_INSTALL_HINT};
 
+/// Detect an AUTHENTICATION / CONFIGURATION failure in a (lowercased)
+/// provider error, so a message like "API key not found" or "profile not
+/// found" is NOT misread as an absent store/key (which would let a diff
+/// report everything as added, or a chunk read silently drop data). These
+/// markers name credentials/permissions/config, never a missing resource.
+fn is_provider_auth_or_config_error(lower: &str) -> bool {
+    lower.contains("api key")
+        || lower.contains("api-key")
+        || lower.contains("token")
+        || lower.contains("credential")
+        || lower.contains("unauthor") // unauthorized / unauthorised
+        || lower.contains("forbidden")
+        || lower.contains("403")
+        || lower.contains("permission")
+        || lower.contains("profile")
+}
+
 /// Cloud-mode `push_config_entries`: resolve the platform config-store
 /// id via `fastly config-store list --json`, then shell out per
 /// physical entry to `fastly config-store-entry update --upsert --stdin`.
@@ -162,12 +179,14 @@ pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfi
     let stderr = String::from_utf8_lossy(&output.stderr);
     let lower = stderr.to_ascii_lowercase();
     // A genuinely absent ENTRY is a 404, or a not-found phrase that
-    // mentions the item/entry/key. A bare "not found" (e.g. "profile not
-    // found" from an auth failure) must NOT be misreported as a missing
-    // key -- it is surfaced as an error instead.
+    // mentions the item/entry/key -- but NEVER an auth/config failure like
+    // "API key not found" (which contains "key") or "profile not found".
+    // Those are surfaced as errors instead of masked as a missing key.
     let mentions_entry = lower.contains("item") || lower.contains("entry") || lower.contains("key");
     let not_found = lower.contains("not found") || lower.contains("does not exist");
-    if lower.contains("404") || (not_found && mentions_entry) {
+    if !is_provider_auth_or_config_error(&lower)
+        && (lower.contains("404") || (not_found && mentions_entry))
+    {
         return Ok(ReadConfigEntry::MissingKey);
     }
     Err(format!(
@@ -226,7 +245,14 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404") {
+    // A genuinely absent chunk is a not-found; an auth/config failure is
+    // NOT -- suppressing it as `None` would silently drop chunk data and
+    // reconstruct a corrupt value, so it is surfaced as an error.
+    if !is_provider_auth_or_config_error(&lower)
+        && (lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("404"))
+    {
         return Ok(None);
     }
     Err(format!(
@@ -922,6 +948,34 @@ mod tests {
         assert!(
             matches!(result, ReadConfigEntry::MissingKey),
             "not-found stderr => MissingKey"
+        );
+    }
+
+    /// An auth failure whose stderr mentions "API key not found" contains
+    /// "key" + "not found" but must NOT be masked as a missing key -- it is
+    /// surfaced as an error so the operator fixes their credentials.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_auth_key_not_found() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // First call (config-store list) succeeds; describe fails on auth.
+        let fake = fake_fastly_returning("", "Error: API key not found", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("an auth failure must be an error, not MissingKey");
+        };
+        assert!(
+            err.contains("API key"),
+            "the auth failure must surface: {err}"
         );
     }
 

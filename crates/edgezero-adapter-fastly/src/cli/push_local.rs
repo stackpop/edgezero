@@ -110,25 +110,43 @@ pub(super) fn read_entry(
     let doc: toml_edit::DocumentMut = raw
         .parse()
         .map_err(|err| format!("failed to parse {}: {err}", fastly_path.display()))?;
-    // Probe `[local_server.config_stores.<name>]` — if absent, the store
-    // has not been seeded locally yet.
-    let Some(contents) = doc
-        .get("local_server")
-        .and_then(|ls| ls.get("config_stores"))
-        .and_then(|cs| cs.get(name))
-        .and_then(|store_tbl| store_tbl.get("contents"))
-    else {
+    // Walk `local_server -> config_stores -> <name> -> contents`,
+    // distinguishing an ABSENT node (the store isn't seeded yet ->
+    // MissingStore) from a MALFORMED one (a scalar/array where a table is
+    // expected). A malformed intermediate node is corrupt local state, not
+    // a missing store -- surfacing it as MissingStore would let a diff
+    // report every key as "added".
+    let malformed = |label: &str| {
+        format!(
+            "`{label}` in {} is not a table; the local Fastly config-store state is malformed. Re-run `config push --adapter fastly --local` to rewrite it.",
+            fastly_path.display()
+        )
+    };
+    let Some(local_server_item) = doc.get("local_server") else {
         return Ok(ReadConfigEntry::MissingStore);
     };
-    // `contents` must be a table of `key = "value"` pairs. A scalar or
-    // array here is CORRUPT local state, not a missing key -- surface it
-    // as an error rather than silently reporting every key absent (which a
-    // diff would then read as "everything was added").
+    let Some(local_server) = local_server_item.as_table_like() else {
+        return Err(malformed("[local_server]"));
+    };
+    let Some(config_stores_item) = local_server.get("config_stores") else {
+        return Ok(ReadConfigEntry::MissingStore);
+    };
+    let Some(config_stores) = config_stores_item.as_table_like() else {
+        return Err(malformed("[local_server.config_stores]"));
+    };
+    let Some(store_item) = config_stores.get(name) else {
+        return Ok(ReadConfigEntry::MissingStore);
+    };
+    let Some(store_tbl) = store_item.as_table_like() else {
+        return Err(malformed(&format!("[local_server.config_stores.{name}]")));
+    };
+    let Some(contents) = store_tbl.get("contents") else {
+        return Ok(ReadConfigEntry::MissingStore);
+    };
     if contents.as_table_like().is_none() {
-        return Err(format!(
-            "`[local_server.config_stores.{name}.contents]` in {} is not a table; the local Fastly config-store state is malformed. Re-run `config push --adapter fastly --local` to rewrite it.",
-            fastly_path.display()
-        ));
+        return Err(malformed(&format!(
+            "[local_server.config_stores.{name}.contents]"
+        )));
     }
     // The contents table is `key = "value"` pairs.
     match contents.get(key) {
@@ -316,6 +334,31 @@ mod tests {
         assert!(
             err.contains("is not a table"),
             "error names the malformed state: {err}"
+        );
+    }
+
+    #[test]
+    fn read_local_errors_when_an_intermediate_node_is_a_scalar() {
+        // A malformed INTERMEDIATE node (`local_server = "x"`) is corrupt
+        // local state, NOT a missing store -- the optional-chain walk must
+        // surface it as an error rather than reporting MissingStore.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\nlocal_server = \"oops\"\n").expect("write");
+        let result = FastlyCliAdapter.read_config_entry_local(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("a scalar `local_server` must be an error, not MissingStore");
+        };
+        assert!(
+            err.contains("`[local_server]`") && err.contains("is not a table"),
+            "error names the malformed intermediate node: {err}"
         );
     }
 

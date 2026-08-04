@@ -391,6 +391,8 @@ impl Adapter for SpinCliAdapter {
                     .to_owned()
             })?;
         let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
+        let crate_root = cli_support::read_adapter_crate_root(manifest_root, adapter_manifest_path)
+            .unwrap_or_else(|| spin_manifest_dir.to_path_buf());
         let runtime_config_path = push_ctx.runtime_config_path.map_or_else(
             || spin_manifest_dir.join("runtime-config.toml"),
             Path::to_path_buf,
@@ -431,6 +433,7 @@ impl Adapter for SpinCliAdapter {
             // Branch 4: `type = "spin"` or missing stanza (default).
             Some(runtime_config::KeyValueBackend::Spin { path }) => {
                 let db_path = push_local::resolve_sqlite_path_guarded(
+                    &crate_root,
                     spin_manifest_dir,
                     runtime_config_dir,
                     path.as_deref(),
@@ -439,6 +442,7 @@ impl Adapter for SpinCliAdapter {
             }
             None => {
                 let db_path = push_local::resolve_sqlite_path_guarded(
+                    &crate_root,
                     spin_manifest_dir,
                     runtime_config_dir,
                     None,
@@ -476,6 +480,8 @@ impl Adapter for SpinCliAdapter {
                     .to_owned()
             })?;
         let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
+        let crate_root = cli_support::read_adapter_crate_root(manifest_root, adapter_manifest_path)
+            .unwrap_or_else(|| spin_manifest_dir.to_path_buf());
         let runtime_config_path = push_ctx.runtime_config_path.map_or_else(
             || spin_manifest_dir.join("runtime-config.toml"),
             Path::to_path_buf,
@@ -499,6 +505,7 @@ impl Adapter for SpinCliAdapter {
             store.logical.as_str(),
         )?;
         let db_path = push_local::resolve_sqlite_path_guarded(
+            &crate_root,
             spin_manifest_dir,
             runtime_config_dir,
             explicit_path,
