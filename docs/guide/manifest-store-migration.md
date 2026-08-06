@@ -198,8 +198,10 @@ nothing is tracked:
 
 ```bash
 # `(^|/)` anchors each name to a path segment, so both `wrangler.toml`
-# and `adapters/wrangler.toml` match.
-matcher='(^|/)(axum|wrangler|fastly|spin|runtime-config)\.toml$|(^|/)\.dev\.vars$'
+# and `adapters/wrangler.toml` match. `.dev.vars` (Cloudflare) and `.env`
+# (Spin's `<crate>/.env`, Axum's `.edgezero/.env`) are secret-bearing and
+# must be untracked too.
+matcher='(^|/)(axum|wrangler|fastly|spin|runtime-config)\.toml$|(^|/)\.dev\.vars$|(^|/)\.env$'
 
 # Untrack matching files without touching your working copy. NUL-delimited
 # end-to-end (`-z` / `-0`) so paths with spaces or newlines survive; the

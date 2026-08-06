@@ -91,6 +91,19 @@ check "restore-failure-returns-nonzero" "$restore_rc" "1"
 check "restore-failure-keeps-live-dir" "$([ -d "$work/live" ] && echo yes || echo no)" "yes"
 check "restore-failure-live-content-intact" "$([ -f "$work/live/a" ] && echo yes || echo no)" "yes"
 
+# 7. SYMLINK capture is refused (exit 1) and the link + its target are left
+#    untouched, so `cp` can't follow the link and lose its identity.
+printf 'target-content\n' > "$work/target"
+ln -s "$work/target" "$work/link"
+(
+  BACKUPS=()
+  backup_in_tree "$work/link"
+) 2>/dev/null
+rc=$?
+check "symlink-capture-refused" "$rc" "1"
+check "symlink-still-a-link" "$([ -L "$work/link" ] && echo yes || echo no)" "yes"
+check "symlink-target-untouched" "$(cat "$work/target")" "target-content"
+
 rm -rf "$work"
 
 printf 'smoke_backup_test: %d passed, %d failed\n' "$pass" "$fail"

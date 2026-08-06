@@ -14,13 +14,61 @@
 # Entry format: "orig::existed::backup" (existed = 0|1; backup empty when 0).
 BACKUPS=()
 
+# Stop the smoke's server, its DESCENDANTS, and any lingering holder of the
+# port, then wait until the port is actually free -- BEFORE restoration. The
+# wrapper PID's direct children aren't enough: `wrangler` spawns `workerd`,
+# `spin` forks, etc., and a surviving descendant can flush state AFTER the
+# backup was restored, re-corrupting the developer's tree. Args:
+# <wrapper-pid> [port].
+smoke_stop_server() {
+  local pid="$1"
+  local port="${2:-}"
+  if [ -n "$pid" ]; then
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while [ "$waited" -lt 5 ] && kill -0 "$pid" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  # Grand-children (workerd/spin) the wrapper PID didn't cover keep the port
+  # bound; hunt them by port and wait for the bind to clear.
+  if [ -n "$port" ] && command -v lsof >/dev/null 2>&1; then
+    local holders
+    holders=$(lsof -ti ":${port}" 2>/dev/null || true)
+    if [ -n "$holders" ]; then
+      # shellcheck disable=SC2086
+      kill -KILL $holders 2>/dev/null || true
+    fi
+    local waited=0
+    while [ "$waited" -lt 5 ] && lsof -ti ":${port}" >/dev/null 2>&1; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+}
+
 # Record a fail-closed backup of a FILE or DIRECTORY the smoke is about to
 # mutate. Records the original-existence flag separately so an absent file
 # and a present-but-empty file are distinguishable on restore.
 backup_in_tree() {
   local orig="$1"
   local back="" existed=0
-  if [ -e "$orig" ] || [ -L "$orig" ]; then
+  # Refuse a SYMLINK (file or dir): these are EdgeZero-owned local files
+  # that provision/push never create through a link, so one appearing here
+  # is anomalous. Following it would (a) capture the link TARGET's content
+  # via `cp`, losing link identity, and (b) leave the target mutated while
+  # restore writes back a regular object. Fail closed -- matching the
+  # provision-side `reject_symlinked_target` policy -- BEFORE any mutation.
+  if [ -L "$orig" ]; then
+    printf 'FATAL: `%s` is a symlink; refusing to back it up (EdgeZero-owned local state is never a symlink). Replace it with a regular file/dir before running the smoke.\n' "$orig" >&2
+    exit 1
+  fi
+  if [ -e "$orig" ]; then
     existed=1
     if [ -d "$orig" ]; then
       back=$(mktemp -d) || {

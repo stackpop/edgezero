@@ -1581,6 +1581,42 @@ mod tests {
         }
     }
 
+    /// Hard-cutoff guard: NO scaffold template may reclaim a
+    /// provision-owned adapter manifest. The synthesiser is the single
+    /// writer for `axum.toml` / `wrangler.toml` / `fastly.toml` /
+    /// `spin.toml` / `runtime-config.toml`; a `*.toml.hbs` reintroducing
+    /// one would resurrect the templated-manifest path the cutoff removed
+    /// (and could ship stale/placeholder values the synthesiser omits).
+    #[test]
+    fn no_template_reclaims_a_provision_owned_manifest() {
+        const FORBIDDEN: &[&str] = &[
+            "axum.toml.hbs",
+            "wrangler.toml.hbs",
+            "fastly.toml.hbs",
+            "spin.toml.hbs",
+            "runtime-config.toml.hbs",
+        ];
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        let mut offenders: Vec<String> = Vec::new();
+        walk_toml_templates(&workspace_root.join("crates"), &mut |path, _body| {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && FORBIDDEN.contains(&name)
+            {
+                offenders.push(path.display().to_string());
+            }
+        });
+        assert!(
+            offenders.is_empty(),
+            "scaffold templates must not reclaim a provision-owned manifest (the synthesiser is \
+             the single writer); offenders: {offenders:?}"
+        );
+    }
+
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
         // Serialise PATH mutation against config.rs's push-shim tests

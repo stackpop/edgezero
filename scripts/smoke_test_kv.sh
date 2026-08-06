@@ -25,14 +25,10 @@ SERVER_PID=""
 . "$ROOT_DIR/scripts/lib/smoke_backup.sh"
 
 cleanup() {
-  if [ -n "$SERVER_PID" ]; then
-    echo ""
-    echo "==> Stopping server (PID $SERVER_PID)..."
-    # Kill the process and its children (useful for wrangler/workerd)
-    pkill -P "$SERVER_PID" 2>/dev/null || true
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-  fi
+  # Kill the server AND its descendants (workerd/spin) and free the port
+  # BEFORE restoring, or a survivor could flush state over the restore.
+  smoke_stop_server "$SERVER_PID" "${PORT:-}"
+  SERVER_PID=""
   restore_backups
 }
 
@@ -56,8 +52,11 @@ case "$ADAPTER" in
     backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
     ;;
 esac
-# Arm the trap only AFTER a successful backup.
+# Arm the trap only AFTER a successful backup. A signal runs cleanup then
+# EXITS so an interrupt can't resume the smoke and re-mutate after restore.
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml

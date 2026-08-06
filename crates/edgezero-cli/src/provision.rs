@@ -535,8 +535,14 @@ fn merge_and_render_typed_dry_run(
         .into_iter()
         .chain(typed.status_lines)
         .collect();
-    // Preserve a partial-failure error from EITHER arm.
-    let merged_error = base.error.or(typed.error);
+    // Preserve a partial-failure error from EITHER arm -- SANITISED, since
+    // an adapter's error is built against the staged tempdir and would
+    // otherwise leak raw staging paths into dry-run output (spec §"Dry-run"
+    // forbids tempdir paths in stdout/stderr, on the error path too).
+    let merged_error = base
+        .error
+        .or(typed.error)
+        .map(|err| err.replace(&staged_str, &project_str));
     let merged_outcome = match base.deployed.or(typed.deployed) {
         Some(state) => ProvisionOutcome::with_deployed(merged_status, state),
         None => ProvisionOutcome::from_status_lines(merged_status),
@@ -1545,9 +1551,17 @@ fn run_local_dry_run(
     };
     // Carry a partial-failure error through: `run_provision` returns
     // `Err(outcome.error)` after writeback, so an adapter that reported
-    // `with_error` fails the dry-run instead of exiting zero.
+    // `with_error` fails the dry-run instead of exiting zero. SANITISE it
+    // first -- the adapter built it against the staged tempdir, and spec
+    // §"Dry-run" forbids raw tempdir paths in output on the error path too.
     Ok(match outcome.error {
-        Some(err) => rebuilt.with_error(err),
+        Some(err) => {
+            let sanitised = err.replace(
+                staged_root.to_string_lossy().as_ref(),
+                manifest_root.to_string_lossy().as_ref(),
+            );
+            rebuilt.with_error(sanitised)
+        }
         None => rebuilt,
     })
 }
@@ -1706,6 +1720,10 @@ serve = "echo"
     // ran, so a dry-run test can prove it is skipped after a base failure.
     static PROVISION_SHOULD_ERROR: AtomicBool = AtomicBool::new(false);
     static TYPED_CALLED: AtomicBool = AtomicBool::new(false);
+    // Captures the (staged) manifest root the fake's `provision` saw when it
+    // returned a partial-failure error, so a dry-run test can assert the
+    // staged tempdir path is stripped from the surfaced error.
+    static RECORDED_PROVISION_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
     /// RAII guard: on `set`, chdir into `new_cwd`; on drop, restore
     /// the previous cwd. Callers MUST hold `manifest_guard()` while
@@ -1760,7 +1778,7 @@ serve = "echo"
 
         fn provision(
             &self,
-            _manifest_root: &Path,
+            manifest_root: &Path,
             _adapter_manifest_path: Option<&str>,
             _component_selector: Option<&str>,
             _stores: &ProvisionStores<'_>,
@@ -1770,7 +1788,13 @@ serve = "echo"
         ) -> Result<ProvisionOutcome, String> {
             RECORDED_DRY_RUN.store(dry_run, Ordering::SeqCst);
             if PROVISION_SHOULD_ERROR.load(Ordering::SeqCst) {
-                return Ok(ProvisionOutcome::default().with_error("base store failed".to_owned()));
+                if let Ok(mut slot) = RECORDED_PROVISION_ROOT.lock() {
+                    *slot = Some(manifest_root.to_path_buf());
+                }
+                // Embed the (staged) manifest root so a dry-run test can
+                // prove the error is sanitised before it reaches the operator.
+                return Ok(ProvisionOutcome::default()
+                    .with_error(format!("base store failed at {}", manifest_root.display())));
             }
             Ok(ProvisionOutcome::default())
         }
@@ -1893,6 +1917,9 @@ serve = "echo"
         VALIDATE_SAW_FILE.store(false, Ordering::SeqCst);
         PROVISION_SHOULD_ERROR.store(false, Ordering::SeqCst);
         TYPED_CALLED.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = RECORDED_PROVISION_ROOT.lock() {
+            *slot = None;
+        }
     }
 
     /// Walks the tree at `root` and returns a sorted `Vec<(relative
@@ -4087,6 +4114,17 @@ default = "default"
         assert!(
             !TYPED_CALLED.load(Ordering::SeqCst),
             "typed provision must NOT run after a base partial failure (real execution stops first)"
+        );
+        // The error is built against the STAGED tempdir; it must be
+        // sanitised so no raw staging path leaks to the operator.
+        let staged = RECORDED_PROVISION_ROOT
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .expect("the fake recorded the staged provision root");
+        assert!(
+            !err.contains(&*staged.to_string_lossy()),
+            "the staged tempdir path must be stripped from the surfaced error: {err}"
         );
     }
 

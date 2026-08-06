@@ -43,13 +43,10 @@ FAIL=0
 export SMOKE_SECRET="$SMOKE_SECRET_VALUE"
 
 cleanup() {
-  if [ -n "$SERVER_PID" ]; then
-    echo ""
-    echo "==> Stopping server (PID $SERVER_PID)..."
-    pkill -P "$SERVER_PID" 2>/dev/null || true
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-  fi
+  # Kill the server AND its descendants (workerd/spin) and free the port
+  # BEFORE restoring, or a survivor could flush state over the restore.
+  smoke_stop_server "$SERVER_PID" "${PORT:-}"
+  SERVER_PID=""
   restore_backups
 }
 
@@ -76,8 +73,11 @@ case "$ADAPTER" in
 esac
 
 # Install the trap AFTER a successful backup so an abort mid-warm-up still
-# restores, while a failed backup aborts before the trap can run.
+# restores, while a failed backup aborts before the trap can run. A signal
+# runs cleanup then EXITS so an interrupt can't resume and re-mutate.
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml

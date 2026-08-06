@@ -41,7 +41,14 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &["spin"],
     },
     commands: CommandTemplates {
-        build: "cargo build --target wasm32-wasip2 --release -p {crate}",
+        // Pin `--target-dir target` so the wasm ALWAYS lands at the
+        // conventional workspace target that the synthesised `spin.toml`
+        // `source` references. Without it, a `CARGO_TARGET_DIR=custom` build
+        // would write elsewhere while `spin deploy` / `spin up` (which read
+        // `source`) kept serving the stale conventional artifact. The
+        // `--target-dir` CLI flag overrides `CARGO_TARGET_DIR`, keeping the
+        // build output and `source` consistent by construction.
+        build: "cargo build --target wasm32-wasip2 --release --target-dir target -p {crate}",
         deploy: "spin deploy --from {crate_dir}",
         serve: "spin up --from {crate_dir} --runtime-config-file {crate_dir}/runtime-config.toml",
     },
@@ -908,6 +915,21 @@ pub(super) fn env_mutation_guard() -> &'static Mutex<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn spin_blueprint_build_pins_target_dir_to_conventional_source() {
+        // The generated `commands.build` must pin `--target-dir target` so a
+        // custom `CARGO_TARGET_DIR` can't leave `spin.toml`'s `source`
+        // pointing at a stale conventional artifact after a build.
+        assert!(
+            SPIN_BLUEPRINT
+                .commands
+                .build
+                .contains("--target-dir target"),
+            "spin build command must pin the conventional target dir: {}",
+            SPIN_BLUEPRINT.commands.build
+        );
+    }
 
     // Shared fixture names. Pinning these as consts (instead of
     // inline `"sessions"` / `"app_config"` / `"demo"` per call site)

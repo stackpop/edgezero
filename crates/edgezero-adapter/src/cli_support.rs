@@ -162,11 +162,12 @@ pub fn resolve_cargo_target_dir(
     ctx: &AdapterExecContext<'_>,
 ) -> CargoTargetDir {
     // 1. `--target-dir <v>` / `--target-dir=<v>`, then a
-    //    `--config build.target-dir="…"` override, in the build args.
+    //    `--config build.target-dir="…"` / `--config <file>` override, in
+    //    the build args. Cargo lets the LAST occurrence win.
     if let Some(dir) = target_dir_from_args(build_args) {
         return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
     }
-    if let Some(dir) = config_target_dir_from_args(build_args) {
+    if let Some(dir) = config_target_dir_from_args(crate_dir, build_args) {
         return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
     }
     // 2. `CARGO_TARGET_DIR`, then its `[build] target-dir` env alias
@@ -183,64 +184,107 @@ pub fn resolve_cargo_target_dir(
             return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
         }
     }
-    // 3. Nearest `.cargo/config.toml` (or `.cargo/config`) `[build]
-    //    target-dir`, from the crate root up to the workspace root.
-    let workspace_root = find_workspace_root(crate_dir);
-    let mut dir = crate_dir;
-    loop {
+    // 3. `.cargo/config.toml` (or `.cargo/config`) `[build] target-dir`,
+    //    walking EVERY ancestor from the crate dir to the filesystem root
+    //    (cargo doesn't stop at the workspace), preferring `config.toml`
+    //    over `config`, then `$CARGO_HOME`. The nearest declaration wins.
+    let mut dir = Some(crate_dir);
+    while let Some(current) = dir {
         for name in ["config.toml", "config"] {
-            if let Some(target) = config_build_target_dir(&dir.join(".cargo").join(name)) {
-                return CargoTargetDir::Explicit(resolve_dir_against(dir, &target));
+            if let Some(target) = config_build_target_dir(&current.join(".cargo").join(name)) {
+                return CargoTargetDir::Explicit(resolve_dir_against(current, &target));
             }
         }
-        if dir == workspace_root {
-            break;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => break,
+        dir = current.parent();
+    }
+    if let Some(home) = cargo_home() {
+        for name in ["config.toml", "config"] {
+            if let Some(target) = config_build_target_dir(&home.join(name)) {
+                return CargoTargetDir::Explicit(resolve_dir_against(&home, &target));
+            }
         }
     }
     CargoTargetDir::Conventional
 }
 
+/// `$CARGO_HOME` (or `~/.cargo`), where cargo keeps its global config.
+fn cargo_home() -> Option<PathBuf> {
+    env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+}
+
 /// Extract the value of a `--target-dir` build argument (`--target-dir X`
-/// or `--target-dir=X`), if present.
+/// or `--target-dir=X`). Cargo lets the LAST occurrence win.
 fn target_dir_from_args(args: &[String]) -> Option<PathBuf> {
+    let mut last = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if let Some(value) = arg.strip_prefix("--target-dir=") {
-            return Some(PathBuf::from(value));
+            last = Some(PathBuf::from(value));
+            continue;
         }
-        if arg == "--target-dir" {
-            return iter.next().map(PathBuf::from);
+        if arg == "--target-dir"
+            && let Some(value) = iter.next()
+        {
+            last = Some(PathBuf::from(value));
         }
     }
-    None
+    last
 }
 
-/// Extract a `--config build.target-dir="…"` override from the build args
-/// (`--config KEY=VAL` or `--config=KEY=VAL`). Cargo parses the value as
-/// TOML, so a quoted string is unwrapped.
-fn config_target_dir_from_args(args: &[String]) -> Option<PathBuf> {
+/// Extract a target-dir override from `--config` build args -- both the
+/// inline `--config build.target-dir="…"` form AND the `--config <file>`
+/// form (where the file's `[build] target-dir` is read). Cargo lets the
+/// LAST `--config` win. A file's relative `target-dir` is resolved against
+/// the config file's directory; an inline relative value is returned as-is
+/// for the caller to resolve against the build's working directory.
+fn config_target_dir_from_args(crate_dir: &Path, args: &[String]) -> Option<PathBuf> {
     const KEY: &str = "build.target-dir=";
+    let mut last: Option<PathBuf> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        let payload = if arg == "--config" {
+        let raw = if arg == "--config" {
             iter.next().map(String::as_str)
         } else {
             arg.strip_prefix("--config=")
         };
-        if let Some(config_kv) = payload
-            && let Some(value) = config_kv.trim().strip_prefix(KEY)
-        {
+        let Some(spec) = raw.map(str::trim) else {
+            continue;
+        };
+        if let Some(value) = spec.strip_prefix(KEY) {
             let unquoted = value.trim().trim_matches(|ch| ch == '"' || ch == '\'');
             if !unquoted.is_empty() {
-                return Some(PathBuf::from(unquoted));
+                last = Some(PathBuf::from(unquoted));
+            }
+            continue;
+        }
+        // `--config <file>`: read the file's `[build] target-dir`, resolved
+        // against the file's own directory.
+        if !is_inline_config_kv(spec) {
+            let cfg_path = resolve_dir_against(crate_dir, Path::new(spec));
+            if let Some(target) = config_build_target_dir(&cfg_path) {
+                let base = cfg_path.parent().unwrap_or(crate_dir);
+                last = Some(resolve_dir_against(base, &target));
             }
         }
     }
-    None
+    last
+}
+
+/// Whether a `--config` payload is an inline `dotted.key=value` (as opposed
+/// to a config FILE path). Keys are dotted identifiers with no path
+/// separators; a value containing `/` in its key half is a file path.
+fn is_inline_config_kv(payload: &str) -> bool {
+    match payload.split_once('=') {
+        Some((key, _)) => {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+        }
+        None => false,
+    }
 }
 
 /// Resolve a possibly-relative target dir against `base` (absolute values
@@ -565,6 +609,58 @@ mod tests {
         match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
             CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("custom")),
             CargoTargetDir::Conventional => panic!("expected explicit from --config"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_config_build_arg_last_occurrence_wins() {
+        // Cargo lets the LAST `--config build.target-dir` win.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        let ctx = AdapterExecContext::new();
+        let args = [
+            "--config".to_owned(),
+            "build.target-dir=\"first\"".to_owned(),
+            "--config".to_owned(),
+            "build.target-dir=\"second\"".to_owned(),
+        ];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("second")),
+            CargoTargetDir::Conventional => panic!("expected explicit"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_target_dir_arg_last_occurrence_wins() {
+        let dir = tempdir().unwrap();
+        let ctx = AdapterExecContext::new();
+        let args = [
+            "--target-dir".to_owned(),
+            "first".to_owned(),
+            "--target-dir=second".to_owned(),
+        ];
+        match resolve_cargo_target_dir(dir.path(), &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, dir.path().join("second")),
+            CargoTargetDir::Conventional => panic!("expected explicit"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_reads_config_file_arg() {
+        // `--config <file>` loads the file's `[build] target-dir`, resolved
+        // against the config file's own directory.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::write(
+            crate_dir.join("alt-config.toml"),
+            "[build]\ntarget-dir = \"file-out\"\n",
+        )
+        .unwrap();
+        let ctx = AdapterExecContext::new();
+        let args = ["--config".to_owned(), "alt-config.toml".to_owned()];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("file-out")),
+            CargoTargetDir::Conventional => panic!("expected explicit from --config <file>"),
         }
     }
 

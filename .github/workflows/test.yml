@@ -61,22 +61,23 @@ jobs:
       # Enforce spec §"Adapter manifests are gitignored" + §"Migration for
       # downstream projects". All five generated adapter manifests
       # (`axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`,
-      # `runtime-config.toml`) and Cloudflare's `.dev.vars` MUST NOT be
-      # tracked -- teammates regenerate them locally via
-      # `provision --local`.
-      - name: Enforce adapter manifests and .dev.vars are not tracked
+      # `runtime-config.toml`), Cloudflare's `.dev.vars`, AND the
+      # provision-written secret-bearing env-line files (Spin's
+      # `<crate>/.env`, Axum's `.edgezero/.env`) MUST NOT be tracked --
+      # teammates regenerate them locally via `provision --local`.
+      - name: Enforce adapter manifests and secret env files are not tracked
         run: |
-          if git ls-files | grep -E '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$'; then
-            echo "::error::These adapter manifests AND Cloudflare's .dev.vars must be gitignored (spec §'Adapter manifests are gitignored' + §'Migration for downstream projects'). .dev.vars carries operator secret values and must NEVER be committed."
+          if git ls-files | grep -E '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$|(^|/)\.env$'; then
+            echo "::error::These adapter manifests AND secret-bearing env files (.dev.vars / .env) must be gitignored (spec §'Adapter manifests are gitignored' + §'Migration for downstream projects'). They carry operator secret values and must NEVER be committed."
             exit 1
           fi
 
       # The step above only proves these files are not CURRENTLY tracked.
       # Also prove they are actually IGNORED, so a `git add` can't slip a
-      # regenerated manifest (or a secret-bearing `.dev.vars`) into a
-      # commit. `git check-ignore` evaluates the ignore rules against the
-      # pathname whether or not the file exists.
-      - name: Enforce adapter manifests and .dev.vars are gitignored
+      # regenerated manifest (or a secret-bearing env file) into a commit.
+      # `git check-ignore` evaluates the ignore rules against the pathname
+      # whether or not the file exists.
+      - name: Enforce adapter manifests and secret env files are gitignored
         run: |
           for probe in \
             crates/demo/axum.toml \
@@ -84,9 +85,11 @@ jobs:
             crates/demo/fastly.toml \
             crates/demo/spin.toml \
             crates/demo/runtime-config.toml \
-            crates/demo/.dev.vars; do
+            crates/demo/.dev.vars \
+            crates/demo/.env \
+            .edgezero/.env; do
             if ! git check-ignore -q "$probe"; then
-              echo "::error::'$probe' is NOT gitignored. Add the pattern to .gitignore so provision-generated adapter state and secret-bearing .dev.vars can never be committed by accident."
+              echo "::error::'$probe' is NOT gitignored. Add the pattern to .gitignore so provision-generated adapter state and secret-bearing env files can never be committed by accident."
               exit 1
             fi
           done

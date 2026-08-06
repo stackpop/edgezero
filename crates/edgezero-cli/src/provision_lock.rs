@@ -43,9 +43,18 @@ pub(crate) const LOCK_ENV: &str = "EDGEZERO_PROVISION_LOCK";
 /// release; the OS will also release automatically on process exit.
 #[must_use = "the lock is released when this guard is dropped -- bind it to a `_lock` variable that lives for the critical section"]
 pub(crate) struct ProvisionLock {
-    // `Some` when THIS guard owns the OS file lock; `None` when it merely
-    // BORROWS a lock an ancestor process already advertised via `LOCK_ENV`.
-    file: Option<File>,
+    // The OS file lock this guard holds: EITHER the main `provision.lock`
+    // (owner) OR the `provision.borrow.lock` sibling lock (borrower). Drop
+    // releases whichever it is.
+    file: File,
+    // `true` when this guard BORROWS an ancestor deploy's advertised lock
+    // (holding the sibling lock for intra-tree serialisation) rather than
+    // owning the main lock. Read by the cfg(test) `owns_os_lock` getter.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the cfg(test) owns_os_lock getter")
+    )]
+    borrowed: bool,
     // Read by the cfg(test) `path()` getter only. In non-test builds
     // the field is still needed so error diagnostics can name the
     // lockfile path -- silence dead_code accordingly.
@@ -128,13 +137,47 @@ impl ProvisionLock {
             if acquired {
                 // No real holder despite the advertisement -- own it.
                 return Ok(Self {
-                    file: Some(file),
+                    file,
+                    borrowed: false,
                     path,
                 });
             }
-            // A holder exists (our ancestor deploy) -- borrow without an OS
-            // lock so a composed deploy doesn't self-deadlock.
-            return Ok(Self { file: None, path });
+            // A real holder exists (our ancestor deploy). Don't take the
+            // main lock (that would self-deadlock the composed deploy), but
+            // DO serialise against SIBLING borrowers via a SEPARATE lock, so
+            // two provisions the same deploy spawns can't rewrite the same
+            // manifests / env files concurrently. Release the failed
+            // non-blocking attempt fd first.
+            drop(file);
+            let sibling_path = dot_edgezero.join("provision.borrow.lock");
+            reject_symlink_components(
+                manifest_root,
+                &sibling_path,
+                "the sibling provision lock path `<project>/.edgezero/provision.borrow.lock`",
+            )?;
+            let sibling = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&sibling_path)
+                .map_err(|err| {
+                    format!(
+                        "failed to open sibling provision lock at {}: {err}",
+                        sibling_path.display()
+                    )
+                })?;
+            sibling.lock_exclusive().map_err(|err| {
+                format!(
+                    "failed to acquire the sibling provision lock on {}: {err} -- another provision spawned by the same deploy may be running",
+                    sibling_path.display()
+                )
+            })?;
+            return Ok(Self {
+                file: sibling,
+                borrowed: true,
+                path,
+            });
         }
         file.lock_exclusive().map_err(|err| {
             format!(
@@ -143,7 +186,8 @@ impl ProvisionLock {
             )
         })?;
         Ok(Self {
-            file: Some(file),
+            file,
+            borrowed: false,
             path,
         })
     }
@@ -153,23 +197,21 @@ impl ProvisionLock {
         &self.path
     }
 
-    /// `true` when this guard owns the OS file lock; `false` when it merely
-    /// borrows an ancestor's advertised (and PROVEN-held) lock.
+    /// `true` when this guard OWNS the main OS lock; `false` when it borrows
+    /// an ancestor's advertised lock (holding the sibling lock instead).
     #[cfg(test)]
     pub(crate) fn owns_os_lock(&self) -> bool {
-        self.file.is_some()
+        !self.borrowed
     }
 }
 
 impl Drop for ProvisionLock {
     fn drop(&mut self) {
-        // The OS releases the lock on descriptor close, but call
-        // `unlock` explicitly so double-close-in-drop doesn't leave a
-        // stray flock reference in error paths. A BORROWED guard owns no
-        // descriptor -- nothing to unlock.
-        if let Some(file) = &self.file {
-            drop(FileExt::unlock(file));
-        }
+        // The OS releases the lock on descriptor close, but call `unlock`
+        // explicitly so double-close-in-drop doesn't leave a stray flock
+        // reference in error paths. Releases whichever lock this guard
+        // holds -- the main lock (owner) or the sibling lock (borrower).
+        drop(FileExt::unlock(&self.file));
         // Note: we do NOT delete the lock file. Deletion races with
         // a peer that has the descriptor open (they'd hold a lock on
         // a nameless file for the rest of their lifetime). Leaving
@@ -236,6 +278,48 @@ mod tests {
         assert!(
             lock.owns_os_lock(),
             "a forged advertisement must not be trusted: acquire must own the real lock"
+        );
+    }
+
+    #[test]
+    fn sibling_borrowers_serialise_against_each_other() {
+        // Two provisions the SAME deploy spawns both borrow the parent's
+        // advertised lock -- but they must still serialise with EACH OTHER
+        // (via the sibling lock) so they can't rewrite the same manifests
+        // concurrently. The second borrower must BLOCK on the first.
+        use crate::test_support::{EnvOverride, manifest_guard};
+        use std::sync::PoisonError;
+        let _g = manifest_guard()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let advert = ProvisionLock::lock_path_for(temp.path());
+        let _env = EnvOverride::set(super::LOCK_ENV, advert.as_os_str());
+        // The "deploy parent" owns the main lock.
+        let owner = ProvisionLock::acquire(temp.path()).expect("owner");
+        assert!(owner.owns_os_lock(), "owner holds the main lock");
+
+        let root = temp.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let root_a = root.clone();
+        let handle_a = thread::spawn(move || {
+            let lock = ProvisionLock::acquire(&root_a).expect("sibling A");
+            assert!(!lock.owns_os_lock(), "A borrows (holds the sibling lock)");
+            tx.send(()).expect("signal");
+            thread::sleep(Duration::from_millis(50));
+            drop(lock);
+        });
+        rx.recv().expect("await A");
+        let start = Instant::now();
+        // Sibling B must block on A's sibling lock.
+        let lock_b = ProvisionLock::acquire(&root).expect("sibling B");
+        let elapsed = start.elapsed();
+        assert!(!lock_b.owns_os_lock(), "B borrows too");
+        drop(lock_b);
+        handle_a.join().expect("join A");
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "B must serialise behind A's sibling lock; only waited {elapsed:?}"
         );
     }
 

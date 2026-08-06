@@ -1930,9 +1930,10 @@ EOF
 # operator runs `provision --local` next. The portable guarded
 # loop below works on macOS / BSD `xargs` (which lacks the
 # GNU `-r` "no-run-if-empty" flag) as well as GNU systems.
-# `.dev.vars` is left untouched -- operators rarely have it
-# tracked, but the same loop will pick it up if they do.
-tracked=$(git ls-files | rg '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' || true)
+# `.dev.vars` (Cloudflare) and `.env` (Spin's `<crate>/.env`, Axum's
+# `.edgezero/.env`) are secret-bearing and untracked too -- operators
+# rarely have them tracked, but the loop picks them up if they do.
+tracked=$(git ls-files | rg '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$|(^|/)\.env$' || true)
 if [ -n "$tracked" ]; then
   printf '%s\n' "$tracked" | xargs git rm --cached
 fi

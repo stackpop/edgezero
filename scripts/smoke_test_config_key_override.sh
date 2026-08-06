@@ -123,7 +123,8 @@ cleanup() {
   stop_server || true
   restore_backups
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # Bash 3.2-portable upper-case (macOS ships /usr/bin/env bash as 3.2).
 # `${var^^}` is Bash 4+; tr is portable.
@@ -446,7 +447,8 @@ for suite in "${SUITES[@]}"; do
 
   printf '\n=== 12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
   tmp=$(mktemp -d)
-  trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
+  trap "cleanup; rm -rf '$tmp'" EXIT
+  trap "cleanup; rm -rf '$tmp'; exit 130" INT TERM
 
   # Back up EVERY operator-owned file/dir this row touches BEFORE warm-up.
   # `provision --local` (warm-up), the reset below, the secret seed, and
@@ -506,7 +508,8 @@ for suite in "${SUITES[@]}"; do
     FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
 
@@ -534,7 +537,8 @@ for suite in "${SUITES[@]}"; do
     FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
   result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
@@ -549,7 +553,8 @@ for suite in "${SUITES[@]}"; do
     # diagnostic; just abort the row.
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
 
@@ -560,7 +565,8 @@ for suite in "${SUITES[@]}"; do
     FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
   result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
@@ -569,7 +575,8 @@ for suite in "${SUITES[@]}"; do
   cleanup
 
   rm -rf "$tmp"
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
 done
 
 # -- 9.3 Fastly oversized envelope smoke ---------------------------------
@@ -579,7 +586,8 @@ if [ "${SKIP_FASTLY:-0}" = "1" ]; then
 else
   printf '\n=== 9.3 Fastly chunk-pointer smoke ===\n'
   tmp=$(mktemp -d)
-  trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
+  trap "cleanup; rm -rf '$tmp'" EXIT
+  trap "cleanup; rm -rf '$tmp'; exit 130" INT TERM
 
   # Back up fastly.toml BEFORE warm-up regenerates it (and before the
   # push / `seed_fastly_runtime_env` edit it in place), so cleanup
@@ -638,7 +646,8 @@ TOML
   cleanup
 
   rm -rf "$tmp"
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
 fi
 
 # -- 8.3 Spin Cloud Unsupported smoke ------------------------------------
