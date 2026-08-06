@@ -179,6 +179,59 @@ jobs:
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
         run: .github/actions/deploy-core/tests/assert-rollback-threaded.sh
 
+  # Separate-job artifact handoff: build the CLI in ONE job, deploy in a DEPENDENT
+  # job that downloads the artifact by a LITERAL name (a `steps.*.outputs` value
+  # cannot cross a job boundary). This is the layout the guide recommends for keeping
+  # the credential entirely out of the build phase, and the only smoke that exercises
+  # cross-job artifact download.
+  handoff-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      # No provider credentials in this job at all: it only builds and uploads.
+      - name: Build the APP's own CLI package (build job)
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          app-cli-artifact: edgezero-cli-handoff
+
+  handoff-deploy:
+    needs: handoff-build
+    runs-on: ubuntu-24.04
+    # The deploy job carries the token; inherited aliases it MUST still clear.
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The deploy job needs the app SOURCE (working-directory); the CLI binary comes
+      # from the build job's artifact, downloaded inside deploy-fastly by its literal
+      # name — NOT a step output, which cannot cross jobs.
+      - name: Recreate the fixture app source
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      - name: Set up fake Fastly API for rollback-target capture
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+      - name: Deploy using the artifact built in the other job (literal name)
+        id: deploy
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: edgezero-cli-handoff
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+      - name: Assert the cross-job handoff produced a real production deploy
+        env:
+          EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs['fastly-version'] }}
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
+        run: .github/actions/deploy-core/tests/assert-production-deploy.sh
+
   # Config push: the real config-push-fastly wrapper against a fake `fastly`,
   # proving the whole chain — artifact download, Fastly CLI install, the app
   # CLI's TYPED `config push` (the bundled stub cannot do this), and the
