@@ -883,16 +883,24 @@ mod tests {
             "a typo'd flag must be rejected, not silently forwarded"
         );
 
-        // And passthrough AFTER `--` still works — including a literal `--stage` a
-        // caller genuinely means for the adapter command.
-        let args =
-            Args::try_parse_from(["edgezero", "deploy", "--adapter", "fastly", "--", "--stage"])
-                .expect("passthrough after -- is accepted verbatim");
+        // And a genuine adapter passthrough AFTER `--` still parses verbatim. (The
+        // reserved `--stage`/`--staging` spellings parse the same way but are rejected
+        // later by run_deploy — see run_deploy_rejects_staging_spellings_in_passthrough.)
+        let args = Args::try_parse_from([
+            "edgezero",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--",
+            "--comment",
+            "ci",
+        ])
+        .expect("passthrough after -- is accepted verbatim");
         let Command::Deploy(deploy) = args.cmd else {
             panic!("expected Command::Deploy");
         };
         assert!(!deploy.staging);
-        assert_eq!(deploy.adapter_args, vec!["--stage"]);
+        assert_eq!(deploy.adapter_args, vec!["--comment", "ci"]);
     }
 
     #[test]

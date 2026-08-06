@@ -163,7 +163,8 @@ reference to port from. Most transfer with light changes:
 3. **`deploy-fastly` wrapper (minimal composite action)**
    - Typed inputs: `app-cli-artifact`, `app-cli-bin`, `fastly-api-token`,
      `fastly-service-id`, plus forwarded `working-directory`, `manifest`,
-     `build-mode`, `build-args`, `deploy-args`, `cache`, and `stage` (§5.4).
+     `rust-toolchain`, `build-mode`, `build-args`, `deploy-args`, `cache`, and
+     `stage` (§5.4).
    - Map `fastly-api-token` → `provider-env: {FASTLY_API_TOKEN: …}` and
      `fastly-service-id` → action-owned `deploy-flags: ["--service-id", …]` (typed
      flags, placed BEFORE `--`); when `stage: true`, add `--staging`.

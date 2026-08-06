@@ -160,6 +160,24 @@ pub fn run_build(args: &BuildArgs) -> Result<(), String> {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
+    // Reject reserved staging-lifecycle spellings in the passthrough. `--staging` is
+    // a typed flag (before `--`); if it — or the renamed-away `--stage` — appears in
+    // the passthrough (after `--`), the operator meant to stage but `args.staging` is
+    // false, so this would silently run a PRODUCTION deploy and forward the token to
+    // a manifest deploy command that ignores the flag. Fail closed instead of aliasing.
+    if let Some(flag) = args
+        .adapter_args
+        .iter()
+        .find(|arg| arg.as_str() == "--staging" || arg.as_str() == "--stage")
+    {
+        return Err(format!(
+            "`{flag}` is not a passthrough deploy arg. To stage, use the typed flag: \
+             `deploy --adapter {} --staging` (before any `--`). Refusing to run a \
+             production deploy with `{flag}` after `--`.",
+            args.adapter
+        ));
+    }
+
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
 
@@ -460,6 +478,7 @@ pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
 ///
 /// Returns an error if the manifest cannot be loaded, the adapter is not
 /// configured, or the active version cannot be resolved.
+#[cfg(feature = "cli")]
 #[inline]
 pub fn run_active_version(args: &ActiveVersionArgs) -> Result<(), String> {
     // No manifest load: `active-version` is a pure Fastly-API operation keyed on
@@ -778,6 +797,27 @@ mod tests {
             "--service-id SVC1 --non-interactive",
             "manifest deploy command must receive the adapter args verbatim"
         );
+    }
+
+    #[test]
+    fn run_deploy_rejects_staging_spellings_in_passthrough() {
+        // A reserved lifecycle spelling after `--` must FAIL CLOSED before any deploy
+        // action runs — never silently route to production. The guard is the first
+        // thing run_deploy does, so no manifest/adapter setup is needed to reach it.
+        for flag in ["--stage", "--staging"] {
+            let args = DeployArgs {
+                adapter: "fastly".to_owned(),
+                adapter_args: vec![flag.to_owned()],
+                service_id: Some("SVC1".to_owned()),
+                staging: false,
+            };
+            let err = run_deploy(&args)
+                .expect_err("a reserved staging spelling in passthrough must be rejected");
+            assert!(
+                err.contains("--staging") && err.contains(flag),
+                "the error must name the flag and point at the typed --staging: {err}"
+            );
+        }
     }
 
     #[test]

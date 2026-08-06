@@ -93,13 +93,15 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
 8. **No Python in tooling or CI.** Validation, metadata checks, and security
    scans run through Bash, `jq`, and pinned release binaries (`actionlint`,
    `zizmor`). No `python3` heredocs and no `pip install`.
-9. **Pin third-party actions.** Third-party `uses:` in the repository's own
-   _workflows_ are referenced by their published major/minor tag (for example
-   `actions/checkout@v4`). Third-party `uses:` nested _inside a reusable action_
-   (`build-app-cli`, `deploy-fastly`, …) are pinned to a full commit SHA with a
-   readable version comment (`@<sha> # v4.6.2`): a consumer who SHA-pins one of
-   these actions cannot otherwise freeze a mutable child tag, so the action must
-   freeze it for them.
+9. **Pin third-party actions.** Every third-party `uses:` — in the repository's own
+   _workflows_ and nested _inside a reusable action_ (`build-app-cli`,
+   `deploy-fastly`, …) — is pinned to a concrete, immutable-or-released reference: a
+   full commit SHA or an exact released version tag (for example
+   `actions/checkout@v4` or `actions-rust-lang/setup-rust-toolchain@v1.17.0`). A
+   moving major alias (`@v4`) is discouraged and a branch/floating ref
+   (`@main`, `@develop`, `@latest`) is rejected. Both gates enforce this:
+   `check-action-pins.sh` accepts only a SHA or a version-tag shape, and
+   `.github/zizmor.yml` sets the `unpinned-uses` policy to `ref-pin`.
 10. **Safe by default.** Caching is opt-in, deploys require committed source, and
     provider credentials never reach outputs, summaries, caches, or
     action-global environment files.
@@ -609,7 +611,10 @@ probe it, roll back on failure.
    setup/build never hold the secret-bearing blob.
 6. In every non-deploy step (setup, build), unset each name in
    `provider-env-clear` (defense-in-depth against inherited caller `env:`).
-7. Reject NUL-containing argument or value entries.
+7. Reject NUL-containing argument or value entries. Reject `provider-env` values
+   containing CR or LF as well: the `$(base64 --decode)` that materializes each
+   value strips trailing newlines, so a value carrying one would be silently
+   truncated to a wrong credential.
 8. Apply the adapter's deploy-arg allowlist (wrapper-provided) to `deploy-args`.
 9. Resolve `working-directory` beneath `github.workspace` using canonical paths
    and symlink resolution; fail if missing or not a directory.

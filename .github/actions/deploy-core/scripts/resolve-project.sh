@@ -199,10 +199,19 @@ main() {
   fi
   target_dir="$cargo_ws_root/target"
 
+  # Workspace IDENTITY for the cache key: its path relative to the repo root (stable
+  # across runners, unlike the absolute path). Two nested workspaces at the same
+  # revision with matching lockfiles/toolchains cache DIFFERENT target/ dirs; without
+  # this they would share a key and clobber each other's cache.
+  local cargo_ws_rel
+  cargo_ws_rel="${cargo_ws_root#"$git_root"}"
+  cargo_ws_rel="${cargo_ws_rel#/}"
+  [[ -n "$cargo_ws_rel" ]] || cargo_ws_rel="root"
+
   local rust_toolchain effective_build_mode cache_key
   rust_toolchain=$(resolve_rust_toolchain "$rust_toolchain_input" "$app_dir" "$git_root" "$action_root")
   effective_build_mode=$(resolve_effective_build_mode "${EDGEZERO__BUILD__MODE:-auto}")
-  cache_key="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$rust_toolchain")-$(sanitize_ref "$target")-$(sanitize_ref "$cli_version")-${source_revision}-${lock_hash}"
+  cache_key="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$rust_toolchain")-$(sanitize_ref "$target")-$(sanitize_ref "$cli_version")-$(sanitize_ref "$cargo_ws_rel")-${source_revision}-${lock_hash}"
 
   append_output working-directory "$app_dir"
   append_output working-directory-relative "$app_rel"

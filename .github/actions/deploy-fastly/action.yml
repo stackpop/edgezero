@@ -248,10 +248,9 @@ runs:
         FASTLY_HOME: ""
 
     - name: Install Rust toolchain
-      # Pinned to a full commit SHA (with a readable version comment): a consumer
-      # who SHA-pins THIS action cannot otherwise freeze a mutable child tag, so
-      # nested third-party uses are hash-pinned regardless of the tag-pin policy
-      # that applies at the workflow level.
+      # Pinned to an exact released version tag, per the repo's pin policy
+      # (check-action-pins.sh + .github/zizmor.yml accept a SHA or a version tag;
+      # branch/floating refs are rejected).
       uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
       with:
         toolchain: ${{ steps.resolve.outputs['rust-toolchain'] }}
@@ -301,10 +300,17 @@ runs:
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/scripts/install-fastly.sh
 
-    - name: Build (validation)
-      if: ${{ steps.resolve.outputs['effective-build-mode'] == 'always' }}
+    # Runs on build-mode: always (a validation gate), AND whenever caching is on and
+    # the restore missed — so the target/ cache is SEEDED here, in a step that holds
+    # NO provider token, and never from the credential-bearing deploy below. A build
+    # script therefore cannot persist a secret into the cached target/.
+    - name: Build (validation / cache seed)
+      if: ${{ steps.resolve.outputs['effective-build-mode'] == 'always' || (inputs.cache == 'true' && steps.cache-restore.outputs['cache-hit'] != 'true') }}
       shell: bash
       env:
+        # Sourced at bash startup, before the script can scrub — blank them here too.
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__ADAPTER: fastly
@@ -330,6 +336,35 @@ runs:
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/run-app-cli.sh build
 
+    # Save from the CREDENTIAL-FREE build above, BEFORE the token-bearing deploy — so
+    # the cached target/ can never contain a secret a build script wrote during the
+    # deploy. (With build-mode: never and cache on, the seed build above runs solely
+    # to populate this cache; the deploy still recompiles, but that output is never
+    # cached.)
+    - name: Save application target cache
+      if: ${{ inputs.cache == 'true' && steps.cache-restore.outputs['cache-hit'] != 'true' }}
+      uses: actions/cache/save@v4.3.0
+      with:
+        key: ${{ steps.resolve.outputs['cache-key'] }}
+        path: ${{ steps.resolve.outputs['cache-path'] }}
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+
     # Production only: read the version active BEFORE we deploy — the rollback
     # target. Fastly cannot tell it apart from a staged version afterward, so it
     # must be captured now. Skipped for a staged deploy (staging rollback
@@ -339,6 +374,11 @@ runs:
       if: ${{ inputs.stage != 'true' }}
       shell: bash
       env:
+        # BASH_ENV/ENV are sourced at bash startup — BEFORE this step's script can
+        # scrub — so a caller's job env could otherwise run code here with the token
+        # in scope. Blank them in the token-bearing step itself, not only the ws step.
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
@@ -365,6 +405,10 @@ runs:
       id: deploy
       shell: bash
       env:
+        # BASH_ENV/ENV are sourced at bash startup, before this script can scrub —
+        # blank them so a caller's job env cannot run code here with the token.
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__ADAPTER: fastly
@@ -379,30 +423,6 @@ runs:
         EDGEZERO__FASTLY__API_TOKEN: ${{ inputs['fastly-api-token'] }}
         EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
       run: $GITHUB_ACTION_PATH/scripts/deploy.sh
-
-    - name: Save application target cache
-      if: ${{ inputs.cache == 'true' && steps.cache-restore.outputs['cache-hit'] != 'true' }}
-      uses: actions/cache/save@v4.3.0
-      with:
-        key: ${{ steps.resolve.outputs['cache-key'] }}
-        path: ${{ steps.resolve.outputs['cache-path'] }}
-      env:
-        FASTLY_API_TOKEN: ""
-        FASTLY_SERVICE_ID: ""
-        FASTLY_TOKEN: ""
-        FASTLY_KEY: ""
-        FASTLY_API_KEY: ""
-        FASTLY_AUTH_TOKEN: ""
-        FASTLY_API_ENDPOINT: ""
-        FASTLY_ENDPOINT: ""
-        FASTLY_API_URL: ""
-        FASTLY_PROFILE: ""
-        FASTLY_SERVICE_NAME: ""
-        FASTLY_DEBUG: ""
-        FASTLY_DEBUG_MODE: ""
-        FASTLY_CONFIG_FILE: ""
-        FASTLY_CARGO_PROFILE: ""
-        FASTLY_HOME: ""
 
     - name: Write summary
       if: ${{ always() }}

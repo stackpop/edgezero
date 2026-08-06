@@ -24,7 +24,7 @@ files=(
 status=0
 while IFS= read -r line; do
   # line format: <path>:<lineno>:<content>
-  ref=$(printf '%s' "$line" | sed -nE 's/.*uses:[[:space:]]*//p' | tr -d '"'"'"'')
+  ref=$(printf '%s' "$line" | sed -nE 's/.*uses[[:space:]]*:[[:space:]]*//p' | tr -d '"'"'"'')
   [[ -z "$ref" ]] && continue
   case "$ref" in
     ./* | docker://*) continue ;;
@@ -47,7 +47,9 @@ while IFS= read -r line; do
     echo "::error::action ref '@$suffix' is neither a full commit SHA nor a release version tag (mutable branch/floating refs are not allowed): $line" >&2
     status=1
   fi
-done < <(grep -rEn '^[[:space:]]*(-[[:space:]]+)?uses:' "${files[@]}" 2>/dev/null || true)
+# `uses[[:space:]]*:` — YAML (and actionlint) accept `uses : x`, so a space before
+# the colon must not slip an unpinned ref past this gate.
+done < <(grep -rEn '^[[:space:]]*(-[[:space:]]+)?uses[[:space:]]*:' "${files[@]}" 2>/dev/null || true)
 
 if [[ "$status" -eq 0 ]]; then
   echo "all third-party action references are pinned to a concrete ref"

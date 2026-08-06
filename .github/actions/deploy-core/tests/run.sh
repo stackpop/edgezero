@@ -461,6 +461,22 @@ test_workspace_step_scrub() {
     assert_succeeds "build-app-cli: '$step' blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
     assert_succeeds "build-app-cli: '$step' blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
   done
+
+  # The TOKEN-bearing run steps must blank BASH_ENV/ENV too: bash sources them at
+  # startup, before the step's script can scrub, so a caller's job env could
+  # otherwise run code with the provider token in scope.
+  local token_step
+  for token_step in \
+    "deploy-fastly|Capture rollback target" \
+    "deploy-fastly|Deploy" \
+    "healthcheck-fastly|Health check" \
+    "config-push-fastly|Config push" \
+    "rollback-fastly|Rollback"; do
+    a="${token_step%%|*}"; step="${token_step#*|}"
+    block=$(step_block "$ACTIONS_DIR/$a/action.yml" "$step")
+    assert_succeeds "$a: token step '$step' blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
+    assert_succeeds "$a: token step '$step' blanks ENV" grep -qF 'ENV: ""' <<<"$block"
+  done
 }
 
 test_workspace_isolation() {
@@ -1293,7 +1309,7 @@ cache_key_for() {
     GITHUB_OUTPUT="$out" \
     RUNNER_OS=Linux RUNNER_ARCH=X64 \
     EDGEZERO__ACTION__ROOT="$REPO_ROOT" \
-    EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY="${CK_WORKDIR:-app}" \
     EDGEZERO__PROJECT__RUST_TOOLCHAIN="${CK_TOOLCHAIN:-1.95.0}" \
     EDGEZERO__PROJECT__TARGET="${CK_TARGET:-wasm32-wasip1}" \
     EDGEZERO__APP__CLI__VERSION="${CK_CLI_VERSION:-1.0.0}" \
@@ -1333,6 +1349,21 @@ TOML
     bash -c "[[ '$(CK_TARGET=wasm32-unknown-unknown cache_key_for)' == '$base' ]]"
   assert_fails "a different app-CLI version changes the key" \
     bash -c "[[ '$(CK_CLI_VERSION=2.0.0 cache_key_for)' == '$base' ]]"
+
+  # Nested workspaces at the SAME revision with identical lockfiles/toolchains must
+  # NOT collide: a second workspace at a different path gets a different key.
+  mkdir -p "$ws/app-b/src"
+  cat >"$ws/app-b/Cargo.toml" <<'TOML'
+[package]
+name = "ck-fixture-b"
+version = "0.1.0"
+edition = "2021"
+TOML
+  echo 'fn main() {}' >"$ws/app-b/src/main.rs"
+  cp "$ws/app/Cargo.lock" "$ws/app-b/Cargo.lock"
+  git -C "$ws" add -A && git -C "$ws" commit -qm add-second-workspace
+  assert_fails "a second workspace at a different path does NOT share the key" \
+    bash -c "[[ '$(CK_WORKDIR=app-b cache_key_for)' == '$(cache_key_for)' ]]"
 
   # The lockfile hash is the point: new deps must not reuse an old target/.
   printf 'version = 3\n# changed\n' >"$ws/app/Cargo.lock"

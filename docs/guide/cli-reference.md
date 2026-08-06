@@ -478,10 +478,12 @@ Install the provider CLI:
 ## Building Your Own CLI
 
 `edgezero-cli` ships a library as well as a binary. Every downstream command is
-exposed as a `(*Args, run_*)` pair (`BuildArgs` / `run_build`, `DeployArgs` /
-`run_deploy`, `NewArgs` / `run_new`, `ServeArgs` / `run_serve`), so a downstream
-project can build its own CLI binary that reuses any subset of the built-ins and
-adds its own subcommands.
+exposed as a `(*Args, run_*)` pair — `BuildArgs` / `run_build`, `DeployArgs` /
+`run_deploy` (with `--staging` and `--service-id`), the Fastly staging-lifecycle
+trio `HealthcheckArgs` / `run_healthcheck`, `RollbackArgs` / `run_rollback`, and
+`ActiveVersionArgs` / `run_active_version`, plus `NewArgs` / `run_new` and
+`ServeArgs` / `run_serve` — so a downstream project can build its own CLI binary
+that reuses any subset of the built-ins and adds its own subcommands.
 
 The crate is not on crates.io — EdgeZero crates are `publish = false` until the
 first registry release — so depend on it by Git (or by path, in a local
