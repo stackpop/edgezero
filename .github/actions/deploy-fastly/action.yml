@@ -300,12 +300,14 @@ runs:
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/scripts/install-fastly.sh
 
-    # Runs on build-mode: always (a validation gate), AND whenever caching is on and
-    # the restore missed — so the target/ cache is SEEDED here, in a step that holds
-    # NO provider token, and never from the credential-bearing deploy below. A build
-    # script therefore cannot persist a secret into the cached target/.
+    # Runs on build-mode: always — a validation gate that ALSO seeds the target/
+    # cache from a step holding NO provider token, so a build script cannot persist a
+    # secret into the cache (the token-bearing deploy below is never cached). Note:
+    # this runs `<app-cli> build`, so it requires the app CLI to support `build`;
+    # that is why caching is tied to build-mode: always rather than forced on every
+    # cache=true (an app may deploy via a manifest command and implement no `build`).
     - name: Build (validation / cache seed)
-      if: ${{ steps.resolve.outputs['effective-build-mode'] == 'always' || (inputs.cache == 'true' && steps.cache-restore.outputs['cache-hit'] != 'true') }}
+      if: ${{ steps.resolve.outputs['effective-build-mode'] == 'always' }}
       shell: bash
       env:
         # Sourced at bash startup, before the script can scrub — blank them here too.
@@ -338,11 +340,12 @@ runs:
 
     # Save from the CREDENTIAL-FREE build above, BEFORE the token-bearing deploy — so
     # the cached target/ can never contain a secret a build script wrote during the
-    # deploy. (With build-mode: never and cache on, the seed build above runs solely
-    # to populate this cache; the deploy still recompiles, but that output is never
-    # cached.)
+    # deploy. Gated on build-mode: always because that is the step that produced a
+    # token-free target/; with build-mode: never nothing credential-free built the
+    # tree, so there is nothing safe to cache and the deploy's own compile is never
+    # saved.
     - name: Save application target cache
-      if: ${{ inputs.cache == 'true' && steps.cache-restore.outputs['cache-hit'] != 'true' }}
+      if: ${{ inputs.cache == 'true' && steps.resolve.outputs['effective-build-mode'] == 'always' && steps.cache-restore.outputs['cache-hit'] != 'true' }}
       uses: actions/cache/save@v4.3.0
       with:
         key: ${{ steps.resolve.outputs['cache-key'] }}

@@ -844,7 +844,12 @@ not today.
 
 ## 11. Caching
 
-`cache` enables opt-in application build caching, `false` by default.
+`cache` enables opt-in application build caching, `false` by default. The cache is
+only ever SAVED from the credential-free build step (`build-mode: always`), never
+after the token-bearing deploy — so a build script cannot persist a secret into the
+cached `target/`. With `build-mode: never` the deploy itself compiles (with the
+credential), and that output is deliberately not cached; caching therefore takes
+effect only under `build-mode: always`.
 
 ### 11.1 Git root vs Cargo workspace root
 
