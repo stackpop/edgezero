@@ -526,17 +526,15 @@ impl Adapter for FastlyCliAdapter {
         // Reject reserved keys before any expansion or I/O.
         reject_reserved_root_keys(entries)?;
         reject_duplicate_root_keys(entries)?;
-        // Expand each logical root once: flatten for the commit, and keep
-        // the exact per-root keep-set + the value written at the root key
-        // for GC (no prefix scan of the flattened set). Collecting all
-        // physical entries first also surfaces pointer-too-large errors
-        // before touching the remote store.
+        // Expand each logical root into its physical entries (chunks + pointer, or
+        // a single direct entry). Collecting them all first surfaces a
+        // pointer-too-large error before touching the remote store. A cloud push
+        // does NOT reclaim, so — unlike the local path — it keeps no per-root
+        // keep-set / root-value GC bookkeeping.
         let mut physical_entries: Vec<(String, String)> = Vec::new();
-        let mut roots: Vec<(String, HashSet<String>, String)> = Vec::with_capacity(entries.len());
         for (key, body) in entries {
-            let (expanded, new_keys, new_root_value) = expand_root(key, body)?;
+            let (expanded, ..) = expand_root(key, body)?;
             physical_entries.extend(expanded);
-            roots.push((key.clone(), new_keys, new_root_value));
         }
         if dry_run {
             // Report intent without shelling out. Stays fully offline: no
