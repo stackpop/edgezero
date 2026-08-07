@@ -126,7 +126,7 @@ mod tests {
     use super::*;
     use crate::body::Body;
     use crate::handler::IntoHandler as _;
-    use crate::http::{request_builder, Method, Response, StatusCode};
+    use crate::http::{Method, Response, StatusCode, request_builder};
     use crate::params::PathParams;
     use crate::response::response_with_body;
     use futures::executor::block_on;

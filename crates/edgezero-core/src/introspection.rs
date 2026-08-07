@@ -8,7 +8,7 @@ use crate::error::EdgeError;
 use crate::extractor::FromRequest;
 // NOTE: `Response` is an HTTP alias exported from `crate::http`, NOT
 // `crate::response` (response.rs itself imports it from crate::http).
-use crate::http::{response_builder, Response, StatusCode};
+use crate::http::{Response, StatusCode, response_builder};
 use crate::router::RouteInfo;
 use async_trait::async_trait;
 use edgezero_core::action;
@@ -112,7 +112,7 @@ pub async fn config(ctx: RequestContext) -> Result<Response, EdgeError> {
 mod tests {
     use super::*;
     use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
-    use crate::http::{request_builder, Method, Response};
+    use crate::http::{Method, Response, request_builder};
     use crate::router::RouterService;
     use crate::store_registry::{ConfigRegistry, ConfigStoreBinding, StoreRegistry};
     use async_trait::async_trait;
@@ -234,9 +234,10 @@ mod tests {
         // Shape: [{ "method", "path" }] — the /r route itself is present.
         let body = body_json(resp);
         let arr = body.as_array().expect("routes array");
-        assert!(arr
-            .iter()
-            .any(|entry| entry["method"] == "GET" && entry["path"] == "/r"));
+        assert!(
+            arr.iter()
+                .any(|entry| entry["method"] == "GET" && entry["path"] == "/r")
+        );
     }
 
     #[test]

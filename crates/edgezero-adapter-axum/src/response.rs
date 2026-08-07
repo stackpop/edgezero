@@ -2,7 +2,7 @@ use axum::body::Body as AxumBody;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, Response, StatusCode};
 use futures::executor::block_on;
-use futures_util::{pin_mut, StreamExt as _};
+use futures_util::{StreamExt as _, pin_mut};
 use tracing::error;
 
 use edgezero_core::body::Body;
@@ -58,7 +58,7 @@ fn error_response_500(message: &'static str) -> Response<AxumBody> {
 mod tests {
     use super::*;
     use edgezero_core::body::Body;
-    use edgezero_core::http::{response_builder, StatusCode};
+    use edgezero_core::http::{StatusCode, response_builder};
     use futures::stream;
 
     #[test]

@@ -23,9 +23,9 @@ use std::collections::HashMap;
 #[cfg(not(any(all(feature = "cloudflare", target_arch = "wasm32"), test)))]
 use std::convert::Infallible;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use worker::kv::KvStore as WorkerKvStore;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::Env;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use worker::kv::KvStore as WorkerKvStore;
 
 /// Config store backed by a Cloudflare KV namespace.
 ///

@@ -7,7 +7,7 @@ use edgezero_core::extractor::{Headers, Json, Path};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
-use futures::{stream, StreamExt as _};
+use futures::{StreamExt as _, stream};
 use std::env;
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
@@ -89,11 +89,11 @@ fn build_proxy_target(rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> 
         target.push_str(trimmed_rest);
     }
 
-    if let Some(query) = original_uri.query() {
-        if !query.is_empty() {
-            target.push('?');
-            target.push_str(query);
-        }
+    if let Some(query) = original_uri.query()
+        && !query.is_empty()
+    {
+        target.push('?');
+        target.push_str(query);
     }
 
     target
@@ -136,14 +136,13 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
-    use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
+    use edgezero_core::http::{Method, StatusCode, Uri, request_builder};
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
+    use edgezero_core::test_env::{EnvOverride, env_lock};
     use futures::executor::block_on;
     use std::collections::HashMap;
-    use std::env;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     struct TestProxyClient;
 
@@ -153,39 +152,6 @@ mod tests {
             let (_method, uri, _headers, _body, _) = request.into_parts();
             assert!(uri.to_string().contains("status/201"));
             Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
-        }
-    }
-
-    /// Serializes every test that reads or writes the `API_BASE_URL`
-    /// process-global env var -- concurrent `env::set_var` / `env::var`
-    /// across threads is unsound, so these tests must not overlap.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Restores `API_BASE_URL` to its prior value when dropped, so a
-    /// panicking assertion cannot leak process-global state.
-    struct EnvVarGuard {
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(value: &str) -> Self {
-            let original = env::var("API_BASE_URL").ok();
-            env::set_var("API_BASE_URL", value);
-            Self { original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => env::set_var("API_BASE_URL", value),
-                None => env::remove_var("API_BASE_URL"),
-            }
         }
     }
 
@@ -261,8 +227,8 @@ mod tests {
 
     #[test]
     fn build_proxy_target_merges_segments_and_query() {
-        let _lock = env_lock();
-        let _env = EnvVarGuard::set("https://example.com/api");
+        let _lock = env_lock().lock().expect("env lock");
+        let _env = EnvOverride::set("API_BASE_URL", "https://example.com/api");
         let original = Uri::from_static("/proxy/status?foo=bar");
         let target = build_proxy_target("status/200", &original).expect("target uri");
         assert_eq!(
@@ -273,7 +239,7 @@ mod tests {
 
     #[test]
     fn proxy_demo_without_handle_returns_placeholder() {
-        let _lock = env_lock();
+        let _lock = env_lock().lock().expect("env lock");
         let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -281,7 +247,7 @@ mod tests {
 
     #[test]
     fn proxy_demo_uses_injected_handle() {
-        let _lock = env_lock();
+        let _lock = env_lock().lock().expect("env lock");
 
         let mut request = request_builder()
             .method(Method::GET)

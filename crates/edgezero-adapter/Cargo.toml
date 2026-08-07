@@ -1,9 +1,11 @@
 [package]
 name = "edgezero-adapter"
-version = "0.1.0"
-edition = "2021"
-license = { workspace = true }
 description = "Adapter registry and traits for EdgeZero adapters"
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true

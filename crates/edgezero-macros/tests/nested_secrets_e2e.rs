@@ -17,7 +17,7 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
 use edgezero_core::context::RequestContext;
 use edgezero_core::extractor::{AppConfig as AppConfigExtractor, FromRequest as _};
-use edgezero_core::http::{request_builder, Method};
+use edgezero_core::http::{Method, request_builder};
 use edgezero_core::params::PathParams;
 use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
 use edgezero_core::store_registry::{

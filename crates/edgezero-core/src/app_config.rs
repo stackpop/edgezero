@@ -25,9 +25,9 @@ use std::thread_local;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
+use toml::Value;
 use toml::de::Error as TomlDeError;
 use toml::value::Datetime;
-use toml::Value;
 use validator::{Validate, ValidationErrors};
 
 /// One segment of a [`SecretField`] path.
@@ -347,23 +347,21 @@ fn prune_secret_leaf(errors: &mut ValidationErrors, path: &[SecretPathSegment]) 
         };
 
     let mut clear = false;
-    if kind_is_array {
-        if let Some(ValidationErrorsKind::List(items)) = errors.errors_mut().get_mut(name.as_ref())
-        {
-            for inner in items.values_mut() {
-                prune_secret_leaf(inner, tail);
-            }
-            items.retain(|_, inner| !inner.errors().is_empty());
-            clear = items.is_empty();
-        }
-    }
-    if !kind_is_array {
-        if let Some(ValidationErrorsKind::Struct(inner)) =
-            errors.errors_mut().get_mut(name.as_ref())
-        {
+    if kind_is_array
+        && let Some(ValidationErrorsKind::List(items)) = errors.errors_mut().get_mut(name.as_ref())
+    {
+        for inner in items.values_mut() {
             prune_secret_leaf(inner, tail);
-            clear = inner.errors().is_empty();
         }
+        items.retain(|_, inner| !inner.errors().is_empty());
+        clear = items.is_empty();
+    }
+    if !kind_is_array
+        && let Some(ValidationErrorsKind::Struct(inner)) =
+            errors.errors_mut().get_mut(name.as_ref())
+    {
+        prune_secret_leaf(inner, tail);
+        clear = inner.errors().is_empty();
     }
     if clear {
         errors.errors_mut().remove(name.as_ref());
@@ -743,6 +741,7 @@ fn walk_and_overlay(
 )]
 mod tests {
     use super::*;
+    use crate::test_env::{EnvOverride, env_lock};
     use serde::Deserialize;
     use std::io::Write as _;
     use tempfile::NamedTempFile;
@@ -1077,14 +1076,14 @@ timeout_ms = 1500
         );
         let app_name = "overlay_disabled_test";
         let env_key = "OVERLAY_DISABLED_TEST__GREETING";
-        env::set_var(env_key, "should-be-ignored");
+        let _lock = env_lock().lock().expect("env lock");
+        let _override = EnvOverride::set(env_key, "should-be-ignored");
         let cfg = load_app_config_with_options::<FixtureConfig>(
             file.path(),
             app_name,
             &AppConfigLoadOptions { env_overlay: false },
         )
         .expect("load");
-        env::remove_var(env_key);
         assert_eq!(cfg.greeting, "hello", "overlay disabled: file value wins");
     }
 

@@ -12,8 +12,8 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Expr, ExprLit, Field, Fields, GenericArgument,
-    Ident, Lit, Meta, MetaNameValue, Path, PathArguments, Type,
+    Attribute, Data, DeriveInput, Expr, ExprLit, Field, Fields, GenericArgument, Ident, Lit, Meta,
+    MetaNameValue, Path, PathArguments, Type, parse_macro_input,
 };
 
 /// Recognised `#[secret(...)]` annotation kinds.
@@ -451,16 +451,13 @@ fn type_is_bare_ident(ty: &Type, ident: &syn::Ident) -> bool {
 
 /// `Vec<T>` / `[T]` -> (T, true); otherwise (`field_ty`, false).
 fn nested_child_type(ty: &Type) -> (&Type, bool) {
-    if let Type::Path(type_path) = ty {
-        if let Some(last) = type_path.path.segments.last() {
-            if last.ident == "Vec" {
-                if let PathArguments::AngleBracketed(bracketed) = &last.arguments {
-                    if let Some(GenericArgument::Type(inner)) = bracketed.args.first() {
-                        return (inner, true);
-                    }
-                }
-            }
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(last) = type_path.path.segments.last()
+        && last.ident == "Vec"
+        && let PathArguments::AngleBracketed(bracketed) = &last.arguments
+        && let Some(GenericArgument::Type(inner)) = bracketed.args.first()
+    {
+        return (inner, true);
     }
     if let Type::Slice(slice) = ty {
         return (&slice.elem, true);
@@ -476,24 +473,22 @@ fn parse_secret_kind(attr: &Attribute) -> Result<SecretAnnotation, syn::Error> {
         Meta::Path(_) => Ok(SecretAnnotation::KeyInDefault),
         Meta::List(list) => {
             // Try `store_ref = "field"` first (name-value form).
-            if let Ok(nv) = syn::parse2::<MetaNameValue>(list.tokens.clone()) {
-                if nv.path.is_ident("store_ref") {
-                    if let Expr::Lit(ExprLit {
-                        lit: Lit::Str(str_lit),
-                        ..
-                    }) = nv.value
-                    {
-                        return Ok(SecretAnnotation::KeyInNamedStore {
-                            store_ref_field: str_lit.value(),
-                        });
-                    }
-                }
+            if let Ok(nv) = syn::parse2::<MetaNameValue>(list.tokens.clone())
+                && nv.path.is_ident("store_ref")
+                && let Expr::Lit(ExprLit {
+                    lit: Lit::Str(str_lit),
+                    ..
+                }) = nv.value
+            {
+                return Ok(SecretAnnotation::KeyInNamedStore {
+                    store_ref_field: str_lit.value(),
+                });
             }
             // Try bare `store_ref` path.
-            if let Ok(path) = syn::parse2::<Path>(list.tokens.clone()) {
-                if path.is_ident("store_ref") {
-                    return Ok(SecretAnnotation::StoreRef);
-                }
+            if let Ok(path) = syn::parse2::<Path>(list.tokens.clone())
+                && path.is_ident("store_ref")
+            {
+                return Ok(SecretAnnotation::StoreRef);
             }
             Err(syn::Error::new_spanned(
                 &list.tokens,
@@ -515,29 +510,24 @@ fn secret_string_optionality(ty: &Type) -> Option<bool> {
     if is_scalar_string_type(ty) {
         return Some(false);
     }
-    if let Type::Path(type_path) = ty {
-        if let Some(last) = type_path.path.segments.last() {
-            if last.ident == "Option" {
-                if let PathArguments::AngleBracketed(bracketed) = &last.arguments {
-                    if let Some(GenericArgument::Type(inner)) = bracketed.args.first() {
-                        if is_scalar_string_type(inner) {
-                            return Some(true);
-                        }
-                    }
-                }
-            }
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(last) = type_path.path.segments.last()
+        && last.ident == "Option"
+        && let PathArguments::AngleBracketed(bracketed) = &last.arguments
+        && let Some(GenericArgument::Type(inner)) = bracketed.args.first()
+        && is_scalar_string_type(inner)
+    {
+        return Some(true);
     }
     None
 }
 
 fn is_scalar_string_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        if type_path.qself.is_none() {
-            if let Some(last) = type_path.path.segments.last() {
-                return last.ident == "String" && last.arguments.is_empty();
-            }
-        }
+    if let Type::Path(type_path) = ty
+        && type_path.qself.is_none()
+        && let Some(last) = type_path.path.segments.last()
+    {
+        return last.ident == "String" && last.arguments.is_empty();
     }
     false
 }

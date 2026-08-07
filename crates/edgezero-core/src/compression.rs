@@ -3,9 +3,9 @@ use std::io;
 use async_compression::futures::bufread::{BrotliDecoder, GzipDecoder};
 use async_stream::try_stream;
 use bytes::Bytes;
+use futures::TryStream;
 use futures::io::{AsyncReadExt as _, BufReader};
 use futures::stream::Stream;
-use futures::TryStream;
 use futures_util::TryStreamExt as _;
 
 const BUFFER_SIZE: usize = 8 * 1024;
@@ -66,7 +66,7 @@ where
 mod tests {
     use super::*;
     use brotli::CompressorWriter;
-    use flate2::{write::GzEncoder, Compression};
+    use flate2::{Compression, write::GzEncoder};
     use futures::executor::block_on;
     use futures_util::stream;
     use std::io::Write as _;

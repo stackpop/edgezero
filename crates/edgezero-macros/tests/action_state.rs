@@ -10,7 +10,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::error::EdgeError;
     use edgezero_core::extractor::{Query, State};
-    use edgezero_core::http::{request_builder, Method, StatusCode};
+    use edgezero_core::http::{Method, StatusCode, request_builder};
     use edgezero_core::router::RouterService;
     use futures::executor::block_on;
     use serde::Deserialize;

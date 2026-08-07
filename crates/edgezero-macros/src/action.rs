@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
 use syn::punctuated::Punctuated;
-use syn::{spanned::Spanned as _, Error, FnArg, ItemFn, Pat, PathArguments, Token, Type};
+use syn::{Error, FnArg, ItemFn, Pat, PathArguments, Token, Type, spanned::Spanned as _};
 
 /// `(extract_stmts, arg_idents)` produced from a handler's argument list — the
 /// `FromRequest` extraction statements and the idents passed to the inner fn.
@@ -68,7 +68,7 @@ fn expand_action_impl(
         Err(err) => return err.to_compile_error(),
     };
 
-    let output = if is_capability_handler {
+    if is_capability_handler {
         // A fn can't carry per-handler data past type-erasure into
         // `Arc<dyn DynHandler>`, so an opt-in handler becomes a unit struct with
         // its own `DynHandler` impl whose `introspection_needs()` reports which
@@ -115,9 +115,7 @@ fn expand_action_impl(
                 ::edgezero_core::responder::Responder::respond(result)
             }
         }
-    };
-
-    output
+    }
 }
 
 /// Parse the optional `#[action(...)]` capability list into
@@ -231,15 +229,14 @@ fn path_is_request_context(path: &syn::Path) -> bool {
 fn normalize_request_context_patterns(func: &mut ItemFn) -> Result<(), Error> {
     let mut error: Option<Error> = None;
     for arg in &mut func.sig.inputs {
-        if let FnArg::Typed(pat_type) = arg {
-            if is_request_context_type(&pat_type.ty) {
-                if let Err(err) = normalize_request_context_pat(&mut pat_type.pat) {
-                    if let Some(existing) = error.as_mut() {
-                        existing.combine(err);
-                    } else {
-                        error = Some(err);
-                    }
-                }
+        if let FnArg::Typed(pat_type) = arg
+            && is_request_context_type(&pat_type.ty)
+            && let Err(err) = normalize_request_context_pat(&mut pat_type.pat)
+        {
+            if let Some(existing) = error.as_mut() {
+                existing.combine(err);
+            } else {
+                error = Some(err);
             }
         }
     }

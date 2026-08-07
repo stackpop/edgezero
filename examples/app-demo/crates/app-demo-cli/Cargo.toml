@@ -1,9 +1,11 @@
 [package]
 name = "app-demo-cli"
-version = "0.1.0"
-edition = "2021"
-license.workspace = true
-publish = false
+description = "CLI entry point for the EdgeZero app-demo example"
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true

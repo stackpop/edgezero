@@ -1,9 +1,11 @@
 [package]
 name = "edgezero-macros"
-edition = { workspace = true }
-version = { workspace = true }
+description = "Procedural macros (#[action], #[app]) for EdgeZero"
 authors = { workspace = true }
+edition = { workspace = true }
 license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true

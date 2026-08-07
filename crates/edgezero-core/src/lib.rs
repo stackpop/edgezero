@@ -38,5 +38,9 @@ pub mod response;
 pub mod router;
 pub mod secret_store;
 pub mod store_registry;
+/// Test-only env-var guards. The workspace's only `unsafe` lives here; see the
+/// module docs. Enable via the `test-utils` feature in `[dev-dependencies]`.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_env;
 
-pub use edgezero_macros::{action, app, AppConfig};
+pub use edgezero_macros::{AppConfig, action, app};

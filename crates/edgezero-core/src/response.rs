@@ -1,8 +1,8 @@
 use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::{
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
     HeaderValue, Response, StatusCode,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
 };
 
 /// Convert common return types into `Response`.
@@ -95,15 +95,15 @@ pub fn response_with_body(status: StatusCode, body: Body) -> Result<Response, Ed
 
     let mut builder = response_builder().status(status);
 
-    if let Body::Once(bytes) = &body {
-        if !bytes.is_empty() {
-            builder = builder
-                .header(CONTENT_LENGTH, bytes.len().to_string())
-                .header(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain; charset=utf-8"),
-                );
-        }
+    if let Body::Once(bytes) = &body
+        && !bytes.is_empty()
+    {
+        builder = builder
+            .header(CONTENT_LENGTH, bytes.len().to_string())
+            .header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
     }
 
     builder.body(body).map_err(EdgeError::internal)

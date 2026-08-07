@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// Major version range of `spin` CLI / runtime we've verified the
 /// `spin_key_value` schema against. Spin's `crates/key-value-spin`
@@ -222,15 +222,15 @@ pub(crate) fn write_batch(
     // racing `push_cloud`'s fake-spin tests; see its doc comment.
     verify_spin_runtime_compat();
 
-    if let Some(parent) = db_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "failed to create parent dir for `{}`: {err}",
-                    db_path.display()
-                )
-            })?;
-        }
+    if let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create parent dir for `{}`: {err}",
+                db_path.display()
+            )
+        })?;
     }
 
     let mut connection = Connection::open(db_path)
