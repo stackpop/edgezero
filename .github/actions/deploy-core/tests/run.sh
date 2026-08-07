@@ -1365,6 +1365,20 @@ TOML
   assert_fails "a second workspace at a different path does NOT share the key" \
     bash -c "[[ '$(CK_WORKDIR=app-b cache_key_for)' == '$(cache_key_for)' ]]"
 
+  # Sanitize-collision guard: `apps/api` and `apps-api` both sanitize to `apps-api`,
+  # so a sanitized workspace component would give them the SAME key. The hashed
+  # identity must keep them distinct.
+  mkdir -p "$ws/apps/api/src" "$ws/apps-api/src"
+  printf '[package]\nname = "ck-nested"\nversion = "0.1.0"\nedition = "2021"\n' >"$ws/apps/api/Cargo.toml"
+  printf '[package]\nname = "ck-flat"\nversion = "0.1.0"\nedition = "2021"\n' >"$ws/apps-api/Cargo.toml"
+  echo 'fn main() {}' >"$ws/apps/api/src/main.rs"
+  echo 'fn main() {}' >"$ws/apps-api/src/main.rs"
+  cp "$ws/app/Cargo.lock" "$ws/apps/api/Cargo.lock"
+  cp "$ws/app/Cargo.lock" "$ws/apps-api/Cargo.lock"
+  git -C "$ws" add -A && git -C "$ws" commit -qm add-collision-workspaces
+  assert_fails "apps/api and apps-api do NOT collide on the cache key" \
+    bash -c "[[ '$(CK_WORKDIR=apps/api cache_key_for)' == '$(CK_WORKDIR=apps-api cache_key_for)' ]]"
+
   # The lockfile hash is the point: new deps must not reuse an old target/.
   printf 'version = 3\n# changed\n' >"$ws/app/Cargo.lock"
   git -C "$ws" add -A && git -C "$ws" commit -qm lockfile-change
@@ -1738,6 +1752,41 @@ out healthy
 out status-code
 EOF
   )" "$(parse_action_surface "$ACTIONS_DIR/healthcheck-fastly/action.yml")"
+}
+
+test_action_pin_gate() {
+  section "action pin gate (branch/floating refs, all YAML key forms)"
+  local checker="$ACTIONS_DIR/deploy-core/tests/check-action-pins.sh"
+  local dir="$WORK_DIR/pins"
+  mkdir -p "$dir"
+
+  # Valid pins in block, quoted, and flow forms — a version tag and a full SHA —
+  # plus a commented-out branch ref that must be IGNORED (not a real `uses`).
+  cat >"$dir/ok.yml" <<'YML'
+steps:
+  - uses: actions/checkout@v4.3.0
+  - "uses": actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+  - { uses: actions/setup-node@v4 }
+  # uses: actions/checkout@main
+YML
+  assert_succeeds "valid pins (block/quoted/flow, tag+SHA) pass; a commented branch is ignored" \
+    bash "$checker" "$dir/ok.yml"
+
+  # Each mutable-ref form must be REJECTED — including the ones a line-anchored
+  # `uses:` grep misses: a quoted key, a flow mapping, and a space before the colon.
+  local bad
+  for bad in \
+    'uses: actions/checkout@main' \
+    '"uses": actions/checkout@develop' \
+    '{ uses: actions/checkout@latest }' \
+    'uses : actions/checkout@release-2'; do
+    printf 'steps:\n  - %s\n' "$bad" >"$dir/bad.yml"
+    assert_fails "a mutable ref is rejected: $bad" bash "$checker" "$dir/bad.yml"
+  done
+
+  # An entirely unpinned ref (no @) is rejected too.
+  printf 'steps:\n  - uses: actions/checkout\n' >"$dir/unpinned.yml"
+  assert_fails "an unpinned ref (no @) is rejected" bash "$checker" "$dir/unpinned.yml"
 }
 
 # ---------------------------------------------------------------------------
@@ -2204,6 +2253,7 @@ main() {
   test_action_metadata
   test_action_output_contracts
   test_action_public_surface
+  test_action_pin_gate
 
   printf '\nPassed: %d  Failed: %d\n' "$tests_passed" "$tests_failed"
   [[ "$tests_failed" -eq 0 ]]

@@ -136,6 +136,9 @@ steps:
       app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
       working-directory: apps/api
       manifest: edgezero.toml
+      # `cache` only takes effect with `build-mode: always` (the credential-free
+      # build that seeds the cache); with the Fastly default `never` it is a no-op.
+      build-mode: always
       cache: true
       fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
       fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}

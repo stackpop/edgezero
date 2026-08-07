@@ -165,11 +165,14 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     // the passthrough (after `--`), the operator meant to stage but `args.staging` is
     // false, so this would silently run a PRODUCTION deploy and forward the token to
     // a manifest deploy command that ignores the flag. Fail closed instead of aliasing.
-    if let Some(flag) = args
-        .adapter_args
-        .iter()
-        .find(|arg| arg.as_str() == "--staging" || arg.as_str() == "--stage")
-    {
+    if let Some(flag) = args.adapter_args.iter().find(|arg| {
+        let text = arg.as_str();
+        // Bare (`--staging`) AND equals-forms (`--staging=true`, `--stage=1`): a
+        // prefix match closes the `--stage=…` bypass that a bare `==` would miss.
+        matches!(text, "--staging" | "--stage")
+            || text.starts_with("--staging=")
+            || text.starts_with("--stage=")
+    }) {
         return Err(format!(
             "`{flag}` is not a passthrough deploy arg. To stage, use the typed flag: \
              `deploy --adapter {} --staging` (before any `--`). Refusing to run a \
@@ -804,7 +807,9 @@ mod tests {
         // A reserved lifecycle spelling after `--` must FAIL CLOSED before any deploy
         // action runs — never silently route to production. The guard is the first
         // thing run_deploy does, so no manifest/adapter setup is needed to reach it.
-        for flag in ["--stage", "--staging"] {
+        // Bare AND equals-forms: `--stage=true`/`--staging=1` must not slip past a
+        // bare-equality check and route to production.
+        for flag in ["--stage", "--staging", "--stage=true", "--staging=1"] {
             let args = DeployArgs {
                 adapter: "fastly".to_owned(),
                 adapter_args: vec![flag.to_owned()],

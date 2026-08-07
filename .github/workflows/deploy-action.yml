@@ -13,9 +13,17 @@ on:
       - .github/workflows/fastly-installer-check.yml
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
+      # The smoke fixture is a real Cargo app built against this workspace's crate
+      # graph, so a change to the CLI/core/macro crates, the workspace manifest and
+      # lockfile, or the pinned toolchain can change what the smoke compiles.
+      - Cargo.toml
+      - Cargo.lock
+      - .tool-versions
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
       - crates/edgezero-cli/**
+      - crates/edgezero-core/**
+      - crates/edgezero-macros/**
       - docs/guide/deploy-github-actions.md
       - docs/specs/**
   push:
@@ -31,9 +39,17 @@ on:
       - .github/workflows/fastly-installer-check.yml
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
+      # The smoke fixture is a real Cargo app built against this workspace's crate
+      # graph, so a change to the CLI/core/macro crates, the workspace manifest and
+      # lockfile, or the pinned toolchain can change what the smoke compiles.
+      - Cargo.toml
+      - Cargo.lock
+      - .tool-versions
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
       - crates/edgezero-cli/**
+      - crates/edgezero-core/**
+      - crates/edgezero-macros/**
       - docs/guide/deploy-github-actions.md
       - docs/specs/**
 

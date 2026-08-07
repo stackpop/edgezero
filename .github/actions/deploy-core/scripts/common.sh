@@ -117,6 +117,19 @@ sha256_file() {
   fi
 }
 
+# Hex sha256 of an ARBITRARY string (no trailing newline added), for building a
+# collision-free identity when `sanitize_ref` would fold distinct inputs together
+# (e.g. `apps/api` and `apps-api` both sanitize to `apps-api`).
+sha256_string() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{ print $1 }'
+  else
+    fail "required command 'sha256sum' or 'shasum' was not found"
+  fi
+}
+
 read_tool_version() {
   local file="$1"
   local tool="$2"

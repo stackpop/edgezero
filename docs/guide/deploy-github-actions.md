@@ -145,6 +145,10 @@ workspace may be the subdirectory itself), so a monorepo caches the right
     app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     working-directory: apps/api
     manifest: edgezero.toml
+    # `cache` only takes effect with `build-mode: always` — that credential-free
+    # build is what seeds the cache (the token-bearing deploy is never cached). With
+    # the Fastly default `build-mode: never`, `cache: true` is a no-op.
+    build-mode: always
     cache: true
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
