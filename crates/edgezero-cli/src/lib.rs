@@ -210,17 +210,31 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     // inherited env var so that child BORROWS it instead of self-dead-
     // locking, while an unrelated concurrent provision still serialises.
     let lock_root = manifest_root_for_lock();
-    let _lock = provision_lock::ProvisionLock::acquire(&lock_root)?;
+    // Held (via its `Drop`) until the end of this function, so the lock
+    // stays taken for the whole deploy even though it's last *named* below.
+    let lock = provision_lock::ProvisionLock::acquire(&lock_root)?;
     // Advertise the held lock to the deploy subprocess (and its children)
     // via the child's own environment -- NOT the parent's global env, which
     // edition-2024 `set_var` would make unsafe and the workspace forbids.
     // A nested `<app>-cli provision` / `config push` inherits this and
     // BORROWS the lock instead of self-dead-locking.
+    // Advertise BOTH the lock path and the per-holder token so a nested
+    // provision can prove the advertised holder is still the one holding
+    // the lock (a stale/leaked advertisement carries a token that no longer
+    // matches the lock file and is refused). Both keys OVERRIDE any
+    // inherited ancestor advertisement (see `build_child_env`) so this
+    // deploy always advertises ITS OWN lock.
     let advert = provision_lock::ProvisionLock::lock_path_for(&lock_root);
-    let overlay = vec![(
-        provision_lock::LOCK_ENV.to_owned(),
-        advert.to_string_lossy().into_owned(),
-    )];
+    let overlay = vec![
+        (
+            provision_lock::LOCK_ENV.to_owned(),
+            advert.to_string_lossy().into_owned(),
+        ),
+        (
+            provision_lock::LOCK_TOKEN_ENV.to_owned(),
+            lock.token().to_owned(),
+        ),
+    ];
     adapter::execute_with_env_overlay(
         &args.adapter,
         adapter::Action::Deploy,

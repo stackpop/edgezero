@@ -87,9 +87,17 @@ static AXUM_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &[],
     },
     commands: CommandTemplates {
+        // Omit the `[adapters.axum.commands]` shell block: a shell override
+        // would take precedence over the registry dispatch and run cargo by
+        // package name, bypassing `axum.toml` (its `crate_dir` in
+        // particular). With no block, `build`/`serve` route through the
+        // axum.toml-aware registry adapter. These strings are unused while
+        // `emit_commands` is false; kept for parity with the other
+        // blueprints.
         build: "cargo build -p {crate}",
         serve: "cargo run -p {crate}",
         deploy: "# configure deployment for Axum",
+        emit_commands: false,
     },
     logging: LoggingDefaults {
         endpoint: None,

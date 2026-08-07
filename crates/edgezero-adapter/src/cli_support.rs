@@ -236,11 +236,13 @@ fn target_dir_from_args(args: &[String]) -> Option<PathBuf> {
 /// Extract a target-dir override from `--config` build args -- both the
 /// inline `--config build.target-dir="…"` form AND the `--config <file>`
 /// form (where the file's `[build] target-dir` is read). Cargo lets the
-/// LAST `--config` win. A file's relative `target-dir` is resolved against
-/// the config file's directory; an inline relative value is returned as-is
-/// for the caller to resolve against the build's working directory.
+/// LAST `--config` win. An inline value is parsed as a TOML expression (so
+/// `--config 'build.target-dir = "x"'` with spaces works exactly like
+/// `--config build.target-dir="x"`) and returned relative for the caller to
+/// resolve against the build's working directory; a config FILE's relative
+/// `target-dir` is resolved by [`config_build_target_dir`] against cargo's
+/// own base for that file.
 fn config_target_dir_from_args(crate_dir: &Path, args: &[String]) -> Option<PathBuf> {
-    const KEY: &str = "build.target-dir=";
     let mut last: Option<PathBuf> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -252,39 +254,51 @@ fn config_target_dir_from_args(crate_dir: &Path, args: &[String]) -> Option<Path
         let Some(spec) = raw.map(str::trim) else {
             continue;
         };
-        if let Some(value) = spec.strip_prefix(KEY) {
-            let unquoted = value.trim().trim_matches(|ch| ch == '"' || ch == '\'');
-            if !unquoted.is_empty() {
-                last = Some(PathBuf::from(unquoted));
+        if is_inline_config_kv(spec) {
+            // Inline `--config <toml>`: parse the whole payload as TOML
+            // rather than string-matching a fixed `key=` prefix, so a
+            // spaced `build.target-dir = "x"` is honoured, not dropped.
+            if let Some(target) = target_dir_from_toml_str(spec) {
+                last = Some(target);
             }
             continue;
         }
-        // `--config <file>`: read the file's `[build] target-dir`, resolved
-        // against the file's own directory.
-        if !is_inline_config_kv(spec) {
-            let cfg_path = resolve_dir_against(crate_dir, Path::new(spec));
-            if let Some(target) = config_build_target_dir(&cfg_path) {
-                let base = cfg_path.parent().unwrap_or(crate_dir);
-                last = Some(resolve_dir_against(base, &target));
-            }
+        // `--config <file>`: read the file's `[build] target-dir` (following
+        // `include`), already resolved against cargo's base for the file.
+        let cfg_path = resolve_dir_against(crate_dir, Path::new(spec));
+        if let Some(target) = config_build_target_dir(&cfg_path) {
+            last = Some(target);
         }
     }
     last
 }
 
-/// Whether a `--config` payload is an inline `dotted.key=value` (as opposed
-/// to a config FILE path). Keys are dotted identifiers with no path
-/// separators; a value containing `/` in its key half is a file path.
+/// Whether a `--config` payload is an inline TOML expression (as opposed to
+/// a config FILE path). Cargo treats `--config <arg>` as inline TOML when it
+/// parses as `dotted.key = value`; the key half (trimmed of the surrounding
+/// whitespace cargo permits) is a dotted identifier with no path separators.
 fn is_inline_config_kv(payload: &str) -> bool {
     match payload.split_once('=') {
         Some((key, _)) => {
-            !key.is_empty()
-                && key
+            let trimmed = key.trim();
+            !trimmed.is_empty()
+                && trimmed
                     .chars()
                     .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_'))
         }
         None => false,
     }
+}
+
+/// Navigate `[build] target-dir` out of a parsed TOML document string,
+/// returning the RAW (unresolved) value. Shared by the inline `--config`
+/// path and the config-file reader.
+fn target_dir_from_toml_str(raw: &str) -> Option<PathBuf> {
+    let doc: toml::Value = toml::from_str(raw).ok()?;
+    doc.get("build")?
+        .get("target-dir")?
+        .as_str()
+        .map(PathBuf::from)
 }
 
 /// Resolve a possibly-relative target dir against `base` (absolute values
@@ -298,14 +312,55 @@ fn resolve_dir_against(base: &Path, dir: &Path) -> PathBuf {
     }
 }
 
-/// Read `[build] target-dir` from a cargo config file, if it declares one.
+/// Depth bound on `include` chains, guarding against cyclic or pathological
+/// config includes.
+const MAX_CONFIG_INCLUDE_DEPTH: usize = 16;
+
+/// Read `[build] target-dir` from a cargo config file, following `include`
+/// directives, and RESOLVE a relative value the way cargo does: a
+/// config-relative path is relative to the PARENT of the directory that
+/// contains the config file (for `<root>/.cargo/config.toml` that is
+/// `<root>`). The including file wins over its includes, matching cargo's
+/// merge order. Returns the resolved dir, or `None` if none is declared
+/// anywhere in the chain.
 fn config_build_target_dir(config_path: &Path) -> Option<PathBuf> {
+    config_build_target_dir_at(config_path, 0)
+}
+
+fn config_build_target_dir_at(config_path: &Path, depth: usize) -> Option<PathBuf> {
+    if depth > MAX_CONFIG_INCLUDE_DEPTH {
+        return None;
+    }
     let raw = fs::read_to_string(config_path).ok()?;
     let doc: toml::Value = toml::from_str(&raw).ok()?;
-    doc.get("build")?
-        .get("target-dir")?
-        .as_str()
-        .map(PathBuf::from)
+
+    // The including file's own `[build] target-dir` takes precedence.
+    if let Some(target) = doc
+        .get("build")
+        .and_then(|build| build.get("target-dir"))
+        .and_then(toml::Value::as_str)
+    {
+        // cargo base: the parent of the directory containing the config file.
+        let base = config_path.parent().and_then(Path::parent);
+        let dir = Path::new(target);
+        return Some(match base {
+            Some(parent) => resolve_dir_against(parent, dir),
+            None => dir.to_path_buf(),
+        });
+    }
+
+    // Otherwise follow `include` (a single path or an array), resolved
+    // against the including file's own directory, lowest precedence last.
+    let include_dir = config_path.parent()?;
+    let includes: Vec<&str> = match doc.get("include") {
+        Some(toml::Value::String(one)) => vec![one.as_str()],
+        Some(toml::Value::Array(many)) => many.iter().filter_map(toml::Value::as_str).collect(),
+        _ => return None,
+    };
+    includes.into_iter().find_map(|inc| {
+        let inc_path = resolve_dir_against(include_dir, Path::new(inc));
+        config_build_target_dir_at(&inc_path, depth.saturating_add(1))
+    })
 }
 
 /// Calculates the path distance between two directories based on shared leading components.
@@ -647,20 +702,68 @@ mod tests {
 
     #[test]
     fn resolve_target_dir_reads_config_file_arg() {
-        // `--config <file>` loads the file's `[build] target-dir`, resolved
-        // against the config file's own directory.
+        // `--config <file>` loads the file's `[build] target-dir`. cargo
+        // resolves a config-relative path against the PARENT of the
+        // directory containing the config file, so a file at
+        // `<crate>/cfg/alt-config.toml` resolves `file-out` against
+        // `<crate>` -- NOT against `<crate>/cfg`.
         let dir = tempdir().unwrap();
         let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join("cfg")).unwrap();
         fs::write(
-            crate_dir.join("alt-config.toml"),
+            crate_dir.join("cfg/alt-config.toml"),
             "[build]\ntarget-dir = \"file-out\"\n",
         )
         .unwrap();
         let ctx = AdapterExecContext::new();
-        let args = ["--config".to_owned(), "alt-config.toml".to_owned()];
+        let args = ["--config".to_owned(), "cfg/alt-config.toml".to_owned()];
         match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
             CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("file-out")),
             CargoTargetDir::Conventional => panic!("expected explicit from --config <file>"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_reads_spaced_inline_config() {
+        // cargo parses `--config <toml>` as a TOML expression, so a spaced
+        // `build.target-dir = "x"` must be honoured exactly like the
+        // unspaced `build.target-dir="x"` -- not dropped as a file path.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        let ctx = AdapterExecContext::new();
+        let args = [
+            "--config".to_owned(),
+            "build.target-dir = \"spaced-out\"".to_owned(),
+        ];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("spaced-out")),
+            CargoTargetDir::Conventional => panic!("expected explicit from spaced inline --config"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_follows_config_include() {
+        // A `--config <file>` whose `[build] target-dir` lives in an
+        // `include`d file must still be found. The base file is nested so
+        // the parent-of-parent resolution lands on `<crate>`.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join("cfg")).unwrap();
+        fs::write(
+            crate_dir.join("cfg/base.toml"),
+            "include = \"included.toml\"\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_dir.join("cfg/included.toml"),
+            "[build]\ntarget-dir = \"inc-out\"\n",
+        )
+        .unwrap();
+        let ctx = AdapterExecContext::new();
+        let args = ["--config".to_owned(), "cfg/base.toml".to_owned()];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("inc-out")),
+            CargoTargetDir::Conventional => panic!("expected explicit from included config"),
         }
     }
 

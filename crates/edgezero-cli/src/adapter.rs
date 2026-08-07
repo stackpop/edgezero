@@ -60,7 +60,9 @@ impl From<Action> for AdapterAction {
 ///   1. Parent env -- an operator's `KEY=v edgezero serve` wins over
 ///      everything. `Command` has no inherit-then-override per key, so
 ///      a parent-set key is simply never pushed here and the child
-///      inherits it untouched.
+///      inherits it untouched. EXCEPTION: the provision-lock
+///      advertisement keys ([`is_lock_advertisement_key`]) always
+///      override, so a nested deploy advertises its OWN lock.
 ///   2. The `.env` overlay (Spin's `<spin_dir>/.env`, Axum's
 ///      `.edgezero/.env`).
 ///   3. Manifest `[environment.variables]` -- a DEFAULT, not an
@@ -77,8 +79,13 @@ fn build_child_env(
 ) -> Result<Vec<(String, String)>, String> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |key: &str, value: String| {
-        // Parent wins: never shadow a key the operator exported.
-        if env::var_os(key).is_some() {
+        // Parent wins: never shadow a key the operator exported -- EXCEPT
+        // the provision-lock advertisement. A nested deploy MUST advertise
+        // ITS OWN lock path/token; if we deferred to an inherited ancestor
+        // advertisement, the child's nested provision would see the wrong
+        // path/token and dead-lock on this deploy's non-reentrant lock
+        // instead of borrowing it.
+        if !is_lock_advertisement_key(key) && env::var_os(key).is_some() {
             return;
         }
         out.retain(|(existing, _)| existing != key);
@@ -109,6 +116,15 @@ fn build_child_env(
         assert_required_secrets_present(adapter_name, env, &out)?;
     }
     Ok(out)
+}
+
+/// The provision-lock advertisement keys a nested deploy must be able to
+/// OVERRIDE in the child env (rather than defer to an inherited ancestor
+/// value). Kept next to `build_child_env`'s precedence rule so the two
+/// don't drift.
+fn is_lock_advertisement_key(key: &str) -> bool {
+    use crate::provision_lock::{LOCK_ENV, LOCK_TOKEN_ENV};
+    key == LOCK_ENV || key == LOCK_TOKEN_ENV
 }
 
 /// Every `[environment.secrets]` binding must resolve to a value the

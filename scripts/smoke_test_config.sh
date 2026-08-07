@@ -96,6 +96,7 @@ case "$ADAPTER" in
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
       config push --adapter axum --local --no-env --yes 2>&1)
     echo "==> Starting Axum adapter on port $PORT..."
+    smoke_require_port_free "$PORT"
     # `EnvSecretStore` resolves the `demo_api_token` key verbatim from the
     # process env, so /config/typed's secret walk needs it exported.
     (cd "$DEMO_DIR" && demo_api_token="$DEMO_SECRET_VALUE" \
@@ -118,6 +119,7 @@ case "$ADAPTER" in
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
       config push --adapter fastly --local --no-env --yes 2>&1)
     echo "==> Starting Fastly Viceroy on port $PORT..."
+    smoke_require_port_free "$PORT"
     # Warm-up's provision_typed wrote a `[[local_server.secret_stores.default]]`
     # entry mapping `demo_api_token` to the DEMO_API_TOKEN env var; export it
     # so viceroy resolves the secret /config/typed pulls in.
@@ -144,6 +146,7 @@ case "$ADAPTER" in
     printf 'demo_api_token="%s"\n' "$DEMO_SECRET_VALUE" \
       > "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
     echo "==> Starting Cloudflare wrangler dev on port $PORT..."
+    smoke_require_port_free "$PORT"
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!
     ;;
@@ -166,6 +169,7 @@ case "$ADAPTER" in
     (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
       config push --adapter spin --local --no-env --yes 2>&1)
     echo "==> Starting Spin on port $PORT..."
+    smoke_require_port_free "$PORT"
     # `--runtime-config-file runtime-config.toml` is REQUIRED — the
     # demo's spin.toml declares non-`default` KV labels
     # (`app_config`, `sessions`, `cache`) and Spin's runtime only

@@ -41,6 +41,7 @@ static FASTLY_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build: "fastly compute build -C {crate_dir}",
         deploy: "fastly compute deploy -C {crate_dir}",
         serve: "fastly compute serve -C {crate_dir}",
+        emit_commands: true,
     },
     logging: LoggingDefaults {
         endpoint: Some("stdout"),

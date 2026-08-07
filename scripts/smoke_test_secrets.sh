@@ -134,6 +134,7 @@ start_server() {
       echo "==> Building app-demo (axum)..."
       (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
       echo "==> Starting Axum adapter on port $PORT..."
+      smoke_require_port_free "$PORT"
       (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
       SERVER_PID=$!
       ;;
@@ -155,6 +156,7 @@ key = "SMOKE_SECRET"
 env = "SMOKE_SECRET"
 TOML
       echo "==> Starting Fastly Viceroy on port $PORT..."
+      smoke_require_port_free "$PORT"
       (cd "$DEMO_DIR" && fastly compute serve -C crates/app-demo-adapter-fastly 2>&1) &
       SERVER_PID=$!
       ;;
@@ -167,6 +169,7 @@ TOML
       # `.dev.vars` was backed up before warm-up; cleanup restores it.
       printf '%s=%s\n' "$SMOKE_SECRET_NAME" "$SMOKE_SECRET_VALUE" > "$DEV_VARS_FILE"
       echo "==> Starting Cloudflare wrangler dev on port $PORT..."
+      smoke_require_port_free "$PORT"
       (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
       SERVER_PID=$!
       ;;
@@ -240,6 +243,7 @@ with open(path, "w", encoding="utf-8") as fh:
     fh.write(text)
 PY
       echo "==> Starting Spin on port $PORT..."
+      smoke_require_port_free "$PORT"
       # SpinSecretStore normalises the key to lowercase, so SMOKE_SECRET maps to
       # the Spin variable smoke_secret.  Pass the value via SPIN_VARIABLE_SMOKE_SECRET.
       # `--runtime-config-file runtime-config.toml`: the demo's

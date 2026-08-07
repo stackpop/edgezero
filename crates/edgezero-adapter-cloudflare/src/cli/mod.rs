@@ -41,6 +41,7 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build: "wrangler build --cwd {crate_dir}",
         deploy: "wrangler deploy --cwd {crate_dir}",
         serve: "wrangler dev --cwd {crate_dir}",
+        emit_commands: true,
     },
     logging: LoggingDefaults {
         endpoint: None,
@@ -215,10 +216,28 @@ impl Adapter for CloudflareCliAdapter {
         Ok(())
     }
 
-    // Cloudflare has no adapter-specific canonicalisation rule on
-    // typed secret store bindings. Trait default no-op.
-    #[inline]
-    fn validate_typed_secrets(&self, _entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+    /// Cloudflare appends each typed secret as a `<key>=""` line into the
+    /// SAME `.dev.vars` that `provision_local` seeds with generated
+    /// `EDGEZERO__STORES__<KIND>__<ID>__NAME` / `__KEY` store-overlay lines,
+    /// and both batches share one `append_lines_dedup_with_header` pass. A
+    /// typed secret whose key falls in that reserved `EDGEZERO__STORES__`
+    /// namespace would dedup against a generated overlay line and one would
+    /// be silently dropped. Reject the collision here, in preflight, before
+    /// any write.
+    fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        const RESERVED_PREFIX: &str = "EDGEZERO__STORES__";
+        for entry in entries {
+            if entry
+                .key_value
+                .to_ascii_uppercase()
+                .starts_with(RESERVED_PREFIX)
+            {
+                return Err(format!(
+                    "cloudflare: typed secret key `{}` is reserved: the `{RESERVED_PREFIX}` namespace is generated into `.dev.vars` by provision (store `__NAME` / `__KEY` overlays), so a secret there would collide and be silently dropped. Rename the secret.",
+                    entry.key_value
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -505,6 +524,38 @@ mod tests {
             outcome.deployed.is_none(),
             "local provision_typed returns no deployed state"
         );
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_reserved_store_overlay_namespace() {
+        // A typed secret key in the `EDGEZERO__STORES__` namespace would
+        // collide (and be silently deduped away) against the generated
+        // store-overlay lines provision writes into the SAME `.dev.vars`.
+        // Preflight must refuse it.
+        let entries = [TypedSecretEntry::new(
+            TEST_SECRET_ID,
+            "collision",
+            "EDGEZERO__STORES__CONFIG__APP__KEY",
+        )];
+        let Err(err) = CloudflareCliAdapter.validate_typed_secrets(&entries) else {
+            panic!("a reserved-namespace secret key must be rejected");
+        };
+        assert!(
+            err.contains("reserved") && err.contains("EDGEZERO__STORES__"),
+            "error explains the reserved-namespace collision: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_typed_secrets_allows_ordinary_keys() {
+        let entries = [TypedSecretEntry::new(
+            TEST_SECRET_ID,
+            "api",
+            "demo_api_token",
+        )];
+        CloudflareCliAdapter
+            .validate_typed_secrets(&entries)
+            .expect("an ordinary secret key must pass preflight");
     }
 
     #[test]

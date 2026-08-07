@@ -19,12 +19,18 @@
 //! `.edgezero/.env`, `.edgezero/local-config-<id>.json`, the
 //! advisory lock) shares one gitignored directory. The parent dir
 //! is created lazily on first acquire. The file is created lazily
-//! and never truncated so multiple runs can share the sentinel
-//! across time.
+//! and opened without truncation so multiple runs share the sentinel
+//! (and its flock identity) across time; the lock OWNER rewrites its
+//! contents with a per-holder token (see [`LOCK_TOKEN_ENV`]) while
+//! holding the lock, which never changes the file's identity.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf, absolute};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs4::fs_std::FileExt;
 
@@ -38,6 +44,60 @@ use crate::path_safety::reject_symlink_components;
 /// file lock. An UNRELATED concurrent provision (a separate process tree,
 /// no inherited env) still serialises on the OS file lock.
 pub(crate) const LOCK_ENV: &str = "EDGEZERO_PROVISION_LOCK";
+
+/// Env var carrying the per-holder TOKEN that authenticates the [`LOCK_ENV`]
+/// advertisement. The owner writes a fresh token into the lock file while
+/// holding the lock and advertises the SAME token here. A nested provision
+/// borrows only when this env token matches the token currently in the lock
+/// file -- proving the current holder is the very process that advertised.
+/// A stale (ancestor already released, unrelated process now holds the
+/// lock), leaked, or forged advertisement carries a token that no longer
+/// matches the file, so the borrow is refused and the invocation serialises
+/// on the real OS lock instead of bypassing an unrelated holder.
+pub(crate) const LOCK_TOKEN_ENV: &str = "EDGEZERO_PROVISION_LOCK_TOKEN";
+
+/// Process-lifetime counter making concurrently-generated tokens distinct.
+static TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Mint a token unique enough to distinguish this holder from any other:
+/// pid + wall-clock nanos + a monotonic per-process sequence. This is an
+/// ownership PROOF, not a secret -- a forged token with no real holder is
+/// already caught (the non-blocking acquire succeeds and we own the lock),
+/// so the token only needs to be unforgeable-by-accident across live
+/// holders, which pid+time+seq satisfies.
+fn mint_token() -> String {
+    let pid = process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let seq = TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{pid}-{nanos}-{seq}")
+}
+
+/// Overwrite the lock file's contents with `token` while holding the lock.
+/// Truncates so a shorter new token can't leave a previous holder's
+/// trailing bytes behind. Best-effort: a write failure is non-fatal (the
+/// lock itself is held either way) but drops reentrancy to "serialise on
+/// the real lock", never "borrow past an unrelated holder".
+fn write_token(file: &File, token: &str) {
+    let mut handle: &File = file;
+    let len = u64::try_from(token.len()).unwrap_or(u64::MAX);
+    if handle.seek(SeekFrom::Start(0)).is_ok()
+        && handle.write_all(token.as_bytes()).is_ok()
+        && file.set_len(len).is_ok()
+    {
+        drop(handle.flush());
+    }
+}
+
+/// Read the token the current lock holder wrote at `path`. Reads do not
+/// require the advisory lock, so a borrower can read while the owner holds
+/// it. Returns an empty string on any read error (treated as "no match").
+fn read_token(path: &Path) -> String {
+    fs::read_to_string(path)
+        .map(|contents| contents.trim().to_owned())
+        .unwrap_or_default()
+}
 
 /// Guard object representing an active advisory lock. Drop it to
 /// release; the OS will also release automatically on process exit.
@@ -60,6 +120,11 @@ pub(crate) struct ProvisionLock {
     // lockfile path -- silence dead_code accordingly.
     #[cfg_attr(not(test), expect(dead_code, reason = "diagnostics-only field"))]
     path: PathBuf,
+    // The token that authenticates this held lock: minted+written when we
+    // OWN the main lock, or the file token we validated when we BORROW.
+    // `run_deploy` advertises it via `LOCK_TOKEN_ENV` so a nested provision
+    // can prove the advertised holder is still the one holding the lock.
+    token: String,
 }
 
 impl ProvisionLock {
@@ -136,60 +201,94 @@ impl ProvisionLock {
             })?;
             if acquired {
                 // No real holder despite the advertisement -- own it.
-                return Ok(Self {
-                    file,
-                    borrowed: false,
-                    path,
-                });
+                return Ok(Self::owned(file, path));
             }
-            // A real holder exists (our ancestor deploy). Don't take the
-            // main lock (that would self-deadlock the composed deploy), but
-            // DO serialise against SIBLING borrowers via a SEPARATE lock, so
-            // two provisions the same deploy spawns can't rewrite the same
-            // manifests / env files concurrently. Release the failed
-            // non-blocking attempt fd first.
-            drop(file);
-            let sibling_path = dot_edgezero.join("provision.borrow.lock");
-            reject_symlink_components(
-                manifest_root,
-                &sibling_path,
-                "the sibling provision lock path `<project>/.edgezero/provision.borrow.lock`",
-            )?;
-            let sibling = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&sibling_path)
-                .map_err(|err| {
-                    format!(
-                        "failed to open sibling provision lock at {}: {err}",
-                        sibling_path.display()
-                    )
-                })?;
-            sibling.lock_exclusive().map_err(|err| {
-                format!(
-                    "failed to acquire the sibling provision lock on {}: {err} -- another provision spawned by the same deploy may be running",
-                    sibling_path.display()
-                )
-            })?;
-            return Ok(Self {
-                file: sibling,
-                borrowed: true,
-                path,
-            });
+            // A real holder exists -- but is it the ancestor that advertised,
+            // or an UNRELATED process that happens to hold this path (the
+            // advertisement is stale/leaked)? Authenticate: the ancestor
+            // wrote its token into the lock file while holding it and
+            // advertised the SAME token via `LOCK_TOKEN_ENV`. Borrow ONLY
+            // when the file token matches; otherwise the holder is not our
+            // advertiser, so fall through to the blocking acquire below and
+            // serialise on the REAL lock rather than bypass an unrelated one.
+            let file_token = read_token(&path);
+            let env_token = env::var(LOCK_TOKEN_ENV).unwrap_or_default();
+            if !file_token.is_empty() && file_token == env_token {
+                return Self::borrow_via_sibling(manifest_root, &dot_edgezero, path, file_token);
+            }
         }
+        // Own the main lock: either no advertisement matched, or a matching
+        // advertisement failed authentication (stale/unrelated holder) so we
+        // block here until it releases rather than borrow past it.
         file.lock_exclusive().map_err(|err| {
             format!(
                 "failed to acquire exclusive provision lock on {}: {err} -- another `edgezero provision` or `edgezero config push` may be running against the same tree",
                 path.display()
             )
         })?;
-        Ok(Self {
+        Ok(Self::owned(file, path))
+    }
+
+    /// Build an OWNER guard: mint a token, stamp it into the (already
+    /// locked) file so a deploy spawned from here can advertise it, and
+    /// record it for [`token`](Self::token).
+    fn owned(file: File, path: PathBuf) -> Self {
+        let token = mint_token();
+        write_token(&file, &token);
+        Self {
             file,
             borrowed: false,
             path,
+            token,
+        }
+    }
+
+    /// Build a BORROWER guard for an authenticated ancestor deploy. Doesn't
+    /// take the main lock (that would self-deadlock the composed deploy) but
+    /// DOES hold a SEPARATE sibling lock so two provisions the same deploy
+    /// spawns can't rewrite the same manifests / env files concurrently.
+    fn borrow_via_sibling(
+        manifest_root: &Path,
+        dot_edgezero: &Path,
+        path: PathBuf,
+        token: String,
+    ) -> Result<Self, String> {
+        let sibling_path = dot_edgezero.join("provision.borrow.lock");
+        reject_symlink_components(
+            manifest_root,
+            &sibling_path,
+            "the sibling provision lock path `<project>/.edgezero/provision.borrow.lock`",
+        )?;
+        let sibling = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&sibling_path)
+            .map_err(|err| {
+                format!(
+                    "failed to open sibling provision lock at {}: {err}",
+                    sibling_path.display()
+                )
+            })?;
+        sibling.lock_exclusive().map_err(|err| {
+            format!(
+                "failed to acquire the sibling provision lock on {}: {err} -- another provision spawned by the same deploy may be running",
+                sibling_path.display()
+            )
+        })?;
+        Ok(Self {
+            file: sibling,
+            borrowed: true,
+            path,
+            token,
         })
+    }
+
+    /// The token authenticating this held lock, for `run_deploy` to
+    /// advertise via [`LOCK_TOKEN_ENV`] alongside the lock path.
+    pub(crate) fn token(&self) -> &str {
+        &self.token
     }
 
     #[cfg(test)]
@@ -249,6 +348,8 @@ mod tests {
             l1.owns_os_lock(),
             "the first acquire must OWN the lock (nothing held it yet)"
         );
+        // The owner stamped a token; advertise it so the borrow authenticates.
+        let _tok = EnvOverride::set(super::LOCK_TOKEN_ENV, OsStr::new(l1.token()));
         let l2 = ProvisionLock::acquire(temp.path()).expect("second acquire");
         assert!(
             !l2.owns_os_lock(),
@@ -282,6 +383,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_token_does_not_bypass_an_unrelated_holder() {
+        // LOCK_ENV matches the path AND a real lock is held, but the
+        // advertised TOKEN does NOT match the token the holder wrote -- i.e.
+        // the advertisement is stale/leaked and the current holder is
+        // unrelated. acquire must NOT borrow past it; it must serialise on
+        // the real OS lock (block until the holder releases, then own it).
+        use crate::test_support::{EnvOverride, manifest_guard};
+        use std::sync::PoisonError;
+        let _g = manifest_guard()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let advert = ProvisionLock::lock_path_for(temp.path());
+        let _env = EnvOverride::set(super::LOCK_ENV, advert.as_os_str());
+        let owner = ProvisionLock::acquire(temp.path()).expect("owner");
+        assert!(owner.owns_os_lock(), "owner holds the main lock");
+        // Advertise a token that does NOT match the owner's.
+        let _tok = EnvOverride::set(
+            super::LOCK_TOKEN_ENV,
+            OsStr::new("stale-token-does-not-match"),
+        );
+
+        let root = temp.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let lock = ProvisionLock::acquire(&root).expect("acquire");
+            let owns = lock.owns_os_lock();
+            tx.send(owns).expect("signal");
+            drop(lock);
+        });
+        // A stale token must NOT let the acquire return while the owner still
+        // holds the lock -- a borrow would return immediately.
+        let early = rx.recv_timeout(Duration::from_millis(150));
+        assert!(
+            early.is_err(),
+            "a stale token must block on the unrelated holder, not borrow past it"
+        );
+        drop(owner);
+        let owns = rx.recv().expect("await acquire");
+        handle.join().expect("join");
+        assert!(
+            owns,
+            "after the holder released, the acquire must OWN the real lock (never borrow on a stale token)"
+        );
+    }
+
+    #[test]
     fn sibling_borrowers_serialise_against_each_other() {
         // Two provisions the SAME deploy spawns both borrow the parent's
         // advertised lock -- but they must still serialise with EACH OTHER
@@ -298,6 +446,8 @@ mod tests {
         // The "deploy parent" owns the main lock.
         let owner = ProvisionLock::acquire(temp.path()).expect("owner");
         assert!(owner.owns_os_lock(), "owner holds the main lock");
+        // Advertise the owner's token so both siblings authenticate the borrow.
+        let _tok = EnvOverride::set(super::LOCK_TOKEN_ENV, OsStr::new(owner.token()));
 
         let root = temp.path().to_path_buf();
         let (tx, rx) = mpsc::channel();

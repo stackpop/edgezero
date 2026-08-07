@@ -75,6 +75,7 @@ case "$ADAPTER" in
     echo "==> Building app-demo (axum)..."
     (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
     echo "==> Starting Axum adapter on port $PORT..."
+    smoke_require_port_free "$PORT"
     (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
     SERVER_PID=$!
     ;;
@@ -85,6 +86,7 @@ case "$ADAPTER" in
       exit 1
     }
     echo "==> Starting Fastly Viceroy on port $PORT..."
+    smoke_require_port_free "$PORT"
     (cd "$DEMO_DIR" && fastly compute serve -C crates/app-demo-adapter-fastly 2>&1) &
     SERVER_PID=$!
     ;;
@@ -95,6 +97,7 @@ case "$ADAPTER" in
       exit 1
     }
     echo "==> Starting Cloudflare wrangler dev on port $PORT..."
+    smoke_require_port_free "$PORT"
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!
     ;;
@@ -107,6 +110,7 @@ case "$ADAPTER" in
     echo "==> Building Spin WASM (wasm32-wasip2)..."
     (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
     echo "==> Starting Spin on port $PORT..."
+    smoke_require_port_free "$PORT"
     # `--runtime-config-file runtime-config.toml`: the demo's
     # spin.toml declares non-`default` KV labels (`sessions`,
     # `cache`) and Spin's runtime only auto-provides the `default`

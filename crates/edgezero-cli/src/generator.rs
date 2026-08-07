@@ -475,21 +475,21 @@ fn render_manifest_section(
     crate_name: &str,
     crate_dir_rel: &str,
 ) -> Result<String, fmt::Error> {
-    let build_cmd = blueprint
-        .commands
-        .build
-        .replace("{crate}", crate_name)
-        .replace("{crate_dir}", crate_dir_rel);
-    let serve_cmd = blueprint
-        .commands
-        .serve
-        .replace("{crate}", crate_name)
-        .replace("{crate_dir}", crate_dir_rel);
-    let deploy_cmd = blueprint
-        .commands
-        .deploy
-        .replace("{crate}", crate_name)
-        .replace("{crate_dir}", crate_dir_rel);
+    // The declared adapter manifest path and its parent directory. For the
+    // flat generated layout `{manifest_dir}` equals `{crate_dir}`, but the
+    // Spin commands reference `{manifest}` / `{manifest_dir}` so they stay
+    // correct if the manifest is ever nested below the crate root.
+    let manifest_rel = format!("{crate_dir_rel}/{}", blueprint.manifest.manifest_filename);
+    let expand = |template: &str| {
+        template
+            .replace("{crate}", crate_name)
+            .replace("{manifest_dir}", crate_dir_rel)
+            .replace("{manifest}", &manifest_rel)
+            .replace("{crate_dir}", crate_dir_rel)
+    };
+    let build_cmd = expand(blueprint.commands.build);
+    let serve_cmd = expand(blueprint.commands.serve);
+    let deploy_cmd = expand(blueprint.commands.deploy);
 
     let mut out = String::new();
     writeln!(
@@ -512,12 +512,17 @@ fn render_manifest_section(
             .join(", ");
         writeln!(out, "features = [{joined}]")?;
     }
-    out.push('\n');
-    writeln!(
-        out,
-        "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n",
-        blueprint.id, build_cmd, deploy_cmd, serve_cmd,
-    )?;
+    // Adapters whose build/serve must honour their own manifest (Axum reads
+    // `axum.toml`) opt out of the shell `commands` block, which would
+    // otherwise take precedence over the manifest-aware registry dispatch.
+    if blueprint.commands.emit_commands {
+        out.push('\n');
+        writeln!(
+            out,
+            "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n",
+            blueprint.id, build_cmd, deploy_cmd, serve_cmd,
+        )?;
+    }
 
     out.push('\n');
     writeln!(out, "[adapters.{}.logging]", blueprint.id)?;
@@ -1220,6 +1225,25 @@ mod tests {
         assert!(
             manifest.contains("[adapters.spin"),
             "edgezero.toml should include spin adapter section"
+        );
+
+        // Axum omits the shell `commands` block so build/serve route through
+        // the axum.toml-aware registry adapter instead of a raw `cargo -p`
+        // shell override that would bypass the manifest.
+        assert!(
+            !manifest.contains("[adapters.axum.commands]"),
+            "axum must not emit a shell commands block: {manifest}"
+        );
+        // Spin's serve/deploy target the DECLARED manifest, not the crate
+        // root, so a nested spin.toml still resolves.
+        assert!(
+            manifest.contains("spin deploy --from crates/") && manifest.contains("/spin.toml"),
+            "spin deploy must point --from at the declared manifest: {manifest}"
+        );
+        assert!(
+            manifest.contains("--runtime-config-file crates/")
+                && manifest.contains("/runtime-config.toml"),
+            "spin serve must point --runtime-config-file next to the manifest: {manifest}"
         );
 
         let gitignore =

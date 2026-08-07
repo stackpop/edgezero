@@ -49,8 +49,14 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         // `--target-dir` CLI flag overrides `CARGO_TARGET_DIR`, keeping the
         // build output and `source` consistent by construction.
         build: "cargo build --target wasm32-wasip2 --release --target-dir target -p {crate}",
-        deploy: "spin deploy --from {crate_dir}",
-        serve: "spin up --from {crate_dir} --runtime-config-file {crate_dir}/runtime-config.toml",
+        // Point `--from` and the runtime config at the DECLARED manifest, not
+        // `{crate_dir}`: a nested manifest (e.g. `crates/server/config/spin.toml`)
+        // lives below the crate root, so `spin deploy/up --from {crate_dir}`
+        // and `{crate_dir}/runtime-config.toml` would miss it. `{manifest}` is
+        // the declared manifest path and `{manifest_dir}` its parent.
+        deploy: "spin deploy --from {manifest}",
+        serve: "spin up --from {manifest} --runtime-config-file {manifest_dir}/runtime-config.toml",
+        emit_commands: true,
     },
     logging: LoggingDefaults {
         endpoint: None,

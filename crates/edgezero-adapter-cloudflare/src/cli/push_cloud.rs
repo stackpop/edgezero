@@ -268,9 +268,12 @@ fn bulk_payload(entries: &[(String, String)]) -> Result<String, String> {
 ///
 /// # Mapping to `ReadConfigEntry`
 /// - Success (exit 0) → `Present(stdout)`.
-/// - Exit non-zero, stderr contains "not found" / "does not exist" → `MissingKey`.
+/// - Exit non-zero, stderr is an auth/config failure → `Err` (checked FIRST,
+///   so an auth message mentioning "binding"/"not found" is never misread as
+///   a missing store/key).
 /// - Exit non-zero, stderr mentions "binding" → `MissingStore` (the KV
 ///   namespace binding itself doesn't exist in `wrangler.toml`).
+/// - Exit non-zero, stderr contains "not found" / "does not exist" → `MissingKey`.
 /// - Any other non-zero exit → `Err`.
 pub(super) fn read_wrangler_kv_key(
     manifest_root: &Path,
@@ -322,18 +325,25 @@ pub(super) fn read_wrangler_kv_key(
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let lower = stderr.to_ascii_lowercase();
-    // A missing BINDING (the KV namespace itself) is a missing store --
-    // check it FIRST so "binding ... not found" isn't misread as a missing
-    // key.
+    // An AUTH/CONFIG failure ("API token not found", "unauthorized", ...) is
+    // surfaced as an error and must be checked BEFORE any missing-store /
+    // missing-key mapping: such messages routinely mention "binding" or
+    // "not found", and misclassifying them would make a diff report the
+    // whole store as missing (everything added) instead of failing loudly.
+    if is_wrangler_auth_or_config_error(&lower) {
+        return Err(format!(
+            "`wrangler kv key get --binding {binding} {key} {locality}` failed to authenticate or resolve configuration; run `edgezero auth login --adapter cloudflare` and check `wrangler.toml`\nstderr: {}",
+            stderr.trim()
+        ));
+    }
+    // A missing BINDING (the KV namespace itself) is a missing store -- check
+    // it before the key case so "binding ... not found" isn't misread as a
+    // missing key.
     if lower.contains("binding") {
         return Ok(ReadConfigEntry::MissingStore);
     }
-    // A genuinely absent KEY is a not-found -- but NEVER an auth/config
-    // failure like "API token not found", which is surfaced as an error so
-    // a diff doesn't report everything as added.
-    if !is_wrangler_auth_or_config_error(&lower)
-        && (lower.contains("not found") || lower.contains("does not exist"))
-    {
+    // A genuinely absent KEY is a not-found.
+    if lower.contains("not found") || lower.contains("does not exist") {
         return Ok(ReadConfigEntry::MissingKey);
     }
     Err(format!(
@@ -838,6 +848,38 @@ mod tests {
         assert!(
             matches!(result, ReadConfigEntry::MissingStore),
             "binding stderr => MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_auth_failure_that_mentions_binding() {
+        // An auth/config failure whose message ALSO contains "binding" must
+        // surface as an error -- not be misclassified as MissingStore, which
+        // would make a diff report the whole store as added.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning(
+            "",
+            "Error: Unauthorized [10000] while resolving binding APP_CONFIG",
+            1,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter.read_config_entry(
+            project_dir.path(),
+            Some("wrangler.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("an auth failure mentioning 'binding' must be an error, not MissingStore");
+        };
+        assert!(
+            err.contains("authenticate") || err.contains("Unauthorized"),
+            "the auth failure must surface: {err}"
         );
     }
 

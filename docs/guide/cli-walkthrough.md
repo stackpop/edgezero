@@ -146,8 +146,8 @@ Per-adapter behaviour:
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
   by the Fermyon stack). For each KV id AND each `[stores.config]` id (both KV-backed
   at runtime since the KV-config migration), appends the platform-resolved label to
-  the resolved `[component.<component>].key_value_stores = [...]` array. Secrets stay
-  manual — see [§5 Spin manual secret declarations](#5-spin-manual-secret-declarations).
+  the resolved `[component.<component>].key_value_stores = [...]` array. Typed
+  `#[secret]` variables are declared by `provision` — see [Spin secret variables](#spin-secret-variables).
 
 If your `spin.toml` declares more than one `[component.*]`, set
 `[adapters.spin.adapter].component = "<id>"` in `edgezero.toml` so `provision` knows
@@ -250,24 +250,23 @@ SET <key> <value>`).
   at build time), and the cloud writer shells out to the official
   Fermyon plugin.
 
-### Spin manual secret declarations
+### Spin secret variables
 
-`config push` never writes secret **values** or Spin secret variables — the blob
-stores each `#[secret]` field's key NAME (not its resolved value), and a
-`#[secret(store_ref)]` field's runtime key is code-local (e.g.
-`ctx.secret_store(&cfg.vault)?.require_str("active")`), so the CLI cannot infer it.
-Declare them manually in `spin.toml`:
+`provision --adapter spin --local` declares your typed `#[secret]` fields for
+you: for each one it adds a lowercased `[variables].<name> = { default = "",
+secret = true }` entry plus a `[component.<id>.variables].<name> = "{{ <name> }}"`
+binding to `spin.toml`, and seeds a `SPIN_VARIABLE_<NAME>=` line in the adapter's
+`.env`. Existing entries are left untouched, so a re-run never clobbers an
+operator edit. You do **not** hand-edit `spin.toml` for typed secrets.
 
-```toml
-[variables]
-api_token = { required = true, secret = true }  # the #[secret] field
+`config push` still never writes secret **values** — the blob stores each
+`#[secret]` field's key NAME, not its resolved value. Set the value at run time
+via `SPIN_VARIABLE_<NAME>=<value>` (or `spin up --env <NAME>=<value>`).
 
-[component.myapp.variables]
-api_token = "{{ api_token }}"
-```
-
-Then set the value at run time via `SPIN_VARIABLE_API_TOKEN=<value>` or
-`spin up --env API_TOKEN=<value>`.
+The one case the CLI cannot infer is a `#[secret(store_ref)]` field whose runtime
+key is code-local (e.g. `ctx.secret_store(&cfg.vault)?.require_str("active")`):
+declare that variable + binding in `spin.toml` yourself, since only your code
+knows the key.
 
 ## 6. Env-var overlay
 
@@ -315,13 +314,14 @@ myapp-cli build --adapter cloudflare
 myapp-cli deploy --adapter cloudflare
 ```
 
-For Spin (which has the most manual setup because of secret variables):
+For Spin:
 
 ```bash
 edgezero new myapp && cd myapp
-# Add manual secret declarations to crates/myapp-adapter-spin/spin.toml first
-# (see "Spin manual secret declarations" above)
 myapp-cli auth login --adapter spin
+# provision declares typed #[secret] variables in spin.toml for you; only
+# code-local #[secret(store_ref)] keys need a manual declaration first
+# (see "Spin secret variables" above)
 myapp-cli provision --adapter spin
 myapp-cli config validate --strict
 myapp-cli config push --adapter spin

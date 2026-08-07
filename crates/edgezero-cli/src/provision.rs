@@ -1247,7 +1247,13 @@ pub(crate) fn render_dry_run_report(
         let with_verb = rewritten
             .replacen("wrote ", "would write ", 1)
             .replacen("created ", "would create ", 1)
-            .replacen("appended ", "would append ", 1);
+            .replacen("appended ", "would append ", 1)
+            // Fastly pins a deployed `service_id` into fastly.toml; Cloudflare
+            // upserts a `kv binding` into wrangler.toml. Both were reported in
+            // the factual past tense, so a dry-run read as if the write had
+            // already happened -- rewrite them to the conditional too.
+            .replacen("pinned ", "would pin ", 1)
+            .replacen("kv binding ", "would bind kv ", 1);
         out.push_str(&with_verb);
         out.push('\n');
     }
@@ -2892,6 +2898,9 @@ ids = ["default"]
             "wrote crates/spin/spin.toml".to_owned(),
             "created .edgezero/.env".to_owned(),
             "appended crates/spin/.env".to_owned(),
+            "fastly: pinned service_id = \"abc123\" from deployed".to_owned(),
+            "cloudflare: kv binding `sessions` -> id `ns1` (logical id `sessions`) in wrangler.toml"
+                .to_owned(),
         ]);
         let allow_list = DryRunAllowList { pairs: vec![] };
         let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome);
@@ -2907,12 +2916,25 @@ ids = ["default"]
             report.contains("would append crates/spin/.env"),
             "verb-rewriting must turn 'appended' into 'would append': {report}"
         );
+        assert!(
+            report.contains("fastly: would pin service_id"),
+            "verb-rewriting must turn 'pinned' into 'would pin': {report}"
+        );
+        assert!(
+            report.contains("cloudflare: would bind kv `sessions`"),
+            "verb-rewriting must turn 'kv binding' into 'would bind kv': {report}"
+        );
         // Negative: raw verbs must not survive
         assert!(!report.contains("\nwrote "), "raw 'wrote' must be gone");
         assert!(!report.contains("\ncreated "), "raw 'created' must be gone");
         assert!(
             !report.contains("\nappended "),
             "raw 'appended' must be gone"
+        );
+        assert!(!report.contains(" pinned "), "raw 'pinned' must be gone");
+        assert!(
+            !report.contains(" kv binding "),
+            "raw 'kv binding' must be gone"
         );
     }
 

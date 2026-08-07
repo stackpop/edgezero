@@ -54,7 +54,7 @@ PORT=8787
 PASS=0
 FAIL=0
 # Fail-closed backup/restore of files the smoke mutates in place. Defines
-# `BACKUPS`, `backup_in_tree`, and `restore_backups`; a failed capture
+# `backup_in_tree`, `restore_backups`, and `reset_backups`; a failed capture
 # aborts before any mutation rather than recording a bad backup.
 # shellcheck source=lib/smoke_backup.sh
 . "$ROOT_DIR/scripts/lib/smoke_backup.sh"
