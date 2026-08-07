@@ -110,7 +110,7 @@ mod tests {
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{request_builder, response_builder, Response, StatusCode};
+    use edgezero_core::http::{Response, StatusCode, request_builder, response_builder};
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{SecretError, SecretHandle, SecretStore};

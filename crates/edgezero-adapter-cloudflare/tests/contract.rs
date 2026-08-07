@@ -18,14 +18,14 @@ mod tests {
 
     use bytes::Bytes;
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
-    use edgezero_adapter_cloudflare::request::{into_core_request, CloudflareService};
+    use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
     use edgezero_adapter_cloudflare::response::from_core_response;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{response_builder, Method, Response, StatusCode};
+    use edgezero_core::http::{Method, Response, StatusCode, response_builder};
     use edgezero_core::router::RouterService;
     use futures::stream;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};

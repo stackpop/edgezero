@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, Ident, LitStr, Token};
+use syn::{Ident, LitStr, Token, parse_macro_input};
 use validator::Validate as _;
 
 #[derive(Debug)]
@@ -335,7 +335,7 @@ fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> Tok
 
 #[cfg(test)]
 mod tests {
-    use super::{build_route_tokens, parse_handler_path, AppArgs, Manifest};
+    use super::{AppArgs, Manifest, build_route_tokens, parse_handler_path};
     use syn::parse_str;
 
     #[test]

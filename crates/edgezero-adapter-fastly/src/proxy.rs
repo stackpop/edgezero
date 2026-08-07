@@ -4,11 +4,11 @@ use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderMap, HeaderValue, Method, Uri};
-use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse, PROXY_HEADER};
+use edgezero_core::http::{HeaderMap, HeaderValue, Method, Uri, header};
+use edgezero_core::proxy::{PROXY_HEADER, ProxyClient, ProxyRequest, ProxyResponse};
 use fastly::{
-    error::anyhow, http::body::StreamingBody, Backend, Request as FastlyRequest,
-    Response as FastlyResponse,
+    Backend, Request as FastlyRequest, Response as FastlyResponse, error::anyhow,
+    http::body::StreamingBody,
 };
 use futures_util::stream::{BoxStream, StreamExt as _};
 use std::io::{self, Write as _};
@@ -210,7 +210,7 @@ fn transform_stream(
 mod tests {
     use super::*;
     use brotli::CompressorWriter;
-    use flate2::{write::GzEncoder, Compression};
+    use flate2::{Compression, write::GzEncoder};
     use futures::executor::block_on;
 
     fn collect_body(body: Body) -> Vec<u8> {

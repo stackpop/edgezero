@@ -56,7 +56,7 @@ use std::string::ToString;
 use proc_macro2::{Ident, Span};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{visit, GenericArgument, PathArguments, Token, Type};
+use syn::{GenericArgument, PathArguments, Token, Type, visit};
 use walkdir::WalkDir;
 
 // ---------------------------------------------------------------------------
@@ -233,10 +233,10 @@ fn type_contains_app_config_struct(ty: &Type, set: &HashSet<String>) -> Option<S
             if matches!(ident.as_str(), "Option" | "Vec" | "Box" | "Rc" | "Arc") {
                 if let PathArguments::AngleBracketed(ab) = &last.arguments {
                     for arg in &ab.args {
-                        if let GenericArgument::Type(inner) = arg {
-                            if let Some(found) = type_contains_app_config_struct(inner, set) {
-                                return Some(found);
-                            }
+                        if let GenericArgument::Type(inner) = arg
+                            && let Some(found) = type_contains_app_config_struct(inner, set)
+                        {
+                            return Some(found);
                         }
                     }
                 }

@@ -36,7 +36,7 @@ pub fn run_auth(args: &AuthArgs) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::args::{AuthArgs, AuthSub};
-    use crate::test_support::{manifest_guard, EnvOverride, BASIC_MANIFEST};
+    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use std::fs;
     use tempfile::TempDir;
 

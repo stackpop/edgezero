@@ -8,7 +8,7 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{request_builder, Extensions, Request};
+use edgezero_core::http::{Extensions, Request, request_builder};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
@@ -623,7 +623,7 @@ mod synthesis_tests {
     fn extended_request_extensions_are_visible_to_handler() {
         use edgezero_core::body::Body;
         use edgezero_core::context::RequestContext;
-        use edgezero_core::http::{request_builder, Method, StatusCode};
+        use edgezero_core::http::{Method, StatusCode, request_builder};
         use edgezero_core::router::RouterService;
         use futures::executor::block_on;
 

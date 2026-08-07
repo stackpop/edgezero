@@ -78,7 +78,7 @@ where
 mod tests {
     use super::*;
     use crate::body::Body;
-    use crate::http::{request_builder, Method, StatusCode};
+    use crate::http::{Method, StatusCode, request_builder};
     use crate::params::PathParams;
     use futures::executor::block_on;
 

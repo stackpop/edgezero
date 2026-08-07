@@ -76,10 +76,11 @@ mod tests {
     });
 
     use super::*;
-    use crate::test_utils::{env_guard, EnvOverride};
+    use crate::test_utils::env_guard;
     use bytes::Bytes;
     use edgezero_core::secret_store::InMemorySecretStore;
     use edgezero_core::secret_store_contract_tests;
+    use edgezero_core::test_env::EnvOverride;
     #[cfg(unix)]
     use std::ffi::OsString;
 
@@ -104,7 +105,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_bytes_returns_none_when_var_not_set() {
         let _guard = env_guard().lock().await;
-        let _env = EnvOverride::clear("__EDGEZERO_TEST_MISSING_VAR_XYZ__");
+        let _env = EnvOverride::remove("__EDGEZERO_TEST_MISSING_VAR_XYZ__");
         let store = EnvSecretStore::new();
         let result = store
             .get_bytes("env", "__EDGEZERO_TEST_MISSING_VAR_XYZ__")

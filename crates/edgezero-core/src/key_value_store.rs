@@ -277,11 +277,13 @@ macro_rules! key_value_store_contract_tests {
                         .await
                         .unwrap();
                     assert!(second.keys.iter().all(|key| key.starts_with("prefix/")));
-                    assert!(first
-                        .keys
-                        .iter()
-                        .chain(second.keys.iter())
-                        .all(|key| key.starts_with("prefix/")));
+                    assert!(
+                        first
+                            .keys
+                            .iter()
+                            .chain(second.keys.iter())
+                            .all(|key| key.starts_with("prefix/"))
+                    );
                 });
             }
         }
@@ -1021,11 +1023,11 @@ mod tests {
 
         async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
             let mut data = self.data.lock().unwrap();
-            if let Some((_, Some(exp))) = data.get(key) {
-                if SystemTime::now() >= *exp {
-                    data.remove(key);
-                    return Ok(None);
-                }
+            if let Some((_, Some(exp))) = data.get(key)
+                && SystemTime::now() >= *exp
+            {
+                data.remove(key);
+                return Ok(None);
             }
             Ok(data.get(key).map(|(value, _)| value.clone()))
         }

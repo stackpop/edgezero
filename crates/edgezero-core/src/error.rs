@@ -7,10 +7,10 @@ use thiserror::Error;
 use crate::body::Body;
 use crate::config_store::ConfigStoreError;
 use crate::http::{
-    header::{CONTENT_TYPE, RETRY_AFTER},
     HeaderValue, Method, Response, StatusCode,
+    header::{CONTENT_TYPE, RETRY_AFTER},
 };
-use crate::response::{response_with_body, IntoResponse};
+use crate::response::{IntoResponse, response_with_body};
 
 /// Application-level error that carries an HTTP status code.
 #[derive(Debug, Error)]

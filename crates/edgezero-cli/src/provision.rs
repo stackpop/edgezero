@@ -151,7 +151,7 @@ fn resolve_kind(
 mod tests {
     use super::*;
     use crate::args::ProvisionArgs;
-    use crate::test_support::{manifest_guard, EnvOverride, PROVISION_MANIFEST};
+    use crate::test_support::{EnvOverride, PROVISION_MANIFEST, manifest_guard};
     use std::fs;
     use tempfile::TempDir;
 

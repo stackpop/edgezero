@@ -11,10 +11,18 @@ This guide walks you through creating your first EdgeZero application.
 
 ## Installation
 
-Install the EdgeZero CLI from the workspace or a published crate:
+The EdgeZero crates are not published to crates.io. They are intentionally
+marked `publish = false` until the first registry release, so install the CLI
+from a local checkout:
 
 ```bash
 cargo install --path crates/edgezero-cli
+```
+
+Or straight from Git, without cloning first:
+
+```bash
+cargo install --git https://github.com/stackpop/edgezero.git edgezero-cli
 ```
 
 ## Create a New Project

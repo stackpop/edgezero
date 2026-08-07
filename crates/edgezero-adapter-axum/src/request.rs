@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 
-use axum::body::{to_bytes, Body as AxumBody};
+use axum::body::{Body as AxumBody, to_bytes};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::Request;
 use edgezero_core::body::Body;
-use edgezero_core::http::header::CONTENT_TYPE;
 use edgezero_core::http::HeaderValue;
 use edgezero_core::http::Request as CoreRequest;
+use edgezero_core::http::header::CONTENT_TYPE;
 use edgezero_core::proxy::ProxyHandle;
 
 use crate::context::AxumRequestContext;
@@ -119,10 +119,12 @@ mod tests {
 
         let context = AxumRequestContext::get(&core_request).expect("context");
         assert_eq!(context.remote_addr, Some("127.0.0.1:4000".parse().unwrap()));
-        assert!(core_request
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .is_none());
+        assert!(
+            core_request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .is_none()
+        );
     }
 
     #[tokio::test]

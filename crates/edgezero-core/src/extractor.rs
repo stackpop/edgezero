@@ -1006,7 +1006,7 @@ async fn resolve_leaf(
             return Err(EdgeError::config_out_of_date(
                 format!("missing or non-string value at `{leaf_path}`"),
                 leaf_path,
-            ))
+            ));
         }
     };
 
@@ -1147,7 +1147,7 @@ mod tests {
     use crate::body::Body;
     use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use crate::context::RequestContext;
-    use crate::http::{request_builder, HeaderValue, Method, StatusCode};
+    use crate::http::{HeaderValue, Method, StatusCode, request_builder};
     use crate::params::PathParams;
     use crate::secret_store::{InMemorySecretStore, NoopSecretStore, SecretHandle, SecretStore};
     use crate::store_registry::StoreRegistry;
@@ -2594,9 +2594,10 @@ mod tests {
         let err = block_on(secret_walk::<NestedCfg>(&ctx, &mut data))
             .expect_err("missing required nested leaf");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(err
-            .to_string()
-            .contains("integrations.datadome.server_side_key"));
+        assert!(
+            err.to_string()
+                .contains("integrations.datadome.server_side_key")
+        );
     }
 
     #[test]

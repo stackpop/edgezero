@@ -1,9 +1,11 @@
 [package]
 name = "edgezero-core"
-edition = { workspace = true }
-version = { workspace = true }
+description = "Core routing, extractors, middleware, and proxy primitives for EdgeZero"
 authors = { workspace = true }
+edition = { workspace = true }
 license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true
