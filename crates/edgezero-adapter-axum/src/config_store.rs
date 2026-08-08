@@ -181,10 +181,10 @@ impl ConfigStore for AxumConfigStore {
 /// root without finding one.
 ///
 /// Used by [`AxumConfigStore::local_path`] to keep push and runtime
-/// on the same path regardless of launch cwd. Pulled out as a free
-/// function so the same discovery rule can be reused by other
-/// runtime helpers in the future.
-fn find_project_root_dir() -> Option<PathBuf> {
+/// on the same path regardless of launch cwd. Also reused by the dev
+/// server's KV path anchoring so config and KV state land in the SAME
+/// `.edgezero` directory.
+pub(crate) fn find_project_root_dir() -> Option<PathBuf> {
     find_project_root_dir_from(&env::current_dir().ok()?)
 }
 

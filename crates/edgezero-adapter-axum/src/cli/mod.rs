@@ -189,6 +189,13 @@ impl Adapter for AxumCliAdapter {
     /// than writing an unrepresentable file.
     #[inline]
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        // Base provision writes generated `EDGEZERO__STORES__<KIND>__<ID>__NAME`
+        // / `__KEY` store-overlay lines into the SAME `.edgezero/.env` typed
+        // secrets are appended to, under one dedup pass. A secret key in that
+        // reserved namespace would collide and be silently dropped -- and the
+        // runtime secret lookup would then return the store LABEL as the
+        // credential. Reject it in preflight.
+        const RESERVED_PREFIX: &str = "EDGEZERO__STORES__";
         for entry in entries {
             let key = entry.key_value;
             let reason = if key.is_empty() {
@@ -201,6 +208,12 @@ impl Adapter for AxumCliAdapter {
                 Some("has leading or trailing whitespace")
             } else if key.starts_with('#') {
                 Some("starts with `#`, which `.env` readers treat as a comment")
+            } else if key.to_ascii_uppercase().starts_with(RESERVED_PREFIX) {
+                Some(
+                    "is in the reserved `EDGEZERO__STORES__` namespace that provision generates \
+                     into `.edgezero/.env` (store `__NAME` / `__KEY` overlays); a secret there \
+                     would collide and be silently dropped",
+                )
             } else {
                 None
             };
@@ -741,6 +754,25 @@ mod tests {
                 .validate_typed_secrets(&entries)
                 .expect_err("a key that cannot round-trip through a .env line must be rejected");
         }
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_reserved_store_overlay_namespace() {
+        // A secret key in the `EDGEZERO__STORES__` namespace would collide
+        // (and be silently deduped away) against the generated store-overlay
+        // lines base provision writes into the SAME `.edgezero/.env`.
+        let entries = vec![TypedSecretEntry::new(
+            "default",
+            "field",
+            "EDGEZERO__STORES__CONFIG__APP__KEY",
+        )];
+        let err = AXUM_ADAPTER
+            .validate_typed_secrets(&entries)
+            .expect_err("a reserved-namespace secret key must be rejected");
+        assert!(
+            err.contains("reserved") && err.contains("EDGEZERO__STORES__"),
+            "error explains the reserved-namespace collision: {err}"
+        );
     }
 
     #[test]

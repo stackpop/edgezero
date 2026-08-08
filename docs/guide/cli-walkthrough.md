@@ -253,11 +253,20 @@ SET <key> <value>`).
 ### Spin secret variables
 
 `provision --adapter spin --local` declares your typed `#[secret]` fields for
-you: for each one it adds a lowercased `[variables].<name> = { default = "",
-secret = true }` entry plus a `[component.<id>.variables].<name> = "{{ <name> }}"`
-binding to `spin.toml`, and seeds a `SPIN_VARIABLE_<NAME>=` line in the adapter's
-`.env`. Existing entries are left untouched, so a re-run never clobbers an
-operator edit. You do **not** hand-edit `spin.toml` for typed secrets.
+you. For each one it adds a lowercased `[variables]` entry plus a
+`[component.<id>.variables]` binding to `spin.toml`, and seeds a
+`SPIN_VARIABLE_<NAME>=` line in the adapter's `.env`:
+
+```toml
+[variables]
+api_token = { default = "", secret = true }
+
+[component.myapp.variables]
+api_token = "{{ api_token }}"
+```
+
+Existing entries are left untouched, so a re-run never clobbers an operator
+edit. You do **not** hand-edit `spin.toml` for typed secrets.
 
 `config push` still never writes secret **values** — the blob stores each
 `#[secret]` field's key NAME, not its resolved value. Set the value at run time
@@ -319,10 +328,12 @@ For Spin:
 ```bash
 edgezero new myapp && cd myapp
 myapp-cli auth login --adapter spin
-# provision declares typed #[secret] variables in spin.toml for you; only
-# code-local #[secret(store_ref)] keys need a manual declaration first
-# (see "Spin secret variables" above)
-myapp-cli provision --adapter spin
+# provision --local synthesises the gitignored spin.toml AND declares your
+# typed #[secret] variables in it. This is the step that writes the secret
+# bindings -- the cloud arm no-ops on typed secrets (Fermyon Cloud manages
+# variables). Only code-local #[secret(store_ref)] keys need a manual
+# declaration (see "Spin secret variables" above).
+myapp-cli provision --adapter spin --local
 myapp-cli config validate --strict
 myapp-cli config push --adapter spin
 myapp-cli build --adapter spin

@@ -37,6 +37,9 @@ pub(super) fn provision(
     // only by case would collapse onto one variable and `env_file`'s
     // dedup would silently drop the loser. Reject before any write.
     stores.reject_case_colliding_logical_ids()?;
+    // A user store named like the internal runtime-override config store
+    // would be merged into it -- reject before any write.
+    super::reject_reserved_store_names(stores)?;
 
     let fastly_rel = adapter_manifest_path.unwrap_or("fastly.toml");
     let fastly_path = manifest_root.join(fastly_rel);
@@ -85,7 +88,7 @@ pub(super) fn provision(
     for store in stores.kv {
         upsert_local_kv_store(&mut doc, &store.platform)?;
         status_lines.push(format!(
-            "fastly: local kv_store `{}` (logical id `{}`) in {path_display}",
+            "fastly: wrote local kv_store `{}` (logical id `{}`) in {path_display}",
             store.platform, store.logical
         ));
     }
@@ -97,7 +100,7 @@ pub(super) fn provision(
     for store in stores.config {
         upsert_local_config_store(&mut doc, &store.platform)?;
         status_lines.push(format!(
-            "fastly: local config_store `{}` (logical id `{}`) in {path_display}",
+            "fastly: wrote local config_store `{}` (logical id `{}`) in {path_display}",
             store.platform, store.logical
         ));
     }
@@ -166,7 +169,7 @@ pub(super) fn provision_typed(
             format!("{} (platform `{}`)", entry.store_id, entry.platform)
         };
         status_lines.push(format!(
-            "fastly: secret_store `{store_label}` key `{}` (env `{}`) in {path_display}",
+            "fastly: wrote secret_store `{store_label}` key `{}` (env `{}`) in {path_display}",
             entry.key_value,
             entry.key_value.to_ascii_uppercase(),
         ));
@@ -711,6 +714,39 @@ mod tests {
     }
 
     // ---------- provision (local mode) ----------
+
+    #[test]
+    fn local_provision_rejects_reserved_runtime_env_store_name() {
+        // A user store whose PLATFORM name resolves to the reserved
+        // `edgezero_runtime_env` (here via an env overlay on a benign logical
+        // id) would be merged into provision's own runtime-override store.
+        // Refuse before any write.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let config_ids = vec![ResolvedStoreId::new("app_config", "edgezero_runtime_env")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        let Err(err) = FastlyCliAdapter.provision(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &stores,
+            None,
+            ProvisionMode::Local,
+            false,
+        ) else {
+            panic!("a store colliding with the reserved runtime-env name must be refused");
+        };
+        assert!(
+            err.contains("reserved") && err.contains("edgezero_runtime_env"),
+            "error explains the reserved-name collision: {err}"
+        );
+    }
 
     #[test]
     fn synthesised_fastly_toml_honors_renamed_adapter_crate() {

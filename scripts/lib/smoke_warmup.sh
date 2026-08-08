@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared smoke warm-up: provisions per-adapter local state via the
 # generated app-demo-cli so smoke scripts can boot emulators on fresh
 # clones where Cloudflare/Fastly/Spin manifests are gitignored.
@@ -28,7 +29,7 @@ smoke_warmup_provision_local() {
     local adapter
     adapter="$(smoke_canonical_adapter "$1")"
     (
-        cd "$DEMO_DIR"
+        cd "$DEMO_DIR" || exit 1
         cargo run --quiet -p app-demo-cli -- \
             provision --adapter "$adapter" --local
     )

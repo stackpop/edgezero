@@ -1249,11 +1249,15 @@ pub(crate) fn render_dry_run_report(
             .replacen("created ", "would create ", 1)
             .replacen("appended ", "would append ", 1)
             // Fastly pins a deployed `service_id` into fastly.toml; Cloudflare
-            // upserts a `kv binding` into wrangler.toml. Both were reported in
-            // the factual past tense, so a dry-run read as if the write had
-            // already happened -- rewrite them to the conditional too.
+            // upserts a `kv binding` into wrangler.toml; Axum `ensured` the
+            // `.edgezero/.env` file. All were reported in the factual past
+            // tense, so a dry-run read as if the write had already happened --
+            // rewrite them to the conditional too. `ensured` is applied before
+            // `wrote`/`appended` above already ran, so a line carrying both
+            // (`ensured X + appended Y`) gets both verbs rewritten.
             .replacen("pinned ", "would pin ", 1)
-            .replacen("kv binding ", "would bind kv ", 1);
+            .replacen("kv binding ", "would bind kv ", 1)
+            .replacen("ensured ", "would ensure ", 1);
         out.push_str(&with_verb);
         out.push('\n');
     }
@@ -2901,6 +2905,9 @@ ids = ["default"]
             "fastly: pinned service_id = \"abc123\" from deployed".to_owned(),
             "cloudflare: kv binding `sessions` -> id `ns1` (logical id `sessions`) in wrangler.toml"
                 .to_owned(),
+            "axum: ensured .edgezero/.env + appended 3 lines to .edgezero/.env".to_owned(),
+            "fastly: wrote local kv_store `sessions` (logical id `sessions`) in fastly.toml"
+                .to_owned(),
         ]);
         let allow_list = DryRunAllowList { pairs: vec![] };
         let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome);
@@ -2923,6 +2930,14 @@ ids = ["default"]
         assert!(
             report.contains("cloudflare: would bind kv `sessions`"),
             "verb-rewriting must turn 'kv binding' into 'would bind kv': {report}"
+        );
+        assert!(
+            report.contains("axum: would ensure .edgezero/.env + would append 3 lines"),
+            "verb-rewriting must turn 'ensured'/'appended' into conditional: {report}"
+        );
+        assert!(
+            report.contains("fastly: would write local kv_store `sessions`"),
+            "verb-rewriting must turn fastly 'wrote local kv_store' into conditional: {report}"
         );
         // Negative: raw verbs must not survive
         assert!(!report.contains("\nwrote "), "raw 'wrote' must be gone");

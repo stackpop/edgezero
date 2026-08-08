@@ -260,13 +260,19 @@ spin cloud login    # one-time
 Spin secrets use `spin_sdk::variables`, which exposes a **single flat
 variable namespace** per component (no notion of multiple named secret
 stores). `[stores.secrets].ids.len() > 1` while targeting Spin is caught
-by `config validate --strict`. Secret variables are declared manually in
-`spin.toml` with `secret = true`:
+by `config validate --strict`.
+
+`provision --adapter spin --local` declares your typed `#[secret]` fields
+for you — it appends the `[variables]` entry and the
+`[component.<id>.variables]` binding to `spin.toml` (and a
+`SPIN_VARIABLE_<NAME>=` placeholder to the crate's `.env`). You only declare
+a variable by hand for a code-local `#[secret(store_ref)]` key the CLI can't
+infer. The generated shape is:
 
 ```toml
 # spin.toml
 [variables]
-api_token = { required = true, secret = true }
+api_token = { default = "", secret = true }
 
 [component.my-app.variables]
 api_token = "{{ api_token }}"

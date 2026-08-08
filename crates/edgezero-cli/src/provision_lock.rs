@@ -26,7 +26,7 @@
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek as _, SeekFrom, Write as _};
+use std::io::{self, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf, absolute};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,18 +76,18 @@ fn mint_token() -> String {
 
 /// Overwrite the lock file's contents with `token` while holding the lock.
 /// Truncates so a shorter new token can't leave a previous holder's
-/// trailing bytes behind. Best-effort: a write failure is non-fatal (the
-/// lock itself is held either way) but drops reentrancy to "serialise on
-/// the real lock", never "borrow past an unrelated holder".
-fn write_token(file: &File, token: &str) {
+/// trailing bytes behind. FAIL-CLOSED: the caller ([`ProvisionLock::owned`])
+/// turns an error here into a failed acquire, because a held lock with an
+/// UNPERSISTED token would advertise a token no nested provision can read
+/// back -- the nested borrow would fail authentication, block on the
+/// parent's lock, and dead-lock the composed deploy.
+fn write_token(file: &File, token: &str) -> io::Result<()> {
     let mut handle: &File = file;
     let len = u64::try_from(token.len()).unwrap_or(u64::MAX);
-    if handle.seek(SeekFrom::Start(0)).is_ok()
-        && handle.write_all(token.as_bytes()).is_ok()
-        && file.set_len(len).is_ok()
-    {
-        drop(handle.flush());
-    }
+    handle.seek(SeekFrom::Start(0))?;
+    handle.write_all(token.as_bytes())?;
+    file.set_len(len)?;
+    handle.flush()
 }
 
 /// Read the token the current lock holder wrote at `path`. Reads do not
@@ -201,7 +201,7 @@ impl ProvisionLock {
             })?;
             if acquired {
                 // No real holder despite the advertisement -- own it.
-                return Ok(Self::owned(file, path));
+                return Self::owned(file, path);
             }
             // A real holder exists -- but is it the ancestor that advertised,
             // or an UNRELATED process that happens to hold this path (the
@@ -226,21 +226,31 @@ impl ProvisionLock {
                 path.display()
             )
         })?;
-        Ok(Self::owned(file, path))
+        Self::owned(file, path)
     }
 
     /// Build an OWNER guard: mint a token, stamp it into the (already
     /// locked) file so a deploy spawned from here can advertise it, and
     /// record it for [`token`](Self::token).
-    fn owned(file: File, path: PathBuf) -> Self {
+    ///
+    /// FAIL-CLOSED: if the token can't be persisted, return an error rather
+    /// than a guard. Holding the lock while advertising a token the file
+    /// doesn't carry would make every nested provision fail authentication,
+    /// block on this lock, and dead-lock the composed deploy.
+    fn owned(file: File, path: PathBuf) -> Result<Self, String> {
         let token = mint_token();
-        write_token(&file, &token);
-        Self {
+        write_token(&file, &token).map_err(|err| {
+            format!(
+                "failed to persist the provision lock token to {}: {err} -- refusing to hold the lock with an unpersisted token, which would dead-lock a nested provision that cannot authenticate the borrow",
+                path.display()
+            )
+        })?;
+        Ok(Self {
             file,
             borrowed: false,
             path,
             token,
-        }
+        })
     }
 
     /// Build a BORROWER guard for an authenticated ancestor deploy. Doesn't

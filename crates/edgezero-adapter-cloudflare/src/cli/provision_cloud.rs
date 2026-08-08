@@ -212,6 +212,16 @@ fn provision_one_kv_store(
     // into wrangler.toml rather than calling `wrangler kv namespace
     // create` and orphaning a DUPLICATE namespace on Cloudflare.
     if let Some(tracked) = tracked_id {
+        // But a tracked id must be a REAL namespace id. A malformed value
+        // (hand-edited, a placeholder, or corruption -- e.g. `abc`) would
+        // otherwise be restored verbatim and make provision report success,
+        // while every later read/push against that fake id fails. Refuse
+        // loudly instead of silently trusting it.
+        if !is_real_namespace_id(tracked) {
+            return Err(format!(
+                "tracked KV namespace id `{tracked}` for binding `{binding}` (logical id `{logical}`) is not a valid Cloudflare namespace id (32-char lowercase hex). Fix or remove `[adapters.cloudflare.deployed].kv_namespaces.{logical}` in edgezero.toml; delete it to recreate the namespace on the next provision."
+            ));
+        }
         check_kv_namespaces_writeback_shape(wrangler_path)?;
         if dry_run {
             out.push(format!(
@@ -1058,6 +1068,53 @@ id = "00112233445566778899aabbccddeeff"
         assert_eq!(
             kv_ns.get(TEST_KV_ID).map(String::as_str),
             Some("abcdefabcdefabcdefabcdefabcdef00")
+        );
+    }
+
+    #[test]
+    fn provision_rejects_malformed_tracked_namespace_id() {
+        // A malformed tracked id (hand-edited / corrupt -- e.g. `abc`) must
+        // NOT be restored verbatim: that would make provision report success
+        // while every later read/push against the fake id fails. Refuse it.
+        let _guard = path_mutation_guard().lock().expect("path guard");
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\n",
+        );
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let tracked = tracked_kv(TEST_KV_ID, "abc");
+        // Per-store failures surface via `outcome.error` (not `Err`), matching
+        // the partial-failure contract.
+        let outcome = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                Some(&tracked),
+                ProvisionMode::Cloud,
+                false,
+            )
+            .expect("malformed-tracked-id surfaces via outcome.error, not Err");
+        let err = outcome
+            .error
+            .as_deref()
+            .expect("a malformed tracked namespace id must be refused");
+        assert!(
+            err.contains("abc") && err.contains("not a valid"),
+            "error explains the malformed tracked id: {err}"
+        );
+        // The garbage id must NOT have been written back.
+        let after = fs::read_to_string(dir.path().join("wrangler.toml")).expect("read");
+        assert!(
+            !after.contains("id = \"abc\""),
+            "malformed id must not be restored into wrangler.toml: {after}"
         );
     }
 

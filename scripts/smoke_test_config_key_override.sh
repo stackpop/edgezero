@@ -69,49 +69,34 @@ FAIL=0
 # the next boot will silently inherit the prior server's responses
 # and assertions will compare against stale state.
 stop_server() {
-  local rc=0
-  if [ -n "$SERVER_PID" ]; then
-    pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
-    kill -TERM "$SERVER_PID" 2>/dev/null || true
-    local waited=0
-    while [ "$waited" -lt 5 ] && kill -0 "$SERVER_PID" 2>/dev/null; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
-  fi
-  # Best-effort port-binder kill via lsof. The cargo-run wrapper
-  # often spawns a child that outlives the wrapper PID; pkill -P
-  # catches direct children, but a re-exec or grand-child can
-  # survive. lsof finds whoever's actually listening on $PORT.
-  if command -v lsof >/dev/null 2>&1; then
-    local port_pids
-    port_pids=$(lsof -ti ":${PORT}" 2>/dev/null || true)
-    if [ -n "$port_pids" ]; then
-      printf '  note: killing stray port-%s holder(s): %s\n' "$PORT" "$port_pids" >&2
-      # shellcheck disable=SC2086
-      kill -KILL $port_pids 2>/dev/null || true
-    fi
-  fi
-  # Verify the port is free; fail loud if not. A live port here
-  # means the next boot would either silently inherit the old
-  # server's responses or fail to bind -- either way the row's
-  # assertions would be meaningless.
+  # Delegate the actual kill + descendant/port hunt to the shared helper,
+  # which ONLY touches the port when a server was really launched (an empty
+  # `SERVER_PID` is a no-op). CRUCIAL: this is what a pre-launch `cleanup`
+  # hits, and without the shared guard it would SIGKILL whatever unrelated
+  # service already holds $PORT.
+  local had_server="$SERVER_PID"
+  smoke_stop_server "$SERVER_PID" "$PORT"
+  SERVER_PID=""
+  # Nothing was launched => nothing to verify or fail on.
+  [ -n "$had_server" ] || return 0
+  # Verify the port is actually free; fail loud if not. A live port here
+  # means the next boot would either silently inherit the old server's
+  # responses or fail to bind -- either way the row's assertions would be
+  # meaningless. Prefer `lsof` so a NON-HTTP listener is detected too; fall
+  # back to an HTTP probe only when `lsof` is unavailable.
   local waited=0
   while [ "$waited" -lt 10 ]; do
-    if ! curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -ti ":${PORT}" >/dev/null 2>&1 || return 0
+    elif ! curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
       return 0
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  printf '  FAIL  stop_server: port %s still serving after 10s -- prior runtime did not die\n' "$PORT" >&2
+  printf '  FAIL  stop_server: port %s still in use after 10s -- prior runtime did not die\n' "$PORT" >&2
   FAIL=$((FAIL + 1))
-  rc=1
-  return "$rc"
+  return 1
 }
 
 cleanup() {
@@ -330,9 +315,18 @@ seed_secret_for_adapter() {
 boot_runtime() {
   local adapter="$1"
   ensure_runtime_built "$adapter" || return 1
-  # Refuse to launch if the port is already taken. If we boot anyway,
-  # wait_for_port could return success on the OTHER process's response.
-  if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+  # Refuse to launch if the port is already taken (and NEVER kill the
+  # occupant -- it isn't ours). If we boot anyway, wait_for_port could
+  # return success on the OTHER process's response. Prefer `lsof` so a
+  # NON-HTTP listener is caught; fall back to an HTTP probe when `lsof`
+  # is unavailable.
+  local port_busy=""
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti ":${PORT}" >/dev/null 2>&1 && port_busy=1
+  elif curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+    port_busy=1
+  fi
+  if [ -n "$port_busy" ]; then
     printf '  FAIL  boot_runtime: port %s already in use; refusing to boot %s\n' "$PORT" "$adapter" >&2
     FAIL=$((FAIL + 1))
     return 1
@@ -420,7 +414,7 @@ for suite in "${SUITES[@]}"; do
   extra="${suite#*:}"
 
   skip_var="SKIP_$(upper "$adapter")"
-  eval "skip_val=\${${skip_var}:-0}"
+  skip_val="${!skip_var:-0}"
   if [ "$skip_val" = "1" ]; then
     printf '\n=== 12.7 __KEY override smoke: %s SKIPPED (%s=1) ===\n' "$adapter" "$skip_var"
     continue
@@ -447,8 +441,8 @@ for suite in "${SUITES[@]}"; do
 
   printf '\n=== 12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
   tmp=$(mktemp -d)
-  trap "cleanup; rm -rf '$tmp'" EXIT
-  trap "cleanup; rm -rf '$tmp'; exit 130" INT TERM
+  trap 'cleanup; rm -rf "$tmp"' EXIT
+  trap 'cleanup; rm -rf "$tmp"; exit 130' INT TERM
 
   # Back up EVERY operator-owned file/dir this row touches BEFORE warm-up.
   # `provision --local` (warm-up), the reset below, the secret seed, and
@@ -586,8 +580,8 @@ if [ "${SKIP_FASTLY:-0}" = "1" ]; then
 else
   printf '\n=== 9.3 Fastly chunk-pointer smoke ===\n'
   tmp=$(mktemp -d)
-  trap "cleanup; rm -rf '$tmp'" EXIT
-  trap "cleanup; rm -rf '$tmp'; exit 130" INT TERM
+  trap 'cleanup; rm -rf "$tmp"' EXIT
+  trap 'cleanup; rm -rf "$tmp"; exit 130' INT TERM
 
   # Back up fastly.toml BEFORE warm-up regenerates it (and before the
   # push / `seed_fastly_runtime_env` edit it in place), so cleanup

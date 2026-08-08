@@ -1227,23 +1227,18 @@ mod tests {
             "edgezero.toml should include spin adapter section"
         );
 
-        // Axum omits the shell `commands` block so build/serve route through
-        // the axum.toml-aware registry adapter instead of a raw `cargo -p`
-        // shell override that would bypass the manifest.
+        // Axum and Spin omit the shell `commands` block so build/serve/deploy
+        // route through the registry adapter, which reads the declared
+        // manifest dynamically (Axum's axum.toml, Spin's declared spin.toml)
+        // instead of a static shell override that bakes the path or bypasses
+        // the manifest.
         assert!(
             !manifest.contains("[adapters.axum.commands]"),
             "axum must not emit a shell commands block: {manifest}"
         );
-        // Spin's serve/deploy target the DECLARED manifest, not the crate
-        // root, so a nested spin.toml still resolves.
         assert!(
-            manifest.contains("spin deploy --from crates/") && manifest.contains("/spin.toml"),
-            "spin deploy must point --from at the declared manifest: {manifest}"
-        );
-        assert!(
-            manifest.contains("--runtime-config-file crates/")
-                && manifest.contains("/runtime-config.toml"),
-            "spin serve must point --runtime-config-file next to the manifest: {manifest}"
+            !manifest.contains("[adapters.spin.commands]"),
+            "spin must not emit a shell commands block: {manifest}"
         );
 
         let gitignore =

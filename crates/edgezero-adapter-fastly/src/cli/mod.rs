@@ -19,6 +19,36 @@ mod push_cloud;
 mod push_local;
 mod run;
 
+/// Fastly's INTERNAL runtime-override config store. Provision creates it and
+/// writes the `__NAME` / `__KEY` overlays into it (local Viceroy block and the
+/// cloud config-store). A user-declared store resolving to the SAME platform
+/// name would be merged into it, cross-contaminating operator config with the
+/// runtime overrides -- so the name is reserved.
+pub(super) const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
+
+/// Reject any declared store whose PLATFORM name collides with the reserved
+/// [`RUNTIME_ENV_STORE_NAME`], BEFORE provision writes anything. Shared by the
+/// local and cloud provision arms.
+pub(super) fn reject_reserved_store_names(stores: &ProvisionStores<'_>) -> Result<(), String> {
+    for (kind, group) in [
+        ("kv", stores.kv),
+        ("config", stores.config),
+        ("secrets", stores.secrets),
+    ] {
+        for store in group {
+            if store.platform == RUNTIME_ENV_STORE_NAME {
+                return Err(format!(
+                    "fastly: {kind} store `{}` (platform name `{}`) collides with the reserved runtime-override config store `{RUNTIME_ENV_STORE_NAME}` that provision manages. Rename the store id or its `EDGEZERO__STORES__{}__..__NAME` override.",
+                    store.logical,
+                    store.platform,
+                    kind.to_ascii_uppercase(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
 
 static FASTLY_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {

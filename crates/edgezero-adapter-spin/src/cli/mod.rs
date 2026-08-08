@@ -41,22 +41,20 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &["spin"],
     },
     commands: CommandTemplates {
-        // Pin `--target-dir target` so the wasm ALWAYS lands at the
-        // conventional workspace target that the synthesised `spin.toml`
-        // `source` references. Without it, a `CARGO_TARGET_DIR=custom` build
-        // would write elsewhere while `spin deploy` / `spin up` (which read
-        // `source`) kept serving the stale conventional artifact. The
-        // `--target-dir` CLI flag overrides `CARGO_TARGET_DIR`, keeping the
-        // build output and `source` consistent by construction.
+        // Omit the `[adapters.spin.commands]` shell block: a static shell
+        // override bakes the manifest PATH at `edgezero new` time, so moving
+        // the declaration to a nested `spin.toml` later would leave build /
+        // serve / deploy targeting the old path while provision uses the new
+        // one. With no block, all three route through the registry adapter,
+        // which reads `[adapters.spin.adapter].manifest` DYNAMICALLY -- and
+        // `run::build` refreshes the conventional `source` artifact (honouring
+        // custom target dirs), so the stale-wasm hazard is handled without a
+        // pinned `--target-dir`. These strings are unused while
+        // `emit_commands` is false; kept for parity with the other blueprints.
         build: "cargo build --target wasm32-wasip2 --release --target-dir target -p {crate}",
-        // Point `--from` and the runtime config at the DECLARED manifest, not
-        // `{crate_dir}`: a nested manifest (e.g. `crates/server/config/spin.toml`)
-        // lives below the crate root, so `spin deploy/up --from {crate_dir}`
-        // and `{crate_dir}/runtime-config.toml` would miss it. `{manifest}` is
-        // the declared manifest path and `{manifest_dir}` its parent.
         deploy: "spin deploy --from {manifest}",
         serve: "spin up --from {manifest} --runtime-config-file {manifest_dir}/runtime-config.toml",
-        emit_commands: true,
+        emit_commands: false,
     },
     logging: LoggingDefaults {
         endpoint: None,

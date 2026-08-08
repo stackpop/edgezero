@@ -101,6 +101,17 @@ jobs:
       - name: Nested AppConfig checker tests
         run: cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config
 
+      # Lint the smoke/helper shell scripts. `-x` follows `source`d libs;
+      # `--severity=warning` gates on warnings and errors (SC1091/SC2086-style
+      # info notes stay advisory). ubuntu-latest ships shellcheck.
+      - name: ShellCheck smoke scripts
+        run: shellcheck -x --severity=warning scripts/*.sh scripts/lib/*.sh
+
+      # Run the backup/restore helper's own unit tests -- fail-closed backup,
+      # atomic restore, symlink refusal, ownership-guarded server teardown.
+      - name: Smoke backup helper unit tests
+        run: bash scripts/lib/smoke_backup_test.sh
+
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 

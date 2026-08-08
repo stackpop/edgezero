@@ -356,20 +356,31 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
         .stdin
         .take()
         .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
-    stdin
-        .write_all(value.as_bytes())
-        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))?;
+    // Write the value, but do NOT early-return on a write error: if the child
+    // died before reading (bad args, auth failure), the write fails with
+    // BrokenPipe while the USEFUL diagnostic is the child's own stderr. Reap
+    // the child FIRST (avoids a zombie), then surface its stderr/status --
+    // folding the pipe error in only as secondary context.
+    let write_result = stdin.write_all(value.as_bytes());
     drop(stdin);
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `fastly`: {err}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Err(err) = write_result {
+        return Err(format!(
+            "failed to write the value to `fastly` stdin ({err}); `fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
     if output.status.success() {
         return Ok(());
     }
     Err(format!(
         "`fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
         output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
+        stderr.trim()
     ))
 }
 
@@ -925,6 +936,24 @@ mod tests {
             panic!("expected Present");
         };
         assert_eq!(value, envelope);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_config_store_entry_surfaces_child_stderr_on_failure() {
+        // When the `fastly` CLI exits non-zero, the error must carry the
+        // CHILD'S stderr (the real diagnostic) and the child must be reaped --
+        // not a bare stdin-write error. `fake_fastly_returning` exits without
+        // reading stdin, so this also exercises the write-then-reap ordering.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fake = fake_fastly_returning("", "AUTH: token expired [401]", 1);
+        let _path = PathPrepend::new(fake.path());
+        let err = create_config_store_entry("store-abc123", "greeting", "hello")
+            .expect_err("a non-zero fastly exit must be an error");
+        assert!(
+            err.contains("token expired"),
+            "the child's stderr must surface, not a bare pipe error: {err}"
+        );
     }
 
     #[cfg(unix)]

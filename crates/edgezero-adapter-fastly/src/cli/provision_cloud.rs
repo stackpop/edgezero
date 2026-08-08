@@ -22,6 +22,11 @@ pub(super) fn provision(
     deployed: Option<&AdapterDeployedState>,
     dry_run: bool,
 ) -> Result<ProvisionOutcome, String> {
+    // A user store named like the internal runtime-override config store
+    // would be created remotely AND merged into the runtime-env store --
+    // reject BEFORE any account mutation (dry-run too, so the preview
+    // models the real outcome).
+    super::reject_reserved_store_names(stores)?;
     // Fastly is Multi for every store kind. Each id maps 1:1
     // to a Fastly resource (kv-store / config-store /
     // secret-store) created via the Fastly CLI; the manifest
@@ -628,8 +633,8 @@ mod tests {
 
     #[test]
     fn setup_block_present_true_when_only_setup_exists() {
-        // Post-F6 (PR #269 round 2): `setup_block_present` only
-        // checks `[setup.<kind>_stores.<id>]`. The pre-fix check
+        // `setup_block_present` only checks
+        // `[setup.<kind>_stores.<id>]`. An earlier check
         // ALSO required `[local_server.<kind>_stores.<id>]`, but
         // writing an empty `[local_server.*]` table didn't match
         // fastly's local-server schema (config-stores need

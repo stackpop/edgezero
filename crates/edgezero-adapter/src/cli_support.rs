@@ -4,6 +4,7 @@
 )]
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -174,13 +175,7 @@ pub fn resolve_cargo_target_dir(
     //    `CARGO_BUILD_TARGET_DIR`. The ctx-applied env the build ran with
     //    takes precedence over the process env, mirroring `command.env`.
     for key in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-        let env_dir = ctx
-            .env()
-            .iter()
-            .find(|(candidate, _)| candidate == key)
-            .map(|(_, value)| PathBuf::from(value))
-            .or_else(|| env::var_os(key).map(PathBuf::from));
-        if let Some(dir) = env_dir {
+        if let Some(dir) = env_value(ctx, key).map(PathBuf::from) {
             return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
         }
     }
@@ -197,7 +192,7 @@ pub fn resolve_cargo_target_dir(
         }
         dir = current.parent();
     }
-    if let Some(home) = cargo_home() {
+    if let Some(home) = cargo_home(ctx) {
         for name in ["config.toml", "config"] {
             if let Some(target) = config_build_target_dir(&home.join(name)) {
                 return CargoTargetDir::Explicit(resolve_dir_against(&home, &target));
@@ -207,11 +202,24 @@ pub fn resolve_cargo_target_dir(
     CargoTargetDir::Conventional
 }
 
+/// Read an env var the build actually ran with: the ctx-applied overlay
+/// (mirroring `command.env`) takes precedence over the process env.
+fn env_value(ctx: &AdapterExecContext<'_>, key: &str) -> Option<OsString> {
+    ctx.env()
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| OsString::from(value))
+        .or_else(|| env::var_os(key))
+}
+
 /// `$CARGO_HOME` (or `~/.cargo`), where cargo keeps its global config.
-fn cargo_home() -> Option<PathBuf> {
-    env::var_os("CARGO_HOME")
+/// Honours a ctx-provided `CARGO_HOME` / `HOME` (the env the build ran
+/// with) before the process env, so the global-config lookup matches the
+/// directory cargo actually used.
+fn cargo_home(ctx: &AdapterExecContext<'_>) -> Option<PathBuf> {
+    env_value(ctx, "CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .or_else(|| env_value(ctx, "HOME").map(|home| PathBuf::from(home).join(".cargo")))
 }
 
 /// Extract the value of a `--target-dir` build argument (`--target-dir X`
@@ -257,8 +265,9 @@ fn config_target_dir_from_args(crate_dir: &Path, args: &[String]) -> Option<Path
         if is_inline_config_kv(spec) {
             // Inline `--config <toml>`: parse the whole payload as TOML
             // rather than string-matching a fixed `key=` prefix, so a
-            // spaced `build.target-dir = "x"` is honoured, not dropped.
-            if let Some(target) = target_dir_from_toml_str(spec) {
+            // spaced `build.target-dir = "x"` and quoted keys are honoured,
+            // not dropped. An inline `include` is followed too (cargo does).
+            if let Some(target) = target_dir_from_inline(spec, crate_dir) {
                 last = Some(target);
             }
             continue;
@@ -275,18 +284,43 @@ fn config_target_dir_from_args(crate_dir: &Path, args: &[String]) -> Option<Path
 
 /// Whether a `--config` payload is an inline TOML expression (as opposed to
 /// a config FILE path). Cargo treats `--config <arg>` as inline TOML when it
-/// parses as `dotted.key = value`; the key half (trimmed of the surrounding
-/// whitespace cargo permits) is a dotted identifier with no path separators.
+/// parses as a non-empty TOML table; anything that doesn't (a bare path like
+/// `cfg/config.toml`) is a file. Parsing -- rather than a hand-rolled key
+/// scan -- accepts quoted dotted keys (`build."target-dir" = "x"`) that cargo
+/// accepts too.
 fn is_inline_config_kv(payload: &str) -> bool {
-    match payload.split_once('=') {
-        Some((key, _)) => {
-            let trimmed = key.trim();
-            !trimmed.is_empty()
-                && trimmed
-                    .chars()
-                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_'))
-        }
-        None => false,
+    toml::from_str::<toml::Table>(payload).is_ok_and(|table| !table.is_empty())
+}
+
+/// Extract a target-dir from an inline `--config` TOML payload: the direct
+/// `build.target-dir` (returned RAW for the caller to resolve against the
+/// build cwd), or, failing that, one reached via an inline `include`
+/// (resolved against the build cwd `crate_dir`, LAST entry winning).
+fn target_dir_from_inline(spec: &str, crate_dir: &Path) -> Option<PathBuf> {
+    let doc: toml::Value = toml::from_str(spec).ok()?;
+    if let Some(target) = doc
+        .get("build")
+        .and_then(|build| build.get("target-dir"))
+        .and_then(toml::Value::as_str)
+    {
+        return Some(PathBuf::from(target));
+    }
+    collect_includes(&doc)?.iter().rev().find_map(|inc| {
+        config_build_target_dir_at(&resolve_dir_against(crate_dir, Path::new(inc)), 0)
+    })
+}
+
+/// The `include` directive as a list of paths: a single string or an array
+/// of strings (cargo's two accepted forms). `None` when absent or malformed.
+fn collect_includes(doc: &toml::Value) -> Option<Vec<String>> {
+    match doc.get("include") {
+        Some(toml::Value::String(one)) => Some(vec![one.clone()]),
+        Some(toml::Value::Array(many)) => Some(
+            many.iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        _ => None,
     }
 }
 
@@ -320,9 +354,10 @@ const MAX_CONFIG_INCLUDE_DEPTH: usize = 16;
 /// directives, and RESOLVE a relative value the way cargo does: a
 /// config-relative path is relative to the PARENT of the directory that
 /// contains the config file (for `<root>/.cargo/config.toml` that is
-/// `<root>`). The including file wins over its includes, matching cargo's
-/// merge order. Returns the resolved dir, or `None` if none is declared
-/// anywhere in the chain.
+/// `<root>`). The including file wins over its includes, and among includes
+/// a LATER entry wins over an earlier one -- matching cargo's merge order.
+/// Returns the resolved dir, or `None` if none is declared anywhere in the
+/// chain.
 fn config_build_target_dir(config_path: &Path) -> Option<PathBuf> {
     config_build_target_dir_at(config_path, 0)
 }
@@ -350,14 +385,11 @@ fn config_build_target_dir_at(config_path: &Path, depth: usize) -> Option<PathBu
     }
 
     // Otherwise follow `include` (a single path or an array), resolved
-    // against the including file's own directory, lowest precedence last.
+    // against the including file's own directory. Cargo merges later
+    // includes ON TOP of earlier ones, so a LATER entry wins: iterate in
+    // reverse and take the first (i.e. last-listed) that declares one.
     let include_dir = config_path.parent()?;
-    let includes: Vec<&str> = match doc.get("include") {
-        Some(toml::Value::String(one)) => vec![one.as_str()],
-        Some(toml::Value::Array(many)) => many.iter().filter_map(toml::Value::as_str).collect(),
-        _ => return None,
-    };
-    includes.into_iter().find_map(|inc| {
+    collect_includes(&doc)?.iter().rev().find_map(|inc| {
         let inc_path = resolve_dir_against(include_dir, Path::new(inc));
         config_build_target_dir_at(&inc_path, depth.saturating_add(1))
     })
@@ -764,6 +796,108 @@ mod tests {
         match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
             CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("inc-out")),
             CargoTargetDir::Conventional => panic!("expected explicit from included config"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_config_include_array_last_entry_wins() {
+        // Cargo merges later `include` entries on top of earlier ones, so a
+        // target-dir declared in the LAST include must win over an earlier
+        // one.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join("cfg")).unwrap();
+        fs::write(
+            crate_dir.join("cfg/base.toml"),
+            "include = [\"first.toml\", \"second.toml\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_dir.join("cfg/first.toml"),
+            "[build]\ntarget-dir = \"first-out\"\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_dir.join("cfg/second.toml"),
+            "[build]\ntarget-dir = \"second-out\"\n",
+        )
+        .unwrap();
+        let ctx = AdapterExecContext::new();
+        let args = ["--config".to_owned(), "cfg/base.toml".to_owned()];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(
+                path,
+                crate_dir.join("second-out"),
+                "the LAST include must win"
+            ),
+            CargoTargetDir::Conventional => panic!("expected explicit from include array"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_accepts_quoted_inline_key() {
+        // Cargo accepts quoted dotted keys in inline `--config`; a hand-rolled
+        // key scan rejected the quotes and mis-treated it as a file path.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        let ctx = AdapterExecContext::new();
+        let args = [
+            "--config".to_owned(),
+            "build.\"target-dir\" = \"quoted-out\"".to_owned(),
+        ];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("quoted-out")),
+            CargoTargetDir::Conventional => panic!("expected explicit from quoted inline key"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_follows_inline_config_include() {
+        // An inline `--config 'include="..."'` must be followed too, not just
+        // a `--config <file>` include.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join("cfg")).unwrap();
+        fs::write(
+            crate_dir.join("cfg/included.toml"),
+            "[build]\ntarget-dir = \"inline-inc-out\"\n",
+        )
+        .unwrap();
+        let ctx = AdapterExecContext::new();
+        let args = [
+            "--config".to_owned(),
+            "include=\"cfg/included.toml\"".to_owned(),
+        ];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("inline-inc-out")),
+            CargoTargetDir::Conventional => panic!("expected explicit from inline include"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_honours_ctx_cargo_home_for_global_config() {
+        // The global-config lookup must honour a ctx-provided CARGO_HOME (the
+        // env the build actually ran with), not only the process env.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path().join("proj");
+        let cargo_home = dir.path().join("custom-cargo-home");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::create_dir_all(&cargo_home).unwrap();
+        fs::write(
+            cargo_home.join("config.toml"),
+            "[build]\ntarget-dir = \"/abs-global-out\"\n",
+        )
+        .unwrap();
+        let cargo_home_str = cargo_home.to_string_lossy().into_owned();
+        let env = [("CARGO_HOME".to_owned(), cargo_home_str)];
+        let ctx = AdapterExecContext::new().with_env(&env);
+        match resolve_cargo_target_dir(&crate_dir, &[], &ctx) {
+            CargoTargetDir::Explicit(path) => {
+                assert_eq!(path, PathBuf::from("/abs-global-out"));
+            }
+            CargoTargetDir::Conventional => {
+                panic!("expected explicit from ctx CARGO_HOME global config")
+            }
         }
     }
 

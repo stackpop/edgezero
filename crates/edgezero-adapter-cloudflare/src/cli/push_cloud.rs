@@ -336,10 +336,11 @@ pub(super) fn read_wrangler_kv_key(
             stderr.trim()
         ));
     }
-    // A missing BINDING (the KV namespace itself) is a missing store -- check
-    // it before the key case so "binding ... not found" isn't misread as a
-    // missing key.
-    if lower.contains("binding") {
+    // A missing BINDING / namespace (the KV store itself) is a missing store
+    // -- check it before the key case so "binding ... not found" isn't misread
+    // as a missing key. Current wrangler also reports a wholly unconfigured
+    // project as "No KV Namespaces configured!", which is the same condition.
+    if lower.contains("binding") || lower.contains("no kv namespaces") {
         return Ok(ReadConfigEntry::MissingStore);
     }
     // A genuinely absent KEY is a not-found.
@@ -848,6 +849,33 @@ mod tests {
         assert!(
             matches!(result, ReadConfigEntry::MissingStore),
             "binding stderr => MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_maps_no_kv_namespaces_configured_to_missing_store() {
+        // Current wrangler reports a wholly unconfigured project as
+        // "No KV Namespaces configured!" -- the same missing-store condition
+        // as a missing binding, so it must map to MissingStore (not Err).
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "No KV Namespaces configured!", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("'No KV Namespaces configured!' maps to MissingStore (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "'No KV Namespaces configured!' => MissingStore"
         );
     }
 
