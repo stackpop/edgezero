@@ -38,7 +38,7 @@ The app and its deploy workflow live in one repo.
 ```yaml
 jobs:
   deploy:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:

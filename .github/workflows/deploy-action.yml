@@ -62,7 +62,7 @@ env:
 
 jobs:
   static-checks:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -125,7 +125,7 @@ jobs:
   # assertion lives in a script under deploy-core/tests/ so it is shellcheck'd
   # and readable outside the YAML.
   composite-smoke:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # Inherited provider aliases the deploy MUST clear (provider-env boundary).
     env:
       FASTLY_ENDPOINT: https://inherited.invalid
@@ -201,7 +201,7 @@ jobs:
   # the credential entirely out of the build phase, and the only smoke that exercises
   # cross-job artifact download.
   handoff-build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -218,7 +218,7 @@ jobs:
 
   handoff-deploy:
     needs: handoff-build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # The deploy job carries the token; inherited aliases it MUST still clear.
     env:
       FASTLY_ENDPOINT: https://inherited.invalid
@@ -248,13 +248,59 @@ jobs:
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
         run: .github/actions/deploy-core/tests/assert-production-deploy.sh
 
+  # Cache POPULATION + RESTORE HIT end to end. build-mode: always runs the
+  # credential-free seed build that populates target/ and saves the cache; a second
+  # deploy in the same job restores it. Deleting target/ between the two proves the
+  # marker comes back from the CACHE (a real restore hit), not from disk — and the
+  # idempotent seed build leaves a restored marker untouched, so a rebuild would be
+  # caught as a different value.
+  cache-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          app-cli-artifact: edgezero-cli-cache
+      - name: Set up fake Fastly API
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+      - name: Deploy (populate cache via the credential-free seed build)
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+          build-mode: always
+          cache: true
+      - name: Capture the seeded marker, then delete target/
+        run: .github/actions/deploy-core/tests/cache-smoke-capture.sh
+      - name: Deploy again (restore cache)
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+          build-mode: always
+          cache: true
+      - name: Assert the marker was restored from cache (not rebuilt)
+        run: .github/actions/deploy-core/tests/cache-smoke-assert.sh
+
   # Config push: the real config-push-fastly wrapper against a fake `fastly`,
   # proving the whole chain — artifact download, Fastly CLI install, the app
   # CLI's TYPED `config push` (the bundled stub cannot do this), and the
   # staging-key contract. Config push is deliberately NOT part of deploy, so it
   # gets its own job.
   config-push-smoke:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # Inherited provider aliases the push MUST clear.
     env:
       FASTLY_ENDPOINT: https://inherited.invalid
@@ -332,7 +378,7 @@ jobs:
   # found were argv/verb defects, the assertions check argv and verbs — see the
   # assert-*.sh scripts for what each one regression-tests.
   lifecycle-smoke:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # Inherited provider aliases that every step MUST clear. FASTLY_API_TOKEN is
     # here on purpose: a PRODUCTION healthcheck must probe with no token even when
     # the job env carries one.

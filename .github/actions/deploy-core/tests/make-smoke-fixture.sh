@@ -62,7 +62,9 @@ TOML
 //! contract config-push-fastly depends on: only an app-owned CLI has the
 //! app-config struct, so only it can push typed config.
 use clap::{Parser, Subcommand};
-use edgezero_cli::args::{ActiveVersionArgs, ConfigPushArgs, DeployArgs, HealthcheckArgs, RollbackArgs};
+use edgezero_cli::args::{
+    ActiveVersionArgs, BuildArgs, ConfigPushArgs, DeployArgs, HealthcheckArgs, RollbackArgs,
+};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
@@ -84,6 +86,7 @@ struct Args {
 enum Cmd {
     #[command(subcommand)]
     Config(ConfigCmd),
+    Build(BuildArgs),
     Deploy(DeployArgs),
     Healthcheck(HealthcheckArgs),
     ActiveVersion(ActiveVersionArgs),
@@ -101,6 +104,7 @@ fn main() {
         Cmd::Config(ConfigCmd::Push(args)) => {
             edgezero_cli::run_config_push_typed::<FixtureAppConfig>(&args)
         }
+        Cmd::Build(args) => edgezero_cli::run_build(&args),
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
         Cmd::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
         Cmd::ActiveVersion(args) => edgezero_cli::run_active_version(&args),
@@ -134,15 +138,45 @@ printf '%s\n' "$@" >"${GITHUB_WORKSPACE}/fixture-app/deploy-argv.txt"
 # rolled-back-from --version to still be active) sees 7 rather than the 40 that
 # capture saw before this deploy.
 [ -n "${FAKE_ACTIVE_VERSION_FILE:-}" ] && printf '7\n' >"${FAKE_ACTIVE_VERSION_FILE}"
+# Recovery smoke: model a MUTATION whose version line is LOST. The service is now
+# at 7 (activated above), but the deploy emits no parseable `version=`, so
+# deploy-fastly fails while `mutation-attempted` stays true. FAKE_LOSE_VERSION is
+# outside the EDGEZERO__* namespace, so it survives the pre-exec scrub.
+if [ -n "${FAKE_LOSE_VERSION:-}" ]; then
+  echo "deploy mutated the service but its version line was lost" >&2
+  exit 0
+fi
 echo "version=7"
 SH
   chmod +x fake-deploy.sh
+
+  # A credential-free "build" the cache-seed step runs under build-mode: always. It
+  # does no real compile — it just populates target/ (the cache path) so there is
+  # something to save, and it is IDEMPOTENT: if the marker already exists (restored
+  # from cache) it leaves it untouched, which is how the cache smoke proves a restore
+  # HIT rather than a rebuild. It must run WITHOUT a provider token.
+  cat >fake-build.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[ -z "${FASTLY_API_TOKEN:-}" ] || {
+  echo "cache-seed build must run without a provider token" >&2
+  exit 91
+}
+mkdir -p target
+# Idempotent: only stamp a fresh marker when one was NOT restored from the cache.
+if [ ! -f target/fixture-build-marker ]; then
+  printf 'built-%s\n' "$RANDOM$RANDOM" >target/fixture-build-marker
+fi
+echo "Built package (fixture cache seed)"
+SH
+  chmod +x fake-build.sh
 
   cat >edgezero.toml <<'ETOML'
 [app]
 name = "fixture-app"
 
 [adapters.fastly.commands]
+build = "bash fake-build.sh"
 deploy = "bash fake-deploy.sh"
 
 # config push resolves this logical id, then the Fastly adapter matches it by
@@ -164,6 +198,10 @@ manifest_version = 3
 name = "fixture-app"
 language = "rust"
 FTOML
+
+  # Ignore build output so the cache-seed build (which writes target/) never dirties
+  # the source and trips the committed-source guard.
+  printf 'target/\n' >.gitignore
 
   cargo generate-lockfile
 

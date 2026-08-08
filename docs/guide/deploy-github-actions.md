@@ -23,7 +23,7 @@ this page is the practical how-to.
 Under the hood a private `deploy-core` engine (a set of shared scripts) holds all
 provider-neutral behavior; the wrappers above are thin.
 
-**Runner support:** Linux x86-64 only (`ubuntu-24.04` is tested).
+**Runner support:** Linux x86-64 only (`ubuntu-latest` is tested).
 
 ## What you provide
 
@@ -62,7 +62,7 @@ provider-neutral behavior; the wrappers above are thin.
 ```yaml
 jobs:
   deploy:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -179,7 +179,7 @@ boundaries).
 ```yaml
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -194,7 +194,7 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:

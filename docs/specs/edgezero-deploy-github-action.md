@@ -592,7 +592,7 @@ probe it, roll back on failure.
 
 ## 6. Execution flow (engine)
 
-1. Verify the runner is Linux x86-64 (`ubuntu-24.04` is the tested environment).
+1. Verify the runner is Linux x86-64 (`ubuntu-latest` is the tested environment).
 2. Validate that `adapter` is a well-formed, non-empty token. The engine does
    **not** enumerate the CLI's compiled adapters (there is no introspection
    command); an unsupported adapter surfaces as the CLI's own error at build or
