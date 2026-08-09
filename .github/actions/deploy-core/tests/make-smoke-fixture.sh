@@ -199,9 +199,11 @@ name = "fixture-app"
 language = "rust"
 FTOML
 
-  # Ignore build output so the cache-seed build (which writes target/) never dirties
-  # the source and trips the committed-source guard.
-  printf 'target/\n' >.gitignore
+  # Ignore build output AND the fake deploy's side-effect files (env-seen.txt,
+  # deploy-argv.txt) so they never dirty the source and trip the committed-source
+  # guard. This matters for the cache smoke, which deploys TWICE: the first deploy
+  # writes these, and the second deploy's guard would otherwise see a dirty tree.
+  printf 'target/\nenv-seen.txt\ndeploy-argv.txt\n' >.gitignore
 
   cargo generate-lockfile
 
