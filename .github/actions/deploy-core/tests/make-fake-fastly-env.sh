@@ -188,6 +188,13 @@ if [[ "$*" == *"--config"* ]]; then
   # being rolled back from. Every version the fixture may activate is listed, so a
   # rollback target is a version the service actually has.
   if [[ "$url" == */version ]]; then
+    # Recovery smoke: a broken-API sentinel makes active-version resolution fail, so
+    # a lost-version deploy cannot recover the version. Absent otherwise, so this is
+    # inert for every other smoke.
+    if [[ -n "${FAKE_API_BREAK_FILE:-}" && -f "$FAKE_API_BREAK_FILE" ]]; then
+      printf 'simulated Fastly API failure\n500'
+      exit 0
+    fi
     printf '%s\n200' "$(fake_version_list_json)"
     exit 0
   fi
@@ -271,6 +278,9 @@ main() {
   {
     printf 'FAKE_CALL_LOG=%s\n' "$log"
     printf 'FAKE_ACTIVE_VERSION_FILE=%s\n' "$active_state"
+    # The recovery smoke touches this path to break active-version resolution; it is
+    # not created here, so every other smoke sees a working API.
+    printf 'FAKE_API_BREAK_FILE=%s\n' "$workspace/fake-api-break"
   } >>"${GITHUB_ENV:?GITHUB_ENV is required}"
 
   notice "fake fastly (v$pinned) packaged as a checksum-verified archive at $archive; fake curl on PATH"

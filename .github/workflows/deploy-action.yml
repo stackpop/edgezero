@@ -294,6 +294,73 @@ jobs:
       - name: Assert the marker was restored from cache (not rebuilt)
         run: .github/actions/deploy-core/tests/cache-smoke-assert.sh
 
+  # Lost-version RECOVERY through the actual actions. A production deploy mutates the
+  # service (activates v7) but loses its version line AND breaks the API fallback, so
+  # deploy-fastly fails with mutation-attempted=true. The operator then recovers:
+  # download the CLI artifact, ask active-version what is live now (7), and roll back
+  # to the previously-captured version (40). Exercises artifact download,
+  # active-version recovery, and rollback together — the flow the guide documents.
+  recovery-smoke:
+    runs-on: ubuntu-latest
+    # fake-deploy reads this (only it, and only during the deploy step): it loses the
+    # version line and trips the API-break sentinel so the fallback also fails.
+    env:
+      FAKE_LOSE_VERSION: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          app-cli-artifact: edgezero-cli-recovery
+      - name: Set up fake Fastly API
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+      - name: Deploy (mutates, then loses the version — must fail)
+        id: deploy
+        continue-on-error: true
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+      - name: Assert the deploy failed but signalled a possible mutation
+        env:
+          EDGEZERO__TEST__DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          EDGEZERO__TEST__MUTATION_ATTEMPTED: ${{ steps.deploy.outputs['mutation-attempted'] }}
+        run: .github/actions/deploy-core/tests/assert-lost-version.sh
+      - name: Download the CLI artifact for recovery
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: edgezero-cli-recovery
+          path: recover-cli
+      - name: Recover the live version from the provider (operator flow)
+        id: recover
+        env:
+          FASTLY_API_TOKEN: dummy-token
+          FASTLY_SERVICE_ID: dummy-service
+        run: .github/actions/deploy-core/tests/recovery-active-version.sh recover-cli
+      - name: Roll back to the captured previous version, keyed on the recovered live version
+        id: rollback
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: edgezero-cli-recovery
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+          fastly-version: ${{ steps.recover.outputs.version }}
+          rollback-to: "40"
+          deploy-to: production
+      - name: Assert recovery rolled the service back to the captured version
+        env:
+          EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.rollback.outputs['rolled-back-to'] }}
+        run: .github/actions/deploy-core/tests/assert-recovery-rollback.sh
+
   # Config push: the real config-push-fastly wrapper against a fake `fastly`,
   # proving the whole chain — artifact download, Fastly CLI install, the app
   # CLI's TYPED `config push` (the bundled stub cannot do this), and the

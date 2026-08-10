@@ -143,6 +143,12 @@ printf '%s\n' "$@" >"${GITHUB_WORKSPACE}/fixture-app/deploy-argv.txt"
 # deploy-fastly fails while `mutation-attempted` stays true. FAKE_LOSE_VERSION is
 # outside the EDGEZERO__* namespace, so it survives the pre-exec scrub.
 if [ -n "${FAKE_LOSE_VERSION:-}" ]; then
+  # The mutation already happened (active=7 above). Now BREAK the provider API so
+  # the CLI's version-resolution fallback (active-version) also fails — the version
+  # is truly lost and deploy-fastly fails. This sentinel is created HERE, during the
+  # deploy, so the rollback-target capture that ran BEFORE the deploy still saw a
+  # working API. Recovery removes the sentinel and asks the API what is live now.
+  [ -n "${FAKE_API_BREAK_FILE:-}" ] && : >"${FAKE_API_BREAK_FILE}"
   echo "deploy mutated the service but its version line was lost" >&2
   exit 0
 fi
