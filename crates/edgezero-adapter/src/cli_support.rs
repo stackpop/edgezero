@@ -179,13 +179,16 @@ pub fn resolve_cargo_target_dir(
             return CargoTargetDir::Explicit(resolve_dir_against(crate_dir, &dir));
         }
     }
-    // 3. `.cargo/config.toml` (or `.cargo/config`) `[build] target-dir`,
+    // 3. `.cargo/config` (or `.cargo/config.toml`) `[build] target-dir`,
     //    walking EVERY ancestor from the crate dir to the filesystem root
-    //    (cargo doesn't stop at the workspace), preferring `config.toml`
-    //    over `config`, then `$CARGO_HOME`. The nearest declaration wins.
+    //    (cargo doesn't stop at the workspace), then `$CARGO_HOME`. The
+    //    nearest declaration wins. Cargo prefers the EXTENSIONLESS `config`
+    //    over `config.toml` when BOTH exist in the same `.cargo/` dir
+    //    (verified against cargo 1.95 via `cargo metadata`), so probe
+    //    `config` first.
     let mut dir = Some(crate_dir);
     while let Some(current) = dir {
-        for name in ["config.toml", "config"] {
+        for name in ["config", "config.toml"] {
             if let Some(target) = config_build_target_dir(&current.join(".cargo").join(name)) {
                 return CargoTargetDir::Explicit(resolve_dir_against(current, &target));
             }
@@ -193,7 +196,7 @@ pub fn resolve_cargo_target_dir(
         dir = current.parent();
     }
     if let Some(home) = cargo_home(ctx) {
-        for name in ["config.toml", "config"] {
+        for name in ["config", "config.toml"] {
             if let Some(target) = config_build_target_dir(&home.join(name)) {
                 return CargoTargetDir::Explicit(resolve_dir_against(&home, &target));
             }
@@ -310,16 +313,26 @@ fn target_dir_from_inline(spec: &str, crate_dir: &Path) -> Option<PathBuf> {
     })
 }
 
-/// The `include` directive as a list of paths: a single string or an array
-/// of strings (cargo's two accepted forms). `None` when absent or malformed.
+/// The `include` directive as a list of paths. Cargo accepts a single
+/// string, an array of strings, OR an array whose entries are TABLES of the
+/// form `{ path = "..." }` (optionally `optional = true`). `None` when
+/// absent or malformed. A bare table (`include = { path = ... }`, no array)
+/// is rejected by cargo itself, so it's not accepted here either.
 fn collect_includes(doc: &toml::Value) -> Option<Vec<String>> {
+    fn entry_path(entry: &toml::Value) -> Option<String> {
+        if let toml::Value::String(one) = entry {
+            return Some(one.clone());
+        }
+        // Array entries may be tables of the form `{ path = "..." }`.
+        entry
+            .as_table()
+            .and_then(|table| table.get("path"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    }
     match doc.get("include") {
         Some(toml::Value::String(one)) => Some(vec![one.clone()]),
-        Some(toml::Value::Array(many)) => Some(
-            many.iter()
-                .filter_map(|entry| entry.as_str().map(str::to_owned))
-                .collect(),
-        ),
+        Some(toml::Value::Array(many)) => Some(many.iter().filter_map(entry_path).collect()),
         _ => None,
     }
 }
@@ -669,6 +682,60 @@ mod tests {
         match resolve_cargo_target_dir(&crate_dir, &[], &ctx) {
             CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("cfg-out")),
             CargoTargetDir::Conventional => panic!("expected explicit from config.toml"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_prefers_extensionless_config_over_config_toml() {
+        // Cargo uses the extensionless `.cargo/config` over `.cargo/config.toml`
+        // when BOTH exist (verified against cargo 1.95). Match that so artifact
+        // discovery lands where cargo actually writes.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join(".cargo")).unwrap();
+        fs::write(
+            crate_dir.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"from-config-toml\"\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_dir.join(".cargo/config"),
+            "[build]\ntarget-dir = \"from-config-noext\"\n",
+        )
+        .unwrap();
+        let ctx = AdapterExecContext::new();
+        match resolve_cargo_target_dir(crate_dir, &[], &ctx) {
+            CargoTargetDir::Explicit(path) => {
+                assert_eq!(path, crate_dir.join("from-config-noext"));
+            }
+            CargoTargetDir::Conventional => panic!("expected explicit from .cargo/config"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_dir_follows_array_of_tables_include() {
+        // Cargo accepts array-of-tables includes (`include = [{ path = "..." }]`);
+        // the earlier string-only parse dropped them.
+        let dir = tempdir().unwrap();
+        let crate_dir = dir.path();
+        fs::create_dir_all(crate_dir.join("cfg")).unwrap();
+        fs::write(
+            crate_dir.join("cfg/base.toml"),
+            "include = [{ path = \"included.toml\" }]\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_dir.join("cfg/included.toml"),
+            "[build]\ntarget-dir = \"tbl-inc-out\"\n",
+        )
+        .unwrap();
+        let ctx = AdapterExecContext::new();
+        let args = ["--config".to_owned(), "cfg/base.toml".to_owned()];
+        match resolve_cargo_target_dir(crate_dir, &args, &ctx) {
+            CargoTargetDir::Explicit(path) => assert_eq!(path, crate_dir.join("tbl-inc-out")),
+            CargoTargetDir::Conventional => {
+                panic!("expected explicit from array-of-tables include")
+            }
         }
     }
 

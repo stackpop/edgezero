@@ -189,13 +189,14 @@ impl Adapter for AxumCliAdapter {
     /// than writing an unrepresentable file.
     #[inline]
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
-        // Base provision writes generated `EDGEZERO__STORES__<KIND>__<ID>__NAME`
-        // / `__KEY` store-overlay lines into the SAME `.edgezero/.env` typed
-        // secrets are appended to, under one dedup pass. A secret key in that
-        // reserved namespace would collide and be silently dropped -- and the
-        // runtime secret lookup would then return the store LABEL as the
-        // credential. Reject it in preflight.
-        const RESERVED_PREFIX: &str = "EDGEZERO__STORES__";
+        // The ENTIRE `EDGEZERO__` namespace is reserved for runtime config:
+        // provision writes generated `EDGEZERO__STORES__...` store overlays
+        // into the same `.edgezero/.env` typed secrets are appended to, and
+        // the runtime also reads `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*`
+        // / etc. from that env. A secret key anywhere under `EDGEZERO__` would
+        // collide with (or be shadowed by) runtime configuration and resolve
+        // to config data instead of the credential. Reject in preflight.
+        const RESERVED_PREFIX: &str = "EDGEZERO__";
         for entry in entries {
             let key = entry.key_value;
             let reason = if key.is_empty() {
@@ -210,9 +211,10 @@ impl Adapter for AxumCliAdapter {
                 Some("starts with `#`, which `.env` readers treat as a comment")
             } else if key.to_ascii_uppercase().starts_with(RESERVED_PREFIX) {
                 Some(
-                    "is in the reserved `EDGEZERO__STORES__` namespace that provision generates \
-                     into `.edgezero/.env` (store `__NAME` / `__KEY` overlays); a secret there \
-                     would collide and be silently dropped",
+                    "is in the reserved `EDGEZERO__` namespace used for runtime configuration \
+                     (store overlays, `EDGEZERO__ADAPTER__*`, `EDGEZERO__LOGGING__*`, ...) in \
+                     `.edgezero/.env`; a secret there would collide with config and resolve to \
+                     configuration data instead of the credential",
                 )
             } else {
                 None
@@ -761,18 +763,21 @@ mod tests {
         // A secret key in the `EDGEZERO__STORES__` namespace would collide
         // (and be silently deduped away) against the generated store-overlay
         // lines base provision writes into the SAME `.edgezero/.env`.
-        let entries = vec![TypedSecretEntry::new(
-            "default",
-            "field",
+        for reserved in [
             "EDGEZERO__STORES__CONFIG__APP__KEY",
-        )];
-        let err = AXUM_ADAPTER
-            .validate_typed_secrets(&entries)
-            .expect_err("a reserved-namespace secret key must be rejected");
-        assert!(
-            err.contains("reserved") && err.contains("EDGEZERO__STORES__"),
-            "error explains the reserved-namespace collision: {err}"
-        );
+            "EDGEZERO__ADAPTER__HOST",
+            "EDGEZERO__LOGGING__LEVEL",
+            "edgezero__adapter__port", // case-insensitive
+        ] {
+            let entries = vec![TypedSecretEntry::new("default", "field", reserved)];
+            let Err(err) = AXUM_ADAPTER.validate_typed_secrets(&entries) else {
+                panic!("a reserved-namespace secret key must be rejected: {reserved}");
+            };
+            assert!(
+                err.contains("reserved") && err.contains("EDGEZERO__"),
+                "error explains the reserved-namespace collision for {reserved}: {err}"
+            );
+        }
     }
 
     #[test]

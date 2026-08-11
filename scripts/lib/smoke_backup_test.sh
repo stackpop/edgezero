@@ -133,6 +133,21 @@ check "empty-pid-stop-returns-zero" "$stop_rc" "0"
 check "empty-pid-stop-no-port-kill" "$kill_calls" "0"
 check "empty-pid-stop-no-lsof" "$lsof_calls" "0"
 
+# 10. smoke_pid_is_descendant: a real child process is a descendant of this
+#     shell; an unrelated pid (init) is NOT. This is what gates whether a
+#     port holder gets killed, so an unrelated holder is never attributed to
+#     us.
+sleep 30 &
+child_pid=$!
+check "descendant-of-self" \
+  "$(smoke_pid_is_descendant "$child_pid" "$$" && echo yes || echo no)" "yes"
+# init (pid 1) is NOT a descendant of this shell, so it would never be
+# attributed to us / killed.
+check "unrelated-pid-not-descendant" \
+  "$(smoke_pid_is_descendant "1" "$$" && echo yes || echo no)" "no"
+kill "$child_pid" 2>/dev/null
+wait "$child_pid" 2>/dev/null
+
 rm -rf "$work"
 
 printf 'smoke_backup_test: %d passed, %d failed\n' "$pass" "$fail"

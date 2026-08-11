@@ -36,16 +36,22 @@ platform name.
 ## What changed and why
 
 `edgezero.toml` is now portable: it declares what the app _is_, not
-how any particular platform runs it. The old per-adapter store and
-runtime tables (`[stores.*.adapters.*]`, `[adapters.<name>.adapter]
-host`, etc.) coupled the manifest to a specific deployment shape;
-keeping them required the manifest to be recompiled every time you
-moved between environments.
+how any particular platform runs it. The old per-adapter STORE tables
+(`[stores.*.adapters.*]`) coupled the manifest to a specific deployment
+shape; keeping them required the manifest to be recompiled every time you
+moved between environments, so they were removed.
+
+`[adapters.<name>.adapter]` still exists, and axum still accepts a
+`host` / `port` bind hint there — but only as a **default**. The
+authoritative per-environment values come from the environment overlay
+(`EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`, which win over the
+manifest hint), so the same file works across environments.
 
 The new shape lets one manifest cover dev, staging, and production for
 the same workload. Per-environment differences (which Cloudflare KV
 namespace ID maps to the `sessions` store, what host axum binds to,
-what log level the worker uses) live in the environment, not the file.
+what log level the worker uses) live in the environment overlay, with the
+manifest carrying only the portable defaults.
 
 ## Field-by-field
 

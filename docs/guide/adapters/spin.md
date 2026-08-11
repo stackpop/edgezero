@@ -95,11 +95,16 @@ cargo build --target wasm32-wasip2 --release -p my-app-adapter-spin
 ## Local Development
 
 ```bash
-# Using the CLI
+# Using the CLI (recommended -- it passes the runtime config and the
+# provision-written .env for you)
 edgezero serve --adapter spin
 
-# Or directly
-spin up --from crates/my-app-adapter-spin
+# Or directly. You MUST pass the runtime-config file (it declares the
+# non-`default` KV stores) and source the provision-written .env (it
+# carries the SPIN_VARIABLE_* secrets and the EDGEZERO__* store overlays):
+cd crates/my-app-adapter-spin
+set -a; . ./.env; set +a
+spin up --from spin.toml --runtime-config-file runtime-config.toml
 ```
 
 ## Deployment

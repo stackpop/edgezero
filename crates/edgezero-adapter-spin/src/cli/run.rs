@@ -70,13 +70,61 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
     fs::copy(&artifact, &dest)
         .map_err(|err| format!("failed to copy artifact to {}: {err}", dest.display()))?;
 
-    // Also refresh the CONVENTIONAL workspace target path that the
-    // synthesised `spin.toml` `source` references. `spin up` / `spin
-    // deploy` read `source`, so a build redirected to a custom target dir
-    // would otherwise leave a STALE module there.
+    // Refresh the module path that `spin up` / `spin deploy` actually read
+    // -- the component's DECLARED `source` in spin.toml -- so a custom
+    // target dir OR an operator-edited `source` never leaves a stale module.
+    // Falls back to the CONVENTIONAL workspace target path when the manifest
+    // can't be parsed or declares no matching source.
+    refresh_declared_source(&manifest, &underscored, &artifact)?;
     refresh_conventional_source(&workspace_root, &underscored, &artifact)?;
 
     Ok(dest)
+}
+
+/// Refresh the DECLARED `source` path of THIS crate's component in
+/// `spin.toml` with the freshly built `artifact`. Only the component whose
+/// `source` filename is `<crate>.wasm` (`underscored_wasm`) is touched, so a
+/// multi-component manifest's other components are never clobbered. A local
+/// file `source` is resolved relative to the manifest's directory; registry
+/// (`{ url = ... }`) sources are skipped. Best-effort on parse failure.
+fn refresh_declared_source(
+    manifest: &Path,
+    underscored_wasm: &str,
+    artifact: &Path,
+) -> Result<(), String> {
+    let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(raw) = fs::read_to_string(manifest) else {
+        return Ok(());
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&raw) else {
+        return Ok(());
+    };
+    let Some(components) = doc.get("component").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for component in components.values() {
+        let Some(source) = component.get("source").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        if Path::new(source).file_name().and_then(|name| name.to_str()) != Some(underscored_wasm) {
+            continue;
+        }
+        let src_path = manifest_dir.join(source);
+        if src_path == artifact {
+            continue;
+        }
+        if let Some(parent) = src_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+        fs::copy(artifact, &src_path).map_err(|err| {
+            format!(
+                "failed to refresh spin component source {}: {err}",
+                src_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Copy the freshly-located `artifact` to the CONVENTIONAL workspace target
@@ -124,6 +172,11 @@ pub fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(),
     let mut command = Command::new("spin");
     command
         .args(["deploy"])
+        // Pass the DECLARED manifest explicitly. `current_dir` alone makes
+        // `spin` load whatever `spin.toml` sits in that dir -- wrong when the
+        // declared manifest has a non-standard filename (e.g. `spin.prod.toml`).
+        .arg("--from")
+        .arg(&manifest)
         .args(extra_args)
         .current_dir(manifest_dir);
     for (key, value) in ctx.env() {
@@ -235,6 +288,10 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
 
     let mut command = Command::new("spin");
     command.args(["up"]);
+    // Pass the DECLARED manifest explicitly (a non-standard filename like
+    // `spin.prod.toml` is otherwise ignored -- `spin up` would load whatever
+    // `spin.toml` is in the cwd, or fail if none exists there).
+    command.arg("--from").arg(&manifest);
     // Match the manifest `commands.serve` shell path, which passes
     // `--runtime-config-file <dir>/runtime-config.toml`. Provision
     // writes each store's `[key_value_store.<name>]` block into that

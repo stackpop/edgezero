@@ -277,6 +277,18 @@ pub(super) fn provision(
             .and_then(|state| state.sub_tables.get("preview_kv_namespaces"))
             .and_then(|kv| kv.get(&store.logical))
             .map(String::as_str);
+        // A tracked id must be a REAL Cloudflare namespace id -- consistent
+        // with cloud provision, which rejects the same malformed value. A
+        // hand-edited / corrupt id (e.g. `abc123`) written into the local
+        // wrangler.toml would make `wrangler dev` bind a fake namespace.
+        if let Some(id) = deployed_id
+            && !super::provision_cloud::is_real_namespace_id(id)
+        {
+            return Err(format!(
+                "tracked KV namespace id `{id}` for binding `{}` (logical id `{}`) is not a valid Cloudflare namespace id (32-char lowercase hex). Fix or remove `[adapters.cloudflare.deployed].kv_namespaces.{}` in edgezero.toml.",
+                store.platform, store.logical, store.logical
+            ));
+        }
         let placeholder = format!("<placeholder-namespace-id-{}>", store.logical);
 
         // TOML cells use PLATFORM binding.
@@ -776,9 +788,9 @@ mod tests {
 
     #[test]
     fn cloudflare_local_provision_uses_deployed_namespace_id_when_set() {
-        // Deployed carries `kv_namespaces.sessions = "abc123"`.
-        // Expect the id cell in wrangler.toml to be "abc123" (deployed
-        // wins over placeholder).
+        // Deployed carries a REAL 32-char namespace id. Expect the id cell in
+        // wrangler.toml to be that id (deployed wins over placeholder).
+        const REAL_ID: &str = "abcdefabcdefabcdefabcdefabcdef00";
         let dir = tempdir().expect("tempdir");
         let path = write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
@@ -787,7 +799,7 @@ mod tests {
             kv: &kv_ids,
             secrets: &[],
         };
-        let state = deployed_kv(TEST_KV_ID, "abc123");
+        let state = deployed_kv(TEST_KV_ID, REAL_ID);
         let out = CloudflareCliAdapter
             .provision(
                 dir.path(),
@@ -802,12 +814,43 @@ mod tests {
         assert!(out.deployed.is_none());
         let after = fs::read_to_string(&path).expect("read");
         assert!(
-            after.contains("id = \"abc123\""),
+            after.contains(&format!("id = \"{REAL_ID}\"")),
             "deployed id wins over placeholder: {after}"
         );
         assert!(
             !after.contains("<placeholder-namespace-id-sessions>"),
             "no placeholder emitted when deployed provides an id: {after}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_rejects_malformed_tracked_id() {
+        // A malformed tracked id must be refused locally too -- cloud already
+        // rejects the same value, and writing it into wrangler.toml would bind
+        // a fake namespace under `wrangler dev`.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let state = deployed_kv(TEST_KV_ID, "abc123");
+        let Err(err) = CloudflareCliAdapter.provision(
+            dir.path(),
+            Some("wrangler.toml"),
+            None,
+            &stores,
+            Some(&state),
+            ProvisionMode::Local,
+            false,
+        ) else {
+            panic!("a malformed tracked id must be refused in local provision");
+        };
+        assert!(
+            err.contains("abc123") && err.contains("not a valid"),
+            "error explains the malformed tracked id: {err}"
         );
     }
 
@@ -827,7 +870,7 @@ mod tests {
             kv: &kv_ids,
             secrets: &[],
         };
-        let state = deployed_kv(TEST_KV_ID, "from-cloud");
+        let state = deployed_kv(TEST_KV_ID, "0123456789abcdef0123456789abcd01");
         CloudflareCliAdapter
             .provision(
                 dir.path(),
@@ -841,7 +884,7 @@ mod tests {
             .expect("local provision succeeds");
         let after = fs::read_to_string(&path).expect("read");
         assert!(
-            after.contains("id = \"from-cloud\""),
+            after.contains("id = \"0123456789abcdef0123456789abcd01\""),
             "deployed id wins over existing local id: {after}"
         );
         assert!(
@@ -992,7 +1035,7 @@ mod tests {
             kv: &[],
             secrets: &[],
         };
-        let state = deployed_kv(TEST_CONFIG_ID, "abc123");
+        let state = deployed_kv(TEST_CONFIG_ID, "0123456789abcdef0123456789abcd02");
         CloudflareCliAdapter
             .provision(
                 dir.path(),
@@ -1014,7 +1057,7 @@ mod tests {
             "logical id must NOT leak into the binding cell: {after}"
         );
         assert!(
-            after.contains("id = \"abc123\""),
+            after.contains("id = \"0123456789abcdef0123456789abcd02\""),
             "deployed id resolved via LOGICAL lookup: {after}"
         );
     }

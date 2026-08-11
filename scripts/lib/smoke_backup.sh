@@ -26,12 +26,26 @@ reset_backups() {
   BK_BACK=()
 }
 
-# Stop the smoke's server, its DESCENDANTS, and any lingering holder of the
-# port, then wait until the port is actually free -- BEFORE restoration. The
-# wrapper PID's direct children aren't enough: `wrangler` spawns `workerd`,
-# `spin` forks, etc., and a surviving descendant can flush state AFTER the
-# backup was restored, re-corrupting the developer's tree. Args:
-# <wrapper-pid> [port].
+# Is PID $1 a descendant of (or equal to) PID $2? Walks the parent-pid
+# chain up to init, bounded so a cycle/oddity can't loop forever. Used to
+# prove a port holder is OURS before killing it.
+smoke_pid_is_descendant() {
+  local cur="$1" ancestor="$2" guard=0
+  while [ -n "$cur" ] && [ "$cur" != "0" ] && [ "$cur" != "1" ] && [ "$guard" -lt 64 ]; do
+    if [ "$cur" = "$ancestor" ]; then
+      return 0
+    fi
+    cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+    guard=$((guard + 1))
+  done
+  [ "$cur" = "$ancestor" ]
+}
+
+# Stop the smoke's server and its DESCENDANTS, then wait until the port is
+# actually free -- BEFORE restoration. The wrapper PID's direct children
+# aren't enough: `wrangler` spawns `workerd`, `spin` forks, etc., and a
+# surviving descendant can flush state AFTER the backup was restored,
+# re-corrupting the developer's tree. Args: <wrapper-pid> [port].
 smoke_stop_server() {
   local pid="$1"
   local port="${2:-}"
@@ -41,6 +55,21 @@ smoke_stop_server() {
   # already holds the port -- data loss in someone else's process.
   if [ -z "$pid" ]; then
     return 0
+  fi
+  # Capture the port holders that are OUR DESCENDANTS *before* tearing the
+  # tree down. Afterwards a re-parented grand-child (adopted by init) can no
+  # longer be attributed to us -- and if our server died before binding and
+  # an UNRELATED process then grabbed the port, that process is not our
+  # descendant and must never be killed. We only ever kill what we can prove
+  # is ours.
+  local owned_holders=""
+  if [ -n "$port" ] && command -v lsof >/dev/null 2>&1; then
+    local holder
+    for holder in $(lsof -ti ":${port}" 2>/dev/null || true); do
+      if smoke_pid_is_descendant "$holder" "$pid"; then
+        owned_holders="$owned_holders $holder"
+      fi
+    done
   fi
   pkill -TERM -P "$pid" 2>/dev/null || true
   kill -TERM "$pid" 2>/dev/null || true
@@ -52,16 +81,15 @@ smoke_stop_server() {
   pkill -KILL -P "$pid" 2>/dev/null || true
   kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  # Grand-children (workerd/spin) the wrapper PID didn't cover keep the port
-  # bound; hunt them by port and wait for the bind to clear. Only reached
-  # because we DID launch a server on this port.
+  # KILL the OWNED port holders captured above (workerd/spin grand-children
+  # that `pkill -P` didn't cover) -- never an unrelated holder.
+  if [ -n "$owned_holders" ]; then
+    # shellcheck disable=SC2086
+    kill -KILL $owned_holders 2>/dev/null || true
+  fi
+  # Wait for the port to clear as a courtesy; do NOT kill whoever holds it
+  # now (it may be an unrelated process that grabbed the freed port).
   if [ -n "$port" ] && command -v lsof >/dev/null 2>&1; then
-    local holders
-    holders=$(lsof -ti ":${port}" 2>/dev/null || true)
-    if [ -n "$holders" ]; then
-      # shellcheck disable=SC2086
-      kill -KILL $holders 2>/dev/null || true
-    fi
     waited=0
     while [ "$waited" -lt 5 ] && lsof -ti ":${port}" >/dev/null 2>&1; do
       sleep 1

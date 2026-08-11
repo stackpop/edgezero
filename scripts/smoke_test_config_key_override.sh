@@ -131,20 +131,40 @@ seed_fastly_runtime_env() {
   # whole block each time. backup_in_tree already restores the
   # tracked content on cleanup.
   python3 - "$fastly_toml" "$key_override" <<'PY'
-import re
 import sys
 path, key_override = sys.argv[1], sys.argv[2]
 with open(path, 'r', encoding='utf-8') as fh:
-    text = fh.read()
-# Drop any prior edgezero_runtime_env block (idempotent across rows).
-pattern = re.compile(
-    r'\n\[local_server\.config_stores\.edgezero_runtime_env\][^\[]*'
-    r'\[local_server\.config_stores\.edgezero_runtime_env\.contents\][^\[]*',
-    re.MULTILINE,
+    lines = fh.readlines()
+
+# Drop any prior edgezero_runtime_env block (idempotent across rows) by
+# LINES, not a `[^[]*` regex: a `[` inside a value or a comment (e.g.
+# `# see [stores.kv]`) would terminate that regex early and leave block
+# body lines uncommented, corrupting the manifest. A TOML section ends at
+# the next line that STARTS with `[` (after optional whitespace); the
+# block's own two headers are treated as part of the block.
+BLOCK_HEADERS = (
+    '[local_server.config_stores.edgezero_runtime_env]',
+    '[local_server.config_stores.edgezero_runtime_env.contents]',
 )
-text = pattern.sub('\n', text)
+out = []
+skipping = False
+for line in lines:
+    stripped = line.strip()
+    if stripped in BLOCK_HEADERS:
+        skipping = True
+        continue
+    if skipping:
+        # A DIFFERENT section header ends the removed block; body lines
+        # (values, comments, blanks -- brackets or not) are dropped.
+        if stripped.startswith('['):
+            skipping = False
+            out.append(line)
+        continue
+    out.append(line)
+
+text = ''.join(out)
 if key_override:
-    text += (
+    text = text.rstrip('\n') + '\n' + (
         '\n[local_server.config_stores.edgezero_runtime_env]\n'
         'format = "inline-toml"\n'
         '[local_server.config_stores.edgezero_runtime_env.contents]\n'

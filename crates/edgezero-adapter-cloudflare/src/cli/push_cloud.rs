@@ -336,14 +336,25 @@ pub(super) fn read_wrangler_kv_key(
             stderr.trim()
         ));
     }
-    // A missing BINDING / namespace (the KV store itself) is a missing store
-    // -- check it before the key case so "binding ... not found" isn't misread
-    // as a missing key. Current wrangler also reports a wholly unconfigured
-    // project as "No KV Namespaces configured!", which is the same condition.
-    if lower.contains("binding") || lower.contains("no kv namespaces") {
+    // A missing BINDING / namespace (the KV store itself) is a missing store.
+    // Require an ABSENCE qualifier alongside "binding" -- a bare mention of
+    // "binding" (invalid binding syntax, a malformed-manifest diagnostic that
+    // names a binding, ...) is a real error, NOT an absent store, and mapping
+    // it to MissingStore would make a diff report the whole store as added.
+    // Current wrangler also reports a wholly unconfigured project as
+    // "No KV Namespaces configured!", which is the same missing-store case.
+    let binding_absent = lower.contains("binding")
+        && (lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("not defined")
+            || lower.contains("no such")
+            || lower.contains("could not find")
+            || lower.contains("unknown"));
+    if binding_absent || lower.contains("no kv namespaces") {
         return Ok(ReadConfigEntry::MissingStore);
     }
-    // A genuinely absent KEY is a not-found.
+    // A genuinely absent KEY is a not-found (with no "binding" qualifier,
+    // handled above).
     if lower.contains("not found") || lower.contains("does not exist") {
         return Ok(ReadConfigEntry::MissingKey);
     }
@@ -849,6 +860,35 @@ mod tests {
         assert!(
             matches!(result, ReadConfigEntry::MissingStore),
             "binding stderr => MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_bare_binding_error_without_absence() {
+        // A "binding" error that is NOT an absence (invalid syntax, malformed
+        // manifest naming a binding) must surface as an error, not be
+        // misclassified as an absent store (which would report the whole
+        // store as added in a diff).
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: invalid binding name `APP CONFIG`", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter.read_config_entry(
+            project_dir.path(),
+            Some("wrangler.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("a bare binding error (no absence) must be an error, not MissingStore");
+        };
+        assert!(
+            err.contains("invalid binding"),
+            "the real binding error must surface: {err}"
         );
     }
 

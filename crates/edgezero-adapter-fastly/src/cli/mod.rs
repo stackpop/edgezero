@@ -26,6 +26,21 @@ mod run;
 /// runtime overrides -- so the name is reserved.
 pub(super) const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
 
+/// Reject a SINGLE resolved store whose PLATFORM name collides with the
+/// reserved [`RUNTIME_ENV_STORE_NAME`]. Used by the config read/write
+/// dispatch so a runtime env overlay can't route application config into the
+/// internal runtime-override store (which provision manages) and overwrite
+/// runtime configuration.
+fn reject_reserved_store(store: &ResolvedStoreId) -> Result<(), String> {
+    if store.platform == RUNTIME_ENV_STORE_NAME {
+        return Err(format!(
+            "fastly: store `{}` (platform name `{}`) collides with the reserved runtime-override config store `{RUNTIME_ENV_STORE_NAME}` that EdgeZero manages. Rename the store id or its `EDGEZERO__STORES__..__NAME` override.",
+            store.logical, store.platform
+        ));
+    }
+    Ok(())
+}
+
 /// Reject any declared store whose PLATFORM name collides with the reserved
 /// [`RUNTIME_ENV_STORE_NAME`], BEFORE provision writes anything. Shared by the
 /// local and cloud provision arms.
@@ -377,6 +392,7 @@ impl Adapter for FastlyCliAdapter {
         _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
+        reject_reserved_store(store)?;
         push_cloud::write_entries(store, entries, dry_run)
     }
 
@@ -390,6 +406,7 @@ impl Adapter for FastlyCliAdapter {
         _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
+        reject_reserved_store(store)?;
         push_local::write_entries(
             manifest_root,
             adapter_manifest_path,
@@ -408,6 +425,7 @@ impl Adapter for FastlyCliAdapter {
         key: &str,
         _push_ctx: &AdapterPushContext<'_>,
     ) -> Result<ReadConfigEntry, String> {
+        reject_reserved_store(store)?;
         push_cloud::read_entry(store, key)
     }
 
@@ -420,6 +438,7 @@ impl Adapter for FastlyCliAdapter {
         key: &str,
         _push_ctx: &AdapterPushContext<'_>,
     ) -> Result<ReadConfigEntry, String> {
+        reject_reserved_store(store)?;
         push_local::read_entry(manifest_root, adapter_manifest_path, store, key)
     }
 
@@ -502,7 +521,65 @@ pub(crate) fn path_mutation_guard() -> &'static PathMutationMutex<()> {
 #[cfg(test)]
 mod tests {
     use super::FastlyCliAdapter;
+    use edgezero_adapter::registry::{AdapterPushContext, ResolvedStoreId};
     use edgezero_adapter::{Adapter as _, TypedSecretEntry};
+    use std::path::Path;
+
+    #[test]
+    fn config_dispatch_rejects_reserved_runtime_env_store() {
+        // An env overlay that routes a config store's platform name to the
+        // reserved `edgezero_runtime_env` must be refused at the read/write
+        // dispatch -- not just during provision -- so app config can't
+        // overwrite the internal runtime-override store.
+        let store = ResolvedStoreId::new("app_config", "edgezero_runtime_env");
+        let ctx = AdapterPushContext::new();
+        let entries = [("k".to_owned(), "v".to_owned())];
+        for result in [
+            FastlyCliAdapter
+                .read_config_entry(Path::new("."), Some("fastly.toml"), None, &store, "k", &ctx)
+                .map(|_| ()),
+            FastlyCliAdapter
+                .push_config_entries(
+                    Path::new("."),
+                    Some("fastly.toml"),
+                    None,
+                    &store,
+                    &entries,
+                    &ctx,
+                    true,
+                )
+                .map(|_| ()),
+            FastlyCliAdapter
+                .read_config_entry_local(
+                    Path::new("."),
+                    Some("fastly.toml"),
+                    None,
+                    &store,
+                    "k",
+                    &ctx,
+                )
+                .map(|_| ()),
+            FastlyCliAdapter
+                .push_config_entries_local(
+                    Path::new("."),
+                    Some("fastly.toml"),
+                    None,
+                    &store,
+                    &entries,
+                    &ctx,
+                    true,
+                )
+                .map(|_| ()),
+        ] {
+            let Err(err) = result else {
+                panic!("a config op against the reserved runtime store must be refused");
+            };
+            assert!(
+                err.contains("reserved") && err.contains("edgezero_runtime_env"),
+                "error explains the reserved-store collision: {err}"
+            );
+        }
+    }
 
     #[test]
     fn validate_typed_secrets_passes_with_no_collision() {

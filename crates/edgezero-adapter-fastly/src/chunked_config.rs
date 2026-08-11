@@ -26,13 +26,14 @@ use sha2::{Digest as _, Sha256};
 /// resolver to bound the untrusted per-chunk lengths a pointer declares
 /// before any allocation -- so it stays unconditional.
 pub(crate) const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
-/// Per-entry KEY length limit enforced by Fastly Config Store. Chunk
-/// keys append a fixed content-address suffix to the root key, so a
-/// long root key can push a chunk key past this bound -- Fastly would
-/// reject the write at runtime, so the writer refuses upfront. CLI
-/// writer only.
+/// Per-entry KEY length limit enforced by Fastly Config Store: Fastly
+/// documents a MAXIMUM key length of 255 characters (so 255 is valid, 256
+/// is rejected). Chunk keys append a fixed content-address suffix to the
+/// root key, so a long root key can push a chunk key past this bound --
+/// Fastly would reject the write at runtime, so the writer refuses upfront.
+/// CLI writer only.
 #[cfg(any(feature = "cli", test))]
-pub(crate) const FASTLY_CONFIG_KEY_LIMIT: usize = 256;
+pub(crate) const FASTLY_CONFIG_KEY_LIMIT: usize = 255;
 /// Target payload size per chunk (kept under the entry limit to leave
 /// room for the key and any protocol overhead). CLI writer only.
 #[cfg(any(feature = "cli", test))]
@@ -95,7 +96,7 @@ pub(crate) fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    // Fastly rejects Config Store keys longer than 256 characters. Check
+    // Fastly rejects Config Store keys longer than 255 characters. Check
     // the ROOT key BEFORE the direct-value early return below, which
     // writes `root_key` verbatim -- otherwise a small envelope under an
     // over-long key sails past every local check and fails remotely.
@@ -141,7 +142,7 @@ pub(crate) fn prepare_fastly_config_entries(
             format!("chunk [{start}..{end}] for `{root_key}` is not valid UTF-8: {err}")
         })?;
         let chunk_key = format!("{root_key}{CHUNK_KEY_INFIX}{envelope_sha256}.{idx}");
-        // Fastly rejects Config Store keys longer than 256 characters.
+        // Fastly rejects Config Store keys longer than 255 characters.
         // The chunk key is `<root>.__edgezero_chunks.<64-hex>.<idx>`, so a
         // long root key overflows the limit. Refuse here rather than emit
         // a key the platform silently rejects on `config push`.
@@ -448,53 +449,54 @@ mod tests {
     }
 
     #[test]
-    fn direct_value_rejects_root_key_over_256_chars() {
+    fn direct_value_rejects_root_key_over_255_chars() {
         // A SMALL envelope (no chunking) under an over-long key must still
         // be refused locally -- the direct-value path writes the root key
-        // verbatim, so skipping the check would only fail remotely.
+        // verbatim, so skipping the check would only fail remotely. Fastly's
+        // documented max key length is 255, so 256 is rejected.
         let envelope = make_envelope_json(64);
         assert!(
             envelope.len() <= FASTLY_CONFIG_ENTRY_LIMIT,
             "fixture must take the direct-value path"
         );
-        let long_key = "k".repeat(257);
+        let long_key = "k".repeat(256);
         let err = prepare_fastly_config_entries(&long_key, &envelope)
-            .expect_err("a 257-char key must be rejected even without chunking");
+            .expect_err("a 256-char key must be rejected even without chunking");
         assert!(
-            err.contains("256") && err.contains("key limit"),
+            err.contains("255") && err.contains("key limit"),
             "error explains the key-length limit: {err}"
         );
     }
 
     #[test]
-    fn oversized_root_key_rejected_when_chunk_key_exceeds_256() {
+    fn oversized_root_key_rejected_when_chunk_key_exceeds_255() {
         // Chunk keys append `.__edgezero_chunks.<64-hex>.<idx>` (an
         // 85-char suffix at idx 0) to the root key. A 200-char root key
-        // pushes the chunk key well past Fastly's 256-char key limit.
+        // pushes the chunk key well past Fastly's 255-char key limit.
         let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let long_key = "k".repeat(200);
         let err = prepare_fastly_config_entries(&long_key, &envelope)
-            .expect_err("a root key that overflows the 256-char chunk-key limit must be rejected");
+            .expect_err("a root key that overflows the 255-char chunk-key limit must be rejected");
         assert!(
-            err.contains("256") && err.contains("key limit"),
+            err.contains("255") && err.contains("key limit"),
             "error explains the key-length limit: {err}"
         );
     }
 
     #[test]
-    fn root_key_landing_exactly_on_256_chunk_key_is_accepted() {
+    fn root_key_landing_exactly_on_255_chunk_key_is_accepted() {
         // suffix at idx 0 = 19 (infix) + 64 (sha) + 1 (`.`) + 1 (`0`) = 85.
-        // A 171-char root key makes the chunk key exactly 256 chars. An
-        // 8001-char envelope splits into two chunks, so the index stays a
-        // single digit and every chunk key stays at the limit.
+        // A 170-char root key makes the chunk key exactly 255 chars (the
+        // documented max). An 8001-char envelope splits into two chunks, so
+        // the index stays a single digit and every chunk key stays at 255.
         let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        let boundary_key = "k".repeat(171);
+        let boundary_key = "k".repeat(170);
         let entries = prepare_fastly_config_entries(&boundary_key, &envelope)
-            .expect("a chunk key of exactly 256 chars is within the limit");
+            .expect("a chunk key of exactly 255 chars is within the limit");
         for (key, _) in &entries[..entries.len().saturating_sub(1)] {
             assert!(
                 key.len() <= FASTLY_CONFIG_KEY_LIMIT,
-                "chunk key must stay within the 256-char limit: {} chars",
+                "chunk key must stay within the 255-char limit: {} chars",
                 key.len()
             );
         }

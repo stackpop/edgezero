@@ -215,9 +215,11 @@ new` already ran the `--local` form for you when scaffolding, so
    fastly secret-store-entry create --store-id=<id> --name=demo_api_token --value=<value>
 
    # Spin local -- Spin resolves the secret from the SPIN_VARIABLE_<UPPER>
-   # env var (provision writes an empty `SPIN_VARIABLE_DEMO_API_TOKEN=`
-   # placeholder into the spin crate's .env; fill in the value).
-   echo SPIN_VARIABLE_DEMO_API_TOKEN=<value> >> .env
+   # env var. provision writes an empty `SPIN_VARIABLE_DEMO_API_TOKEN=`
+   # placeholder into the SPIN CRATE's .env (next to spin.toml), which
+   # `edgezero serve --adapter spin` sources; set the value THERE, not in
+   # the caller's cwd:
+   echo SPIN_VARIABLE_DEMO_API_TOKEN=<value> >> crates/<app>-adapter-spin/.env
 
    # Axum local
    EDGEZERO_SECRET_demo_api_token=<value> cargo run -p <app-cli> -- serve --adapter axum

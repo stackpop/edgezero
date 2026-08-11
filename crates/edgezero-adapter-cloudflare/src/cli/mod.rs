@@ -218,14 +218,15 @@ impl Adapter for CloudflareCliAdapter {
 
     /// Cloudflare appends each typed secret as a `<key>=""` line into the
     /// SAME `.dev.vars` that `provision_local` seeds with generated
-    /// `EDGEZERO__STORES__<KIND>__<ID>__NAME` / `__KEY` store-overlay lines,
-    /// and both batches share one `append_lines_dedup_with_header` pass. A
-    /// typed secret whose key falls in that reserved `EDGEZERO__STORES__`
-    /// namespace would dedup against a generated overlay line and one would
-    /// be silently dropped. Reject the collision here, in preflight, before
-    /// any write.
+    /// `EDGEZERO__*` runtime-config lines (store `__NAME` / `__KEY` overlays,
+    /// plus `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*`), and both batches
+    /// share one `append_lines_dedup_with_header` pass. A typed secret whose
+    /// key falls anywhere in that reserved `EDGEZERO__` namespace would
+    /// collide with runtime config and resolve to configuration data instead
+    /// of the credential. Reject the collision here, in preflight, before any
+    /// write.
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
-        const RESERVED_PREFIX: &str = "EDGEZERO__STORES__";
+        const RESERVED_PREFIX: &str = "EDGEZERO__";
         for entry in entries {
             if entry
                 .key_value
@@ -233,7 +234,7 @@ impl Adapter for CloudflareCliAdapter {
                 .starts_with(RESERVED_PREFIX)
             {
                 return Err(format!(
-                    "cloudflare: typed secret key `{}` is reserved: the `{RESERVED_PREFIX}` namespace is generated into `.dev.vars` by provision (store `__NAME` / `__KEY` overlays), so a secret there would collide and be silently dropped. Rename the secret.",
+                    "cloudflare: typed secret key `{}` is reserved: the `{RESERVED_PREFIX}` namespace is used for runtime configuration in `.dev.vars` (store overlays, `EDGEZERO__ADAPTER__*`, `EDGEZERO__LOGGING__*`, ...), so a secret there would collide with config and resolve to configuration data instead of the credential. Rename the secret.",
                     entry.key_value
                 ));
             }
@@ -527,23 +528,26 @@ mod tests {
     }
 
     #[test]
-    fn validate_typed_secrets_rejects_reserved_store_overlay_namespace() {
-        // A typed secret key in the `EDGEZERO__STORES__` namespace would
-        // collide (and be silently deduped away) against the generated
-        // store-overlay lines provision writes into the SAME `.dev.vars`.
-        // Preflight must refuse it.
-        let entries = [TypedSecretEntry::new(
-            TEST_SECRET_ID,
-            "collision",
+    fn validate_typed_secrets_rejects_reserved_edgezero_namespace() {
+        // A typed secret key ANYWHERE in the reserved `EDGEZERO__` namespace
+        // (store overlays AND adapter/logging runtime config) would collide
+        // with runtime config in the SAME `.dev.vars`. Preflight must refuse
+        // it, case-insensitively.
+        for reserved in [
             "EDGEZERO__STORES__CONFIG__APP__KEY",
-        )];
-        let Err(err) = CloudflareCliAdapter.validate_typed_secrets(&entries) else {
-            panic!("a reserved-namespace secret key must be rejected");
-        };
-        assert!(
-            err.contains("reserved") && err.contains("EDGEZERO__STORES__"),
-            "error explains the reserved-namespace collision: {err}"
-        );
+            "EDGEZERO__ADAPTER__HOST",
+            "EDGEZERO__LOGGING__LEVEL",
+            "edgezero__adapter__port",
+        ] {
+            let entries = [TypedSecretEntry::new(TEST_SECRET_ID, "collision", reserved)];
+            let Err(err) = CloudflareCliAdapter.validate_typed_secrets(&entries) else {
+                panic!("a reserved-namespace secret key must be rejected: {reserved}");
+            };
+            assert!(
+                err.contains("reserved") && err.contains("EDGEZERO__"),
+                "error explains the reserved-namespace collision for {reserved}: {err}"
+            );
+        }
     }
 
     #[test]
