@@ -1766,45 +1766,68 @@ test_action_pin_gate() {
   local dir="$WORK_DIR/pins"
   mkdir -p "$dir"
 
+  # Each fixture is a real WORKFLOW (proper jobs.<job>.steps nesting) — the checker
+  # extracts only genuine action `uses`, not arbitrary map keys. `wrap` writes the
+  # jobs/steps scaffolding so the tests exercise the same paths the gate selects.
+  wrap() { printf 'jobs:\n  a:\n    steps:\n%s\n' "$1" >"$2"; }
+
   # Valid pins in block, quoted, and flow forms — a version tag and a full SHA —
   # plus a commented-out branch ref that must be IGNORED (not a real `uses`).
-  cat >"$dir/ok.yml" <<'YML'
-steps:
-  - uses: actions/checkout@v4.3.0
-  - "uses": actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-  - { uses: actions/setup-node@v4 }
-  # uses: actions/checkout@main
-YML
+  wrap '      - uses: actions/checkout@v4.3.0
+      - "uses": actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+      - { uses: actions/setup-node@v4 }
+      # uses: actions/checkout@main' "$dir/ok.yml"
   assert_succeeds "valid pins (block/quoted/flow, tag+SHA) pass; a commented branch is ignored" \
     bash "$checker" "$dir/ok.yml"
 
   # Every mutable-ref form must be REJECTED — including the ones NO text regex can
   # catch: a unicode-ESCAPED key, a `!!str`-TAGGED value, and a MULTILINE folded
   # scalar. A structural parse sees the `uses` and the `@main` in all of them.
-  printf 'steps:\n  - uses: actions/checkout@main\n' >"$dir/block.yml"
+  wrap '      - uses: actions/checkout@main' "$dir/block.yml"
   assert_fails "block @main is rejected" bash "$checker" "$dir/block.yml"
 
-  printf 'steps:\n  - "uses": actions/checkout@develop\n' >"$dir/quoted.yml"
+  wrap '      - "uses": actions/checkout@develop' "$dir/quoted.yml"
   assert_fails "quoted-key @develop is rejected" bash "$checker" "$dir/quoted.yml"
 
-  printf 'steps:\n  - { uses: actions/checkout@latest }\n' >"$dir/flow.yml"
+  wrap '      - { uses: actions/checkout@latest }' "$dir/flow.yml"
   assert_fails "flow-mapping @latest is rejected" bash "$checker" "$dir/flow.yml"
 
-  printf 'steps:\n  - uses : actions/checkout@release-2\n' >"$dir/space.yml"
+  wrap '      - uses : actions/checkout@release-2' "$dir/space.yml"
   assert_fails "space-before-colon @release-2 is rejected" bash "$checker" "$dir/space.yml"
 
-  printf 'steps:\n  - "\\u0075ses": actions/checkout@main\n' >"$dir/escaped.yml"
+  wrap '      - "\u0075ses": actions/checkout@main' "$dir/escaped.yml"
   assert_fails "unicode-escaped key cannot hide @main" bash "$checker" "$dir/escaped.yml"
 
-  printf 'steps:\n  - uses: !!str actions/checkout@main\n' >"$dir/tagged.yml"
+  wrap '      - uses: !!str actions/checkout@main' "$dir/tagged.yml"
   assert_fails "a !!str-tagged @main is rejected" bash "$checker" "$dir/tagged.yml"
 
-  printf 'steps:\n  - uses: >-\n      actions/checkout@main\n' >"$dir/multiline.yml"
+  wrap '      - uses: >-
+          actions/checkout@main' "$dir/multiline.yml"
   assert_fails "a multiline folded @main is rejected" bash "$checker" "$dir/multiline.yml"
 
   # An entirely unpinned ref (no @) is rejected too.
-  printf 'steps:\n  - uses: actions/checkout\n' >"$dir/unpinned.yml"
+  wrap '      - uses: actions/checkout' "$dir/unpinned.yml"
   assert_fails "an unpinned ref (no @) is rejected" bash "$checker" "$dir/unpinned.yml"
+
+  # A non-action `uses` field (here an env var literally named `uses`) is NOT an
+  # action reference and must NOT be flagged — only job/step/composite `uses` count.
+  cat >"$dir/env-uses.yml" <<'YML'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    env:
+      uses: some-internal-value@main
+    steps:
+      - uses: actions/checkout@v4.3.0
+YML
+  assert_succeeds "a non-action 'uses' field (jobs.<job>.env.uses) is not treated as a ref" \
+    bash "$checker" "$dir/env-uses.yml"
+
+  # FAIL CLOSED: a file yq cannot parse must be REJECTED, never silently passed.
+  printf 'jobs:\n  a:\n    steps:\n      - uses: actions/checkout@main\n  bad: [unclosed\n' \
+    >"$dir/malformed.yml"
+  assert_fails "malformed YAML is rejected (fail-closed, not passed unchecked)" \
+    bash "$checker" "$dir/malformed.yml"
 }
 
 # ---------------------------------------------------------------------------

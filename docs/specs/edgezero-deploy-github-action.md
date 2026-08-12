@@ -628,8 +628,9 @@ probe it, roll back on failure.
 11. Resolve the application **Git root**; record `source-revision`; fail on a
     dirty working tree (`build-app-cli` used an isolated `CARGO_TARGET_DIR`, so its
     CLI build did not dirty this tree).
-12. Resolve the **Cargo workspace root** for `working-directory` (§11.1) for all
-    Cargo-scoped operations that follow.
+12. Resolve the **Cargo workspace root** for `working-directory` (§11.1) and the
+    effective **build-mode** (§8) — both are needed by the cache and build steps
+    that follow — for all Cargo-scoped operations.
 13. Resolve the application Rust toolchain (§7) and install it plus the
     **wrapper-provided** application `target` (Fastly → `wasm32-wasip1`). The
     engine does not map `adapter` → target.
@@ -638,7 +639,7 @@ probe it, roll back on failure.
     `build-mode: always`, whose credential-free build both populates and re-saves it;
     with `build-mode: never` the restore, seed build, and save are all skipped.
 15. Print non-sensitive diagnostics.
-16. Resolve `build-mode` (§8). If `always`, run
+16. If the effective `build-mode` (resolved at step 12) is `always`, run
     `<app-cli-bin> build --adapter <adapter> -- <build-args…>` with **no** provider
     credentials in scope (the `provider-env-clear` names stay unset here). Then, if
     `cache: true`, **SAVE** the `target/` cache from this credential-free build —

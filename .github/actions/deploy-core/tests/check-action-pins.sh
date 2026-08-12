@@ -20,10 +20,16 @@ REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)
 # Require mikefarah yq v4: its expression syntax below is version-specific, and the
 # alternative (kislyuk's python yq) is a different tool. Fail closed if it is absent
 # so a gate that silently checked nothing can never pass.
-if ! command -v yq >/dev/null 2>&1 || ! yq --version 2>&1 | grep -qiE 'mikefarah|version v?4\.'; then
+if ! command -v yq >/dev/null 2>&1 || ! yq --version 2>&1 | grep -qE 'mikefarah/yq.*version v?4\.'; then
   echo "::error::check-action-pins.sh requires mikefarah yq v4 for structural YAML parsing" >&2
   exit 2
 fi
+
+# Extract ONLY genuine action references: workflow job-level `uses` (reusable
+# workflow calls), workflow step `uses`, and composite-action `runs.steps[].uses`.
+# A blanket "any map with a `uses` key" would also reject unrelated fields such as
+# `jobs.<job>.env.uses`.
+uses_query='[(.jobs[]? | .uses), (.jobs[]? | .steps[]? | .uses), (.runs.steps[]? | .uses)] | .[] | select(. != null)'
 
 files=()
 if [[ "$#" -gt 0 ]]; then
@@ -43,7 +49,14 @@ tag_re='^v?[0-9]+(\.[0-9]+)*([-+][0-9A-Za-z.-]+)?$'
 status=0
 for file in "${files[@]}"; do
   [[ -f "$file" ]] || continue
-  # yq errors on a non-YAML file; treat that as no refs (a real workflow parses).
+  # FAIL CLOSED on a parse/tool failure: if yq cannot read the file, a `2>/dev/null`
+  # process substitution would yield no refs and the gate would silently pass a file
+  # it never checked. Capture the output and the exit status instead.
+  if ! uses_list=$(yq "$uses_query" "$file" 2>/dev/null); then
+    echo "::error::could not parse '$file' as YAML — refusing to pass a file the pin gate cannot read" >&2
+    status=1
+    continue
+  fi
   while IFS= read -r ref; do
     [[ -z "$ref" || "$ref" == "null" ]] && continue
     case "$ref" in
@@ -61,7 +74,7 @@ for file in "${files[@]}"; do
       echo "::error::action ref '@$suffix' is neither a full commit SHA nor a release version tag (mutable branch/floating refs are not allowed): '$ref' in $file" >&2
       status=1
     fi
-  done < <(yq '.. | select(tag == "!!map" and has("uses")) | .uses' "$file" 2>/dev/null)
+  done <<<"$uses_list"
 done
 
 if [[ "$status" -eq 0 ]]; then

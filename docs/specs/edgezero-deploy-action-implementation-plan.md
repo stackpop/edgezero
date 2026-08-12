@@ -142,9 +142,13 @@ reference to port from. Most transfer with light changes:
    - Resolve Rust toolchain (explicit → Rustup files → `.tool-versions` → repo
      fallback) and install the **wrapper-provided** concrete `target` (the engine
      never maps `adapter` → target).
-   - Optional exact-key cache of the **Cargo workspace root** `target/`
-     restore/save.
-   - Resolve `build-mode`; optional credential-free build.
+   - Resolve `build-mode` (§8).
+   - Cache is gated on `build-mode: always`: restore the exact-key **Cargo
+     workspace root** `target/`, and SAVE it from the credential-free build BELOW —
+     BEFORE the credential-bearing deploy, never after — so a secret can never enter
+     the cache. Under `build-mode: never`, restore/save are both skipped.
+   - Under `build-mode: always`, run the credential-free build (the cache save above
+     captures its `target/`).
    - Non-deploy steps: unset the `provider-env-clear` names (defense-in-depth;
      `provider-env` itself is absent here).
    - Deploy step only (its `env:` carries `provider-env`): clear the

@@ -3,14 +3,11 @@ name: Deploy actions
 on:
   pull_request:
     paths:
-      - .github/actions/build-app-cli/**
-      - .github/actions/deploy-core/**
-      - .github/actions/deploy-fastly/**
-      - .github/actions/healthcheck-fastly/**
-      - .github/actions/rollback-fastly/**
-      - .github/actions/config-push-fastly/**
-      - .github/workflows/deploy-action.yml
-      - .github/workflows/fastly-installer-check.yml
+      # ANY workflow or action change must start the repository-wide pin gate (and
+      # the smokes) — including a brand-new action directory or an unrelated
+      # workflow like test.yml that could introduce a floating ref.
+      - .github/actions/**
+      - .github/workflows/**
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
       # The smoke fixture is a real Cargo app built against this workspace's crate
@@ -29,14 +26,11 @@ on:
   push:
     branches: [main]
     paths:
-      - .github/actions/build-app-cli/**
-      - .github/actions/deploy-core/**
-      - .github/actions/deploy-fastly/**
-      - .github/actions/healthcheck-fastly/**
-      - .github/actions/rollback-fastly/**
-      - .github/actions/config-push-fastly/**
-      - .github/workflows/deploy-action.yml
-      - .github/workflows/fastly-installer-check.yml
+      # ANY workflow or action change must start the repository-wide pin gate (and
+      # the smokes) — including a brand-new action directory or an unrelated
+      # workflow like test.yml that could introduce a floating ref.
+      - .github/actions/**
+      - .github/workflows/**
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
       # The smoke fixture is a real Cargo app built against this workspace's crate
@@ -167,11 +161,6 @@ jobs:
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
           deploy-args: '["--comment","smoke"]'
-          # Negative cache case: cache: true with the Fastly default build-mode:
-          # never is a documented NO-OP — no seed build, no save, no restore — and
-          # the deploy still succeeds. (cache-smoke covers the positive path with
-          # build-mode: always.)
-          cache: true
 
       - name: Assert production deploy, version threading, and credential boundary
         env:
@@ -297,6 +286,23 @@ jobs:
           cache: true
       - name: Assert the marker was restored from cache (not rebuilt)
         run: .github/actions/deploy-core/tests/cache-smoke-assert.sh
+      # Negative regression: build-mode: never must SKIP restore (gated on always).
+      # Delete target/, deploy with build-mode: never + cache: true, and assert the
+      # cache did NOT come back. Reintroducing the old restore condition would fail
+      # here instead of leaving the smoke green.
+      - name: Delete target/ before the build-mode never deploy
+        run: .github/actions/deploy-core/tests/cache-smoke-capture.sh
+      - name: Deploy with build-mode never (restore must be skipped)
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+          build-mode: never
+          cache: true
+      - name: Assert the cache was NOT restored under build-mode never
+        run: .github/actions/deploy-core/tests/cache-smoke-assert-no-restore.sh
 
   # Lost-version RECOVERY through the actual actions. A production deploy mutates the
   # service (activates v7) but loses its version line AND breaks the API fallback, so
