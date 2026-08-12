@@ -39,6 +39,8 @@ use std::io;
 use std::mem;
 use std::process::Command;
 
+use edgezero_adapter::registry::AdapterPushContext;
+
 /// Approximate worst-case argv size we'll squeeze into ONE `spin cloud
 /// key-value set` invocation before chunking into multiple
 /// invocations. Linux's typical `ARG_MAX` is 128 KiB-2 MiB; macOS is
@@ -56,6 +58,18 @@ pub(crate) fn deploy_command_targets_fermyon_cloud(deploy_cmd: Option<&str>) -> 
         return false;
     };
     cmd.contains("spin cloud deploy") || cmd.contains("spin deploy")
+}
+
+/// Whether a `config push`/`diff` should target Fermyon Cloud. Prefers the
+/// EXPLICIT `[adapters.spin.adapter].cloud = true` flag (the hard-cutoff
+/// manifest omits the `[adapters.spin.commands]` block, so the deploy-command
+/// heuristic can no longer fire on generated projects), falling back to the
+/// legacy deploy-command sniff for hand-written manifests that still carry a
+/// `commands.deploy`.
+#[must_use]
+pub(crate) fn push_targets_fermyon_cloud(push_ctx: &AdapterPushContext<'_>) -> bool {
+    push_ctx.cloud_target
+        || deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)
 }
 
 /// Build the `key=value` argv strings for one chunk. Each entry's
@@ -296,6 +310,22 @@ mod tests {
     #[test]
     fn missing_deploy_command_returns_false() {
         assert!(!deploy_command_targets_fermyon_cloud(None));
+    }
+
+    #[test]
+    fn push_targets_cloud_via_explicit_flag_without_commands_block() {
+        // The hard-cutoff manifest omits `[adapters.spin.commands]`, so the
+        // deploy-command heuristic can't fire. The explicit
+        // `[adapters.spin.adapter].cloud = true` flag must still route to
+        // cloud; unset must stay local; and a legacy `commands.deploy` sniff
+        // must still work for hand-written manifests.
+        assert!(push_targets_fermyon_cloud(
+            &AdapterPushContext::new().with_cloud_target(true)
+        ));
+        assert!(!push_targets_fermyon_cloud(&AdapterPushContext::new()));
+        assert!(push_targets_fermyon_cloud(
+            &AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin cloud deploy")
+        ));
     }
 
     // ---------- argv shape ----------

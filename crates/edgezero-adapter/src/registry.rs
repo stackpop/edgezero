@@ -404,6 +404,12 @@ pub struct AdapterPushContext<'ctx> {
     /// adapter), in which case auto-detection silently does not
     /// fire.
     pub manifest_adapter_deploy_cmd: Option<&'ctx str>,
+    /// `true` when `[adapters.<name>.adapter].cloud = true` -- the explicit
+    /// signal that config `push`/`diff` should target the platform CLOUD
+    /// store. The authoritative replacement for the `manifest_adapter_deploy_cmd`
+    /// heuristic (the hard-cutoff manifest no longer emits a `commands` block
+    /// to sniff). Adapters treat cloud as `cloud_target || <deploy-cmd sniff>`.
+    pub cloud_target: bool,
     /// Already-resolved path to the adapter's runtime configuration
     /// file (e.g. Spin's `runtime-config.toml`, which declares the
     /// `[key_value_store.<label>]` backends `config push --adapter
@@ -430,6 +436,14 @@ impl<'ctx> AdapterPushContext<'ctx> {
     #[inline]
     pub fn with_local(mut self, local: bool) -> Self {
         self.local = local;
+        self
+    }
+
+    /// Set the explicit cloud-target flag (`[adapters.<name>.adapter].cloud`).
+    #[must_use]
+    #[inline]
+    pub fn with_cloud_target(mut self, cloud: bool) -> Self {
+        self.cloud_target = cloud;
         self
     }
 

@@ -212,7 +212,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     let lock_root = manifest_root_for_lock();
     // Held (via its `Drop`) until the end of this function, so the lock
     // stays taken for the whole deploy even though it's last *named* below.
-    let lock = provision_lock::ProvisionLock::acquire(&lock_root)?;
+    let lock = provision_lock::ProvisionLock::acquire_for_deploy(&lock_root)?;
     // Advertise the held lock to the deploy subprocess (and its children)
     // via the child's own environment -- NOT the parent's global env, which
     // edition-2024 `set_var` would make unsafe and the workspace forbids.

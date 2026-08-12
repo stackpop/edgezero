@@ -1042,6 +1042,7 @@ fn resolve_push_paths(ctx: &PushContext) -> Result<ResolvedPushPaths<'_>, String
     if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
         push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
     }
+    push_ctx = push_ctx.with_cloud_target(adapter_cfg.adapter.cloud.unwrap_or(false));
     let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
     let component_selector = adapter_cfg.adapter.component.clone();
     Ok(ResolvedPushPaths {

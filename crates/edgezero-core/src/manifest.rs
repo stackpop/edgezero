@@ -459,6 +459,15 @@ pub struct ManifestAdapterDefinition {
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub component: Option<String>,
+    /// Whether config `push` / `diff` targets the platform's CLOUD store
+    /// rather than the local emulator store. Currently only the Spin adapter
+    /// reads it: `true` routes `config push`/`diff --adapter spin` to Fermyon
+    /// Cloud key-value (`spin cloud key-value ...`); unset/`false` uses the
+    /// local `SQLite` store. Replaces the old heuristic that inferred cloud
+    /// from the `[adapters.spin.commands].deploy` string, which the
+    /// hard-cutoff manifest no longer emits.
+    #[serde(default)]
+    pub cloud: Option<bool>,
     #[serde(rename = "crate")]
     #[serde(default)]
     #[validate(length(min = 1_u64))]
@@ -2001,7 +2010,7 @@ ids = ["default"]
 
     #[test]
     fn manifest_rejects_case_fold_duplicate_adapter_keys() {
-        // PR #269 round 4: case-fold dup detection. `[adapters.xenon]`
+        // Case-fold duplicate detection. `[adapters.xenon]`
         // and `[adapters.Xenon]` are distinct TOML keys but resolve
         // to the same `adapter_entry` lookup at runtime — reject at
         // load time so the case-insensitive lookup is never
@@ -2048,7 +2057,7 @@ ids = ["default"]
 
     #[test]
     fn manifest_stores_rejects_unknown_kind_at_parse_time() {
-        // PR #269 round 4 / F2: `deny_unknown_fields` on
+        // `deny_unknown_fields` on
         // ManifestStores catches typos like `[stores.secret]` (vs
         // the correct `[stores.secrets]`). Pre-fix, a typo passed
         // parsing silently and the runtime saw no secrets

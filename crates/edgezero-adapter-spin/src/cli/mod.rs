@@ -412,7 +412,7 @@ impl Adapter for SpinCliAdapter {
         let platform = store.platform.as_str();
 
         // Branch 2: Fermyon Cloud auto-detect.
-        if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
+        if push_cloud::push_targets_fermyon_cloud(push_ctx) {
             return Ok(ReadConfigEntry::Unsupported(
                 "Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1",
             ));

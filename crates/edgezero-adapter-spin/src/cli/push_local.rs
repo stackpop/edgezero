@@ -538,7 +538,7 @@ pub(super) fn dispatch_push(
     //    declaration, and parsing the file would gratuitously block
     //    cloud pushes (including `--dry-run` previews) on syntax
     //    errors in a file that doesn't influence the cloud path.
-    if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
+    if push_cloud::push_targets_fermyon_cloud(push_ctx) {
         let app_name = read_spin_application_name(&spin_manifest_path)?;
         if dry_run {
             // Run the same validation the real push runs: a `=` in

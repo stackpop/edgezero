@@ -150,6 +150,23 @@ impl ProvisionLock {
     /// filesystem error with the lockfile path so operators can
     /// diagnose disk-full / permission issues.
     pub(crate) fn acquire(manifest_root: &Path) -> Result<Self, String> {
+        // File writers (provision / config push) need the sibling lock so two
+        // of them spawned by the same deploy serialise.
+        Self::acquire_inner(manifest_root, true)
+    }
+
+    /// Acquire for a DEPLOY, which only SPAWNS provisions and writes no
+    /// provision files itself. A borrowing deploy therefore takes NO sibling
+    /// lock -- holding it across the deploy subprocess is exactly what
+    /// dead-locks a nested (grand)child borrower that then contends on the
+    /// same single sibling file. Co-sibling PROVISIONS still serialise,
+    /// because each of THEM (via [`acquire`](Self::acquire)) takes the
+    /// sibling lock.
+    pub(crate) fn acquire_for_deploy(manifest_root: &Path) -> Result<Self, String> {
+        Self::acquire_inner(manifest_root, false)
+    }
+
+    fn acquire_inner(manifest_root: &Path, needs_sibling: bool) -> Result<Self, String> {
         let dot_edgezero = manifest_root.join(".edgezero");
         let path = dot_edgezero.join("provision.lock");
         // Reject a symlinked `.edgezero/` or `provision.lock` BEFORE
@@ -214,7 +231,24 @@ impl ProvisionLock {
             let file_token = read_token(&path);
             let env_token = env::var(LOCK_TOKEN_ENV).unwrap_or_default();
             if !file_token.is_empty() && file_token == env_token {
-                return Self::borrow_via_sibling(manifest_root, &dot_edgezero, path, file_token);
+                if needs_sibling {
+                    return Self::borrow_via_sibling(
+                        manifest_root,
+                        &dot_edgezero,
+                        path,
+                        file_token,
+                    );
+                }
+                // A deploy borrower holds NO lock (it writes no provision
+                // files); it keeps only the unlocked main descriptor. This
+                // is what lets a three-level composed deploy avoid dead-
+                // locking on the single shared sibling file.
+                return Ok(Self {
+                    file,
+                    borrowed: true,
+                    path,
+                    token: file_token,
+                });
             }
         }
         // Own the main lock: either no advertisement matched, or a matching
@@ -481,6 +515,46 @@ mod tests {
             elapsed >= Duration::from_millis(30),
             "B must serialise behind A's sibling lock; only waited {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn deploy_borrower_does_not_hold_the_sibling_lock() {
+        // A composed deploy: the owner holds the main lock; a nested DEPLOY
+        // borrows via `acquire_for_deploy` and must take NO sibling lock (it
+        // writes no provision files). A provision that then borrows and DOES
+        // take the sibling lock must not block on the deploy borrower --
+        // otherwise a three-level composed deploy dead-locks.
+        use crate::test_support::{EnvOverride, manifest_guard};
+        use std::sync::PoisonError;
+        let _g = manifest_guard()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let advert = ProvisionLock::lock_path_for(temp.path());
+        let _env = EnvOverride::set(super::LOCK_ENV, advert.as_os_str());
+        let owner = ProvisionLock::acquire(temp.path()).expect("owner");
+        assert!(owner.owns_os_lock(), "owner holds the main lock");
+        let _tok = EnvOverride::set(super::LOCK_TOKEN_ENV, OsStr::new(owner.token()));
+
+        // The nested deploy borrows WITHOUT taking the sibling lock.
+        let deploy = ProvisionLock::acquire_for_deploy(temp.path()).expect("deploy borrow");
+        assert!(!deploy.owns_os_lock(), "the nested deploy borrows the lock");
+
+        // A provision borrower (which DOES take the sibling lock) must not
+        // block on the deploy borrower.
+        let root = temp.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let prov = ProvisionLock::acquire(&root).expect("provision borrow");
+            tx.send(()).expect("signal");
+            drop(prov);
+        });
+        rx.recv_timeout(Duration::from_secs(3)).expect(
+            "a provision borrow must not block on a deploy borrower's sibling lock (deadlock)",
+        );
+        handle.join().expect("join provision");
+        drop(deploy);
+        drop(owner);
     }
 
     #[test]
