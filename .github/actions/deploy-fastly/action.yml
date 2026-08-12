@@ -223,7 +223,10 @@ runs:
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/resolve-project.sh
 
     - name: Restore application target cache
-      if: ${{ inputs.cache == 'true' }}
+      # Only when a credential-free build will actually USE and re-SAVE it — i.e.
+      # build-mode: always. With build-mode: never the seed build and save are
+      # skipped, so restoring would be a no-op; skip it too, matching the docs.
+      if: ${{ inputs.cache == 'true' && steps.resolve.outputs['effective-build-mode'] == 'always' }}
       id: cache-restore
       uses: actions/cache/restore@v4.3.0
       with:

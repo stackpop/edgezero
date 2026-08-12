@@ -167,6 +167,10 @@ jobs:
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
           deploy-args: '["--comment","smoke"]'
+          # Negative cache case: cache: true with the Fastly default build-mode:
+          # never is a documented NO-OP — no seed build, no save, no restore — and
+          # the deploy still succeeds. (cache-smoke covers the positive path with
+          # build-mode: always.)
           cache: true
 
       - name: Assert production deploy, version threading, and credential boundary
@@ -334,6 +338,9 @@ jobs:
         env:
           EDGEZERO__TEST__DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           EDGEZERO__TEST__MUTATION_ATTEMPTED: ${{ steps.deploy.outputs['mutation-attempted'] }}
+          # The rollback target captured BEFORE the deploy must still thread out of a
+          # FAILED deploy — that is what a real recovery rolls back to.
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
         run: .github/actions/deploy-core/tests/assert-lost-version.sh
       - name: Download the CLI artifact for recovery
         uses: actions/download-artifact@v4.3.0
@@ -354,7 +361,9 @@ jobs:
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
           fastly-version: ${{ steps.recover.outputs.version }}
-          rollback-to: "40"
+          # Thread the deploy's OWN previous-version output (captured pre-mutation),
+          # exactly as the guide's recovery documents — not a hardcoded value.
+          rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
           deploy-to: production
       - name: Assert recovery rolled the service back to the captured version
         env:

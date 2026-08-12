@@ -99,9 +99,13 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
    full commit SHA or an exact released version tag (for example
    `actions/checkout@v4` or `actions-rust-lang/setup-rust-toolchain@v1.17.0`). A
    moving major alias (`@v4`) is discouraged and a branch/floating ref
-   (`@main`, `@develop`, `@latest`) is rejected. Both gates enforce this:
-   `check-action-pins.sh` accepts only a SHA or a version-tag shape, and
-   `.github/zizmor.yml` sets the `unpinned-uses` policy to `ref-pin`.
+   (`@main`, `@develop`, `@latest`) is rejected. `check-action-pins.sh` is the
+   repository-wide gate: it parses every workflow and action's YAML STRUCTURALLY
+   (via `yq`, so a quoted, unicode-escaped, `!!str`-tagged, or multiline-scalar
+   `uses` cannot hide a floating ref) and accepts only a SHA or a version-tag shape.
+   `.github/zizmor.yml` sets `unpinned-uses` to `ref-pin` as defense-in-depth over
+   the deploy action surface (zizmor cannot distinguish a tag from a branch, so the
+   tag-vs-branch decision is the pin script's).
 10. **Safe by default.** Caching is opt-in, deploys require committed source, and
     provider credentials never reach outputs, summaries, caches, or
     action-global environment files.
@@ -629,12 +633,18 @@ probe it, roll back on failure.
 13. Resolve the application Rust toolchain (§7) and install it plus the
     **wrapper-provided** application `target` (Fastly → `wasm32-wasip1`). The
     engine does not map `adapter` → target.
-14. If `cache: true`, restore the exact-key **Cargo workspace root** `target/`
-    cache.
+14. If `cache: true` **and** `build-mode: always` (§8), restore the exact-key
+    **Cargo workspace root** `target/` cache. Caching takes effect only under
+    `build-mode: always`, whose credential-free build both populates and re-saves it;
+    with `build-mode: never` the restore, seed build, and save are all skipped.
 15. Print non-sensitive diagnostics.
 16. Resolve `build-mode` (§8). If `always`, run
     `<app-cli-bin> build --adapter <adapter> -- <build-args…>` with **no** provider
-    credentials in scope (the `provider-env-clear` names stay unset here).
+    credentials in scope (the `provider-env-clear` names stay unset here). Then, if
+    `cache: true`, **SAVE** the `target/` cache from this credential-free build —
+    BEFORE the credential-bearing deploy below — so a build script can never persist
+    a secret into the cache. The deploy's own recompile (for `build-mode: never`) is
+    deliberately never cached.
 17. In a separate deploy step whose step-scoped `env:` is the **only** place
     `provider-env` is exposed: clear the `provider-env-clear` aliases, parse
     `provider-env` and export only its values, and run:
@@ -650,9 +660,9 @@ probe it, roll back on failure.
     this step builds application code with credentials in scope — see §10.1.
 
 18. Clean action-owned temporary tool, auth, log, and cache state with
-    `if: always()`.
-19. Save the application cache when enabled and safe.
-20. Set outputs and write a non-sensitive GitHub step summary with
+    `if: always()`. (The `target/` cache was already saved credential-free at step
+    16, before the deploy — never after it.)
+19. Set outputs and write a non-sensitive GitHub step summary with
     `if: always()`.
 
 When an argument array is empty, the trailing `--` may be omitted.

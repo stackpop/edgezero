@@ -1755,7 +1755,13 @@ EOF
 }
 
 test_action_pin_gate() {
-  section "action pin gate (branch/floating refs, all YAML key forms)"
+  section "action pin gate (structural; branch/floating refs, every YAML form)"
+  # The gate parses YAML structurally with yq, so it needs yq to run. Skip locally
+  # when yq is absent (CI's static-checks job has it and enforces there).
+  if ! command -v yq >/dev/null 2>&1; then
+    printf '  (skipped: yq not installed)\n'
+    return 0
+  fi
   local checker="$ACTIONS_DIR/deploy-core/tests/check-action-pins.sh"
   local dir="$WORK_DIR/pins"
   mkdir -p "$dir"
@@ -1772,17 +1778,29 @@ YML
   assert_succeeds "valid pins (block/quoted/flow, tag+SHA) pass; a commented branch is ignored" \
     bash "$checker" "$dir/ok.yml"
 
-  # Each mutable-ref form must be REJECTED — including the ones a line-anchored
-  # `uses:` grep misses: a quoted key, a flow mapping, and a space before the colon.
-  local bad
-  for bad in \
-    'uses: actions/checkout@main' \
-    '"uses": actions/checkout@develop' \
-    '{ uses: actions/checkout@latest }' \
-    'uses : actions/checkout@release-2'; do
-    printf 'steps:\n  - %s\n' "$bad" >"$dir/bad.yml"
-    assert_fails "a mutable ref is rejected: $bad" bash "$checker" "$dir/bad.yml"
-  done
+  # Every mutable-ref form must be REJECTED — including the ones NO text regex can
+  # catch: a unicode-ESCAPED key, a `!!str`-TAGGED value, and a MULTILINE folded
+  # scalar. A structural parse sees the `uses` and the `@main` in all of them.
+  printf 'steps:\n  - uses: actions/checkout@main\n' >"$dir/block.yml"
+  assert_fails "block @main is rejected" bash "$checker" "$dir/block.yml"
+
+  printf 'steps:\n  - "uses": actions/checkout@develop\n' >"$dir/quoted.yml"
+  assert_fails "quoted-key @develop is rejected" bash "$checker" "$dir/quoted.yml"
+
+  printf 'steps:\n  - { uses: actions/checkout@latest }\n' >"$dir/flow.yml"
+  assert_fails "flow-mapping @latest is rejected" bash "$checker" "$dir/flow.yml"
+
+  printf 'steps:\n  - uses : actions/checkout@release-2\n' >"$dir/space.yml"
+  assert_fails "space-before-colon @release-2 is rejected" bash "$checker" "$dir/space.yml"
+
+  printf 'steps:\n  - "\\u0075ses": actions/checkout@main\n' >"$dir/escaped.yml"
+  assert_fails "unicode-escaped key cannot hide @main" bash "$checker" "$dir/escaped.yml"
+
+  printf 'steps:\n  - uses: !!str actions/checkout@main\n' >"$dir/tagged.yml"
+  assert_fails "a !!str-tagged @main is rejected" bash "$checker" "$dir/tagged.yml"
+
+  printf 'steps:\n  - uses: >-\n      actions/checkout@main\n' >"$dir/multiline.yml"
+  assert_fails "a multiline folded @main is rejected" bash "$checker" "$dir/multiline.yml"
 
   # An entirely unpinned ref (no @) is rejected too.
   printf 'steps:\n  - uses: actions/checkout\n' >"$dir/unpinned.yml"
