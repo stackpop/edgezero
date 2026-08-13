@@ -41,10 +41,11 @@ else
   )
 fi
 
-# A full commit SHA, or a release version tag (v4.3.0, 1.2, v1.17.0-rc.1). Regexes
-# live in variables (the bash-3.2-safe idiom for `=~`).
+# A full commit SHA, or a release version tag. The tag allows an optional semver
+# prerelease AND build-metadata suffix together (v1.2.3-rc.1+build.5), not just one.
+# Regexes live in variables (the bash-3.2-safe idiom for `=~`).
 sha_re='^[0-9a-fA-F]{40}$'
-tag_re='^v?[0-9]+(\.[0-9]+)*([-+][0-9A-Za-z.-]+)?$'
+tag_re='^v?[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
 
 status=0
 for file in "${files[@]}"; do

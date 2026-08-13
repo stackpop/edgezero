@@ -10,6 +10,7 @@ on:
       - .github/workflows/**
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
+      - scripts/install-yq.sh
       # The smoke fixture is a real Cargo app built against this workspace's crate
       # graph, so a change to the CLI/core/macro crates, the workspace manifest and
       # lockfile, or the pinned toolchain can change what the smoke compiles.
@@ -33,6 +34,7 @@ on:
       - .github/workflows/**
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
+      - scripts/install-yq.sh
       # The smoke fixture is a real Cargo app built against this workspace's crate
       # graph, so a change to the CLI/core/macro crates, the workspace manifest and
       # lockfile, or the pinned toolchain can change what the smoke compiles.
@@ -53,6 +55,7 @@ permissions:
 env:
   ACTIONLINT_VERSION: 1.7.7
   ZIZMOR_VERSION: 1.16.3
+  YQ_VERSION: 4.53.3
 
 jobs:
   static-checks:
@@ -65,11 +68,14 @@ jobs:
       - name: Install actionlint (pinned release binary, checksum-verified)
         run: scripts/install-actionlint.sh "${ACTIONLINT_VERSION}"
 
-      - name: Actionlint (this workflow)
-        run: |
-          actionlint \
-            .github/workflows/deploy-action.yml \
-            .github/workflows/fastly-installer-check.yml
+      - name: Actionlint (all workflows)
+        # No file args → actionlint validates every .github/workflows/*.yml. The
+        # `-shellcheck` integration runs shellcheck on each `run:` block at a warning
+        # floor (info-level notes in unrelated workflows are not failures here).
+        run: actionlint -shellcheck='shellcheck -S warning'
+
+      - name: Install yq (pinned release binary, checksum-verified)
+        run: scripts/install-yq.sh "${YQ_VERSION}"
 
       - name: Third-party actions pinned to a ref
         run: .github/actions/deploy-core/tests/check-action-pins.sh

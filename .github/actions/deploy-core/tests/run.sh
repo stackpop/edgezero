@@ -1780,6 +1780,11 @@ test_action_pin_gate() {
   assert_succeeds "valid pins (block/quoted/flow, tag+SHA) pass; a commented branch is ignored" \
     bash "$checker" "$dir/ok.yml"
 
+  # A full semver tag with BOTH a prerelease and build-metadata suffix is valid.
+  wrap '      - uses: some/action@v1.2.3-rc.1+build.5' "$dir/semver.yml"
+  assert_succeeds "a prerelease+build semver tag (@v1.2.3-rc.1+build.5) is accepted" \
+    bash "$checker" "$dir/semver.yml"
+
   # Every mutable-ref form must be REJECTED — including the ones NO text regex can
   # catch: a unicode-ESCAPED key, a `!!str`-TAGGED value, and a MULTILINE folded
   # scalar. A structural parse sees the `uses` and the `@main` in all of them.

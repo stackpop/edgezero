@@ -1021,12 +1021,18 @@ actions never construct error messages containing credentials.
 
 CI for the actions runs:
 
-- `actionlint` from a **pinned release binary** over workflow and action files;
+- `actionlint` from a **pinned release binary** over **every** workflow file
+  (`.github/workflows/*.yml`), with its `shellcheck` integration on `run:` blocks;
+  action metadata is validated separately (YAML parse + the pin gate below);
 - `shellcheck` over shell scripts;
 - YAML parsing for each `action.yml`;
 - metadata contract tests for public inputs/outputs, ported into the Bash
   `tests/run.sh` harness (replacing the previous `python3` heredocs);
 - a check that action tool versions agree with `.tool-versions`;
+- a **repository-wide** pin gate (`check-action-pins.sh`) that rejects any `uses:`
+  pinned to a mutable branch/floating ref, parsing every workflow and action
+  structurally with `yq` — itself installed from a **pinned release binary** whose
+  SHA-256 is checksum-verified (`scripts/install-yq.sh`), never the runner default;
 - `zizmor` from a **pinned release binary** (Rust; installed as a release
   artifact or via `cargo install zizmor --locked`, never `pip`); and
 - Markdown/example validation.
