@@ -65,27 +65,36 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install actionlint (pinned release binary, checksum-verified)
-        run: scripts/install-actionlint.sh "${ACTIONLINT_VERSION}"
+      - name: Install pinned validation binaries under RUNNER_TEMP (checksum-verified)
+        # Per the action's binary-isolation rule (§5.4/security principle 5),
+        # validation tools live under RUNNER_TEMP, not a shared PATH dir. Prepend the
+        # dir so these verified copies win over any runner-provided ones, and confirm
+        # each reports its pinned version — the check steps below also call them by
+        # ABSOLUTE path, so it is provably these that run.
+        run: |
+          bin="$RUNNER_TEMP/tools/bin"
+          mkdir -p "$bin"
+          INSTALL_DIR="$bin" scripts/install-actionlint.sh "$ACTIONLINT_VERSION"
+          INSTALL_DIR="$bin" scripts/install-yq.sh "$YQ_VERSION"
+          cargo install zizmor --version "$ZIZMOR_VERSION" --locked --root "$RUNNER_TEMP/tools"
+          echo "$bin" >>"$GITHUB_PATH"
+          "$bin/actionlint" -version | grep -qF "$ACTIONLINT_VERSION"
+          "$bin/yq" --version | grep -qF "version v$YQ_VERSION"
+          "$bin/zizmor" --version | grep -qF "$ZIZMOR_VERSION"
 
       - name: Actionlint (all workflows)
-        # No file args → actionlint validates every .github/workflows/*.yml. The
-        # `-shellcheck` integration runs shellcheck on each `run:` block at a warning
-        # floor (info-level notes in unrelated workflows are not failures here).
-        run: actionlint -shellcheck='shellcheck -S warning'
-
-      - name: Install yq (pinned release binary, checksum-verified)
-        run: scripts/install-yq.sh "${YQ_VERSION}"
+        # No file args → actionlint validates every .github/workflows/*.{yml,yaml}.
+        # The `-shellcheck` integration runs shellcheck on each `run:` block at a
+        # warning floor (info-level notes in unrelated workflows are not failures).
+        run: |
+          "$RUNNER_TEMP/tools/bin/actionlint" -shellcheck='shellcheck -S warning'
 
       - name: Third-party actions pinned to a ref
         run: .github/actions/deploy-core/tests/check-action-pins.sh
 
-      - name: Install zizmor (cargo, no pip)
-        run: cargo install zizmor --version "${ZIZMOR_VERSION}" --locked
-
       - name: Zizmor security scan
         run: |
-          zizmor --offline \
+          "$RUNNER_TEMP/tools/bin/zizmor" --offline \
             .github/workflows/deploy-action.yml \
             .github/workflows/fastly-installer-check.yml \
             .github/actions/build-app-cli/action.yml \
@@ -107,7 +116,8 @@ jobs:
           shellcheck -e SC1091 \
             .github/actions/*/scripts/*.sh \
             .github/actions/deploy-core/tests/*.sh \
-            scripts/install-actionlint.sh
+            scripts/install-actionlint.sh \
+            scripts/install-yq.sh
 
       - name: Bash contract tests
         run: .github/actions/deploy-core/tests/run.sh
