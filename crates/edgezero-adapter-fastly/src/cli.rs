@@ -168,6 +168,10 @@ struct GcPlan {
     /// `prove_generation`), so deleting part of one destroys the very evidence
     /// that licenses deleting the rest.
     doomed: Vec<Vec<(String, u64)>>,
+    /// The root keys retained as live/protected — the config entries GC will NOT
+    /// delete, sorted. Surfaced so a run shows what it is KEEPING, not only what
+    /// it would delete, making the sweep reviewable.
+    kept_roots: Vec<String>,
     live_count: usize,
     retained_recent: usize,
     roots: usize,
@@ -2310,6 +2314,23 @@ fn parse_rfc3339_secs(raw: &str) -> Option<u64> {
 ///
 /// Fails CLOSED: if the listing is unreadable, or a root's value cannot be
 /// classified, nothing is deleted.
+/// Report what a sweep is KEEPING, not only what it would delete, so the run is
+/// reviewable: each retained root by key, plus the live-chunk total those roots
+/// hold (already summarised). A root listed here is never a delete candidate.
+fn append_kept_roots_report(out: &mut Vec<String>, kept_roots: &[String], live_count: usize) {
+    if kept_roots.is_empty() {
+        out.push("keeping 0 live root(s)".to_owned());
+        return;
+    }
+    out.push(format!(
+        "keeping {} live root(s) ({live_count} live chunk(s) held by them):",
+        kept_roots.len()
+    ));
+    for key in kept_roots {
+        out.push(format!("  keeping `{key}`"));
+    }
+}
+
 fn gc_fastly_config_store(
     store_name: &str,
     older_than_secs: u64,
@@ -2335,6 +2356,7 @@ fn gc_fastly_config_store(
     let plan = plan_gc_reclamation(&items, unix_now_secs(), older_than_secs)?;
     let GcPlan {
         doomed,
+        kept_roots,
         live_count,
         retained_recent,
         roots,
@@ -2349,6 +2371,7 @@ fn gc_fastly_config_store(
         doomed.len(),
     )];
     out.extend(warnings);
+    append_kept_roots_report(&mut out, &kept_roots, live_count);
     if unprovable > 0 {
         // NEVER silent: these entries look like chunk keys but we could not
         // prove our writer produced them, so we left them alone. Say so, or the
@@ -2837,8 +2860,12 @@ fn plan_gc_reclamation(
         );
     }
 
+    let mut kept_roots: Vec<String> = protected.into_iter().collect();
+    kept_roots.sort();
+
     Ok(GcPlan {
         doomed,
+        kept_roots,
         live_count: live.len(),
         retained_recent,
         roots,
@@ -7702,6 +7729,11 @@ echo 'unexpected' >&2; exit 1
         for key in &dead_chunks {
             assert!(rendered.contains(key.as_str()), "names `{key}`: {rendered}");
         }
+        // It must also report what it is KEEPING: the live root, by key.
+        assert!(
+            rendered.contains(&format!("keeping `{TEST_CONFIG_ID}`")),
+            "must name the retained live root: {rendered}"
+        );
     }
 
     /// An unreadable `created_at` on a DELETE path fails CLOSED.
