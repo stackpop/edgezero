@@ -84,9 +84,15 @@ jobs:
       # `AxumConfigStore::from_path` would not be caught by CI.
       # Axum-only path, no live external calls — intentionally kept
       # off the wasm matrix.
+      # `--locked`: app-demo is excluded from the root workspace and keeps its own
+      # committed lockfile, which drifts when the edgezero crates' dependencies
+      # change (e.g. a `syn` major bump lands in the root lock but not here).
+      # Without `--locked` CI silently regenerates it and MASKS that drift; with
+      # it, a stale app-demo lockfile fails here instead of at a consumer's
+      # `cargo build --locked`.
       - name: Run app-demo workspace tests
         working-directory: examples/app-demo
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
 
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests

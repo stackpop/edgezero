@@ -2304,6 +2304,27 @@ fn parse_rfc3339_secs(raw: &str) -> Option<u64> {
     u64::try_from(rounded_up).ok()
 }
 
+/// Report what a sweep is KEEPING, not only what it would delete, so the run is
+/// reviewable: each RETAINED root by key, plus the live-chunk total those roots
+/// hold (already summarised). A root listed here is never a delete candidate.
+///
+/// "Retained", not "live": the set also includes a root that is PROTECTED but not
+/// runtime-readable (e.g. one that fails the writer split check and is warned
+/// about separately) -- it is kept, but calling it "live" would be inaccurate.
+fn append_kept_roots_report(out: &mut Vec<String>, kept_roots: &[String], live_count: usize) {
+    if kept_roots.is_empty() {
+        out.push("keeping 0 retained root(s)".to_owned());
+        return;
+    }
+    out.push(format!(
+        "keeping {} retained root(s) ({live_count} live chunk(s) held by them):",
+        kept_roots.len()
+    ));
+    for key in kept_roots {
+        out.push(format!("  keeping `{key}`"));
+    }
+}
+
 /// `config gc` for Fastly: delete chunk entries that no LIVE root pointer
 /// references and that are older than the operator's `older_than_secs`.
 ///
@@ -2314,23 +2335,6 @@ fn parse_rfc3339_secs(raw: &str) -> Option<u64> {
 ///
 /// Fails CLOSED: if the listing is unreadable, or a root's value cannot be
 /// classified, nothing is deleted.
-/// Report what a sweep is KEEPING, not only what it would delete, so the run is
-/// reviewable: each retained root by key, plus the live-chunk total those roots
-/// hold (already summarised). A root listed here is never a delete candidate.
-fn append_kept_roots_report(out: &mut Vec<String>, kept_roots: &[String], live_count: usize) {
-    if kept_roots.is_empty() {
-        out.push("keeping 0 live root(s)".to_owned());
-        return;
-    }
-    out.push(format!(
-        "keeping {} live root(s) ({live_count} live chunk(s) held by them):",
-        kept_roots.len()
-    ));
-    for key in kept_roots {
-        out.push(format!("  keeping `{key}`"));
-    }
-}
-
 fn gc_fastly_config_store(
     store_name: &str,
     older_than_secs: u64,

@@ -311,6 +311,18 @@ pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
 /// state).
 #[inline]
 pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
+    // Reject the contradictory combination clap also forbids, so the PUBLIC API is
+    // safe for a library caller that bypasses clap: a single run cannot both
+    // preview and delete. Checked FIRST so the error is unambiguous, rather than
+    // the threshold validation or the `dry_run || !yes` fallback silently
+    // resolving it.
+    if args.dry_run && args.yes {
+        return Err(
+            "`config gc` cannot both preview and delete: `--dry-run` and `--yes` are mutually \
+             exclusive. Pass exactly one."
+                .to_owned(),
+        );
+    }
     // A destructive run must not invent the operator's safety assertion.
     let older_than_secs = match (args.yes, args.older_than.as_deref()) {
         (true, None) => {
@@ -1919,6 +1931,25 @@ mod tests {
         assert!(
             err.contains("requires an explicit"),
             "must explain the requirement: {err}"
+        );
+    }
+
+    /// The PUBLIC runner rejects `dry_run` + `yes` together, not only clap: a
+    /// library caller that sets both fields must get an explicit error, never the
+    /// wrong-threshold message or a silent preview.
+    #[test]
+    fn config_gc_rejects_dry_run_and_yes_together() {
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            dry_run: true,
+            yes: true,
+            older_than: Some("7d".to_owned()),
+            ..ConfigGcArgs::default()
+        };
+        let err = run_config_gc(&args).expect_err("dry_run + yes must be rejected");
+        assert!(
+            err.contains("mutually exclusive"),
+            "must name the conflict, not the threshold: {err}"
         );
     }
 
