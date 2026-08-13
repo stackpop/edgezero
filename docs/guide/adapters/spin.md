@@ -99,13 +99,20 @@ cargo build --target wasm32-wasip2 --release -p my-app-adapter-spin
 # provision-written .env for you)
 edgezero serve --adapter spin
 
-# Or directly. You MUST pass the runtime-config file (it declares the
-# non-`default` KV stores) and source the provision-written .env (it
-# carries the SPIN_VARIABLE_* secrets and the EDGEZERO__* store overlays):
+# Or directly. Pass the runtime-config file (it declares the non-`default`
+# KV stores) and source the provision-written .env for the SPIN_VARIABLE_*
+# secrets (Spin reads those from the host env as application variables):
 cd crates/my-app-adapter-spin
 set -a; . ./.env; set +a
 spin up --from spin.toml --runtime-config-file runtime-config.toml
 ```
+
+> **Store overrides need `--env`, not the host env.** A Spin component reads
+> its own sandboxed WASI env, which does NOT inherit the `spin` host process
+> environment. So an `EDGEZERO__STORES__…` store-name or per-environment
+> `__KEY` override must be passed with `spin up --env KEY=VALUE` (sourcing it
+> into your shell only sets the host env, which the guest can't see).
+> `edgezero serve --adapter spin` forwards these for you.
 
 ## Deployment
 

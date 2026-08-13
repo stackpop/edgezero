@@ -405,10 +405,22 @@ boot_runtime() {
       # spin reads variables from the app manifest; the demo wires
       # `demo_api_token` to the SPIN_VARIABLE_DEMO_API_TOKEN env var
       # (Spin's documented passthrough).
+      #
+      # The runtime `__KEY` override must reach the GUEST's WASI env, which
+      # Spin populates from `--env` -- NOT from the host process env a bare
+      # `EDGEZERO__...=... spin up` would set (that stays outside the sandbox).
+      # Pass it explicitly via `spin up --env`, mirroring how
+      # `edgezero serve --adapter spin` forwards the EDGEZERO__* overlay.
+      local spin_env_args=()
+      if [ -n "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}" ]; then
+        spin_env_args=(--env "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY}")
+      fi
+      # Empty-array-safe expansion for bash 3.2 under `set -u`.
       (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
         SPIN_VARIABLE_DEMO_API_TOKEN=resolved-token \
         spin up --listen "127.0.0.1:${PORT}" \
-          --runtime-config-file runtime-config.toml 2>&1) &
+          --runtime-config-file runtime-config.toml \
+          ${spin_env_args[@]+"${spin_env_args[@]}"} 2>&1) &
       ;;
     *)
       echo "unknown adapter: $adapter" >&2; return 1 ;;

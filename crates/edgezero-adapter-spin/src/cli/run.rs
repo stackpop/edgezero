@@ -278,6 +278,20 @@ fn locate_artifact(
 /// # Errors
 /// Returns an error if the Spin CLI up command fails.
 #[inline]
+/// The `KEY=VALUE` strings to hand `spin up --env` so the EDGEZERO__*
+/// runtime-config overlay reaches the GUEST's WASI env. A wasip2 component
+/// reads its own sandboxed `std::env`, which Spin populates from `--env` /
+/// `[component.<id>.environment]` -- NOT from the `spin` host process env --
+/// so store `__NAME` / `__KEY` overrides must be forwarded explicitly. Only
+/// the `EDGEZERO__` namespace is forwarded (secrets travel as Spin variables,
+/// and unrelated host env stays out of the sandbox).
+fn guest_env_forwards(env: &[(String, String)]) -> Vec<String> {
+    env.iter()
+        .filter(|(key, _)| key.starts_with("EDGEZERO__"))
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
 pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
     let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
         find_spin_manifest(cli_support::discovery_base(ctx)?.as_path())
@@ -307,6 +321,17 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
         // through a symlink) -- one consistent final-path policy.
         reject_symlinked_target(&runtime_config)?;
         command.arg("--runtime-config-file").arg(&runtime_config);
+    }
+    // Forward the EDGEZERO__* runtime-config overlay INTO THE GUEST via
+    // `spin up --env`. Setting them only on the `spin` host process (the
+    // `command.env` loop below) does NOT reach a wasip2 component: the guest
+    // reads its own sandboxed WASI env (`std::env`), which Spin populates
+    // from `--env` / `[component.<id>.environment]`, never from the host's
+    // inherited environment. Without this the store `__NAME` / `__KEY`
+    // overrides provision writes into `.env` are invisible to the runtime and
+    // every store silently falls back to its logical id.
+    for pair in guest_env_forwards(ctx.env()) {
+        command.arg("--env").arg(pair);
     }
     command.args(extra_args).current_dir(manifest_dir);
     for (key, value) in ctx.env() {
@@ -495,6 +520,37 @@ mod tests {
     /// The common case: no `[adapters.spin.adapter].allowed_outbound_hosts`
     /// declared, so synthesis stays at Spin's deny-all baseline.
     const NO_HOSTS: &[String] = &[];
+
+    #[test]
+    fn guest_env_forwards_only_edgezero_namespace() {
+        // Only `EDGEZERO__*` is forwarded into the guest via `spin up --env`
+        // (store overrides). Secrets (SPIN_VARIABLE_*) and unrelated host env
+        // must NOT leak into the sandbox.
+        let env = vec![
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+                "app_config_staging".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__KV__SESSIONS__NAME".to_owned(),
+                "sessions".to_owned(),
+            ),
+            (
+                "SPIN_VARIABLE_DEMO_API_TOKEN".to_owned(),
+                "secret".to_owned(),
+            ),
+            ("HOME".to_owned(), "/home/dev".to_owned()),
+        ];
+        let forwards = guest_env_forwards(&env);
+        assert_eq!(
+            forwards,
+            vec![
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging".to_owned(),
+                "EDGEZERO__STORES__KV__SESSIONS__NAME=sessions".to_owned(),
+            ],
+            "only EDGEZERO__* forwards; secrets and host env stay out of the guest"
+        );
+    }
 
     #[test]
     fn finds_closest_manifest_when_multiple_exist() {
