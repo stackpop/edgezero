@@ -389,8 +389,10 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
         push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
     }
 
-    // A run without --yes is a dry-run: report, delete nothing.
-    let dry_run = !args.yes;
+    // A dry-run reports and deletes nothing. It is the DEFAULT (no `--yes`), and
+    // `--dry-run` states that intent explicitly (clap makes the two mutually
+    // exclusive, so an explicit `--dry-run` always means `--yes` is unset).
+    let dry_run = args.dry_run || !args.yes;
     let lines = adapter.gc_config_entries(
         manifest_root,
         adapter_manifest_path.as_deref(),
@@ -406,10 +408,10 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
     if dry_run {
         match args.older_than.as_deref() {
             Some(dur) => log::info!(
-                "[edgezero] dry-run (no --yes): nothing was deleted. Re-run with `--yes --older-than {dur}` to apply (a destructive run requires the explicit window). `--older-than {dur}` asserts that NO root in this store changed within that window and that no writer is targeting it -- this sweeps the whole physical store, not just one config."
+                "[edgezero] dry-run: nothing was deleted. Re-run with `--yes --older-than {dur}` to apply (a destructive run requires the explicit window). `--older-than {dur}` asserts that NO root in this store changed within that window and that no writer is targeting it -- this sweeps the whole physical store, not just one config."
             ),
             None => log::info!(
-                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since ANY root in this store last changed -- gc sweeps every root here, so a sibling you re-pushed recently also constrains the window. Then re-run with `--yes --older-than <dur>` (a bare `--yes` is rejected)."
+                "[edgezero] dry-run: previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since ANY root in this store last changed -- gc sweeps every root here, so a sibling you re-pushed recently also constrains the window. Then re-run with `--yes --older-than <dur>` (a bare `--yes` is rejected)."
             ),
         }
     }

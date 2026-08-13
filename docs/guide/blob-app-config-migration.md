@@ -334,7 +334,8 @@ content-addressed chunks, and every re-push orphans the previous generation.
 deletes only unreferenced chunk entries you have asserted are old enough:
 
 ```sh
-# Preview every orphan and its age (dry-run by default):
+# Preview every orphan and its age (dry-run by default; `--dry-run` states it
+# explicitly and is the same thing — it deletes nothing and conflicts with `--yes`):
 <app>-cli config gc --adapter fastly
 
 # Delete, asserting that NO root in this store changed in the last 7 days AND no

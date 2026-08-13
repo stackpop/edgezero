@@ -113,6 +113,12 @@ pub struct ConfigGcArgs {
     /// Adapter whose config store to reclaim (e.g. `fastly`).
     #[arg(long)]
     pub adapter: String,
+    /// Preview only: report what `gc` WOULD delete and delete nothing. This is
+    /// already the default (a run without `--yes` never deletes); the flag just
+    /// lets you state that intent explicitly to double-check a sweep. It CONFLICTS
+    /// with `--yes` -- a single run cannot both preview and delete.
+    #[arg(long, conflicts_with = "yes")]
+    pub dry_run: bool,
     /// Path to `edgezero.toml`.
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
@@ -155,6 +161,7 @@ impl Default for ConfigGcArgs {
     fn default() -> Self {
         Self {
             adapter: String::new(),
+            dry_run: false,
             manifest: PathBuf::from("edgezero.toml"),
             no_env: false,
             older_than: None,
@@ -703,6 +710,39 @@ mod tests {
         );
         assert!(validate.no_env);
         assert!(!validate.strict);
+    }
+
+    #[test]
+    fn config_gc_parses_explicit_dry_run() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--dry-run",
+        ])
+        .expect("parse config gc --dry-run");
+        let Command::Config(ConfigCmd::Gc(gc)) = args.cmd else {
+            panic!("expected Command::Config(ConfigCmd::Gc)");
+        };
+        assert!(gc.dry_run);
+        assert!(!gc.yes);
+    }
+
+    #[test]
+    fn config_gc_dry_run_conflicts_with_yes() {
+        // A single run can never both preview and delete.
+        Args::try_parse_from([
+            "edgezero",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--dry-run",
+            "--yes",
+        ])
+        .expect_err("`--dry-run` and `--yes` must be mutually exclusive");
     }
 
     #[test]

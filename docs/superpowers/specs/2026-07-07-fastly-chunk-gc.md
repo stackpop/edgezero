@@ -293,10 +293,12 @@ is **not a regression**, and it is the only safe automatic behaviour.
 ### `config gc` (`Adapter::gc_config_entries`)
 
 ```
-config gc --adapter fastly [--older-than <dur>] [--yes]
+config gc --adapter fastly [--older-than <dur>] [--dry-run] [--yes]
 ```
 
-Dry-run by default; deletes only with `--yes`.
+Dry-run by default; deletes only with `--yes`. `--dry-run` states the preview
+intent explicitly (same behaviour as omitting `--yes`) and CONFLICTS with `--yes`
+— a single run can never both preview and delete.
 
 1. One `config-store-entry list --json`, parsed **fail-closed**: every entry
    must carry string `item_key`, `item_value`, and `created_at`, or the whole

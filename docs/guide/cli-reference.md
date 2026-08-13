@@ -326,7 +326,7 @@ Local (`fastly.toml`) pushes prune their own prior chunks eagerly and never
 need `gc`.
 
 ```bash
-edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-than <dur>] [--no-env] [--yes]
+edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-than <dur>] [--no-env] [--dry-run] [--yes]
 ```
 
 **Arguments:**
@@ -336,6 +336,7 @@ edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-
 - `--store <id>` — logical config-store id to reclaim. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
 - `--older-than <dur>` — **your safety assertion** (see below). Accepts `7d`, `24h`, `90m`, `30s`, or a bare number of seconds.
 - `--no-env` — ignore `EDGEZERO__STORES__CONFIG__<ID>__NAME`, so the logical store id `<ID>` is used as the physical store name. This is **not** the app-config overlay that `validate`/`push`/`diff` mean by `--no-env` — `gc` never loads your typed app config. Because that variable is normally what maps a logical id onto the real store, `--no-env` **changes which store is swept**, and this command deletes. Check the store id `gc` reports before passing `--yes`.
+- `--dry-run` — preview only: name every key and age it would delete, and delete nothing. This is already the **default** (a run without `--yes` never deletes); the flag just states that intent explicitly to double-check a sweep. It **conflicts with `--yes`** — a single run cannot both preview and delete.
 - `--yes` — actually delete. **Without it, `config gc` is a dry run** that names every key and age it would delete and deletes nothing.
 
 **`--older-than` is an assertion only you can make, and it covers the whole
