@@ -82,6 +82,15 @@ jobs:
           "$bin/yq" --version | grep -qF "version v$YQ_VERSION"
           "$bin/zizmor" --version | grep -qF "$ZIZMOR_VERSION"
 
+      # ShellCheck must be installed BEFORE actionlint: actionlint's `-shellcheck`
+      # integration silently disables itself (and the step exits 0) when shellcheck
+      # is not on PATH, so a `run:` defect could pass unchecked on a runner that does
+      # not preinstall it.
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
       - name: Actionlint (all workflows)
         # No file args → actionlint validates every .github/workflows/*.{yml,yaml}.
         # The `-shellcheck` integration runs shellcheck on each `run:` block at a
@@ -102,11 +111,6 @@ jobs:
             .github/actions/healthcheck-fastly/action.yml \
             .github/actions/rollback-fastly/action.yml \
             .github/actions/config-push-fastly/action.yml
-
-      - name: Install ShellCheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
 
       - name: ShellCheck action scripts
         # -e SC1091: the `source "$SCRIPT_DIR/common.sh"` path is dynamic, so
