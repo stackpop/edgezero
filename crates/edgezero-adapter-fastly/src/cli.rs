@@ -12,9 +12,9 @@ use std::process::id as process_id;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    CHUNK_KEY_INFIX, GcPointer, GcRootValue, ResolveFailure, chunk_key_generation, chunk_lengths,
-    gc_classify_root, gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
-    resolve_fastly_config_value_typed, sha256_hex, value_announces_our_kind,
+    CHUNK_KEY_INFIX, GcPointer, GcRootValue, ResolveFailure, chunk_key_generation, chunk_key_index,
+    chunk_lengths, gc_classify_root, gc_verify_generation, prepare_fastly_config_entries,
+    prior_chunk_keys, resolve_fastly_config_value_typed, sha256_hex, value_announces_our_kind,
     value_is_future_format, value_is_inert_foreign, verify_writer_split_layout,
 };
 use ctor::ctor;
@@ -2305,19 +2305,21 @@ fn parse_rfc3339_secs(raw: &str) -> Option<u64> {
 }
 
 /// Report what a sweep is KEEPING, not only what it would delete, so the run is
-/// reviewable: each RETAINED root by key, plus the live-chunk total those roots
-/// hold (already summarised). A root listed here is never a delete candidate.
+/// reviewable: each RETAINED root by key, plus the referenced-chunk total those
+/// roots hold (already summarised). A root listed here is never a delete
+/// candidate.
 ///
-/// "Retained", not "live": the set also includes a root that is PROTECTED but not
-/// runtime-readable (e.g. one that fails the writer split check and is warned
-/// about separately) -- it is kept, but calling it "live" would be inaccurate.
+/// "Retained"/"referenced", not "live": the set also includes a root that is
+/// PROTECTED but not runtime-readable (e.g. one that fails the writer split check
+/// and is warned about separately). Its chunks are conservatively protected, not
+/// runtime-live, so `live_count` here is a count of REFERENCED chunks.
 fn append_kept_roots_report(out: &mut Vec<String>, kept_roots: &[String], live_count: usize) {
     if kept_roots.is_empty() {
         out.push("keeping 0 retained root(s)".to_owned());
         return;
     }
     out.push(format!(
-        "keeping {} retained root(s) ({live_count} live chunk(s) held by them):",
+        "keeping {} retained root(s) ({live_count} referenced chunk(s) held by them):",
         kept_roots.len()
     ));
     for key in kept_roots {
@@ -2370,7 +2372,7 @@ fn gc_fastly_config_store(
 
     let doomed_count: usize = doomed.iter().map(Vec::len).sum();
     let mut out = vec![format!(
-        "fastly config-store `{store_name}` (id={resolved_id}): {} entries, {roots} root(s), {live_count} live chunk(s), {doomed_count} orphan(s) in {} generation(s) older than {older_than_secs}s, {retained_recent} orphan(s) too recent",
+        "fastly config-store `{store_name}` (id={resolved_id}): {} entries, {roots} root(s), {live_count} referenced chunk(s), {doomed_count} orphan(s) in {} generation(s) older than {older_than_secs}s, {retained_recent} orphan(s) too recent",
         items.len(),
         doomed.len(),
     )];
@@ -2814,7 +2816,7 @@ fn plan_gc_reclamation(
     let mut doomed: Vec<Vec<(String, u64)>> = Vec::new();
     let mut retained_recent = 0_usize;
     let mut unprovable = 0_usize;
-    for ((root, generation), group) in groups {
+    for ((root, generation), mut group) in groups {
         if prove_generation(root, &generation, &group).is_err() {
             // We cannot prove we wrote this, so we do not touch it. It may be an
             // ordinary entry that merely LOOKS like a chunk key (a store can
@@ -2852,6 +2854,13 @@ fn plan_gc_reclamation(
             retained_recent = retained_recent.saturating_add(group.len());
             continue;
         }
+        // Delete in canonical chunk-INDEX order (`.0`, `.1`, ...), NOT the remote
+        // listing order. Deletion stops at a generation's first failure, so a
+        // reordered listing would otherwise change the preview order and which
+        // siblings get stranded; sorting makes both deterministic. Every member is
+        // a canonical chunk of `root` (it passed the grouping filter), so
+        // `chunk_key_index` is `Some`; `None` sorts last defensively.
+        group.sort_by_key(|item| chunk_key_index(root, &item.item_key).unwrap_or(usize::MAX));
         doomed.push(
             group
                 .iter()
@@ -7570,6 +7579,17 @@ echo 'unexpected' >&2; exit 1
             rendered.contains("NOT runtime-readable"),
             "GC must warn that this root is unreadable rather than call it healthy: {rendered}"
         );
+        // This root is PROTECTED (kept) but not runtime-live, so the report must
+        // list it as RETAINED and must NOT label it (or the store) "live".
+        assert!(
+            rendered.contains(&format!("keeping `{TEST_CONFIG_ID}`"))
+                && rendered.contains("retained root(s)"),
+            "an unreadable-but-protected root must be reported as retained: {rendered}"
+        );
+        assert!(
+            !rendered.contains("live root") && !rendered.contains("live chunk"),
+            "an unreadable root's chunks are protected/referenced, never labeled live: {rendered}"
+        );
         // Fail-closed: nothing is deleted, including its chunks.
         let log = fs::read_to_string(&oplog).unwrap_or_default();
         for key in [&key0, &key1] {
@@ -7578,6 +7598,40 @@ echo 'unexpected' >&2; exit 1
                 "must not delete a chunk of an unreadable root: `{key}`; log:\n{log}"
             );
         }
+    }
+
+    #[test]
+    fn kept_roots_report_wording_counts_and_empty_store() {
+        // Empty: a single, unambiguous "nothing retained" line and no root list.
+        let mut empty = Vec::new();
+        append_kept_roots_report(&mut empty, &[], 0);
+        assert_eq!(empty, vec!["keeping 0 retained root(s)".to_owned()]);
+
+        // Non-empty: a heading naming the RETAINED-root count and the
+        // REFERENCED-chunk count, then one line per root by key.
+        let mut out = Vec::new();
+        append_kept_roots_report(
+            &mut out,
+            &["app_config".to_owned(), "app_config_staging".to_owned()],
+            5,
+        );
+        assert!(
+            out[0].contains("keeping 2 retained root(s)")
+                && out[0].contains("5 referenced chunk(s)"),
+            "heading names the retained-root and referenced-chunk counts: {out:?}"
+        );
+        assert!(out.iter().any(|line| line == "  keeping `app_config`"));
+        assert!(
+            out.iter()
+                .any(|line| line == "  keeping `app_config_staging`")
+        );
+        // Never the misleading "live" label -- a retained root may not be
+        // runtime-live, and its chunks are protected/referenced, not live.
+        assert!(
+            !out.iter()
+                .any(|line| line.contains("live root") || line.contains("live chunk")),
+            "must not label retained roots/chunks as live: {out:?}"
+        );
     }
 
     /// A legitimate FOREIGN sibling (the documented `greeting = "hello"`) must

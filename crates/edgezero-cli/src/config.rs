@@ -306,20 +306,20 @@ pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// Returns `Err` if the manifest/adapter cannot be resolved, `--older-than` is
-/// unparseable, or the adapter refuses to reclaim (unreadable/unclassifiable
-/// state).
+/// Returns `Err` if `dry_run` and `yes` are BOTH set (contradictory), the
+/// manifest/adapter cannot be resolved, `--older-than` is unparseable, or the
+/// adapter refuses to reclaim (unreadable/unclassifiable state).
 #[inline]
 pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
     // Reject the contradictory combination clap also forbids, so the PUBLIC API is
     // safe for a library caller that bypasses clap: a single run cannot both
     // preview and delete. Checked FIRST so the error is unambiguous, rather than
     // the threshold validation or the `dry_run || !yes` fallback silently
-    // resolving it.
+    // resolving it. (Passing NEITHER flag is valid -- that is the default dry-run.)
     if args.dry_run && args.yes {
         return Err(
             "`config gc` cannot both preview and delete: `--dry-run` and `--yes` are mutually \
-             exclusive. Pass exactly one."
+             exclusive. Pass at most one (omit both for the default dry-run preview)."
                 .to_owned(),
         );
     }
@@ -1937,20 +1937,37 @@ mod tests {
     /// The PUBLIC runner rejects `dry_run` + `yes` together, not only clap: a
     /// library caller that sets both fields must get an explicit error, never the
     /// wrong-threshold message or a silent preview.
+    ///
+    /// The conflict is checked FIRST, so it wins over EVERY `older_than` shape --
+    /// missing, zero, malformed, or overflowing. If any of these produced the
+    /// threshold error (or a preview) instead of the conflict error, the
+    /// precedence would be wrong.
     #[test]
-    fn config_gc_rejects_dry_run_and_yes_together() {
-        let args = ConfigGcArgs {
-            adapter: "fastly".to_owned(),
-            dry_run: true,
-            yes: true,
-            older_than: Some("7d".to_owned()),
-            ..ConfigGcArgs::default()
-        };
-        let err = run_config_gc(&args).expect_err("dry_run + yes must be rejected");
-        assert!(
-            err.contains("mutually exclusive"),
-            "must name the conflict, not the threshold: {err}"
-        );
+    fn config_gc_conflict_wins_over_every_threshold() {
+        let overflow = format!("{}d", u64::MAX); // parses to a number, then overflows the *86400
+        let thresholds = [
+            None,
+            Some("0"),
+            Some("not-a-duration"),
+            Some(overflow.as_str()),
+            Some("7d"),
+        ];
+        for older_than in thresholds {
+            let args = ConfigGcArgs {
+                adapter: "fastly".to_owned(),
+                dry_run: true,
+                yes: true,
+                older_than: older_than.map(str::to_owned),
+                ..ConfigGcArgs::default()
+            };
+            let err = run_config_gc(&args).expect_err(&format!(
+                "dry_run + yes must error, not preview (older_than={older_than:?})"
+            ));
+            assert!(
+                err.contains("mutually exclusive"),
+                "conflict must win over the threshold for older_than={older_than:?}: {err}"
+            );
+        }
     }
 
     /// `--older-than 0 --yes` parses, but asserts NOTHING --

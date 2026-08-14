@@ -1124,6 +1124,17 @@ pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> 
     chunk_key_parts(root_key, key).map(|(generation, _)| generation)
 }
 
+/// The canonical chunk INDEX (`.N` suffix) of `key` within `root_key`'s
+/// namespace, or `None` when `key` is not a canonical chunk key of that root.
+///
+/// `config gc` uses this to order a proven generation's chunks by writer index
+/// before deleting, so preview and failure-recovery order do not depend on the
+/// remote listing order.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn chunk_key_index(root_key: &str, key: &str) -> Option<usize> {
+    chunk_key_parts(root_key, key).map(|(_, index)| index)
+}
+
 /// Split a canonical chunk key into its `(generation, index)`.
 ///
 /// The validating half of [`chunk_key_generation`], which discards the index.
@@ -2808,6 +2819,25 @@ mod tests {
         let sha = chunk_key_generation("app_config", chunk_key).expect("a chunk key");
         assert_eq!(sha.len(), 64, "64-char sha256 hex");
         assert!(chunk_key.contains(&sha));
+    }
+
+    #[test]
+    fn chunk_key_index_extracts_the_canonical_index() {
+        let good = "a".repeat(64);
+        let base = format!("app_config.__edgezero_chunks.{good}");
+        // `.N` numeric index (used to order a generation by writer index).
+        assert_eq!(chunk_key_index("app_config", &format!("{base}.0")), Some(0));
+        assert_eq!(
+            chunk_key_index("app_config", &format!("{base}.17")),
+            Some(17)
+        );
+        // Non-canonical / non-chunk keys have no index.
+        assert_eq!(chunk_key_index("app_config", "app_config"), None);
+        assert_eq!(
+            chunk_key_index("app_config", &format!("{base}.007")),
+            None,
+            "a non-canonical index (leading zeros) is not one this writer emits"
+        );
     }
 
     #[test]
