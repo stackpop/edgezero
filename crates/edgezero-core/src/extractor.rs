@@ -901,22 +901,32 @@ where
     // A value written by a NEWER format (a bumped envelope version OR an unknown
     // `edgezero_kind` discriminator) needs a DIFFERENT remediation than
     // corruption: re-pushing the same config cannot help a build older than its
-    // config; the deployed build must be UPGRADED. This is the typed app-config
-    // layer's job (the store returns arbitrary direct values verbatim), so it is
-    // detected here, BEFORE the exact-v1 deserialize (a newer format may not even
-    // parse as v1, and serde ignores an unknown discriminator). The reason names
-    // only the version/field, never a value, so surfacing it is safe.
-    if let Some(reason) = future_format_reason(&raw) {
-        return Err(EdgeError::internal(anyhow::anyhow!(
-            "typed app-config blob uses {reason}, which this build does not understand; redeploy \
-             this service with an updated build (re-pushing will not help)"
-        )));
-    }
-    let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
-        EdgeError::internal(anyhow::anyhow!(
-            "typed app-config blob is not a valid envelope (details redacted)"
-        ))
-    })?;
+    // config; the deployed build must be UPGRADED. The version case is already
+    // caught by `verify()` below (`UnknownVersion`); the two it does NOT catch are
+    // an `edgezero_kind` on a v1-shaped value (serde ignores the unknown field)
+    // and a schema-changed envelope that fails the v1 deserialize outright. A
+    // cheap substring gate keeps the second full JSON parse (`future_format_reason`,
+    // which reparses the whole blob as a `Value`) OFF the happy path -- this runs
+    // per request in the edge guest, over a blob that is by definition large
+    // wherever chunking matters. The reason names only the version/field, never a
+    // value, so surfacing it is safe.
+    let kind_tagged = raw.contains("edgezero_kind");
+    let envelope: BlobEnvelope = match serde_json::from_str::<BlobEnvelope>(&raw) {
+        Ok(envelope) if !kind_tagged => envelope,
+        parsed => {
+            if let Some(reason) = future_format_reason(&raw) {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "typed app-config blob uses {reason}, which this build does not understand; \
+                     redeploy this service with an updated build (re-pushing will not help)"
+                )));
+            }
+            parsed.map_err(|_err| {
+                EdgeError::internal(anyhow::anyhow!(
+                    "typed app-config blob is not a valid envelope (details redacted)"
+                ))
+            })?
+        }
+    };
     envelope.verify().map_err(|err| match err {
         BlobEnvelopeError::UnknownVersion(version) => EdgeError::internal(anyhow::anyhow!(
             "typed app-config blob uses envelope version {version}, which this build does not \

@@ -14,6 +14,13 @@ target/
 .spin/
 .edgezero/
 
+# Fastly local config-push lock and staging temp files (sidecars next to the
+# manifest). `examples/app-demo` has a `fastly.toml`, so `config push --local`
+# there leaves these behind; a SIGKILL/panic mid-push can also strand a temp.
+# The globs cover a manifest named something other than `fastly.toml`.
+.*.edgezero-lock
+.*.edgezero-*.tmp
+
 # env
 .env
 

@@ -14,10 +14,13 @@ target/
 .spin/
 .edgezero/
 
-# Fastly local config-push lock (a persistent advisory-lock sidecar next to
-# the manifest; serialises concurrent `config push --local` / `provision`).
-# The glob also covers a manifest named something other than `fastly.toml`.
+# Fastly local config-push lock and staging temp files (sidecars next to the
+# manifest; the lock serialises concurrent `config push --local` / `provision`,
+# the temp is the atomic-replace staging file). `TempFileGuard` removes the temp
+# on every normal return, but a SIGKILL / panic-abort mid-push can leave one
+# behind. The globs also cover a manifest named something other than `fastly.toml`.
 .*.edgezero-lock
+.*.edgezero-*.tmp
 
 # env
 .env

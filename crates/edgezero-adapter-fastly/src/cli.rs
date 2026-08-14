@@ -1809,31 +1809,14 @@ fn write_fastly_local_config_store(
         match orphan_chunk_keys(plan) {
             Ok(orphans) => {
                 for key in orphans {
-                    // Never remove an orphan whose VALUE is itself a root, claims
-                    // our namespace, or was written by a NEWER format: a valid
-                    // direct envelope, a pointer, an unknown/future `edgezero_kind`,
-                    // or a bumped envelope/pointer version (all of which the cloud
-                    // GC path also fails closed on). Deleting one would drop live
-                    // or newer-format config.
-                    let value_protected = contents_tbl
-                        .get(&key)
-                        .and_then(toml_edit::Item::as_str)
-                        .is_some_and(|value| {
-                            value_announces_our_kind(value)
-                                || value_is_future_format(value)
-                                || gc_classify_root(&key, value).is_ok()
-                        });
-                    // Symmetric with cloud GC's fail-closed rule: a key that has
-                    // any canonical chunk nested BENEATH it is a (possibly
-                    // truncated/unreadable) NESTED ROOT. Deleting it would orphan
-                    // that nested generation, so keep it even when its own value
-                    // does not classify. Only a raw leaf PAYLOAD -- announcing no
-                    // kind, not an envelope, and with nothing nested under it --
-                    // prunes normally.
-                    let has_nested_generation = contents_tbl.iter().any(|(other, _)| {
-                        other != key && chunk_key_generation(&key, other).is_some()
-                    });
-                    if value_protected || has_nested_generation {
+                    // Never remove an orphan that is itself protected -- a
+                    // runtime-readable root, a value claiming our `edgezero_kind`
+                    // namespace or written by a NEWER format, or a nested root with
+                    // canonical chunks beneath it (deleting which would orphan that
+                    // nested generation). Only a raw leaf PAYLOAD prunes. Shared
+                    // with the dry-run count via `is_prunable_leaf`, so the preview
+                    // can never disagree with what is removed here.
+                    if !is_prunable_leaf(contents_tbl, &key) {
                         warnings.push(format!(
                             "warning: kept `{key}` -- it is a runtime-readable root, claims the \
                              `edgezero_kind` namespace, or is a nested root with chunks beneath it; \
@@ -2097,6 +2080,32 @@ fn local_contents_table<'doc>(
 /// on a missing file / no prior pointer / direct prior value it reports
 /// `Ok(0)`; on unreadable or malformed prior state it reports `Err(reason)`
 /// which the caller renders as an "unknown" line.
+/// Is `key` a plain, prunable chunk PAYLOAD in `contents`? `false` for a value
+/// that must be KEPT: a runtime-readable root, a value claiming our
+/// `edgezero_kind` namespace or written by a newer format, or a NESTED root (a
+/// key with a canonical chunk beneath it). Only a raw leaf payload prunes.
+///
+/// The single source of truth shared by the real prune (`write_fastly_local_
+/// config_store`) and the dry-run count, so the previewed number can never drift
+/// from what `--yes` actually removes. (The dry-run reads the PRE-upsert table and
+/// the prune the POST-upsert one, but a generated key with a nested generation is
+/// already refused by `reject_generated_key_collisions`, so that asymmetry cannot
+/// change the verdict.)
+fn is_prunable_leaf(contents: &toml_edit::Table, key: &str) -> bool {
+    let value_protected = contents
+        .get(key)
+        .and_then(toml_edit::Item::as_str)
+        .is_some_and(|text| {
+            value_announces_our_kind(text)
+                || value_is_future_format(text)
+                || gc_classify_root(key, text).is_ok()
+        });
+    let has_nested = contents
+        .iter()
+        .any(|(other, _)| other != key && chunk_key_generation(key, other).is_some());
+    !(value_protected || has_nested)
+}
+
 fn local_orphan_counts_for_dry_run(
     path: &Path,
     platform_name: &str,
@@ -2135,32 +2144,13 @@ fn local_orphan_counts_for_dry_run(
                                 Ok(prior) => Ok(prior
                                     .iter()
                                     .filter(|key| !new_keys.contains(*key))
-                                    // Match the real prune exactly, so the count
-                                    // equals what would actually be deleted:
+                                    // Count only what the real prune would remove:
+                                    // it must still be PRESENT (an absent key is a
+                                    // no-op remove, not a deletion) AND a prunable
+                                    // leaf by the SAME predicate the prune uses.
                                     .filter(|key| {
-                                        let Some(orphan_item) = contents.get(key) else {
-                                            // Already ABSENT: the real prune's
-                                            // remove() is a no-op, so this is not a
-                                            // deletion and must not be counted.
-                                            return false;
-                                        };
-                                        // KEPT (not counted) if the real prune
-                                        // would protect it: its value is a
-                                        // runtime-readable root / claims our
-                                        // namespace, OR it is a nested root with
-                                        // chunks beneath it. Mirror both, so the
-                                        // count equals actual deletions.
-                                        let value_protected =
-                                            orphan_item.as_str().is_some_and(|text| {
-                                                value_announces_our_kind(text)
-                                                    || value_is_future_format(text)
-                                                    || gc_classify_root(key, text).is_ok()
-                                            });
-                                        let has_nested = contents.iter().any(|(other, _)| {
-                                            other != key.as_str()
-                                                && chunk_key_generation(key, other).is_some()
-                                        });
-                                        !(value_protected || has_nested)
+                                        contents.get(key.as_str()).is_some()
+                                            && is_prunable_leaf(contents, key)
                                     })
                                     .count()),
                                 Err(_) => Err("suspicious prior pointer".to_owned()),
@@ -2236,23 +2226,33 @@ fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, Str
     // listing exactly, we delete nothing.
     let mut items = Vec::with_capacity(array.len());
     for (idx, entry) in array.iter().enumerate() {
+        // Name the offending KEY, not just the index: `item_key` is readable even
+        // when another field is empty, so the operator can see WHICH entry to fix.
+        let key_hint = entry
+            .get("item_key")
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| !key.is_empty())
+            .map_or_else(|| format!("#{idx}"), |key| format!("`{key}`"));
         let field = |name: &str| -> Result<String, String> {
             let raw = entry
                 .get(name)
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     format!(
-                        "`fastly config-store-entry list` entry #{idx} is missing a string `{name}` \
-                         field; refusing to reclaim on an unreadable listing (nothing deleted)"
+                        "`fastly config-store-entry list` entry {key_hint} is missing a string \
+                         `{name}` field; refusing to reclaim (nothing deleted)"
                     )
                 })?;
-            // An EMPTY field is as dangerous as a missing one: an empty root
-            // value would classify as "references nothing" and orphan its live
-            // chunks. Reject it here rather than reason about it later.
+            // An EMPTY field is as dangerous as a missing one: an empty root value
+            // would classify as "references nothing" and orphan its live chunks.
+            // Reject it here rather than reason about it later -- but say what to
+            // look at, since a legitimate empty-valued sibling is otherwise a
+            // whole-store block with no obvious cause.
             if raw.is_empty() {
                 return Err(format!(
-                    "`fastly config-store-entry list` entry #{idx} has an empty `{name}` field; \
-                     refusing to reclaim on an unreadable listing (nothing deleted)"
+                    "`fastly config-store-entry list` entry {key_hint} has an empty `{name}` field; \
+                     refusing to reclaim (nothing deleted). If this is a legitimate empty-valued \
+                     entry, remove it or give it a value before running `config gc`."
                 ));
             }
             Ok(raw.to_owned())
