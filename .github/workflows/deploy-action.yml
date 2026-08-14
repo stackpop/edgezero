@@ -61,7 +61,7 @@ jobs:
   static-checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -145,7 +145,7 @@ jobs:
       FASTLY_ENDPOINT: https://inherited.invalid
       FASTLY_HOME: /nonexistent/inherited
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -216,7 +216,7 @@ jobs:
   handoff-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Create fixture app (app-owned CLI)
@@ -237,7 +237,7 @@ jobs:
       FASTLY_ENDPOINT: https://inherited.invalid
       FASTLY_HOME: /nonexistent/inherited
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # The deploy job needs the app SOURCE (working-directory); the CLI binary comes
@@ -270,7 +270,7 @@ jobs:
   cache-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Create fixture app (app-owned CLI)
@@ -337,7 +337,7 @@ jobs:
     env:
       FAKE_LOSE_VERSION: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Create fixture app (app-owned CLI)
@@ -369,7 +369,7 @@ jobs:
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
         run: .github/actions/deploy-core/tests/assert-lost-version.sh
       - name: Download the CLI artifact for recovery
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@v8
         with:
           name: edgezero-cli-recovery
           path: recover-cli
@@ -408,7 +408,7 @@ jobs:
       FASTLY_ENDPOINT: https://inherited.invalid
       FASTLY_HOME: /nonexistent/inherited
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -489,7 +489,7 @@ jobs:
       FASTLY_HOME: /nonexistent/inherited
       FASTLY_API_TOKEN: inherited-must-not-reach-production-probes
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 

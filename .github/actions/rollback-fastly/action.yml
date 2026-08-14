@@ -96,7 +96,7 @@ runs:
       run: $GITHUB_ACTION_PATH/scripts/validate.sh
 
     - name: Download CLI artifact
-      uses: actions/download-artifact@v4.3.0
+      uses: actions/download-artifact@v8
       with:
         name: ${{ inputs['app-cli-artifact'] }}
         path: ${{ steps.ws.outputs.root }}/cli-download

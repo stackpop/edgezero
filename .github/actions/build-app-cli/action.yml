@@ -245,7 +245,7 @@ runs:
     # step's note): a custom provider secret should be scoped to the one step that
     # needs it, never to job-level `env:` shared with the build.
     - name: Upload CLI artifact
-      uses: actions/upload-artifact@v4.6.2
+      uses: actions/upload-artifact@v7
       env:
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
