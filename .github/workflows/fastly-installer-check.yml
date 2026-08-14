@@ -13,7 +13,6 @@ on:
     paths:
       - .github/actions/deploy-fastly/scripts/install-fastly.sh
       - .github/actions/deploy-fastly/scripts/verify-installed-version.sh
-      - .github/actions/deploy-fastly/scripts/common.sh
       - .github/actions/deploy-fastly/versions.json
       - .github/actions/deploy-core/scripts/common.sh
       - .tool-versions
@@ -23,7 +22,6 @@ on:
     paths:
       - .github/actions/deploy-fastly/scripts/install-fastly.sh
       - .github/actions/deploy-fastly/scripts/verify-installed-version.sh
-      - .github/actions/deploy-fastly/scripts/common.sh
       - .github/actions/deploy-fastly/versions.json
       - .github/actions/deploy-core/scripts/common.sh
       - .tool-versions

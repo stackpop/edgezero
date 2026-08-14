@@ -258,6 +258,19 @@ read_bool_line() {
   grep -oE "^${key}=(true|false)\$" "$log" | tail -n 1 | cut -d= -f2 || true
 }
 
+# Refuse to proceed unless the working tree at <git_root> is clean (no unstaged,
+# staged, or untracked changes). A credential-bearing action must operate only on
+# COMMITTED source so what it deploys/pushes corresponds to a `source-revision` that
+# can be reconciled later. `label` names the subject in the error.
+assert_committed_source() {
+  local git_root="$1" label="$2"
+  if ! git -C "$git_root" diff --quiet --ignore-submodules -- ||
+    ! git -C "$git_root" diff --cached --quiet --ignore-submodules -- ||
+    [[ -n "$(git -C "$git_root" ls-files --others --exclude-standard)" ]]; then
+    fail "committed source is required; the working tree for '$label' is dirty"
+  fi
+}
+
 # The app CLI to invoke — the ABSOLUTE path the download step resolved, when
 # available, else the bare name.
 #

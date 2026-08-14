@@ -47,10 +47,25 @@ main() {
     fail_with "$rc" "deploy failed (CLI exit $rc or setup error before invocation)"
   fi
 
-  local version
-  version=$(read_numeric_line version "$LIFECYCLE_LOG")
-  [[ -n "$version" ]] ||
+  # The deploy must emit EXACTLY ONE canonical `version=<digits>` line. Mirror the
+  # rollback-target capture (capture-previous.sh) rather than taking the LAST line:
+  # `fastly-version` is threaded straight into healthcheck (`--version`) and rollback
+  # (`--version`), so a non-conforming app CLI that printed a spurious `version=`
+  # line before the authoritative one could otherwise thread a version that was never
+  # deployed. A missing, duplicated, or malformed line fails CLOSED.
+  local version_lines version_count version
+  version_lines=$(grep -E '^version=' "$LIFECYCLE_LOG" || true)
+  version_count=$(printf '%s' "$version_lines" | grep -c . || true)
+  if [[ "$version_count" -eq 0 ]]; then
     fail "deploy reported success but emitted no canonical 'version=<digits>' line, so there is no version to thread into healthcheck or rollback"
+  fi
+  if [[ "$version_count" -gt 1 ]]; then
+    fail "deploy emitted $version_count 'version=' lines; exactly one is required. Refusing to guess which version was deployed. Lines: $(printf '%s' "$version_lines" | tr '\n' ' ')"
+  fi
+  if [[ ! "$version_lines" =~ ^version=([0-9]+)$ ]]; then
+    fail "deploy emitted a malformed version line '$version_lines'; expected 'version=<N>'. Refusing to thread an unparseable version into healthcheck or rollback"
+  fi
+  version="${BASH_REMATCH[1]}"
 
   append_output fastly-version "$version"
 }

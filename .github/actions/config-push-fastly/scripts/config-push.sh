@@ -34,6 +34,7 @@ set -euo pipefail
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG     optional  typed config file path (relative to the app dir)
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE optional  raw inline typed-config content (exclusive with APP_CONFIG)
 #   EDGEZERO__CONFIG_PUSH__NO_ENV         optional  'true' to pass --no-env (skip the env overlay); default false
+#   RUNNER_TEMP                           optional  scratch root for the inline-config temp file (default: /tmp)
 # Writes (outputs):
 #   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
 #   pushed-key                            the key written (base, or its _staging variant)
@@ -74,6 +75,7 @@ main() {
 
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_cmd "$cli_bin"
+  require_cmd git
   # A typo in deploy-to must never silently push to production.
   case "$deploy_to" in
     production | staging) ;;
@@ -110,6 +112,21 @@ main() {
     is_under "$app_dir" "$default_manifest" ||
       fail "the default 'edgezero.toml' resolves outside the application directory — refusing to read a manifest that escapes it"
   fi
+  # Committed-source guard: config pushed from the CHECKED-OUT tree (a manifest or an
+  # app-config FILE) must come from committed source, so the store the live service
+  # reads always corresponds to a revision that can be reconciled later — the same
+  # guarantee deploy gets from resolve-project.sh. Inline config is caller-supplied
+  # CONTENT (a workflow variable), not the tree, so it is exempt.
+  if [[ -z "$app_config_inline" ]]; then
+    local git_root
+    git_root=$(git -C "$app_dir" rev-parse --show-toplevel 2>/dev/null) ||
+      fail "config push requires committed source, but working-directory '$working_directory' is not a Git checkout"
+    git_root=$(canonical_path "$git_root")
+    # Never climb above github.workspace when checking dirtiness.
+    is_under "$workspace_real" "$git_root" || git_root="$workspace_real"
+    assert_committed_source "$git_root" "$working_directory"
+  fi
+
   # Open the private log and install the sensitive-temp cleanup FIRST, so there is
   # never a window where a temp file exists without a trap covering it (a cancel in
   # such a window would leave raw config behind).
@@ -121,10 +138,14 @@ main() {
   # ABSOLUTE path, which the CLI reads as-is. A checked-out path is confined to
   # the app directory as before.
   if [[ -n "$app_config_inline" ]]; then
-    # A deterministic per-process path so the combined trap can name the file
-    # BEFORE it is created — closing the create-then-trap race. config-push runs
-    # no app-controlled code, so a predictable name is not a tampering risk.
-    inline_file="${RUNNER_TEMP:-/tmp}/edgezero-inline-config.$$"
+    # `mktemp` (not a predictable `.$$` path): it creates the file EXCLUSIVELY with a
+    # random name, so a symlink cannot be pre-planted at the path and the `>` write
+    # cannot be redirected — and on a self-hosted runner where RUNNER_TEMP persists
+    # across jobs, a stale/hijacked name can't be reused. The file already exists once
+    # mktemp returns, so the trap set immediately after covers it (no create-then-trap
+    # race). mktemp names never contain a quote, so expanding the paths into the trap
+    # NOW (they must be — `inline_file` is a `main` local, out of scope at EXIT) is safe.
+    inline_file=$(mktemp "${RUNNER_TEMP:-/tmp}/edgezero-inline-config.XXXXXX")
     # shellcheck disable=SC2064  # expand both paths now, not at trap time
     trap "cleanup_sensitive_temps '$LIFECYCLE_LOG' '$inline_file'" EXIT
     (

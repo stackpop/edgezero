@@ -101,12 +101,14 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh"
 
     - name: Validate inputs
       id: validate
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__ADAPTER: fastly
         EDGEZERO__BUILD__MODE: ${{ inputs['build-mode'] }}
         EDGEZERO__BUILD__CACHE: ${{ inputs.cache }}
@@ -142,7 +144,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/scripts/validate.sh
+      run: exec "$GITHUB_ACTION_PATH/scripts/validate.sh"
 
     - name: Download CLI artifact
       uses: actions/download-artifact@v8
@@ -171,6 +173,8 @@ runs:
       id: cli
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ steps.ws.outputs.root }}/cli-download
         EDGEZERO__ACTION__TOOL_ROOT: ${{ steps.ws.outputs.root }}/tools
         EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
@@ -190,12 +194,14 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh"
 
     - name: Resolve project
       id: resolve
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
         EDGEZERO__APP__CLI__VERSION: ${{ steps.cli.outputs['app-cli-version'] }}
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
@@ -220,7 +226,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/resolve-project.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/resolve-project.sh"
 
     - name: Restore application target cache
       # Only when a credential-free build will actually USE and re-SAVE it — i.e.
@@ -283,6 +289,8 @@ runs:
       id: install-fastly
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
         EDGEZERO__FASTLY__VERSIONS_JSON: ${{ github.action_path }}/versions.json
         FASTLY_API_TOKEN: ""
@@ -301,7 +309,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/scripts/install-fastly.sh
+      run: exec "$GITHUB_ACTION_PATH/scripts/install-fastly.sh"
 
     # Runs on build-mode: always — a validation gate that ALSO seeds the target/
     # cache from a step holding NO provider token, so a build script cannot persist a
@@ -339,7 +347,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/run-app-cli.sh build
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/run-app-cli.sh" build
 
     # Save from the CREDENTIAL-FREE build above, BEFORE the token-bearing deploy — so
     # the cached target/ can never contain a secret a build script wrote during the
@@ -405,7 +413,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/scripts/capture-previous.sh
+      run: exec "$GITHUB_ACTION_PATH/scripts/capture-previous.sh"
 
     - name: Deploy
       id: deploy
@@ -428,12 +436,14 @@ runs:
         EDGEZERO__PROVIDER__ENV_CLEAR_FILE: ${{ steps.validate.outputs['provider-env-clear-file'] }}
         EDGEZERO__FASTLY__API_TOKEN: ${{ inputs['fastly-api-token'] }}
         EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
-      run: $GITHUB_ACTION_PATH/scripts/deploy.sh
+      run: exec "$GITHUB_ACTION_PATH/scripts/deploy.sh"
 
     - name: Write summary
       if: ${{ always() }}
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__SUMMARY__ADAPTER: fastly
         EDGEZERO__SUMMARY__WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory-relative'] }}
         EDGEZERO__SUMMARY__SOURCE_REVISION: ${{ steps.resolve.outputs['source-revision'] }}
@@ -460,12 +470,14 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/write-summary.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/write-summary.sh"
 
     - name: Cleanup
       if: ${{ always() }}
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
         EDGEZERO__ACTION__STATE_DIR: ${{ steps.ws.outputs.root }}/state
         EDGEZERO__ACTION__TOOL_ROOT: ${{ steps.ws.outputs.root }}/tools
@@ -485,4 +497,4 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh"

@@ -82,7 +82,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh"
 
     # GitHub does not enforce `required: true` on composite inputs, and an empty
     # artifact name makes actions/download-artifact fetch EVERY artifact in the
@@ -90,6 +90,8 @@ runs:
     - name: Validate inputs
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
         # Non-provider step: blank inherited provider aliases (only the probe step
         # below receives the token, and only when it needs one).
@@ -109,7 +111,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/scripts/validate.sh
+      run: exec "$GITHUB_ACTION_PATH/scripts/validate.sh"
 
     - name: Download CLI artifact
       uses: actions/download-artifact@v8
@@ -138,6 +140,8 @@ runs:
       id: cli
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ steps.ws.outputs.root }}/cli-download
         EDGEZERO__ACTION__TOOL_ROOT: ${{ steps.ws.outputs.root }}/tools
         EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
@@ -157,7 +161,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh"
 
     - name: Health check
       id: check
@@ -196,12 +200,14 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/scripts/healthcheck.sh
+      run: exec "$GITHUB_ACTION_PATH/scripts/healthcheck.sh"
 
     - name: Cleanup
       if: ${{ always() }}
       shell: bash
       env:
+        BASH_ENV: ""
+        ENV: ""
         EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
         EDGEZERO__ACTION__TOOL_ROOT: ${{ steps.ws.outputs.root }}/tools
         FASTLY_API_TOKEN: ""
@@ -220,4 +226,4 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh"

@@ -15,15 +15,8 @@ set -euo pipefail
 #   the tool root's bin/, so `fastly` is callable
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=common.sh
-source "$SCRIPT_DIR/common.sh"
-
-require_linux_x86_64() {
-  case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64 | Linux-amd64) ;;
-    *) fail "the Fastly wrapper supports only Linux x86-64 runners" ;;
-  esac
-}
+# shellcheck source=../../deploy-core/scripts/common.sh
+source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
 
 # The provider CLI gets its OWN directory, never the app CLI's `bin/`. The app
 # names its own binary, and `fastly` is a legal app-CLI name -- sharing one
@@ -68,8 +61,26 @@ main() {
   sha256=$(json_get "$versions_json" fastly.linux_amd64.sha256)
   archive="$tool_root/downloads/fastly-$version-linux-amd64.tar.gz"
 
-  [[ -f "$archive" ]] || curl --fail --location --silent --show-error "$url" --output "$archive"
+  # Download to a scratch path and move it into the cache ONLY after the checksum
+  # verifies. `curl --output "$archive"` truncates the target as the transfer starts,
+  # so a reset mid-download would leave a short archive that the `[[ -f ]]`
+  # idempotency check then trusts on the retry — a permanent checksum failure that
+  # reads as a supply-chain alarm rather than the network blip it was. The cached
+  # archive is therefore only ever a complete, verified file.
+  if [[ ! -f "$archive" ]]; then
+    local scratch
+    scratch=$(mktemp "$tool_root/downloads/fastly-$version.XXXXXX.part")
+    curl --fail --location --silent --show-error "$url" --output "$scratch"
+    actual=$(sha256_file "$scratch")
+    [[ "$actual" == "$sha256" ]] || {
+      rm -f "$scratch"
+      fail "Fastly CLI checksum mismatch for version $version"
+    }
+    mv -f "$scratch" "$archive"
+  fi
 
+  # A cached archive is complete+verified by construction; re-verify defensively
+  # (hashing a small file is cheap) so a corrupted cache never reaches extraction.
   actual=$(sha256_file "$archive")
   [[ "$actual" == "$sha256" ]] || fail "Fastly CLI checksum mismatch for version $version"
 

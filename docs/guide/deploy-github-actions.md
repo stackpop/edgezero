@@ -93,6 +93,17 @@ repository is not readable with the deployer job's default `GITHUB_TOKEN` — mi
 an app-scoped token first (a GitHub App installation token, or a fine-grained PAT
 with `contents: read`) and pass it to the application checkout.
 
+The snippet below is a job fragment with placeholders you must fill in:
+
+- The `ref:` on the application checkout reads an `inputs.ref` workflow input, so
+  the workflow needs a matching `on:` block that declares a `ref` input — or
+  replace it with a literal ref.
+- The application checkout's `token:` reads `steps.app-token.outputs.token`, which
+  assumes an earlier `id: app-token` step that mints the token (shown below). Swap
+  it for however you mint yours.
+- Replace every `@<ref>` in a `uses:` with a real ref — a released tag, or a full
+  commit SHA for a reproducible production deploy.
+
 ```yaml
 steps:
   - name: Checkout deployer
@@ -101,11 +112,20 @@ steps:
       path: deployer
       persist-credentials: false
 
+  # Mint the app-scoped token consumed by the application checkout below. This
+  # example uses a GitHub App; a fine-grained PAT in a secret works too.
+  - id: app-token
+    uses: actions/create-github-app-token@<ref>
+    with:
+      app-id: ${{ vars.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      repositories: my-edgezero-app
+
   - name: Checkout application
     uses: actions/checkout@v4
     with:
       repository: stackpop/my-edgezero-app
-      ref: ${{ inputs.ref }}
+      ref: ${{ inputs.ref }} # requires an `on:` input named `ref`, or use a literal
       path: app
       persist-credentials: false
       token: ${{ steps.app-token.outputs.token }} # app-scoped token
@@ -298,20 +318,20 @@ out of the build's job entirely, or scope it to the one step that needs it.
 
 ### `deploy-fastly`
 
-| Input               | Required | Default         | Meaning                                                                                                                                                                    |
-| ------------------- | -------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                                                                                       |
-| `fastly-api-token`  | Yes      | —               | Injected only into the provider steps (rollback-target capture + deploy); blanked elsewhere.                                                                               |
-| `fastly-service-id` | Yes      | —               | Passed as the typed `--service-id` flag.                                                                                                                                   |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                                                                                           |
-| `working-directory` | No       | `.`             | App directory.                                                                                                                                                             |
-| `manifest`          | No       | empty           | Optional `edgezero.toml` path relative to `working-directory`.                                                                                                             |
-| `rust-toolchain`    | No       | `auto`          | Rust toolchain for the deploy build; `auto` follows discovery (§7).                                                                                                        |
-| `build-mode`        | No       | `auto`          | `auto` (→ `never` for Fastly), `always`, or `never`.                                                                                                                       |
-| `build-args`        | No       | `[]`            | JSON array passed to `<cli> build`. No secrets.                                                                                                                            |
-| `deploy-args`       | No       | `[]`            | JSON array — allowlisted to `--comment` for Fastly. No secrets.                                                                                                            |
-| `stage`             | No       | `false`         | Deploy to a staged draft version instead of activating.                                                                                                                    |
-| `cache`             | No       | `false`         | Exact-key Cargo-workspace `target/` caching. Takes effect with `build-mode: always` (the credential-free build seeds the cache; the token-bearing deploy is never cached). |
+| Input               | Required | Default       | Meaning                                                                                                                                                                    |
+| ------------------- | -------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                                                                                                                                       |
+| `fastly-api-token`  | Yes      | —             | Injected only into the provider steps (rollback-target capture + deploy); blanked elsewhere.                                                                               |
+| `fastly-service-id` | Yes      | —             | Passed as the typed `--service-id` flag.                                                                                                                                   |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact — the `app-cli-bin` recorded in the artifact's `app-cli-meta.json`.                                                                        |
+| `working-directory` | No       | `.`           | App directory.                                                                                                                                                             |
+| `manifest`          | No       | empty         | Optional `edgezero.toml` path relative to `working-directory`.                                                                                                             |
+| `rust-toolchain`    | No       | `auto`        | Rust toolchain for the deploy build; `auto` follows discovery (§7).                                                                                                        |
+| `build-mode`        | No       | `auto`        | `auto` (→ `never` for Fastly), `always`, or `never`.                                                                                                                       |
+| `build-args`        | No       | `[]`          | JSON array passed to `<cli> build`. No secrets.                                                                                                                            |
+| `deploy-args`       | No       | `[]`          | JSON array — allowlisted to `--comment` for Fastly. No secrets.                                                                                                            |
+| `stage`             | No       | `false`       | Deploy to a staged draft version instead of activating.                                                                                                                    |
+| `cache`             | No       | `false`       | Exact-key Cargo-workspace `target/` caching. Takes effect with `build-mode: always` (the credential-free build seeds the cache; the token-bearing deploy is never cached). |
 
 Outputs: `fastly-version`, `source-revision`, `app-cli-version`,
 `provider-cli-version` (the Fastly CLI version this action installed),
@@ -453,19 +473,19 @@ and cannot — pass it through `deploy-args`.
 
 ### `healthcheck-fastly`
 
-| Input               | Required | Default         | Meaning                                                                                                        |
-| ------------------- | -------- | --------------- | -------------------------------------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                           |
-| `fastly-api-token`  | Staging  | —               | Needed only for `deploy-to: staging` (staging-IP resolution); a production probe needs none and receives none. |
-| `fastly-service-id` | Yes      | —               | Service to probe.                                                                                              |
-| `fastly-version`    | Yes      | —               | Version to probe — thread the deploy's `fastly-version`.                                                       |
-| `domain`            | Yes      | —               | Domain to probe, e.g. `www.example.com`.                                                                       |
-| `path`              | No       | `/`             | URL path to probe (must begin with `/`). Covers production and staging alike (staging reroutes the same URL).  |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                               |
-| `deploy-to`         | No       | `production`    | `staging` probes the staged version via its resolved edge IP.                                                  |
-| `retry`             | No       | `3`             | Attempts before declaring the deployment unhealthy.                                                            |
-| `retry-delay`       | No       | `5`             | Seconds between attempts.                                                                                      |
-| `timeout`           | No       | `10`            | Per-attempt timeout in seconds. Must be a positive integer (`0` would disable curl's timeout).                 |
+| Input               | Required | Default       | Meaning                                                                                                        |
+| ------------------- | -------- | ------------- | -------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                                                                           |
+| `fastly-api-token`  | Staging  | —             | Needed only for `deploy-to: staging` (staging-IP resolution); a production probe needs none and receives none. |
+| `fastly-service-id` | Yes      | —             | Service to probe.                                                                                              |
+| `fastly-version`    | Yes      | —             | Version to probe — thread the deploy's `fastly-version`.                                                       |
+| `domain`            | Yes      | —             | Domain to probe, e.g. `www.example.com`.                                                                       |
+| `path`              | No       | `/`           | URL path to probe (must begin with `/`). Covers production and staging alike (staging reroutes the same URL).  |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact — the `app-cli-bin` recorded in the artifact's `app-cli-meta.json`.            |
+| `deploy-to`         | No       | `production`  | `staging` probes the staged version via its resolved edge IP.                                                  |
+| `retry`             | No       | `3`           | Attempts before declaring the deployment unhealthy.                                                            |
+| `retry-delay`       | No       | `5`           | Seconds between attempts.                                                                                      |
+| `timeout`           | No       | `10`          | Per-attempt timeout in seconds. Must be a positive integer (`0` would disable curl's timeout).                 |
 
 Outputs: `healthy`, `status-code`.
 
@@ -475,15 +495,15 @@ alone skips a cancel/timeout), not on the `healthy` output.
 
 ### `rollback-fastly`
 
-| Input               | Required | Default         | Meaning                                                                                                                                                               |
-| ------------------- | -------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                                                                                  |
-| `fastly-api-token`  | Yes      | —               | Fastly API token.                                                                                                                                                     |
-| `fastly-service-id` | Yes      | —               | Service to roll back.                                                                                                                                                 |
-| `fastly-version`    | Yes      | —               | The current (bad) version to roll back **from**.                                                                                                                      |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                                                                                      |
-| `rollback-to`       | No\*     | empty           | **Production only:** the version to re-activate. Wire it from `deploy-fastly`'s `previous-version` output. Required for `deploy-to: production`; ignored for staging. |
-| `deploy-to`         | No       | `production`    | `production` activates `rollback-to`; `staging` deactivates the staged one.                                                                                           |
+| Input               | Required | Default       | Meaning                                                                                                                                                               |
+| ------------------- | -------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                                                                                                                                  |
+| `fastly-api-token`  | Yes      | —             | Fastly API token.                                                                                                                                                     |
+| `fastly-service-id` | Yes      | —             | Service to roll back.                                                                                                                                                 |
+| `fastly-version`    | Yes      | —             | The current (bad) version to roll back **from**.                                                                                                                      |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact — the `app-cli-bin` recorded in the artifact's `app-cli-meta.json`.                                                                   |
+| `rollback-to`       | No\*     | empty         | **Production only:** the version to re-activate. Wire it from `deploy-fastly`'s `previous-version` output. Required for `deploy-to: production`; ignored for staging. |
+| `deploy-to`         | No       | `production`  | `production` activates `rollback-to`; `staging` deactivates the staged one.                                                                                           |
 
 Outputs: `rolled-back-to` (production only — the version that was activated) and
 `mutation-attempted` (`true`, emitted immediately _before_ the rollback CLI runs;
@@ -502,19 +522,19 @@ Pushes your app's typed config to a Fastly config store. This is **separate from
 deploy** — deploy activates code, it never writes runtime config — so you run it
 as its own step, whenever config should move.
 
-| Input               | Required | Default         | Meaning                                                                                                              |
-| ------------------- | -------- | --------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                                                                 |
-| `fastly-api-token`  | Yes      | —               | Fastly API token. Injected only into the push step.                                                                  |
-| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                                                     |
-| `working-directory` | No       | `.`             | App directory (holds the manifest + typed config).                                                                   |
-| `manifest`          | No       | empty           | `edgezero.toml` path relative to `working-directory`.                                                                |
-| `app-config`        | No       | empty           | Typed config file path (default: resolved from the manifest). Mutually exclusive with `app-config-inline`.           |
-| `app-config-inline` | No       | empty           | Raw typed-config (TOML) supplied inline — for config that lives in a GitHub variable with no file on disk.           |
-| `no-env`            | No       | `false`         | `true` passes `--no-env` so the CLI does not overlay `<APP_NAME>__…__<KEY>` env vars onto the config before pushing. |
-| `store`             | No       | empty           | Logical config-store id (default: the manifest's resolved id).                                                       |
-| `key`               | No       | empty           | Explicit base key for a **production** push (default: the logical store id). Not allowed with `deploy-to: staging`.  |
-| `deploy-to`         | No       | `production`    | `staging` writes the `<logical-store-id>_staging` variant in the **same** store.                                     |
+| Input               | Required | Default       | Meaning                                                                                                              |
+| ------------------- | -------- | ------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                                                                                 |
+| `fastly-api-token`  | Yes      | —             | Fastly API token. Injected only into the push step.                                                                  |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact — the `app-cli-bin` recorded in the artifact's `app-cli-meta.json`.                  |
+| `working-directory` | No       | `.`           | App directory (holds the manifest + typed config).                                                                   |
+| `manifest`          | No       | empty         | `edgezero.toml` path relative to `working-directory`.                                                                |
+| `app-config`        | No       | empty         | Typed config file path (default: resolved from the manifest). Mutually exclusive with `app-config-inline`.           |
+| `app-config-inline` | No       | empty         | Raw typed-config (TOML) supplied inline — for config that lives in a GitHub variable with no file on disk.           |
+| `no-env`            | No       | `false`       | `true` passes `--no-env` so the CLI does not overlay `<APP_NAME>__…__<KEY>` env vars onto the config before pushing. |
+| `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).                                                       |
+| `key`               | No       | empty         | Explicit base key for a **production** push (default: the logical store id). Not allowed with `deploy-to: staging`.  |
+| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the **same** store.                                     |
 
 Outputs: `pushed-key` (the key written — the base key, or the derived `_staging`
 variant), `store` (the logical store id the CLI **resolved** — always emitted,
@@ -742,5 +762,8 @@ explicit subcommands you run as separate steps — via the `config-push-fastly`
 action, or your **app-owned** CLI's `<app-cli> config push` / `<app-cli> provision`
 (the typed `config push` is only available on your app's CLI; the bundled
 `edgezero` binary has no typed config in scope and returns an unsupported error).
+When you invoke `config push` yourself in CI (rather than through
+`config-push-fastly`, which adds it for you), pass `--yes` — with no TTY the
+push fails closed on the missing confirmation prompt.
 Cloudflare and Spin deploy wrappers are future work; today these actions target
 Fastly.

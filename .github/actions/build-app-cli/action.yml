@@ -92,7 +92,7 @@ runs:
         CF_ACCOUNT_ID: ""
         SPIN_AUTH_TOKEN: ""
         FERMYON_TOKEN: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh"
 
     - name: Compile application CLI package
       id: compile

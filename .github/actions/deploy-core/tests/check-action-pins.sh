@@ -61,6 +61,7 @@ sha_re='^[0-9a-fA-F]{40}$'
 tag_re='^v?[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
 
 status=0
+refs_seen=0
 for file in "${files[@]}"; do
   [[ -f "$file" ]] || continue
   # FAIL CLOSED on a parse/tool failure: if yq cannot read the file, a `2>/dev/null`
@@ -73,6 +74,7 @@ for file in "${files[@]}"; do
   fi
   while IFS= read -r ref; do
     [[ -z "$ref" || "$ref" == "null" ]] && continue
+    refs_seen=$((refs_seen + 1))
     case "$ref" in
       ./*) continue ;;
       docker://*)
@@ -103,6 +105,16 @@ for file in "${files[@]}"; do
     fi
   done <<<"$uses_list"
 done
+
+# A default (whole-repo) scan that finds ZERO action references is not a pass: the
+# repo's own workflows and composite actions always carry `uses:` refs, so an empty
+# result means the parser saw nothing — a substituted/broken `yq` would make the gate
+# green while checking nothing. Fail closed. (An explicit FILE... run may legitimately
+# target a file with no refs, so only guard the default scan.)
+if [[ "$#" -eq 0 && "$refs_seen" -eq 0 ]]; then
+  echo "::error::pin gate parsed 0 action references across the repository — expected many; refusing to pass (is yq working?)" >&2
+  status=1
+fi
 
 if [[ "$status" -eq 0 ]]; then
   echo "all action references (repository-wide) are pinned to a concrete ref"

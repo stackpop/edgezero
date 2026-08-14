@@ -38,6 +38,27 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
+# --- Untrusted-build isolation (build mode only) -----------------------------
+# `build` mode runs `<cli> build` → `cargo build`, which executes the app's AND
+# every transitive dependency's `build.rs` / proc macros — untrusted code. In
+# deploy-fastly this is the `build-mode: always` seed build, and it runs in the
+# SAME job that later receives the provider token. A `build.rs` that appends a shim
+# dir to `$GITHUB_PATH`, or `LD_PRELOAD=…` / `https_proxy=…` to `$GITHUB_ENV`, would
+# have the runner apply that to the token-bearing `Capture rollback target` and
+# `Deploy` steps — token exfiltration. Strip the GitHub file-command channels from
+# the PROCESS IMAGE before any build runs. This must be a re-exec, not an `unset`:
+# `/proc/<pid>/environ` still exposes the pre-unset values to a child otherwise
+# (the same reason build-app-cli re-execs its untrusted build). The sentinel arg —
+# not an env var, which a caller controls — marks "already stripped". `deploy` mode
+# is deliberately unchanged: it runs the app's OWN trusted CLI with the same token
+# and must keep GITHUB_OUTPUT to write `mutation-attempted`.
+readonly BUILD_ISOLATED_SENTINEL="__edgezero_build_isolated__"
+if [[ "${BASH_SOURCE[0]}" == "${0}" && "${1:-}" == build && "${2:-}" != "$BUILD_ISOLATED_SENTINEL" ]]; then
+  exec env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE \
+    -u GITHUB_STEP_SUMMARY -u BASH_ENV -u ENV \
+    "$0" build "$BUILD_ISOLATED_SENTINEL" "${@:2}"
+fi
+
 # Collect a NUL-delimited file into the global COLLECTED array (portable; avoids
 # Bash 4.3 namerefs, which some runners/macOS Bash 3.2 lack).
 COLLECTED=()

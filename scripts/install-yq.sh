@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #
-# Install a pinned mikefarah yq release, verified against the SHA-256 published in
-# the release's `checksums` file. Mirrors scripts/install-actionlint.sh so the pin
-# gate's YAML parser is a pinned, checksum-verified validation binary — not whatever
-# the runner happens to ship.
+# Install a pinned mikefarah yq release, verified against a SHA-256 PINNED IN THIS
+# REPO (not the release's own `checksums` file). yq is the pin gate's YAML parser,
+# so a compromised release that served a bad binary AND a matching origin checksum
+# would otherwise verify cleanly while the gate silently parses nothing. Anchoring
+# the digest in committed source (the versions.json pattern) closes that. Mirrors
+# scripts/install-actionlint.sh.
 #
 # Usage:
 #   scripts/install-yq.sh <version>
@@ -52,30 +54,28 @@ sha256_of() {
 base="https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}"
 asset="yq_${OS}_${ARCH}"
 
+# Repo-pinned SHA-256 per asset. Bump these together with YQ_VERSION (copy the
+# values from the release's `checksums`, verified once in a trusted context). An
+# unpinned version/platform fails CLOSED rather than trusting the runtime origin.
+expected=""
+case "${YQ_VERSION}:${asset}" in
+  4.53.3:yq_linux_amd64) expected=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4 ;;
+  4.53.3:yq_linux_arm64) expected=578648e463a11c1b6db6010cbf41eafed6bee79466fcffa1bb446672cf7945ea ;;
+  4.53.3:yq_darwin_amd64) expected=b4ba1ecce3c47f00803f4f964de38394326c7a32eb6540616e04fb2935a0f08d ;;
+  4.53.3:yq_darwin_arm64) expected=877de31753a4dd2401aa048937aa9a7fc4d5f6ce858cf31508c5802954297213 ;;
+esac
+if [ -z "$expected" ]; then
+  echo "error: no repo-pinned SHA-256 for $asset at yq ${YQ_VERSION}; add its digest to install-yq.sh from the release checksums rather than trusting the origin" >&2
+  exit 1
+fi
+
 # Work in a private temp dir that is always cleaned up.
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
+# Download to a scratch name and verify against the REPO-pinned digest BEFORE the
+# binary is trusted; the origin's own `checksums` file is never consulted.
 curl --fail --location --silent --show-error "$base/$asset" --output "$workdir/$asset"
-curl --fail --location --silent --show-error "$base/checksums" --output "$workdir/checksums"
-curl --fail --location --silent --show-error \
-  "$base/checksums_hashes_order" --output "$workdir/checksums_hashes_order"
-
-# yq's `checksums` has one column per hash algorithm; `checksums_hashes_order` gives
-# the column order. Column 1 is the filename, so the SHA-256 hash sits at
-# (order-index-of "SHA-256" + 1).
-sha_index="$(grep -n '^SHA-256$' "$workdir/checksums_hashes_order" | head -1 | cut -d: -f1)"
-if [ -z "$sha_index" ]; then
-  echo "error: SHA-256 is not listed in yq's checksums_hashes_order" >&2
-  exit 1
-fi
-expected="$(awk -v col="$((sha_index + 1))" -v name="$asset" \
-  '$1 == name { print $col }' "$workdir/checksums")"
-if ! printf '%s' "$expected" | grep -qE '^[0-9a-fA-F]{64}$'; then
-  echo "error: could not extract a SHA-256 for $asset from yq's checksums" >&2
-  exit 1
-fi
-
 actual="$(sha256_of "$workdir/$asset")"
 if [ "$actual" != "$expected" ]; then
   echo "error: checksum mismatch for $asset (expected $expected, got $actual)" >&2

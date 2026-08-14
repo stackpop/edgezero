@@ -104,15 +104,6 @@ resolve_effective_build_mode() {
 }
 
 # Record the source revision and fail on a dirty working tree.
-assert_committed_source() {
-  local git_root="$1" app_rel="$2"
-  if ! git -C "$git_root" diff --quiet --ignore-submodules -- ||
-    ! git -C "$git_root" diff --cached --quiet --ignore-submodules -- ||
-    [[ -n "$(git -C "$git_root" ls-files --others --exclude-standard)" ]]; then
-    fail "deployments require committed source; working tree for '$app_rel' is dirty"
-  fi
-}
-
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"

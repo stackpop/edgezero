@@ -229,7 +229,9 @@ Fastly-specific actions (§4), not engine behavior.
 > binary.** `edgezero config push` is a stub that exits non-zero by design:
 > pushing typed config requires the app-config struct, which only your generated
 > CLI has. Use the `config-push-fastly` action (it drives the `build-app-cli`
-> artifact), or invoke `<your-app>-cli config push` directly.
+> artifact), or invoke `<your-app>-cli config push` directly. When you invoke it
+> directly in CI, pass `--yes`: with no TTY the push has no confirmation prompt to
+> answer and fails closed without it (the action adds `--yes` for you).
 
 ## 6. Worked example — Trusted Server deployer migration
 

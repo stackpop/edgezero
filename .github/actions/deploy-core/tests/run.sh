@@ -274,6 +274,50 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# run-app-cli.sh — build mode isolates the untrusted build from the job's
+# GitHub file-command channels, so a build.rs cannot append to $GITHUB_PATH /
+# $GITHUB_ENV and reach a later token-bearing step in the same job.
+# ---------------------------------------------------------------------------
+test_run_cli_build_isolation() {
+  section "run-cli build-mode isolation"
+
+  local bin_dir="$WORK_DIR/bin-iso"
+  local app_dir="$WORK_DIR/app-iso"
+  local seen="$WORK_DIR/build-channels-seen.txt"
+  mkdir -p "$bin_dir" "$app_dir"
+
+  # Stands in for `<cli> build`: records which GitHub file-command channels are
+  # still visible to the (untrusted) build's environment.
+  cat >"$bin_dir/fakecli" <<EOF
+#!/usr/bin/env bash
+{
+  printf 'GITHUB_ENV=%s\n' "\${GITHUB_ENV:-<unset>}"
+  printf 'GITHUB_PATH=%s\n' "\${GITHUB_PATH:-<unset>}"
+  printf 'GITHUB_OUTPUT=%s\n' "\${GITHUB_OUTPUT:-<unset>}"
+} >"$seen"
+EOF
+  chmod +x "$bin_dir/fakecli"
+
+  if env -i PATH="$bin_dir:$PATH" \
+    EDGEZERO__APP__CLI__BIN=fakecli \
+    EDGEZERO__ADAPTER=fastly \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
+    GITHUB_ENV="$WORK_DIR/gh-env" \
+    GITHUB_PATH="$WORK_DIR/gh-path" \
+    GITHUB_OUTPUT="$WORK_DIR/gh-output" \
+    bash "$CORE_SCRIPTS/run-app-cli.sh" build >/dev/null 2>&1; then
+    assert_equals "build strips GITHUB_ENV from the build's environment" \
+      "GITHUB_ENV=<unset>" "$(grep '^GITHUB_ENV=' "$seen")"
+    assert_equals "build strips GITHUB_PATH from the build's environment" \
+      "GITHUB_PATH=<unset>" "$(grep '^GITHUB_PATH=' "$seen")"
+    assert_equals "build strips GITHUB_OUTPUT from the build's environment" \
+      "GITHUB_OUTPUT=<unset>" "$(grep '^GITHUB_OUTPUT=' "$seen")"
+  else
+    fail "run-cli build failed to execute"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # download-app-cli.sh — self-describing artifact
 # ---------------------------------------------------------------------------
 # Builds a fake artifact tar (binary + app-cli-meta.json) and asserts download-cli
@@ -440,42 +484,54 @@ step_block() {
   ' "$1"
 }
 
+# Print the label of every `run:` step in <file> that fails to blank BOTH BASH_ENV
+# and ENV. Enumerated from the YAML (step boundary `^    - `, same as step_block), so
+# a newly-added run step is covered automatically — no whitelist to fall behind.
+run_steps_missing_env_scrub() {
+  awk '
+    function flush() {
+      if (has_run && !(has_bash && has_env)) print label
+      has_run = 0; has_bash = 0; has_env = 0
+    }
+    /^    - / { flush(); label = $0 }
+    /^[[:space:]]*run:/ { has_run = 1 }
+    /^[[:space:]]*BASH_ENV: ""[[:space:]]*$/ { has_bash = 1 }
+    /^[[:space:]]*ENV: ""[[:space:]]*$/ { has_env = 1 }
+    END { flush() }
+  ' "$1"
+}
+
 test_workspace_step_scrub() {
   section "workspace steps scrub credentials"
   # The prepare/cleanup steps run before validation, so — like every other step —
   # they MUST blank the shipped aliases and BASH_ENV. Otherwise an inherited token
   # plus a checkout-controlled BASH_ENV runs code with the token before the body.
-  local a p block
+  # ENUMERATE every run: step from each action's YAML — not a hardcoded whitelist —
+  # and require each to blank BOTH BASH_ENV and ENV. A whitelist hides the gap when a
+  # NEW run step forgets the blanking; enumerating fails CI for it. bash/sh source
+  # those channels at startup, before a step's script can scrub, so a caller's job env
+  # could otherwise run code with a provider token in scope.
+  local a p missing
+  for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly; do
+    p="$ACTIONS_DIR/$a/action.yml"
+    missing=$(run_steps_missing_env_scrub "$p")
+    assert_equals "$a: every run: step blanks BASH_ENV and ENV" "" "$missing"
+  done
+
+  # The credential-scrubbing steps ADDITIONALLY blank the shipped FASTLY_API_TOKEN
+  # alias: prepare/cleanup, and the build-app-cli compile/publish/cleanup steps, run
+  # before (or without) the deploy's typed-credential import, so an inherited raw
+  # token must not survive into them.
+  local block
   for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly; do
     p="$ACTIONS_DIR/$a/action.yml"
     block=$(step_block "$p" "Prepare action workspace")
     assert_succeeds "$a: prepare step blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
-    assert_succeeds "$a: prepare step blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
   done
-  # Every build-app-cli run: bash step must blank BASH_ENV — including the publish
-  # step, which holds the REAL GITHUB_OUTPUT and is the handoff-validation boundary,
-  # and the cleanup step.
   local step
   for step in "Compile application CLI package" "Publish CLI outputs" "Cleanup workspace"; do
     block=$(step_block "$ACTIONS_DIR/build-app-cli/action.yml" "$step")
     assert_succeeds "build-app-cli: '$step' blanks FASTLY_API_TOKEN" grep -qF 'FASTLY_API_TOKEN: ""' <<<"$block"
-    assert_succeeds "build-app-cli: '$step' blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
-  done
-
-  # The TOKEN-bearing run steps must blank BASH_ENV/ENV too: bash sources them at
-  # startup, before the step's script can scrub, so a caller's job env could
-  # otherwise run code with the provider token in scope.
-  local token_step
-  for token_step in \
-    "deploy-fastly|Capture rollback target" \
-    "deploy-fastly|Deploy" \
-    "healthcheck-fastly|Health check" \
-    "config-push-fastly|Config push" \
-    "rollback-fastly|Rollback"; do
-    a="${token_step%%|*}"; step="${token_step#*|}"
-    block=$(step_block "$ACTIONS_DIR/$a/action.yml" "$step")
-    assert_succeeds "$a: token step '$step' blanks BASH_ENV" grep -qF 'BASH_ENV: ""' <<<"$block"
-    assert_succeeds "$a: token step '$step' blanks ENV" grep -qF 'ENV: ""' <<<"$block"
   done
 }
 
@@ -1074,6 +1130,14 @@ CLI
   # An in-app file every call can reference (this helper recreates $dir, so the
   # fixture must live here rather than being made by the caller).
   printf 'x\n' >"$dir/app/real.toml"
+  # config-push enforces a committed-source guard, so the app dir must be a clean Git
+  # checkout. bin/ and the argv output live in $dir, OUTSIDE $dir/app, so the fake
+  # CLI's recorded-argv writes never dirty the app repo the guard inspects.
+  git -C "$dir/app" init -q
+  git -C "$dir/app" config user.email t@t.invalid
+  git -C "$dir/app" config user.name t
+  git -C "$dir/app" add -A
+  git -C "$dir/app" commit -qm fixture
 
   PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" \
     EDGEZERO__APP__CLI__BIN=fake-cli \
@@ -2017,6 +2081,9 @@ test_mutation_attempted_signal() {
   # A CLI that SUCCEEDS (exit 0) but emits no canonical line.
   printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/bin/fake-cli"
   chmod +x "$dir/bin/fake-cli"
+  # config-push's committed-source guard needs the app dir to be a clean Git
+  # checkout; an empty freshly-inited repo is clean and lets the CLI be reached.
+  git -C "$dir/app" init -q
 
   # config-push (cross-platform): missing pushed-key fails the step, yet
   # mutation-attempted=true is already written to GITHUB_OUTPUT.
@@ -2285,6 +2352,7 @@ main() {
   test_owned_dir_confinement
   test_cli_bin_confinement
   test_run_cli_argv
+  test_run_cli_build_isolation
   test_provider_env_boundary
   test_download_cli_metadata
   test_wrapper_validate
