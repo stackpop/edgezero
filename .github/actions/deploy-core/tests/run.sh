@@ -1772,12 +1772,15 @@ test_action_pin_gate() {
   wrap() { printf 'jobs:\n  a:\n    steps:\n%s\n' "$1" >"$2"; }
 
   # Valid pins in block, quoted, and flow forms — a version tag and a full SHA —
-  # plus a commented-out branch ref that must be IGNORED (not a real `uses`).
+  # plus a commented-out branch ref that must be IGNORED (not a real `uses`). A bare
+  # major tag (`@v4`) is a deliberately-accepted VERSION TAG under the repo's policy:
+  # the gate enforces a concrete, reviewable ref, NOT immutability (a publisher can
+  # repoint `@v4`). See check-action-pins.sh's header.
   wrap '      - uses: actions/checkout@v4.3.0
       - "uses": actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
       - { uses: actions/setup-node@v4 }
       # uses: actions/checkout@main' "$dir/ok.yml"
-  assert_succeeds "valid pins (block/quoted/flow, tag+SHA) pass; a commented branch is ignored" \
+  assert_succeeds "valid pins (block/quoted/flow, tag+SHA, major tag) pass; a commented branch is ignored" \
     bash "$checker" "$dir/ok.yml"
 
   # A full semver tag with BOTH a prerelease and build-metadata suffix is valid.
@@ -1813,6 +1816,20 @@ test_action_pin_gate() {
   # An entirely unpinned ref (no @) is rejected too.
   wrap '      - uses: actions/checkout' "$dir/unpinned.yml"
   assert_fails "an unpinned ref (no @) is rejected" bash "$checker" "$dir/unpinned.yml"
+
+  # A docker ref must itself be pinned: a floating `:latest` or a bare image is
+  # rejected, while an @<algo>:<digest> or a version tag passes.
+  wrap '      - uses: docker://ghcr.io/x/y:latest' "$dir/docker-latest.yml"
+  assert_fails "a floating docker ':latest' is rejected" bash "$checker" "$dir/docker-latest.yml"
+
+  wrap '      - uses: docker://alpine' "$dir/docker-bare.yml"
+  assert_fails "a bare docker image (no tag/digest) is rejected" bash "$checker" "$dir/docker-bare.yml"
+
+  wrap '      - uses: docker://ghcr.io/x/y@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' "$dir/docker-digest.yml"
+  assert_succeeds "a docker @sha256 digest is accepted" bash "$checker" "$dir/docker-digest.yml"
+
+  wrap '      - uses: docker://alpine:3.18.4' "$dir/docker-tag.yml"
+  assert_succeeds "a docker version tag is accepted" bash "$checker" "$dir/docker-tag.yml"
 
   # A non-action `uses` field (here an env var literally named `uses`) is NOT an
   # action reference and must NOT be flagged — only job/step/composite `uses` count.

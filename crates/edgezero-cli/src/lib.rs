@@ -211,7 +211,8 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     // project directory. (Staged deploys are never manifest-declared
     // commands, so they always get the flag.)
     if !adapter::has_manifest_command(manifest.as_ref(), &args.adapter, action)
-        && let Some(manifest_path) = resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)
+        && let Some(manifest_path) =
+            resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)?
     {
         passthrough.push("--manifest-path".to_owned());
         passthrough.push(manifest_path);
@@ -373,17 +374,69 @@ fn parse_native_version_mention(output: &str) -> Option<u64> {
 }
 
 /// Resolve the absolute path of the adapter's platform manifest
-/// (`[adapters.<adapter>.adapter].manifest`) relative to the manifest
-/// root. Returns `None` when there is no loaded manifest, no root, no
-/// entry for the adapter, or no `manifest` key. Used by the Fastly
-/// staged deploy to target the operator-selected app in a monorepo.
+/// (`[adapters.<adapter>.adapter].manifest`), CONFINED to the loaded
+/// manifest's own directory. Used by the Fastly staged deploy to target
+/// the operator-selected app in a monorepo.
+///
+/// `Ok(None)` when there is no loaded manifest, no root, no entry for the
+/// adapter, or no `manifest` key (the adapter then does its own cwd
+/// search). The `manifest` value is committed app source, but an absolute
+/// path, a `../` traversal, or a symlink escape would otherwise let a
+/// credential-bearing `fastly compute build/deploy` run against source
+/// OUTSIDE the repository `source-revision` describes and outside the
+/// dirty-source guard — so the resolved target is canonicalized and
+/// required to be a regular file beneath the (canonicalized) manifest
+/// root, and any escape is a hard error.
 #[cfg(feature = "cli")]
-fn resolve_adapter_manifest_path(loader: Option<&ManifestLoader>, adapter: &str) -> Option<String> {
-    let manifest = loader?.manifest();
-    let root = manifest.root()?;
-    let (_canonical, cfg) = manifest.adapter_entry(adapter)?;
-    let rel = cfg.adapter.manifest.as_deref()?;
-    Some(root.join(rel).to_string_lossy().into_owned())
+fn resolve_adapter_manifest_path(
+    loader: Option<&ManifestLoader>,
+    adapter: &str,
+) -> Result<Option<String>, String> {
+    use std::fs;
+    use std::path::Path;
+
+    let Some(manifest) = loader.map(ManifestLoader::manifest) else {
+        return Ok(None);
+    };
+    let (Some(root), Some((_canonical, cfg))) = (manifest.root(), manifest.adapter_entry(adapter))
+    else {
+        return Ok(None);
+    };
+    let Some(rel) = cfg.adapter.manifest.as_deref() else {
+        return Ok(None);
+    };
+    if Path::new(rel).is_absolute() {
+        return Err(format!(
+            "adapter '{adapter}' manifest path {rel:?} must be relative to the manifest, not absolute"
+        ));
+    }
+    let root_real = fs::canonicalize(root).map_err(|err| {
+        format!(
+            "could not resolve the manifest root {}: {err}",
+            root.display()
+        )
+    })?;
+    let candidate = root.join(rel);
+    let candidate_real = fs::canonicalize(&candidate).map_err(|err| {
+        format!(
+            "could not resolve adapter '{adapter}' manifest {}: {err}",
+            candidate.display()
+        )
+    })?;
+    if !candidate_real.starts_with(&root_real) {
+        return Err(format!(
+            "adapter '{adapter}' manifest {} resolves outside the application manifest root {}",
+            candidate_real.display(),
+            root_real.display()
+        ));
+    }
+    if !candidate_real.is_file() {
+        return Err(format!(
+            "adapter '{adapter}' manifest {} is not a regular file",
+            candidate_real.display()
+        ));
+    }
+    Ok(Some(candidate_real.to_string_lossy().into_owned()))
 }
 
 /// Probe a deployed version's health (Fastly staging lifecycle)
@@ -627,6 +680,7 @@ mod tests {
     use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use edgezero_core::manifest::ManifestLoader;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -894,6 +948,91 @@ mod tests {
             adapter: "fastly".to_owned(),
         };
         run_serve(&args).expect("serve command runs");
+    }
+
+    // Write an edgezero.toml declaring an adapter `manifest` and load it, so
+    // `manifest.root()` is set — the confinement is only meaningful for a
+    // file-backed manifest with a real root. Returns the loader so each test can
+    // call `resolve_adapter_manifest_path` and assert on its Result.
+    #[cfg(not(windows))]
+    fn manifest_loader_declaring(dir: &Path, manifest_rel: &str) -> ManifestLoader {
+        let manifest_path = dir.join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\nentry = \"crates/demo-core\"\n\n[adapters.fastly.adapter]\ncrate = \"crates/demo-fastly\"\nmanifest = \"{manifest_rel}\"\n"
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        load_manifest_optional()
+            .expect("load manifest")
+            .expect("manifest present")
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_accepts_an_in_root_file() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        fs::create_dir_all(temp.path().join("crates/demo-fastly")).expect("mkdir");
+        fs::write(temp.path().join("crates/demo-fastly/fastly.toml"), "")
+            .expect("write fastly.toml");
+        let loader = manifest_loader_declaring(temp.path(), "crates/demo-fastly/fastly.toml");
+        let resolved = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect("in-root manifest resolves")
+            .expect("a path is returned");
+        assert!(resolved.ends_with("crates/demo-fastly/fastly.toml"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_rejects_absolute() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let loader = manifest_loader_declaring(temp.path(), "/etc/passwd");
+        let err = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect_err("an absolute manifest path must be rejected");
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_rejects_traversal() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let outside = TempDir::new().expect("outside dir");
+        fs::write(outside.path().join("fastly.toml"), "").expect("write outside fastly.toml");
+        let temp = TempDir::new().expect("temp dir");
+        // A `../` escape to a real file outside the manifest root must fail closed.
+        let rel = format!(
+            "../{}/fastly.toml",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        let loader = manifest_loader_declaring(temp.path(), &rel);
+        let err = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect_err("a traversal manifest path must be rejected");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let outside = TempDir::new().expect("outside dir");
+        fs::write(outside.path().join("fastly.toml"), "").expect("write outside fastly.toml");
+        let temp = TempDir::new().expect("temp dir");
+        // A symlink that points at a file outside the root must not smuggle it in.
+        symlink(
+            outside.path().join("fastly.toml"),
+            temp.path().join("fastly.toml"),
+        )
+        .expect("create symlink");
+        let loader = manifest_loader_declaring(temp.path(), "fastly.toml");
+        let err = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect_err("a symlink escaping the manifest root must be rejected");
+        assert!(err.contains("outside"), "{err}");
     }
 
     #[test]

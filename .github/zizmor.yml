@@ -9,8 +9,10 @@
 # This does NOT permit floating refs: zizmor's `ref-pin` alone would accept a
 # branch, but `check-action-pins.sh` rejects any ref that is not a full commit SHA
 # or a release version tag (so `@main`, `@develop`, `@latest`, etc. all fail). The
-# two gates together mean every `uses:` resolves to an immutable SHA or a released
-# version tag.
+# two gates together mean every `uses:` resolves to a full SHA or a released version
+# tag — a concrete, reviewable ref. Note this is a pinning policy, not immutability:
+# a version tag (a major tag such as `@v4` especially) can still be repointed by the
+# action's publisher. Pin to a full commit SHA where that matters.
 rules:
   unpinned-uses:
     config:

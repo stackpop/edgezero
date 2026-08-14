@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
@@ -145,6 +146,15 @@ const FASTLY_API_TOKEN_ENV: &str = "FASTLY_API_TOKEN";
 /// Env var carrying the default Fastly service id, used when
 /// `--service-id` is not passed explicitly.
 const FASTLY_SERVICE_ID_ENV: &str = "FASTLY_SERVICE_ID";
+
+/// Bound every Fastly API call so an outage or a stalled connection cannot hang the
+/// job — potentially until the surrounding workflow timeout, hours later — during a
+/// time-sensitive operation like a rollback. `curl` exits 28 when either limit is
+/// hit, which `curl_config_capture` turns into an explicit timeout error.
+const FASTLY_API_CONNECT_TIMEOUT_SECS: u64 = 10;
+const FASTLY_API_MAX_TIME_SECS: u64 = 30;
+/// curl's exit code for an operation that exceeded `--connect-timeout`/`--max-time`.
+const CURL_EXIT_TIMEOUT: i32 = 28;
 
 /// Flags `fastly compute update` accepts that take a VALUE (either
 /// `--flag value` or `--flag=value`). Verified against
@@ -1344,11 +1354,24 @@ fn ensure_staging_selector_store(store_name: &str) -> Result<String, String> {
 /// (`production`) with only the config selectors redirected to
 /// `<logical>_staging`.
 ///
-/// Deletes twin entries production no longer has (so a removed override does not
-/// linger and diverge staging from production), then upserts the full desired
-/// set. Runs while the staged draft is still editable, before the relink. When
-/// production has NO override store, `production` is empty and the twin holds
+/// Upserts the full desired set FIRST, then deletes twin entries production no
+/// longer has (so a removed override does not linger and diverge staging from
+/// production). Runs while the staged draft is still editable, before the relink.
+/// When production has NO override store, `production` is empty and the twin holds
 /// only the derived staging selectors — staging is still isolated.
+///
+/// Order matters: this per-service twin can still be LINKED by a previously-staged
+/// version of the same service, which reads it live. Upserting every desired entry
+/// before deleting any stale one means that reader never observes a required
+/// selector transiently absent (which would fall it back to PRODUCTION config), and
+/// a mid-reconciliation failure leaves the twin a superset — never a store missing a
+/// selector. `--upsert` (see `create_config_store_entry`) makes the writes
+/// idempotent, so re-running is safe.
+///
+/// Residual limitation: two *concurrent* staged deploys of the SAME service still
+/// race on this one twin. Serialize them with a per-service concurrency group in
+/// the calling workflow (see the deploy guide's reconcile section); a shared store
+/// cannot make that race safe on its own.
 fn mirror_production_to_staging(
     production: &[(String, String)],
     staging_id: &str,
@@ -1357,14 +1380,14 @@ fn mirror_production_to_staging(
 ) -> Result<(), String> {
     let desired = staging_entries_from_production(production, config_logical_ids);
 
+    for (key, value) in &desired {
+        create_config_store_entry(staging_id, key, value)?;
+    }
     let current = read_config_store_entries(staging_id, cwd)?;
     for (key, _) in &current {
         if !desired.iter().any(|(dk, _)| dk == key) {
             delete_config_store_entry(staging_id, key, cwd)?;
         }
-    }
-    for (key, value) in &desired {
-        create_config_store_entry(staging_id, key, value)?;
     }
     Ok(())
 }
@@ -1847,9 +1870,13 @@ fn require_token() -> Result<String, String> {
         .map_err(|_err| format!("{FASTLY_API_TOKEN_ENV} must be set in the environment"))
 }
 
-/// Whether an HTTP status counts as healthy (2xx/3xx).
+/// Whether an HTTP status counts as healthy (2xx only).
+///
+/// A passing probe gates against an automatic rollback, so a 3xx is deliberately
+/// NOT healthy: a staged version answering `301` to an error page (the probe does
+/// not follow redirects) would otherwise mask a bad deploy as healthy.
 fn is_healthy_status(code: u16) -> bool {
-    (200..400).contains(&code)
+    (200..300).contains(&code)
 }
 
 /// Digits immediately following `marker` in `lower` (a lowercased
@@ -2071,6 +2098,9 @@ fn build_curl_probe_args(
     timeout_secs: u64,
 ) -> Vec<String> {
     let mut args = vec![
+        // `-q` first so curl never merges `~/.curlrc` into a probe (a planted
+        // `proxy`/`output` there could otherwise redirect or corrupt the check).
+        "-q".to_owned(),
         "-sS".to_owned(),
         // Disable curl's URL globbing: a valid probe path may contain `[` `]` `{`
         // `}` (e.g. `/health?ids[0]=1`), which curl would otherwise treat as a
@@ -2085,8 +2115,16 @@ fn build_curl_probe_args(
         timeout_secs.to_string(),
     ];
     if let Some(ip) = staging_ip {
+        // `--connect-to ::HOST:PORT` reroutes the TLS connection to the staging
+        // IP. An IPv6 literal must be bracketed or curl mis-parses the colons;
+        // the caller has already validated `ip` parses as an `IpAddr`.
+        let target = if ip.contains(':') {
+            format!("::[{ip}]:443")
+        } else {
+            format!("::{ip}:443")
+        };
         args.push("--connect-to".to_owned());
-        args.push(format!("::{ip}:443"));
+        args.push(target);
     }
     args.push(format!("https://{domain}{path}"));
     args
@@ -2192,12 +2230,29 @@ fn run_fastly_capture(fastly_args: &[String], cwd: &Path) -> Result<String, Stri
     }
 }
 
-/// Run `curl -sS --config -`, piping `config` (which carries the
+/// Run `curl -q -sS --config -`, piping `config` (which carries the
 /// `Fastly-Key` header + url) through stdin so the token never touches
 /// argv. Returns stdout on a zero exit.
+///
+/// `-q` MUST be the first argument: without it curl reads `~/.curlrc`
+/// (or `$CURL_HOME/.curlrc`) and merges it into this token-bearing
+/// config, so a `proxy = …` directive planted by an earlier same-job
+/// build step could exfiltrate the `Fastly-Key` header. `--connect-timeout`
+/// / `--max-time` bound the call.
 fn curl_config_capture(config: &str) -> Result<String, String> {
+    let connect_timeout = FASTLY_API_CONNECT_TIMEOUT_SECS.to_string();
+    let max_time = FASTLY_API_MAX_TIME_SECS.to_string();
     let mut child = Command::new("curl")
-        .args(["-sS", "--config", "-"])
+        .args([
+            "-q",
+            "-sS",
+            "--connect-timeout",
+            &connect_timeout,
+            "--max-time",
+            &max_time,
+            "--config",
+            "-",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2222,6 +2277,11 @@ fn curl_config_capture(config: &str) -> Result<String, String> {
         .map_err(|err| format!("failed to wait on `curl`: {err}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else if output.status.code() == Some(CURL_EXIT_TIMEOUT) {
+        Err(format!(
+            "`curl` timed out after connect-timeout {FASTLY_API_CONNECT_TIMEOUT_SECS}s / max-time {FASTLY_API_MAX_TIME_SECS}s: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     } else {
         Err(format!(
             "`curl` exited with status {}: {}",
@@ -2689,6 +2749,43 @@ fn active_version_or_require(
     }
 }
 
+/// Require `version` to be the currently ACTIVE service version — the
+/// production healthcheck's version contract.
+///
+/// The production probe hits the live domain, which serves whatever version is
+/// active, so "healthcheck version N" is only a true statement about N while N is
+/// active. `phase` (`before probing` / `after probing`) names when the check ran,
+/// so a version activated by a concurrent deploy is reported clearly rather than
+/// masquerading as a healthy `version`.
+fn verify_version_active(
+    service_id: &str,
+    version: u64,
+    token: &str,
+    phase: &str,
+) -> Result<(), String> {
+    let json = fastly_api_get(&format!("/service/{service_id}/version"), token)?;
+    version_active_verdict(resolve_active_version(&json)?, version, service_id, phase)
+}
+
+/// The pure decision behind [`verify_version_active`], split out so the version
+/// contract is unit-testable without a live Fastly API.
+fn version_active_verdict(
+    active: Option<u64>,
+    version: u64,
+    service_id: &str,
+    phase: &str,
+) -> Result<(), String> {
+    match active {
+        Some(active_version) if active_version == version => Ok(()),
+        Some(active_version) => Err(format!(
+            "production healthcheck version {version} is not active {phase}: service {service_id} currently has version {active_version} active, so the live-domain probe reflects version {active_version}, not {version}"
+        )),
+        None => Err(format!(
+            "production healthcheck version {version} could not be confirmed active {phase}: service {service_id} has no active version"
+        )),
+    }
+}
+
 /// `healthcheck --adapter fastly ...`: probe the domain
 /// (production) or the version's staging IP (`--staging`), retrying up
 /// to `--retry` times. Emits `status-code` / `healthy` and returns
@@ -2700,6 +2797,10 @@ fn active_version_or_require(
 /// empty, so this is the real guard: a production healthcheck must never
 /// probe on behalf of an absent/empty version it never verified — the
 /// caller chains that same version into rollback.
+///
+/// On the PRODUCTION path the probe reaches whatever version is live, so when a
+/// token is available `version` is verified ACTIVE before and after the probe
+/// (see [`verify_version_active`]); without a token the check is service-level.
 fn healthcheck(args: &[String]) -> Result<(), String> {
     let domain =
         arg_value(args, "--domain").ok_or_else(|| "healthcheck requires --domain".to_owned())?;
@@ -2726,24 +2827,62 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
         return Err("healthcheck --timeout must be a positive number of seconds".to_owned());
     }
 
-    let staging_ip = if arg_flag(args, "--staging") {
+    let is_staging = arg_flag(args, "--staging");
+    let staging_ip = if is_staging {
         let token = require_token()?;
         let json = fastly_api_get(
             &format!("/service/{service_id}/version/{version}/domain?include=staging_ips"),
             &token,
         )?;
-        Some(parse_staging_ip(&json).ok_or_else(|| {
+        let ip = parse_staging_ip(&json).ok_or_else(|| {
             format!("no staging IP found for service {service_id} version {version}")
-        })?)
+        })?;
+        // `find_staging_ip` searches the response structurally and could surface a
+        // non-address string; require a real `IpAddr` before it reaches curl's
+        // `--connect-to`, which also settles IPv4-vs-IPv6 formatting.
+        ip.parse::<IpAddr>().map_err(|err| {
+            format!("resolved staging IP {ip:?} is not a valid IP address: {err}")
+        })?;
+        Some(ip)
     } else {
         None
     };
+
+    // Production version contract: the probe hits the live domain, which serves
+    // whatever version is ACTIVE — not necessarily `version`. When a token is
+    // available, require `version` to be active both BEFORE and AFTER the probe, so
+    // a version activated concurrently (by another deploy) cannot be reported as a
+    // healthy `version`. Without a token the production check is inherently
+    // service-level — say so rather than imply a version-specific guarantee. The
+    // staging path already targets the specific version's staging IP, so it needs
+    // no such check.
+    let production_token = if is_staging {
+        None
+    } else {
+        match env::var(FASTLY_API_TOKEN_ENV) {
+            Ok(token) if !token.is_empty() => Some(token),
+            _ => {
+                log::info!(
+                    "no {FASTLY_API_TOKEN_ENV} available; production healthcheck is service-level (probes the live domain for service {service_id}, not specifically version {version})"
+                );
+                None
+            }
+        }
+    };
+    if let Some(token) = production_token.as_deref() {
+        verify_version_active(&service_id, version, token, "before probing")?;
+    }
 
     let curl_args = build_curl_probe_args(domain, path, staging_ip.as_deref(), timeout);
     let delay = Duration::from_secs(retry_delay);
     let outcome = probe_with_retries(retry, || curl_status(&curl_args), || thread::sleep(delay));
     match outcome {
         Ok(code) => {
+            // Confirm `version` is STILL active, so a deploy that activated a newer
+            // version during the probe+retries is not reported as a healthy `version`.
+            if let Some(token) = production_token.as_deref() {
+                verify_version_active(&service_id, version, token, "after probing")?;
+            }
             log::info!("status-code={code}");
             log::info!("healthy=true");
             Ok(())
@@ -3207,11 +3346,28 @@ mod tests {
     }
 
     #[test]
-    fn is_healthy_status_covers_2xx_3xx() {
+    fn version_active_verdict_enforces_the_production_version_contract() {
+        // The requested version is the active one: healthy.
+        version_active_verdict(Some(7), 7, "SVC1", "before probing").expect("match is ok");
+        // A different active version (a concurrent deploy) must fail closed and name
+        // BOTH versions so the mismatch is diagnosable.
+        let err = version_active_verdict(Some(9), 7, "SVC1", "after probing")
+            .expect_err("a newer active version must fail the version contract");
+        assert!(err.contains('7') && err.contains('9'), "{err}");
+        // No active version at all is not a healthy version-7 report either.
+        version_active_verdict(None, 7, "SVC1", "before probing")
+            .expect_err("no active version must fail the contract");
+    }
+
+    #[test]
+    fn is_healthy_status_covers_2xx_only() {
         assert!(is_healthy_status(200));
         assert!(is_healthy_status(204));
-        assert!(is_healthy_status(301));
-        assert!(is_healthy_status(399));
+        assert!(is_healthy_status(299));
+        // 3xx is NOT healthy: the probe does not follow redirects, so a 301 to an
+        // error page must not pass a gate that suppresses an automatic rollback.
+        assert!(!is_healthy_status(301));
+        assert!(!is_healthy_status(399));
         assert!(!is_healthy_status(400));
         assert!(!is_healthy_status(500));
         assert!(!is_healthy_status(199));
@@ -3443,6 +3599,24 @@ mod tests {
             .expect("--connect-to present for staging");
         assert_eq!(args[idx + 1], "::151.101.2.10:443");
         assert!(args.contains(&"https://staging.example.com/".to_owned()));
+    }
+
+    #[test]
+    fn build_curl_probe_args_leads_with_q_to_ignore_curlrc() {
+        // `-q` must be the FIRST argument or curl merges `~/.curlrc` before it.
+        let args = build_curl_probe_args("example.com", "/", None, 10);
+        assert_eq!(args.first().map(String::as_str), Some("-q"));
+    }
+
+    #[test]
+    fn build_curl_probe_args_brackets_ipv6_connect_to() {
+        let args = build_curl_probe_args("staging.example.com", "/", Some("2001:db8::1"), 10);
+        let idx = args
+            .iter()
+            .position(|arg| arg == "--connect-to")
+            .expect("--connect-to present for staging");
+        // An IPv6 literal must be bracketed so curl does not misparse the colons.
+        assert_eq!(args[idx + 1], "::[2001:db8::1]:443");
     }
 
     #[test]

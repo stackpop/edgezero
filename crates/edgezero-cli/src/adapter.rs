@@ -346,11 +346,18 @@ fn tee_stream<R: Read, W: Write>(reader: R, mut writer: W) -> String {
     loop {
         line.clear();
         match buffered.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(_) => {
                 let _echoed = writer.write_all(line.as_bytes());
                 let _flushed = writer.flush();
                 captured.push_str(&line);
+            }
+            // A read error (e.g. a non-UTF-8 byte in the child's output) truncates
+            // both the capture and the operator-visible echo. Log it before
+            // breaking so the truncation is diagnosable rather than silent.
+            Err(err) => {
+                log::warn!("stopped reading child output early: {err}");
+                break;
             }
         }
     }

@@ -2,11 +2,18 @@
 set -euo pipefail
 
 # Verifies every `uses:` reference — across ALL repository workflows and composite
-# action metadata — is pinned to a concrete ref: a released VERSION TAG (e.g.
-# `@v4.3.0`) or a full commit SHA, never a mutable branch/floating ref like `@main`,
-# `@develop`, or `@latest`, or an unpinned reference. A version tag is the repo's
-# chosen policy (see .github/zizmor.yml); a bare branch name is rejected because it
-# moves. Local (`./...`) and docker refs are exempt.
+# action metadata — is pinned to a CONCRETE ref: a released VERSION TAG (a major tag
+# `@v4`, or a fuller `@v4.3.0`) or a full commit SHA, never a mutable branch/floating
+# ref like `@main`, `@develop`, or `@latest`, or an unpinned reference.
+#
+# This does NOT assert immutability. A version tag — a major tag such as `@v4`
+# especially — is repointed by the action's publisher on every release, so it can
+# move under you (the tj-actions/changed-files compromise is exactly this). The gate
+# enforces the repo's version-tag policy (see .github/zizmor.yml) and a concrete,
+# reviewable ref; it rejects refs that move on their own (branches) but not a
+# publisher re-tag. Pin to a full commit SHA where cryptographic immutability
+# matters. Local (`./...`) refs are exempt; a `docker://` ref must itself be pinned —
+# by an `@sha256:` digest or a version tag, never a floating `:latest`/bare image.
 #
 # The `uses` values are extracted STRUCTURALLY with yq, so no YAML spelling — a space
 # before the colon, a quoted or unicode-escaped key, a `!!str`-tagged or multiline
@@ -36,8 +43,14 @@ if [[ "$#" -gt 0 ]]; then
   files=("$@")
 else
   while IFS= read -r found; do files+=("$found"); done < <(
+    # GitHub only reads workflows from .github/workflows (no nesting), so maxdepth 1
+    # is correct there. Composite/local actions, however, can live ANYWHERE in the
+    # repo (e.g. tools/deploy/action.yml), so scan action.yml repo-wide — pruning
+    # build/vendor/VCS trees — rather than only under .github/actions.
     find "$REPO_ROOT/.github/workflows" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null
-    find "$REPO_ROOT/.github/actions" -type f \( -name 'action.yml' -o -name 'action.yaml' \) 2>/dev/null
+    find "$REPO_ROOT" \
+      \( -path '*/.git' -o -name target -o -name node_modules \) -prune -o \
+      -type f \( -name 'action.yml' -o -name 'action.yaml' \) -print 2>/dev/null
   )
 fi
 
@@ -61,7 +74,20 @@ for file in "${files[@]}"; do
   while IFS= read -r ref; do
     [[ -z "$ref" || "$ref" == "null" ]] && continue
     case "$ref" in
-      ./* | docker://*) continue ;;
+      ./*) continue ;;
+      docker://*)
+        # A docker ref is pinned by an `@<algo>:<digest>` (immutable) or a version
+        # tag; a bare image or a floating `:latest` is rejected like a branch ref.
+        docker_ref="${ref#docker://}"
+        if [[ "$docker_ref" == *@*:* ]]; then continue; fi
+        docker_tag="${docker_ref##*:}"
+        if [[ "$docker_ref" == *:* && "$docker_tag" != *"/"* && "$docker_tag" =~ $tag_re ]]; then
+          continue
+        fi
+        echo "::error::docker action ref must be pinned by an @<algo>:<digest> or a version tag (floating ':latest'/bare images are not allowed): '$ref' in $file" >&2
+        status=1
+        continue
+        ;;
     esac
     if [[ "$ref" != *@* ]]; then
       echo "::error::unpinned action reference (no @ref): '$ref' in $file" >&2
