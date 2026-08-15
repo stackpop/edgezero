@@ -49,4 +49,5 @@ walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
+handlebars = { workspace = true }
 tempfile = { workspace = true }

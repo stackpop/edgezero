@@ -48,8 +48,8 @@ pub mod args;
 pub use auth::run_auth;
 #[cfg(feature = "cli")]
 pub use config::{
-    DiffExit, run_config_diff_typed, run_config_push, run_config_push_typed, run_config_validate,
-    run_config_validate_typed,
+    DiffExit, run_config_diff_typed, run_config_gc, run_config_push, run_config_push_typed,
+    run_config_validate, run_config_validate_typed,
 };
 #[cfg(feature = "cli")]
 pub use provision::run_provision;

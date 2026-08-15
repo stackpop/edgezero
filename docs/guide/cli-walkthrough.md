@@ -17,6 +17,8 @@ myapp-cli auth        # sign in / out / status against the platform CLI
 myapp-cli provision   # create the platform resources backing your stores
 myapp-cli config validate  # typed validate of edgezero.toml + myapp.toml
 myapp-cli config push      # typed push of myapp.toml to the platform config store
+myapp-cli config diff      # preview the push: local vs the remote config store
+myapp-cli config gc        # reclaim orphaned chunk entries (Fastly oversized configs)
 ```
 
 The default `edgezero` binary exposes the same commands but has no typed app-config
@@ -106,9 +108,10 @@ Per-adapter behaviour:
   fastly <kind>-store create --name=<platform-name>
   ```
 
-  using the same `<platform-name>` resolution, then appends
-  `[setup.<kind>_stores.<platform-name>]` + `[local_server.<kind>_stores.<platform-name>]`
-  tables to `fastly.toml`. Idempotent on the `[setup.*]` block presence.
+  using the same `<platform-name>` resolution, then appends the
+  `[setup.<kind>_stores.<platform-name>]` table to `fastly.toml`. Provision writes
+  ONLY `[setup.*]`; the `[local_server.*]` seeding is written later by
+  `config push --local` (config stores only). Idempotent on the `[setup.*]` block presence.
 
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
   by the Fermyon stack). For each KV id AND each `[stores.config]` id (both KV-backed

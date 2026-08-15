@@ -1,6 +1,10 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
+// Only compiled where it is actually used (the CLI push/GC path and the Fastly
+// runtime resolver). Gating it keeps a `--no-default-features` build dead-code
+// clean instead of dragging in helpers no feature references.
+#[cfg(any(feature = "cli", feature = "fastly", test))]
 pub(crate) mod chunked_config;
 #[cfg(feature = "cli")]
 pub mod cli;
