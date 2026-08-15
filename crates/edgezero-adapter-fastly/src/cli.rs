@@ -4462,14 +4462,16 @@ fn curl_config_capture(config: &str) -> Result<String, String> {
                 format!("failed to spawn `curl`: {err}")
             }
         })?;
-    let mut stdin = child
+    // Take stdin OUT of the child and hand it to a helper BY VALUE, so it drops at
+    // that helper's scope end — a natural drop rather than an explicit `drop(stdin)`,
+    // which trips `clippy::drop_non_drop` on wasm targets where `ChildStdin` is not
+    // `Drop`. The drop must precede `wait_with_output` so curl sees EOF (same pattern
+    // as `write_value_to_fastly_stdin` on the fastly path).
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| "failed to open stdin pipe to `curl`".to_owned())?;
-    stdin
-        .write_all(config.as_bytes())
-        .map_err(|err| format!("failed to write curl config to stdin: {err}"))?;
-    drop(stdin);
+    write_config_to_curl_stdin(stdin, config)?;
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `curl`: {err}"))?;
@@ -4487,6 +4489,16 @@ fn curl_config_capture(config: &str) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// Write `config` to curl's stdin, taking the handle BY VALUE so it drops at this
+/// function's scope end. That natural drop closes the pipe (curl sees EOF) without
+/// an explicit `drop(stdin)`, which trips `clippy::drop_non_drop` on wasm targets
+/// where `ChildStdin` is not `Drop` (mirrors `write_value_to_fastly_stdin`).
+fn write_config_to_curl_stdin(mut stdin: ChildStdin, config: &str) -> Result<(), String> {
+    stdin
+        .write_all(config.as_bytes())
+        .map_err(|err| format!("failed to write curl config to stdin: {err}"))
 }
 
 /// Wrap `value` in a curl-config double-quoted string, escaping the
