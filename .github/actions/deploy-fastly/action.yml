@@ -114,7 +114,7 @@ runs:
         EDGEZERO__BUILD__CACHE: ${{ inputs.cache }}
         EDGEZERO__BUILD__ARGS: ${{ inputs['build-args'] }}
         EDGEZERO__DEPLOY__ARGS: ${{ inputs['deploy-args'] }}
-        EDGEZERO__DEPLOY__ARG_ALLOW: "--comment"
+        EDGEZERO__DEPLOY__ARG_ALLOW: "--comment="
         # Action-owned (not caller input, not allowlist-checked): keeps a
         # manifest-command deploy from blocking on a TTY prompt in CI. The
         # built-in Fastly deploy path de-duplicates it.
@@ -210,6 +210,7 @@ runs:
         EDGEZERO__PROJECT__TARGET: wasm32-wasip1
         EDGEZERO__BUILD__MODE: ${{ inputs['build-mode'] }}
         EDGEZERO__BUILD__CACHE: ${{ inputs.cache }}
+        EDGEZERO__BUILD__ARGS: ${{ inputs['build-args'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""

@@ -18,10 +18,19 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 # ---------------------------------------------------------------------------
 tests_passed=0
 tests_failed=0
+tests_skipped=0
 
 pass() {
   tests_passed=$((tests_passed + 1))
   printf '  \033[32mok\033[0m   %s\n' "$1"
+}
+
+# A test that could NOT run (non-Linux runner, missing yq, a failed `git init`).
+# Counted and reported SEPARATELY from passes, so a green run that silently skipped
+# whole suites is visible rather than masquerading as full coverage.
+skip() {
+  tests_skipped=$((tests_skipped + 1))
+  printf '  \033[33mskip\033[0m %s\n' "$1"
 }
 
 fail() {
@@ -103,10 +112,21 @@ test_validate_inputs() {
   VALIDATE_CACHE=maybe assert_fails "rejects a non-boolean cache" run_validate_inputs
   VALIDATE_STAGE=true assert_succeeds "accepts stage=true" run_validate_inputs
   VALIDATE_STAGE=True assert_fails "rejects a non-boolean stage (typo -> no silent prod)" run_validate_inputs
-  VALIDATE_DEPLOY_ARGS='["--comment","hi"]' VALIDATE_ALLOW='--comment' \
-    assert_succeeds "allows an allowlisted deploy-arg (--comment)" run_validate_inputs
-  VALIDATE_DEPLOY_ARGS='["--service-id","x"]' VALIDATE_ALLOW='--comment' \
+  VALIDATE_DEPLOY_ARGS='["--comment","hi"]' VALIDATE_ALLOW='--comment=' \
+    assert_succeeds "allows a value-taking allowlisted deploy-arg (--comment value)" run_validate_inputs
+  VALIDATE_DEPLOY_ARGS='["--comment=hi"]' VALIDATE_ALLOW='--comment=' \
+    assert_succeeds "allows the --comment=value form too" run_validate_inputs
+  VALIDATE_DEPLOY_ARGS='["--service-id","x"]' VALIDATE_ALLOW='--comment=' \
     assert_fails "rejects a non-allowlisted deploy-arg (--service-id)" run_validate_inputs
+  # A BOOLEAN allowlisted flag must NOT consume a following token — otherwise the
+  # token rides into the provider argv unchecked. The trailing token is validated on
+  # its own pass and rejected because it is not allowlisted.
+  VALIDATE_DEPLOY_ARGS='["--dry-run","--service-id"]' VALIDATE_ALLOW='--dry-run' \
+    assert_fails "a boolean allowlisted flag does not smuggle the next token" run_validate_inputs
+  VALIDATE_DEPLOY_ARGS='["--dry-run"]' VALIDATE_ALLOW='--dry-run' \
+    assert_succeeds "a bare boolean allowlisted flag is accepted" run_validate_inputs
+  VALIDATE_DEPLOY_ARGS='["--dry-run=x"]' VALIDATE_ALLOW='--dry-run' \
+    assert_fails "a boolean allowlisted flag given a value is rejected" run_validate_inputs
   VALIDATE_DEPLOY_ARGS='"not-an-array"' assert_fails "rejects non-array deploy-args" run_validate_inputs
   VALIDATE_BUILD_ARGS='[1,2]' assert_fails "rejects non-string build-args" run_validate_inputs
 }
@@ -330,7 +350,7 @@ test_download_cli_metadata() {
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64 | Linux-amd64) ;;
     *)
-      pass "download-app-cli metadata (skipped: non-Linux runner)"
+      skip "download-app-cli metadata (non-Linux runner)"
       return
       ;;
   esac
@@ -675,7 +695,7 @@ test_deploy_args_prepend() {
   local out args
   out=$(
     EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__ADAPTER=fastly \
-      EDGEZERO__DEPLOY__ARG_ALLOW="--comment" \
+      EDGEZERO__DEPLOY__ARG_ALLOW="--comment=" \
       EDGEZERO__DEPLOY__ARGS='["--comment","hi"]' \
       EDGEZERO__DEPLOY__ARGS_PREPEND='["--non-interactive"]' \
       "$CORE_SCRIPTS/validate-inputs.sh"
@@ -690,7 +710,7 @@ test_deploy_args_prepend() {
   # A caller still cannot smuggle it in themselves.
   assert_fails "the caller allowlist still rejects --non-interactive from deploy-args" \
     env EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__ADAPTER=fastly \
-    EDGEZERO__DEPLOY__ARG_ALLOW="--comment" \
+    EDGEZERO__DEPLOY__ARG_ALLOW="--comment=" \
     EDGEZERO__DEPLOY__ARGS='["--non-interactive"]' \
     "$CORE_SCRIPTS/validate-inputs.sh"
 }
@@ -841,6 +861,40 @@ test_versions_json_pins_official_release() {
     *) verdict="$sha" ;;
   esac
   assert_equals "versions.json pins a 64-hex SHA-256" "sha256" "$verdict"
+}
+
+# ---------------------------------------------------------------------------
+# install-fastly.sh — the checksum comparison must REJECT a mismatched archive.
+# The fastly-installer-check workflow exercises the POSITIVE path end-to-end
+# against the real release; this pins the NEGATIVE path so inverting or deleting
+# the comparison can no longer leave every job green.
+# ---------------------------------------------------------------------------
+test_install_fastly_checksum() {
+  section "install-fastly checksum verification"
+  # install-fastly.sh guards `require_linux_x86_64`, so it only runs on the Linux
+  # x86-64 runner (CI's fastly-installer-check job is one).
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64 | Linux-amd64) ;;
+    *)
+      skip "install-fastly checksum negative (non-Linux runner)"
+      return
+      ;;
+  esac
+  local dir="$WORK_DIR/install-fastly"
+  mkdir -p "$dir"
+  printf '#!/bin/sh\necho fake\n' >"$dir/fastly"
+  tar -C "$dir" -czf "$dir/fastly.tar.gz" fastly
+  printf 'fastly 15.1.0\n' >"$dir/.tool-versions"
+  # A versions.json whose pinned sha256 does NOT match the (file://-served) archive
+  # must fail with a checksum-mismatch error and never extract/install.
+  cat >"$dir/versions-bad.json" <<JSON
+{"fastly":{"version":"15.1.0","linux_amd64":{"url":"file://$dir/fastly.tar.gz","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}}
+JSON
+  assert_fails_with "a Fastly CLI checksum mismatch is rejected (never installed)" \
+    "checksum mismatch" \
+    env EDGEZERO__ACTION__ROOT="$dir" EDGEZERO__FASTLY__VERSIONS_JSON="$dir/versions-bad.json" \
+    EDGEZERO__ACTION__TOOL_ROOT="$dir/tools" RUNNER_TEMP="$dir" \
+    bash "$ACTIONS_DIR/deploy-fastly/scripts/install-fastly.sh"
 }
 
 test_clear_provider_env_aliases() {
@@ -1011,7 +1065,10 @@ test_toolchain_boundary() {
   local ws="$WORK_DIR/tc-workspace"
   mkdir -p "$ws/app"
   printf 'rust 1.60.0\n' >"$ws/.tool-versions"
-  git -C "$ws/app" init -q 2>/dev/null || return 0
+  git -C "$ws/app" init -q 2>/dev/null || {
+    skip "toolchain search boundary (git init unavailable)"
+    return 0
+  }
   printf 'rust 1.95.0\n' >"$ws/app/.tool-versions"
 
   local resolved
@@ -1329,7 +1386,10 @@ test_dirty_source_guard() {
   section "dirty-source guard"
   local repo="$WORK_DIR/dirty-src"
   mkdir -p "$repo"
-  git -C "$repo" init -q 2>/dev/null || return 0
+  git -C "$repo" init -q 2>/dev/null || {
+    skip "dirty-source guard (git init unavailable)"
+    return 0
+  }
   git -C "$repo" config user.email t@t.invalid
   git -C "$repo" config user.name t
   echo one >"$repo/file.txt"
@@ -1378,6 +1438,7 @@ cache_key_for() {
     EDGEZERO__PROJECT__TARGET="${CK_TARGET:-wasm32-wasip1}" \
     EDGEZERO__APP__CLI__VERSION="${CK_CLI_VERSION:-1.0.0}" \
     EDGEZERO__BUILD__CACHE="${CK_CACHE:-false}" \
+    EDGEZERO__BUILD__ARGS="${CK_BUILD_ARGS:-}" \
     bash "$CORE_SCRIPTS/resolve-project.sh" >/dev/null 2>&1 || return $?
   grep -oE '^cache-key=.*$' "$out" | tail -n 1 | cut -d= -f2-
 }
@@ -1394,7 +1455,10 @@ edition = "2021"
 TOML
   echo 'fn main() {}' >"$ws/app/src/main.rs"
   printf 'version = 3\n' >"$ws/app/Cargo.lock"
-  git -C "$ws" init -q 2>/dev/null || return 0
+  git -C "$ws" init -q 2>/dev/null || {
+    skip "cache key (git init unavailable)"
+    return 0
+  }
   git -C "$ws" config user.email t@t.invalid
   git -C "$ws" config user.name t
   git -C "$ws" add -A && git -C "$ws" commit -qm init
@@ -1413,6 +1477,10 @@ TOML
     bash -c "[[ '$(CK_TARGET=wasm32-unknown-unknown cache_key_for)' == '$base' ]]"
   assert_fails "a different app-CLI version changes the key" \
     bash -c "[[ '$(CK_CLI_VERSION=2.0.0 cache_key_for)' == '$base' ]]"
+  # Different build-args (e.g. --features) build different target/ contents, so they
+  # must not share a key.
+  assert_fails "different build-args change the key" \
+    bash -c "[[ '$(CK_BUILD_ARGS='--features extra' cache_key_for)' == '$base' ]]"
 
   # Nested workspaces at the SAME revision with identical lockfiles/toolchains must
   # NOT collide: a second workspace at a different path gets a different key.
@@ -1560,7 +1628,10 @@ test_app_repo_boundary() {
   section "app repository boundary"
   local ok="$WORK_DIR/bnd-ok"
   mkdir -p "$ok"
-  git -C "$ok" init -q 2>/dev/null || return 0
+  git -C "$ok" init -q 2>/dev/null || {
+    skip "app repository boundary (git init unavailable)"
+    return 0
+  }
   rm -rf "$ok"
   mkdir -p "$ok"
   make_boundary_fixture "$ok" independent
@@ -1823,7 +1894,7 @@ test_action_pin_gate() {
   # The gate parses YAML structurally with yq, so it needs yq to run. Skip locally
   # when yq is absent (CI's static-checks job has it and enforces there).
   if ! command -v yq >/dev/null 2>&1; then
-    printf '  (skipped: yq not installed)\n'
+    skip "action pin gate (yq not installed)"
     return 0
   fi
   local checker="$ACTIONS_DIR/deploy-core/tests/check-action-pins.sh"
@@ -2030,7 +2101,7 @@ test_healthcheck_path() {
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64 | Linux-amd64) ;;
     *)
-      pass "healthcheck path threading (skipped: non-Linux runner)"
+      skip "healthcheck path threading (non-Linux runner)"
       return
       ;;
   esac
@@ -2100,7 +2171,7 @@ test_mutation_attempted_signal() {
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64 | Linux-amd64) ;;
     *)
-      pass "rollback mutation-attempted signal (skipped: non-Linux runner)"
+      skip "rollback mutation-attempted signal (non-Linux runner)"
       return
       ;;
   esac
@@ -2368,6 +2439,7 @@ main() {
   test_lifecycle_helpers
   test_capture_previous
   test_versions_json_pins_official_release
+  test_install_fastly_checksum
   test_clear_provider_env_aliases
   test_toolchain_boundary
   test_config_push_argv
@@ -2386,7 +2458,7 @@ main() {
   test_action_public_surface
   test_action_pin_gate
 
-  printf '\nPassed: %d  Failed: %d\n' "$tests_passed" "$tests_failed"
+  printf '\nPassed: %d  Failed: %d  Skipped: %d\n' "$tests_passed" "$tests_failed" "$tests_skipped"
   [[ "$tests_failed" -eq 0 ]]
 }
 

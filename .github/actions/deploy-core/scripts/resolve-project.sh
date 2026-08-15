@@ -16,6 +16,8 @@ set -euo pipefail
 #   EDGEZERO__BUILD__MODE                 optional  auto | always | never (default: auto)
 #   EDGEZERO__BUILD__CACHE                optional  true | false (default: false)
 #   EDGEZERO__APP__CLI__VERSION           optional  folded into the cache key (default: unknown)
+#   EDGEZERO__BUILD__ARGS                 optional  raw build passthrough, folded into the cache key
+#   RUNNER_OS / RUNNER_ARCH               optional  cache-key namespace (default: Linux / X64)
 # Writes (outputs):
 #   working-directory                     resolved absolute app directory
 #   working-directory-relative            app directory relative to the workspace
@@ -113,6 +115,7 @@ main() {
   local target="${EDGEZERO__PROJECT__TARGET:?EDGEZERO__PROJECT__TARGET is required (wrapper-provided concrete target)}"
   local cache="${EDGEZERO__BUILD__CACHE:-false}"
   local cli_version="${EDGEZERO__APP__CLI__VERSION:-unknown}"
+  local build_args="${EDGEZERO__BUILD__ARGS:-}"
 
   require_cmd git
   require_cmd cargo
@@ -130,7 +133,7 @@ main() {
   # separate-repository layout the deployer repo IS the workspace, so a manifest
   # like `../deployer/edgezero.toml` would be "inside github.workspace" yet come
   # from a different repository than the source-revision we report.
-  local git_root source_revision
+  local git_root
   git_root=$(git -C "$app_dir" rev-parse --show-toplevel 2>/dev/null || true)
   [[ -n "$git_root" ]] || fail "working-directory '$app_rel' is not inside a Git repository"
   git_root=$(canonical_path "$git_root")
@@ -203,10 +206,22 @@ main() {
   cargo_ws_rel="${cargo_ws_rel#/}"
   cargo_ws_id=$(sha256_string "$cargo_ws_rel")
 
-  local rust_toolchain effective_build_mode cache_key
+  local rust_toolchain effective_build_mode cache_key build_args_id
   rust_toolchain=$(resolve_rust_toolchain "$rust_toolchain_input" "$app_dir" "$git_root" "$action_root")
+  # Shape-check the resolved toolchain: it reaches `rustup toolchain install`,
+  # `cargo +<tc>`, a third-party action input, and the cache key, and it is the only
+  # free-form repo-sourced string here. Require a channel/version token — no leading
+  # '-' that `cargo +` would read as an option, no whitespace or shell metacharacters
+  # (e.g. a checked-in `rust-toolchain` of `--profile complete`).
+  [[ "$rust_toolchain" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] ||
+    fail "resolved Rust toolchain '$rust_toolchain' is not a valid channel/version token (letters, digits, '.', '_', '+', '-'; not starting with '-')"
   effective_build_mode=$(resolve_effective_build_mode "${EDGEZERO__BUILD__MODE:-auto}")
-  cache_key="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$rust_toolchain")-$(sanitize_ref "$target")-$(sanitize_ref "$cli_version")-${cargo_ws_id}-${source_revision}-${lock_hash}"
+  # Fold build-args into the cache key: two invocations at the same revision with
+  # different `--features` build DIFFERENT target/ contents, so they must not share a
+  # key (the first writer would otherwise win for the key's life). HASH the raw args
+  # so any change busts the key.
+  build_args_id=$(sha256_string "$build_args")
+  cache_key="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$rust_toolchain")-$(sanitize_ref "$target")-$(sanitize_ref "$cli_version")-${cargo_ws_id}-${build_args_id}-${source_revision}-${lock_hash}"
 
   append_output working-directory "$app_dir"
   append_output working-directory-relative "$app_rel"

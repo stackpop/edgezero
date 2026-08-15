@@ -15,6 +15,9 @@ set -euo pipefail
 #   EDGEZERO__PROJECT__RUST_TOOLCHAIN     optional  explicit toolchain or "auto" (default: "auto")
 #   EDGEZERO__APP__CLI__ARTIFACT          optional  uploaded artifact name (default: "edgezero-cli")
 #   RUNNER_TEMP                           optional  action-owned scratch root (default: /tmp)
+#   EDGEZERO__PROVIDER__ENV_CLEAR         optional  JSON array of provider aliases to scrub before the build (default: [])
+#   EDGEZERO__ACTION__WORKSPACE           optional  per-invocation scratch root (default: mktemp under RUNNER_TEMP)
+#   EDGEZERO__ACTION__OUTPUT_FILE         optional  outputs handoff file, started fresh (default: GITHUB_OUTPUT)
 # Writes (outputs):
 #   app-cli-package                       the package that was built
 #   app-cli-bin                           the binary name inside the artifact
@@ -40,7 +43,16 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   if [[ "${1:-}" == "$PROVIDER_ENV_CLEARED_SENTINEL" ]]; then
     shift
   else
-    exec_with_cleared_provider_env "${EDGEZERO__PROVIDER__ENV_CLEAR:-[]}" \
+    # An EXPLICITLY blank `provider-env-clear` fails closed rather than silently
+    # degrading to `[]` (scrub nothing). GitHub lets an empty input override the
+    # action default, and `${VAR:-[]}` would mask that as "no aliases" — so a caller
+    # who blanked the input by mistake would ship their own provider aliases into the
+    # build. `${VAR-[]}` defaults ONLY when UNSET; a set-but-blank value is rejected.
+    # Pass a literal `[]` to intentionally scrub nothing.
+    provider_env_clear_input="${EDGEZERO__PROVIDER__ENV_CLEAR-[]}"
+    [[ -n "${provider_env_clear_input//[[:space:]]/}" ]] ||
+      fail "input 'provider-env-clear' must be a JSON array; an empty value is rejected (pass '[]' to scrub nothing on purpose)"
+    exec_with_cleared_provider_env "$provider_env_clear_input" \
       "$0" "$PROVIDER_ENV_CLEARED_SENTINEL" "$@"
   fi
 fi
@@ -223,11 +235,11 @@ main() {
   # workspace encloses the app dir, so an enclosing deployer workspace would
   # otherwise control the deps of a CLI built from the app's source — the same
   # boundary violation as the package check below, but for the whole build.
-  local workspace_root workspace_real
+  local workspace_root cargo_ws_real
   workspace_root=$(jq -r '.workspace_root' <<<"$metadata")
-  workspace_real=$(canonical_path "$workspace_root")
-  is_under "$app_boundary" "$workspace_real" ||
-    fail "the Cargo workspace root ($workspace_real) is outside the application at $app_boundary; an enclosing workspace would control the lockfile and dependencies the CLI is built from"
+  cargo_ws_real=$(canonical_path "$workspace_root")
+  is_under "$app_boundary" "$cargo_ws_real" ||
+    fail "the Cargo workspace root ($cargo_ws_real) is outside the application at $app_boundary; an enclosing workspace would control the lockfile and dependencies the CLI is built from"
 
   # The package must live inside the APPLICATION's repository.
   #

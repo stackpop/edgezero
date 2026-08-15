@@ -55,8 +55,12 @@ parse_json_string_array() {
   printf '%s' "$value" | jq -jr '.[] | ., "\u0000"' >"$out_file"
 }
 
-# Enforce the wrapper's deploy-arg allowlist. Each permitted flag accepts either
-# `--flag=value` (one token) or `--flag value` (two tokens).
+# Enforce the wrapper's deploy-arg allowlist. Each permitted entry is a flag NAME;
+# a VALUE-TAKING flag is marked with a trailing `=` (e.g. `--comment=`), a BOOLEAN
+# flag is written bare (e.g. `--dry-run`). This distinction matters: a value-taking
+# flag given as `--flag value` consumes the next token, but a boolean flag must NOT —
+# otherwise adding a boolean to the allowlist would let `--boolflag <anything>` smuggle
+# an unchecked arbitrary token straight into the provider argv.
 enforce_deploy_arg_allowlist() {
   local args_file="$1" allow_list="$2"
   local -a permitted=()
@@ -69,16 +73,25 @@ enforce_deploy_arg_allowlist() {
       expecting_value=false
       continue
     fi
-    local flag="${arg%%=*}" matched=false candidate
+    local flag="${arg%%=*}" matched=false takes_value=false candidate name
     for candidate in "${permitted[@]}"; do
-      if [[ "$flag" == "$candidate" ]]; then
+      name="${candidate%=}"
+      if [[ "$flag" == "$name" ]]; then
         matched=true
-        [[ "$arg" == *=* ]] || expecting_value=true
+        [[ "$candidate" == *= ]] && takes_value=true
         break
       fi
     done
     [[ "$matched" == "true" ]] ||
-      fail "deploy-args allows only: ${allow_list:-<none>} (as '--flag value' or '--flag=value'); rejected argument $position"
+      fail "deploy-args allows only: ${allow_list:-<none>}; rejected argument $position"
+    # A boolean flag must not be given a value; a value-taking flag given as
+    # `--flag value` (no '=') consumes exactly the next token, and nothing else can.
+    if [[ "$takes_value" == "false" && "$arg" == *=* ]]; then
+      fail "deploy-arg '$flag' takes no value but was given '$arg' (argument $position)"
+    fi
+    if [[ "$takes_value" == "true" && "$arg" != *=* ]]; then
+      expecting_value=true
+    fi
   done <"$args_file"
   [[ "$expecting_value" == "false" ]] || fail "a value-taking deploy-arg flag is missing its value"
 }
@@ -109,6 +122,14 @@ main() {
     true | false) ;;
     *) fail "input 'stage' must be exactly 'true' or 'false'" ;;
   esac
+
+  # Warn on a cache that will silently do nothing: the target/ cache is populated and
+  # restored only for `build-mode: always` (the credential-free seed build), and
+  # `auto`/`never` skip that build. So `cache: true` without `build-mode: always` is a
+  # no-op — surface it rather than let the user believe caching is on.
+  if [[ "$cache" == "true" && "$build_mode" != "always" ]]; then
+    printf '::warning::cache: true has no effect with build-mode: %s — target/ caching only runs for build-mode: always\n' "$build_mode" >&2
+  fi
 
   require_cmd jq
 

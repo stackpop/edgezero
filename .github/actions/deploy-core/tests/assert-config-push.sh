@@ -15,6 +15,10 @@ set -euo pipefail
 #   EDGEZERO__TEST__PUSHED_STORE  required  the action's store output
 #   EDGEZERO__TEST__REJECT_KEY    optional  a key that must NOT appear in the log
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../scripts/common.sh
+source "$SCRIPT_DIR/../scripts/common.sh"
+
 log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
 expect_key="${EDGEZERO__TEST__EXPECT_KEY:?EDGEZERO__TEST__EXPECT_KEY is required}"
 pushed_key="${EDGEZERO__TEST__PUSHED_KEY:-}"
@@ -23,11 +27,6 @@ reject_key="${EDGEZERO__TEST__REJECT_KEY:-}"
 
 echo "--- recorded fastly calls:"
 cat "$log" || true
-
-fail() {
-  echo "::error::$1"
-  exit 1
-}
 
 # The action's own output must name the key it wrote.
 [[ "$pushed_key" == "$expect_key" ]] ||

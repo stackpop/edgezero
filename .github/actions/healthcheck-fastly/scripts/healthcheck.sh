@@ -71,8 +71,17 @@ main() {
 
   # `healthcheck` is manifest-independent (a pure API/curl probe), so it runs
   # from wherever the step is — no app-directory resolution needed.
+  #
+  # Resolve the CLI on its OWN line, not inside the array literal: `local argv=(
+  # "$(resolve_app_cli)" … )` exits 0 even when the substitution fails (`local`
+  # masks it), so a failed `:?`-guarded resolve would be swallowed and the array
+  # would run with an empty argv[0]. Assign then `require_cmd` so a resolve failure
+  # stops the step here (matching the other lifecycle scripts).
+  local cli_bin
+  cli_bin=$(resolve_app_cli)
+  require_cmd "$cli_bin"
   local argv=(
-    "$(resolve_app_cli)" healthcheck
+    "$cli_bin" healthcheck
     --adapter fastly
     --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID"
     --version "$EDGEZERO__LIFECYCLE__VERSION"

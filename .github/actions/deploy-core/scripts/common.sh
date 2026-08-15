@@ -215,7 +215,12 @@ require_linux_x86_64() {
 # Sets the global LIFECYCLE_LOG. Callers must have `set -euo pipefail`.
 LIFECYCLE_LOG=""
 new_private_log() {
-  local dir="${RUNNER_TEMP:-/tmp}"
+  # Prefer the per-invocation action workspace: cleanup.sh removes it wholesale, so
+  # the (possibly provider-output-bearing) log dies with it even if this EXIT trap
+  # never fires — e.g. a SIGKILL after a cancellation grace period, which no trap and
+  # no chmod 600 survives. Fall back to RUNNER_TEMP for a direct/test run that mints
+  # no workspace. The EXIT trap remains the primary, immediate cleanup.
+  local dir="${EDGEZERO__ACTION__WORKSPACE:-${RUNNER_TEMP:-/tmp}}"
   LIFECYCLE_LOG=$(mktemp "$dir/edgezero-lifecycle.XXXXXX")
   chmod 600 "$LIFECYCLE_LOG"
   # shellcheck disable=SC2064  # expand LIFECYCLE_LOG now, not at trap time
