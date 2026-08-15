@@ -47,25 +47,26 @@ main() {
     fail_with "$rc" "deploy failed (CLI exit $rc or setup error before invocation)"
   fi
 
-  # The deploy must emit EXACTLY ONE canonical `version=<digits>` line. Mirror the
-  # rollback-target capture (capture-previous.sh) rather than taking the LAST line:
-  # `fastly-version` is threaded straight into healthcheck (`--version`) and rollback
-  # (`--version`), so a non-conforming app CLI that printed a spurious `version=`
-  # line before the authoritative one could otherwise thread a version that was never
-  # deployed. A missing, duplicated, or malformed line fails CLOSED.
-  local version_lines version_count version
-  version_lines=$(grep -E '^version=' "$LIFECYCLE_LOG" || true)
-  version_count=$(printf '%s' "$version_lines" | grep -c . || true)
-  if [[ "$version_count" -eq 0 ]]; then
+  # Require exactly one DISTINCT well-formed `version=<digits>` value — stricter than
+  # last-wins, but tolerant of the version legitimately appearing more than once. The
+  # app CLI tees the provider output (which can itself carry a `version=` line) BEFORE
+  # it emits its own canonical `version=<N>`, so a conforming deploy routinely prints
+  # the SAME version twice. Benign duplicates collapse to one value; two DIFFERENT
+  # versions are genuine ambiguity and fail CLOSED rather than threading a version that
+  # was never deployed into healthcheck (`--version`) / rollback (`--version`). A
+  # malformed value never matches the anchored pattern, so a missing/unparseable line
+  # also fails closed. (Non-conforming producers are the exact case capture-previous.sh
+  # guards; here duplicates are expected, so we key on the distinct set, not the count.)
+  local version_values distinct version
+  version_values=$(grep -oE '^version=[0-9]+$' "$LIFECYCLE_LOG" | sort -u || true)
+  distinct=$(printf '%s' "$version_values" | grep -c . || true)
+  if [[ "$distinct" -eq 0 ]]; then
     fail "deploy reported success but emitted no canonical 'version=<digits>' line, so there is no version to thread into healthcheck or rollback"
   fi
-  if [[ "$version_count" -gt 1 ]]; then
-    fail "deploy emitted $version_count 'version=' lines; exactly one is required. Refusing to guess which version was deployed. Lines: $(printf '%s' "$version_lines" | tr '\n' ' ')"
+  if [[ "$distinct" -gt 1 ]]; then
+    fail "deploy emitted conflicting version values ($(printf '%s' "$version_values" | tr '\n' ' ')); refusing to guess which version was deployed"
   fi
-  if [[ ! "$version_lines" =~ ^version=([0-9]+)$ ]]; then
-    fail "deploy emitted a malformed version line '$version_lines'; expected 'version=<N>'. Refusing to thread an unparseable version into healthcheck or rollback"
-  fi
-  version="${BASH_REMATCH[1]}"
+  version="${version_values#version=}"
 
   append_output fastly-version "$version"
 }

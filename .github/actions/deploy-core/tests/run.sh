@@ -2362,6 +2362,23 @@ CLI
   assert_fails "a deploy that never reaches the CLI fails" run_deploy nonexistent-bin
   assert_fails "a deploy that never reaches the CLI does NOT signal mutation-attempted" \
     grep -qx 'mutation-attempted=true' "$dir/out"
+
+  # Version parse: the app CLI tees the provider output BEFORE its canonical line, so
+  # a conforming deploy routinely prints the SAME `version=` twice. Benign duplicates
+  # must resolve to that one value; two DIFFERENT versions must fail closed.
+  printf '#!/usr/bin/env bash\necho "version=42"\necho "Deployed package (service x, version 42)"\necho "version=42"\n' >"$dir/bin/dup-cli"
+  chmod +x "$dir/bin/dup-cli"
+  : >"$dir/out"
+  assert_succeeds "a deploy that prints the same version twice succeeds" run_deploy dup-cli
+  assert_succeeds "duplicate identical version lines resolve to the one value" \
+    grep -qx 'fastly-version=42' "$dir/out"
+
+  printf '#!/usr/bin/env bash\necho "version=42"\necho "version=43"\n' >"$dir/bin/conflict-cli"
+  chmod +x "$dir/bin/conflict-cli"
+  : >"$dir/out"
+  assert_fails "conflicting version values fail closed" run_deploy conflict-cli
+  assert_fails "no fastly-version is threaded on a conflicting deploy" \
+    grep -q '^fastly-version=' "$dir/out"
 }
 
 test_recovery_version_parse() {
