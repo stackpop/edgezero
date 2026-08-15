@@ -99,7 +99,7 @@ run_validate_inputs() {
     EDGEZERO__DEPLOY__FLAGS="${VALIDATE_DEPLOY_FLAGS:-[]}" \
     EDGEZERO__PROVIDER__ENV_CLEAR="${VALIDATE_PROVIDER_ENV_CLEAR:-[]}" \
     EDGEZERO__DEPLOY__ARG_ALLOW="${VALIDATE_ALLOW:-}" \
-    EDGEZERO__DEPLOY__STAGE="${VALIDATE_STAGE:-false}" \
+    EDGEZERO__DEPLOY__TO="${VALIDATE_DEPLOY_TO:-production}" \
     EDGEZERO__ACTION__STATE_DIR="$state_dir" \
     GITHUB_OUTPUT="$state_dir/output.txt" \
     bash "$CORE_SCRIPTS/validate-inputs.sh"
@@ -110,8 +110,9 @@ test_validate_inputs() {
   VALIDATE_ADAPTER=fastly assert_succeeds "accepts a well-formed adapter" run_validate_inputs
   VALIDATE_ADAPTER=FASTLY assert_fails "rejects a malformed adapter" run_validate_inputs
   VALIDATE_CACHE=maybe assert_fails "rejects a non-boolean cache" run_validate_inputs
-  VALIDATE_STAGE=true assert_succeeds "accepts stage=true" run_validate_inputs
-  VALIDATE_STAGE=True assert_fails "rejects a non-boolean stage (typo -> no silent prod)" run_validate_inputs
+  VALIDATE_DEPLOY_TO=staging assert_succeeds "accepts deploy-to=staging" run_validate_inputs
+  VALIDATE_DEPLOY_TO=production assert_succeeds "accepts deploy-to=production" run_validate_inputs
+  VALIDATE_DEPLOY_TO=Staging assert_fails "rejects a misspelled deploy-to (typo -> no silent prod)" run_validate_inputs
   VALIDATE_DEPLOY_ARGS='["--comment","hi"]' VALIDATE_ALLOW='--comment=' \
     assert_succeeds "allows a value-taking allowlisted deploy-arg (--comment value)" run_validate_inputs
   VALIDATE_DEPLOY_ARGS='["--comment=hi"]' VALIDATE_ALLOW='--comment=' \
@@ -1762,7 +1763,7 @@ test_action_output_contracts() {
 # <default>` for every input (default = `none` when absent, else the normalized
 # default VALUE — the scalar as written, or the joined content of a folded/literal
 # block), then `out <name>` for every output — all sorted. Pins names, required
-# flags, AND default values, so a flip like `stage: false` -> `true` is caught.
+# flags, AND default values, so a flip like `deploy-to: production` -> `staging` is caught.
 parse_action_surface() {
   awk '
     function trim(s){ sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
@@ -1794,7 +1795,7 @@ test_action_public_surface() {
   # inputs HAVE descriptions and env keys are unique; test_action_output_contracts
   # only checks output->script wiring. Neither pins the SET of input/output names,
   # their required flags, or their DEFAULT VALUES — so a renamed input, a removed
-  # output, an added input, or a flipped default (e.g. `stage: false` -> `true`,
+  # output, an added input, or a flipped default (e.g.
   # `deploy-to: production` -> `staging`) would pass silently. This asserts the
   # exact documented surface, default values included. Every required input carries
   # no default; every optional input carries one.
@@ -1821,11 +1822,11 @@ in build-args false "[]"
 in build-mode false auto
 in cache false "false"
 in deploy-args false "[]"
+in deploy-to false production
 in fastly-api-token true none
 in fastly-service-id true none
 in manifest false ""
 in rust-toolchain false auto
-in stage false "false"
 in working-directory false .
 out app-cli-version
 out fastly-version

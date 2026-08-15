@@ -15,7 +15,7 @@ Composable actions:
 - `build-app-cli` — compile the CLI package the application provides (a crate in the
   app's own workspace) once, publish it as an artifact;
 - `deploy-fastly` — deploy a checked-out Fastly application using the prebuilt
-  CLI artifact, to production or (with `stage: true`) a staged draft version;
+  CLI artifact, to production or (with `deploy-to: staging`) a staged draft version;
 - `healthcheck-fastly` / `rollback-fastly` — the Fastly staging lifecycle (§4);
 - `config-push-fastly` — push the application's typed config to a Fastly config
   store (the production key, or the `_staging` twin), from a checked-out file or
@@ -202,7 +202,7 @@ steps:
 For Fastly, staging deploy, health checks, and rollback are supported as a
 provider-specific trio, scaffolded into the CLI and exposed through your app CLI:
 
-- `deploy-fastly` with `stage: true` — deploy to a **staged** draft version
+- `deploy-fastly` with `deploy-to: staging` — deploy to a **staged** draft version
   (Fastly `service-version stage`) instead of activating production; outputs
   `fastly-version`.
 - `healthcheck-fastly` — verify a version; for staging it resolves the Fastly
@@ -274,7 +274,7 @@ Workflow shape:
 3. run `build-app-cli` with `app-cli-package: <trusted-server-cli-crate>` and
    `working-directory: trusted-server` (Trusted Server's own CLI package, whose
    `Cargo.toml` already pins the Fastly adapter);
-4. run `deploy-fastly` (set `stage: true` for staging) with the CLI artifact,
+4. run `deploy-fastly` (set `deploy-to: staging` for a staged draft) with the CLI artifact,
    `working-directory: trusted-server`, typed Fastly credentials, and optional
    `deploy-args: ["--comment", …]`; capture `fastly-version` and, for a
    production deploy, `previous-version` (the rollback target). If the deploy step
@@ -338,6 +338,7 @@ Workflow shape:
 
 - `daily-deploy.yml` appears to stage but health-check/rollback production by
   default. Decide whether the scheduled workflow is production or staging and set
-  `deploy-to` / `stage` consistently before migration.
+  `deploy-to` consistently (one verb across deploy/config-push/healthcheck/rollback)
+  before migration.
 - The old action targets `IABTechLab/trusted-server`; verify the actual
   deployment refs before switching.

@@ -20,7 +20,7 @@ Implement the layered deploy actions in the EdgeZero monorepo:
 `build-app-cli` compiles the app-provided CLI package once and publishes it as an
 artifact. `deploy-core` is the adapter-independent deploy engine that consumes
 the prebuilt CLI. `deploy-fastly` is a minimal wrapper that types Fastly
-credentials and calls the engine, with an optional `stage` mode. `healthcheck-fastly`
+credentials and calls the engine, with an optional `deploy-to: staging` mode. `healthcheck-fastly`
 and `rollback-fastly` are thin Fastly-specific wrappers for the staging lifecycle
 (§5.4). Provider orchestration (build, deploy, config push, provision, stage,
 healthcheck, rollback) stays in the CLI.
@@ -168,10 +168,10 @@ reference to port from. Most transfer with light changes:
    - Typed inputs: `app-cli-artifact`, `app-cli-bin`, `fastly-api-token`,
      `fastly-service-id`, plus forwarded `working-directory`, `manifest`,
      `rust-toolchain`, `build-mode`, `build-args`, `deploy-args`, `cache`, and
-     `stage` (§5.4).
+     `deploy-to` (§5.4).
    - Map `fastly-api-token` → `provider-env: {FASTLY_API_TOKEN: …}` and
      `fastly-service-id` → action-owned `deploy-flags: ["--service-id", …]` (typed
-     flags, placed BEFORE `--`); when `stage: true`, add `--staging`.
+     flags, placed BEFORE `--`); when `deploy-to: staging`, add `--staging`.
      `--non-interactive` is NOT a deploy-flag — the engine adds it as a deploy-args
      PREPEND (after `--`, ahead of caller `deploy-args`), and rejects it if a
      caller passes it in `deploy-args`.
@@ -264,7 +264,7 @@ reference to port from. Most transfer with light changes:
      (no `pip`).
    - Port the metadata-validation heredocs into `tests/run.sh`.
    - Composite smoke test: `build-app-cli` → `deploy-fastly` (both production and
-     `stage: true`) → `healthcheck-fastly` → `rollback-fastly`. Fake each action's
+     `deploy-to: staging`) → `healthcheck-fastly` → `rollback-fastly`. Fake each action's
      real dependency: a fake `fastly` binary (marker files + printed version) for
      `deploy-fastly`; a fake app CLI or stubbed Fastly API/`curl` responses for
      `healthcheck-fastly`/`rollback-fastly` (they call the API, not `fastly`).

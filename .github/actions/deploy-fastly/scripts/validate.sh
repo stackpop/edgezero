@@ -31,7 +31,8 @@ main() {
   require_input_matching fastly-service-id "${EDGEZERO__FASTLY__SERVICE_ID:-}" '^[A-Za-z0-9_-]+$'
 
   # Provider-neutral validation (adapter, booleans, JSON-array args, the
-  # allowlist). It also rejects a non-boolean 'stage' before any deploy.
+  # allowlist). It also rejects a 'deploy-to' that is neither production nor
+  # staging before any deploy (a typo must never silently reach production).
   "$SCRIPT_DIR/../../deploy-core/scripts/validate-inputs.sh"
 }
 

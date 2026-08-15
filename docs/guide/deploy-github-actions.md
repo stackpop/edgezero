@@ -330,7 +330,7 @@ out of the build's job entirely, or scope it to the one step that needs it.
 | `build-mode`        | No       | `auto`        | `auto` (→ `never` for Fastly), `always`, or `never`.                                                                                                                       |
 | `build-args`        | No       | `[]`          | JSON array passed to `<cli> build`. No secrets.                                                                                                                            |
 | `deploy-args`       | No       | `[]`          | JSON array — allowlisted to `--comment` for Fastly. No secrets.                                                                                                            |
-| `stage`             | No       | `false`       | Deploy to a staged draft version instead of activating.                                                                                                                    |
+| `deploy-to`         | No       | `production`  | `production` activates the deployed version; `staging` produces a staged draft version instead. Same verb as config-push/healthcheck/rollback and the CLI's `--staging`.   |
 | `cache`             | No       | `false`       | Exact-key Cargo-workspace `target/` caching. Takes effect with `build-mode: always` (the credential-free build seeds the cache; the token-bearing deploy is never cached). |
 
 Outputs: `fastly-version`, `source-revision`, `app-cli-version`,
@@ -585,14 +585,13 @@ production.
 
 ## Strict lifecycle values (fail closed)
 
-`stage` and `deploy-to` are validated exactly, and a bad value **fails the run**
-rather than falling back to production:
+`deploy-to` is validated exactly across every action, and a bad value **fails the
+run** rather than falling back to production:
 
-- `stage` must be exactly `true` or `false`.
 - `deploy-to` must be exactly `production` or `staging`.
 
-A typo like `stage: True` or `deploy-to: Staging` is rejected up front — it will
-never silently deploy to, probe, or roll back production.
+A typo like `deploy-to: Staging` is rejected up front — it will never silently
+deploy to, probe, or roll back production.
 
 ## Credentials
 
@@ -628,7 +627,7 @@ carry no orchestration policy of their own.
   uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
     app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    stage: true
+    deploy-to: staging
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
@@ -653,7 +652,7 @@ carry no orchestration policy of their own.
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
-- `deploy-fastly` with `stage: true` clones the active version, uploads the built
+- `deploy-fastly` with `deploy-to: staging` clones the active version, uploads the built
   package to a new draft, marks it staged, and outputs `fastly-version`.
 - `healthcheck-fastly` resolves the staged version's Fastly staging IP and probes
   it, retrying and exiting non-zero when unhealthy.

@@ -471,7 +471,7 @@ jobs:
         run: .github/actions/deploy-core/tests/assert-config-push.sh
 
   # Staging path: the full lifecycle through the REAL wrappers — deploy-fastly
-  # with `stage: true`, then healthcheck-fastly, then rollback-fastly — against
+  # with `deploy-to: staging`, then healthcheck-fastly, then rollback-fastly — against
   # fake `fastly`/`curl` binaries that mirror the real contracts.
   #
   # The version is never hard-coded: it is threaded out of the deploy action's
@@ -523,7 +523,7 @@ jobs:
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
           deploy-args: '["--comment","staged smoke"]'
-          stage: true
+          deploy-to: staging
 
       - name: Assert the staged Fastly call sequence
         env:

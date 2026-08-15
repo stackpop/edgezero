@@ -310,7 +310,7 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 | `build-mode`        | No       | `auto`        | Forwarded. Fastly `auto` resolves to `never`.                                                                                                                                |
 | `build-args`        | No       | `[]`          | Forwarded to the engine.                                                                                                                                                     |
 | `deploy-args`       | No       | `[]`          | Forwarded. Allowlisted to `--comment` for Fastly (§9).                                                                                                                       |
-| `stage`             | No       | `false`       | When `true`, deploy to a **staged** draft version instead of activating production (§5.4).                                                                                   |
+| `deploy-to`         | No       | `production`  | `production` activates the deployed version; `staging` produces a **staged** draft version instead (§5.4). One consistent verb with config-push/healthcheck/rollback.        |
 | `cache`             | No       | `false`       | Forwarded to the engine.                                                                                                                                                     |
 
 **`deploy-fastly` outputs**
@@ -330,7 +330,7 @@ unintended service, plus an action-owned `--non-interactive` deploy-args PREPEND
 (after `--`) so a manifest-command deploy cannot block on a CI prompt, and
 `provider-env-clear: ["FASTLY_API_TOKEN", "FASTLY_SERVICE_ID", "FASTLY_ENDPOINT",
 "FASTLY_CARGO_PROFILE", …]` so the engine clears Fastly auth/endpoint aliases
-without the engine itself knowing Fastly's names. When `stage: true` it adds
+without the engine itself knowing Fastly's names. When `deploy-to: staging` it adds
 `--staging` to the deploy flags (§5.4).
 
 ### 5.4 Fastly staging lifecycle (`deploy-fastly` stage mode, `healthcheck-fastly`, `rollback-fastly`)
@@ -377,7 +377,7 @@ a previous version (§5.4.3), the caller threads `previous-version` into
 
 #### 5.4.3 The three actions
 
-- **`deploy-fastly` (`stage: true`)** — runs
+- **`deploy-fastly` (`deploy-to: staging`)** — runs
   `<cli> deploy --adapter fastly --service-id <id> --staging` (the wrapper injects
   `--service-id` via `deploy-flags`); outputs `fastly-version` (the staged
   draft). Reuses the engine for build/source/credential scoping; only the
@@ -430,7 +430,7 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
   uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
     app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    stage: true
+    deploy-to: staging
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
@@ -1066,7 +1066,7 @@ Fastly wrapper:
   present only in the provider-calling steps: deploy and the Fastly lifecycle
   steps such as rollback-target capture);
 - cache key construction and missing-lockfile failure;
-- staging lifecycle: `stage` flag adds `--staging`; `fastly-version` parsed from CLI
+- staging lifecycle: `deploy-to: staging` adds `--staging`; `fastly-version` parsed from CLI
   output; `healthcheck-fastly` / `rollback-fastly` pass `--service-id` + version
   and scope `FASTLY_API_TOKEN`; healthcheck exits non-zero on unhealthy; staging
   vs production argv;
@@ -1079,7 +1079,7 @@ Tests must not need live provider credentials.
 
 A workflow exercises the layered actions end to end with a minimal fixture
 EdgeZero app: run `build-app-cli`, then `deploy-fastly` (both production and
-`stage: true`), then `healthcheck-fastly` and `rollback-fastly`. Fake the
+`deploy-to: staging`), then `healthcheck-fastly` and `rollback-fastly`. Fake the
 dependencies each action actually uses:
 
 - for `deploy-fastly`, a fake `fastly` binary that writes marker files and prints
@@ -1142,7 +1142,7 @@ The design is implemented when:
 9. All CI, tooling, and tests run without Python; `actionlint` and `zizmor` run
    from pinned release binaries.
 10. Third-party actions are pinned to readable released tags.
-11. Fastly staging lifecycle works end to end: `deploy-fastly` `stage: true`
+11. Fastly staging lifecycle works end to end: `deploy-fastly` `deploy-to: staging`
     stages a draft and outputs `fastly-version`; `healthcheck-fastly` probes the
     staged version (via its staging IP, the one probe that needs the token) and
     exits non-zero when unhealthy;

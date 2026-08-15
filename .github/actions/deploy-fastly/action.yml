@@ -39,10 +39,10 @@ inputs:
     description: JSON array of Fastly --comment passthrough args (allowlisted).
     required: false
     default: "[]"
-  stage:
-    description: When true, deploy to a staged draft version instead of activating production.
+  deploy-to:
+    description: "'production' activates the deployed version; 'staging' produces a staged draft version instead. One consistent verb across the actions (matches config-push/healthcheck/rollback and the CLI's --staging)."
     required: false
-    default: "false"
+    default: production
   cache:
     description: Enable exact-key Cargo workspace target/ caching.
     required: false
@@ -119,8 +119,8 @@ runs:
         # manifest-command deploy from blocking on a TTY prompt in CI. The
         # built-in Fastly deploy path de-duplicates it.
         EDGEZERO__DEPLOY__ARGS_PREPEND: '["--non-interactive"]'
-        EDGEZERO__DEPLOY__STAGE: ${{ inputs.stage }}
-        EDGEZERO__DEPLOY__FLAGS: ${{ inputs.stage == 'true' && format('["--service-id","{0}","--staging"]', inputs['fastly-service-id']) || format('["--service-id","{0}"]', inputs['fastly-service-id']) }}
+        EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
+        EDGEZERO__DEPLOY__FLAGS: ${{ inputs['deploy-to'] == 'staging' && format('["--service-id","{0}","--staging"]', inputs['fastly-service-id']) || format('["--service-id","{0}"]', inputs['fastly-service-id']) }}
         EDGEZERO__PROVIDER__ENV_CLEAR: '["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_CARGO_PROFILE","FASTLY_HOME"]'
         EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
         EDGEZERO__FASTLY__API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
@@ -386,7 +386,7 @@ runs:
     # deactivates the staged version; there is nothing to activate back to).
     - name: Capture rollback target
       id: capture
-      if: ${{ inputs.stage != 'true' }}
+      if: ${{ inputs['deploy-to'] != 'staging' }}
       shell: bash
       env:
         # BASH_ENV/ENV are sourced at bash startup — BEFORE this step's script can

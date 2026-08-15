@@ -12,7 +12,7 @@ set -euo pipefail
 #   EDGEZERO__RUNNER__ARCH                required  runner arch guard (X64)
 #   EDGEZERO__BUILD__MODE                 optional  auto | always | never (default: auto)
 #   EDGEZERO__BUILD__CACHE                optional  true | false (default: false)
-#   EDGEZERO__DEPLOY__STAGE               optional  true | false (default: false)
+#   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__BUILD__ARGS                 optional  JSON string array (default: [])
 #   EDGEZERO__DEPLOY__ARGS                optional  caller JSON string array (default: [])
 #   EDGEZERO__DEPLOY__ARGS_PREPEND        optional  action-owned JSON array, prepended (default: [])
@@ -100,7 +100,7 @@ main() {
   local adapter="${EDGEZERO__ADAPTER:-}"
   local build_mode="${EDGEZERO__BUILD__MODE:-auto}"
   local cache="${EDGEZERO__BUILD__CACHE:-false}"
-  local stage="${EDGEZERO__DEPLOY__STAGE:-false}"
+  local deploy_to="${EDGEZERO__DEPLOY__TO:-production}"
   local deploy_arg_allow="${EDGEZERO__DEPLOY__ARG_ALLOW:-}"
 
   require_supported_runner "${EDGEZERO__RUNNER__OS:-}" "${EDGEZERO__RUNNER__ARCH:-}"
@@ -117,10 +117,12 @@ main() {
     true | false) ;;
     *) fail "input 'cache' must be exactly 'true' or 'false'" ;;
   esac
-  # A typo here must never silently fall back to a production deploy.
-  case "$stage" in
-    true | false) ;;
-    *) fail "input 'stage' must be exactly 'true' or 'false'" ;;
+  # A typo here must never silently fall back to a production deploy: the wrapper
+  # derives `--staging` only for exactly `staging`, so any other value would deploy
+  # to production. Reject anything that is not one of the two known targets.
+  case "$deploy_to" in
+    production | staging) ;;
+    *) fail "input 'deploy-to' must be exactly 'production' or 'staging'" ;;
   esac
 
   # Warn on a cache that will silently do nothing: the target/ cache is populated and
