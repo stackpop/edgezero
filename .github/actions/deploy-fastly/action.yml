@@ -394,6 +394,9 @@ runs:
         # in scope. Blank them in the token-bearing step itself, not only the ws step.
         BASH_ENV: ""
         ENV: ""
+        # Mint the sensitive lifecycle log under the per-invocation workspace so the
+        # Cleanup step removes it wholesale even if the in-process EXIT trap cannot fire.
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
@@ -424,6 +427,9 @@ runs:
         # blank them so a caller's job env cannot run code here with the token.
         BASH_ENV: ""
         ENV: ""
+        # Mint the sensitive lifecycle log under the per-invocation workspace so the
+        # Cleanup step removes it wholesale even if the in-process EXIT trap cannot fire.
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
         EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__ADAPTER: fastly

@@ -275,8 +275,8 @@ reference to port from. Most transfer with light changes:
    - Cover engine + wrappers: adapter/boolean/JSON validation, path confinement,
      symlink escape, dirty source, toolchain precedence, cache keys, credential
      scoping, deploy-arg allowlist, build/deploy argv, cleanup, log redaction,
-     metadata contract checks, and the staging lifecycle (stage flag, version
-     output parsing, healthcheck/rollback argv, staging vs production paths).
+     metadata contract checks, and the staging lifecycle (`deploy-to` selection,
+     version output parsing, healthcheck/rollback argv, staging vs production paths).
    - No Python; no live provider credentials.
 
 9. **Companion CLI scaffolding (`crates/edgezero-cli`, `edgezero-adapter-fastly`)**

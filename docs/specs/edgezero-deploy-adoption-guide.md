@@ -260,11 +260,11 @@ deployer must handle itself are: internal checkout, `trusted-server-ref`,
 
 Map the legacy trio onto the EdgeZero staging trio:
 
-| Legacy action                              | EdgeZero replacement                               |
-| ------------------------------------------ | -------------------------------------------------- |
-| `fastly/deploy@v2` (with `fastly-staging`) | `build-app-cli` + `deploy-fastly` (`stage:` input) |
-| `fastly/healthcheck@v2`                    | `healthcheck-fastly`                               |
-| `fastly/rollback@v2`                       | `rollback-fastly`                                  |
+| Legacy action                              | EdgeZero replacement                                     |
+| ------------------------------------------ | -------------------------------------------------------- |
+| `fastly/deploy@v2` (with `fastly-staging`) | `build-app-cli` + `deploy-fastly` (`deploy-to: staging`) |
+| `fastly/healthcheck@v2`                    | `healthcheck-fastly`                                     |
+| `fastly/rollback@v2`                       | `rollback-fastly`                                        |
 
 Workflow shape:
 

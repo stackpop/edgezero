@@ -47,22 +47,28 @@ main() {
     fail_with "$rc" "deploy failed (CLI exit $rc or setup error before invocation)"
   fi
 
-  # Require exactly one DISTINCT well-formed `version=<digits>` value — stricter than
-  # last-wins, but tolerant of the version legitimately appearing more than once. The
-  # app CLI tees the provider output (which can itself carry a `version=` line) BEFORE
-  # it emits its own canonical `version=<N>`, so a conforming deploy routinely prints
-  # the SAME version twice. Benign duplicates collapse to one value; two DIFFERENT
-  # versions are genuine ambiguity and fail CLOSED rather than threading a version that
-  # was never deployed into healthcheck (`--version`) / rollback (`--version`). A
-  # malformed value never matches the anchored pattern, so a missing/unparseable line
-  # also fails closed. (Non-conforming producers are the exact case capture-previous.sh
-  # guards; here duplicates are expected, so we key on the distinct set, not the count.)
-  local version_values distinct version
-  version_values=$(grep -oE '^version=[0-9]+$' "$LIFECYCLE_LOG" | sort -u || true)
-  distinct=$(printf '%s' "$version_values" | grep -c . || true)
-  if [[ "$distinct" -eq 0 ]]; then
+  # Resolve the deployed version, tolerant of it legitimately appearing more than
+  # once (the app CLI tees the provider output — which can itself carry a `version=`
+  # line — BEFORE emitting its own canonical `version=<N>`), but FAIL CLOSED on any
+  # broken contract:
+  #   1. EVERY `^version=` line must be well-formed `version=<digits>`. A malformed
+  #      line (`version=43x`, empty `version=`) fails closed even when a SIBLING line
+  #      is valid — dropping the malformed one and trusting the rest would let a
+  #      corrupt contract slip a wrong version through.
+  #   2. Then the well-formed lines must agree on ONE distinct value. Benign
+  #      duplicates collapse; two DIFFERENT versions are genuine ambiguity and fail.
+  #   3. No `version=` line at all is a missing contract.
+  local all_lines malformed version_values distinct version
+  all_lines=$(grep -E '^version=' "$LIFECYCLE_LOG" || true)
+  if [[ -z "$all_lines" ]]; then
     fail "deploy reported success but emitted no canonical 'version=<digits>' line, so there is no version to thread into healthcheck or rollback"
   fi
+  malformed=$(printf '%s\n' "$all_lines" | grep -vE '^version=[0-9]+$' || true)
+  if [[ -n "$malformed" ]]; then
+    fail "deploy emitted a malformed 'version=' line ($(printf '%s' "$malformed" | tr '\n' ' ')); expected 'version=<N>'. Refusing to thread an unparseable version into healthcheck or rollback"
+  fi
+  version_values=$(printf '%s\n' "$all_lines" | sort -u)
+  distinct=$(printf '%s\n' "$version_values" | grep -c . || true)
   if [[ "$distinct" -gt 1 ]]; then
     fail "deploy emitted conflicting version values ($(printf '%s' "$version_values" | tr '\n' ' ')); refusing to guess which version was deployed"
   fi

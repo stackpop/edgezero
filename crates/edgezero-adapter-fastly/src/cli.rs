@@ -3358,15 +3358,31 @@ fn read_config_store_entries(store_id: &str, cwd: &Path) -> Result<Vec<(String, 
         ],
         cwd,
     )?;
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
-        format!("failed to parse `fastly config-store-entry list --json` JSON: {err}\nraw stdout: {stdout}")
+    parse_config_store_entries(&stdout)
+}
+
+/// Parse the `config-store-entry list --json` payload into `(key, value)` pairs.
+///
+/// Split out from the CLI call so it is unit-testable — and, critically, so every
+/// error path REDACTS the payload. The listing carries every entry's `item_value`,
+/// which may be production config or secrets, and CLI status lines are logged
+/// verbatim into commonly-retained CI logs. So a schema-drift / parse error must
+/// summarise the response (size + top-level shape via `redact_describe_response`),
+/// never echo the raw stdout.
+fn parse_config_store_entries(stdout: &str) -> Result<Vec<(String, String)>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(stdout).map_err(|err| {
+        format!(
+            "failed to parse `fastly config-store-entry list --json` JSON: {err} ({})",
+            redact_describe_response(stdout)
+        )
     })?;
     let array = parsed
         .as_array()
         .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))
         .ok_or_else(|| {
             format!(
-                "`fastly config-store-entry list --json` output is neither a bare array nor an `items` envelope; fastly CLI may have changed its schema. Raw stdout: {stdout}"
+                "`fastly config-store-entry list --json` output is neither a bare array nor an `items` envelope ({}); fastly CLI may have changed its schema",
+                redact_describe_response(stdout)
             )
         })?;
     let mut entries = Vec::with_capacity(array.len());
@@ -3385,7 +3401,8 @@ fn read_config_store_entries(store_id: &str, cwd: &Path) -> Result<Vec<(String, 
             }
             _ => {
                 return Err(format!(
-                    "a `fastly config-store-entry list --json` entry has no string `item_key`/`item_value` fields; fastly CLI may have changed its schema. Raw stdout: {stdout}"
+                    "a `fastly config-store-entry list --json` entry has no string `item_key`/`item_value` fields ({}); fastly CLI may have changed its schema",
+                    redact_describe_response(stdout)
                 ));
             }
         }
@@ -5778,6 +5795,57 @@ mod tests {
         assert_eq!(
             parse_staging_ip(r#"[{"name": "example.com", "staging_ip": null}]"#),
             None
+        );
+    }
+
+    #[test]
+    fn parse_config_store_entries_reads_key_value_pairs() {
+        let entries = parse_config_store_entries(
+            r#"[{"item_key":"A","item_value":"1"},{"item_key":"B","item_value":"2"}]"#,
+        )
+        .expect("well-formed listing parses");
+        assert_eq!(
+            entries,
+            vec![
+                ("A".to_owned(), "1".to_owned()),
+                ("B".to_owned(), "2".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_config_store_entries_errors_never_leak_the_value() {
+        // The listing carries every entry's item_value (possibly a production secret),
+        // and CLI status lines are logged verbatim into retained CI logs — so no error
+        // path may echo the payload. A sentinel secret must NEVER appear in any error.
+        const SECRET: &str = "s3cr3t-sentinel-value";
+
+        // 1. Malformed JSON.
+        let malformed_json = parse_config_store_entries(&format!("not json {SECRET}"))
+            .expect_err("malformed JSON must error");
+        assert!(
+            !malformed_json.contains(SECRET),
+            "malformed-JSON error leaked the value: {malformed_json}"
+        );
+
+        // 2. Schema drift: valid JSON that is neither a bare array nor an `items`
+        //    envelope (here an object whose VALUE is the secret).
+        let drift = parse_config_store_entries(&format!(r#"{{"unexpected":"{SECRET}"}}"#))
+            .expect_err("schema drift must error");
+        assert!(
+            !drift.contains(SECRET),
+            "schema-drift error leaked the value: {drift}"
+        );
+
+        // 3. Malformed entry: a valid array where an entry lacks item_key/item_value,
+        //    while a SIBLING entry carries the secret in its value.
+        let bad_entry = parse_config_store_entries(&format!(
+            r#"[{{"item_key":"ok","item_value":"{SECRET}"}},{{"item_key":"bad"}}]"#
+        ))
+        .expect_err("a malformed entry must error");
+        assert!(
+            !bad_entry.contains(SECRET),
+            "malformed-entry error leaked the value: {bad_entry}"
         );
     }
 

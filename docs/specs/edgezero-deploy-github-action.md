@@ -95,10 +95,12 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
    `zizmor`). No `python3` heredocs and no `pip install`.
 9. **Pin third-party actions.** Every third-party `uses:` — in the repository's own
    _workflows_ and nested _inside a reusable action_ (`build-app-cli`,
-   `deploy-fastly`, …) — is pinned to a concrete, immutable-or-released reference: a
-   full commit SHA or an exact released version tag (for example
-   `actions/checkout@v4` or `actions-rust-lang/setup-rust-toolchain@v1.17.0`). A
-   moving major alias (`@v4`) is discouraged and a branch/floating ref
+   `deploy-fastly`, …) — is pinned to a concrete, reviewable reference: a full commit
+   SHA or a released version tag, **including a movable major tag** (for example
+   `actions/checkout@v7` or `actions-rust-lang/setup-rust-toolchain@v1`). This is a
+   pinning policy, not an immutability guarantee: a version tag — a major tag such as
+   `@v4` especially — can be repointed by the action's publisher, so pin to a full
+   commit SHA where cryptographic immutability matters. A branch/floating ref
    (`@main`, `@develop`, `@latest`) is rejected. `check-action-pins.sh` is the
    repository-wide gate: it parses every workflow and action's YAML STRUCTURALLY
    (via `yq`, so a quoted, unicode-escaped, `!!str`-tagged, or multiline-scalar
@@ -597,6 +599,10 @@ probe it, roll back on failure.
 ## 6. Execution flow (engine)
 
 1. Verify the runner is Linux x86-64 (`ubuntu-latest` is the tested environment).
+   Self-hosted runners additionally require **Actions Runner 2.327.1+** — the
+   wrappers use Node 24 actions (`download-artifact@v8`, `cache@v6`,
+   `upload-artifact@v7`, `checkout@v7`), whose runtime ships only in that runner
+   release. This is a runner prerequisite, not something the engine enforces.
 2. Validate that `adapter` is a well-formed, non-empty token. The engine does
    **not** enumerate the CLI's compiled adapters (there is no introspection
    command); an unsupported adapter surfaces as the CLI's own error at build or

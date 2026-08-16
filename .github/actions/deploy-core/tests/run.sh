@@ -2379,6 +2379,15 @@ CLI
   assert_fails "conflicting version values fail closed" run_deploy conflict-cli
   assert_fails "no fastly-version is threaded on a conflicting deploy" \
     grep -q '^fastly-version=' "$dir/out"
+
+  # A malformed `version=` line must fail closed even BESIDE a valid one — the
+  # malformed line must be rejected before the valid values are deduplicated.
+  printf '#!/usr/bin/env bash\necho "version=42"\necho "version=43x"\n' >"$dir/bin/malformed-cli"
+  chmod +x "$dir/bin/malformed-cli"
+  : >"$dir/out"
+  assert_fails "a malformed version line fails closed even beside a valid one" run_deploy malformed-cli
+  assert_fails "no fastly-version is threaded when any version line is malformed" \
+    grep -q '^fastly-version=' "$dir/out"
 }
 
 test_recovery_version_parse() {

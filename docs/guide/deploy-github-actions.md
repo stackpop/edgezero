@@ -23,7 +23,12 @@ this page is the practical how-to.
 Under the hood a private `deploy-core` engine (a set of shared scripts) holds all
 provider-neutral behavior; the wrappers above are thin.
 
-**Runner support:** Linux x86-64 only (`ubuntu-latest` is tested).
+**Runner support:** Linux x86-64 only (`ubuntu-latest` is tested). On **self-hosted**
+runners you must run **Actions Runner 2.327.1 or newer**: these actions use
+Node 24 dependencies (`actions/download-artifact@v8`, `actions/cache@v6`,
+`actions/upload-artifact@v7`, `actions/checkout@v7`), and the Node 24 runtime they
+require ships only in runner 2.327.1+. Hosted runners already meet this; older
+self-hosted runners fail to launch the actions.
 
 ## What you provide
 
