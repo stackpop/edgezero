@@ -1,28 +1,16 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::io::{ErrorKind, Write as _};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 
 use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
 
-use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value};
+use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value_typed};
 
-use super::{ConfigStoreLookup, FASTLY_INSTALL_HINT};
-
-/// Detect an AUTHENTICATION / CONFIGURATION failure in a (lowercased)
-/// provider error, so a message like "API key not found" or "profile not
-/// found" is NOT misread as an absent store/key (which would let a diff
-/// report everything as added, or a chunk read silently drop data). These
-/// markers name credentials/permissions/config, never a missing resource.
-fn is_provider_auth_or_config_error(lower: &str) -> bool {
-    lower.contains("api key")
-        || lower.contains("api-key")
-        || lower.contains("token")
-        || lower.contains("credential")
-        || lower.contains("unauthor") // unauthorized / unauthorised
-        || lower.contains("forbidden")
-        || lower.contains("403")
-        || lower.contains("permission")
-        || lower.contains("profile")
-}
+use super::{
+    ConfigStoreLookup, FASTLY_INSTALL_HINT, classify_resolved_read, expand_root,
+    reject_duplicate_root_keys, reject_generated_key_collisions, reject_reserved_root_keys,
+};
 
 /// Cloud-mode `push_config_entries`: resolve the platform config-store
 /// id via `fastly config-store list --json`, then shell out per
@@ -47,21 +35,23 @@ pub(super) fn write_entries(
             "no config entries to push to fastly config-store `{name}` (logical id `{logical}`)"
         )]);
     }
-    // Expand each logical (key, envelope_json) into physical entries
-    // via the chunk-pointer helper. Entries ≤ 8 000 chars go through
-    // as a single direct entry; larger envelopes are split into
-    // content-addressed chunks with a root pointer written LAST.
-    // Collect all physical entries before any writes so pointer-too-
-    // large errors surface before touching the remote store.
+    // Reject reserved keys before any expansion or I/O.
+    reject_reserved_root_keys(entries)?;
+    reject_duplicate_root_keys(entries)?;
+    // Expand each logical root into its physical entries (chunks + pointer, or
+    // a single direct entry). Collecting them all first surfaces a
+    // pointer-too-large error before touching the remote store. A cloud push
+    // does NOT reclaim, so — unlike the local path — it keeps no per-root
+    // keep-set / root-value GC bookkeeping.
     let mut physical_entries: Vec<(String, String)> = Vec::new();
     for (key, body) in entries {
-        let expanded = prepare_fastly_config_entries(key, body)?;
+        let (expanded, ..) = expand_root(key, body)?;
         physical_entries.extend(expanded);
     }
     if dry_run {
-        // Report intent without shelling out. One line per logical key
-        // noting whether it would be direct or chunked, plus chunk count.
-        let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+        // Report intent without shelling out. Stays fully offline: no
+        // store-id resolution, no remote read (so no GC count).
+        let mut out = Vec::with_capacity(entries.len().saturating_mul(2).saturating_add(1));
         out.push(format!(
             "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and push entries:"
         ));
@@ -83,7 +73,19 @@ pub(super) fn write_entries(
         }
         return Ok(out);
     }
-    let resolved_id = resolve_remote_config_store_id(name)?;
+    let resolved_id =
+        resolve_remote_config_store_id(name)?.ok_or_else(|| no_matching_store_error(name))?;
+    // A cloud push does NOT reclaim orphaned chunks: Fastly's config store is
+    // eventually consistent and records no pointer-supersession time, so
+    // reclamation is the explicit, operator-invoked `config gc`.
+    //
+    // Preflight: refuse if a generated chunk key would clobber an existing
+    // root-like sibling in the remote store. Uses a completeness-strict key
+    // listing (value-tolerant) and describes only the rare colliding keys.
+    let remote_keys = list_config_store_keys(&resolved_id)?;
+    reject_generated_key_collisions(&physical_entries, &remote_keys, |chunk_key| {
+        fetch_remote_config_store_entry(&resolved_id, chunk_key).map(Some)
+    })?;
     push_entries_with_committer(&physical_entries, |key, value| {
         create_config_store_entry(&resolved_id, key, value)
     })?;
@@ -99,39 +101,12 @@ pub(super) fn write_entries(
 /// then resolve chunk pointers via the same store when needed.
 pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfigEntry, String> {
     let name = store.platform.as_str();
-    let store_id = match resolve_remote_config_store_id(name) {
-        Ok(id) => id,
-        Err(err) => {
-            let lower = err.to_ascii_lowercase();
-            // The CLI-absent error (`fastly` not found on PATH) also
-            // contains "not found"; exclude it FIRST so a missing `fastly`
-            // binary propagates as a real error rather than being silently
-            // reported as a missing store -- otherwise a diff would claim
-            // "store absent" when the operator simply hasn't installed the
-            // fastly CLI.
-            if lower.contains("not found on path") {
-                return Err(err);
-            }
-            // A genuinely absent store is signalled by resolve's own store
-            // markers, or by a not-found phrase that specifically mentions
-            // the config store. A BARE "not found" is NOT enough -- an
-            // unrelated failure like "profile not found" would otherwise be
-            // misreported as a missing store, and a diff would then claim
-            // everything was added. Match the SPACED "config store" phrase
-            // only: the hyphenated "config-store" appears in the command
-            // name inside every error string and would over-match.
-            let mentions_store = lower.contains("config store");
-            let not_found = lower.contains("not found")
-                || lower.contains("does not exist")
-                || lower.contains("404");
-            if lower.contains("did you run")
-                || lower.contains("no fastly config-store matches")
-                || (mentions_store && not_found)
-            {
-                return Ok(ReadConfigEntry::MissingStore);
-            }
-            return Err(err);
-        }
+    // A TYPED absence: `Ok(None)` (list succeeded, no store matched) is the
+    // only path to MissingStore. Any operational failure stays `Err` and fails
+    // closed -- an incomplete read must never read as absence and authorise an
+    // overwrite of healthy remote state.
+    let Some(store_id) = resolve_remote_config_store_id(name)? else {
+        return Ok(ReadConfigEntry::MissingStore);
     };
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
@@ -152,11 +127,13 @@ pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfi
             }
         })?;
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = strict_stdout(output.stdout, "config-store-entry describe --json")?;
         // Parse the JSON and extract the `item_value` field.
-        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
             format!(
-                "failed to parse `fastly config-store-entry describe` JSON: {err}\nraw stdout: {stdout}"
+                "failed to parse `fastly config-store-entry describe` JSON (parse error \
+                 redacted; response: {})",
+                redact_describe_response(&stdout)
             )
         })?;
         let value = parsed
@@ -165,34 +142,50 @@ pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfi
             .ok_or_else(|| {
                 format!(
                     "`fastly config-store-entry describe` JSON has no string `item_value` field; \
-                     fastly CLI may have changed its output schema. Raw stdout: {stdout}"
+                     fastly CLI may have changed its output schema. (response: {})",
+                    redact_describe_response(&stdout)
                 )
             })?;
-        // Resolve chunk pointers: if `value` is a direct BlobEnvelope it
-        // passes through unchanged; if it is a chunk pointer the chunks
-        // are fetched from the same store and reconstructed.
-        let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
-            fetch_remote_config_store_entry(&store_id, chunk_key)
-        })?;
-        return Ok(ReadConfigEntry::Present(resolved));
+        // Resolve chunk pointers. A chunk describe that fails could not be FULLY
+        // read; confirm whether the chunk is genuinely ABSENT against the
+        // complete store listing (authoritative), never the describe 404.
+        let store_keys: RefCell<Option<Result<HashSet<String>, String>>> = RefCell::new(None);
+        let fetch_failed: Cell<bool> = Cell::new(false);
+        let resolved = resolve_fastly_config_value_typed(key, value.to_owned(), |chunk_key| {
+            match fetch_remote_config_store_entry(&store_id, chunk_key) {
+                Ok(found) => Ok(Some(found)),
+                Err(_describe_err) => {
+                    match confirm_key_absent_cached(&store_keys, &store_id, chunk_key) {
+                        Ok(true) => Ok(None), // genuinely gone → repairable Corrupt
+                        Ok(false) => {
+                            fetch_failed.set(true);
+                            Err("a referenced chunk is present in the store but its value \
+                                 could not be read (incomplete read)"
+                                .to_owned())
+                        }
+                        Err(list_err) => {
+                            fetch_failed.set(true);
+                            Err(list_err)
+                        }
+                    }
+                }
+            }
+        });
+        return classify_resolved_read(resolved, value, fetch_failed.get());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let lower = stderr.to_ascii_lowercase();
-    // A genuinely absent ENTRY is a 404, or a not-found phrase that
-    // mentions the item/entry/key -- but NEVER an auth/config failure like
-    // "API key not found" (which contains "key") or "profile not found".
-    // Those are surfaced as errors instead of masked as a missing key.
-    let mentions_entry = lower.contains("item") || lower.contains("entry") || lower.contains("key");
-    let not_found = lower.contains("not found") || lower.contains("does not exist");
-    if !is_provider_auth_or_config_error(&lower)
-        && (lower.contains("404") || (not_found && mentions_entry))
-    {
+    // The describe failed. Absence is CONFIRMED only by a complete listing
+    // that omits the key -- never by a describe 404, which a proxy/endpoint or
+    // auth failure produces just the same.
+    if confirm_entry_absent(&store_id, key)? {
         return Ok(ReadConfigEntry::MissingKey);
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
     Err(format!(
-        "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited with status {}\nstderr: {}",
+        "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited \
+         with status {} but the key IS present in the store listing (an operational failure, \
+         not absence); nothing was changed.\nstderr: {}",
         output.status,
-        stderr.trim()
+        redact_stderr(&stderr)
     ))
 }
 
@@ -200,11 +193,10 @@ pub(super) fn read_entry(store: &ResolvedStoreId, key: &str) -> Result<ReadConfi
 /// key, using `fastly config-store-entry describe --store-id=<id> --key=<k>
 /// --json`. Used by the chunk-pointer resolver to fan out to chunk entries.
 ///
-/// Returns:
-/// - `Ok(Some(value))` when the entry exists.
-/// - `Ok(None)` when the entry is absent (not-found / 404 / does not exist).
-/// - `Err(...)` on adapter or parse errors.
-fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<String>, String> {
+/// `Ok(value)` when the entry exists; `Err` on ANY failure, INCLUDING a
+/// not-found. Absence is NOT decided here (a describe 404 is not proof) -- the
+/// caller confirms it against the complete store listing.
+fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<String, String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
     let output = Command::new("fastly")
@@ -224,11 +216,12 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
             }
         })?;
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+        let stdout = strict_stdout(output.stdout, "config-store-entry describe --json")?;
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
             format!(
-                "failed to parse `fastly config-store-entry describe` JSON for chunk \
-                     key `{key}`: {err}\nraw stdout: {stdout}"
+                "failed to parse `fastly config-store-entry describe` JSON for key \
+                 `{key}` (parse error redacted; response: {})",
+                redact_describe_response(&stdout)
             )
         })?;
         let value = parsed
@@ -237,30 +230,132 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
             .ok_or_else(|| {
                 format!(
                     "`fastly config-store-entry describe` JSON has no string `item_value` \
-                     field for chunk key `{key}`; fastly CLI may have changed its output schema. \
-                     Raw stdout: {stdout}"
+                     field for key `{key}`; fastly CLI may have changed its output schema. \
+                     (response: {})",
+                    redact_describe_response(&stdout)
                 )
             })?;
-        return Ok(Some(value.to_owned()));
+        return Ok(value.to_owned());
     }
+    // `Err` on ANY non-success, INCLUDING a not-found. A describe 404 alone is not
+    // proof of absence, so the caller CONFIRMS a genuine absence against the
+    // complete store listing rather than trusting this stderr.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let lower = stderr.to_ascii_lowercase();
-    // A genuinely absent chunk is a not-found; an auth/config failure is
-    // NOT -- suppressing it as `None` would silently drop chunk data and
-    // reconstruct a corrupt value, so it is surfaced as an error.
-    if !is_provider_auth_or_config_error(&lower)
-        && (lower.contains("not found")
-            || lower.contains("does not exist")
-            || lower.contains("404"))
-    {
-        return Ok(None);
-    }
     Err(format!(
         "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` \
          exited with status {}\nstderr: {}",
         output.status,
-        stderr.trim()
+        redact_stderr(&stderr)
     ))
+}
+
+/// The COMPLETE set of item keys in a store, via `config-store-entry list`.
+///
+/// Absence is CONFIRMED against this, never against a describe 404: the listing
+/// is completeness-strict (fails closed on a paginated / non-bare-array view and
+/// on a duplicate key), so a key's absence from it is authoritative.
+fn list_config_store_keys(store_id: &str) -> Result<HashSet<String>, String> {
+    let store_arg = format!("--store-id={store_id}");
+    let output = Command::new("fastly")
+        .args(["config-store-entry", "list", store_arg.as_str(), "--json"])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`fastly config-store-entry list --store-id={store_id} --json` exited with status {}\nstderr: {}",
+            output.status,
+            redact_stderr(&stderr)
+        ));
+    }
+    let stdout = strict_stdout(output.stdout, "config-store-entry list --json")?;
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|_err| {
+        format!(
+            "failed to parse `fastly config-store-entry list` JSON (parse error redacted; \
+             response: {})",
+            redact_describe_response(&stdout)
+        )
+    })?;
+    let array = parsed.as_array().ok_or_else(|| {
+        format!(
+            "refusing to confirm absence: `fastly config-store-entry list --json` did not return a \
+             bare array (response: {}). A paginated or partial view could hide a present key and \
+             turn it into a false absence that authorises an overwrite.",
+            redact_describe_response(&stdout)
+        )
+    })?;
+    let mut keys = HashSet::with_capacity(array.len());
+    for (idx, entry) in array.iter().enumerate() {
+        let key = entry
+            .get("item_key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "`fastly config-store-entry list` entry #{idx} is missing a string `item_key`; \
+                     refusing to confirm absence on an unreadable listing"
+                )
+            })?;
+        if key.is_empty() {
+            return Err(format!(
+                "`fastly config-store-entry list` entry #{idx} has an empty `item_key`; refusing \
+                 to confirm absence on an unreadable listing"
+            ));
+        }
+        if !keys.insert(key.to_owned()) {
+            return Err(format!(
+                "`fastly config-store-entry list` returned duplicate key `{key}`; refusing to \
+                 confirm absence on an ambiguous listing"
+            ));
+        }
+    }
+    Ok(keys)
+}
+
+/// Confirm `key` is ABSENT from the store via a complete listing (authoritative).
+/// `Ok(true)` = the listing succeeded and omits the key. `Ok(false)` = the key IS
+/// present. `Err` = the listing itself failed. All three fail closed for the
+/// caller: only `Ok(true)` is a genuine absence.
+fn confirm_entry_absent(store_id: &str, key: &str) -> Result<bool, String> {
+    Ok(!list_config_store_keys(store_id)?.contains(key))
+}
+
+/// Cached form of [`confirm_entry_absent`] for chunk fetches: lists the store at
+/// most ONCE per read (a whole lost generation would otherwise list per chunk).
+fn confirm_key_absent_cached(
+    cache: &RefCell<Option<Result<HashSet<String>, String>>>,
+    store_id: &str,
+    key: &str,
+) -> Result<bool, String> {
+    let mut slot = cache.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(list_config_store_keys(store_id));
+    }
+    match slot.as_ref() {
+        Some(Ok(keys)) => Ok(!keys.contains(key)),
+        Some(Err(err)) => Err(err.clone()),
+        // Unreachable: populated just above. Fail closed rather than unwrap.
+        None => Err("internal error: store listing cache was not populated".to_owned()),
+    }
+}
+
+/// Convert `fastly` stdout to a `String`, FAILING CLOSED on invalid UTF-8 rather
+/// than substituting U+FFFD. A lossy replacement inside a JSON string could
+/// mutate a stored root value or chunk and yield parseable-but-WRONG data on a
+/// path that drives an overwrite or a deletion. Diagnostics only ever see
+/// redacted output, so stderr stays lossy.
+pub(super) fn strict_stdout(stdout: Vec<u8>, command: &str) -> Result<String, String> {
+    String::from_utf8(stdout).map_err(|_err| {
+        format!(
+            "`fastly {command}` returned non-UTF-8 output; refusing to act on it -- a lossy \
+             conversion could mutate a stored value. Nothing was changed."
+        )
+    })
 }
 
 // -------------------------------------------------------------------
@@ -291,10 +386,17 @@ where
                 .map(|(remaining_key, _)| remaining_key.as_str())
                 .collect();
             return Err(format!(
-                "fastly push failed at entry `{key}` after committing {committed} of {total} entries; the remaining {remaining_count} entries were NOT pushed.\n  Committed (safe to skip on retry): {pushed:?}\n  Failed: `{key}` — {err}\n  Not attempted (re-push these): {remaining:?}",
+                "fastly push failed at entry `{key}` while committing {committed} of {total} entries.\n  \
+                 The failed entry's outcome is UNKNOWN: Fastly may have committed it before the error \
+                 (a timeout can arrive after the write lands), including when it is the root pointer.\n  \
+                 Recovery: re-run the SAME `config push`. It is idempotent -- chunk keys are content-addressed \
+                 and writes use `--upsert` -- so entries already written are rewritten harmlessly and any \
+                 missing ones are filled. Do NOT hand-delete the failed key.\n  \
+                 Already written (a retry rewrites them): {pushed:?}\n  \
+                 Failed: `{key}` (outcome unknown) -- {err}\n  \
+                 Not attempted: {remaining:?}",
                 committed = pushed.len(),
                 total = entries.len(),
-                remaining_count = remaining.len()
             ));
         }
         pushed.push(key.clone());
@@ -349,29 +451,28 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
                 format!("failed to spawn `fastly`: {err}")
             }
         })?;
-    // Move stdin OUT of child via `take` so the ChildStdin drops at
-    // end of scope — that closes the pipe and lets the CLI see EOF.
-    // `child.wait_with_output()` then consumes child cleanly.
-    let mut stdin = child
+    // Take stdin OUT of the child and hand it to a helper that writes the value
+    // and drops the handle on return — closing the pipe so the CLI sees EOF.
+    // Do NOT early-return on a write error: if the child died before reading
+    // (bad args, auth failure), the write fails with BrokenPipe while the USEFUL
+    // diagnostic is the child's own stderr. Reap the child FIRST (avoids a
+    // zombie), then surface its stderr/status -- folding the pipe error in only
+    // as secondary context.
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
-    // Write the value, but do NOT early-return on a write error: if the child
-    // died before reading (bad args, auth failure), the write fails with
-    // BrokenPipe while the USEFUL diagnostic is the child's own stderr. Reap
-    // the child FIRST (avoids a zombie), then surface its stderr/status --
-    // folding the pipe error in only as secondary context.
-    let write_result = stdin.write_all(value.as_bytes());
-    drop(stdin);
+    let write_result = write_value_to_fastly_stdin(stdin, value);
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `fastly`: {err}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Redact stderr: a Fastly error can quote the stored config value back, which
+    // would put credentials into CI logs.
+    let stderr = redact_stderr(&String::from_utf8_lossy(&output.stderr));
     if let Err(err) = write_result {
         return Err(format!(
             "failed to write the value to `fastly` stdin ({err}); `fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
-            output.status,
-            stderr.trim()
+            output.status, stderr
         ));
     }
     if output.status.success() {
@@ -379,9 +480,19 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
     }
     Err(format!(
         "`fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
-        output.status,
-        stderr.trim()
+        output.status, stderr
     ))
+}
+
+/// Write `value` to the child's stdin, then drop the handle as it falls out of
+/// scope on return — closing the pipe so the `fastly` CLI sees EOF. Taking
+/// `stdin` by value gives a natural scope-end drop rather than an explicit
+/// `drop()`, which also keeps this valid on targets where `ChildStdin` is a
+/// non-Drop stub.
+fn write_value_to_fastly_stdin(mut stdin: ChildStdin, value: &str) -> Result<(), String> {
+    stdin
+        .write_all(value.as_bytes())
+        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))
 }
 
 /// Parse `fastly config-store list --json` output and return the
@@ -405,32 +516,38 @@ fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
             shape_summary(&parsed)
         ));
     };
-    let mut any_well_formed = false;
-    for entry in array {
-        let entry_name = entry.get("name").and_then(serde_json::Value::as_str);
-        let entry_id = entry.get("id").and_then(serde_json::Value::as_str);
-        if entry_name.is_some() && entry_id.is_some() {
-            any_well_formed = true;
+    // FAIL CLOSED on any malformed or duplicate row: a `NotFound` here becomes a
+    // MissingStore that AUTHORISES an overwrite, so a listing we cannot read
+    // exactly must never look like a definite absence. Every row must carry a
+    // non-empty string `name` and `id`, and names must be unique.
+    let mut seen_names = HashSet::with_capacity(array.len());
+    let mut found: Option<String> = None;
+    for (idx, entry) in array.iter().enumerate() {
+        let name_field = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let id_field = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let (Some(entry_name), Some(entry_id)) = (name_field, id_field) else {
+            return ConfigStoreLookup::SchemaDrift(format!(
+                "store-list entry #{idx} is missing a non-empty string `name` or `id`; refusing to \
+                 treat a store as absent on a listing this build cannot read exactly"
+            ));
+        };
+        if !seen_names.insert(entry_name.to_owned()) {
+            return ConfigStoreLookup::SchemaDrift(format!(
+                "store-list has a duplicate `name` (`{entry_name}`); refusing to resolve a store id \
+                 on an ambiguous listing"
+            ));
         }
-        if entry_name == Some(name) {
-            return entry_id.map_or_else(
-                || {
-                    ConfigStoreLookup::SchemaDrift(format!(
-                        "entry matched name `{name}` but is missing a string `id` field"
-                    ))
-                },
-                |id| ConfigStoreLookup::Found(id.to_owned()),
-            );
+        if entry_name == name {
+            found = Some(entry_id.to_owned());
         }
     }
-    if array.is_empty() || any_well_formed {
-        ConfigStoreLookup::NotFound
-    } else {
-        ConfigStoreLookup::SchemaDrift(
-            "no entry has both string `name` and `id` fields -- fastly CLI may have changed its output schema"
-                .to_owned(),
-        )
-    }
+    found.map_or(ConfigStoreLookup::NotFound, ConfigStoreLookup::Found)
 }
 
 /// One-line type label for a `serde_json::Value` (for diagnostic
@@ -447,10 +564,13 @@ fn shape_summary(value: &serde_json::Value) -> &'static str {
 }
 
 /// Resolve the platform config-store id on demand: shell out to
-/// `fastly config-store list --json`, parse the JSON, match by
-/// `name`. The provision flow doesn't persist this id, so push
-/// has to re-fetch every time.
-fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
+/// `fastly config-store list --json`, parse the JSON, match by `name`.
+///
+/// Returns a TYPED absence: `Ok(None)` ONLY when the list call SUCCEEDS and no
+/// store matches (a genuine absence). An operational failure (missing binary,
+/// spawn/list failure, schema drift) stays `Err` -- callers that read for a diff
+/// must not treat an operational failure as "store absent" and overwrite.
+pub(super) fn resolve_remote_config_store_id(name: &str) -> Result<Option<String>, String> {
     let output = Command::new("fastly")
         .args(["config-store", "list", "--json"])
         .output()
@@ -468,16 +588,57 @@ fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = strict_stdout(output.stdout, "config-store list --json")?;
     match find_config_store_id(&stdout, name) {
-        ConfigStoreLookup::Found(id) => Ok(id),
-        ConfigStoreLookup::NotFound => Err(format!(
-            "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
-        )),
+        ConfigStoreLookup::Found(id) => Ok(Some(id)),
+        ConfigStoreLookup::NotFound => Ok(None),
         ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
             "could not parse `fastly config-store list --json` output: {detail}.\n  The fastly CLI may have changed its JSON schema in a recent version. Please file a bug report at https://github.com/stackpop/edgezero/issues with the fastly CLI version (`fastly version`) and the raw stdout. Workaround: pin to a known-compatible fastly CLI version."
         )),
     }
+}
+
+/// Message for a genuinely-absent store, for the write/GC callers that treat
+/// absence as a hard error (they cannot operate on a store that does not exist).
+pub(super) fn no_matching_store_error(name: &str) -> String {
+    format!(
+        "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
+    )
+}
+
+/// Summarise a `fastly ... describe` response for diagnostics WITHOUT
+/// leaking its contents. The response body is the stored config value, so a
+/// schema-drift diagnostic must never echo the payload: report only its size and
+/// its top-level *shape*, never a value.
+pub(super) fn redact_describe_response(stdout: &str) -> String {
+    let len = stdout.len();
+    serde_json::from_str::<serde_json::Value>(stdout).map_or_else(
+        |_err| format!("{len} bytes, not valid JSON"),
+        |value| match value {
+            serde_json::Value::Object(map) => {
+                // Object KEYS are stored/provider-controlled data, so only the
+                // COUNT is reported, never the key names.
+                format!("{len} bytes, JSON object with {} field(s)", map.len())
+            }
+            other @ (serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+            | serde_json::Value::Array(_)) => {
+                format!("{len} bytes, JSON {}", shape_summary(&other))
+            }
+        },
+    )
+}
+
+/// Summarise a failing `fastly` invocation's stderr WITHOUT echoing it. The
+/// `describe` and `update --stdin` paths carry the stored config value, so a
+/// Fastly error that quotes the payload back would put credentials into CI logs.
+pub(super) fn redact_stderr(stderr: &str) -> String {
+    let len = stderr.trim().len();
+    format!(
+        "{len} bytes suppressed (may echo the stored config value); re-run the `fastly` command directly to inspect it"
+    )
 }
 
 #[cfg(test)]
@@ -486,150 +647,14 @@ mod tests {
     #[cfg(unix)]
     use super::super::path_mutation_guard;
     use super::*;
+    use crate::chunked_config::CHUNK_KEY_INFIX;
+    use crate::cli::test_support::*;
     use edgezero_adapter::registry::{Adapter as _, AdapterPushContext};
+    #[cfg(unix)]
     use edgezero_core::test_env::PathPrepend;
     #[cfg(unix)]
     use std::fs;
-    #[cfg(unix)]
-    use std::path::Path;
     use tempfile::tempdir;
-
-    // Shared fixture names.
-    const TEST_CONFIG_ID: &str = "app_config";
-
-    /// Build a tempdir containing a `fastly` shim script that:
-    /// - Responds to `config-store list --json` with a store-list JSON containing
-    ///   `TEST_CONFIG_ID` mapped to `store-abc123`.
-    /// - Responds to `config-store-entry describe ...` with `stdout_body` on
-    ///   stdout and `stderr_body` on stderr, exiting with `exit_code`.
-    #[cfg(unix)]
-    fn fake_fastly_returning(
-        stdout_body: &str,
-        stderr_body: &str,
-        exit_code: i32,
-    ) -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempdir().expect("tempdir");
-        let script_path = dir.path().join("fastly");
-        let stdout_file = dir.path().join("stdout_payload.txt");
-        let stderr_file = dir.path().join("stderr_payload.txt");
-        let list_file = dir.path().join("list_payload.txt");
-        // Store-list JSON: bare array with one entry matching TEST_CONFIG_ID.
-        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
-        fs::write(&stdout_file, stdout_body).expect("write stdout payload");
-        fs::write(&stderr_file, stderr_body).expect("write stderr payload");
-        fs::write(&list_file, list_json).expect("write list payload");
-        let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\ncat '{}' >&2\nexit {exit_code}\n",
-            list_file.display(),
-            stdout_file.display(),
-            stderr_file.display(),
-        );
-        fs::write(&script_path, script).expect("write fastly script");
-        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).expect("chmod +x");
-        dir
-    }
-
-    /// Build a fake `fastly` that logs each argv token (one per line) to
-    /// `out_path`, handles the list call correctly, and exits 0 for both calls.
-    #[cfg(unix)]
-    fn fake_fastly_argv_log(out_path: &Path) -> tempfile::TempDir {
-        use edgezero_core::blob_envelope::BlobEnvelope;
-        use serde_json::json;
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempdir().expect("tempdir");
-        let script_path = dir.path().join("fastly");
-        let list_file = dir.path().join("list_payload.txt");
-        let entry_file = dir.path().join("entry_payload.txt");
-        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
-        // item_value must be a valid BlobEnvelope JSON so the resolver accepts it.
-        let envelope_json = serde_json::to_string(&BlobEnvelope::new(
-            json!({"v": "logged"}),
-            "2026-06-22T00:00:00Z".into(),
-        ))
-        .expect("serialize");
-        let entry_json = format!(
-            r#"{{"item_value":{},"store_id":"store-abc123"}}"#,
-            serde_json::to_string(&envelope_json).expect("escape")
-        );
-        fs::write(&list_file, list_json).expect("write list payload");
-        fs::write(&entry_file, &entry_json).expect("write entry payload");
-        let script = format!(
-            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
-            out_path.display(),
-            list_file.display(),
-            entry_file.display(),
-        );
-        fs::write(&script_path, script).expect("write script");
-        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).expect("chmod +x");
-        dir
-    }
-
-    /// Build a valid `BlobEnvelope` JSON string of approximately `target_len` bytes.
-    #[cfg(unix)]
-    fn make_test_envelope(target_len: usize) -> String {
-        use edgezero_core::blob_envelope::BlobEnvelope;
-        use serde_json::json;
-        let pad = "x".repeat(target_len.saturating_add(64));
-        let data = json!({ "pad": pad });
-        let raw =
-            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".into())).unwrap();
-        if raw.len() >= target_len {
-            let overhead = raw.len().saturating_sub(pad.len());
-            let adjusted = "x".repeat(target_len.saturating_sub(overhead));
-            let data2 = json!({ "pad": adjusted });
-            serde_json::to_string(&BlobEnvelope::new(data2, "2026-06-22T00:00:00Z".into())).unwrap()
-        } else {
-            raw
-        }
-    }
-
-    /// Build a fake `fastly` script whose describe response depends on
-    /// the `--key=<k>` argument: `key_responses` maps key names to JSON
-    /// item-value responses. Falls back to exit 1 "not found" for unknown keys.
-    #[cfg(unix)]
-    fn fake_fastly_with_key_dispatch(
-        _dir: &Path,
-        key_responses: &[(String, String)],
-    ) -> tempfile::TempDir {
-        use std::fmt::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        let fake_dir = tempdir().expect("tempdir");
-        let list_file = fake_dir.path().join("list.json");
-        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
-        fs::write(&list_file, list_json).expect("write list");
-        // Write each key response to a named file.
-        let mut dispatch_lines = String::new();
-        for (key, response) in key_responses {
-            let resp_file = fake_dir.path().join(format!("resp_{key}.json"));
-            fs::write(&resp_file, response).expect("write resp");
-            // Use exact-match: iterate argv and compare each token literally
-            // so that a root key like "app_config" does NOT match a chunk key
-            // like "app_config.__edgezero_chunks.abc.0".
-            writeln!(
-                dispatch_lines,
-                "  for arg in \"$@\"; do if [ \"$arg\" = \"--key={key}\" ]; then cat '{}'; exit 0; fi; done",
-                resp_file.display()
-            )
-            .expect("write to String is infallible");
-        }
-        // Fallback outputs "not found" so fetch_remote_config_store_entry
-        // maps it to Ok(None) rather than Err.
-        let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\n{dispatch_lines}echo 'Error: item not found' >&2\nexit 1\n",
-            list_file.display()
-        );
-        let script_path = fake_dir.path().join("fastly");
-        fs::write(&script_path, &script).expect("write script");
-        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).expect("chmod");
-        fake_dir
-    }
 
     // ---------- push_entries_with_committer ----------
 
@@ -688,6 +713,20 @@ mod tests {
             err.contains("committing 2 of 5 entries"),
             "committed/total count: {err}"
         );
+        // The failed entry's outcome is UNKNOWN and recovery is a full idempotent
+        // re-run, not a hand-resume from a claimed boundary.
+        assert!(
+            err.contains("UNKNOWN") && err.contains("outcome unknown"),
+            "failed outcome must be stated unknown: {err}"
+        );
+        assert!(
+            err.contains("re-run the SAME") && err.contains("idempotent"),
+            "recovery must be a full idempotent re-run: {err}"
+        );
+        assert!(
+            !err.contains("safe to skip on retry"),
+            "must not claim committed entries can be skipped from a known boundary: {err}"
+        );
     }
 
     #[test]
@@ -726,8 +765,8 @@ mod tests {
         .expect_err("last-entry failure");
         assert!(err.contains("committing 2 of 3"), "n-1 committed: {err}");
         assert!(
-            err.contains("the remaining 0 entries"),
-            "zero not-attempted when last fails: {err}"
+            err.contains("Not attempted: []"),
+            "zero not-attempted when the last entry fails: {err}"
         );
     }
 
@@ -827,6 +866,37 @@ mod tests {
     }
 
     #[test]
+    fn find_config_store_id_fails_closed_on_a_malformed_row() {
+        // A row that lacks a non-empty `name`/`id` could BE the requested store
+        // (its unreadable name might have matched). Treating the listing as a
+        // definite NotFound would authorise an overwrite of a store that exists,
+        // so a malformed row must be SchemaDrift (a hard error), not NotFound --
+        // even when another row is well-formed.
+        let stdout = format!(
+            r#"[{{"name": "", "id": "abc"}}, {{"name": "{TEST_CONFIG_ID}", "id": "store-1"}}]"#
+        );
+        let drift = find_config_store_id(&stdout, "some-other-store");
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "an empty-name row must fail closed, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_rejects_duplicate_names() {
+        // A duplicate name means we are not reading one consistent view of the
+        // store, so resolving an id off it is ambiguous -> fail closed.
+        let stdout = format!(
+            r#"[{{"name": "{TEST_CONFIG_ID}", "id": "a"}}, {{"name": "{TEST_CONFIG_ID}", "id": "b"}}]"#
+        );
+        let drift = find_config_store_id(&stdout, TEST_CONFIG_ID);
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "a duplicate name must fail closed, got {drift:?}"
+        );
+    }
+
+    #[test]
     fn find_config_store_id_returns_not_found_for_empty_array() {
         // Empty array IS a valid "store doesn't exist yet" signal,
         // not schema drift — fastly CLI legitimately returns `[]`
@@ -858,9 +928,9 @@ mod tests {
                 true,
             )
             .expect("dry-run succeeds");
-        // First line names the resolve+publish flow; subsequent lines preview
-        // each key the push would create (so callers can eyeball the keyset
-        // before running for real).
+        // First line names the resolve+publish flow; then one preview line per
+        // key. A push no longer reclaims anything (see `config gc`), so there is
+        // no GC-intent line.
         assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
         assert!(
             out[0].contains("would resolve fastly config-store `app_config`")
@@ -898,8 +968,6 @@ mod tests {
             "status line names the no-op: {out:?}"
         );
     }
-
-    // ---------- read_config_entry (fake fastly, remote shell-out) ----------
 
     #[cfg(unix)]
     #[test]
@@ -940,28 +1008,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn create_config_store_entry_surfaces_child_stderr_on_failure() {
-        // When the `fastly` CLI exits non-zero, the error must carry the
-        // CHILD'S stderr (the real diagnostic) and the child must be reaped --
-        // not a bare stdin-write error. `fake_fastly_returning` exits without
-        // reading stdin, so this also exercises the write-then-reap ordering.
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fake = fake_fastly_returning("", "AUTH: token expired [401]", 1);
-        let _path = PathPrepend::new(fake.path());
-        let err = create_config_store_entry("store-abc123", "greeting", "hello")
-            .expect_err("a non-zero fastly exit must be an error");
-        assert!(
-            err.contains("token expired"),
-            "the child's stderr must surface, not a bare pipe error: {err}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_remote_returns_missing_key_on_not_found_stderr() {
+    fn read_remote_returns_missing_key_when_confirmed_absent() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // describe exits non-zero with "not found" in stderr → MissingKey.
+        // describe exits non-zero, and the complete store listing (empty here)
+        // CONFIRMS the key is absent → MissingKey (not decided by the 404 alone).
         let fake = fake_fastly_returning("", "Error: item not found", 1);
         let _path = PathPrepend::new(fake.path());
         let result = FastlyCliAdapter
@@ -980,46 +1031,22 @@ mod tests {
         );
     }
 
-    /// An auth failure whose stderr mentions "API key not found" contains
-    /// "key" + "not found" but must NOT be masked as a missing key -- it is
-    /// surfaced as an error so the operator fixes their credentials.
-    #[cfg(unix)]
-    #[test]
-    fn read_remote_reports_error_on_auth_key_not_found() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        // First call (config-store list) succeeds; describe fails on auth.
-        let fake = fake_fastly_returning("", "Error: API key not found", 1);
-        let _path = PathPrepend::new(fake.path());
-        let result = FastlyCliAdapter.read_config_entry(
-            dir.path(),
-            Some("fastly.toml"),
-            None,
-            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-            "greeting",
-            &AdapterPushContext::new(),
-        );
-        let Err(err) = result else {
-            panic!("an auth failure must be an error, not MissingKey");
-        };
-        assert!(
-            err.contains("API key"),
-            "the auth failure must surface: {err}"
-        );
-    }
-
     /// The Fastly impl distinguishes store-not-found from key-not-found via
     /// `resolve_remote_config_store_id`: when the list call exits non-zero and
     /// the error string contains "not found", `read_config_entry` returns
     /// `MissingStore` without ever calling the describe subcommand.
     #[cfg(unix)]
     #[test]
-    fn read_remote_returns_missing_store_on_appropriate_stderr() {
+    fn read_remote_fails_closed_when_the_list_call_itself_errors() {
         use std::os::unix::fs::PermissionsExt as _;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Script that exits non-zero for the list call so resolve fails with
-        // a "not found" error, causing read_config_entry to return MissingStore.
+        // The list call EXITS NON-ZERO with "not found"-shaped stderr. That is an
+        // OPERATIONAL failure (auth/network/server), not proof the store is absent
+        // -- the absence signal is a SUCCESSFUL list that omits the store. So this
+        // must fail closed (a hard error the operator retries), NEVER MissingStore:
+        // reading it as absence could authorise an overwrite of a store we never
+        // actually queried.
         let fake_dir = tempdir().expect("tempdir");
         let stderr_file = fake_dir.path().join("stderr_payload.txt");
         fs::write(&stderr_file, "Error: config store not found for service").expect("write stderr");
@@ -1033,6 +1060,35 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod +x");
         let _path = PathPrepend::new(fake_dir.path());
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        assert!(
+            result.is_err(),
+            "a failed list call must fail closed, not read as MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_store_when_the_store_is_genuinely_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // The list call SUCCEEDS and returns a valid, empty store array. The store
+        // is genuinely absent -> `no fastly config-store matches` -> MissingStore.
+        let fake_dir = tempdir().expect("tempdir");
+        let script_path = fake_dir.path().join("fastly");
+        fs::write(&script_path, "#!/bin/sh\necho '[]'\nexit 0\n").expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        let _path = PathPrepend::new(fake_dir.path());
         let result = FastlyCliAdapter
             .read_config_entry(
                 dir.path(),
@@ -1042,81 +1098,10 @@ mod tests {
                 "greeting",
                 &AdapterPushContext::new(),
             )
-            .expect("list failure with not-found maps to MissingStore (not Err)");
+            .expect("a successful list that omits the store maps to MissingStore");
         assert!(
             matches!(result, ReadConfigEntry::MissingStore),
-            "list not-found => MissingStore"
-        );
-    }
-
-    /// An UNRELATED failure whose stderr merely contains "not found" (e.g.
-    /// an auth "profile not found") must NOT be misreported as a missing
-    /// store -- it is surfaced as a real error so a diff doesn't claim the
-    /// whole store was added.
-    #[cfg(unix)]
-    #[test]
-    fn read_remote_reports_error_on_unrelated_not_found() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        let fake_dir = tempdir().expect("tempdir");
-        let stderr_file = fake_dir.path().join("stderr_payload.txt");
-        fs::write(&stderr_file, "Error: profile 'user' not found").expect("write stderr");
-        let script_path = fake_dir.path().join("fastly");
-        let script = format!(
-            "#!/bin/sh\ncat '{stderr}' >&2\nexit 1\n",
-            stderr = stderr_file.display(),
-        );
-        fs::write(&script_path, script).expect("write script");
-        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).expect("chmod +x");
-        let _path = PathPrepend::new(fake_dir.path());
-        let result = FastlyCliAdapter.read_config_entry(
-            dir.path(),
-            Some("fastly.toml"),
-            None,
-            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-            "greeting",
-            &AdapterPushContext::new(),
-        );
-        let Err(err) = result else {
-            panic!("an unrelated 'not found' must be an error, not MissingStore");
-        };
-        assert!(
-            err.contains("profile"),
-            "error surfaces the real failure: {err}"
-        );
-    }
-
-    /// A missing `fastly` binary must NOT be misreported as a missing
-    /// store: the spawn error ("`fastly` not found on PATH") contains
-    /// "not found", but a diff has to surface it as a genuine error so the
-    /// operator installs the CLI rather than believing the store is absent.
-    #[cfg(unix)]
-    #[test]
-    fn read_remote_reports_error_when_fastly_cli_absent() {
-        use edgezero_core::test_env::EnvOverride;
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        // Replace PATH with a single empty dir so `fastly` cannot be
-        // spawned even when the host has it installed.
-        let empty = tempdir().expect("empty dir");
-        let _path = EnvOverride::set("PATH", empty.path());
-        let result = FastlyCliAdapter.read_config_entry(
-            dir.path(),
-            Some("fastly.toml"),
-            None,
-            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-            "greeting",
-            &AdapterPushContext::new(),
-        );
-        let Err(err) = result else {
-            panic!("a missing fastly CLI must be an error, not MissingStore");
-        };
-        assert!(
-            err.to_ascii_lowercase().contains("not found on path"),
-            "error names the absent CLI: {err}"
+            "store absent from a successful list => MissingStore"
         );
     }
 
@@ -1170,7 +1155,166 @@ mod tests {
         );
     }
 
-    // ---------- chunked push integration tests ----------
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_rejects_reserved_key() {
+        let dir = tempdir().expect("tempdir");
+        let bad_key = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        let err = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(bad_key.clone(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("reserved key must be rejected");
+        assert!(err.contains(&bad_key), "names the key: {err}");
+    }
+
+    /// Schema drift must never echo the config payload — including OBJECT KEYS,
+    /// which are provider/stored data. App config can hold credentials; CLI
+    /// status lines are logged verbatim and CI logs are retained/shared. Only a
+    /// size + field COUNT may be reported.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_schema_drift_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_abc123";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // The sentinel is an OBJECT KEY (not a value): the earlier redactor joined
+        // keys into the diagnostic, so this is what pins the key-disclosure fix.
+        let drift = format!(r#"{{"{SENTINEL}":"x"}}"#);
+        let fake = fake_fastly_returning(&drift, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("schema drift must error")
+        };
+        assert!(
+            !err.contains(SENTINEL),
+            "error must not leak an object KEY from the config payload: {err}"
+        );
+        assert!(
+            err.contains("bytes") && err.contains("field(s)"),
+            "error should carry a redacted size + field COUNT: {err}"
+        );
+    }
+
+    /// The FAILURE branch leaks too: a Fastly error that quotes the stored
+    /// value back in stderr must not reach the user-facing error.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_stderr_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_stderr1";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // A hard failure that echoes the value. The key IS present in the store
+        // listing, so absence confirmation fails and the read surfaces the
+        // (redacted) describe stderr on the hard-error path.
+        let stderr = format!("Error: internal failure processing value {SENTINEL}");
+        let fake = fake_fastly_returning_with_keys("", &stderr, 1, &["cfg"]);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("hard stderr failure must error")
+        };
+        assert!(
+            !err.contains(SENTINEL),
+            "stderr must be redacted, not echoed: {err}"
+        );
+        assert!(
+            err.contains("suppressed"),
+            "error should say the stderr was suppressed: {err}"
+        );
+    }
+
+    /// The WRITE path leaks too: a failing `config-store-entry update --upsert`
+    /// whose stderr quotes the value being written must be redacted.
+    #[cfg(unix)]
+    #[test]
+    fn upsert_stderr_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_upsert1";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        // A fake `fastly` that fails every call, echoing the value in stderr.
+        let stderr = format!("Error: rejected value {SENTINEL}");
+        let fake = fake_fastly_returning("", &stderr, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = create_config_store_entry("store-abc", "cfg", SENTINEL)
+            .expect_err("a failing upsert must error");
+        assert!(
+            !err.contains(SENTINEL),
+            "upsert stderr must be redacted, not echoed: {err}"
+        );
+        assert!(
+            err.contains("suppressed"),
+            "error should say the stderr was suppressed: {err}"
+        );
+    }
+
+    /// `config gc` reads `item_value` for every entry (to classify roots). A
+    /// malformed listing whose values carry secrets must fail closed WITHOUT
+    /// echoing any value. (Replaces the old push prior-read redaction tests,
+    /// which are now vacuous: a cloud push performs no pre-commit read.)
+    #[cfg(unix)]
+    #[test]
+    fn gc_list_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_gc_list";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let good = entry_list_json(&listing);
+        // A valid entry whose VALUE contains the sentinel, plus a malformed
+        // sibling (no created_at) to trip the fail-closed path.
+        let mut array: serde_json::Value = serde_json::from_str(&good).unwrap();
+        let arr = array.as_array_mut().unwrap();
+        arr.push(serde_json::json!({
+            "item_key": "some.__edgezero_chunks.deadbeef.0",
+            "item_value": SENTINEL,
+        }));
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            None,
+            false,
+            &dir.path().join("ops.log"),
+        );
+        fs::write(
+            fake.path().join("entries.json"),
+            serde_json::to_string(&array).unwrap(),
+        )
+        .expect("overwrite entries");
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            !err.contains(SENTINEL),
+            "the fail-closed error must not echo a stored value: {err}"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1374,7 +1518,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_errors_on_missing_chunk() {
+    fn read_config_entry_reports_corrupt_on_a_confirmed_absent_chunk() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
@@ -1382,7 +1526,8 @@ mod tests {
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
         let (_, pointer_json) = physical.last().unwrap();
-        // Only provide the root pointer; omit chunk responses so chunk fetch returns not-found.
+        // Only provide the root pointer; omit chunk responses so the chunk fetch
+        // gets a CLEAN not-found (`Error: item not found`, no operational marker).
         let ptr_resp = format!(
             r#"{{"item_value":{}}}"#,
             serde_json::to_string(pointer_json).unwrap()
@@ -1399,18 +1544,22 @@ mod tests {
             TEST_CONFIG_ID,
             &AdapterPushContext::new(),
         );
-        let Err(err) = result else {
-            panic!("missing chunk must error")
-        };
+        // The chunk describe fails, and the complete store listing (which holds
+        // only the root pointer) CONFIRMS the chunk is absent. The blob spec makes
+        // persistent chunk loss REPAIRABLE by re-pushing, so the read reports
+        // `Corrupt` (a push overwrites to repair), NOT a hard error -- otherwise
+        // `config push` could never fix it. Absence is confirmed by the listing,
+        // never by the describe 404 alone, so a proxy/auth failure (where the
+        // listing also fails, or shows the chunk present) stays a hard error.
         assert!(
-            err.contains("missing chunk"),
-            "error must mention missing chunk: {err}"
+            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
+            "a confirmed-absent chunk must be repairable Corrupt, not a hard error"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_errors_on_corrupt_chunk_hash() {
+    fn read_config_entry_reports_corrupt_on_chunk_hash_mismatch() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
@@ -1456,22 +1605,25 @@ mod tests {
             TEST_CONFIG_ID,
             &AdapterPushContext::new(),
         );
-        let Err(err) = result else {
-            panic!("corrupt chunk must error")
-        };
+        // A chunk-hash mismatch at an EXISTING entry is corrupt stored state the
+        // push repairs by overwriting, so the CLI read reports `Corrupt`. (The
+        // RUNTIME path keeps a hash mismatch as Internal — see config_store.rs.)
         assert!(
-            err.contains("SHA mismatch") || err.contains("mismatch"),
-            "error must mention hash mismatch: {err}"
+            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
+            "a chunk-hash mismatch at an existing entry must be Corrupt (repairable), not an error"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn read_config_entry_errors_on_malformed_pointer() {
+    fn read_config_entry_reports_corrupt_for_malformed_pointer() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        // Root value is JSON but neither a BlobEnvelope nor a valid pointer.
-        let bad_json = r#"{"some_field":"not a pointer or envelope"}"#;
+        // Root value ANNOUNCES our chunk-pointer kind but is malformed. The
+        // `describe` SUCCEEDS (the entry exists), so a resolve failure is CORRUPT
+        // stored state, not an IO error: the read must report `Corrupt` so a push
+        // can overwrite it (in-band repair), NOT hard-error and block recovery.
+        let bad_json = r#"{"edgezero_kind":"fastly_config_chunks","some_field":"x"}"#;
         let item_json = format!(
             r#"{{"item_value":{}}}"#,
             serde_json::to_string(bad_json).unwrap()
@@ -1487,12 +1639,9 @@ mod tests {
             "cfg",
             &AdapterPushContext::new(),
         );
-        let Err(err) = result else {
-            panic!("malformed pointer must error")
-        };
         assert!(
-            err.contains("neither a valid BlobEnvelope") || err.contains("chunk pointer"),
-            "error must describe parse failure: {err}"
+            matches!(result, Ok(ReadConfigEntry::Corrupt(_))),
+            "a malformed pointer at an EXISTING entry must be Corrupt (repairable), not an error"
         );
     }
 }

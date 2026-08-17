@@ -5,7 +5,7 @@ use std::process::Command;
 
 use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
 
-use super::FASTLY_INSTALL_HINT;
+use super::{FASTLY_INSTALL_HINT, ManifestLock, atomically_replace_file};
 
 /// Cloud-mode `provision`: create Fastly platform stores via
 /// `fastly <kind>-store create`, then write the corresponding
@@ -316,9 +316,12 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let doc: toml_edit::DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
     let svc = doc
         .get("service_id")
         .and_then(|item| item.as_str())
@@ -400,9 +403,12 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let doc: toml_edit::DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
     let plural = format!("{kind}_stores");
     Ok(doc
         .get("setup")
@@ -481,14 +487,23 @@ fn assert_setup_writeback_shape(path: &Path) -> Result<(), String> {
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
     use toml_edit::{DocumentMut, Item, table};
 
-    let raw = match fs::read_to_string(path) {
+    // Provision writes the SAME manifest as `config push --local`; take the same
+    // lock so a concurrent provision and push serialise instead of clobbering
+    // each other's edit, and operate on the real target the lock resolved.
+    let lock = ManifestLock::acquire(path)?;
+    let target = lock.target();
+
+    let raw = match fs::read_to_string(target) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+        Err(err) => return Err(format!("failed to read {}: {err}", target.display())),
     };
-    let mut doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let mut doc: DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            target.display()
+        )
+    })?;
 
     let plural = format!("{kind}_stores");
     let parent_entry = doc.entry("setup").or_insert_with(table);
@@ -511,14 +526,14 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
         kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
     }
 
-    fs::write(path, doc.to_string())
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    atomically_replace_file(target, &raw, &doc.to_string())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::FastlyCliAdapter;
+    use super::super::provision_local::write_fastly_local_config_store;
     use super::super::run::synthesise_fastly_toml;
     use super::*;
     use edgezero_adapter::registry::{
@@ -1336,5 +1351,79 @@ mod tests {
         assert!(outcome.deployed.is_none(), "cloud outcome deployed is None");
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, baseline, "fastly.toml untouched in cloud mode");
+    }
+
+    /// The three provisioning parsers must NOT echo a malformed fastly.toml's
+    /// source text (which can contain a stored secret) on a parse failure.
+    #[test]
+    fn provisioning_parsers_redact_malformed_toml() {
+        const SENTINEL: &str = "SUPER_SECRET_IN_A_BROKEN_LINE";
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Malformed TOML whose offending line carries a secret.
+        fs::write(&path, format!("service_id = \"{SENTINEL}\" = broken\n")).expect("write");
+
+        let errs = [
+            read_fastly_service_id(&path).expect_err("malformed toml must error"),
+            setup_block_present(&path, "kv", TEST_KV_ID).expect_err("malformed toml must error"),
+            append_fastly_setup(&path, "kv", TEST_KV_ID).expect_err("malformed toml must error"),
+        ];
+        for err in &errs {
+            assert!(
+                !err.contains(SENTINEL),
+                "a parse error must not echo the stored value: {err}"
+            );
+            assert!(
+                err.contains("redacted"),
+                "error should say it redacted: {err}"
+            );
+        }
+    }
+
+    /// A provision write and a local push serialise on the SAME manifest lock, so
+    /// neither loses the other's edit even though they are different writers.
+    #[cfg(unix)]
+    #[test]
+    fn provision_and_push_serialise_on_the_manifest_lock() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().expect("tempdir");
+        let manifest = Arc::new(dir.path().join("fastly.toml"));
+        fs::write(
+            manifest.as_ref(),
+            "name = \"demo\"\n\n[local_server.config_stores.app_config]\nformat = \"inline-toml\"\n\n[local_server.config_stores.app_config.contents]\n",
+        )
+        .expect("seed");
+
+        for _round in 0_u32..25 {
+            let p_provision = Arc::clone(&manifest);
+            let p_push = Arc::clone(&manifest);
+            let provision =
+                thread::spawn(move || append_fastly_setup(&p_provision, "config", "app_config"));
+            let push = thread::spawn(move || {
+                write_fastly_local_config_store(
+                    &p_push,
+                    TEST_CONFIG_ID,
+                    &[("greeting".to_owned(), "hi".to_owned())],
+                    &[],
+                )
+            });
+            provision
+                .join()
+                .expect("provision thread")
+                .expect("provision");
+            push.join().expect("push thread").expect("push");
+
+            let after = fs::read_to_string(manifest.as_ref()).expect("read");
+            assert!(
+                after.contains("[setup.config_stores.app_config]"),
+                "provision's setup block must survive:\n{after}"
+            );
+            assert!(
+                after.contains("greeting = \"hi\""),
+                "push's config edit must survive:\n{after}"
+            );
+        }
     }
 }

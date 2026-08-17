@@ -399,6 +399,30 @@ impl Adapter for CloudflareCliAdapter {
         )
     }
 
+    // Cloudflare KV stores one envelope per key with no chunk fan-out, so
+    // there are no orphaned chunk entries to reclaim -- inherit the trait's
+    // "not implemented" default (spelled out for the `missing_trait_methods`
+    // lint).
+    fn gc_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _push_ctx: &AdapterPushContext<'_>,
+        _older_than_secs: u64,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "adapter `{}` does not implement `config gc`",
+            self.name()
+        ))
+    }
+
+    fn preflight_config_write(&self, _key: &str, _body: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: cloudflare is Multi for KV (KV namespaces) and
         // Config (KV namespaces), Single for Secrets (Worker

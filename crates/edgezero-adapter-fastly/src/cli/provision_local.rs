@@ -1,9 +1,17 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use edgezero_adapter::registry::{
     AdapterDeployedState, ProvisionOutcome, ProvisionStores, TypedSecretEntry,
 };
+
+use crate::chunked_config::{
+    prior_chunk_keys, resolve_fastly_config_value_typed, value_is_future_format,
+};
+
+use super::push_local::{is_prunable_leaf, reject_local_generated_key_collisions};
+use super::{ManifestLock, atomically_replace_file};
 
 /// Local-mode provision: seed Viceroy state in `fastly.toml` for the
 /// declared stores + the `edgezero_runtime_env` runtime-override
@@ -615,9 +623,21 @@ pub(super) fn write_fastly_local_config_store(
     path: &Path,
     platform_name: &str,
     entries: &[(String, String)],
-) -> Result<(), String> {
+    gc_roots: &[(String, HashSet<String>)],
+) -> Result<Vec<String>, String> {
     use std::io::ErrorKind;
     use toml_edit::{DocumentMut, Item, Value};
+
+    // Hold a cross-process advisory lock for the WHOLE read-modify-write. Two
+    // concurrent local pushes would otherwise both read the file, each apply
+    // their own edit, and the later rename would discard the earlier push's
+    // change. Serialising here makes each push read what the previous one wrote
+    // and build on it, so both edits survive. Released when `lock` drops.
+    let lock = ManifestLock::acquire(path)?;
+    // Read and replace the REAL target the lock guards, so a symlinked manifest
+    // and a direct path never diverge between the read, the compare, and the
+    // rename.
+    let target = lock.target();
 
     // `config push --local` OWNS only the `key = value` pairs INSIDE an
     // already-provisioned contents table. Creating the `[local_server]`
@@ -628,46 +648,185 @@ pub(super) fn write_fastly_local_config_store(
     // provisioned -- possibly with the wrong shape -- so a missing store
     // block is an error that points the operator at provision, not
     // something push papers over.
-    let raw = fs::read_to_string(path).map_err(|err| {
+    let raw = fs::read_to_string(target).map_err(|err| {
         if err.kind() == ErrorKind::NotFound {
             format!(
                 "{}: not found; run `provision --adapter fastly --local` first to create the local config store, then re-run config push",
-                path.display()
+                target.display()
             )
         } else {
-            format!("failed to read {}: {err}", path.display())
+            format!("failed to read {}: {err}", target.display())
         }
     })?;
-    let mut doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    // Redacted: `toml_edit`'s parse error quotes the offending source LINE, which
+    // in a config-store `contents` table is a stored (possibly secret-bearing)
+    // value. The diff read redacts the same failure; the writer must too.
+    let mut doc: DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            target.display()
+        )
+    })?;
 
-    // Upsert into the existing per-store contents table so a
-    // `config push --key app_config_staging` does NOT wipe the
-    // previously-pushed `app_config` blob. Spec 12.7 requires
-    // default + staging keys to coexist so the runtime
-    // EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY env var can
-    // switch between them. (Earlier wholesale-replace was a
-    // misread of the "stale entries don't linger" property:
-    // that applies WITHIN a key (old chunks for the same root
-    // become unreferenced when a new chunk-set installs a new
-    // pointer), NOT across sibling keys.)
-    let contents_tbl = doc
+    // Navigate (error if absent) to the provision-owned per-store table, then its
+    // `contents`. Upsert into the EXISTING contents table so a
+    // `config push --key app_config_staging` does NOT wipe the previously-pushed
+    // `app_config` blob (spec 12.7 requires default + staging keys to coexist).
+    let store_tbl = doc
         .get_mut("local_server")
         .and_then(Item::as_table_mut)
         .and_then(|tbl| tbl.get_mut("config_stores"))
         .and_then(Item::as_table_mut)
         .and_then(|tbl| tbl.get_mut(platform_name))
         .and_then(Item::as_table_mut)
-        .and_then(|tbl| tbl.get_mut("contents"))
+        .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
+    ensure_inline_toml_format(store_tbl, platform_name)?;
+    let contents_tbl = store_tbl
+        .get_mut("contents")
         .and_then(Item::as_table_mut)
         .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
+
+    reject_future_local_roots(contents_tbl, gc_roots)?;
+    reject_local_generated_key_collisions(contents_tbl, entries)?;
+    // Snapshot prior chunk keys per GC root BEFORE the upsert, using the exact
+    // keep-set the caller computed for each root (no prefix scan).
+    let mut plans: Vec<FastlyConfigGcPlan> = Vec::with_capacity(gc_roots.len());
+    for (root_key, new_keys) in gc_roots {
+        let prior_keys = contents_tbl
+            .get(root_key)
+            .and_then(toml_edit::Item::as_str)
+            .map_or_else(|| Ok(Vec::new()), |value| prior_chunk_keys(root_key, value));
+        plans.push(FastlyConfigGcPlan {
+            new_keys: new_keys.clone(),
+            prior_keys,
+        });
+    }
+
+    // Upsert the new physical entries.
     for (key, value) in entries {
         contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
     }
 
-    fs::write(path, doc.to_string())
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    // Prune orphans in the same in-memory rewrite; a suspicious prior pointer
+    // (Err) warns and deletes nothing.
+    let mut warnings = Vec::new();
+    for plan in &plans {
+        match orphan_chunk_keys(plan) {
+            Ok(orphans) => {
+                for key in orphans {
+                    // Never remove an orphan that is itself protected -- only a
+                    // raw leaf PAYLOAD prunes. Shared with the dry-run count via
+                    // `is_prunable_leaf`, so the preview can never disagree.
+                    if !is_prunable_leaf(contents_tbl, &key) {
+                        warnings.push(format!(
+                            "warning: kept `{key}` -- it is a runtime-readable root, claims the \
+                             `edgezero_kind` namespace, or is a nested root with chunks beneath it; \
+                             not a prunable chunk payload"
+                        ));
+                        continue;
+                    }
+                    contents_tbl.remove(&key);
+                }
+            }
+            Err(err) => warnings.push(format!("warning: {err}")),
+        }
+    }
+
+    atomically_replace_file(target, &raw, &doc.to_string())?;
+    Ok(warnings)
+}
+
+/// Per-root plan for the LOCAL path's eager prune.
+///
+/// Local reclamation is safe to do immediately: `fastly.toml` is a single file
+/// that Viceroy reads at startup — there is no propagation window and no POP that
+/// could still be serving the previous pointer. (The cloud path cannot do this.)
+struct FastlyConfigGcPlan {
+    /// Exact keep-set this push writes for the root (chunk keys + root key).
+    new_keys: HashSet<String>,
+    /// Prior chunk keys to consider deleting, or a warning to surface
+    /// (suspicious prior pointer) that skips GC for this root.
+    prior_keys: Result<Vec<String>, String>,
+}
+
+/// Orphans = prior chunk keys not in the new keep-set. Propagates a
+/// suspicious-pointer `Err` so the caller can warn and skip GC.
+fn orphan_chunk_keys(plan: &FastlyConfigGcPlan) -> Result<Vec<String>, String> {
+    match &plan.prior_keys {
+        Ok(prior) => Ok(prior
+            .iter()
+            .filter(|key| !plan.new_keys.contains(*key))
+            .cloned()
+            .collect()),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+/// Ensure a local config-store entry is `format = "inline-toml"` -- the only
+/// format compatible with the inline `contents` this writer emits.
+///
+/// REFUSES an existing non-inline store rather than converting it: a
+/// `format = "json"` / `"file"` store points at an EXTERNAL file this writer
+/// cannot safely rewrite. Migration is the operator's explicit choice.
+fn ensure_inline_toml_format(
+    store_tbl: &mut toml_edit::Table,
+    platform_name: &str,
+) -> Result<(), String> {
+    let existing = store_tbl.get("format").and_then(toml_edit::Item::as_str);
+    match existing {
+        Some("inline-toml") => Ok(()),
+        Some(other) => Err(format!(
+            "refusing to push: `local_server.config_stores.{platform_name}` uses `format = \
+             \"{other}\"` (an external-file store), which is incompatible with the inline \
+             `contents` this command writes. Converting it here would either produce a manifest \
+             the local server rejects or silently discard the sibling entries the external file \
+             holds. Migrate the store to `format = \"inline-toml\"` (or a fresh store id) yourself, \
+             then re-run. Nothing was changed."
+        )),
+        None => {
+            // A brand-new or format-less entry: this writer owns it, so stamp the
+            // inline format it is about to fill.
+            store_tbl.insert("format", toml_edit::value("inline-toml"));
+            Ok(())
+        }
+    }
+}
+
+/// TOCTOU guard for the LOCAL writer: refuse to overwrite a root that now holds a
+/// NEWER format, classified HERE under the write lock. The generic push's
+/// pre-push future-format check ran BEFORE the lock, so a newer writer could have
+/// installed a v2 value in between; without this the old writer would clobber it.
+fn reject_future_local_roots(
+    contents_tbl: &toml_edit::Table,
+    gc_roots: &[(String, HashSet<String>)],
+) -> Result<(), String> {
+    for (root_key, _) in gc_roots {
+        let Some(existing) = contents_tbl.get(root_key).and_then(toml_edit::Item::as_str) else {
+            continue;
+        };
+        // Raw check: a direct future envelope, a future pointer version, or an
+        // unknown `edgezero_kind`.
+        let mut is_future = value_is_future_format(existing);
+        if !is_future {
+            // Resolve against the locked contents to catch a future INNER envelope
+            // behind a valid v1 pointer. Only `FutureFormat` blocks the write; a
+            // corrupt/incomplete v1 prior stays overwritable.
+            let resolved = resolve_fastly_config_value_typed(root_key, existing.to_owned(), |ck| {
+                Ok(contents_tbl
+                    .get(ck)
+                    .and_then(toml_edit::Item::as_str)
+                    .map(str::to_owned))
+            });
+            is_future = matches!(resolved, Err(err) if err.is_future_format());
+        }
+        if is_future {
+            return Err(format!(
+                "refusing to overwrite `{root_key}`: the local store now holds a value in a newer \
+                 format this CLI does not recognise (installed since the pre-push check). Upgrade \
+                 the CLI rather than clobber a newer format. Nothing was changed."
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1777,7 +1936,7 @@ mod tests {
             ("greeting".to_owned(), "hello".to_owned()),
             ("service.timeout_ms".to_owned(), "1500".to_owned()),
         ];
-        write_fastly_local_config_store(&path, TEST_CONFIG_ID, &entries).expect("write");
+        write_fastly_local_config_store(&path, TEST_CONFIG_ID, &entries, &[]).expect("write");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains(&format!("[local_server.config_stores.{TEST_CONFIG_ID}]")),
@@ -1810,12 +1969,14 @@ mod tests {
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "stale".to_owned())],
+            &[],
         )
         .expect("first write");
         write_fastly_local_config_store(
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "fresh".to_owned())],
+            &[],
         )
         .expect("second write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -1845,6 +2006,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
         )
         .expect("write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -1872,6 +2034,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
         )
         .expect_err("push must refuse to fabricate an unprovisioned store block");
         assert!(
@@ -1892,6 +2055,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
         )
         .expect_err("push must not create fastly.toml from nothing");
         assert!(
@@ -1903,5 +2067,150 @@ build = \"cargo build --release\"
             "push must not create the file on refusal: {}",
             path.display()
         );
+    }
+
+    /// A symlinked manifest must be updated THROUGH the link: the real file's
+    /// contents change and the symlink itself is preserved (not replaced with a
+    /// regular file). The lock and the replace both resolve to the real target.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_follows_a_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let real = dir.path().join("real-fastly.toml");
+        let link = dir.path().join("fastly.toml");
+        seed_provisioned_config_store(&real, "name = \"demo\"\n", TEST_CONFIG_ID);
+        symlink(&real, &link).expect("symlink");
+
+        write_fastly_local_config_store(
+            &link,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
+        )
+        .expect("push through symlink");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "the manifest symlink must be preserved, not replaced with a file"
+        );
+        assert!(
+            fs::read_to_string(&real)
+                .expect("read real")
+                .contains("greeting = \"hi\""),
+            "the real target behind the symlink must be updated"
+        );
+    }
+
+    /// A HARD-LINKED manifest cannot be replaced safely (rename breaks the link;
+    /// path-based locks miss the other names), so the writer FAILS CLOSED with a
+    /// fix rather than silently diverging.
+    #[cfg(unix)]
+    #[test]
+    fn local_rewrite_refuses_a_hard_linked_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = dir.path().join("fastly.toml");
+        let other = dir.path().join("other-name.toml");
+        fs::write(&manifest, "name = \"demo\"\n").expect("seed");
+        fs::hard_link(&manifest, &other).expect("hard link");
+
+        let err = write_fastly_local_config_store(
+            &manifest,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
+        )
+        .expect_err("a hard-linked manifest must be refused");
+        assert!(
+            err.contains("hard link"),
+            "must explain the hard-link refusal: {err}"
+        );
+        // Nothing was written -- the original content is intact.
+        assert_eq!(
+            fs::read_to_string(&manifest).expect("read"),
+            "name = \"demo\"\n",
+            "a refused write must not modify the manifest"
+        );
+    }
+
+    /// Two concurrent local pushes must not lose each other's edit. Each thread
+    /// adds a DISTINCT key; the cross-process lock serialises the whole
+    /// read-modify-write, so the second push reads what the first wrote and both
+    /// keys survive. Without the lock, both would read the same base and the
+    /// later rename would discard the earlier key -- the silent data loss.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_local_pushes_do_not_lose_edits() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().expect("tempdir");
+        let path = Arc::new(dir.path().join("fastly.toml"));
+        seed_provisioned_config_store(path.as_ref(), "name = \"demo\"\n", TEST_CONFIG_ID);
+
+        // Many rounds to make the interleaving likely to hit the race window.
+        for round in 0_u32..25 {
+            let path_a = Arc::clone(&path);
+            let path_b = Arc::clone(&path);
+            let key_a = format!("alpha_{round}");
+            let key_b = format!("beta_{round}");
+            let (ka, kb) = (key_a.clone(), key_b.clone());
+            let ta = thread::spawn(move || {
+                write_fastly_local_config_store(
+                    &path_a,
+                    TEST_CONFIG_ID,
+                    &[(ka, "a".to_owned())],
+                    &[],
+                )
+            });
+            let tb = thread::spawn(move || {
+                write_fastly_local_config_store(
+                    &path_b,
+                    TEST_CONFIG_ID,
+                    &[(kb, "b".to_owned())],
+                    &[],
+                )
+            });
+            ta.join().expect("thread a").expect("push a");
+            tb.join().expect("thread b").expect("push b");
+
+            let after = fs::read_to_string(path.as_ref()).expect("read back");
+            assert!(
+                after.contains(&format!("{key_a} = \"a\"")),
+                "round {round}: `{key_a}` was lost by a concurrent push:\n{after}"
+            );
+            assert!(
+                after.contains(&format!("{key_b} = \"b\"")),
+                "round {round}: `{key_b}` was lost by a concurrent push:\n{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_chunk_keys_subtracts_new_keys() {
+        let mut new_keys = HashSet::new();
+        new_keys.insert("keep".to_owned());
+        let plan = FastlyConfigGcPlan {
+            new_keys,
+            prior_keys: Ok(vec![
+                "gone1".to_owned(),
+                "keep".to_owned(),
+                "gone2".to_owned(),
+            ]),
+        };
+        let orphans = orphan_chunk_keys(&plan).expect("ok");
+        assert_eq!(orphans, vec!["gone1".to_owned(), "gone2".to_owned()]);
+    }
+
+    #[test]
+    fn orphan_chunk_keys_propagates_prior_err() {
+        let plan = FastlyConfigGcPlan {
+            new_keys: HashSet::new(),
+            prior_keys: Err("suspicious".to_owned()),
+        };
+        orphan_chunk_keys(&plan).unwrap_err();
     }
 }

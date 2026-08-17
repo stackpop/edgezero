@@ -524,6 +524,29 @@ impl Adapter for SpinCliAdapter {
         push_local::read_sqlite_entry(&db_path, platform, key)
     }
 
+    // Spin config lives in KV (one value per key, no chunk fan-out), so there
+    // are no orphaned chunk entries to reclaim -- inherit the trait's "not
+    // implemented" default (spelled out for the `missing_trait_methods` lint).
+    fn gc_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _push_ctx: &AdapterPushContext<'_>,
+        _older_than_secs: u64,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "adapter `{}` does not implement `config gc`",
+            self.name()
+        ))
+    }
+
+    fn preflight_config_write(&self, _key: &str, _body: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: Multi for KV AND Config (both label-backed via the
         // Spin KV API now of the spin-kv-config plan).

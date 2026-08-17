@@ -131,12 +131,15 @@ jobs:
       # `AxumConfigStore::from_path` would not be caught by CI.
       # Axum-only path, no live external calls — intentionally kept
       # off the wasm matrix.
+      # `--locked`: app-demo is excluded from the root workspace and keeps its own
+      # committed lockfile, which drifts when the edgezero crates' dependencies
+      # change (e.g. a `syn` major bump lands in the root lock but not here).
+      # Without `--locked` CI silently regenerates it and MASKS that drift; with
+      # it, a stale app-demo lockfile fails here instead of at a consumer's
+      # `cargo build --locked`.
       - name: Run app-demo workspace tests
         working-directory: examples/app-demo
-        # `--locked` so a stale Cargo.lock (e.g. a dependency added to an
-        # adapter crate but not reflected here) fails CI instead of being
-        # silently regenerated.
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --locked --workspace --all-targets
 
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests
@@ -273,6 +276,16 @@ jobs:
         env:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: cargo test -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --test contract
+
+      # The colocated runtime unit tests (config-store resolver, chunk
+      # remediation) need the `fastly` feature and only RUN under Viceroy — the
+      # `--test contract` line above never exercises them. Run the lib target so
+      # the runtime fail-closed/remediation behaviour is actually verified in CI.
+      - name: Run fastly wasm runtime unit tests
+        if: matrix.adapter == 'fastly'
+        env:
+          ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
+        run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --lib
 
       - name: Check ${{ matrix.adapter }} wasm target
         run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}
