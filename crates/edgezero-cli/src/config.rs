@@ -18,7 +18,10 @@
 //! env-overlay unless `--no-env` is passed, so the validation sees
 //! the values the runtime would.
 
-use crate::args::{ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat};
+use crate::args::{
+    ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat,
+    parse_duration_secs,
+};
 use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
 use edgezero_adapter::registry::{
@@ -28,7 +31,7 @@ use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretField, SecretKind,
     SecretPathSegment,
 };
-use edgezero_core::blob_envelope::BlobEnvelope;
+use edgezero_core::blob_envelope::{BlobEnvelope, BlobEnvelopeError, ENVELOPE_VERSION_V1};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::Serialize;
@@ -36,10 +39,27 @@ use serde::de::DeserializeOwned;
 use similar::TextDiff;
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, IsTerminal as _, Write, stdin};
+use std::iter;
 use std::path::{Path, PathBuf};
 use toml::Value;
 use toml::value::Table;
 use validator::Validate;
+
+/// Hard-error message shown when a push would overwrite a NEWER envelope format.
+const FUTURE_FORMAT_PUSH_ERROR: &str = "the remote value uses an envelope version this CLI does not recognise (a newer format); \
+     UPGRADE the CLI to push to this store rather than overwrite a newer format.";
+
+/// A `Present` remote body, classified for the push/diff flow.
+enum PresentBody {
+    /// The value exists but is corrupt (malformed, or a SHA mismatch). Treated
+    /// like `Corrupt`: the push OVERWRITES it (the in-band repair). This makes the
+    /// repair contract hold for EVERY adapter, not just Fastly -- axum, Cloudflare
+    /// and Spin return a raw stored value as `Present`, and the generic layer here
+    /// (not each adapter) turns an unverifiable one into a repairable overwrite.
+    Corrupt,
+    /// A valid, integrity-verified envelope to diff against.
+    Valid(Box<BlobEnvelope>),
+}
 
 /// Pre-loaded state for either push flow. Shares
 /// [`ValidationContext`] with the validate flows (manifest, raw
@@ -125,6 +145,10 @@ pub struct DiffExit {
 /// Internal outcome of a `config diff` run. Drives `apply_exit_code`.
 /// Variants are alphabetical per `clippy::arbitrary_source_item_ordering`.
 enum DiffOutcome {
+    /// The remote entry exists but is CORRUPT — no valid comparison was
+    /// possible. Reported distinctly (never as "no changes" or "all added") so a
+    /// scripted `config diff` cannot read it as a successful clean comparison.
+    CorruptRemote,
     /// Diff is present (remote != local, or remote absent).
     DiffPresent,
     /// SHA matched — no changes.
@@ -272,6 +296,140 @@ pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
     )
 }
 
+/// `config gc` — reclaim chunk entries no live config pointer references.
+///
+/// Runs in-band in the bundled binary: unlike `push` / `diff` it needs no typed
+/// app-config, only the store's own contents.
+///
+/// SAFE BY DEFAULT: without `--yes` this is a dry-run. The adapter fails closed
+/// — if it cannot classify the store's state with confidence it deletes nothing.
+///
+/// # Errors
+///
+/// Returns `Err` if `dry_run` and `yes` are BOTH set (contradictory), the
+/// manifest/adapter cannot be resolved, `--older-than` is unparseable, or the
+/// adapter refuses to reclaim (unreadable/unclassifiable state).
+#[inline]
+pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
+    // Reject the contradictory combination clap also forbids, so the PUBLIC API is
+    // safe for a library caller that bypasses clap: a single run cannot both
+    // preview and delete. Checked FIRST so the error is unambiguous, rather than
+    // the threshold validation or the `dry_run || !yes` fallback silently
+    // resolving it. (Passing NEITHER flag is valid -- that is the default dry-run.)
+    if args.dry_run && args.yes {
+        return Err(
+            "`config gc` cannot both preview and delete: `--dry-run` and `--yes` are mutually \
+             exclusive. Pass at most one (omit both for the default dry-run preview)."
+                .to_owned(),
+        );
+    }
+    // A destructive run must not invent the operator's safety assertion.
+    let older_than_secs = match (args.yes, args.older_than.as_deref()) {
+        (true, None) => {
+            return Err(
+                "`config gc --yes` requires an explicit `--older-than <dur>`: a destructive run \
+                 must not guess it. It asserts that NO root in the selected store changed within \
+                 that window and that no writer is targeting the store, so nothing POPs may still \
+                 be serving is deleted -- `gc` sweeps the whole physical store, not just the \
+                 config you have in mind. Run without `--yes` first to preview every orphan and \
+                 its age."
+                    .to_owned(),
+            );
+        }
+        (yes, Some(raw)) => {
+            let secs = parse_duration_secs(raw)?;
+            // `--older-than 0 --yes` asserts nothing: it makes EVERY orphan
+            // eligible, including one superseded a second ago whose pointer
+            // POPs are still serving. Dry-run may preview at zero; a delete
+            // may not run at it.
+            if yes && secs == 0 {
+                return Err(format!(
+                    "`config gc --yes --older-than {raw}` resolves to 0 seconds, which asserts \
+                     nothing: it would make every orphan eligible, including chunks a pointer POPs \
+                     are still serving. Pass a window at least as long as Fastly's propagation \
+                     time and no longer than the time since ANY root in this store last changed."
+                ));
+            }
+            secs
+        }
+        // Dry-run with no threshold: preview EVERY orphan (age >= 0) with ages,
+        // so the operator can choose `--older-than` from real data.
+        (false, None) => 0,
+    };
+
+    // Manifest-only resolution. Unlike `push`/`diff`, `gc` reclaims by
+    // inspecting the STORE, so it must NOT require the typed app-config file to
+    // exist — resolve the adapter + store straight from `edgezero.toml`.
+    let manifest_loader = ManifestLoader::from_path(&args.manifest)
+        .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
+    let manifest = manifest_loader.manifest();
+    ensure_adapter_defined(&args.adapter, Some(&manifest_loader))?;
+    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
+        format!(
+            "adapter `{}` is declared in {} but not registered in this build (rebuild the CLI with its feature enabled)",
+            args.adapter,
+            args.manifest.display()
+        )
+    })?;
+    let (_canonical, adapter_cfg) = manifest.adapter_entry(adapter.name()).ok_or_else(|| {
+        format!(
+            "adapter `{}` has no `[adapters.{}]` block",
+            args.adapter, args.adapter
+        )
+    })?;
+
+    let logical = resolve_config_store_id(args.store.as_deref(), manifest)?;
+    // `--no-env` means: do not overlay `EDGEZERO__*`. An empty config yields the
+    // logical id as the platform name (`store_name`'s fallback).
+    let env_config = if args.no_env {
+        EnvConfig::from_vars(iter::empty::<(String, String)>())
+    } else {
+        EnvConfig::from_env()
+    };
+    let platform = env_config.store_name("config", &logical);
+    let store = ResolvedStoreId::new(logical, platform);
+
+    let manifest_root = args
+        .manifest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
+    let component_selector = adapter_cfg.adapter.component.clone();
+    let mut push_ctx = adapter_registry::AdapterPushContext::new();
+    if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
+        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
+    }
+
+    // A dry-run reports and deletes nothing. It is the DEFAULT (no `--yes`), and
+    // `--dry-run` states that intent explicitly (clap makes the two mutually
+    // exclusive, so an explicit `--dry-run` always means `--yes` is unset).
+    let dry_run = args.dry_run || !args.yes;
+    let lines = adapter.gc_config_entries(
+        manifest_root,
+        adapter_manifest_path.as_deref(),
+        component_selector.as_deref(),
+        &store,
+        &push_ctx,
+        older_than_secs,
+        dry_run,
+    )?;
+    for line in lines {
+        log::info!("[edgezero] {line}");
+    }
+    if dry_run {
+        match args.older_than.as_deref() {
+            Some(dur) => log::info!(
+                "[edgezero] dry-run: nothing was deleted. Re-run with `--yes --older-than {dur}` to apply (a destructive run requires the explicit window). `--older-than {dur}` asserts that NO root in this store changed within that window and that no writer is targeting it -- this sweeps the whole physical store, not just one config."
+            ),
+            None => log::info!(
+                "[edgezero] dry-run: previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since ANY root in this store last changed -- gc sweeps every root here, so a sibling you re-pushed recently also constrains the window. Then re-run with `--yes --older-than <dur>` (a bare `--yes` is rejected)."
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Typed flow — push the user's `C` struct. Runs strict pre-flight
 /// validation, then builds a `BlobEnvelope`, reads back the current
 /// remote for skip-on-equal + inline diff, prompts for consent, and
@@ -322,6 +480,12 @@ where
     let local_envelope: BlobEnvelope =
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
     let local_sha = local_envelope.sha256.clone();
+
+    // Reject an infeasible push (bad/over-limit key, over-limit derived chunk
+    // keys, oversized pointer) BEFORE any provider I/O — otherwise it would
+    // trigger a list/describe round-trip only to be rejected by the write path
+    // afterwards. `body` is the envelope JSON the write would store.
+    ctx.adapter.preflight_config_write(&key, &body)?;
 
     // First read + diff.
     let remote = read_remote(ctx.adapter, args.local, &paths, &ctx.store, &key)?;
@@ -379,7 +543,10 @@ fn diff_info(msg: &str) {
 /// per Q10's table.
 fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
     let code = match (exit_code_flag, outcome) {
-        (_, DiffOutcome::Unsupported) => 2_i32,
+        // "Could not compare" (unsupported read-back, or a corrupt remote) is
+        // exit 2 REGARDLESS of --exit-code, so it is never mistaken for a clean
+        // comparison by a script.
+        (_, DiffOutcome::Unsupported | DiffOutcome::CorruptRemote) => 2_i32,
         (true, DiffOutcome::DiffPresent | DiffOutcome::RemoteAbsent) => 1_i32,
         // false + any, or true + NoChanges → no signal.
         _ => 0_i32,
@@ -485,26 +652,32 @@ where
 
     // Branch per variant, render, determine outcome.
     let outcome: DiffOutcome = match &remote {
-        ReadConfigEntry::Present(body) => {
-            let remote_envelope: BlobEnvelope = serde_json::from_str(body)
-                .map_err(|err| format!("remote envelope parse failed: {err}"))?;
-            remote_envelope
-                .verify()
-                .map_err(|err| format!("remote envelope verification failed: {err}"))?;
-            if remote_envelope.sha256 == local_sha {
-                diff_info(&format!("# no changes (sha256 matches: {local_sha})"));
-                DiffOutcome::NoChanges
-            } else {
-                dispatch_diff_format(
-                    &remote_envelope.data,
-                    &local_envelope.data,
-                    &remote_envelope.sha256,
-                    &local_sha,
-                    &args.format,
-                );
-                DiffOutcome::DiffPresent
+        ReadConfigEntry::Present(body) => match classify_present_body(body)? {
+            // A future envelope version returns Err above (hard error).
+            PresentBody::Valid(remote_envelope) => {
+                if remote_envelope.sha256 == local_sha {
+                    diff_info(&format!("# no changes (sha256 matches: {local_sha})"));
+                    DiffOutcome::NoChanges
+                } else {
+                    dispatch_diff_format(
+                        &remote_envelope.data,
+                        &local_envelope.data,
+                        &remote_envelope.sha256,
+                        &local_sha,
+                        &args.format,
+                    );
+                    DiffOutcome::DiffPresent
+                }
             }
-        }
+            PresentBody::Corrupt => {
+                diff_info(&format!(
+                    "# existing value at key `{key}` is unusable; NO diff was computed. \
+                     `<app-cli> config push --adapter {} --yes` will REPLACE it.",
+                    args.adapter,
+                ));
+                DiffOutcome::CorruptRemote
+            }
+        },
         ReadConfigEntry::MissingKey => {
             let leaf_count = collect_changes(
                 &serde_json::Value::Object(serde_json::Map::default()),
@@ -542,6 +715,14 @@ where
                 &args.format,
             );
             DiffOutcome::RemoteAbsent
+        }
+        ReadConfigEntry::Corrupt(reason) => {
+            diff_info(&format!(
+                "# existing value at key `{key}` is unusable ({reason}); NO diff was computed. \
+                 `<app-cli> config push --adapter {} --yes` will REPLACE it.",
+                args.adapter,
+            ));
+            DiffOutcome::CorruptRemote
         }
         ReadConfigEntry::Unsupported(reason) => {
             diff_info(&format!(
@@ -590,7 +771,20 @@ fn dispatch_diff_format(
 /// Consent gate: 8.3 Spin Cloud four-branch UX when `remote` is
 /// `Unsupported`; 8.2 default flow otherwise.
 fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(), String> {
+    // A CORRUPT remote (the value exists but does not resolve) is NOT handled
+    // here — it falls to the `else` NORMAL consent path below, so a push
+    // overwrites the broken generation with just `--yes`. That is the in-band
+    // repair the runtime and spec promise.
+    //
+    // The `Unsupported` branch below is for a read that could not be COMPUTED at
+    // all: a CLOUD read that cannot reach the backend (Spin Cloud), where a
+    // dry-run is genuinely impossible; or a LOCAL read of malformed on-disk state
+    // (unreadable/invalid TOML, a non-table parent) — a recoverable single-file
+    // overwrite that takes the normal consent path (`if args.local`).
     if let ReadConfigEntry::Unsupported(reason) = remote {
+        if args.local {
+            return require_consent(args, remote);
+        }
         if args.dry_run {
             return Err(format!(
                 "config push --dry-run --adapter spin against Spin Cloud is unsupported \
@@ -684,12 +878,15 @@ fn recheck_before_write(
     approved_remote_sha: Option<&str>,
 ) -> Result<RecheckOutcome, String> {
     let remote_now = read_remote(adapter, args.local, paths, store, key)?;
-    if let ReadConfigEntry::Present(body_now) = remote_now {
-        let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now)
-            .map_err(|err| format!("post-consent remote envelope parse failed: {err}"))?;
-        remote_now_env
-            .verify()
-            .map_err(|err| format!("post-consent remote envelope verification failed: {err}"))?;
+    // A Present body that no longer verifies (a concurrent write landed a corrupt
+    // value on any adapter) is handled like the `Corrupt` variant below: overwrite
+    // to repair. A FUTURE envelope version returns Err (hard error).
+    let present_now = if let ReadConfigEntry::Present(body_now) = &remote_now {
+        Some(classify_present_body(body_now)?)
+    } else {
+        None
+    };
+    if let Some(PresentBody::Valid(remote_now_env)) = &present_now {
         if remote_now_env.sha256 == local_sha {
             push_info(&format!(
                 "# concurrent push reached the same state (sha256 matches: {local_sha}); skipping write"
@@ -708,6 +905,15 @@ fn recheck_before_write(
                 short_ref(&remote_now_env.sha256),
             ));
         }
+    } else if matches!(remote_now, ReadConfigEntry::Corrupt(_))
+        || matches!(present_now, Some(PresentBody::Corrupt))
+    {
+        // The remote is (or became) CORRUPT: report it precisely instead of
+        // modelling it as a removal, then overwrite. A Present→Corrupt transition
+        // is a concurrent write that landed a broken value, not a deletion.
+        push_info(&format!(
+            "# remote value at key `{key}` is unusable at write time; overwriting to repair it"
+        ));
     } else if matches!(first_read, ReadConfigEntry::Present(_)) {
         // First read Present, second read MissingKey/MissingStore:
         // the remote was removed while we waited for consent. Warn
@@ -719,10 +925,59 @@ fn recheck_before_write(
             ));
         }
     } else {
-        // First read MissingKey/MissingStore, second also Missing —
-        // nothing changed; fall through to write silently.
+        // First read MissingKey/MissingStore/Corrupt, second also non-Present —
+        // nothing to compare; fall through to write.
     }
     Ok(RecheckOutcome::Write)
+}
+
+/// Classify a `Present` body. `Err` for a FUTURE format (a bumped envelope
+/// version) — the push must refuse rather than overwrite a newer format.
+fn classify_present_body(body: &str) -> Result<PresentBody, String> {
+    // Detect a NEWER envelope version BEFORE deserializing as the exact v1 schema.
+    // A v2 envelope may add/rename/retype fields and fail to deserialize as the v1
+    // `BlobEnvelope`, which would otherwise fall through to `Corrupt` and let a
+    // downgrade push overwrite a newer format. Version detection must come first.
+    if body_is_future_envelope(body) {
+        return Err(FUTURE_FORMAT_PUSH_ERROR.to_owned());
+    }
+    match serde_json::from_str::<BlobEnvelope>(body) {
+        Ok(envelope) => match envelope.verify() {
+            Ok(()) => Ok(PresentBody::Valid(Box::new(envelope))),
+            // A bumped envelope version is a newer format: do NOT overwrite it.
+            Err(BlobEnvelopeError::UnknownVersion(_)) => Err(FUTURE_FORMAT_PUSH_ERROR.to_owned()),
+            // A SHA mismatch is corruption a push repairs.
+            Err(_) => Ok(PresentBody::Corrupt),
+        },
+        // Not a parseable envelope at all: corruption a push repairs.
+        Err(_) => Ok(PresentBody::Corrupt),
+    }
+}
+
+/// Is `body` a NEWER format this CLI must not overwrite?
+///
+/// A cheap, schema-agnostic pre-check that parses only as a generic JSON object.
+/// True when EITHER:
+/// - it carries an `edgezero_kind` field. A v1 `BlobEnvelope` never has one; its
+///   presence means a chunk pointer or a newer discriminated format. serde would
+///   otherwise ignore the unknown field and deserialize a v1-shaped envelope with
+///   `edgezero_kind: "new_format"` as valid, letting a push overwrite it; or
+/// - it carries a `version` field that is present but NOT 1 -- a newer envelope
+///   even when it no longer deserializes as the exact v1 [`BlobEnvelope`].
+///
+/// A missing/absent version with no `edgezero_kind` is NOT future (that stays
+/// repairable corruption).
+fn body_is_future_envelope(body: &str) -> bool {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if obj.contains_key("edgezero_kind") {
+        return true;
+    }
+    // A `version` PRESENT but not EXACTLY integer 1 is a newer format. `as_u64()`
+    // alone fails open on `"2"`, `-1`, `2.5`, or `1.0`.
+    obj.get("version")
+        .is_some_and(|version| version.as_u64() != Some(u64::from(ENVELOPE_VERSION_V1)))
 }
 
 /// Render the first-read diff and return the outcome.
@@ -730,6 +985,8 @@ fn recheck_before_write(
 /// - `Present` with matching SHA → `NoChange`.
 /// - `Present` with differing SHA → renders diff (when `!no_diff`) and
 ///   returns `ProceedFromPresent` with the remote SHA.
+/// - `Present` but unverifiable (corrupt) → proceeds to overwrite (repair);
+///   a FUTURE envelope version is a hard error instead.
 /// - `MissingKey` / `MissingStore` → renders "all leaves added" diff
 ///   (when `!no_diff`) and returns `ProceedFromMissingOrUnsupported`.
 /// - `Unsupported` → returns `ProceedFromMissingOrUnsupported` without
@@ -746,27 +1003,33 @@ fn render_first_read_diff(
     no_diff: bool,
 ) -> Result<FirstReadOutcome, String> {
     match remote {
-        ReadConfigEntry::Present(body_str) => {
-            let remote_envelope: BlobEnvelope = serde_json::from_str(body_str)
-                .map_err(|err| format!("remote envelope parse failed: {err}"))?;
-            remote_envelope
-                .verify()
-                .map_err(|err| format!("remote envelope verification failed: {err}"))?;
-            if remote_envelope.sha256 == local_sha {
-                return Ok(FirstReadOutcome::NoChange);
+        ReadConfigEntry::Present(body_str) => match classify_present_body(body_str)? {
+            PresentBody::Valid(remote_envelope) => {
+                if remote_envelope.sha256 == local_sha {
+                    return Ok(FirstReadOutcome::NoChange);
+                }
+                if !no_diff {
+                    print_unified_diff_inline(
+                        &remote_envelope.data,
+                        &local_envelope.data,
+                        &remote_envelope.sha256,
+                        local_sha,
+                    );
+                }
+                Ok(FirstReadOutcome::ProceedFromPresent {
+                    approved_remote_sha: remote_envelope.sha256.clone(),
+                })
             }
-            if !no_diff {
-                print_unified_diff_inline(
-                    &remote_envelope.data,
-                    &local_envelope.data,
-                    &remote_envelope.sha256,
-                    local_sha,
-                );
+            PresentBody::Corrupt => {
+                // Corrupt on ANY adapter (an unverifiable Present value): no real
+                // prior to diff. Report it and overwrite -- the in-band repair.
+                push_info(&format!(
+                    "# existing value at key `{key}` is unusable; NO diff was computed. It will be \
+                     REPLACED by this push."
+                ));
+                Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
             }
-            Ok(FirstReadOutcome::ProceedFromPresent {
-                approved_remote_sha: remote_envelope.sha256.clone(),
-            })
-        }
+        },
         ReadConfigEntry::MissingKey if !no_diff => {
             push_info(&format!("# no remote at key `{key}`; all leaves added"));
             print_unified_diff_inline(
@@ -789,6 +1052,17 @@ fn render_first_read_diff(
                 "(none)",
                 local_sha,
             );
+            Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
+        }
+        ReadConfigEntry::Corrupt(reason) => {
+            // The existing remote value is unreadable, so there is NO real prior
+            // to diff against. Do NOT fabricate a local-vs-empty diff (that reads
+            // as "the remote was empty"); just report the corruption and proceed
+            // to overwrite (the in-band repair).
+            push_info(&format!(
+                "# existing value at key `{key}` is unusable ({reason}); NO diff was computed. It \
+                 will be REPLACED by this push."
+            ));
             Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
         }
         // Unsupported, MissingKey/MissingStore with no_diff, and future
@@ -1639,6 +1913,295 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    // ---------- config gc argument gating ----------
+
+    /// A destructive `config gc --yes` MUST NOT invent the safety assertion: it
+    /// requires an explicit `--older-than`. The check runs before any manifest
+    /// or store access, so it is testable in isolation.
+    #[test]
+    fn config_gc_yes_requires_explicit_older_than() {
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            yes: true,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        let err = run_config_gc(&args).expect_err("--yes without --older-than must be rejected");
+        assert!(
+            err.contains("requires an explicit"),
+            "must explain the requirement: {err}"
+        );
+    }
+
+    /// The PUBLIC runner rejects `dry_run` + `yes` together, not only clap: a
+    /// library caller that sets both fields must get an explicit error, never the
+    /// wrong-threshold message or a silent preview.
+    ///
+    /// The conflict is checked FIRST, so it wins over EVERY `older_than` shape --
+    /// missing, zero, malformed, or overflowing. If any of these produced the
+    /// threshold error (or a preview) instead of the conflict error, the
+    /// precedence would be wrong.
+    #[test]
+    fn config_gc_conflict_wins_over_every_threshold() {
+        let overflow = format!("{}d", u64::MAX); // parses to a number, then overflows the *86400
+        let thresholds = [
+            None,
+            Some("0"),
+            Some("not-a-duration"),
+            Some(overflow.as_str()),
+            Some("7d"),
+        ];
+        for older_than in thresholds {
+            let args = ConfigGcArgs {
+                adapter: "fastly".to_owned(),
+                dry_run: true,
+                yes: true,
+                older_than: older_than.map(str::to_owned),
+                ..ConfigGcArgs::default()
+            };
+            let err = run_config_gc(&args).expect_err(&format!(
+                "dry_run + yes must error, not preview (older_than={older_than:?})"
+            ));
+            assert!(
+                err.contains("mutually exclusive"),
+                "conflict must win over the threshold for older_than={older_than:?}: {err}"
+            );
+        }
+    }
+
+    /// `--older-than 0 --yes` parses, but asserts NOTHING --
+    /// it makes every orphan eligible, including one superseded a second ago whose
+    /// pointer POPs still serve. A destructive run must reject it (a dry-run may
+    /// still preview at zero — see `config_gc_dry_run_allows_missing_older_than`).
+    #[test]
+    fn config_gc_yes_rejects_zero_older_than() {
+        for raw in ["0", "0s", "0d"] {
+            let args = ConfigGcArgs {
+                adapter: "fastly".to_owned(),
+                yes: true,
+                older_than: Some(raw.to_owned()),
+                ..ConfigGcArgs::default()
+            };
+            let err = run_config_gc(&args)
+                .expect_err("a zero window on a destructive run must be rejected");
+            assert!(
+                err.contains("resolves to 0 seconds"),
+                "`--older-than {raw}` must be rejected as a no-op assertion, got: {err}"
+            );
+        }
+    }
+
+    /// Build a fake `fastly` that maps store name→id via `config-store list`
+    /// (`store_list_json`), serves `entry_list_json` for `config-store-entry
+    /// list`, and logs every `config-store-entry` invocation's argv to `oplog`
+    /// (so a test can assert which store-id the resolved name flowed to, and any
+    /// delete arguments).
+    #[cfg(unix)]
+    fn fake_fastly_gc_list(
+        store_list_json: &str,
+        entry_list_json: &str,
+        oplog: &Path,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let list_file = tmp.path().join("list.json");
+        fs::write(&list_file, entry_list_json).expect("write entry list json");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then echo '{stores}'; exit 0; fi\n\
+             case \"$2\" in\n  list) echo \"list $*\" >> '{log}'; cat '{list}'; exit 0;;\n  delete) echo \"delete $*\" >> '{log}'; exit 0;;\nesac\nexit 0\n",
+            stores = store_list_json,
+            list = list_file.display(),
+            log = oplog.display(),
+        );
+        let script_path = tmp.path().join("fastly");
+        fs::write(&script_path, &script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        tmp
+    }
+
+    const GC_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+"#;
+
+    /// COMMAND-LEVEL GC: a dry-run drives the whole wrapper — manifest load, store
+    /// resolution, adapter-registry dispatch, listing, classification, and
+    /// reporting — end to end. A store with only a live root and a foreign sibling
+    /// has nothing to reclaim, so the command SUCCEEDS and deletes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_dispatches_and_reports_nothing_to_reclaim() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+
+        let live = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "greeting": "hi" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let list = json!([
+            { "item_key": "app_config", "item_value": live, "created_at": "2026-07-01T00:00:00Z" },
+            { "item_key": "greeting", "item_value": "hello", "created_at": "2026-07-01T00:00:00Z" },
+        ])
+        .to_string();
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(r#"[{"name":"app_config","id":"store-1"}]"#, &list, &oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: true,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        run_config_gc(&args).expect("a dry-run over a clean store must succeed end to end");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.contains("delete "),
+            "a dry-run (and a nothing-to-reclaim store) must delete nothing: {log}"
+        );
+    }
+
+    /// COMMAND-LEVEL fail-closed regression: a store whose root claims an
+    /// UNKNOWN/future `edgezero_kind` must abort the whole command (nothing
+    /// deleted), driven through the real dispatch path, not just the internal
+    /// classifier.
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_fails_closed_on_unknown_kind_root() {
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+
+        let list = json!([
+            {
+                "item_key": "app_config",
+                "item_value": r#"{"edgezero_kind":"fastly_config_chunks_v2","data":{}}"#,
+                "created_at": "2026-07-01T00:00:00Z"
+            },
+        ])
+        .to_string();
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(r#"[{"name":"app_config","id":"store-1"}]"#, &list, &oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: true,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        let err = run_config_gc(&args).expect_err("an unknown-kind root must fail closed");
+        assert!(
+            err.contains("refusing to reclaim") || err.contains("does not recognise"),
+            "must fail closed on the unknown kind: {err}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.contains("delete "),
+            "a fail-closed run deletes nothing: {log}"
+        );
+    }
+
+    /// COMMAND-LEVEL store routing: the ENV-derived platform name
+    /// (`EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`) must drive store selection.
+    /// The gc resolves that name to a Fastly store id via `config-store list`,
+    /// then lists entries under that id. The fake only knows the env name, so a
+    /// wrong-store regression (ignoring the overlay) would fail resolution — and
+    /// we assert the resolved id flowed through to the entry listing.
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_selects_the_env_derived_store() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let _env = EnvOverride::set(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+            "shared_config",
+        );
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+
+        let live = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "greeting": "hi" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let entries = json!([
+            { "item_key": "app_config", "item_value": live, "created_at": "2026-07-01T00:00:00Z" },
+        ])
+        .to_string();
+        // The store list is keyed ONLY on the ENV name -> a specific id. If the
+        // overlay were ignored (logical "app_config" looked up), resolution fails.
+        let stores = r#"[{"name":"shared_config","id":"store-42"}]"#;
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(stores, &entries, &oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: false, // apply the EDGEZERO__* overlay
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        run_config_gc(&args).expect("the env-derived store must resolve and list");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            log.contains("--store-id=store-42"),
+            "the entry listing must run against the ENV-derived store id: {log}"
+        );
+    }
+
+    /// A dry-run (no `--yes`) is allowed without `--older-than`; it fails later,
+    /// only because the fixture manifest/adapter is absent — NOT on the
+    /// threshold gate. (Proves the gate does not fire for a dry-run.)
+    #[test]
+    fn config_gc_dry_run_allows_missing_older_than() {
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest: PathBuf::from("does-not-exist.toml"),
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        let err = run_config_gc(&args).expect_err("no manifest here");
+        assert!(
+            !err.contains("requires an explicit"),
+            "the threshold gate must not fire for a dry-run: {err}"
+        );
+    }
 
     // ---------- shared fixtures ----------
 
@@ -2739,6 +3302,383 @@ deep = true
 
     // ---------- typed push ----------
 
+    /// A corrupt local prior value must not block `config push --local`: the
+    /// diff read degrades to `Unsupported`, and the shared handler must route a
+    /// LOCAL `Unsupported` through the normal consent path (reaching the writer)
+    /// rather than the Spin-Cloud dry-run rejection. Exercises the real
+    /// orchestration end-to-end, not the adapter methods in isolation.
+    #[test]
+    fn local_dry_run_over_corrupt_prior_reaches_the_writer() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+
+        // Every kind of unreadable prior STATE must let a local dry-run reach the
+        // writer's degrading count rather than hitting the Spin-Cloud rejection:
+        // a corrupt-but-parsing pointer, malformed TOML, and a non-string root.
+        let corrupt_pointer = format!(
+            "app_config = {}",
+            toml_string_literal(&format!(
+                "{{\"edgezero_kind\":\"fastly_config_chunks\",\"version\":1,\"chunks\":[{{\"key\":\"app_config.__edgezero_chunks.{sha}.0\",\"len\":10,\"sha256\":\"x\"}}],\"data_sha256\":\"\",\"envelope_len\":10,\"envelope_sha256\":\"{sha}\"}}",
+                sha = "a".repeat(64),
+            )),
+        );
+        let cases = [
+            (
+                "corrupt pointer",
+                format!("[local_server.config_stores.app_config.contents]\n{corrupt_pointer}\n"),
+            ),
+            (
+                "malformed TOML",
+                "[local_server.config_stores.app_config.contents]\nthis is not valid toml = = ="
+                    .to_owned(),
+            ),
+            (
+                "non-string root",
+                "[local_server.config_stores.app_config.contents]\napp_config = 42\n".to_owned(),
+            ),
+        ];
+
+        for (label, fastly_toml) in cases {
+            let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+            fs::write(dir.path().join("fastly.toml"), &fastly_toml).expect("write fastly.toml");
+
+            let mut args = push_args(&manifest, "fastly");
+            args.local = true;
+            args.dry_run = true;
+            args.app_config = Some(dir.path().join("demo-app.toml"));
+
+            run_config_push_typed::<FixtureConfig>(&args).unwrap_or_else(|err| {
+                panic!("a local dry-run over {label} must reach the writer, not be rejected: {err}")
+            });
+        }
+    }
+
+    /// The dry-run degradation does NOT weaken the real push: a real
+    /// `config push --local` over malformed TOML still fails fatally at the
+    /// writer (which cannot parse the file to write into it).
+    #[test]
+    fn local_real_push_over_malformed_toml_still_fails() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        fs::write(dir.path().join("fastly.toml"), "this is not = = valid toml")
+            .expect("write fastly.toml");
+
+        let mut args = push_args(&manifest, "fastly");
+        args.local = true;
+        args.yes = true; // real write, non-interactive
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("a real push over malformed TOML must fail at the writer");
+    }
+
+    /// The body-aware preflight runs BEFORE any remote I/O: an infeasible cloud
+    /// push (here, a reserved `--key`) fails with the preflight error, not a
+    /// `fastly`-not-found / auth error from the remote read. If preflight ran
+    /// after `read_remote`, the error would be about the missing/failed shell-out.
+    #[test]
+    fn cloud_push_preflight_rejects_reserved_key_before_remote_io() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        // A fake `fastly` on PATH records any invocation, so an ordering
+        // regression shows up as a logged call rather than a real shell-out.
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_logging(&oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let mut args = push_args(&manifest, "fastly");
+        // A reserved-namespace --key: infeasible, and preflight-detectable.
+        args.key = Some("app_config.__edgezero_chunks.deadbeef.0".to_owned());
+        args.yes = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("a reserved --key must be rejected");
+        assert!(
+            err.contains("reserved infix"),
+            "must fail at preflight (before any remote read), not on a shell-out: {err}"
+        );
+        assert!(
+            !oplog.exists(),
+            "preflight must reject BEFORE any `fastly` invocation; log: {:?}",
+            fs::read_to_string(&oplog).unwrap_or_default()
+        );
+    }
+
+    /// Stronger ordering proof: the generic push runs the FULL body-aware
+    /// preflight offline before ANY remote I/O. Unlike a reserved key (rejectable
+    /// by key SHAPE alone), a DERIVED-key overflow is only detectable by actually
+    /// expanding the envelope into chunks — a ~200-char root key is itself valid,
+    /// but once the >8 000-byte body chunks, the derived `<root>.__edgezero_chunks.
+    /// <64-char-sha>.<index>` key exceeds the 255-char store limit. If preflight
+    /// ran AFTER `read_remote`, the error would be a `fastly`-not-found shell-out
+    /// (no CLI on PATH in tests), never the key-limit message — so this pins that
+    /// the generic path performs no list/describe/update/delete before the offline
+    /// feasibility check has passed.
+    #[test]
+    fn cloud_push_preflight_rejects_derived_key_overflow_before_remote_io() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        // A fake `fastly` on PATH records any invocation, so an ordering
+        // regression shows up as a logged call rather than a real shell-out
+        // against the developer's authenticated CLI.
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_logging(&oplog);
+        let _prepend = PathPrepend::new(fake.path());
+        // A body large enough to force chunking (envelope > 8 000 bytes). The
+        // huge `greeting` passes `#[validate(length(min = 1))]`.
+        let big_app_config = format!(
+            "api_token = \"demo_api_token\"\ngreeting = \"{}\"\nvault = \"default\"\n\n[service]\ntimeout_ms = 1500\n",
+            "x".repeat(9_000)
+        );
+        fs::write(dir.path().join("demo-app.toml"), big_app_config).expect("write big app config");
+
+        let mut args = push_args(&manifest, "fastly");
+        // A VALID root key (<= 255 chars, no reserved infix) whose DERIVED chunk
+        // key (+~85 chars) overflows the store's 255-char limit once chunked.
+        args.key = Some("r".repeat(200));
+        args.yes = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("a derived-key overflow must be rejected");
+        assert!(
+            err.contains("character limit"),
+            "must fail at the offline body-aware preflight (before any remote read), not on a \
+             shell-out: {err}"
+        );
+        // The decisive assertion: NO list/describe/update/delete was attempted.
+        assert!(
+            !oplog.exists(),
+            "the body-aware preflight must reject BEFORE any `fastly` invocation; log: {:?}",
+            fs::read_to_string(&oplog).unwrap_or_default()
+        );
+    }
+
+    /// A CORRUPT remote (the value exists but does not resolve) must let the push
+    /// PROCEED to overwrite — the in-band repair contract. `render_first_read_diff`
+    /// returns `ProceedFromMissingOrUnsupported`, and the consent gate takes the
+    /// normal `--yes` path (not the Spin-Cloud Unsupported branch).
+    #[test]
+    fn corrupt_remote_proceeds_to_overwrite_not_abort() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let local = BlobEnvelope::new(json!({ "k": "v" }), "2026-01-01T00:00:00Z".to_owned());
+        let outcome = render_first_read_diff(
+            &ReadConfigEntry::Corrupt("corrupt or incomplete chunk state"),
+            "app_config",
+            &local,
+            &local.sha256,
+            true,
+        )
+        .expect("a corrupt remote must not error the diff read");
+        assert!(
+            matches!(outcome, FirstReadOutcome::ProceedFromMissingOrUnsupported),
+            "a corrupt remote must proceed to overwrite, not abort"
+        );
+
+        // Consent: with --yes the push proceeds (repair), and it does NOT take the
+        // Spin-Cloud Unsupported branch (which would mis-message a fastly repair).
+        let mut args = push_args(Path::new("unused.toml"), "fastly");
+        args.yes = true;
+        handle_consent(&args, &ReadConfigEntry::Corrupt("corrupt")).expect("--yes must proceed");
+    }
+
+    /// A read-only `config diff` against a CORRUPT remote must NOT read as a
+    /// clean/absent comparison: it exits 2 ("could not compare") regardless of
+    /// `--exit-code`, distinct from `NoChanges` (0) and `RemoteAbsent`/`DiffPresent`.
+    #[test]
+    fn corrupt_remote_diff_exits_could_not_compare() {
+        assert_eq!(
+            apply_exit_code(false, DiffOutcome::CorruptRemote).code,
+            2_i32
+        );
+        assert_eq!(
+            apply_exit_code(true, DiffOutcome::CorruptRemote).code,
+            2_i32
+        );
+        // For contrast: a clean match is 0, and an absent remote with --exit-code
+        // signals a change (1) -- neither is what a corrupt remote reports.
+        assert_eq!(apply_exit_code(false, DiffOutcome::NoChanges).code, 0_i32);
+        assert_eq!(apply_exit_code(true, DiffOutcome::RemoteAbsent).code, 1_i32);
+    }
+
+    /// The repair contract is GENERIC, not Fastly-only: any adapter that returns a
+    /// malformed value as `Present` still gets the overwrite-to-repair behavior
+    /// (the generic layer classifies it), while a FUTURE envelope version is a
+    /// hard error the push refuses.
+    #[test]
+    fn present_body_classification_drives_generic_repair() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let valid = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "k": "v" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            classify_present_body(&valid),
+            Ok(PresentBody::Valid(_))
+        ));
+
+        // A malformed value returned as Present (axum/cloudflare/spin path) is
+        // repairable Corrupt -> the push overwrites it, on ANY adapter.
+        assert!(matches!(
+            classify_present_body("not an envelope"),
+            Ok(PresentBody::Corrupt)
+        ));
+        let mut bad_sha: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        bad_sha["sha256"] = json!("0".repeat(64));
+        assert!(matches!(
+            classify_present_body(&bad_sha.to_string()),
+            Ok(PresentBody::Corrupt)
+        ));
+
+        // A future envelope VERSION is a hard error -- never overwritten.
+        let mut v2: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        v2["version"] = json!(2_u32);
+        assert!(
+            classify_present_body(&v2.to_string()).is_err_and(|err| err.contains("UPGRADE")),
+            "a future envelope version must refuse the push"
+        );
+
+        // A future envelope whose SCHEMA also changed (so it no longer
+        // deserializes as the exact v1 `BlobEnvelope`) is STILL refused: version
+        // detection runs BEFORE v1 deserialization, so it never falls through to
+        // repairable Corrupt and gets overwritten by a downgrade push.
+        let future_schema = json!({
+            "version": 2_u32,
+            "data": { "k": "v" },
+            "generated_at": "2026-01-01T00:00:00Z",
+            "sha256": 12_u32, // a NUMBER: v1 expects a string, so v1 deserialize fails
+        });
+        assert!(
+            classify_present_body(&future_schema.to_string())
+                .is_err_and(|err| err.contains("UPGRADE")),
+            "a future envelope that fails v1 deserialize must still refuse the push"
+        );
+
+        // An UNKNOWN `edgezero_kind` on a v1-SHAPED envelope must be refused, not
+        // overwritten: serde ignores the extra field and would otherwise accept it
+        // as a valid v1 envelope. Non-Fastly adapters return raw Present values, so
+        // this generic guard is the only thing standing between them and a
+        // downgrade overwrite of a newer discriminated format.
+        let mut kinded: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        kinded["edgezero_kind"] = json!("new_format");
+        assert!(
+            classify_present_body(&kinded.to_string()).is_err_and(|err| err.contains("UPGRADE")),
+            "a v1-shaped envelope carrying an unknown edgezero_kind must refuse the push"
+        );
+
+        // And the first-read-diff flow proceeds to overwrite on a corrupt Present.
+        let local = BlobEnvelope::new(json!({ "k": "v2" }), "2026-01-01T00:00:00Z".to_owned());
+        let outcome = render_first_read_diff(
+            &ReadConfigEntry::Present("garbage".to_owned()),
+            "app_config",
+            &local,
+            &local.sha256,
+            true,
+        )
+        .expect("a corrupt Present must not abort the push");
+        assert!(matches!(
+            outcome,
+            FirstReadOutcome::ProceedFromMissingOrUnsupported
+        ));
+    }
+
+    /// Serialise a string as a TOML basic-string literal (test helper).
+    fn toml_string_literal(value: &str) -> String {
+        let mut out = String::from('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+        out
+    }
+
     #[test]
     fn typed_push_writes_blob_envelope_to_local_config_file() {
         use edgezero_core::blob_envelope::{BlobEnvelope, ENVELOPE_VERSION_V1};
@@ -3326,6 +4266,26 @@ ids = ["default"]
         use std::sync::OnceLock;
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
         GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Build a tempdir containing a `fastly` script that APPENDS every
+    /// invocation to `oplog` and fails. Injected via PATH so an ordering
+    /// regression is caught as a recorded invocation instead of silently
+    /// shelling out to the developer's real, authenticated Fastly CLI.
+    #[cfg(unix)]
+    fn fake_fastly_logging(oplog: &Path) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script_path = tmp.path().join("fastly");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\necho 'fake fastly: refusing' >&2\nexit 1\n",
+            log = oplog.display(),
+        );
+        fs::write(&script_path, &script).expect("write fastly script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        tmp
     }
 
     /// Build a tempdir containing a `spin` script that emits fixed

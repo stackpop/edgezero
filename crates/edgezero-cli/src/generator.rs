@@ -1345,6 +1345,7 @@ mod tests {
         for import in [
             "AuthArgs",
             "BuildArgs",
+            "ConfigGcArgs",
             "ConfigPushArgs",
             "ConfigValidateArgs",
             "DeployArgs",
@@ -1382,12 +1383,22 @@ mod tests {
             );
         }
 
+        // `config gc` reclaims leaked chunk entries. It is UNTYPED on purpose:
+        // it inspects the store's physical entries, not the app-config struct,
+        // so it takes `ConfigGcArgs` and dispatches to the untyped runner. A
+        // generated CLI that omits it leaves operators no way to reclaim.
+        assert!(
+            main.contains("Gc(ConfigGcArgs)"),
+            "<name>-cli ConfigCmd must include the untyped `Gc(ConfigGcArgs)` variant: {main}"
+        );
+
         // Typed dispatch — the whole reason a downstream CLI
         // exists. Raw push/validate would defeat the point.
         for call in [
             "run_config_push_typed::<DemoAppConfig>",
             "run_config_validate_typed::<DemoAppConfig>",
             "edgezero_cli::run_auth",
+            "edgezero_cli::run_config_gc",
             "edgezero_cli::run_provision",
         ] {
             assert!(
