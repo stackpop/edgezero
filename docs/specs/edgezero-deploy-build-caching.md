@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions — Build Caching Spec
 
-**Status:** Design (proposed) — v6, caching via a credential-free build job
+**Status:** Design (proposed) — v6.1, caching via a reusable build **workflow**
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md` (the deploy-actions spec),
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -10,175 +10,203 @@
 
 `build-app-cli` compiles the application's own CLI package (native) into a throwaway
 `mktemp` `CARGO_TARGET_DIR` with **no caching**, so every deploy recompiles the whole
-dependency graph (~10 min for `stackpop/trusted-server-deployer`).
+dependency graph (~10 min for `stackpop/trusted-server-deployer`). Caching it safely
+requires a build environment that provably holds **no provider credential** while a
+cache is written.
 
-Five prior design rounds tried to cache this build _in place_ — inside the same job
-as the token-bearing deploy, with in-process credential scrubbing. Every version
-foundered on the same class of problem: making a cache **safe to write and correct**
-while a provider token is in scope, and while re-deriving key/path/ownership
-machinery by hand. The blockers were fundamentally about **the token being present in
-the job**, not about caching itself.
+## 2. Decision: a reusable workflow owns the credential-free build job
 
-## 2. Decision: the security boundary is job isolation
+A **composite action cannot enforce** a credential-free job: it runs inside the
+caller's job, the caller may add later steps to that same job, and
+`Swatinem/rust-cache`'s JavaScript `post:` hook runs during **job cleanup — after**
+those steps. A workflow could pass an env check, run a token-bearing deploy later in
+the same job, and then have the cache save a `target/` shaped by that step. So
+"enforced" and "structural" are only achievable by a surface that **owns the whole
+job**.
 
-Run `build-app-cli` in a **dedicated job that holds no provider credentials**, and
-enable caching only there. `build-app-cli` is already credential-free and already
-publishes the compiled CLI as an artifact that a separate deploy job downloads — so
-this is a topology the actions already support, not a new mechanism.
+Therefore caching is delivered through a **reusable workflow** (`on: workflow_call`)
+that owns the build job end-to-end. A caller invokes it as a job
+(`jobs.build.uses: stackpop/edgezero/.github/workflows/build-app-cli.yml@<ref>`) and
+**cannot inject steps into it**. The workflow:
 
-Making the credential-free property a **job boundary** (rather than in-process
-scrubbing) dissolves the recurring blockers:
+- declares minimal `permissions:` (`contents: read`) and **no `id-token`** (OIDC off);
+- **requests no provider secrets** (no `secrets: inherit`; no provider inputs), so no
+  token can exist in the job;
+- checks out the app with `persist-credentials: false`;
+- runs the pinned rust-cache + the existing `build-app-cli` composite + `upload-artifact`.
 
-- **No save-before-token ordering problem** and **no post-hook timing problem** — the
-  job never holds a token, so _when_ the cache saves is irrelevant to credential
-  safety. This re-enables a cache that saves at job end.
-- **No trusted-Cargo-boundary regression** — `cargo`/`cargo metadata` running with the
-  GitHub file-command channels live has nothing to exfiltrate in a tokenless job.
-- **No bespoke key/path/ownership design** — because the job is a normal Rust CI
-  build, it can use a **maintained cache** (`Swatinem/rust-cache`, pinned) that
-  already solves cache-path stability, key composition, cleaning, and restore.
+Because the reusable workflow owns the job, tokenlessness is **structural**. The
+composite `build-app-cli` action is unchanged for the **uncached, in-job** use; the
+`cache: true` path is supported **only** via the reusable workflow. The two-job
+topology is:
 
-What remains is one **irreducible precondition**, true of _any_ dependency-reuse
-cache and now the whole security story (§4).
+```
+job build  = uses: .../build-app-cli.yml@<ref>   (owns a tokenless job; caches; uploads artifact)
+job deploy = (secrets) download artifact → deploy-fastly / lifecycle
+```
 
 ## 3. Design
 
-### 3.1 Topology
+### 3.1 Toolchain-bound caching lifecycle
 
-Caching is a supported **workflow shape**, enforced by the actions:
+rust-cache invokes bare `rustc`/`cargo metadata`, so it would otherwise key and
+restore against the **runner-default** compiler, not the app's resolved toolchain.
+The reusable workflow's job runs this exact order:
 
+1. checkout app (`persist-credentials: false`) at the caller-supplied full SHA;
+2. resolve the app toolchain and **install/select** it, then **export
+   `RUSTUP_TOOLCHAIN`** so every later `rustc`/`cargo`/rust-cache invocation uses it;
+3. resolve the **host target triple** for that toolchain;
+4. `Swatinem/rust-cache` **restore** (§3.2);
+5. the `build-app-cli` compile (§3.3) — **no target reset on the restored path**;
+6. stage the artifact (§3.4) and `upload-artifact`;
+7. rust-cache **job-end save** — safe because the job is tokenless.
+
+Test with an application toolchain **different from the runner default** to prove the
+binding.
+
+### 3.2 rust-cache pin and configuration
+
+Pinned by full SHA (the pin gate requires a 40-hex SHA **specifically for
+`Swatinem/rust-cache`**, alongside the repo's general version-tag policy; a regression
+test rejects **every** non-40-hex rust-cache ref, not only `@v2`):
+
+```yaml
+uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 ```
-job build   (no secrets):  checkout app → build-app-cli (cache: true) → upload artifact
-job deploy  (secrets):     download artifact → deploy-fastly / lifecycle
-```
 
-The build job passes **no** `FASTLY_API_TOKEN`/provider secrets. The deploy job holds
-the token and consumes the prebuilt CLI. The existing artifact handoff
-(`app-cli-meta.json` + the binary) is unchanged.
+Configuration:
 
-### 3.2 Enforceable boundary (not just documented)
+- `cache-bin: false` (do not cache `CARGO_HOME/bin` executables),
+  `cache-workspace-crates: false` (do not cache the app's own crates' outputs);
+- `prefix-key` **replaces** rust-cache's default prefix with a versioned, namespaced
+  value: `edgezero-build-app-cli-v1-<hosted-image-id>-<suffix-hash>` (§3.5, §3.6),
+  where `suffix-hash` is the bounded SHA-256 of `cache-key-suffix`;
+- `workspaces:` maps the **canonical Cargo workspace** to a target dir given as a
+  **path relative to that workspace** — rust-cache's config does not interpret an
+  absolute right-hand side as expected. The target lives **outside** the
+  per-invocation action workspace (§3.3) so composite cleanup cannot delete it before
+  the post-save.
 
-The boundary is verifiable, so the action enforces it: when `cache: true`,
-`build-app-cli` **asserts that no known provider credential is present** in its
-environment (the same alias set it already scrubs) and **fails closed** if one is —
-turning "run this in a credential-free job" from a doc note into a checked
-precondition. A deployer who puts the token in the build job gets a clear error, not
-a silent secret-bearing cache write.
+### 3.3 Target directory, lifetime, concurrency
 
-### 3.3 Caching mechanism
+- The cached `CARGO_TARGET_DIR` is a **stable path outside** the per-invocation
+  workspace that composite cleanup removes, so it survives until rust-cache's job-end
+  save.
+- The compile's existing unconditional target **reset is removed on the cached path**
+  (it would erase a restore); reset happens only when initializing a new namespace or
+  on the uncached path.
+- Because the reusable workflow owns the job, there is **exactly one cache-enabled
+  invocation per job** — the concurrent-invocation isolation the composite supports
+  is not needed here and is not claimed.
 
-Within the credential-free build job the action runs **`Swatinem/rust-cache`, pinned
-by full commit SHA** (a `# vX.Y.Z` trailer; the pin gate and `zizmor` accept a SHA;
-add a regression test that a bare `@v2` is rejected). rust-cache owns key derivation
-(lockfile + `rustc` + workspace + `prefix-key`), path stability, cache cleaning, and
-restore/save; its **job-end post-hook save is now safe** because the job is
-tokenless. `cache-key-suffix` maps to rust-cache's `prefix-key`.
+### 3.4 Artifact discovery and Cargo compatibility
 
-To let rust-cache cache the build, two small action changes are required:
+- `cache: true` **requires Cargo ≥ 1.91** (for `build.build-dir`); the workflow checks
+  the resolved toolchain's Cargo version and fails closed with a clear message
+  otherwise (no silent fallback).
+- The build forces `--target <resolved-host-triple>` and constrains `build.build-dir`
+  to the owned target root.
+- The executable is selected from Cargo's `--message-format=json` stream: the **single**
+  `compiler-artifact` whose `package_id` matches the resolved package, whose
+  `target.name` is the requested binary, whose `target.kind` contains `bin`, and whose
+  `executable` is non-null — after a successful `build-finished`. The path is
+  canonicalized to lie beneath the owned target and checked for execute permission.
+- rust-cache runs `cargo metadata --all-features` (no `--locked`); the plan's
+  "all Cargo commands use `--locked`" contract is scoped to **our** invocations, and
+  this exception is documented.
 
-- **Stable target dir.** When `cache: true`, build into a stable, rust-cache-visible
-  `CARGO_TARGET_DIR` instead of the current `mktemp` (rust-cache and Cargo's
-  absolute-path dep-info both require a stable path). `cache: false` keeps today's
-  `mktemp` + reset behavior exactly.
-- **Deterministic artifact discovery.** Force `--target <resolved-host-triple>`,
-  constrain `build.build-dir` to the owned target root, and read the executable path
-  from Cargo's `--message-format=json` compiler-artifact message — so a repo
-  `.cargo/config.toml` / `CARGO_BUILD_TARGET` cannot move the binary out from under a
-  constructed path.
+### 3.5 Artifact provenance
 
-The resolver values that feed rust-cache (the stable target dir, the host triple, the
-`prefix-key`) and the artifact path are derived **inside the tokenless build job**, so
-passing them between steps is not a credential regression — there is no secret in the
-job to leak through a resolver-output file. They are still validated before use
-(canonical owned paths; a `prefix-key` bounded and hashed from `cache-key-suffix`).
+Both jobs must check out the **same resolved full SHA**. `app-cli-meta.json` gains
+`app-repo` and `source-revision` fields; the deploy job **validates** them (matching
+its own checkout) **before** the downloaded CLI is run with provider credentials, so a
+cache/artifact from a different repo or revision cannot receive the token.
 
-### 3.4 Security — the one remaining precondition
+### 3.6 Security and environment identity
 
-A dependency-reuse cache **necessarily stores dependency source**: `registry/cache`
-holds `.crate` archives (full crate source), `git/db` holds dependency repos, and
-`target/` can hold build-script-generated source and embedded data. GitHub Actions
-caches are **readable across refs, including fork PRs reading base/default-branch
-caches**, and a cache key is a **namespace, not an ACL**. Therefore:
+- **Reader trust (the enabling precondition).** A dependency-reuse cache necessarily
+  stores dependency **source** (`registry/cache` `.crate` archives, `git/db` repos) and
+  compiled `target/`. Actions caches are readable across refs, including fork PRs
+  reading base/default-branch caches; a key is a **namespace, not an ACL**. A repo that
+  runs untrusted PR workflows and has **private dependencies** MUST NOT enable
+  `cache: true` unless it accepts that exposure (or uses ACL storage).
+- **Build-environment identity.** rust-cache keys `CC`/`CFLAGS`/`CXX`/`CMAKE`/`CARGO`
+  and `RUST*` values, but **not** the compiler/linker/libc/header versions or the
+  runner image — and GitHub-hosted images update regularly, so they are **not**
+  homogeneous over a cache's lifetime. The `prefix-key` therefore includes a
+  **hosted-image identity** (`ImageOS`/`ImageVersion`); self-hosted runners must supply
+  an immutable environment namespace (via `cache-key-suffix`) or a pinned container.
+- **Alias check is defense-in-depth only.** An in-job assertion that provider aliases
+  are absent cannot prove job topology (it misses later inputs, checkout credentials,
+  OIDC, arbitrary secret names/files, and persistent-runner state), and the composite
+  already blanks aliases before its scripts run, so an in-script check sees scrubbed
+  values. The **workflow owning the job** is the guarantee; any alias check is a
+  secondary signal that must run **before** scrubbing and is **not** presented as proof.
 
-- **Reader trust is the enabling precondition.** A repository that runs untrusted PR
-  workflows and has **private dependencies** MUST NOT enable `cache: true` unless it
-  accepts that fork PRs can read that dependency source (or uses storage with real
-  ACLs). This is stated plainly in the guide; it is not something the action can
-  paper over.
-- **Writer trust.** The cached `target/` is executable input to later builds in the
-  same repo scope; cache-writing runs must not be triggered by untrusted refs.
-- **No credential in the cache** is now structural: the job has no token (§3.2), so no
-  provider secret can reach a cached path regardless of save timing.
+### 3.7 Inputs
 
-**Build-environment homogeneity.** rust-cache keys on `Cargo.lock` + `rustc` +
-workspace, not the runner image, libc, linker, C toolchain, or `CC`/`CFLAGS`/`CMAKE`
-inputs. A build script can therefore produce native artifacts that Cargo considers
-_Fresh_ on a differently-provisioned runner. Caching assumes **homogeneous runner
-images** (the hosted-runner default); a fleet with heterogeneous images must namespace
-by environment via `cache-key-suffix` (or not enable caching). This is documented as a
-precondition, not enforced.
+The reusable workflow surfaces, and forwards to the composite:
 
-### 3.5 Inputs on `build-app-cli`
+| Input              | Default | Meaning                                                                            |
+| ------------------ | ------- | ---------------------------------------------------------------------------------- |
+| `cache`            | `false` | Enable rust-cache (reusable-workflow path only). Off by default.                   |
+| `cache-key-suffix` | `""`    | Bounded/hashed into `prefix-key` to namespace / rotate a cache. Not an ACL (§3.6). |
 
-| Input              | Default | Meaning                                                                                                      |
-| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------ |
-| `cache`            | `false` | `true` \| `false`. Enable rust-cache in a credential-free job (§3.2 enforces tokenlessness). Off by default. |
-| `cache-key-suffix` | `""`    | Passed to rust-cache `prefix-key` to namespace / rotate a cache. A namespace, **not** an ACL (§3.4).         |
-
-`cli-profile` and private-**registry/git** authentication remain out of scope for v1
-(§6).
+`cli-profile` and private-registry/git dependency authentication remain out of scope
+for v1 (§7). With `cache: false`, `build-app-cli` behaves exactly as today (throwaway
+`mktemp` target, reset, online build).
 
 ## 4. Testing
 
-- **Boundary enforcement (`run.sh`):** `cache: true` with a provider alias present
-  fails closed; absent, it proceeds; `cache: false` runs no cache step and keeps the
-  `mktemp` + reset path.
-- **Artifact discovery:** the binary is located via the JSON compiler-artifact
-  message under the forced host target, not a constructed `target/release/<bin>` path;
-  a repo `CARGO_BUILD_TARGET` override does not break discovery.
-- **Pin regression:** `Swatinem/rust-cache@v2` (tag) fails the SHA requirement for
-  that action; the pinned SHA passes.
-- **Smoke (two runs, separate jobs/runs):** run 1 (credential-free build job)
-  populates the cache and uploads the CLI artifact; run 2 at a new revision on the
-  same lockfile restores it and, with **network blocked**, completes the build with
-  known registry dependencies **Fresh** (not recompiled) — asserted by dependency
-  artifact freshness, not timing. The two revisions have observably different CLI
-  behavior and distinct artifact names.
+- **Pin regression:** any non-40-hex `Swatinem/rust-cache` reference fails the gate;
+  the pinned SHA passes.
+- **Toolchain binding:** an app toolchain ≠ runner default is the one used for restore,
+  compile, and save (`RUSTUP_TOOLCHAIN` exported).
+- **Artifact discovery:** the binary is selected via the JSON `compiler-artifact` rules
+  under the forced host target; a hostile repo `.cargo/config.toml` / `CARGO_BUILD_TARGET`
+  does not break it; Cargo < 1.91 fails closed.
+- **Provenance:** the deploy job rejects an artifact whose `app-repo`/`source-revision`
+  differ from its checkout before running it with credentials.
+- **Smoke (freshness, two runs):** hold manifests, toolchain, keyed environment, and
+  `GITHUB_JOB` constant; run 1 populates the cache; run 2 restores, then builds with
+  **Cargo network access blocked** and asserts a known **registry** dependency reports
+  `fresh: true`, **workspace-local** crates rebuild, and the application artifact
+  differs between the two revisions.
+- **Lifecycle:** hits, misses, `cache: false`, nested workspaces, suffix rotation,
+  hostile Cargo config, and target survival past composite cleanup (post-save).
 
 ## 5. Docs and migration
 
-- `docs/guide/deploy-github-actions.md` + `docs/specs/edgezero-deploy-adoption-guide.md`:
-  the **two-job topology** (§3.1) becomes the documented caching pattern; the current
-  single-job same-repo example gains a cached-build-job variant. State the §3.4
-  reader-trust precondition prominently.
-- `docs/specs/edgezero-deploy-github-action.md`: note that caching is scoped to a
-  credential-free build job, the enforced tokenless precondition, and the pinned
-  rust-cache; the existing `deploy-fastly` exact-cache language is untouched
-  (`deploy-fastly` is unchanged).
-- `docs/specs/edgezero-deploy-action-implementation-plan.md`: the `build-app-cli`
-  changes (enforcement, stable target dir, artifact discovery, rust-cache pin).
-- Pin gate / `zizmor`: add the `Swatinem/rust-cache` SHA and the bare-tag regression
-  test.
-- Public-surface golden: the two new inputs.
+- **Scope the parent's exact-key language to `deploy-fastly.cache`** and define
+  `build-app-cli.cache` separately as a **rolling dependency/build cache** (rust-cache:
+  registry/git + `target/`, rolling restore prefix omitting manifest/lock hashes,
+  job-end save) with its own contents, trust assumptions, and timing —
+  `deploy-fastly` is unchanged.
+- New **reusable workflow** `.github/workflows/build-app-cli.yml` documented in the
+  guide + adoption guide as the caching topology (two jobs), with the §3.6 reader-trust
+  and homogeneity preconditions prominent.
+- Pin gate / `zizmor`: add the rust-cache SHA and the non-40-hex regression test.
+- Public-surface golden: the reusable-workflow inputs.
 
-## 6. Default, effect, out of scope
+## 6. Default and effect
 
-**Off by default.** In the two-job topology with `cache: true`, a warm build reuses
-compiled dependencies (the bulk of the ~10 min); the app crate still recompiles per
-revision. rust-cache's cleaning bounds cache size.
+**Off by default.** In the two-job topology with `cache: true`, a warm build restores
+compiled **dependencies** (the bulk of the ~10 min); the app crate and workspace-local
+crates still recompile. rust-cache's **save-time cleaning prunes the newly saved
+entry** (it does not retroactively bound existing entries).
 
-Out of scope for v1: `cli-profile` (a faster CLI build profile — a separate,
-cache-free win worth revisiting); private-registry/git dependency authentication;
-caching for non-Fastly adapters.
+## 7. Out of scope / future
 
-## 7. Why not the earlier approaches (for the record)
+- `cli-profile` (a faster CLI build profile — a separate, cache-free win).
+- Private-registry/git dependency authentication.
+- Caching for non-Fastly adapters.
 
-- **In-place in the deploy job (v2–v5):** required in-process credential scrubbing +
-  save-before-token timing + a hand-built key/path/ownership design; five rounds of
-  review showed this is a large, security-sensitive project that fights the token
-  being in the job. Job isolation removes the token, not the caching.
-- **In-house exact/rolling cache:** re-derives rust-cache; exact-lock keys cannot warm
-  when manifests/features/profiles change without the lockfile, and rolling keys add
-  ancestry GitHub does not guarantee.
-- **rust-cache in the deploy job:** its post-hook save runs after the token deploy —
-  unsafe. The pivot to a tokenless job is exactly what makes rust-cache usable.
+## 8. History (for the record)
+
+- **v2–v5, in-place in the deploy job:** required in-process scrubbing +
+  save-before-token timing + hand-built key/path/ownership; blocked by the token being
+  in the job.
+- **v6, composite action + rust-cache in a "credential-free job":** correct pivot, but
+  a composite **cannot enforce** the tokenless job (caller-added steps + post-hook save
+  at cleanup). v6.1 moves the boundary to a **reusable workflow** that owns the job.
