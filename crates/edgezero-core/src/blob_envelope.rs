@@ -5,6 +5,8 @@
 //! { "data": {...}, "sha256": "<hex>", "version": 1, "generated_at": "<RFC3339 UTC>" }
 //! ```
 
+use core::fmt;
+
 use crate::canonical_form::canonical_data_sha256;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,12 +23,32 @@ pub struct BlobEnvelope {
     pub version: u32,
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum BlobEnvelopeError {
-    #[error("sha mismatch: stored {stored}, computed {computed}")]
+    // The stored/computed hashes are NOT interpolated into the Display message.
+    // `stored` is a blob-controlled string (a malformed envelope can set it to
+    // anything, including a secret), and this error is formatted into diagnostics
+    // that reach HTTP responses and logs. Redacting at the source covers every
+    // caller — the extractor, the chunk resolver, the CLI push/diff paths, and
+    // the introspection endpoint — instead of each having to remember to. The
+    // fields stay on the struct for programmatic inspection.
+    #[error("stored SHA-256 does not match the computed hash (hashes redacted)")]
     ShaMismatch { stored: String, computed: String },
     #[error("unknown envelope version {0}; expected {expected}", expected = ENVELOPE_VERSION_V1)]
     UnknownVersion(u32),
+}
+
+// Debug is hand-written (NOT derived): a derived `Debug` would print the
+// `stored`/`computed` hashes, so `{err:?}` / `?err` (anyhow) would leak what the
+// Display message deliberately redacts. Debug therefore mirrors Display.
+impl fmt::Debug for BlobEnvelopeError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShaMismatch { .. } => f.write_str("ShaMismatch { hashes redacted }"),
+            Self::UnknownVersion(version) => write!(f, "UnknownVersion({version})"),
+        }
+    }
 }
 
 impl BlobEnvelope {
@@ -87,6 +109,29 @@ mod tests {
         let envelope =
             BlobEnvelope::new(json!({ "greeting": "hi" }), "2026-06-17T00:00:00Z".into());
         envelope.verify().unwrap();
+    }
+
+    #[test]
+    fn sha_mismatch_display_does_not_leak_the_stored_hash() {
+        // The stored SHA is blob-controlled and this Display is formatted into
+        // diagnostics that reach HTTP responses and logs by many callers.
+        // Redacting here is the single point that covers all of them.
+        const SENTINEL: &str = "SUPER_SECRET_STORED_HASH";
+        let mut envelope = BlobEnvelope::new(json!({ "greeting": "hi" }), "2026-06-17".into());
+        envelope.sha256 = SENTINEL.to_owned();
+        let err = envelope
+            .verify()
+            .expect_err("a tampered sha must fail verify");
+        assert!(
+            !err.to_string().contains(SENTINEL),
+            "the stored hash must never appear in the error Display: {err}"
+        );
+        // Debug must redact too: `{err:?}` / `?err` (anyhow) would otherwise
+        // print the stored hash even though Display redacts it.
+        assert!(
+            !format!("{err:?}").contains(SENTINEL),
+            "the stored hash must never appear in the error Debug: {err:?}"
+        );
     }
 
     #[test]

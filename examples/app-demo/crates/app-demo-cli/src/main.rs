@@ -13,8 +13,8 @@
 use app_demo_core::config::AppDemoConfig;
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs,
-    ProvisionArgs, ServeArgs,
+    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs, ConfigValidateArgs,
+    DeployArgs, NewArgs, ProvisionArgs, ServeArgs,
 };
 use edgezero_cli::DiffExit;
 
@@ -58,6 +58,12 @@ enum AppDemoConfigCmd {
     /// store and report changes. Exits 0 (no changes), 1 (changes with
     /// `--exit-code`), or 2 (unsupported / error).
     Diff(ConfigDiffArgs),
+    /// Reclaim chunk entries in the adapter's config store that no live config
+    /// pointer references.
+    ///
+    /// Needs no typed app-config — it inspects the store itself. SAFE BY
+    /// DEFAULT: without `--yes` it only reports what it would delete.
+    Gc(ConfigGcArgs),
     /// Push `app-demo.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
     /// (per spec 3.3 Model A — `#[secret]` fields store the key NAME,
@@ -87,6 +93,7 @@ fn main() {
                 Err(err) => Err(err),
             }
         }
+        Cmd::Config(AppDemoConfigCmd::Gc(args)) => edgezero_cli::run_config_gc(&args),
         Cmd::Config(AppDemoConfigCmd::Push(args)) => {
             edgezero_cli::run_config_push_typed::<AppDemoConfig>(&args)
         }

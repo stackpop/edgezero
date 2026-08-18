@@ -99,11 +99,17 @@ pub async fn config(ctx: RequestContext) -> Result<Response, EdgeError> {
         .await
         .map_err(EdgeError::from)?
         .ok_or_else(|| EdgeError::not_found("no config blob in default store"))?;
-    let envelope: BlobEnvelope = serde_json::from_str(&raw)
-        .map_err(|err| EdgeError::internal(anyhow::anyhow!("envelope parse failed: {err}")))?;
-    envelope.verify().map_err(|err| {
-        EdgeError::internal(anyhow::anyhow!("envelope verification failed: {err}"))
+    // Neither error echoes the stored value: a serde parse error embeds the
+    // input, and the envelope integrity error is redacted at its source. `raw`
+    // is the stored config blob and may hold secrets; this reaches the HTTP body.
+    let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
+        EdgeError::internal(anyhow::anyhow!(
+            "config blob is not a valid envelope (details redacted)"
+        ))
     })?;
+    envelope
+        .verify()
+        .map_err(|err| EdgeError::internal(anyhow::anyhow!("config blob {err}")))?;
     let body = Body::json(&envelope.into_data()).map_err(EdgeError::internal)?;
     json_response(StatusCode::OK, body)
 }
