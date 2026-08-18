@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions — Build Caching Spec
 
-**Status:** Design (proposed) — v5, mirrors `deploy-fastly`'s exact-key cache
+**Status:** Design (proposed) — v6, caching via a credential-free build job
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md` (the deploy-actions spec),
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -8,211 +8,163 @@
 
 ## 1. Problem
 
-`build-app-cli` compiles the application's own CLI package (native) `--release`
-into a throwaway `mktemp` `CARGO_TARGET_DIR`, with **no caching of any kind** — so
-every deploy recompiles the whole dependency graph (~10 min for
-`stackpop/trusted-server-deployer`), and it is the one cost a downstream deployer
-cannot fix on its own. `deploy-fastly` already caches its `wasm32-wasip1` build with
-an **exact-key, credential-free** cache. This spec applies that **same proven
-pattern** to `build-app-cli`.
+`build-app-cli` compiles the application's own CLI package (native) into a throwaway
+`mktemp` `CARGO_TARGET_DIR` with **no caching**, so every deploy recompiles the whole
+dependency graph (~10 min for `stackpop/trusted-server-deployer`).
 
-The lifecycle actions (`healthcheck`/`rollback`/`config-push`) compile nothing and
-are out of scope.
+Five prior design rounds tried to cache this build _in place_ — inside the same job
+as the token-bearing deploy, with in-process credential scrubbing. Every version
+foundered on the same class of problem: making a cache **safe to write and correct**
+while a provider token is in scope, and while re-deriving key/path/ownership
+machinery by hand. The blockers were fundamentally about **the token being present in
+the job**, not about caching itself.
 
-## 2. Decision: mirror `deploy-fastly`, not a third-party cache
+## 2. Decision: the security boundary is job isolation
 
-Earlier rounds explored an elaborate in-house rolling cache and then
-`Swatinem/rust-cache`. Both were rejected on review:
+Run `build-app-cli` in a **dedicated job that holds no provider credentials**, and
+enable caching only there. `build-app-cli` is already credential-free and already
+publishes the compiled CLI as an artifact that a separate deploy job downloads — so
+this is a topology the actions already support, not a new mechanism.
 
-- A **rolling / restore-prefix** cache adds ancestry assumptions GitHub does not
-  guarantee, generation churn, and key/path complexity.
-- **rust-cache** saves via a JavaScript `post:` hook that GitHub runs at **job
-  end** — after the caller's token-bearing deploy and after this composite's
-  cleanup — which **breaks the credential-free-save-before-deploy invariant**,
-  post-save cleanup, and same-job testing. It also archives whole `registry/`/`git/`
-  trees (including some extracted sources/checkouts) and `CARGO_HOME/bin`, caching
-  private source and executable state, and runs `cargo metadata` with the GitHub
-  file-command channels live, defeating the trusted-Cargo boundary.
+Making the credential-free property a **job boundary** (rather than in-process
+scrubbing) dissolves the recurring blockers:
 
-The design that fits this action's security model is the one already in the repo:
-an **exact-key** `actions/cache/restore` + `save` pair with **explicit timing**,
-credential-free, over paths the action controls. `build-app-cli` mirrors it. An
-exact lock key means dependencies are compiled once per lockfile and reused; only
-the app crate recompiles per revision. This is the ~10-min win, achieved simply.
+- **No save-before-token ordering problem** and **no post-hook timing problem** — the
+  job never holds a token, so _when_ the cache saves is irrelevant to credential
+  safety. This re-enables a cache that saves at job end.
+- **No trusted-Cargo-boundary regression** — `cargo`/`cargo metadata` running with the
+  GitHub file-command channels live has nothing to exfiltrate in a tokenless job.
+- **No bespoke key/path/ownership design** — because the job is a normal Rust CI
+  build, it can use a **maintained cache** (`Swatinem/rust-cache`, pinned) that
+  already solves cache-path stability, key composition, cleaning, and restore.
+
+What remains is one **irreducible precondition**, true of _any_ dependency-reuse
+cache and now the whole security story (§4).
 
 ## 3. Design
 
-### 3.1 Inputs on `build-app-cli`
+### 3.1 Topology
 
-| Input              | Default | Meaning                                                                                                                                                            |
-| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `cache`            | `false` | `true` \| `false`. Enable the cache. **Off by default** (§6), matching `deploy-fastly`. No `auto` — the lockfile is mandatory, so a no-lock branch is unreachable. |
-| `cache-key-suffix` | `""`    | Folded into the exact key (SHA-256'd, length-bounded) to namespace / rotate a cache. A namespace, **not** access control (§3.8).                                   |
+Caching is a supported **workflow shape**, enforced by the actions:
 
-`cli-profile` and private-**registry** authentication are **out of scope for v1**
-(§7); the cached build uses the same dependency model `deploy-fastly`'s cached build
-already assumes.
+```
+job build   (no secrets):  checkout app → build-app-cli (cache: true) → upload artifact
+job deploy  (secrets):     download artifact → deploy-fastly / lifecycle
+```
 
-### 3.2 Cache contents and stable paths
+The build job passes **no** `FASTLY_API_TOKEN`/provider secrets. The deploy job holds
+the token and consumes the prebuilt CLI. The existing artifact handoff
+(`app-cli-meta.json` + the binary) is unchanged.
 
-`actions/cache` folds the cached `path` set into its internal version, and Cargo's
-dep-info embeds absolute paths — so the cached directories are at **fixed, stable
-paths** across invocations and revisions (not the current `mktemp`):
+### 3.2 Enforceable boundary (not just documented)
 
-- `CARGO_HOME = $RUNNER_TEMP/edgezero-cli-cache/cargo-home`
-- `CARGO_TARGET_DIR = $RUNNER_TEMP/edgezero-cli-cache/target`
+The boundary is verifiable, so the action enforces it: when `cache: true`,
+`build-app-cli` **asserts that no known provider credential is present** in its
+environment (the same alias set it already scrubs) and **fails closed** if one is —
+turning "run this in a credential-free job" from a doc note into a checked
+precondition. A deployer who puts the token in the build job gets a clear error, not
+a silent secret-bearing cache write.
 
-The `path:` list given to `actions/cache` is **explicit and minimal**, so we — not a
-third-party tool — decide what is stored:
+### 3.3 Caching mechanism
 
-- `CARGO_HOME/registry/index`, `CARGO_HOME/registry/cache`, `CARGO_HOME/git/db` —
-  the verified/regenerable parts; **excludes** extracted `registry/src`,
-  `git/checkouts`, and `CARGO_HOME/bin`, so **no dependency source or installed
-  executable is cached**;
-- `CARGO_TARGET_DIR` — the compiled outputs (dependency artifacts; the app binary is
-  rebuilt anyway). This is compiled executable state, governed by the writer-trust
-  precondition (§3.8).
+Within the credential-free build job the action runs **`Swatinem/rust-cache`, pinned
+by full commit SHA** (a `# vX.Y.Z` trailer; the pin gate and `zizmor` accept a SHA;
+add a regression test that a bare `@v2` is rejected). rust-cache owns key derivation
+(lockfile + `rustc` + workspace + `prefix-key`), path stability, cache cleaning, and
+restore/save; its **job-end post-hook save is now safe** because the job is
+tokenless. `cache-key-suffix` maps to rust-cache's `prefix-key`.
 
-### 3.3 Exact key (shared with `deploy-fastly`)
+To let rust-cache cache the build, two small action changes are required:
 
-Extract `resolve-project.sh`'s key derivation into a shared `deploy-core` helper so
-both actions compute keys identically. The `build-app-cli` key is **exact — no
-restore-prefix** (aligning with the parent spec's existing exact-cache mandate), a
-hyphen-joined string of, in order:
+- **Stable target dir.** When `cache: true`, build into a stable, rust-cache-visible
+  `CARGO_TARGET_DIR` instead of the current `mktemp` (rust-cache and Cargo's
+  absolute-path dep-info both require a stable path). `cache: false` keeps today's
+  `mktemp` + reset behavior exactly.
+- **Deterministic artifact discovery.** Force `--target <resolved-host-triple>`,
+  constrain `build.build-dir` to the owned target root, and read the executable path
+  from Cargo's `--message-format=json` compiler-artifact message — so a repo
+  `.cargo/config.toml` / `CARGO_BUILD_TARGET` cannot move the binary out from under a
+  constructed path.
 
-`edgezero-cli-<schema>-<os>-<arch>-<host-target-triple>-<toolchain-channel>-<rustc-commit>-<app-repo-id>-<workspace-id>-<app-cli-package>-<app-cli-bin>-<lock-hash>-<suffix-hash>`
+### 3.4 Security — the one remaining precondition
 
-- `app-repo-id` (application Git identity) and `workspace-id` (hash of the workspace
-  root relative to the app Git root, as the deploy key already does) prevent two
-  apps at one deployer path, or two packages exposing the same binary, from
-  colliding;
-- `suffix-hash` is the length-bounded SHA-256 of `cache-key-suffix`;
-- the key is derived from committed files (`Cargo.lock`) and the resolved toolchain
-  within the **existing credential-free build boundary** — no new app-controlled
-  command runs outside that boundary.
+A dependency-reuse cache **necessarily stores dependency source**: `registry/cache`
+holds `.crate` archives (full crate source), `git/db` holds dependency repos, and
+`target/` can hold build-script-generated source and embedded data. GitHub Actions
+caches are **readable across refs, including fork PRs reading base/default-branch
+caches**, and a cache key is a **namespace, not an ACL**. Therefore:
 
-Because the key changes with the lockfile/toolchain/identity, a bump starts a fresh
-entry; an exact match reuses the prior compiled dependencies.
+- **Reader trust is the enabling precondition.** A repository that runs untrusted PR
+  workflows and has **private dependencies** MUST NOT enable `cache: true` unless it
+  accepts that fork PRs can read that dependency source (or uses storage with real
+  ACLs). This is stated plainly in the guide; it is not something the action can
+  paper over.
+- **Writer trust.** The cached `target/` is executable input to later builds in the
+  same repo scope; cache-writing runs must not be triggered by untrusted refs.
+- **No credential in the cache** is now structural: the job has no token (§3.2), so no
+  provider secret can reach a cached path regardless of save timing.
 
-### 3.4 Step graph and explicit save timing
+### 3.5 Inputs on `build-app-cli`
 
-1. Resolve project (app identity, `source-revision`, toolchain) — **committed-source
-   guard** (§3.6).
-2. Install the resolved toolchain (the key needs `rustc`); the build continues to
-   use `cargo +<toolchain>` as today.
-3. Compute the exact key (§3.3).
-4. `actions/cache/restore` into the fixed paths (§3.2). On a hit, **do not**
-   `reset_owned_dir` the target dir (the current unconditional reset would erase the
-   restore); the reset is retained only on the uncached path.
-5. The credential-free CLI build (the existing provider-env re-exec/scrub is
-   unchanged), then package the binary + `app-cli-meta.json` as today.
-6. **Committed-source re-check** (§3.6), then `actions/cache/save` under the exact
-   key.
+| Input              | Default | Meaning                                                                                                      |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------ |
+| `cache`            | `false` | `true` \| `false`. Enable rust-cache in a credential-free job (§3.2 enforces tokenlessness). Off by default. |
+| `cache-key-suffix` | `""`    | Passed to rust-cache `prefix-key` to namespace / rotate a cache. A namespace, **not** an ACL (§3.4).         |
 
-Save is an **explicit step that runs here — after the credential-free build, before
-the caller's token-bearing deploy/lifecycle steps** — exactly as `deploy-fastly`
-saves before its deploy. There is no job-end post-hook, so a build script cannot
-persist a secret written by a later token step into the cache.
-
-### 3.5 `cache: false` — today's behavior, unchanged
-
-With `cache: false` the action behaves exactly as today: a throwaway `mktemp`
-`CARGO_TARGET_DIR`, an online build, and the existing owned-directory reset and
-cleanup. No cache step runs.
-
-### 3.6 Committed-source provenance gate
-
-`build-app-cli` today builds immediately after `cargo metadata` with **no dirty-tree
-guard**, so a dirty tree can seed a cache under a clean `HEAD`. The action MUST:
-
-- assert committed source (`assert_committed_source`) **before** the build, and
-- **re-check** immediately before `cache/save`, refusing to save if the tree became
-  dirty (a `build.rs` can modify source after the first check).
-
-Coverage matches `deploy-fastly`'s existing guard (tracked files); dirty submodules
-and external path dependencies are a **documented limitation** shared with the
-current deploy cache, not newly introduced here. This closes a latent correctness
-gap independent of caching.
-
-### 3.7 Concurrency and cleanup (self-hosted)
-
-Fixed shared paths mean two same-key invocations on a persistent runner could race.
-A cross-step **ownership file** at `$RUNNER_TEMP/edgezero-cli-cache/owner` is claimed
-(atomic create) before restore and released after save; an invocation that cannot
-claim it **skips restore and save**, builds in a private `mktemp` target dir
-(correct, uncached), and cleans it up — never touching the shared paths. On ephemeral
-runners (the supported model) this never triggers. The owner always removes the local
-cached directories after save (remote eviction does not clean self-hosted files).
-
-### 3.8 Security — trusted writers AND readers
-
-The cache preserves `build-app-cli`'s credential-free posture (the save runs before
-any token, §3.4) and stores **no dependency source** (§3.2). Remaining preconditions
-for enabling `cache: true`, identical to `deploy-fastly`'s cache posture:
-
-- **Trusted writers.** `CARGO_TARGET_DIR` is compiled executable input to later
-  builds; a cache-writing run must not be triggered by an untrusted ref, and the
-  provenance gate (§3.6) binds the saved entry to committed source.
-- **Trusted readers.** Actions caches are readable across refs, including fork PRs
-  reading base/default-branch caches; `cache-key-suffix` is a **namespace, not an
-  ACL**. Because dependency source is not cached (§3.2), the exposure is limited to
-  compiled artifacts; a repository running untrusted PR workflows that still considers
-  that sensitive leaves `cache: false`.
-- **No job-level secrets** in the build step beyond what the action injects.
-
-Default `false` (§6) matches `deploy-fastly` and the parent's opt-in posture.
+`cli-profile` and private-**registry/git** authentication remain out of scope for v1
+(§6).
 
 ## 4. Testing
 
-Mirror `deploy-fastly`'s existing `cache-smoke` shape:
+- **Boundary enforcement (`run.sh`):** `cache: true` with a provider alias present
+  fails closed; absent, it proceeds; `cache: false` runs no cache step and keeps the
+  `mktemp` + reset path.
+- **Artifact discovery:** the binary is located via the JSON compiler-artifact
+  message under the forced host target, not a constructed `target/release/<bin>` path;
+  a repo `CARGO_BUILD_TARGET` override does not break discovery.
+- **Pin regression:** `Swatinem/rust-cache@v2` (tag) fails the SHA requirement for
+  that action; the pinned SHA passes.
+- **Smoke (two runs, separate jobs/runs):** run 1 (credential-free build job)
+  populates the cache and uploads the CLI artifact; run 2 at a new revision on the
+  same lockfile restores it and, with **network blocked**, completes the build with
+  known registry dependencies **Fresh** (not recompiled) — asserted by dependency
+  artifact freshness, not timing. The two revisions have observably different CLI
+  behavior and distinct artifact names.
 
-- **Contract (`run.sh`):** the shared key helper produces the exact
-  `build-app-cli` key with all §3.3 fields (a change to any field, the lockfile, or
-  the suffix changes the key; the suffix is hashed/length-bounded); the two actions'
-  helpers agree on shared fields; `cache: false` runs no cache step and keeps the
-  `mktemp`+reset path; `cache: true` skips the reset on a hit.
-- **Smoke (seed + restore-hit, two runs):** run 1 populates the cache; run 2 at a
-  new revision on the same lockfile restores it (cache-hit recorded) and does **not**
-  re-download or recompile dependencies (assert known dependency artifacts are fresh,
-  with network blocked during run 2 — no timing assertions). A negative
-  (`cache: false`) case does not restore.
-- **Ordering / provenance:** `cache/save` occurs before any token-bearing step; a
-  dirty tree is refused before build and before save (§3.6); ownership contention ⇒
-  the loser builds uncached and touches no shared path (§3.7).
+## 5. Docs and migration
 
-## 5. Docs and spec-migration impact
+- `docs/guide/deploy-github-actions.md` + `docs/specs/edgezero-deploy-adoption-guide.md`:
+  the **two-job topology** (§3.1) becomes the documented caching pattern; the current
+  single-job same-repo example gains a cached-build-job variant. State the §3.4
+  reader-trust precondition prominently.
+- `docs/specs/edgezero-deploy-github-action.md`: note that caching is scoped to a
+  credential-free build job, the enforced tokenless precondition, and the pinned
+  rust-cache; the existing `deploy-fastly` exact-cache language is untouched
+  (`deploy-fastly` is unchanged).
+- `docs/specs/edgezero-deploy-action-implementation-plan.md`: the `build-app-cli`
+  changes (enforcement, stable target dir, artifact discovery, rust-cache pin).
+- Pin gate / `zizmor`: add the `Swatinem/rust-cache` SHA and the bare-tag regression
+  test.
+- Public-surface golden: the two new inputs.
 
-Restricted to `build-app-cli`; **`deploy-fastly` is unchanged** and retains its
-immediate credential-free save before deployment.
+## 6. Default, effect, out of scope
 
-- `docs/specs/edgezero-deploy-github-action.md`: extend the existing exact-cache
-  section to cover `build-app-cli` (same exact-key, no-prefix model — no conflict
-  with its current mandate); add the two inputs and the shared key helper.
-- `docs/specs/edgezero-deploy-action-implementation-plan.md`: add the step graph
-  (§3.4) and the committed-source gate.
-- `docs/specs/edgezero-deploy-adoption-guide.md` + `docs/guide/deploy-github-actions.md`:
-  document `cache` / `cache-key-suffix`, the writer/reader preconditions, and the
-  existing "cache the WASM build too" recipe.
-- The action public-surface golden test gains the two new inputs.
-- No deployer-specific configuration in any of them.
+**Off by default.** In the two-job topology with `cache: true`, a warm build reuses
+compiled dependencies (the bulk of the ~10 min); the app crate still recompiles per
+revision. rust-cache's cleaning bounds cache size.
 
-## 6. Default and expected effect
+Out of scope for v1: `cli-profile` (a faster CLI build profile — a separate,
+cache-free win worth revisiting); private-registry/git dependency authentication;
+caching for non-Fastly adapters.
 
-**Off by default**, matching `deploy-fastly`. A deployer meeting the preconditions
-sets `cache: true` and, after a first warm run per lockfile, avoids dependency
-download **and recompilation** — the app crate still recompiles per revision, but the
-dependency graph (the bulk of the ~10 min) is reused. Because the key is exact and
-the paths fixed, there is no restore-prefix churn.
+## 7. Why not the earlier approaches (for the record)
 
-> **Zero-config was considered and declined.** The maintainer chose `cache` **off**
-> for the §3.8 trust reasons and parent-spec consistency; downstream repos opt in.
-
-## 7. Out of scope / future
-
-- `cli-profile` (a faster CLI build profile) — orthogonal to caching; revisit
-  separately.
-- Private-**registry** and private-**git** dependency authentication for the cached
-  build — the phased credentialed-fetch approach had unresolved holes (git auth,
-  warm-cache auth-skip); v1 assumes `deploy-fastly`'s current dependency model.
-- Cross-revision "rolling" warming via restore-prefixes (rejected; exact key only).
-- Caching for non-Fastly adapters when those wrappers land.
+- **In-place in the deploy job (v2–v5):** required in-process credential scrubbing +
+  save-before-token timing + a hand-built key/path/ownership design; five rounds of
+  review showed this is a large, security-sensitive project that fights the token
+  being in the job. Job isolation removes the token, not the caching.
+- **In-house exact/rolling cache:** re-derives rust-cache; exact-lock keys cannot warm
+  when manifests/features/profiles change without the lockfile, and rolling keys add
+  ancestry GitHub does not guarantee.
+- **rust-cache in the deploy job:** its post-hook save runs after the token deploy —
+  unsafe. The pivot to a tokenless job is exactly what makes rust-cache usable.
