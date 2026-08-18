@@ -86,6 +86,12 @@ To let rust-cache cache the build, two small action changes are required:
   `.cargo/config.toml` / `CARGO_BUILD_TARGET` cannot move the binary out from under a
   constructed path.
 
+The resolver values that feed rust-cache (the stable target dir, the host triple, the
+`prefix-key`) and the artifact path are derived **inside the tokenless build job**, so
+passing them between steps is not a credential regression — there is no secret in the
+job to leak through a resolver-output file. They are still validated before use
+(canonical owned paths; a `prefix-key` bounded and hashed from `cache-key-suffix`).
+
 ### 3.4 Security — the one remaining precondition
 
 A dependency-reuse cache **necessarily stores dependency source**: `registry/cache`
@@ -103,6 +109,14 @@ caches**, and a cache key is a **namespace, not an ACL**. Therefore:
   same repo scope; cache-writing runs must not be triggered by untrusted refs.
 - **No credential in the cache** is now structural: the job has no token (§3.2), so no
   provider secret can reach a cached path regardless of save timing.
+
+**Build-environment homogeneity.** rust-cache keys on `Cargo.lock` + `rustc` +
+workspace, not the runner image, libc, linker, C toolchain, or `CC`/`CFLAGS`/`CMAKE`
+inputs. A build script can therefore produce native artifacts that Cargo considers
+_Fresh_ on a differently-provisioned runner. Caching assumes **homogeneous runner
+images** (the hosted-runner default); a fleet with heterogeneous images must namespace
+by environment via `cache-key-suffix` (or not enable caching). This is documented as a
+precondition, not enforced.
 
 ### 3.5 Inputs on `build-app-cli`
 
