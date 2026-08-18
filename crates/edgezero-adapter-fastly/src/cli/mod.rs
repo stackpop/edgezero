@@ -1016,6 +1016,7 @@ mod tests {
     use edgezero_adapter::TypedSecretEntry;
     use edgezero_adapter::registry::{AdapterPushContext, ResolvedStoreId};
     use std::path::Path;
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     #[test]

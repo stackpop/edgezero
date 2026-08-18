@@ -16,7 +16,9 @@ use super::FastlyCliAdapter;
 use crate::chunked_config::prepare_fastly_config_entries;
 #[cfg(unix)]
 use edgezero_adapter::registry::{Adapter as _, AdapterPushContext, ResolvedStoreId};
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use tempfile::tempdir;
 
 /// Invoke `config gc` on the config store at `dir` via the adapter boundary.

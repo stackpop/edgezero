@@ -882,6 +882,7 @@ mod tests {
     #[cfg(unix)]
     use super::super::path_mutation_guard;
     use super::*;
+    #[cfg(unix)]
     use crate::cli::test_support::*;
     #[cfg(unix)]
     use edgezero_core::test_env::PathPrepend;

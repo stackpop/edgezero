@@ -533,6 +533,7 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::super::FastlyCliAdapter;
+    #[cfg(unix)]
     use super::super::provision_local::write_fastly_local_config_store;
     use super::super::run::synthesise_fastly_toml;
     use super::*;

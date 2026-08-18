@@ -357,6 +357,7 @@ mod tests {
     use super::super::provision_local::write_fastly_local_config_store;
     use super::*;
     use crate::chunked_config::CHUNK_KEY_INFIX;
+    #[cfg(unix)]
     use crate::cli::test_support::chunk_keys_of;
     use edgezero_adapter::registry::{Adapter as _, AdapterPushContext, ResolvedStoreId};
     use tempfile::tempdir;

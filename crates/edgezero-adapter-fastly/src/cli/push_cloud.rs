@@ -647,6 +647,7 @@ mod tests {
     #[cfg(unix)]
     use super::super::path_mutation_guard;
     use super::*;
+    #[cfg(unix)]
     use crate::chunked_config::CHUNK_KEY_INFIX;
     use crate::cli::test_support::*;
     use edgezero_adapter::registry::{Adapter as _, AdapterPushContext};

@@ -840,6 +840,7 @@ mod tests {
     use edgezero_adapter::registry::{
         Adapter as _, ProvisionMode, ResolvedStoreId, TypedSecretEntry,
     };
+    #[cfg(unix)]
     use edgezero_core::test_env::PathPrepend;
     use tempfile::tempdir;
 
@@ -874,6 +875,7 @@ mod tests {
 
     // ---------- provision (local mode) ----------
 
+    #[cfg(unix)]
     #[test]
     fn local_provision_rejects_reserved_runtime_env_store_name() {
         // A user store whose PLATFORM name resolves to the reserved
