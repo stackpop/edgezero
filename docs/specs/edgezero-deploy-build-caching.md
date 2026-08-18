@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions — Build Caching Spec
 
-**Status:** Design (proposed) — revised twice after review
+**Status:** Design (proposed) — build-vs-buy resolved: adopt pinned `rust-cache`
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md` (the deploy-actions spec),
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -8,363 +8,218 @@
 
 ## 1. Problem
 
-A deploy performs up to **two cold Rust compiles**, back to back, neither cached
-by default:
+A deploy performs up to **two cold Rust compiles**, back to back, neither cached by
+default:
 
 1. **`build-app-cli`** compiles the application's own CLI package (native)
-   `--release` into a throwaway `mktemp` `CARGO_TARGET_DIR`, with **no caching of
-   any kind** (registry, git, or `target/`). Every deploy recompiles the whole
+   `--release` into a throwaway `mktemp` `CARGO_TARGET_DIR`, with **no caching of any
+   kind** (registry, git, or `target/`). Every deploy recompiles the whole
    dependency graph — the dominant cost (~10 min for
    `stackpop/trusted-server-deployer`).
 2. **`deploy-fastly`** compiles the app to `wasm32-wasip1`; its `target/` cache is
    opt-in and only active under `build-mode: always`.
 
 The lifecycle actions (`healthcheck`/`rollback`/`config-push`) compile nothing and
-are out of scope. This spec adds caching to `build-app-cli`, the largest cost and
-the one a downstream deployer cannot fix on its own.
+are out of scope. This spec adds **opt-in** caching to `build-app-cli`, the largest
+cost and the one a downstream deployer cannot fix on its own.
 
-**A note on build vs. buy.** Robustly caching Rust builds in CI is genuinely hard
-— path stability, key composition, cache cleaning, private-source trust — which is
-why `Swatinem/rust-cache` exists. This repo has chosen an in-house exact-key cache
-(pin policy, no unpinned third-party actions). This spec re-derives the necessary
-invariants explicitly; a future decision to adopt a pinned third-party cache would
-subsume most of §3, and is recorded as an alternative in §9.
+## 2. Decision: adopt a pinned third-party cache
 
-## 2. Goals and non-goals
+Two earlier design rounds showed that a _correct_ in-house cache must re-derive a
+large body of subtle invariants — cache-path stability (`actions/cache` folds the
+path into its internal version), Cargo's absolute-path dep-info, the safe
+Cargo-home layout (index/cache/db but **not** extracted sources/checkouts),
+generation keying, restore-prefix semantics without ancestry, and cache cleaning to
+bound churn. **`Swatinem/rust-cache` already solves all of these.** The project
+therefore adopts it, **pinned by full commit SHA** (with a `# vX.Y.Z` trailer),
+which the pin gate and `zizmor` accept. This reverses the earlier "no third-party
+cache action" non-goal — a deliberate build-vs-buy decision.
 
-**Goals**
-
-- Give `build-app-cli` **opt-in** caching that reuses unchanged dependency
-  compilation across revisions.
-- Make the trust boundary **enforceable by the action's control flow**, not just
-  documented.
-- Reuse `deploy-fastly`'s in-house cache mechanics and a shared key derivation.
-
-**Non-goals**
-
-- No changes to the lifecycle actions.
-- No new third-party cache action (see §9 for the recorded alternative).
-- No deployer-specific config in shipped docs (per-repo tuning, e.g. for
-  `trusted-server-deployer`, is delivered separately after implementation).
-- No change to the default WASM `build-mode`.
+rust-cache owns: caching `~/.cargo/{registry/index,registry/cache,git/db}` and the
+build `target/` (pruned to keep dependency artifacts, not the workspace crates'
+own outputs); key derivation over the lockfile + `rustc` version + workspace +
+`prefix-key`; restore-prefix partial hits; and post-job save with cleaning. This
+spec specifies only the **wiring and the concerns rust-cache does not cover**.
 
 ## 3. Design
 
-### 3.1 Stable paths — the generation lives in the KEY, never the path
+### 3.1 Inputs on `build-app-cli`
 
-`actions/cache` folds the `path` set into an internal cache **version**; a restore
-hits only when **both** the key/restore-prefix **and** the version (paths) match.
-Varying a path per run or per generation therefore **defeats every cross-run
-restore**. Cargo compounds this: fingerprint/dep-info files embed **absolute
-paths**, so relocating `CARGO_TARGET_DIR`/`CARGO_HOME` invalidates reuse even
-locally.
+| Input                  | Default   | Meaning                                                                                                                                           |
+| ---------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cache`                | `false`   | `true` \| `false`. Gate the rust-cache steps. **Off by default** (§5). No `auto` — the lockfile is mandatory, so a no-lock branch is unreachable. |
+| `cache-key-suffix`     | `""`      | Passed to rust-cache's `prefix-key` to namespace / rotate the cache. A namespace, **not** access control (§3.6).                                  |
+| `cli-profile`          | `release` | Cargo profile for the CLI build (§3.5).                                                                                                           |
+| `registry-credentials` | `""`      | JSON map of registry name → token for the credentialed fetch phase (§3.4). Empty ⇒ public deps only; a private graph fails closed.                |
 
-Therefore the cached directories are at **fixed, stable paths** for every
-invocation and every revision:
+### 3.2 What rust-cache is given, and the target directory
 
-- `EDGEZERO__CACHE__ROOT = $RUNNER_TEMP/edgezero-build-cache` (a stable string),
-- `CARGO_HOME = $EDGEZERO__CACHE__ROOT/cargo-home`,
-- `CARGO_TARGET_DIR = $EDGEZERO__CACHE__ROOT/target`.
+When `cache: true`, the action runs `Swatinem/rust-cache@<sha>` (restore) before the
+build and lets its post-step save. It is configured with:
 
-All generation/identity distinctions live in the cache **key** (§3.3), never in the
-path. (This replaces today's per-invocation `mktemp` target dir; the isolation it
-provided is re-established by the cross-step ownership protocol in §3.9.)
+- a **stable `CARGO_TARGET_DIR`** that rust-cache caches (via its `workspaces` /
+  `cache-directories` inputs). This **replaces** today's throwaway `mktemp` target
+  dir: rust-cache requires a stable, known location, and Cargo's absolute-path
+  dep-info requires the path not to move between runs. The directory remains
+  action-owned and is still removed on the non-cached (`cache: false`) path.
+- `prefix-key` incorporating the hashed `cache-key-suffix` and the CLI identity
+  (`app-cli-package`) so two apps or two suffixes never share an entry; rust-cache
+  already folds in the lockfile, `rustc` version, and workspace.
 
-### 3.2 Two caches, with Cargo's recommended Cargo-home layout
+The action MUST NOT reset (`reset_owned_dir`) the target dir when a cache was
+restored — the current unconditional reset would erase the restore. The reset is
+retained only on the uncached path.
 
-**(a) Dependency cache.** Caches only the parts of `CARGO_HOME` that are
-verified/regenerable per Cargo's own CI guidance — **`registry/index`,
-`registry/cache`, and `git/db`** — and **excludes the extracted `registry/src` and
-`git/checkouts`**. This matters: extracted sources and Git checkouts contain
-`build.rs`/proc-macro code, so caching them would restore **executable input** from
-an unsigned archive. `.crate` files in `registry/cache` are re-verified by checksum
-on extraction and `git/db` is re-checked-out, so this layout is safe to restore
-without the target cache's trusted-input requirement. Keyed exactly on the lockfile
-(§3.3); populated completely by a `cargo fetch --locked` phase (§3.7) **before**
-save, so an incomplete Cargo home is never frozen.
-
-**(b) Target cache.** Caches `CARGO_TARGET_DIR`, which **is** trusted executable
-input (compiled artifacts and build-script outputs from a prior run). It is
-governed by the writer/reader trust boundary in §3.10. Keyed per generation
-(§3.3), restored by prefix (§3.4).
-
-### 3.3 Cache keys — separate grammars, exact
-
-Extract `resolve-project.sh`'s key derivation into a shared `deploy-core` helper so
-`build-app-cli` and `deploy-fastly` cannot drift. Free-form components are hashed;
-every key begins with a **cache-schema version** constant so the format can be
-rotated centrally.
-
-**Shared identity prefix `P`** (both caches), in this fixed order:
-
-```
-edgezero-<schema>-<cache-kind>-<os>-<arch>-<host-target-triple>
-  -<toolchain-channel>-<rustc-commit-hash>
-  -<app-repo-id>-<workspace-id>-<app-cli-package>-<app-cli-bin>-<cli-profile>
-  -<suffix-hash>
-```
-
-- `cache-kind` is literally `deps` or `target` — the two caches never share a key
-  space.
-- `app-repo-id` (the application Git remote/root identity) and `workspace-id` (the
-  hash of the Cargo workspace root's path relative to the app Git root, as the
-  deploy key already does) prevent two different checked-out apps at the same
-  deployer path, or nested workspaces, from colliding.
-- `app-cli-package` **and** `app-cli-bin` are both included: two packages can expose
-  the same binary name.
-- `suffix-hash` is the SHA-256 (length-bounded input) of `cache-key-suffix` (§3.12).
-
-**Dependency key** = `P(deps)` + `-<Cargo.lock-hash>`. Exact; no restore-prefix.
-
-**Target key** = `P(target)` + `-<Cargo.lock-hash>` + `-<source-revision>`, with
-`source-revision` as the **final** component and
-**`restore-keys = P(target)-<Cargo.lock-hash>-`** (the same string minus the final
-revision). Because the revision is last, dropping it yields a true prefix.
-
-**Field matrices** (also the test contract, §4):
-
-| Key changes when…                                                            | `deps` key |                    `target` key                     |
-| ---------------------------------------------------------------------------- | :--------: | :-------------------------------------------------: |
-| schema/os/arch/host-triple/toolchain/rustc/repo/workspace/package/bin/suffix |     ✓      |                          ✓                          |
-| `Cargo.lock` content                                                         |     ✓      |                          ✓                          |
-| `cli-profile`                                                                |     ✓      |                          ✓                          |
-| `source-revision`                                                            |     —      | ✓ (final component; absent from the restore prefix) |
-
-### 3.4 Restore semantics — latest accessible, no ancestry
-
-GitHub restore-key prefix matching returns the **most recently created, accessible,
-version-matching** cache — it has **no Git-ancestry awareness**. So a target-cache
-restore yields "the latest accessible compatible generation," which may come from a
-concurrent run, a retry, a sibling branch, or the default branch — **not
-necessarily the immediate parent commit**. Tag-scoped caches are further isolated
-by tag, so successive release tags do **not** form a rolling chain.
-
-The spec therefore claims only: a build restores _some_ compatible prior generation
-when one is accessible, and **records the matched key** (an action output +
-summary line) for observability. It asserts **no** parent/ancestry relationship,
-and correctness never depends on which generation restores (a wrong-but-compatible
-`target/` only costs extra recompilation, never incorrect output — the exact
-`target` key on save still identifies this revision's generation).
-
-### 3.5 Committed-source guard (new, and a pre-existing gap)
+### 3.3 Committed-source guard (new; a pre-existing gap)
 
 `build-app-cli` today builds immediately after `cargo metadata`, with **no
-dirty-tree guard** — so a dirty tree can produce artifacts that then seed a cache
-labeled with the clean `HEAD` `source-revision`. Independent of caching this is a
-latent correctness gap; caching makes it poison. The action MUST:
+dirty-tree guard**, so a dirty tree can seed a cache under a clean `HEAD`. Caching
+makes that poison. The action MUST assert committed source
+(`assert_committed_source`) **before** the cached build. (This closes a latent
+correctness gap independent of caching.)
 
-- assert committed source (reusing `assert_committed_source`) **before** restoring
-  or building, and
-- **re-check** immediately before `cache/save`, refusing to save if the tree became
-  dirty during the build.
+### 3.4 Private dependencies — credentialed fetch, then scrubbed offline build
 
-`source-revision` in the target key is only meaningful under this guard.
+An action-owned `CARGO_HOME`/target does not inherit runner Cargo credentials, and
+the build step must stay credential-free — so private deps use a phased flow rather
+than a token in the build env:
 
-### 3.6 Step graph and the credential-free handoff
+1. **Fetch (credentialed):** a dedicated step runs `cargo fetch --locked` with a
+   deployer-supplied credential from `registry-credentials`
+   (`CARGO_REGISTRIES_*_TOKEN` / a temp credentials file). This authenticates
+   private registries and fully populates the Cargo home rust-cache saves.
+2. **Scrub:** the credential file/env is removed before the build; no token reaches
+   `build.rs`.
+3. **Offline build:** the compile runs `cargo build --locked --offline`, resolving
+   from the fetched home.
 
-Keys depend on the resolved toolchain's `rustc` commit, so the toolchain must be
-installed **before** keys are computed and caches restored. `build-app-cli` today
-installs the toolchain and compiles inside one script, and unconditionally **resets
-the target dir** (`reset_owned_dir`) — which would erase a restored cache. The
-cached path therefore uses this ordered step graph:
+A committed `.cargo/config.toml` is honored for registry _config_; credentials come
+**only** from `registry-credentials`, never the tree or runner home. Empty
+`registry-credentials` with a private graph fails closed with a clear message.
+Public-only graphs are unaffected.
 
-1. Resolve project (app repo id, workspace id, `source-revision`, toolchain) —
-   committed-source guard (§3.5).
-2. Install the resolved toolchain.
-3. Compute the `deps` and `target` keys (now that `rustc` is known).
-4. `cache/restore` both caches into the fixed paths (§3.1). **Do not reset**
-   `CARGO_TARGET_DIR` when a restore occurred.
-5. Credentialed fetch → scrub → offline build (§3.7), artifact discovery (§3.8).
-6. `cache/save` (deps if the fetch changed it; target under the exact key) — after
-   the committed-source re-check and ownership check (§3.9).
+### 3.5 `cli-profile` and artifact discovery
 
-The existing credential-free re-exec/scrub that fronts the build is preserved; the
-cache steps expose only key/path strings, never provider credentials.
+`cli-profile` (default `release`) selects the profile — `release`→`--release`,
+`dev`→(default), a name the app's `Cargo.toml` defines→`--profile <name>`. Because a
+repo `.cargo/config.toml` / `CARGO_BUILD_TARGET` can move the native target and
+profiles change the output subdir, the built binary is **not** discovered by
+constructing `target/<profile>/<bin>`. Instead the build:
 
-### 3.7 Private dependencies — credentialed fetch, then scrubbed offline build
+- forces an explicit `--target <resolved-host-triple>`,
+- constrains `build.build-dir` to the stable `CARGO_TARGET_DIR`, and
+- reads the executable path from Cargo's `--message-format=json` compiler-artifact
+  message for the CLI bin target.
 
-An action-owned `CARGO_HOME` (§3.1) does not inherit the runner's `~/.cargo`
-credentials, and the build step must remain credential-free — so authenticated
-private dependencies need an explicit, phased flow rather than a token in the build
-env:
+rust-cache caches all profile subdirs under one key, so `dev` and `release` builds
+coexist without collision; `cli-profile` need not be in the cache key.
 
-1. **Fetch phase (credentialed).** A dedicated step runs `cargo fetch --locked`
-   with a deployer-supplied credential from a new **`registry-credentials`** input
-   (a JSON map of registry name → token, written to a temporary Cargo credentials
-   file / `CARGO_REGISTRIES_*_TOKEN`). This both authenticates private registries
-   and fully populates the dependency cache.
-2. **Scrub.** The credentials file / env is removed before the build; the token
-   never reaches `build.rs`.
-3. **Offline build.** The compile runs `cargo build --locked --offline`, resolving
-   everything from the fetched Cargo home — so no credential exists in the build or
-   cache-save phase.
+**Reuse claim, stated precisely (§5):** the target cache yields **cross-revision
+reuse of unchanged dependency compilation**. It does **not** make the changed app
+crate compile incrementally — `release` is `incremental = false` — so the app crate
+recompiles in full unless a deployer selects a custom incremental profile.
 
-A committed `.cargo/config.toml` in the app repo is honored for registry _config_
-(sources/replacements), but **credentials come only from `registry-credentials`**,
-never the tree or the runner home. If `registry-credentials` is unset and the graph
-needs auth, `cargo fetch` fails closed with a clear message. Repositories that use
-no private registries are unaffected.
+### 3.6 Security — trusted writers AND trusted readers
 
-### 3.8 Artifact discovery — force the host target, read Cargo's JSON
+rust-cache does not change GitHub's cache trust model, so the boundary is the same
+and is a **precondition for enabling `cache: true`**:
 
-A repo `.cargo/config.toml` or `CARGO_BUILD_TARGET` can silently change the native
-target (binary under `target/<triple>/<profile>/`), and `build.build-dir` can
-relocate intermediates — so constructing `target/<profile>/<bin>` is unreliable.
-Instead the action:
+- **Trusted writers.** The `target/` cache is executable input to later builds; a
+  cache-writing run must never be triggered by an untrusted ref.
+- **Trusted readers / confidentiality.** Actions caches are readable by workflows on
+  other refs, **including fork PRs reading base/default-branch caches**.
+  `cache-key-suffix`/`prefix-key` is a **namespace, not an ACL**. A repository that
+  runs untrusted PR workflows MUST NOT cache **private dependency source** unless it
+  uses storage with real ACLs; it may still leave `cache: false`.
+- **No job-level secrets** in the build step beyond what the action injects;
+  provider credentials are already scoped away; registry tokens exist only in the
+  scrubbed fetch phase (§3.4).
 
-- builds with an **explicit `--target <resolved-host-triple>`** (so the output
-  layout is deterministic regardless of repo config),
-- constrains `build.build-dir` to the fixed `CARGO_TARGET_DIR`, and
-- obtains the executable path from Cargo's **`--message-format=json` compiler-
-  artifact** message for the CLI bin target, rather than constructing it.
+The `build-app-cli` scrub of declared provider aliases + `BASH_ENV`/`ENV` is
+preserved on the cached path; it is **not** a same-UID isolation boundary, which is
+why the writer/reader preconditions above are load-bearing. Default `false` (§5)
+reconciles with the parent spec's opt-in posture.
 
-### 3.9 Concurrency and cleanup (self-hosted)
+### 3.7 Step graph
 
-A single process-held lock cannot span the separate restore/build/save **steps**.
-Instead a **cross-step ownership file** at `EDGEZERO__CACHE__ROOT/owner` is claimed
-(atomic create) at the start of restore and released after save:
+1. Resolve project (app identity, `source-revision`, toolchain) + committed-source
+   guard (§3.3).
+2. Install the resolved toolchain (rust-cache's key needs `rustc`).
+3. `Swatinem/rust-cache@<sha>` restore (when `cache: true`), pointed at the stable
+   `CARGO_TARGET_DIR`, with `prefix-key` from §3.2.
+4. Credentialed fetch → scrub (§3.4).
+5. Offline `cargo build` (no target reset on the restored path), then JSON artifact
+   discovery (§3.5).
+6. Package the binary + `app-cli-meta.json` as today.
+7. rust-cache post-step saves (cleans + stores).
 
-- The invocation that claims it owns the fixed paths for its duration; it restores,
-  builds, and saves.
-- A concurrent invocation that fails to claim it **skips both cache actions**,
-  builds in a private `mktemp` `CARGO_TARGET_DIR` (correct, uncached), and cleans it
-  up — never touching the shared paths.
-- After `cache/save`, the owner **always removes the local cached directories** (and
-  the owner file). Remote cache eviction does **not** clean persistent
-  self-hosted-runner files, so the action must.
-
-On ephemeral runners (the supported model) contention never arises; this protocol
-only matters for persistent self-hosted runners, and is fail-safe (loser is
-correct-but-uncached).
-
-### 3.10 Security — trusted writers AND trusted readers
-
-Caching a build's output is safe only with a trusted writer, and caching source is
-confidential only with a trusted reader. The `build-app-cli` scrub removes declared
-provider aliases and blanks `BASH_ENV`/`ENV` but is **not** a same-UID isolation
-boundary. Enabling `cache: true` therefore requires, as **enforced or documented
-preconditions**:
-
-- **Trusted writers.** Cache-writing runs must be trusted, never triggered by
-  untrusted refs. The target cache is executable input to later builds (§3.2b), so a
-  poisoned writer poisons downstream builds.
-- **Trusted readers / confidentiality.** GitHub Actions caches are readable by
-  workflows on other refs, **including fork PRs reading base/default-branch
-  caches**. `cache-key-suffix` is a **namespace, not access control**. A repository
-  that executes untrusted PR workflows MUST NOT cache **private dependency source**
-  (the dependency cache) unless it uses storage with real ACLs; such repos may still
-  cache the target artifacts only if writers are trusted, or leave `cache: false`.
-- **No job-level secrets** in the `build-app-cli` step beyond what the action
-  injects; provider credentials are already scoped away; registry tokens exist only
-  in the scrubbed fetch phase (§3.7).
-
-These preconditions and the default (`false`, §3.12/§6) reconcile with the parent
-spec's opt-in, exact-cache posture (which this spec amends — see §5).
-
-### 3.11 `cli-profile`
-
-The CLI is a build-time tool (API calls, shell-outs, no hot loops), so `--release`
-mostly adds compile time. `cli-profile` (default `release`) selects the profile:
-
-- **Allowed values:** `release`, `dev`, or a profile the **app's own `Cargo.toml`
-  defines**. Effective flags: `release`→`--release`, `dev`→(default), named→
-  `--profile <name>`.
-- Artifact discovery is via Cargo's JSON message (§3.8), so the profile's output
-  directory is never hard-coded.
-- `cli-profile` is part of both keys (§3.3).
-
-Note the reuse claim precisely (§6): the target cache yields **cross-revision reuse
-of unchanged dependency artifacts**. It does **not** make the changed app crate
-compile incrementally — Cargo's `release` profile sets `incremental = false`, so the
-app crate recompiles in full unless the deployer selects a custom incremental
-profile.
-
-### 3.12 Inputs on `build-app-cli`
-
-| Input                  | Default   | Meaning                                                                                                                                                             |
-| ---------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cache`                | `false`   | `true` \| `false`. Enable the two caches. **Off by default** (§6). No `auto` (the lockfile is mandatory, so a no-lock branch is unreachable).                       |
-| `cache-key-suffix`     | `""`      | Free-form; **SHA-256'd and length-bounded** before use (the paths are fixed, but the key must not be attacker-shaped). A namespace, **not** access control (§3.10). |
-| `cli-profile`          | `release` | §3.11.                                                                                                                                                              |
-| `registry-credentials` | `""`      | JSON map of registry name → token for the credentialed fetch phase (§3.7). Empty ⇒ public deps only; a private graph fails closed.                                  |
+The existing credential-free re-exec/scrub fronting the build is preserved; cache
+steps expose only key/path strings, never provider credentials.
 
 ## 4. Testing
 
-- **Key contract (`run.sh`):** the two field matrices in §3.3 exactly — a change to
-  any shared field changes both keys; `Cargo.lock` changes both; `source-revision`
-  changes only the `target` key and is absent from its restore prefix; the suffix is
-  hashed/length-bounded; the shared helper matches `resolve-project` where fields
-  overlap; artifact discovery reads the JSON message, not a constructed path.
-- **Generation smoke (A/B/C):** three builds at distinct revisions A, B, C on one
-  lockfile, each with a **unique `cache-key-suffix` per test run** and **distinct
-  artifact names**, asserting: A seeds a `target` generation; B restores _a_
-  compatible generation (matched key recorded), rebuilds, saves its own; C restores
-  _a_ compatible generation and records **which** key matched (observability) —
-  without asserting ancestry (§3.4). A separate case asserts the `deps` cache
-  restores registry/git and the offline build succeeds with no network.
-- **Negative cases:** `cache: true` build fails ⇒ no poisoned save; dirty tree ⇒
-  refuse to save (§3.5); ownership contention ⇒ loser builds uncached and touches no
-  shared path (§3.9); `registry-credentials` unset with a private graph ⇒ fetch
-  fails closed (§3.7); trust-boundary: the build step still scrubs provider
-  aliases/`BASH_ENV` on the cached path.
+rust-cache's own correctness (path stability, keying, cleaning, restore) is trusted
+and not re-tested. Tests cover **our wiring and the concerns we own**:
+
+- **Contract (`run.sh`):** `cache: false` runs no cache step and keeps the uncached
+  `mktemp` + reset path; `cache: true` skips the reset and uses the stable target
+  dir; `cache-key-suffix` reaches `prefix-key` hashed; `cli-profile` maps to the
+  right flag and the binary is found via the JSON message (not a constructed path);
+  the committed-source guard rejects a dirty tree before a cached build.
+- **Fetch phase:** `registry-credentials` populates the home and the subsequent
+  `--offline` build succeeds with no network; unset credentials + a private graph
+  fails closed; the credential is absent from the build/save phase.
+- **Smoke (A/B):** with `cache: true`, a second build at a new revision on the same
+  lockfile completes with dependencies restored (no re-download, reduced compile),
+  recording the matched cache key for observability — **without** asserting
+  ancestry (rust-cache owns restore selection).
+- **Negative:** a failed build does not poison a save; provider aliases/`BASH_ENV`
+  remain blanked on the cached path.
 
 ## 5. Docs and spec-migration impact
 
 This spec **amends** the parent deploy spec, which currently mandates target-only
-**exact** caching and **forbids restore prefixes**. Normative updates required:
+**exact** caching, **forbids restore prefixes**, and implies no third-party cache
+action. Normative updates:
 
 - `docs/specs/edgezero-deploy-github-action.md`: replace the exact-only / no-prefix
-  caching language with the two-cache model, the restore-prefix (target) rule, the
-  writer/reader trust boundary, and the shared key helper; add the `build-app-cli`
-  inputs.
-- `docs/specs/edgezero-deploy-action-implementation-plan.md`: add the cache step
-  graph (§3.6) and the fetch/scrub/offline phase.
-- `docs/specs/edgezero-deploy-adoption-guide.md` and
-  `docs/guide/deploy-github-actions.md`: document the inputs, the **security
-  preconditions** (esp. the fork-PR reader caveat and private-source rule), and the
-  "cache the WASM build too" recipe.
+  / no-third-party caching language with the pinned-`rust-cache` model and the
+  writer/reader trust boundary; add the `build-app-cli` inputs.
+- `docs/specs/edgezero-deploy-action-implementation-plan.md`: add the step graph
+  (§3.7), the fetch/scrub/offline phase, and the rust-cache SHA pin.
+- `docs/specs/edgezero-deploy-adoption-guide.md` + `docs/guide/deploy-github-actions.md`:
+  document the inputs, the **security preconditions** (esp. the fork-PR reader
+  caveat and the private-source rule), and the "cache the WASM build too" recipe
+  (`build-mode: always` + `cache: true` on `deploy-fastly`).
+- The pinned `Swatinem/rust-cache@<sha>` is added to the pin-gate's expectations and
+  `zizmor` config (SHA pin, accepted by both).
 - No deployer-specific configuration in any of them.
 
-## 6. Default, expected effect, and storage
+## 6. Default and expected effect
 
-**Off by default**, per §3.10 and the parent's posture. A deployer meeting the
-preconditions sets `cache: true` and gets: dependency **download+extract** avoided
-after the first run per lockfile; and **cross-revision reuse of unchanged
-dependency compilation** via the target cache, so second-and-later commits skip
-recompiling unchanged deps (the app crate still recompiles per §3.11).
+**Off by default**, per §3.6 and the parent's posture. A deployer that meets the
+preconditions sets `cache: true` and gets, after a first warm run per lockfile:
+dependency download/extract avoided, and **unchanged dependency compilation reused
+across revisions** (the app crate still recompiles per §3.5). rust-cache's cleaning
+bounds cache size, so churn is far lower than storing a full `target/` per commit.
 
-**Storage/churn.** Saving a full `target/` archive per commit is not delta caching;
-on a busy repo this can churn the repo's cache quota (older generations evicted).
-The `target` key's identity fields keep generations scoped; deployers can bound
-churn with `cache-key-suffix` scoping. This tradeoff is documented, not hidden.
-
-> **Open decision (maintainer).** The original goal favored a zero-config default
-> (`cache` on) so downstream repos speed up on a version bump alone. This spec
-> defaults **off** for the §3.10 trust reasons and parent-spec consistency. Flipping
-> to on would require treating §3.10's preconditions as guaranteed for **every**
-> consumer — a conscious, documented risk-acceptance, not an assumption.
+> **Zero-config was considered and declined.** The original goal favored `cache` on
+> by default so downstream repos speed up on a version bump alone; the maintainer
+> chose **off** for the §3.6 trust reasons and parent-spec consistency. Downstream
+> repos opt in after meeting the preconditions.
 
 ## 7. Out of scope / future
 
 - Compiler-level caching (`sccache`) shared across jobs.
-- Prebuilding and publishing the CLI as a release artifact reused across deploys.
+- Prebuilding and publishing the CLI as a release artifact.
 - Caching for non-Fastly adapters when those wrappers land.
-- Storage with real ACLs (e.g. a self-hosted cache backend) enabling private-source
-  caching in untrusted-PR repositories.
+- Storage with real ACLs enabling private-source caching in untrusted-PR repos.
 
 ## 8. Open questions carried into planning
 
-- Exact bytes hashed for `app-repo-id` (remote URL vs. first-commit hash) and
-  `workspace-id`.
-- The `registry-credentials` schema and its validation (name charset, token
-  handling) — modeled on the existing `provider-env` typing.
-- Whether the dependency cache is worth enabling independently of the target cache
-  for public-only graphs (download savings without the target trust surface).
-
-## 9. Recorded alternative
-
-Adopt a **pinned** third-party Rust cache (`Swatinem/rust-cache`) instead of the
-in-house target cache. It already solves path stability, key composition, cache
-cleaning, and prefix restore. It would subsume most of §3, at the cost of a pinned
-third-party dependency the repo has so far avoided. Recorded for an explicit
-build-vs-buy decision before implementation.
+- The exact rust-cache version/SHA to pin, and which of its inputs (`workspaces`,
+  `cache-directories`, `cache-targets`, `save-if`, `cache-all-crates`) the wiring
+  sets.
+- The `registry-credentials` schema and validation, modeled on the existing
+  `provider-env` typing.
+- Whether to expose the dependency-only benefit separately for public-only graphs.
