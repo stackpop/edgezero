@@ -123,8 +123,8 @@ fn build_child_env(
 /// value). Kept next to `build_child_env`'s precedence rule so the two
 /// don't drift.
 fn is_lock_advertisement_key(key: &str) -> bool {
-    use crate::provision_lock::{LOCK_ENV, LOCK_TOKEN_ENV};
-    key == LOCK_ENV || key == LOCK_TOKEN_ENV
+    use crate::provision_lock::{LOCK_ENV, LOCK_TOKEN_ENV, SIBLING_DEPTH_ENV};
+    key == LOCK_ENV || key == LOCK_TOKEN_ENV || key == SIBLING_DEPTH_ENV
 }
 
 /// Every `[environment.secrets]` binding must resolve to a value the

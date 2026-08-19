@@ -234,6 +234,15 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
             provision_lock::LOCK_TOKEN_ENV.to_owned(),
             lock.token().to_owned(),
         ),
+        // Advertise the borrow DEPTH so a nested provision / config push /
+        // deploy serialises on the correct depth-keyed sibling lock -- one
+        // level deeper than whatever this deploy holds, so it never blocks on
+        // this deploy's own sibling lock (no composed-deploy deadlock) while
+        // still serialising its co-siblings.
+        (
+            provision_lock::SIBLING_DEPTH_ENV.to_owned(),
+            lock.child_sibling_depth().to_string(),
+        ),
     ];
     adapter::execute_with_env_overlay(
         &args.adapter,

@@ -56,6 +56,27 @@ pub(crate) const LOCK_ENV: &str = "EDGEZERO_PROVISION_LOCK";
 /// on the real OS lock instead of bypassing an unrelated holder.
 pub(crate) const LOCK_TOKEN_ENV: &str = "EDGEZERO_PROVISION_LOCK_TOKEN";
 
+/// Env var carrying the borrow-tree DEPTH. A borrower serialises its file
+/// writes against its CO-SIBLINGS on a depth-keyed sibling lock
+/// (`provision.borrow.<depth>.lock`); a deploy advertises `depth + 1` to its
+/// subprocess so a NESTED borrower serialises on a DIFFERENT file at the next
+/// depth. This is what lets a THREE-level (or deeper) composed deploy hold
+/// serialisation at EVERY level without a nested borrower dead-locking on the
+/// single shared sibling file an ancestor already holds -- and, crucially,
+/// makes a borrowing DEPLOY (which writes `fastly.toml` via `fastly compute
+/// deploy`) serialise with its co-siblings instead of racing lock-free.
+pub(crate) const SIBLING_DEPTH_ENV: &str = "EDGEZERO_PROVISION_SIBLING_DEPTH";
+
+/// Read the inherited borrow depth (`SIBLING_DEPTH_ENV`), defaulting to 1 --
+/// the first borrow level under a top-level main-lock owner.
+fn inherited_sibling_depth() -> u32 {
+    env::var(SIBLING_DEPTH_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|depth| *depth >= 1)
+        .unwrap_or(1)
+}
+
 /// Process-lifetime counter making concurrently-generated tokens distinct.
 static TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -125,6 +146,11 @@ pub(crate) struct ProvisionLock {
     // `run_deploy` advertises it via `LOCK_TOKEN_ENV` so a nested provision
     // can prove the advertised holder is still the one holding the lock.
     token: String,
+    // The depth `run_deploy` advertises to a deploy subprocess via
+    // `SIBLING_DEPTH_ENV`: `1` when this guard OWNS the main lock (its
+    // children are the first borrow level), or `held_depth + 1` when it holds
+    // a depth-keyed sibling lock (its children serialise one level deeper).
+    child_sibling_depth: u32,
 }
 
 impl ProvisionLock {
@@ -150,23 +176,20 @@ impl ProvisionLock {
     /// filesystem error with the lockfile path so operators can
     /// diagnose disk-full / permission issues.
     pub(crate) fn acquire(manifest_root: &Path) -> Result<Self, String> {
-        // File writers (provision / config push) need the sibling lock so two
-        // of them spawned by the same deploy serialise.
-        Self::acquire_inner(manifest_root, true)
+        Self::acquire_inner(manifest_root)
     }
 
-    /// Acquire for a DEPLOY, which only SPAWNS provisions and writes no
-    /// provision files itself. A borrowing deploy therefore takes NO sibling
-    /// lock -- holding it across the deploy subprocess is exactly what
-    /// dead-locks a nested (grand)child borrower that then contends on the
-    /// same single sibling file. Co-sibling PROVISIONS still serialise,
-    /// because each of THEM (via [`acquire`](Self::acquire)) takes the
-    /// sibling lock.
+    /// Acquire for a DEPLOY. A deploy owns the main lock when top-level, or --
+    /// when nested -- borrows the main lock AND takes a depth-keyed sibling
+    /// lock, because `fastly compute deploy` writes `fastly.toml` (the
+    /// `service_id`) and so must serialise with its co-siblings just like a
+    /// provision. Depth-keying keeps a deeper nested borrower from
+    /// dead-locking on this deploy's sibling lock.
     pub(crate) fn acquire_for_deploy(manifest_root: &Path) -> Result<Self, String> {
-        Self::acquire_inner(manifest_root, false)
+        Self::acquire_inner(manifest_root)
     }
 
-    fn acquire_inner(manifest_root: &Path, needs_sibling: bool) -> Result<Self, String> {
+    fn acquire_inner(manifest_root: &Path) -> Result<Self, String> {
         let dot_edgezero = manifest_root.join(".edgezero");
         let path = dot_edgezero.join("provision.lock");
         // Reject a symlinked `.edgezero/` or `provision.lock` BEFORE
@@ -231,24 +254,17 @@ impl ProvisionLock {
             let file_token = read_token(&path);
             let env_token = env::var(LOCK_TOKEN_ENV).unwrap_or_default();
             if !file_token.is_empty() && file_token == env_token {
-                if needs_sibling {
-                    return Self::borrow_via_sibling(
-                        manifest_root,
-                        &dot_edgezero,
-                        path,
-                        file_token,
-                    );
-                }
-                // A deploy borrower holds NO lock (it writes no provision
-                // files); it keeps only the unlocked main descriptor. This
-                // is what lets a three-level composed deploy avoid dead-
-                // locking on the single shared sibling file.
-                return Ok(Self {
-                    file,
-                    borrowed: true,
-                    path,
-                    token: file_token,
-                });
+                // Borrow the MAIN lock (never block on it -- that self-
+                // deadlocks the composed deploy), but serialise this borrower's
+                // file writes against its CO-SIBLINGS on a DEPTH-KEYED sibling
+                // lock. BOTH provisions AND deploys take it: a borrowing deploy
+                // writes `fastly.toml` (`fastly compute deploy` records the
+                // service_id), so it MUST serialise too -- a lock-free deploy
+                // borrower would race a co-sibling provision and lose an edit.
+                // Depth-keying (not one shared sibling file) is what keeps a
+                // NESTED borrower from dead-locking on an ancestor's sibling
+                // lock.
+                return Self::borrow_via_sibling(manifest_root, &dot_edgezero, path, file_token);
             }
         }
         // Own the main lock: either no advertisement matched, or a matching
@@ -284,24 +300,30 @@ impl ProvisionLock {
             borrowed: false,
             path,
             token,
+            // A main-lock owner's children are the FIRST borrow level.
+            child_sibling_depth: 1,
         })
     }
 
     /// Build a BORROWER guard for an authenticated ancestor deploy. Doesn't
     /// take the main lock (that would self-deadlock the composed deploy) but
-    /// DOES hold a SEPARATE sibling lock so two provisions the same deploy
-    /// spawns can't rewrite the same manifests / env files concurrently.
+    /// DOES hold a DEPTH-KEYED sibling lock (`provision.borrow.<depth>.lock`),
+    /// so file writers spawned by the SAME deploy (co-siblings at this depth)
+    /// serialise, while a MORE-nested borrower serialises on the NEXT depth's
+    /// file and so never blocks on this one -- the reentrant, race-free
+    /// replacement for a single shared sibling file.
     fn borrow_via_sibling(
         manifest_root: &Path,
         dot_edgezero: &Path,
         path: PathBuf,
         token: String,
     ) -> Result<Self, String> {
-        let sibling_path = dot_edgezero.join("provision.borrow.lock");
+        let depth = inherited_sibling_depth();
+        let sibling_path = dot_edgezero.join(format!("provision.borrow.{depth}.lock"));
         reject_symlink_components(
             manifest_root,
             &sibling_path,
-            "the sibling provision lock path `<project>/.edgezero/provision.borrow.lock`",
+            "the depth-keyed sibling provision lock path `<project>/.edgezero/provision.borrow.<depth>.lock`",
         )?;
         let sibling = OpenOptions::new()
             .create(true)
@@ -326,7 +348,17 @@ impl ProvisionLock {
             borrowed: true,
             path,
             token,
+            // A borrower's own children serialise one level deeper.
+            child_sibling_depth: depth.saturating_add(1),
         })
+    }
+
+    /// The borrow depth `run_deploy` advertises to a deploy subprocess via
+    /// [`SIBLING_DEPTH_ENV`], so a nested provision / config push / deploy
+    /// serialises on the correct depth-keyed sibling lock. `1` under a
+    /// main-lock owner; one deeper than the depth this guard itself holds.
+    pub(crate) fn child_sibling_depth(&self) -> u32 {
+        self.child_sibling_depth
     }
 
     /// The token authenticating this held lock, for `run_deploy` to
@@ -518,12 +550,14 @@ mod tests {
     }
 
     #[test]
-    fn deploy_borrower_does_not_hold_the_sibling_lock() {
+    fn deploy_borrower_serialises_cosiblings_but_not_deeper_nesting() {
         // A composed deploy: the owner holds the main lock; a nested DEPLOY
-        // borrows via `acquire_for_deploy` and must take NO sibling lock (it
-        // writes no provision files). A provision that then borrows and DOES
-        // take the sibling lock must not block on the deploy borrower --
-        // otherwise a three-level composed deploy dead-locks.
+        // borrows via `acquire_for_deploy` and -- unlike the earlier lock-free
+        // behaviour -- DOES take a depth-keyed sibling lock, because `fastly
+        // compute deploy` writes `fastly.toml`. A CO-SIBLING file writer at the
+        // SAME depth must SERIALISE behind it (no race), while a MORE-nested
+        // borrower one depth deeper (as the deploy advertises) must NOT block
+        // on it (no composed-deploy deadlock).
         use crate::test_support::{EnvOverride, manifest_guard};
         use std::sync::PoisonError;
         let _g = manifest_guard()
@@ -536,24 +570,52 @@ mod tests {
         assert!(owner.owns_os_lock(), "owner holds the main lock");
         let _tok = EnvOverride::set(super::LOCK_TOKEN_ENV, OsStr::new(owner.token()));
 
-        // The nested deploy borrows WITHOUT taking the sibling lock.
+        // The nested deploy borrows the main lock AND takes the depth-1 sibling
+        // lock; it advertises depth 2 to its own children.
         let deploy = ProvisionLock::acquire_for_deploy(temp.path()).expect("deploy borrow");
-        assert!(!deploy.owns_os_lock(), "the nested deploy borrows the lock");
-
-        // A provision borrower (which DOES take the sibling lock) must not
-        // block on the deploy borrower.
+        assert!(
+            !deploy.owns_os_lock(),
+            "the nested deploy borrows the main lock"
+        );
+        assert_eq!(
+            deploy.child_sibling_depth(),
+            2,
+            "deploy advertises the next depth to its children"
+        );
         let root = temp.path().to_path_buf();
+
+        // (a) A DEEPER-nested borrower (depth 2, as the deploy advertises to
+        // its children) must NOT block on the deploy's depth-1 sibling lock --
+        // it serialises on a different file.
+        let depth_override = EnvOverride::set(super::SIBLING_DEPTH_ENV, OsStr::new("2"));
         let (tx, rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            let prov = ProvisionLock::acquire(&root).expect("provision borrow");
+        let deeper_root = root.clone();
+        let deeper = thread::spawn(move || {
+            let nested = ProvisionLock::acquire(&deeper_root).expect("deeper nested borrow");
             tx.send(()).expect("signal");
-            drop(prov);
+            drop(nested);
         });
         rx.recv_timeout(Duration::from_secs(3)).expect(
-            "a provision borrow must not block on a deploy borrower's sibling lock (deadlock)",
+            "a deeper-nested borrow must not block on the deploy's sibling lock (deadlock)",
         );
-        handle.join().expect("join provision");
+        deeper.join().expect("join deeper");
+        // Restore the default depth (1) for the co-sibling check below.
+        drop(depth_override);
+
+        // (b) A CO-SIBLING file writer at the SAME depth (1) MUST serialise
+        // behind the deploy's depth-1 sibling lock.
+        let start = Instant::now();
+        let cosibling = thread::spawn(move || {
+            let prov = ProvisionLock::acquire(&root).expect("co-sibling provision");
+            drop(prov);
+        });
+        thread::sleep(Duration::from_millis(50));
         drop(deploy);
+        cosibling.join().expect("join co-sibling");
+        assert!(
+            start.elapsed() >= Duration::from_millis(30),
+            "the co-sibling must serialise behind the deploy's depth-1 sibling lock"
+        );
         drop(owner);
     }
 
