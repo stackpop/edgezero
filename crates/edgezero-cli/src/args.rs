@@ -10,6 +10,16 @@ This command requires a typed app-config struct (`C`) and runs from your generat
 CLI, not the bundled `edgezero` binary. Run `<your-app>-cli config push` (or `... diff`) \
 instead. See `<your-app>-cli config push --help`.";
 
+/// Printed after a successful bundled `edgezero provision --local`. The
+/// bundled binary has no typed `C`, so it writes the manifest + store
+/// bindings but NOT the per-`#[secret]` placeholders. This names the
+/// follow-up step the operator runs from their generated CLI.
+pub const PROVISION_TYPED_FOLLOWUP: &str = "\
+The bundled `edgezero` binary wrote the adapter manifest and store bindings, but it has no typed \
+app-config struct, so it did NOT write `#[secret]` placeholders. If your app declares typed \
+secrets, finish provisioning from your generated CLI: `<your-app>-cli provision --adapter <name> \
+--local`.";
+
 #[derive(Parser, Debug)]
 #[command(name = "edgezero", about = "EdgeZero CLI")]
 pub struct Args {
@@ -264,6 +274,12 @@ pub struct ProvisionArgs {
     /// without performing them.
     #[arg(long)]
     pub dry_run: bool,
+    /// Switch the flow from cloud-SDK shell-outs to local-file writes.
+    /// Adapter-local manifests, env files, and runtime-config TOML are
+    /// synthesised or merged in place; no cloud CLIs are invoked. See
+    /// spec §"CLI" for the full mode contract.
+    #[arg(long)]
+    pub local: bool,
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
@@ -283,6 +299,7 @@ impl Default for ProvisionArgs {
         Self {
             adapter: String::new(),
             dry_run: false,
+            local: false,
             manifest: default_manifest_path(),
         }
     }
@@ -381,14 +398,24 @@ impl Default for ConfigDiffArgs {
 /// `run_config_push_typed::<C>`.  The bundled `edgezero` binary exposes
 /// a `ConfigCmdStubArgs` catch-all instead and redirects to the typed
 /// CLI at runtime.
-#[derive(clap::Args, Debug)]
-#[non_exhaustive]
+/// `no_diff` and `no_env` live
+/// on this struct as top-level public fields to preserve source
+/// compatibility with downstream CLIs that predate the 2026-07-13
+/// changes. Total bool count is 5 (`dry_run`, `local`, `no_diff`,
+/// `no_env`, `yes`), which trips
+/// `clippy::struct_excessive_bools` (threshold 3). The lint
+/// prefers grouping into a sub-struct, but that would break
+/// `args.no_diff = true;` style construction downstream — a
+/// public API break `#[non_exhaustive]` explicitly does NOT
+/// insulate against.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "clap args struct: each bool is a distinct CLI flag \
-              (dry_run, local, no_diff, no_env, yes); a state machine \
-              would be inappropriate here"
+    reason = "5 bools by design: source-compat for downstream CLIs that assign \
+              `args.no_diff` / `args.no_env` directly. Grouping into a sub-struct \
+              trips E0609 at every existing call site."
 )]
+#[derive(clap::Args, Debug)]
+#[non_exhaustive]
 pub struct ConfigPushArgs {
     /// Target adapter name.
     #[arg(long, required = true)]
@@ -418,14 +445,6 @@ pub struct ConfigPushArgs {
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
-    /// Skip the inline diff render.
-    #[arg(long)]
-    pub no_diff: bool,
-    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
-    /// typed app-config. The default loads the overlay so the runtime
-    /// and the push see the same resolved values.
-    #[arg(long)]
-    pub no_env: bool,
     /// Path to the adapter's runtime configuration file. Currently
     /// only honoured by Spin, which reads
     /// `[key_value_store.<label>]` stanzas to dispatch
@@ -440,6 +459,14 @@ pub struct ConfigPushArgs {
     /// `[stores.config].ids` has length 1).
     #[arg(long)]
     pub store: Option<String>,
+    /// Skip the inline diff render.
+    #[arg(long)]
+    pub no_diff: bool,
+    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
+    /// typed app-config. The default loads the overlay so the runtime
+    /// and the push see the same resolved values.
+    #[arg(long)]
+    pub no_env: bool,
     /// Skip the inline diff prompt and write unconditionally.
     #[arg(long, short)]
     pub yes: bool,
@@ -826,6 +853,30 @@ mod tests {
     fn provision_requires_adapter() {
         Args::try_parse_from(["edgezero", "provision"])
             .expect_err("`provision` without --adapter must error");
+    }
+
+    #[test]
+    fn provision_args_local_flag_defaults_false() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ProvisionArgs,
+        }
+        let cli = Cli::try_parse_from(["bin", "--adapter", "spin"]).unwrap();
+        assert!(!cli.args.local);
+    }
+
+    #[test]
+    fn provision_args_local_flag_parses() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ProvisionArgs,
+        }
+        let cli = Cli::try_parse_from(["bin", "--adapter", "spin", "--local"]).unwrap();
+        assert!(cli.args.local);
     }
 
     // ── config push / diff stub tests (12.8 + 12.11) ──────────────────

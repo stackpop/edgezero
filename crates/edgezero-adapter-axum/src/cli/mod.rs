@@ -1,0 +1,1449 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use ctor::ctor;
+use edgezero_adapter::cli_support;
+use edgezero_adapter::env_file::{
+    EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, reject_symlink_components,
+    reject_symlinked_target,
+};
+use edgezero_adapter::registry::{
+    Adapter, AdapterAction, AdapterDeployedState, AdapterExecContext, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry, register_adapter,
+};
+use edgezero_adapter::scaffold::{
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
+};
+
+mod provision_local;
+mod run;
+
+// `axum.toml` is intentionally absent from the scaffold registration.
+// It is written by the scaffold-time provision loop that runs
+// immediately after file emission (see `generator.rs`
+// `provision_all_selected_adapters` -> `Adapter::synthesise_baseline_manifest`
+// -> `run::synthesise_axum_toml`). Registering a scaffold template
+// here would cause `axum.toml` to be created before provision runs;
+// provision's `write_baseline_to_disk` skips files that already
+// exist (spec § "Adapter manifests are gitignored"), so the two
+// baselines would diverge — the scaffold template would win at
+// `edgezero new`, but the synthesiser would win on a clean clone.
+// Keep this single-source: only the synthesiser writes `axum.toml`.
+static AXUM_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
+    TemplateRegistration {
+        name: "axum_Cargo_toml",
+        contents: include_str!("../templates/Cargo.toml.hbs"),
+    },
+    TemplateRegistration {
+        name: "axum_src_main_rs",
+        contents: include_str!("../templates/src/main.rs.hbs"),
+    },
+];
+
+static AXUM_FILE_SPECS: &[AdapterFileSpec] = &[
+    AdapterFileSpec {
+        template: "axum_Cargo_toml",
+        output: "Cargo.toml",
+    },
+    AdapterFileSpec {
+        template: "axum_src_main_rs",
+        output: "src/main.rs",
+    },
+];
+
+static AXUM_DEPENDENCIES: &[DependencySpec] = &[
+    DependencySpec {
+        key: "dep_edgezero_core_axum",
+        repo_crate: "crates/edgezero-core",
+        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\" }",
+        features: &[],
+    },
+    DependencySpec {
+        key: "dep_edgezero_adapter_axum",
+        repo_crate: "crates/edgezero-adapter-axum",
+        fallback: "edgezero-adapter-axum = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-axum\", default-features = false }",
+        features: &["axum"],
+    },
+];
+
+static AXUM_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
+    id: "axum",
+    display_name: "Axum",
+    crate_suffix: "adapter-axum",
+    dependency_crate: "edgezero-adapter-axum",
+    dependency_repo_path: "crates/edgezero-adapter-axum",
+    template_registrations: AXUM_TEMPLATE_REGISTRATIONS,
+    files: AXUM_FILE_SPECS,
+    extra_dirs: &["src"],
+    dependencies: AXUM_DEPENDENCIES,
+    manifest: ManifestSpec {
+        manifest_filename: "axum.toml",
+        build_target: "native",
+        build_profile: "dev",
+        build_features: &[],
+    },
+    commands: CommandTemplates {
+        // Omit the `[adapters.axum.commands]` shell block: a shell override
+        // would take precedence over the registry dispatch and run cargo by
+        // package name, bypassing `axum.toml` (its `crate_dir` in
+        // particular). With no block, `build`/`serve` route through the
+        // axum.toml-aware registry adapter. These strings are unused while
+        // `emit_commands` is false; kept for parity with the other
+        // blueprints.
+        build: "cargo build -p {crate}",
+        serve: "cargo run -p {crate}",
+        deploy: "# configure deployment for Axum",
+        emit_commands: false,
+    },
+    logging: LoggingDefaults {
+        endpoint: None,
+        level: "info",
+        echo_stdout: Some(true),
+    },
+    readme: ReadmeInfo {
+        description: "{display} adapter entrypoint.",
+        dev_heading: "{display} (local)",
+        dev_steps: &[
+            "`cd {crate_dir}`",
+            "`cargo run` or `edgezero serve --adapter axum`",
+        ],
+    },
+    run_module: "edgezero_adapter_axum",
+};
+
+static AXUM_ADAPTER: AxumCliAdapter = AxumCliAdapter;
+
+struct AxumCliAdapter;
+
+impl Adapter for AxumCliAdapter {
+    fn execute(
+        &self,
+        action: AdapterAction,
+        args: &[String],
+        ctx: &AdapterExecContext<'_>,
+    ) -> Result<(), String> {
+        match action {
+            // The axum adapter is the in-process native dev server —
+            // there is no remote auth provider to sign in/out of.
+            // Per spec this is an explicit no-op.
+            AdapterAction::AuthLogin | AdapterAction::AuthLogout | AdapterAction::AuthStatus => {
+                log::info!(
+                    "[edgezero] axum has no remote auth surface; `auth` is a no-op for this adapter"
+                );
+                Ok(())
+            }
+            AdapterAction::Build => run::build(args, ctx),
+            AdapterAction::Deploy => run::deploy(args),
+            AdapterAction::Serve => run::serve(args, ctx),
+            other => Err(format!("axum adapter does not support {other:?}")),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "axum"
+    }
+
+    // Axum has no cloud identifiers to persist across provisions.
+    #[inline]
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    // Axum's KV / config / secrets each live in their own file — no
+    // logical-id merging across store kinds.
+    #[inline]
+    fn merged_id_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    // Axum has no per-platform adapter manifest to validate — axum.toml
+    // is the runtime's own file, checked at load time by the axum
+    // adapter, not by the CLI. No-op mirrors the trait default.
+    #[inline]
+    fn validate_adapter_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _allow_component_refresh: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Axum has no adapter-specific key naming constraint on
+    // app-config keys. Trait default no-op.
+    #[inline]
+    fn validate_app_config_keys(&self, _keys: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Axum writes each typed secret as a bare `<key>=` line into
+    /// `.edgezero/.env`. A key that cannot round-trip through that format
+    /// would emit a line meaning something else: `partner=token` becomes
+    /// `partner=token=`, which every `.env` reader parses back as the key
+    /// `partner` with the value `token=`. Reject those keys here rather
+    /// than writing an unrepresentable file.
+    #[inline]
+    fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        // The ENTIRE `EDGEZERO__` namespace is reserved for runtime config:
+        // provision writes generated `EDGEZERO__STORES__...` store overlays
+        // into the same `.edgezero/.env` typed secrets are appended to, and
+        // the runtime also reads `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*`
+        // / etc. from that env. A secret key anywhere under `EDGEZERO__` would
+        // collide with (or be shadowed by) runtime configuration and resolve
+        // to config data instead of the credential. Reject in preflight.
+        const RESERVED_PREFIX: &str = "EDGEZERO__";
+        for entry in entries {
+            let key = entry.key_value;
+            let reason = if key.is_empty() {
+                Some("is empty")
+            } else if key.contains('=') {
+                Some("contains `=`")
+            } else if key.contains('\n') || key.contains('\r') {
+                Some("contains a newline")
+            } else if key.trim() != key {
+                Some("has leading or trailing whitespace")
+            } else if key.starts_with('#') {
+                Some("starts with `#`, which `.env` readers treat as a comment")
+            } else if key.to_ascii_uppercase().starts_with(RESERVED_PREFIX) {
+                Some(
+                    "is in the reserved `EDGEZERO__` namespace used for runtime configuration \
+                     (store overlays, `EDGEZERO__ADAPTER__*`, `EDGEZERO__LOGGING__*`, ...) in \
+                     `.edgezero/.env`; a secret there would collide with config and resolve to \
+                     configuration data instead of the credential",
+                )
+            } else {
+                None
+            };
+            if let Some(rejection) = reason {
+                return Err(format!(
+                    "secret key `{key}` (field `{field}`) {rejection}; axum writes typed secrets as \
+                     `<key>=` lines in `.edgezero/.env`, and this key cannot round-trip through \
+                     that format. Rename the key on the `#[secret]` field.",
+                    field = entry.field_name,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn provision(
+        &self,
+        manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        stores: &ProvisionStores<'_>,
+        _deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String> {
+        match mode {
+            ProvisionMode::Cloud => {}
+            ProvisionMode::Local => {
+                return provision_local::provision(manifest_root, stores, dry_run);
+            }
+            // ProvisionMode is #[non_exhaustive]; explicit error so a
+            // future mode variant doesn't quietly fall through.
+            other => {
+                return Err(format!(
+                    "axum adapter does not implement provision mode {other:?}"
+                ));
+            }
+        }
+        //: axum has no remote resources. Print one note per
+        // declared store id so the operator sees the CLI heard
+        // them — same shape `dry_run` would have, since there is
+        // nothing to actually perform.
+        let mut out = Vec::with_capacity(
+            stores
+                .kv
+                .len()
+                .saturating_add(stores.config.len())
+                .saturating_add(stores.secrets.len()),
+        );
+        for store in stores.kv {
+            let logical = store.logical.as_str();
+            out.push(format!(
+                "axum KV store `{logical}` is in-memory; nothing to provision"
+            ));
+        }
+        for store in stores.config {
+            // Axum reads `.edgezero/local-config-<logical>.json`.
+            // The platform name is informational here -- the env
+            // overlay isn't used for local file paths because the
+            // path encoding is the spec's canonical form.
+            let logical = store.logical.as_str();
+            out.push(format!(
+                "axum config store `{logical}` reads `.edgezero/local-config-{logical}.json`; nothing to provision"
+            ));
+        }
+        for store in stores.secrets {
+            let logical = store.logical.as_str();
+            out.push(format!(
+                "axum secret store `{logical}` reads env vars; nothing to provision"
+            ));
+        }
+        if out.is_empty() {
+            out.push("axum has no declared stores to provision".to_owned());
+        }
+        Ok(ProvisionOutcome::from_status_lines(out))
+    }
+
+    fn provision_typed(
+        &self,
+        manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        typed_secrets: &[TypedSecretEntry<'_>],
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String> {
+        // Axum has no cloud secret store: cloud is a documented no-op.
+        // Local mode appends `<key_value>=` lines to `.edgezero/.env`
+        // (unquoted empty value — the loosest `.env` form). The
+        // operator fills in the actual secret by editing the file.
+        // `append_lines_dedup` handles parent-dir creation so
+        // `.edgezero/` gets auto-created on the first-run case.
+        if !matches!(mode, ProvisionMode::Local) {
+            return Ok(ProvisionOutcome::default());
+        }
+        let env_path = manifest_root.join(".edgezero").join(".env");
+        let lines: Vec<String> = typed_secrets
+            .iter()
+            .map(|entry| format!("{}=", entry.key_value))
+            .collect();
+        let wrote = append_lines_dedup_with_header(
+            &env_path,
+            Some(EDGEZERO_PROVISION_HEADER),
+            &lines,
+            dry_run,
+        )
+        .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+        // Report what actually landed, not the candidate count: on a
+        // re-provision where every placeholder already exists, the write
+        // is a dedup no-op and claiming "wrote N" would be misleading.
+        let status_lines = if wrote {
+            vec![format!(
+                "axum: wrote {} secret placeholder(s) to {}",
+                typed_secrets.len(),
+                env_path.display()
+            )]
+        } else {
+            vec![format!(
+                "axum: {} secret placeholder(s) already present in {}; no change",
+                typed_secrets.len(),
+                env_path.display()
+            )]
+        };
+        Ok(ProvisionOutcome::from_status_lines(status_lines))
+    }
+
+    fn push_config_entries(
+        &self,
+        manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        //: axum is local-only. Push writes the same flat
+        // `string -> string` JSON object `AxumConfigStore` reads
+        // back from `.edgezero/local-config-<id>.json`. The path
+        // is keyed on the LOGICAL id, not the env-resolved
+        // platform name -- the local file flow is the spec's
+        // canonical form and isn't subject to the per-store env
+        // overlay (which targets platform store names, not local
+        // file paths).
+        let logical = store.logical.as_str();
+        let local_dir = manifest_root.join(".edgezero");
+        let target = local_dir.join(format!("local-config-{logical}.json"));
+        if dry_run {
+            return Ok(vec![format!(
+                "would write {} entries to {}",
+                entries.len(),
+                target.display()
+            )]);
+        }
+        // A symlinked local-config file would have the read below
+        // follow it and the write clobber (or, if dangling, create)
+        // its target outside the project tree.
+        reject_symlinked_target(&target)?;
+        fs::create_dir_all(&local_dir)
+            .map_err(|err| format!("failed to create {}: {err}", local_dir.display()))?;
+        // Upsert into any existing map so a `config push --key
+        // app_config_staging` doesn't wipe a previously-pushed
+        // `app_config` blob (spec 12.7 requires default + staging
+        // to coexist for the `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`
+        // override to switch between them). The map is owned (rather
+        // than borrowed) so we can merge old + new without lifetime
+        // surgery on the slice.
+        // Only two cases legitimately yield an empty starting map: the
+        // file does not exist yet, or it exists but is blank. EVERY
+        // other read failure (invalid UTF-8, permission denied, a
+        // transient I/O error) MUST propagate -- a `_ => BTreeMap::new()`
+        // catch-all silently discards the operator's existing keys and
+        // the `fs::write` below then replaces the file with just this
+        // push's entries, losing every sibling blob (e.g. a previously
+        // pushed `app_config` when pushing `app_config_staging`).
+        let mut map: BTreeMap<String, String> = match fs::read_to_string(&target) {
+            Ok(text) if text.trim().is_empty() => BTreeMap::new(),
+            Ok(text) => serde_json::from_str(&text).map_err(|err| {
+                format!(
+                    "failed to parse existing {}: {err} (expected a JSON object of key->envelope)",
+                    target.display()
+                )
+            })?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(err) => {
+                return Err(format!(
+                    "failed to read existing {}: {err} -- refusing to overwrite it, which would \
+                     drop any config keys it already holds",
+                    target.display()
+                ));
+            }
+        };
+        for (key, value) in entries {
+            map.insert(key.clone(), value.clone());
+        }
+        let json = serde_json::to_string_pretty(&map)
+            .map_err(|err| format!("failed to serialize config to JSON: {err}"))?;
+        fs::write(&target, json)
+            .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+        Ok(vec![format!(
+            "wrote {} entries to {} ({} total keys after upsert)",
+            entries.len(),
+            target.display(),
+            map.len(),
+        )])
+    }
+
+    fn push_config_entries_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        entries: &[(String, String)],
+        push_ctx: &AdapterPushContext<'_>,
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Axum is local-only: the default push already writes
+        // `.edgezero/local-config-<id>.json`, which is what the
+        // running dev server reads. `--local` is therefore the
+        // same as the default; we delegate and prepend a notice
+        // so the operator who typed `--local` for parity with
+        // fastly/cloudflare knows there was nothing extra to do.
+        let mut lines = self.push_config_entries(
+            manifest_root,
+            adapter_manifest_path,
+            component_selector,
+            store,
+            entries,
+            push_ctx,
+            dry_run,
+        )?;
+        let notice =
+            "axum push is always local: `--local` has no separate effect (writes the same `.edgezero/local-config-<id>.json` either way)".to_owned();
+        lines.insert(0, notice);
+        Ok(lines)
+    }
+
+    fn read_config_entry(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Axum has no "remote" — delegate to the local impl.
+        // The local JSON file IS the live state for the running dev server.
+        self.read_config_entry_local(
+            manifest_root,
+            adapter_manifest_path,
+            component_selector,
+            store,
+            key,
+            push_ctx,
+        )
+    }
+
+    fn read_config_entry_local(
+        &self,
+        manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Axum reads `.edgezero/local-config-<logical>.json`.
+        // The path is keyed on the LOGICAL id (matching
+        // `push_config_entries`), not the env-resolved platform name.
+        let path = manifest_root
+            .join(".edgezero")
+            .join(format!("local-config-{}.json", store.logical));
+        // Reject a symlink at ANY component from `manifest_root` down to the
+        // JSON file -- not just the final one -- so a symlinked `.edgezero`
+        // directory can't redirect the diff read off the tree either.
+        // Matches the write side's containment policy.
+        reject_symlink_components(manifest_root, &path)?;
+        match fs::read_to_string(&path) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ReadConfigEntry::MissingStore),
+            Err(err) => Err(format!("failed to read {}: {err}", path.display())),
+            Ok(raw) => {
+                let map: BTreeMap<String, String> = serde_json::from_str(&raw)
+                    .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+                match map.get(key) {
+                    Some(value) => Ok(ReadConfigEntry::Present(value.clone())),
+                    None => Ok(ReadConfigEntry::MissingKey),
+                }
+            }
+        }
+    }
+
+    // Axum config is a local JSON map (one value per key, no chunk fan-out),
+    // so there are no orphaned chunk entries to reclaim -- inherit the trait's
+    // "not implemented" default (spelled out for the `missing_trait_methods`
+    // lint).
+    fn gc_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _push_ctx: &AdapterPushContext<'_>,
+        _older_than_secs: u64,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "adapter `{}` does not implement `config gc`",
+            self.name()
+        ))
+    }
+
+    fn preflight_config_write(&self, _key: &str, _body: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        //: axum is Multi for KV (local file dirs) and Config
+        // (local JSON files), Single for Secrets (env vars).
+        &["secrets"]
+    }
+
+    fn synthesise_baseline_manifest(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        adapter_crate_path: Option<&str>,
+        _component_selector: Option<&str>,
+        app_name: &str,
+        _deployed: Option<&AdapterDeployedState>,
+        _allowed_outbound_hosts: &[String],
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        // Axum's manifest is pure operator-facing dev-server config
+        // (host, port, crate name, crate dir). There are no cloud
+        // identifiers to weave in, and provision's merge path is a
+        // no-op on the file. The baseline is emitted so a fresh
+        // clone's `provision --local` gets a runnable `axum.toml`
+        // without needing the operator to hand-author one -- same
+        // model as Cloudflare / Fastly / Spin.
+        let rel = adapter_manifest_path.map_or_else(|| PathBuf::from("axum.toml"), PathBuf::from);
+        // Prefer the authoritative declared `[adapters.axum.adapter].crate`
+        // for the crate name; fall back to the ancestor `Cargo.toml`
+        // search, then the scaffold convention. (An ancestor search alone
+        // could pick a nested package between the manifest and the crate.)
+        let crate_name = match cli_support::read_crate_name_at(manifest_root, adapter_crate_path)? {
+            Some(name) => name,
+            None => cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+                .unwrap_or_else(|| {
+                    if app_name.is_empty() {
+                        "app-adapter-axum".to_owned()
+                    } else {
+                        format!("{app_name}-adapter-axum")
+                    }
+                }),
+        };
+        // Compute `crate_dir` (relative path from the manifest's
+        // parent to the crate root). The scaffold convention
+        // `crates/<crate>/axum.toml` puts the manifest INSIDE the
+        // crate root so `crate_dir = "."`. A nested manifest like
+        // `crates/server/config/axum.toml` needs `".."` because
+        // the crate root sits one level above the manifest's
+        // parent — the axum-adapter loader consumes `crate_dir`
+        // to locate `Cargo.toml`, and without the right count of
+        // `..` it looks in `config/Cargo.toml` and fails
+        // discovery.
+        let crate_dir =
+            derive_axum_crate_dir(manifest_root, adapter_manifest_path, adapter_crate_path);
+        Ok(vec![(
+            rel,
+            run::synthesise_axum_toml(&crate_name, &crate_dir),
+        )])
+    }
+}
+
+/// Return the `crate_dir` string the synthesiser should emit for
+/// this manifest layout: the relative path from the manifest's
+/// parent to the crate root (the dir carrying `Cargo.toml`).
+///
+/// The crate root is the AUTHORITATIVE declared
+/// `[adapters.axum.adapter].crate` when present (so `crate_dir` agrees
+/// with the crate NAME, which also honours `.crate`); it falls back to
+/// the nearest-ancestor `Cargo.toml` search only when `.crate` is
+/// undeclared. Without this, a nested package between the manifest and
+/// the intended crate could make the crate NAME and `crate_dir` name two
+/// DIFFERENT crates in the same `axum.toml`.
+///
+/// Falls back to `"."` when `.manifest` is unset (first-run scaffold),
+/// when no crate root can be resolved, or when the resolved crate root
+/// isn't a lexical ancestor of the manifest's parent (a `.crate` /
+/// `.manifest` misconfiguration) -- `"."` is the scaffold-convention
+/// default (`crates/<crate>/axum.toml`).
+fn derive_axum_crate_dir(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    adapter_crate_path: Option<&str>,
+) -> String {
+    use std::iter;
+    use std::path::Component;
+    let Some(rel_str) = adapter_manifest_path else {
+        return ".".to_owned();
+    };
+    let crate_root = match adapter_crate_path {
+        Some(cp) => manifest_root.join(cp),
+        None => match cli_support::read_adapter_crate_root(manifest_root, adapter_manifest_path) {
+            Some(root) => root,
+            None => return ".".to_owned(),
+        },
+    };
+    let manifest_abs = manifest_root.join(rel_str);
+    let Some(manifest_parent) = manifest_abs.parent() else {
+        return ".".to_owned();
+    };
+    // Count directory hops from `manifest_parent` back up to
+    // `crate_root`. Both are built from the SAME `manifest_root.join(...)`
+    // base, and `read_adapter_crate_root` returns a lexical ancestor of
+    // `manifest_parent` (it walks up via `.parent()`), so `strip_prefix`
+    // succeeds LEXICALLY. We deliberately do NOT `canonicalize()` here:
+    // canonicalisation requires the path to exist on disk, and on a fresh
+    // clone the nested `<crate>/config/` dir may not be created yet -- it
+    // would leave `manifest_parent` relative while an existing
+    // `crate_root` resolved to absolute, so `strip_prefix` would fail and
+    // emit `.` (wrong: the nested manifest needs `..`). Falls back to `.`
+    // only if the lexical prefix genuinely doesn't hold.
+    let Ok(down_from_crate) = manifest_parent.strip_prefix(&crate_root) else {
+        return ".".to_owned();
+    };
+    let hops = down_from_crate
+        .components()
+        .filter(|comp| matches!(comp, Component::Normal(_)))
+        .count();
+    if hops == 0 {
+        ".".to_owned()
+    } else {
+        iter::repeat_n("..", hops).collect::<Vec<_>>().join("/")
+    }
+}
+
+#[inline]
+pub fn register() {
+    register_adapter(&AXUM_ADAPTER);
+    register_adapter_blueprint(&AXUM_BLUEPRINT);
+}
+
+#[ctor(unsafe)]
+fn register_ctor() {
+    register();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_crate(root: &Path, rel: &str, name: &str) {
+        let dir = root.join(rel);
+        fs::create_dir_all(&dir).expect("mkdir crate");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .expect("write Cargo.toml");
+    }
+
+    #[test]
+    fn derive_axum_crate_dir_nested_manifest_without_existing_config_dir() {
+        // Regression: the nested `config/` dir does NOT exist yet (fresh
+        // clone / synthesis), but the crate root does. The derivation must
+        // still emit `..` -- it did not when it canonicalised the two
+        // sides independently (missing path stayed relative, existing path
+        // went absolute, `strip_prefix` failed and emitted `.`).
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_crate(root, "crates/server", "server");
+        // `crates/server/config/` is deliberately NOT created. `None`
+        // crate path exercises the ancestor-search fallback.
+        assert_eq!(
+            derive_axum_crate_dir(root, Some("crates/server/config/axum.toml"), None),
+            "..",
+            "a manifest one dir below the crate root needs `..`"
+        );
+        assert_eq!(
+            derive_axum_crate_dir(root, Some("crates/server/config/deep/axum.toml"), None),
+            "../..",
+            "two dirs below the crate root needs `../..`"
+        );
+    }
+
+    #[test]
+    fn derive_axum_crate_dir_scaffold_convention_is_dot() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_crate(root, "crates/app", "app");
+        assert_eq!(
+            derive_axum_crate_dir(root, Some("crates/app/axum.toml"), None),
+            ".",
+            "a manifest AT the crate root needs `.`"
+        );
+    }
+
+    #[test]
+    fn derive_axum_crate_dir_prefers_declared_crate_over_nested_package() {
+        // A nested package sits BETWEEN the manifest and the intended
+        // crate. Ancestor search would stop at `crates/server/config`
+        // (crate_dir `.`), disagreeing with the crate NAME (which honours
+        // `.crate`). The declared `.crate` must win: `crate_dir = ".."`.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_crate(root, "crates/server", "server");
+        // Intervening nested package that ancestor search would wrongly pick.
+        write_crate(root, "crates/server/config", "server-config");
+        assert_eq!(
+            derive_axum_crate_dir(
+                root,
+                Some("crates/server/config/axum.toml"),
+                Some("crates/server"),
+            ),
+            "..",
+            "declared `.crate` must anchor crate_dir, not the nested package"
+        );
+    }
+
+    #[test]
+    fn derive_axum_crate_dir_no_manifest_is_dot() {
+        let dir = tempdir().expect("tempdir");
+        assert_eq!(derive_axum_crate_dir(dir.path(), None, None), ".");
+    }
+
+    #[test]
+    fn adapter_name_is_axum() {
+        assert_eq!(AXUM_ADAPTER.name(), "axum");
+    }
+
+    #[test]
+    fn blueprint_has_correct_id() {
+        assert_eq!(AXUM_BLUEPRINT.id, "axum");
+        assert_eq!(AXUM_BLUEPRINT.display_name, "Axum");
+    }
+
+    // ---------- validate_typed_secrets ----------
+
+    #[test]
+    fn validate_typed_secrets_rejects_key_containing_equals() {
+        // `partner=token` would be written as `partner=token=`, which
+        // reads back as key `partner` with value `token=`.
+        let entries = vec![TypedSecretEntry::new("default", "field", "partner=token")];
+        let err = AXUM_ADAPTER
+            .validate_typed_secrets(&entries)
+            .expect_err("a key containing `=` cannot round-trip through a .env line");
+        assert!(
+            err.contains("partner=token") && err.contains("contains `=`"),
+            "error names the key and the reason: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_newline_whitespace_and_comment_keys() {
+        for bad in ["with\nnewline", " padded", "padded ", "#commented", ""] {
+            let entries = vec![TypedSecretEntry::new("default", "field", bad)];
+            AXUM_ADAPTER
+                .validate_typed_secrets(&entries)
+                .expect_err("a key that cannot round-trip through a .env line must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_reserved_store_overlay_namespace() {
+        // A secret key in the `EDGEZERO__STORES__` namespace would collide
+        // (and be silently deduped away) against the generated store-overlay
+        // lines base provision writes into the SAME `.edgezero/.env`.
+        for reserved in [
+            "EDGEZERO__STORES__CONFIG__APP__KEY",
+            "EDGEZERO__ADAPTER__HOST",
+            "EDGEZERO__LOGGING__LEVEL",
+            "edgezero__adapter__port", // case-insensitive
+        ] {
+            let entries = vec![TypedSecretEntry::new("default", "field", reserved)];
+            let Err(err) = AXUM_ADAPTER.validate_typed_secrets(&entries) else {
+                panic!("a reserved-namespace secret key must be rejected: {reserved}");
+            };
+            assert!(
+                err.contains("reserved") && err.contains("EDGEZERO__"),
+                "error explains the reserved-namespace collision for {reserved}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_typed_secrets_accepts_ordinary_keys() {
+        let entries = vec![
+            TypedSecretEntry::new("default", "field_a", "demo_api_token"),
+            TypedSecretEntry::new("default", "field_b", "PARTNER_TOKEN"),
+        ];
+        AXUM_ADAPTER
+            .validate_typed_secrets(&entries)
+            .expect("ordinary keys round-trip fine");
+    }
+
+    // ---------- push_config_entries ----------
+
+    #[test]
+    fn push_writes_flat_json_to_local_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        let lines = AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("wrote 2 entries"),
+            "status line names count: {lines:?}"
+        );
+        let json_path = dir.path().join(".edgezero/local-config-app_config.json");
+        let raw = fs::read_to_string(&json_path).expect("read written file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["greeting"], "hello");
+        assert_eq!(parsed["service.timeout_ms"], "1500");
+    }
+
+    #[test]
+    fn push_dry_run_does_not_create_local_dir_or_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let lines = AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert!(
+            lines[0].contains("would write 1 entries"),
+            "dry-run line: {lines:?}"
+        );
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            ".edgezero must not exist after dry-run"
+        );
+    }
+
+    #[test]
+    fn push_creates_dot_edgezero_directory_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![("key".to_owned(), "value".to_owned())];
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("x"),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        assert!(dir.path().join(".edgezero").is_dir(), ".edgezero created");
+    }
+
+    #[test]
+    fn push_with_empty_entries_writes_empty_json_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("empty"),
+                &[],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds even with no entries");
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-empty.json"))
+            .expect("read written file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!({}));
+    }
+
+    #[test]
+    fn push_propagates_read_error_instead_of_clobbering_existing_keys() {
+        // Regression: the read
+        // arm used to be `_ => BTreeMap::new()`, which swallowed EVERY
+        // read failure -- not just NotFound. A local-config file that
+        // is unreadable (invalid UTF-8 here; permission-denied and
+        // transient I/O errors take the same arm) would silently reset
+        // the map, and the `fs::write` that follows would replace the
+        // file with only this push's entries -- destroying every
+        // sibling blob the operator had already pushed.
+        //
+        // Invalid UTF-8 is the portable way to force `read_to_string`
+        // to fail: a permission-based fixture would need root-less
+        // chmod semantics that differ across CI platforms.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("mkdir .edgezero");
+        let target = local_dir.join("local-config-app_config.json");
+        fs::write(&target, [0x66, 0x6f, 0x6f, 0xff, 0xfe]).expect("seed invalid UTF-8");
+
+        let err = AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &[("app_config".to_owned(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("an unreadable local-config file must abort the push");
+        assert!(
+            err.contains("failed to read existing"),
+            "error must name the read failure rather than silently resetting the store: {err}"
+        );
+
+        // The load-bearing assertion: the unreadable file is untouched,
+        // so no operator data was destroyed by the failed push.
+        let after = fs::read(&target).expect("file still present");
+        assert_eq!(
+            after,
+            vec![0x66, 0x6f, 0x6f, 0xff, 0xfe],
+            "push must not overwrite a local-config file it could not read"
+        );
+    }
+
+    /// Push-after-provision COMPOSITION: run real `provision_typed`
+    /// (which writes the secret file), let the operator fill in the
+    /// value, then `config push --local` (which writes
+    /// `.edgezero/local-config-<id>.json`) and assert the operator's
+    /// secret survives. Running the actual provision means a
+    /// provision-output-shape regression can't slip past this test.
+    #[test]
+    fn push_after_provision_preserves_dotenv_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 1. Provision writes the secret placeholder into .edgezero/.env.
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &[TypedSecretEntry::new(
+                    "default",
+                    "api_token",
+                    "demo_api_token",
+                )],
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed writes the placeholder");
+        let env_path = dir.path().join(".edgezero").join(".env");
+        assert!(
+            fs::read_to_string(&env_path)
+                .expect("provision wrote .env")
+                .contains("demo_api_token="),
+            "provision must write the secret placeholder line"
+        );
+        // 2. Operator fills the placeholder with a real value.
+        let filled = fs::read_to_string(&env_path)
+            .unwrap()
+            .replace("demo_api_token=", "demo_api_token=real-secret-value");
+        fs::write(&env_path, &filled).expect("operator edit");
+
+        // 3. Push config; the secret file must be left intact.
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &[("app_config".to_owned(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+
+        assert!(
+            fs::read_to_string(&env_path)
+                .expect("read .env")
+                .contains("demo_api_token=real-secret-value"),
+            "config push must not touch the provision-written .env secret"
+        );
+    }
+
+    /// A symlinked local-config file must be refused before push
+    /// reads through it and the write clobbers the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn push_refuses_a_symlinked_local_config_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim-outside");
+        fs::write(&victim, "OPERATOR DATA\n").expect("seed victim");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("mkdir .edgezero");
+        symlink(&victim, local_dir.join("local-config-app_config.json")).expect("symlink");
+
+        let err = AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &[("app_config".to_owned(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("a symlinked local-config file must be refused");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim intact"),
+            "OPERATOR DATA\n",
+            "push must not write through the symlink"
+        );
+    }
+
+    // ---------- read_config_entry / read_config_entry_local ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_local_rejects_a_symlinked_edgezero_dir() {
+        // The diff/read path must reject a symlinked INTERMEDIATE `.edgezero`
+        // dir, not just the final JSON, so a planted directory symlink can't
+        // redirect the read off the tree.
+        use std::fs::create_dir_all;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("proj");
+        create_dir_all(&root).expect("mkdir proj");
+        let outside = dir.path().join("outside");
+        create_dir_all(&outside).expect("mkdir outside");
+        symlink(&outside, root.join(".edgezero")).expect("symlink .edgezero");
+
+        let Err(err) = AxumCliAdapter.read_config_entry_local(
+            &root,
+            None,
+            None,
+            &ResolvedStoreId::from_logical("app_config"),
+            "greeting",
+            &AdapterPushContext::new(),
+        ) else {
+            panic!("a symlinked .edgezero must be refused, not read through");
+        };
+        assert!(err.contains("symlink"), "error names the symlink: {err}");
+    }
+
+    #[test]
+    fn read_config_entry_local_returns_missing_store_when_file_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = AxumCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("infallible on missing file");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "missing file => MissingStore"
+        );
+    }
+
+    #[test]
+    fn read_config_entry_local_returns_missing_key_when_key_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Write a JSON file with one key so the store exists, but the
+        // requested key is not in it.
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("create dir");
+        fs::write(
+            local_dir.join("local-config-app_config.json"),
+            r#"{"other_key": "value"}"#,
+        )
+        .expect("write");
+        let result = AxumCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("infallible on missing key");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "key absent => MissingKey"
+        );
+    }
+
+    #[test]
+    fn read_config_entry_local_returns_present_when_key_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("create dir");
+        fs::write(
+            local_dir.join("local-config-app_config.json"),
+            r#"{"greeting": "hello-axum"}"#,
+        )
+        .expect("write");
+        let result = AxumCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("key present");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, "hello-axum", "value matches");
+    }
+
+    #[test]
+    fn read_config_entry_delegates_to_local() {
+        // Axum has no remote: read_config_entry and read_config_entry_local
+        // must return the same result for the same inputs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("create dir");
+        fs::write(
+            local_dir.join("local-config-app_config.json"),
+            r#"{"greeting": "hello-axum"}"#,
+        )
+        .expect("write");
+        let store = ResolvedStoreId::from_logical("app_config");
+        let ctx = AdapterPushContext::new();
+        let via_local = AxumCliAdapter
+            .read_config_entry_local(dir.path(), None, None, &store, "greeting", &ctx)
+            .expect("local ok");
+        let via_remote = AxumCliAdapter
+            .read_config_entry(dir.path(), None, None, &store, "greeting", &ctx)
+            .expect("remote ok");
+        let ReadConfigEntry::Present(local_val) = via_local else {
+            panic!("expected Present from local");
+        };
+        let ReadConfigEntry::Present(remote_val) = via_remote else {
+            panic!("expected Present from remote");
+        };
+        assert_eq!(local_val, remote_val, "local and remote agree");
+    }
+
+    #[test]
+    fn read_config_entry_local_errors_on_malformed_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("create dir");
+        fs::write(
+            local_dir.join("local-config-app_config.json"),
+            "not valid json {{{",
+        )
+        .expect("write");
+        let result = AxumCliAdapter.read_config_entry_local(
+            dir.path(),
+            None,
+            None,
+            &ResolvedStoreId::from_logical("app_config"),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("failed to parse"),
+                "error names the failure: {err}"
+            ),
+            Ok(_) => panic!("expected Err for malformed JSON"),
+        }
+    }
+
+    /// Spec 12.7: pushing two blobs under different keys (e.g.
+    /// `app_config` + `app_config_staging`) must leave both keys
+    /// readable so the runtime
+    /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` override can
+    /// switch between them. Prior to the upsert fix the second push
+    /// wiped the first by wholesale-rewriting the JSON map.
+    #[test]
+    fn push_config_entries_preserves_sibling_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ResolvedStoreId::from_logical("app_config");
+        let ctx = AdapterPushContext::new();
+
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &store,
+                &[("app_config".to_owned(), "{\"envelope\":\"A\"}".to_owned())],
+                &ctx,
+                false,
+            )
+            .expect("first push");
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &store,
+                &[(
+                    "app_config_staging".to_owned(),
+                    "{\"envelope\":\"B\"}".to_owned(),
+                )],
+                &ctx,
+                false,
+            )
+            .expect("second push (sibling key)");
+
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("read");
+        let map: BTreeMap<String, String> = serde_json::from_str(&raw).expect("parse map");
+        assert_eq!(
+            map.get("app_config").map(String::as_str),
+            Some("{\"envelope\":\"A\"}"),
+            "default key must survive sibling push: {raw}"
+        );
+        assert_eq!(
+            map.get("app_config_staging").map(String::as_str),
+            Some("{\"envelope\":\"B\"}"),
+            "staging key must be present: {raw}"
+        );
+    }
+
+    // ---------- provision_typed (Local mode) — secret placeholders ----------
+
+    #[test]
+    fn axum_provision_typed_appends_secret_placeholders_to_edgezero_env() {
+        // Fixture: no `.edgezero/` pre-existing (append_lines_dedup
+        // creates it via parent-dir handling). provision_typed writes
+        // `<key_value>=` per entry — unquoted empty value.
+        let dir = tempdir().unwrap();
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        let outcome = AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env_path = dir.path().join(".edgezero/.env");
+        assert!(env_path.exists(), ".env exists: {}", env_path.display());
+        let env = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            env.lines().any(|line| line == "demo_api_token="),
+            "unquoted empty-value placeholder present: {env}"
+        );
+        assert!(
+            outcome
+                .status_lines
+                .iter()
+                .any(|line| line.contains(&env_path.display().to_string())),
+            "status line names the .env path: {:?}",
+            outcome.status_lines
+        );
+        assert!(
+            outcome.deployed.is_none(),
+            "local provision_typed returns no deployed state"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_creates_dot_edgezero_if_missing() {
+        // No `.edgezero/` pre-existing. append_lines_dedup
+        // creates parent dirs, so the first-run case works without an
+        // explicit `create_dir_all` in provision_typed.
+        let dir = tempdir().unwrap();
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            "sanity: .edgezero/ must NOT pre-exist"
+        );
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        assert!(
+            dir.path().join(".edgezero").is_dir(),
+            ".edgezero/ auto-created via append_lines_dedup parent-dir handling"
+        );
+        assert!(
+            dir.path().join(".edgezero/.env").exists(),
+            ".env landed inside auto-created .edgezero/"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_cloud_mode_is_a_no_op() {
+        // Cloud is a no-op: axum has no cloud secret store. The load-
+        // bearing negative assertion is that Cloud mode must NOT
+        // create `.edgezero/` or `.env`.
+        let dir = tempdir().unwrap();
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        let outcome = AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Cloud,
+                false,
+            )
+            .unwrap();
+        assert!(
+            outcome.status_lines.is_empty(),
+            "cloud mode emits no status lines: {:?}",
+            outcome.status_lines
+        );
+        assert!(
+            outcome.deployed.is_none(),
+            "cloud mode returns no deployed state"
+        );
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            "cloud mode must NOT auto-create .edgezero/"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_deduplicates_matching_key() {
+        // Operator has already filled in the real value. Re-running
+        // provision_typed must NOT clobber it with the empty
+        // placeholder — append_lines_dedup collapses keys.
+        let dir = tempdir().unwrap();
+        let dot_edgezero = dir.path().join(".edgezero");
+        fs::create_dir_all(&dot_edgezero).unwrap();
+        let env_path = dot_edgezero.join(".env");
+        fs::write(&env_path, "demo_api_token=operator_value\n").unwrap();
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            env.contains("demo_api_token=operator_value"),
+            "operator's real value survives: {env}"
+        );
+        let token_lines = env
+            .lines()
+            .filter(|line| {
+                let after_hash = line.trim_start().strip_prefix('#').unwrap_or(line);
+                after_hash.trim_start().starts_with("demo_api_token=")
+            })
+            .count();
+        assert_eq!(
+            token_lines, 1,
+            "exactly one demo_api_token line remains: {env}"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_handles_multiple_entries() {
+        // Multiple TypedSecretEntry values across different store_ids.
+        // Every key_value must land as a `<key_value>=` line, exactly
+        // once each.
+        let dir = tempdir().unwrap();
+        let entries = [
+            TypedSecretEntry::new("default", "api_token", "demo_api_token"),
+            TypedSecretEntry::new("default", "hmac_key", "demo_hmac_key"),
+            TypedSecretEntry::new("audit", "audit_token", "audit_secret"),
+        ];
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env = fs::read_to_string(dir.path().join(".edgezero/.env")).unwrap();
+        for expected in ["demo_api_token=", "demo_hmac_key=", "audit_secret="] {
+            let count = env.lines().filter(|line| *line == expected).count();
+            assert_eq!(
+                count, 1,
+                "expected exactly one line `{expected}` in .env: {env}"
+            );
+        }
+    }
+}

@@ -35,6 +35,16 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
+
+# Shared warm-up: provision --local per adapter row synthesises
+# gitignored manifests (`wrangler.toml`, `fastly.toml`, `spin.toml`,
+# `runtime-config.toml`) + line-oriented files (`.env`, `.dev.vars`)
+# so this smoke can boot each row's emulator without a pre-populated
+# worktree. Replaces the per-adapter `backup_in_tree` calls that used
+# to protect tracked copies from smoke mutation — those files are now
+# gitignored and regenerable, so mutation is no longer a concern.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
 SERVER_PID=""
 # Match the demo's edgezero.toml port (8787) so the runtime and
 # this script speak the same port. Hardcoding a different port
@@ -43,9 +53,11 @@ SERVER_PID=""
 PORT=8787
 PASS=0
 FAIL=0
-# Per-row backup of files the smoke would otherwise mutate in place
-# in the checked-in app-demo tree. Cleanup restores them on exit.
-declare -a BACKUPS=()
+# Fail-closed backup/restore of files the smoke mutates in place. Defines
+# `backup_in_tree`, `restore_backups`, and `reset_backups`; a failed capture
+# aborts before any mutation rather than recording a bad backup.
+# shellcheck source=lib/smoke_backup.sh
+. "$ROOT_DIR/scripts/lib/smoke_backup.sh"
 
 # Stop the running runtime without touching tracked-fixture backups.
 # Used between staging-blob and default-blob assertions in the same
@@ -57,90 +69,47 @@ declare -a BACKUPS=()
 # the next boot will silently inherit the prior server's responses
 # and assertions will compare against stale state.
 stop_server() {
-  local rc=0
-  if [ -n "$SERVER_PID" ]; then
-    pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
-    kill -TERM "$SERVER_PID" 2>/dev/null || true
-    local waited=0
-    while [ "$waited" -lt 5 ] && kill -0 "$SERVER_PID" 2>/dev/null; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
-  fi
-  # Best-effort port-binder kill via lsof. The cargo-run wrapper
-  # often spawns a child that outlives the wrapper PID; pkill -P
-  # catches direct children, but a re-exec or grand-child can
-  # survive. lsof finds whoever's actually listening on $PORT.
-  if command -v lsof >/dev/null 2>&1; then
-    local port_pids
-    port_pids=$(lsof -ti ":${PORT}" 2>/dev/null || true)
-    if [ -n "$port_pids" ]; then
-      printf '  note: killing stray port-%s holder(s): %s\n' "$PORT" "$port_pids" >&2
-      # shellcheck disable=SC2086
-      kill -KILL $port_pids 2>/dev/null || true
-    fi
-  fi
-  # Verify the port is free; fail loud if not. A live port here
-  # means the next boot would either silently inherit the old
-  # server's responses or fail to bind -- either way the row's
-  # assertions would be meaningless.
+  # Delegate the actual kill + descendant/port hunt to the shared helper,
+  # which ONLY touches the port when a server was really launched (an empty
+  # `SERVER_PID` is a no-op). CRUCIAL: this is what a pre-launch `cleanup`
+  # hits, and without the shared guard it would SIGKILL whatever unrelated
+  # service already holds $PORT.
+  local had_server="$SERVER_PID"
+  smoke_stop_server "$SERVER_PID" "$PORT"
+  SERVER_PID=""
+  # Nothing was launched => nothing to verify or fail on.
+  [ -n "$had_server" ] || return 0
+  # Verify the port is actually free; fail loud if not. A live port here
+  # means the next boot would either silently inherit the old server's
+  # responses or fail to bind -- either way the row's assertions would be
+  # meaningless. Prefer `lsof` so a NON-HTTP listener is detected too; fall
+  # back to an HTTP probe only when `lsof` is unavailable.
   local waited=0
   while [ "$waited" -lt 10 ]; do
-    if ! curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -ti ":${PORT}" >/dev/null 2>&1 || return 0
+    elif ! curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
       return 0
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  printf '  FAIL  stop_server: port %s still serving after 10s -- prior runtime did not die\n' "$PORT" >&2
+  printf '  FAIL  stop_server: port %s still in use after 10s -- prior runtime did not die\n' "$PORT" >&2
   FAIL=$((FAIL + 1))
-  rc=1
-  return "$rc"
-}
-
-# Restore tracked fixtures the smoke mutated in place. Called once
-# per row AFTER all assertions for that row have finished, and again
-# from the EXIT trap as a safety net.
-restore_backups() {
-  for pair in "${BACKUPS[@]:-}"; do
-    [ -z "$pair" ] && continue
-    orig="${pair%%::*}"
-    back="${pair##*::}"
-    if [ -s "$back" ]; then
-      mv "$back" "$orig" 2>/dev/null || true
-    else
-      # Empty marker file = the original didn't exist; remove what
-      # the smoke created.
-      rm -f "$back" 2>/dev/null || true
-      rm -f "$orig" 2>/dev/null || true
-    fi
-  done
-  BACKUPS=()
+  return 1
 }
 
 cleanup() {
-  stop_server
+  # `stop_server` can legitimately return non-zero (it sets FAIL and
+  # returns 1 when a port won't free). Under `set -e` that would abort
+  # this handler BEFORE `restore_backups`, leaving the operator's backed-
+  # up files (notably `.dev.vars`) unrestored. Never let it short-circuit
+  # the restore.
+  stop_server || true
   restore_backups
 }
-trap cleanup EXIT INT TERM
-
-# Record a backup of $1 (an in-tree file the smoke is about to mutate)
-# so `cleanup` can restore it.
-backup_in_tree() {
-  local orig="$1"
-  local back
-  back=$(mktemp)
-  if [ -e "$orig" ]; then
-    cp -p "$orig" "$back"
-  else
-    : > "$back"  # marker that the file didn't exist
-  fi
-  BACKUPS+=("${orig}::${back}")
-}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # Bash 3.2-portable upper-case (macOS ships /usr/bin/env bash as 3.2).
 # `${var^^}` is Bash 4+; tr is portable.
@@ -162,20 +131,40 @@ seed_fastly_runtime_env() {
   # whole block each time. backup_in_tree already restores the
   # tracked content on cleanup.
   python3 - "$fastly_toml" "$key_override" <<'PY'
-import re
 import sys
 path, key_override = sys.argv[1], sys.argv[2]
 with open(path, 'r', encoding='utf-8') as fh:
-    text = fh.read()
-# Drop any prior edgezero_runtime_env block (idempotent across rows).
-pattern = re.compile(
-    r'\n\[local_server\.config_stores\.edgezero_runtime_env\][^\[]*'
-    r'\[local_server\.config_stores\.edgezero_runtime_env\.contents\][^\[]*',
-    re.MULTILINE,
+    lines = fh.readlines()
+
+# Drop any prior edgezero_runtime_env block (idempotent across rows) by
+# LINES, not a `[^[]*` regex: a `[` inside a value or a comment (e.g.
+# `# see [stores.kv]`) would terminate that regex early and leave block
+# body lines uncommented, corrupting the manifest. A TOML section ends at
+# the next line that STARTS with `[` (after optional whitespace); the
+# block's own two headers are treated as part of the block.
+BLOCK_HEADERS = (
+    '[local_server.config_stores.edgezero_runtime_env]',
+    '[local_server.config_stores.edgezero_runtime_env.contents]',
 )
-text = pattern.sub('\n', text)
+out = []
+skipping = False
+for line in lines:
+    stripped = line.strip()
+    if stripped in BLOCK_HEADERS:
+        skipping = True
+        continue
+    if skipping:
+        # A DIFFERENT section header ends the removed block; body lines
+        # (values, comments, blanks -- brackets or not) are dropped.
+        if stripped.startswith('['):
+            skipping = False
+            out.append(line)
+        continue
+    out.append(line)
+
+text = ''.join(out)
 if key_override:
-    text += (
+    text = text.rstrip('\n') + '\n' + (
         '\n[local_server.config_stores.edgezero_runtime_env]\n'
         'format = "inline-toml"\n'
         '[local_server.config_stores.edgezero_runtime_env.contents]\n'
@@ -287,8 +276,8 @@ ensure_runtime_built() {
 #   - axum:       process env var (handled inline by boot_runtime).
 #   - cloudflare: .dev.vars file at the worker root.
 #   - fastly:     [local_server.secret_stores.default.contents] in
-#                 fastly.toml (mutates the tracked file -- the
-#                 caller already backed it up).
+#                 fastly.toml (gitignored, regenerated by
+#                 `provision --local` during smoke warm-up).
 #   - spin:       runtime-config.toml's variable provider; the
 #                 demo's spin.toml exposes `demo_api_token` as a
 #                 variable. We pre-create a local override file the
@@ -305,24 +294,18 @@ seed_secret_for_adapter() {
       ;;
     cloudflare)
       local dev_vars="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      # `.dev.vars` was backed up BEFORE warm-up (see the per-row backup
+      # block), so it is safe to overwrite here; cleanup restores it.
       printf 'demo_api_token="resolved-token"\n' > "$dev_vars"
       return 0
       ;;
     fastly)
-      local fastly_toml="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-      # The fixture's [local_server.secret_stores.default] is an
-      # array-of-tables (each entry exposes one key + the env var
-      # to read its value from). Append a second entry rather than
-      # opening a normal-table block at the same path; mixing the
-      # two forms is a TOML parse error. Viceroy reads
-      # `demo_api_token`'s value from $DEMO_API_TOKEN_SECRET, which
-      # boot_runtime exports inline.
-      cat >> "$fastly_toml" <<'TOML'
-
-[[local_server.secret_stores.default]]
-key = "demo_api_token"
-env = "DEMO_API_TOKEN_SECRET"
-TOML
+      # No-op: the warm-up's `provision_typed` already wrote the
+      # `[[local_server.secret_stores.default]]` entry for the typed
+      # `demo_api_token` secret, mapping it to the DEMO_API_TOKEN env var
+      # (the uppercased key). Appending our own second entry here created
+      # a DUPLICATE with a different env var, so viceroy could resolve the
+      # wrong one. boot_runtime exports DEMO_API_TOKEN inline instead.
       return 0
       ;;
     spin)
@@ -352,9 +335,18 @@ TOML
 boot_runtime() {
   local adapter="$1"
   ensure_runtime_built "$adapter" || return 1
-  # Refuse to launch if the port is already taken. If we boot anyway,
-  # wait_for_port could return success on the OTHER process's response.
-  if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+  # Refuse to launch if the port is already taken (and NEVER kill the
+  # occupant -- it isn't ours). If we boot anyway, wait_for_port could
+  # return success on the OTHER process's response. Prefer `lsof` so a
+  # NON-HTTP listener is caught; fall back to an HTTP probe when `lsof`
+  # is unavailable.
+  local port_busy=""
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti ":${PORT}" >/dev/null 2>&1 && port_busy=1
+  elif curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+    port_busy=1
+  fi
+  if [ -n "$port_busy" ]; then
     printf '  FAIL  boot_runtime: port %s already in use; refusing to boot %s\n' "$PORT" "$adapter" >&2
     FAIL=$((FAIL + 1))
     return 1
@@ -385,10 +377,10 @@ boot_runtime() {
         wrangler dev --local --port "$PORT" 2>&1) &
       ;;
     fastly)
-      # DEMO_API_TOKEN_SECRET is the env var viceroy reads to
-      # populate the `demo_api_token` secret-store entry seeded
-      # by seed_secret_for_adapter. viceroy 0.17+ uses `serve`
-      # for the long-running HTTP path (`run` was renamed).
+      # DEMO_API_TOKEN is the env var viceroy reads to populate the
+      # `demo_api_token` secret-store entry that the warm-up's
+      # `provision_typed` wrote (env = uppercased key). viceroy 0.17+
+      # uses `serve` for the long-running HTTP path (`run` was renamed).
       #
       # The wasm artifact lives in the app-demo workspace's
       # shared target dir (not the adapter crate's local
@@ -405,7 +397,7 @@ boot_runtime() {
       seed_fastly_runtime_env "$fastly_toml" \
         "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}"
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
-        DEMO_API_TOKEN_SECRET=resolved-token \
+        DEMO_API_TOKEN=resolved-token \
         viceroy serve -C fastly.toml --addr "127.0.0.1:${PORT}" \
           "$DEMO_DIR/target/wasm32-wasip1/debug/app-demo-adapter-fastly.wasm" 2>&1) &
       ;;
@@ -413,10 +405,22 @@ boot_runtime() {
       # spin reads variables from the app manifest; the demo wires
       # `demo_api_token` to the SPIN_VARIABLE_DEMO_API_TOKEN env var
       # (Spin's documented passthrough).
+      #
+      # The runtime `__KEY` override must reach the GUEST's WASI env, which
+      # Spin populates from `--env` -- NOT from the host process env a bare
+      # `EDGEZERO__...=... spin up` would set (that stays outside the sandbox).
+      # Pass it explicitly via `spin up --env`, mirroring how
+      # `edgezero serve --adapter spin` forwards the EDGEZERO__* overlay.
+      local spin_env_args=()
+      if [ -n "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}" ]; then
+        spin_env_args=(--env "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY}")
+      fi
+      # Empty-array-safe expansion for bash 3.2 under `set -u`.
       (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
         SPIN_VARIABLE_DEMO_API_TOKEN=resolved-token \
         spin up --listen "127.0.0.1:${PORT}" \
-          --runtime-config-file runtime-config.toml 2>&1) &
+          --runtime-config-file runtime-config.toml \
+          ${spin_env_args[@]+"${spin_env_args[@]}"} 2>&1) &
       ;;
     *)
       echo "unknown adapter: $adapter" >&2; return 1 ;;
@@ -442,7 +446,7 @@ for suite in "${SUITES[@]}"; do
   extra="${suite#*:}"
 
   skip_var="SKIP_$(upper "$adapter")"
-  eval "skip_val=\${${skip_var}:-0}"
+  skip_val="${!skip_var:-0}"
   if [ "$skip_val" = "1" ]; then
     printf '\n=== 12.7 __KEY override smoke: %s SKIPPED (%s=1) ===\n' "$adapter" "$skip_var"
     continue
@@ -469,30 +473,42 @@ for suite in "${SUITES[@]}"; do
 
   printf '\n=== 12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
   tmp=$(mktemp -d)
-  trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
+  trap 'cleanup; rm -rf "$tmp"' EXIT
+  trap 'cleanup; rm -rf "$tmp"; exit 130' INT TERM
 
-  # Back up any tracked fixture the push will mutate in place. For
-  # Fastly that's fastly.toml; gitignored local-state directories
-  # (`.wrangler/`, `.spin/`, `.edgezero/`) are reset below.
-  # The Cloudflare row writes a transient `.dev.vars` file -- back
-  # it up too so the worktree stays clean.
-  if [ "$adapter" = "fastly" ]; then
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-  fi
-  if [ "$adapter" = "cloudflare" ]; then
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-  fi
-  # Spin no longer needs spin.toml backup-restore: the fixture's
-  # [variables] declares demo_api_token directly so the smoke
-  # doesn't mutate it.
+  # Back up EVERY operator-owned file/dir this row touches BEFORE warm-up.
+  # `provision --local` (warm-up), the reset below, the secret seed, and
+  # the push all mutate these; backing up first captures the developer's
+  # ORIGINAL state (present or absent), and `restore_backups` returns it
+  # exactly on cleanup. The emulator-state DIRECTORIES (.edgezero /
+  # .wrangler / .spin) can hold real config / KV / SQLite state, so they
+  # must be preserved, not just the manifests.
+  case "$adapter" in
+    axum)
+      backup_in_tree "$DEMO_DIR/.edgezero"
+      ;;
+    cloudflare)
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      ;;
+    spin)
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+      ;;
+    fastly)
+      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+      ;;
+  esac
 
-  # Reset the adapter's local emulator state so the smoke starts
-  # from a known-clean cutover state. The blob-model push read-back
-  # hard-fails if it finds a non-BlobEnvelope value at the target
-  # key (correct behaviour per the cutover spec); a developer's
-  # leftover .wrangler/ / .spin/ / .edgezero/ state from older
-  # smoke runs would otherwise trip that check. These directories
-  # are all gitignored and are regenerated by the push itself.
+  # Warm up per-row local state — provision --local regenerates the
+  # gitignored adapter manifest + .env / .dev.vars.
+  smoke_warmup_provision_local "$adapter"
+
+  # Reset the adapter's local emulator state so the smoke starts from a
+  # known-clean cutover state. The blob-model push read-back hard-fails if
+  # it finds a non-BlobEnvelope value at the target key; a developer's
+  # leftover .wrangler/ / .spin/ / .edgezero/ state would trip that check.
+  # These dirs were backed up ABOVE, so cleanup restores the original.
   case "$adapter" in
     axum)
       rm -rf "$DEMO_DIR/.edgezero"
@@ -504,11 +520,7 @@ for suite in "${SUITES[@]}"; do
       rm -rf "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
       ;;
     fastly)
-      # No separate local-state dir for Fastly; fastly.toml IS the
-      # local store and is already backed up above. The backup's
-      # restore puts the contents block back to its pre-smoke shape,
-      # so we don't need an extra reset here.
-      :
+      : # fastly.toml (already backed up) is the store; nothing to reset.
       ;;
   esac
 
@@ -522,7 +534,8 @@ for suite in "${SUITES[@]}"; do
     FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
 
@@ -550,7 +563,8 @@ for suite in "${SUITES[@]}"; do
     FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
   result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
@@ -565,7 +579,8 @@ for suite in "${SUITES[@]}"; do
     # diagnostic; just abort the row.
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
 
@@ -576,7 +591,8 @@ for suite in "${SUITES[@]}"; do
     FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
     continue
   fi
   result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
@@ -585,7 +601,8 @@ for suite in "${SUITES[@]}"; do
   cleanup
 
   rm -rf "$tmp"
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
 done
 
 # -- 9.3 Fastly oversized envelope smoke ---------------------------------
@@ -595,11 +612,15 @@ if [ "${SKIP_FASTLY:-0}" = "1" ]; then
 else
   printf '\n=== 9.3 Fastly chunk-pointer smoke ===\n'
   tmp=$(mktemp -d)
-  trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
+  trap 'cleanup; rm -rf "$tmp"' EXIT
+  trap 'cleanup; rm -rf "$tmp"; exit 130' INT TERM
 
-  # The local push rewrites fastly.toml in the checked-in app-demo
-  # tree; back it up so `cleanup` restores it on exit.
+  # Back up fastly.toml BEFORE warm-up regenerates it (and before the
+  # push / `seed_fastly_runtime_env` edit it in place), so cleanup
+  # restores the developer's ORIGINAL, not the post-provision copy.
   backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+  # Warm up Fastly local state — provision --local synthesises fastly.toml.
+  smoke_warmup_provision_local fastly
 
   # Build an oversized greeting (>= 9 000 chars after envelope wrap)
   # so the chunked path fires.
@@ -634,9 +655,8 @@ TOML
 
   # Seed the demo_api_token secret so /config/typed's secret walk
   # resolves; without it the assertion would fail in the extractor
-  # before testing the chunk-pointer round-trip. The fastly.toml
-  # append survives in the per-row backup and gets restored on
-  # cleanup.
+  # before testing the chunk-pointer round-trip. Any fastly.toml edit is
+  # covered by the `backup_in_tree` above and restored on cleanup.
   seed_secret_for_adapter fastly || true
 
   if boot_runtime fastly; then
@@ -652,7 +672,8 @@ TOML
   cleanup
 
   rm -rf "$tmp"
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT TERM
 fi
 
 # -- 8.3 Spin Cloud Unsupported smoke ------------------------------------

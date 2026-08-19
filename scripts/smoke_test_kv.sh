@@ -16,17 +16,56 @@ DEMO_DIR="$ROOT_DIR/examples/app-demo"
 ADAPTER="${1:-axum}"
 SERVER_PID=""
 
+# Fail-closed backup/restore of the operator files + emulator state this
+# smoke mutates. Warm-up (`provision --local`) rewrites the manifests /
+# `.env` / `.dev.vars`, and the KV pushes seed the persistent emulator
+# stores (`.edgezero` / `.wrangler` / `.spin`); without a backup a run
+# would leave a developer's tree changed.
+# shellcheck source=lib/smoke_backup.sh
+. "$ROOT_DIR/scripts/lib/smoke_backup.sh"
+
 cleanup() {
-  if [ -n "$SERVER_PID" ]; then
-    echo ""
-    echo "==> Stopping server (PID $SERVER_PID)..."
-    # Kill the process and its children (useful for wrangler/workerd)
-    pkill -P "$SERVER_PID" 2>/dev/null || true
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-  fi
+  # Kill the server AND its descendants (workerd/spin) and free the port
+  # BEFORE restoring, or a survivor could flush state over the restore.
+  smoke_stop_server "$SERVER_PID" "${PORT:-}"
+  SERVER_PID=""
+  restore_backups
 }
+
+# Back up BEFORE arming the restore trap and BEFORE warm-up: a failed
+# backup aborts here, before any mutation, so the tree is never left in a
+# half-restored state.
+case "$ADAPTER" in
+  axum)
+    backup_in_tree "$DEMO_DIR/.edgezero"
+    ;;
+  cloudflare|cf)
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
+    ;;
+  fastly)
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+    ;;
+  spin)
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/runtime-config.toml"
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
+    ;;
+esac
+# Arm the trap only AFTER a successful backup. A signal runs cleanup then
+# EXITS so an interrupt can't resume the smoke and re-mutate after restore.
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# Warm up per-adapter local state — provision --local synthesises
+# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
+# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
+# this because those adapter manifests are gitignored.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
+smoke_warmup_provision_local "$ADAPTER"
 
 # -- Adapter-specific config ------------------------------------------------
 
@@ -36,6 +75,7 @@ case "$ADAPTER" in
     echo "==> Building app-demo (axum)..."
     (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
     echo "==> Starting Axum adapter on port $PORT..."
+    smoke_require_port_free "$PORT"
     (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
     SERVER_PID=$!
     ;;
@@ -46,6 +86,7 @@ case "$ADAPTER" in
       exit 1
     }
     echo "==> Starting Fastly Viceroy on port $PORT..."
+    smoke_require_port_free "$PORT"
     (cd "$DEMO_DIR" && fastly compute serve -C crates/app-demo-adapter-fastly 2>&1) &
     SERVER_PID=$!
     ;;
@@ -56,6 +97,7 @@ case "$ADAPTER" in
       exit 1
     }
     echo "==> Starting Cloudflare wrangler dev on port $PORT..."
+    smoke_require_port_free "$PORT"
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!
     ;;
@@ -68,6 +110,7 @@ case "$ADAPTER" in
     echo "==> Building Spin WASM (wasm32-wasip2)..."
     (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
     echo "==> Starting Spin on port $PORT..."
+    smoke_require_port_free "$PORT"
     # `--runtime-config-file runtime-config.toml`: the demo's
     # spin.toml declares non-`default` KV labels (`sessions`,
     # `cache`) and Spin's runtime only auto-provides the `default`

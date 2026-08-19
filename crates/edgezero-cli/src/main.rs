@@ -4,6 +4,7 @@
 fn main() {
     use clap::Parser as _;
     use edgezero_cli::args::{self, Args, Command, ConfigCmd};
+    use edgezero_cli::stream::info_line;
     use std::process;
 
     edgezero_cli::init_cli_logger();
@@ -15,14 +16,7 @@ fn main() {
         // invocation, prints the pointer text, and exits 2 so callers can
         // distinguish "wrong binary" from a runtime error (exit 1).
         Command::Config(ConfigCmd::Push(_) | ConfigCmd::Diff(_)) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "intentional: pointer text must reach the user even when \
-                          stdout is piped; this is the only stderr write in main"
-            )]
-            {
-                eprintln!("{}", args::STUB_POINTER_AFTER_HELP);
-            };
+            info_line(args::STUB_POINTER_AFTER_HELP);
             process::exit(2);
         }
         // `config gc` needs no typed app-config -- it reclaims unreferenced
@@ -35,7 +29,17 @@ fn main() {
         #[cfg(feature = "demo-example")]
         Command::Demo => edgezero_cli::run_demo(),
         Command::New(cmd_args) => edgezero_cli::run_new(&cmd_args),
-        Command::Provision(cmd_args) => edgezero_cli::run_provision(&cmd_args),
+        Command::Provision(cmd_args) => {
+            let result = edgezero_cli::run_provision(&cmd_args);
+            // The bundled binary can't write typed `#[secret]`
+            // placeholders (no `C`); point the operator at the generated
+            // CLI for that follow-up. Skip on dry-run so the preview
+            // isn't cluttered, and only for local provisioning.
+            if result.is_ok() && cmd_args.local && !cmd_args.dry_run {
+                info_line(args::PROVISION_TYPED_FOLLOWUP);
+            }
+            result
+        }
         Command::Serve(cmd_args) => edgezero_cli::run_serve(&cmd_args),
     };
     if let Err(err) = result {

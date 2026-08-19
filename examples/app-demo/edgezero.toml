@@ -187,10 +187,8 @@ port = 8787
 target = "native"
 profile = "dev"
 
-[adapters.axum.commands]
-build = "cargo build -p app-demo-adapter-axum"
-deploy = "# configure deployment for Axum"
-serve = "cargo run -p app-demo-adapter-axum"
+# No [adapters.axum.commands]: build/serve route through the axum.toml-aware
+# registry adapter (a static `cargo -p` shell override would bypass axum.toml).
 
 [adapters.axum.logging]
 level = "info"
@@ -236,16 +234,19 @@ echo_stdout = true
 [adapters.spin.adapter]
 crate = "crates/app-demo-adapter-spin"
 manifest = "crates/app-demo-adapter-spin/spin.toml"
+# Opt this project into outbound HTTP. Spin defaults to deny-all, and
+# `provision --local` keeps that secure baseline unless this is set;
+# the demo app makes outbound calls, so it declares the allow-list here.
+allowed_outbound_hosts = ["https://*:*"]
 
 [adapters.spin.build]
 target = "wasm32-wasip2"
 profile = "release"
 features = ["spin"]
 
-[adapters.spin.commands]
-build = "cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin"
-deploy = "spin deploy --from crates/app-demo-adapter-spin"
-serve = "spin up --from crates/app-demo-adapter-spin --runtime-config-file crates/app-demo-adapter-spin/runtime-config.toml"
+# No [adapters.spin.commands]: build/serve/deploy route through the registry
+# adapter, which reads the declared spin.toml dynamically and refreshes the
+# conventional `source` artifact (a static shell override would bake the path).
 
 [adapters.spin.logging]
 level = "info"

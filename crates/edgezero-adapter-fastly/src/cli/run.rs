@@ -1,0 +1,465 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use edgezero_adapter::cli_support::{
+    self, find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
+};
+use edgezero_adapter::registry::AdapterExecContext;
+use walkdir::WalkDir;
+
+/// # Errors
+/// Returns an error if the Fastly CLI build command fails.
+#[inline]
+pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<PathBuf, String> {
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_fastly_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
+    // `Cargo.toml` lives at the declared crate root, which is NOT
+    // necessarily the manifest's parent -- a nested declared manifest
+    // like `crates/server/config/fastly.toml` would otherwise resolve
+    // `crates/server/config/Cargo.toml`.
+    let crate_dir = cli_support::adapter_crate_dir(ctx, &manifest)?;
+    let cargo_manifest = crate_dir.join("Cargo.toml");
+    let crate_name = read_package_name(&cargo_manifest)?;
+
+    let mut command = Command::new("cargo");
+    command
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "wasm32-wasip1",
+            "--manifest-path",
+            cargo_manifest
+                .to_str()
+                .ok_or("invalid Cargo manifest path")?,
+        ])
+        .args(extra_args)
+        // Anchor cargo at the crate root, not the process cwd. When the
+        // CLI dispatches through an absolute `EDGEZERO_MANIFEST` from
+        // outside the project, an unanchored `cargo` would discover the
+        // wrong `.cargo/config.toml` and resolve relative args against the
+        // caller's directory.
+        .current_dir(&crate_dir);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to run cargo build: {err}"))?;
+    if !status.success() {
+        return Err(format!("cargo build failed with status {status}"));
+    }
+
+    let workspace_root = find_workspace_root(&crate_dir);
+    let artifact = locate_artifact(&workspace_root, &crate_dir, &crate_name, extra_args, ctx)?;
+    let pkg_dir = workspace_root.join("pkg");
+    fs::create_dir_all(&pkg_dir)
+        .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
+    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
+    fs::copy(&artifact, &dest)
+        .map_err(|err| format!("failed to copy artifact to {}: {err}", dest.display()))?;
+
+    Ok(dest)
+}
+
+/// # Errors
+/// Returns an error if the Fastly CLI deploy command fails.
+#[inline]
+pub fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_fastly_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
+
+    let mut command = Command::new("fastly");
+    command
+        .args(["compute", "deploy"])
+        .args(extra_args)
+        .current_dir(manifest_dir);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
+    if !status.success() {
+        return Err(format!("fastly compute deploy failed with status {status}"));
+    }
+
+    Ok(())
+}
+
+/// # Errors
+/// Returns an error if the Fastly CLI serve command (Viceroy) fails.
+#[inline]
+pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
+        find_fastly_manifest(cli_support::discovery_base(ctx)?.as_path())
+    })?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
+
+    let mut command = Command::new("fastly");
+    command
+        .args(["compute", "serve"])
+        .args(extra_args)
+        .current_dir(manifest_dir);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
+    if !status.success() {
+        return Err(format!("fastly compute serve failed with status {status}"));
+    }
+
+    Ok(())
+}
+
+fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
+    if let Some(found) = find_manifest_upwards(start, "fastly.toml") {
+        return Ok(found);
+    }
+
+    let root = find_workspace_root(start);
+    let mut candidates: Vec<PathBuf> = WalkDir::new(&root)
+        .follow_links(true)
+        .max_depth(8)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().to_path_buf())
+        .filter(|path| {
+            path.file_name().is_some_and(|n| n == "fastly.toml")
+                && path
+                    .parent()
+                    .is_some_and(|dir| dir.join("Cargo.toml").exists())
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Err("could not locate fastly.toml".to_owned());
+    }
+
+    candidates.sort_by_key(|path| {
+        let parent = path.parent().unwrap_or(Path::new(""));
+        path_distance(start, parent)
+    });
+
+    Ok(candidates.remove(0))
+}
+
+fn locate_artifact(
+    workspace_root: &Path,
+    crate_dir: &Path,
+    crate_name: &str,
+    build_args: &[String],
+    ctx: &AdapterExecContext<'_>,
+) -> Result<PathBuf, String> {
+    let target_triple = "wasm32-wasip1";
+    let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
+
+    // Resolve cargo's effective target dir the SAME way the build did
+    // (`--target-dir` arg, then `CARGO_TARGET_DIR`, then a
+    // `.cargo/config.toml` `[build] target-dir`). When an override is in
+    // play, look ONLY there -- falling back to the conventional `target/`
+    // paths could package a STALE artifact from an earlier default build.
+    match cli_support::resolve_cargo_target_dir(crate_dir, build_args, ctx) {
+        cli_support::CargoTargetDir::Explicit(dir) => {
+            let candidate = dir.join(target_triple).join("release").join(&release_name);
+            return if candidate.exists() {
+                Ok(candidate)
+            } else {
+                Err(format!(
+                    "compiled artifact `{release_name}` not found in the requested target directory {} (a custom target dir was set via --target-dir, CARGO_TARGET_DIR, or .cargo/config.toml); refusing to fall back to a conventional target path to avoid packaging a stale artifact",
+                    candidate.display()
+                ))
+            };
+        }
+        cli_support::CargoTargetDir::Conventional => {}
+    }
+
+    let manifest_target = crate_dir
+        .join("target")
+        .join(target_triple)
+        .join("release")
+        .join(&release_name);
+    if manifest_target.exists() {
+        return Ok(manifest_target);
+    }
+
+    let workspace_target = workspace_root
+        .join("target")
+        .join(target_triple)
+        .join("release")
+        .join(&release_name);
+    if workspace_target.exists() {
+        return Ok(workspace_target);
+    }
+
+    Err(format!(
+        "compiled artifact not found (looked in {} and workspace target)",
+        crate_dir.display()
+    ))
+}
+
+/// Synthesised baseline `fastly.toml` for clean clones. Built via
+/// `toml_edit::DocumentMut` (NOT raw `format!`) so any legal
+/// `[app].name` — including names with TOML-significant characters
+/// like `"`, `\`, or newlines — is escaped correctly. Manifest
+/// validation today only length-bounds the name; raw interpolation
+/// would produce invalid TOML for legal inputs.
+///
+/// `service_id` from `[adapters.fastly.deployed]` is threaded
+/// through as `Option<&str>`; when `None` the key is OMITTED so the
+/// operator's first `fastly compute deploy` populates it (per spec
+/// §"Writeback ownership" — we deliberately don't emit
+/// `service_id = ""`).
+pub(crate) fn synthesise_fastly_toml(crate_name: &str, service_id: Option<&str>) -> String {
+    use toml_edit::{DocumentMut, Item, Table, value};
+
+    // The `name` field spells the adapter crate's Cargo package
+    // name. The caller in `cli/mod.rs` reads this from the
+    // `Cargo.toml` adjacent to the adapter manifest (honouring the
+    // operator's `[adapters.fastly.adapter].crate` rename) and
+    // falls back to the scaffold convention
+    // `<app_name>-adapter-fastly` only when no Cargo.toml is
+    // discoverable. `fastly compute build` reads this and expects
+    // it to match the Cargo package it builds.
+
+    let mut doc = DocumentMut::new();
+    doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
+    // `Table::insert` returns the previous value (if any). We build a
+    // fresh document from `DocumentMut::new()`, so nothing to displace
+    // -- but the return is discarded intentionally. Using `insert`
+    // instead of `doc["..."] = ...` sidesteps `clippy::indexing_slicing`
+    // (the index form panics if the key is missing; `insert` doesn't).
+    // No `authors` key: the spec's normative Fastly baseline
+    // (spec §"Fastly (fastly.toml)") is `manifest_version` + `name` +
+    // `language` + `[scripts].build` + `[local_server]`. Emitting an
+    // empty `authors = [""]` array exceeded that baseline. Field order matches the spec's shown
+    // baseline so the exact-content test can pin it verbatim.
+    doc.insert("manifest_version", value(3));
+    doc.insert("name", value(crate_name));
+    doc.insert("language", value("rust"));
+    if let Some(sid) = service_id {
+        doc.insert("service_id", value(sid));
+    }
+    // `[scripts]` and `[local_server]` are the standard Fastly Compute
+    // scaffold tables. `scripts.build` pins the cargo target so
+    // `fastly compute build` reproduces the wasm artifact; the empty
+    // `[local_server]` header is a placeholder the operator fills in
+    // when seeding local viceroy state (config-store contents,
+    // per-request backends, etc.).
+    let mut scripts = Table::new();
+    scripts.insert(
+        "build",
+        value("cargo build --profile release --target wasm32-wasip1"),
+    );
+    doc.insert("scripts", Item::Table(scripts));
+    doc.insert("local_server", Item::Table(Table::new()));
+    doc.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edgezero_adapter::cli_support::read_package_name;
+    use tempfile::tempdir;
+
+    #[test]
+    fn finds_closest_manifest_when_multiple_exist() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let first = root.join("crates/first");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
+        fs::write(first.join("fastly.toml"), "name=\"first\"").unwrap();
+
+        let second = root.join("examples/second");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
+        fs::write(second.join("fastly.toml"), "name=\"second\"").unwrap();
+
+        let found = find_fastly_manifest(&second).unwrap();
+        assert_eq!(found, second.join("fastly.toml"));
+    }
+
+    #[test]
+    fn finds_manifest_in_current_directory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+        fs::write(root.join("fastly.toml"), "name = \"demo\"").unwrap();
+
+        let manifest = find_fastly_manifest(root).expect("should find manifest");
+        assert_eq!(manifest, root.join("fastly.toml"));
+    }
+
+    #[test]
+    fn locate_artifact_considers_workspace_target() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let manifest_dir = workspace.join("service");
+        fs::create_dir_all(manifest_dir.join("target/wasm32-wasip1/release")).unwrap();
+        let artifact = workspace.join("target/wasm32-wasip1/release/demo.wasm");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "wasm").unwrap();
+
+        let located = locate_artifact(
+            workspace,
+            &manifest_dir,
+            "demo",
+            &[],
+            &AdapterExecContext::new(),
+        )
+        .unwrap();
+        assert_eq!(located, artifact);
+    }
+
+    #[test]
+    fn locate_artifact_honors_target_dir_build_arg_over_stale_default() {
+        // A `--target-dir` build arg redirects cargo. Discovery must look
+        // ONLY there, even when a STALE artifact sits at the conventional
+        // workspace target from an earlier default build.
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let crate_dir = workspace.join("service");
+        fs::create_dir_all(&crate_dir).unwrap();
+        let stale = workspace.join("target/wasm32-wasip1/release/demo.wasm");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "stale").unwrap();
+        let fresh = crate_dir.join("custom/wasm32-wasip1/release/demo.wasm");
+        fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        fs::write(&fresh, "fresh").unwrap();
+
+        let build_args = ["--target-dir".to_owned(), "custom".to_owned()];
+        let located = locate_artifact(
+            workspace,
+            &crate_dir,
+            "demo",
+            &build_args,
+            &AdapterExecContext::new(),
+        )
+        .unwrap();
+        assert_eq!(located, fresh, "must select the custom-target artifact");
+    }
+
+    #[test]
+    fn locate_artifact_errors_when_explicit_target_dir_has_no_artifact() {
+        // An explicit target dir with no artifact must error rather than
+        // silently fall back to a stale conventional artifact.
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let crate_dir = workspace.join("service");
+        fs::create_dir_all(&crate_dir).unwrap();
+        let stale = workspace.join("target/wasm32-wasip1/release/demo.wasm");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "stale").unwrap();
+
+        let env = [("CARGO_TARGET_DIR".to_owned(), "custom".to_owned())];
+        let ctx = AdapterExecContext::new().with_env(&env);
+        let err = locate_artifact(workspace, &crate_dir, "demo", &[], &ctx)
+            .expect_err("must not fall back to the stale conventional artifact");
+        assert!(err.contains("stale"), "error explains the refusal: {err}");
+    }
+
+    #[test]
+    fn read_package_falls_back_to_name() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(&manifest, "name = \"demo\"").unwrap();
+        let name = read_package_name(&manifest).unwrap();
+        assert_eq!(name, "demo");
+    }
+
+    #[test]
+    fn read_package_prefers_package_table() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(&manifest, "[package]\nname = \"demo\"\n").unwrap();
+        let name = read_package_name(&manifest).unwrap();
+        assert_eq!(name, "demo");
+    }
+
+    // ---------- synthesise_fastly_toml ----------
+
+    #[test]
+    fn synthesises_fastly_toml_matches_spec_baseline_exactly() {
+        // Exact-content test: the
+        // synthesised fastly.toml with no tracked service_id must equal
+        // the spec's normative Fastly baseline byte-for-byte -- no
+        // `authors` array, no other extras.
+        let out = synthesise_fastly_toml("demo-adapter-fastly", None);
+        let expected = "# edgezero-provision: v1\n\
+             manifest_version = 3\n\
+             name = \"demo-adapter-fastly\"\n\
+             language = \"rust\"\n\n\
+             [scripts]\n\
+             build = \"cargo build --profile release --target wasm32-wasip1\"\n\n\
+             [local_server]\n";
+        assert_eq!(out, expected, "fastly.toml baseline drifted from spec");
+    }
+
+    #[test]
+    fn synthesises_fastly_toml_pins_service_id_when_deployed_present() {
+        let out = synthesise_fastly_toml("demo", Some("SVC1"));
+        // Reparse-and-index: substring `service_id = "SVC1"` passes
+        // for both the correct root form AND the shipped bug where
+        // service_id landed inside `[local_server]`. Explicitly assert
+        // it's at the ROOT of the doc.
+        let doc: toml_edit::DocumentMut = out.parse().expect("re-parse synthesised fastly.toml");
+        assert_eq!(
+            doc.get("service_id").and_then(toml_edit::Item::as_str),
+            Some("SVC1"),
+            "service_id must live at the TOML root, not nested under a section: {out}"
+        );
+        // Also assert no `local_server.service_id` -- that would be
+        // the exact silent-drift bug we're guarding against.
+        let local_server_carries_it = doc
+            .get("local_server")
+            .and_then(|item| item.as_table())
+            .and_then(|tbl| tbl.get("service_id"))
+            .is_some();
+        assert!(
+            !local_server_carries_it,
+            "service_id must NOT appear under `[local_server]`: {out}"
+        );
+    }
+
+    #[test]
+    fn synthesise_fastly_toml_escapes_pathological_crate_names() {
+        // Cargo restricts `[package].name` to `[A-Za-z0-9_-]`, but
+        // the synth must still be defensive against TOML-hostile
+        // inputs so an exotic value in
+        // `[adapters.fastly.adapter].crate` doesn't produce invalid
+        // TOML.
+        for name in [
+            r#"has"quote"#,
+            r"has\backslash",
+            "has\nnewline",
+            "has = equals",
+        ] {
+            let out = synthesise_fastly_toml(name, None);
+            let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
+        }
+    }
+
+    #[test]
+    fn synthesise_fastly_toml_escapes_pathological_service_ids() {
+        // `fastly compute deploy` may return arbitrary strings.
+        for sid in [r#"has"quote"#, r"has\slash", "has\nnewline"] {
+            let out = synthesise_fastly_toml("demo", Some(sid));
+            let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            assert_eq!(doc["service_id"].as_str(), Some(sid), "input: {sid:?}");
+        }
+    }
+}

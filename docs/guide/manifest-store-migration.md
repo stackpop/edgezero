@@ -36,16 +36,22 @@ platform name.
 ## What changed and why
 
 `edgezero.toml` is now portable: it declares what the app _is_, not
-how any particular platform runs it. The old per-adapter store and
-runtime tables (`[stores.*.adapters.*]`, `[adapters.<name>.adapter]
-host`, etc.) coupled the manifest to a specific deployment shape;
-keeping them required the manifest to be recompiled every time you
-moved between environments.
+how any particular platform runs it. The old per-adapter STORE tables
+(`[stores.*.adapters.*]`) coupled the manifest to a specific deployment
+shape; keeping them required the manifest to be recompiled every time you
+moved between environments, so they were removed.
+
+`[adapters.<name>.adapter]` still exists, and axum still accepts a
+`host` / `port` bind hint there — but only as a **default**. The
+authoritative per-environment values come from the environment overlay
+(`EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`, which win over the
+manifest hint), so the same file works across environments.
 
 The new shape lets one manifest cover dev, staging, and production for
 the same workload. Per-environment differences (which Cloudflare KV
 namespace ID maps to the `sessions` store, what host axum binds to,
-what log level the worker uses) live in the environment, not the file.
+what log level the worker uses) live in the environment overlay, with the
+manifest carrying only the portable defaults.
 
 ## Field-by-field
 
@@ -157,20 +163,63 @@ just need a quick fixture for local testing.
 The Cloudflare config store used to read one `[vars]` string binding
 containing a JSON object. It now reads from a **KV namespace** binding
 asynchronously. To migrate, replace each `[vars] app_config = '{ … }'`
-entry with a KV namespace binding:
+entry in your local copy of `wrangler.toml` with a KV namespace binding:
 
 ```toml
-# wrangler.toml — before
+# your local copy of wrangler.toml — before
 [vars]
 app_config = '{"greeting":"hello","feature.new_checkout":"false"}'
 
-# wrangler.toml — after
+# your local copy of wrangler.toml — after
 [[kv_namespaces]]
 binding = "app_config"
 id      = "abc123…"
 ```
 
-Populate the namespace via `wrangler kv:key put`. The binding name
-becomes the platform name resolved by
+`<app>-cli provision --adapter cloudflare` writes the `[[kv_namespaces]]`
+binding for you. Populate the namespace via `wrangler kv:key put`. The
+binding name becomes the platform name resolved by
 `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME` (with the default being
 the literal id `app_config`).
+
+::: tip Adapter manifests are gitignored
+Your local copy of `axum.toml`, `wrangler.toml`, `fastly.toml`,
+`spin.toml`, and `runtime-config.toml` is not tracked — regenerate
+each with `cargo run -p <app>-cli -- provision --adapter <name> --local`
+(the project CLI isn't installed on a fresh clone, so build-and-run it
+from source) and re-apply any operator edits after cloning. All five
+adapter manifests follow the same gitignored-generated model, so the
+source of truth is `edgezero.toml` (which stays tracked).
+:::
+
+## Un-tracking manifests already committed to your repo
+
+If your project committed these manifests before the cutover, add them
+to `.gitignore` and then untrack them **without deleting your working
+copy** (`--cached`), so provision can own them going forward. Match the
+five adapter manifests plus the Cloudflare `.dev.vars` secrets file at the
+repo root **and** any subdirectory (a `**/name.toml` pathspec silently
+skips files at the repo root), and guard the removal so it's a no-op when
+nothing is tracked:
+
+```bash
+# `(^|/)` anchors each name to a path segment, so both `wrangler.toml`
+# and `adapters/wrangler.toml` match. `.dev.vars` (Cloudflare) and `.env`
+# (Spin's `<crate>/.env`, Axum's `.edgezero/.env`) are secret-bearing and
+# must be untracked too.
+matcher='(^|/)(axum|wrangler|fastly|spin|runtime-config)\.toml$|(^|/)\.dev\.vars$|(^|/)\.env$'
+
+# Untrack matching files without touching your working copy. NUL-delimited
+# end-to-end (`-z` / `-0`) so paths with spaces or newlines survive; the
+# `grep -q` pre-check keeps `git rm` from running on an empty list.
+if git ls-files -z | grep -qzE "$matcher"; then
+  git ls-files -z | grep -zE "$matcher" | xargs -0 git rm --cached --
+fi
+
+# Verify none remain tracked (expect no output):
+git ls-files -z | grep -zE "$matcher" | tr '\0' '\n'
+```
+
+Commit the `.gitignore` change plus the `git rm --cached` removals
+together. Your local files stay on disk; teammates regenerate theirs
+with `provision --local` after pulling.

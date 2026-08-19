@@ -1,5 +1,6 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -20,6 +21,86 @@ pub enum AdapterAction {
     Build,
     Deploy,
     Serve,
+}
+
+/// Provision dispatch mode. `Cloud` keeps today's cloud-CLI shell-out
+/// behaviour; `Local` writes adapter-local emulator state (no cloud
+/// calls). Threaded through `Adapter::provision` so each adapter
+/// branches once at the top of its impl. See spec §"CLI / trait
+/// surface".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProvisionMode {
+    Cloud,
+    Local,
+}
+
+/// Adapter-emitted deployed identifiers. Kept neutral (string-keyed
+/// maps only) so `edgezero-adapter` stays dep-free of
+/// `edgezero-core` -- the CLI maps this into the strongly typed
+/// `ManifestAdapterDeployed` shape when writing `edgezero.toml`.
+/// See spec §"Writeback ownership".
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct AdapterDeployedState {
+    pub fields: BTreeMap<String, String>,
+    pub sub_tables: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Return value of `Adapter::provision` (and `provision_typed`).
+/// `status_lines` are operator-facing; `deployed`, when `Some`,
+/// records the cloud-returned identifiers the CLI persists into
+/// `edgezero.toml`'s `[adapters.<name>.deployed]` block. Local
+/// provision returns `deployed: None`.
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct ProvisionOutcome {
+    pub deployed: Option<AdapterDeployedState>,
+    pub status_lines: Vec<String>,
+    /// A partial-failure error. When `Some`, provision did NOT fully
+    /// succeed, but `deployed` still carries the DURABLE identifiers
+    /// created before the failure (e.g. Cloudflare namespaces already
+    /// created via `wrangler kv namespace create`). The CLI persists
+    /// `deployed` FIRST -- so a partially-created set is checkpointed
+    /// into tracked `edgezero.toml` and not lost -- THEN propagates
+    /// this error. Adapters that fully succeed leave it `None`.
+    pub error: Option<String>,
+}
+
+impl ProvisionOutcome {
+    /// Construct with status lines and no deployed writeback. This is
+    /// the common case for local-mode provision (spec §"Writeback
+    /// ownership": local returns `deployed: None`).
+    #[inline]
+    #[must_use]
+    pub fn from_status_lines(status_lines: Vec<String>) -> Self {
+        Self {
+            deployed: None,
+            status_lines,
+            error: None,
+        }
+    }
+
+    /// Construct with status lines AND cloud-returned deployed
+    /// identifiers to persist into `edgezero.toml`.
+    #[inline]
+    #[must_use]
+    pub fn with_deployed(status_lines: Vec<String>, deployed: AdapterDeployedState) -> Self {
+        Self {
+            deployed: Some(deployed),
+            status_lines,
+            error: None,
+        }
+    }
+
+    /// Attach a partial-failure error while keeping the durable
+    /// `deployed` identifiers already produced. See [`Self::error`].
+    #[inline]
+    #[must_use]
+    pub fn with_error(mut self, error: String) -> Self {
+        self.error = Some(error);
+        self
+    }
 }
 
 /// A single declared store id, paired with the platform name the
@@ -95,6 +176,204 @@ pub struct ProvisionStores<'stores> {
     pub secrets: &'stores [ResolvedStoreId],
 }
 
+impl ProvisionStores<'_> {
+    /// Reject two logical ids of the same kind that differ only by
+    /// ASCII case.
+    ///
+    /// Adapters that write line-oriented local files (Cloudflare's
+    /// `.dev.vars`, Fastly's `.env`) emit one
+    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME="<platform>"` line
+    /// per store, upper-casing the logical id. That derivation is
+    /// lossy: `[stores.kv.myStore]` and `[stores.kv.MYSTORE]` are two
+    /// distinct manifest entries (TOML keys are case-sensitive) that
+    /// both emit `EDGEZERO__STORES__KV__MYSTORE__NAME`. `env_file`'s
+    /// key-normalised dedup then keeps the FIRST line and silently
+    /// drops the second, so the second store resolves to the first
+    /// store's platform name at runtime -- reads and writes land in
+    /// the wrong store with no error anywhere.
+    ///
+    /// Kind is part of the env name, so ids only collide within a
+    /// kind: a `config` and a `kv` store may share a logical id.
+    ///
+    /// # Errors
+    /// Returns an error naming both colliding ids and their kind.
+    #[inline]
+    pub fn reject_case_colliding_logical_ids(&self) -> Result<(), String> {
+        for (kind, stores) in [
+            ("CONFIG", self.config),
+            ("KV", self.kv),
+            ("SECRETS", self.secrets),
+        ] {
+            let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+            for store in stores {
+                let upper = store.logical.to_ascii_uppercase();
+                if let Some(prev) = seen.insert(upper.clone(), store.logical.as_str())
+                    && prev != store.logical
+                {
+                    return Err(format!(
+                        "[stores.{kind_lower}] declares both `{prev}` and `{this}`, which differ \
+                         only by case. `provision --local` writes one \
+                         `EDGEZERO__STORES__{kind}__{upper}__NAME` line per store, upper-casing \
+                         the logical id, so both would target the same variable and one store \
+                         would silently resolve to the other's platform name. Rename one so the \
+                         ids differ by more than case.",
+                        kind_lower = kind.to_ascii_lowercase(),
+                        this = store.logical,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Execution context passed to [`Adapter::execute`] carrying the
+/// manifest-derived working directory and child environment.
+///
+/// Exists because the CLI has two dispatch paths for
+/// `build` / `deploy` / `serve` / `auth`:
+///
+/// * `[adapters.<name>.commands].<action>` is set -> the CLI spawns
+///   that shell command itself, applying the manifest root as cwd and
+///   the resolved environment (bind hints, `[environment.variables]`,
+///   the provision-written `.env` overlay) to the child.
+/// * the command is unset -> the CLI falls back to the registered
+///   adapter's `execute`, which spawns its own vendor CLI.
+///
+/// The fallback used to receive only the action and passthrough args,
+/// so everything the first path applies was silently dropped: a
+/// `serve` would start the app with none of the secrets from its
+/// `.env` file and resolve its manifest from the process cwd rather
+/// than the project root. This
+/// struct is how the second path receives the same context as the
+/// first.
+///
+/// The env pairs are fully resolved by the CLI -- precedence between
+/// parent env, manifest variables, bind hints and the `.env` overlay
+/// is already applied, and entries the parent process already exports
+/// are already dropped. Adapters MUST apply them verbatim
+/// (`cmd.envs(ctx.env())`) rather than re-deriving precedence.
+///
+/// Built via [`Self::new`] + the `with_*` setters; `#[non_exhaustive]`
+/// keeps construction inside the builder so future fields don't break
+/// out-of-tree adapters that only RECEIVE it.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct AdapterExecContext<'ctx> {
+    cwd: Option<&'ctx Path>,
+    env: &'ctx [(String, String)],
+    adapter_manifest: Option<&'ctx Path>,
+    adapter_crate: Option<&'ctx Path>,
+}
+
+impl<'ctx> AdapterExecContext<'ctx> {
+    /// Empty context: no cwd override, no env overrides. Adapters
+    /// behave exactly as they did before the context existed.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            cwd: None,
+            env: &[],
+            adapter_manifest: None,
+            adapter_crate: None,
+        }
+    }
+
+    /// Directory the adapter's spawned CLI should run in -- the
+    /// manifest root, NOT the process cwd.
+    #[must_use]
+    #[inline]
+    pub fn with_cwd(mut self, cwd: &'ctx Path) -> Self {
+        self.cwd = Some(cwd);
+        self
+    }
+
+    /// The manifest-declared, project-root-resolved
+    /// `[adapters.<name>.adapter].manifest` path. When set, an adapter
+    /// MUST use it verbatim instead of scanning the workspace for its
+    /// per-platform manifest -- ambient discovery can pick the wrong
+    /// manifest in a nested / multi-app layout, or follow a symlink off
+    /// the validated tree.
+    #[must_use]
+    #[inline]
+    pub fn with_adapter_manifest(mut self, adapter_manifest: &'ctx Path) -> Self {
+        self.adapter_manifest = Some(adapter_manifest);
+        self
+    }
+
+    /// The manifest-declared, project-root-resolved
+    /// `[adapters.<name>.adapter].crate` directory -- the crate root
+    /// holding `Cargo.toml`.
+    ///
+    /// Adapters MUST NOT assume `Cargo.toml` sits beside the platform
+    /// manifest: a declared nested manifest such as
+    /// `crates/server/config/spin.toml` would resolve
+    /// `crates/server/config/Cargo.toml`, which does not exist. When
+    /// this is set it names the real crate root; the manifest's parent
+    /// is only a fallback for standalone (no-context) invocations.
+    #[must_use]
+    #[inline]
+    pub fn with_adapter_crate(mut self, adapter_crate: &'ctx Path) -> Self {
+        self.adapter_crate = Some(adapter_crate);
+        self
+    }
+
+    /// Fully-resolved `(key, value)` pairs to set on the child.
+    #[must_use]
+    #[inline]
+    pub fn with_env(mut self, env: &'ctx [(String, String)]) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// The manifest root, when the CLI resolved one. `None` means the
+    /// adapter should keep its existing cwd behaviour.
+    #[must_use]
+    #[inline]
+    pub fn cwd(&self) -> Option<&'ctx Path> {
+        self.cwd
+    }
+
+    /// Resolved child-env pairs. Apply verbatim; see the type docs.
+    #[must_use]
+    #[inline]
+    pub fn env(&self) -> &'ctx [(String, String)] {
+        self.env
+    }
+
+    /// The declared adapter-manifest path, when the CLI loaded a
+    /// manifest. `Some` means the adapter must NOT run ambient
+    /// discovery -- see [`Self::with_adapter_manifest`].
+    #[must_use]
+    #[inline]
+    pub fn adapter_manifest(&self) -> Option<&'ctx Path> {
+        self.adapter_manifest
+    }
+
+    /// The declared adapter crate root, when the CLI loaded a manifest.
+    /// `Some` means `Cargo.toml` lives HERE, not necessarily beside the
+    /// platform manifest -- see [`Self::with_adapter_crate`].
+    #[must_use]
+    #[inline]
+    pub fn adapter_crate(&self) -> Option<&'ctx Path> {
+        self.adapter_crate
+    }
+
+    /// Apply this context to a [`Command`] the adapter is about to
+    /// spawn. Adapters should prefer this over reading the accessors
+    /// so cwd/env handling stays identical across every adapter.
+    #[inline]
+    pub fn apply(&self, command: &mut Command) {
+        if let Some(cwd) = self.cwd {
+            command.current_dir(cwd);
+        }
+        for (key, value) in self.env {
+            command.env(key, value);
+        }
+    }
+}
+
 /// Context passed to [`Adapter::push_config_entries`] and
 /// [`Adapter::push_config_entries_local`] carrying already-resolved
 /// `config push` overlay values.
@@ -116,15 +395,12 @@ pub struct AdapterPushContext<'ctx> {
     /// right writeback target; adapters where local == default
     /// can ignore it.
     pub local: bool,
-    /// `[adapters.<name>.commands].deploy` from the manifest, if set.
-    /// Adapters use this to auto-detect the deployment target —
-    /// e.g. Spin treats `spin deploy` / `spin cloud deploy` as a
-    /// signal to shell out to `spin cloud key-value set` instead of
-    /// writing local `SQLite`. `None` means the operator left the
-    /// deploy command unset (or no manifest entry exists for this
-    /// adapter), in which case auto-detection silently does not
-    /// fire.
-    pub manifest_adapter_deploy_cmd: Option<&'ctx str>,
+    /// `true` when `[adapters.<name>.adapter].cloud = true` -- the SOLE
+    /// signal that config `push`/`diff` should target the platform CLOUD
+    /// store (Spin's Fermyon Cloud KV). There is no deploy-command heuristic
+    /// and no backward-compatibility fallback: a project reaches cloud only
+    /// when it sets this flag explicitly.
+    pub cloud_target: bool,
     /// Already-resolved path to the adapter's runtime configuration
     /// file (e.g. Spin's `runtime-config.toml`, which declares the
     /// `[key_value_store.<label>]` backends `config push --adapter
@@ -154,11 +430,11 @@ impl<'ctx> AdapterPushContext<'ctx> {
         self
     }
 
-    /// Set the manifest-adapter deploy command.
+    /// Set the explicit cloud-target flag (`[adapters.<name>.adapter].cloud`).
     #[must_use]
     #[inline]
-    pub fn with_manifest_adapter_deploy_cmd(mut self, cmd: &'ctx str) -> Self {
-        self.manifest_adapter_deploy_cmd = Some(cmd);
+    pub fn with_cloud_target(mut self, cloud: bool) -> Self {
+        self.cloud_target = cloud;
         self
     }
 
@@ -180,12 +456,24 @@ pub struct TypedSecretEntry<'entry> {
     pub field_name: String,
     /// Blob value — i.e. the secret-store KEY NAME.
     pub key_value: &'entry str,
-    /// Logical secret-store id this key targets.
+    /// Logical secret-store id this key targets (the id declared in
+    /// `[stores.secrets].ids`). Used for human-facing wording and the
+    /// flat-namespace collision checks.
     pub store_id: &'entry str,
+    /// Platform store name the runtime actually opens — the logical id
+    /// after the `EDGEZERO__STORES__SECRETS__<ID>__NAME` env override
+    /// is applied, or the logical id itself when unset. Adapters that
+    /// seed a local emulator store (Fastly's Viceroy
+    /// `[[local_server.secret_stores.<name>]]`) MUST key it by this,
+    /// not by `store_id` -- the runtime resolves the same override and
+    /// would otherwise open a store the seed never created.
+    pub platform: String,
 }
 
 impl<'entry> TypedSecretEntry<'entry> {
-    /// Construct a new entry from its three components.
+    /// Construct an entry whose platform name equals its logical id
+    /// (no env override). This is the right constructor for tests and
+    /// for adapters whose secret stores have no name-override path.
     #[must_use]
     #[inline]
     pub fn new<Name: Into<String>>(
@@ -197,7 +485,18 @@ impl<'entry> TypedSecretEntry<'entry> {
             field_name: field_name.into(),
             key_value,
             store_id,
+            platform: store_id.to_owned(),
         }
+    }
+
+    /// Override the resolved platform store name — the CLI applies the
+    /// `EDGEZERO__STORES__SECRETS__<ID>__NAME` overlay and threads the
+    /// result in so adapters seed the store the runtime will open.
+    #[must_use]
+    #[inline]
+    pub fn with_platform<P: Into<String>>(mut self, platform: P) -> Self {
+        self.platform = platform.into();
+        self
     }
 }
 
@@ -255,6 +554,20 @@ pub enum ReadConfigEntry {
 /// of `edgezero-core`. Defaults are no-ops; adapters override what
 /// they actually need.
 pub trait Adapter: Sync + Send {
+    /// Names of the `ManifestAdapterDeployed` fields this adapter
+    /// reads at provision time. Manifest-level cross-check
+    /// (`validate_deployed_field_ownership` in the CLI) rejects
+    /// `[adapters.<name>.deployed]` blocks whose populated fields
+    /// aren't in this list — catching operator typos and writeback
+    /// bugs before they corrupt the deployed state at next provision.
+    ///
+    /// Default is `&[]` — adapters that don't persist deployed state
+    /// (spin, axum today) inherit it.
+    #[inline]
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Execute the requested action with optional adapter-specific args.
     ///
     /// `args` is a stringly-typed pass-through for arguments meant
@@ -267,9 +580,22 @@ pub trait Adapter: Sync + Send {
     /// typed parameter structs (e.g. `BuildArgs { manifest_root,
     /// extra_args }`) mirroring the rest of the trait.
     ///
+    /// `ctx` carries the manifest root and the fully-resolved child
+    /// environment. Adapters that spawn a vendor CLI MUST apply it
+    /// (`ctx.apply(&mut cmd)`) so the registry-fallback dispatch
+    /// behaves like the `[adapters.<name>.commands]` shell path --
+    /// see [`AdapterExecContext`]. Actions with no working-directory
+    /// or environment component (the `auth` arms shell out to a
+    /// globally-scoped vendor login) may ignore it.
+    ///
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+    fn execute(
+        &self,
+        action: AdapterAction,
+        args: &[String],
+        ctx: &AdapterExecContext<'_>,
+    ) -> Result<(), String>;
 
     /// Reclaim chunk entries that no LIVE config pointer references.
     ///
@@ -368,23 +694,61 @@ pub trait Adapter: Sync + Send {
     /// (`wrangler.toml`, `fastly.toml`, `spin.toml`) relative to
     /// the root. `stores` carries the declared ids per kind.
     ///
-    /// Default: no-op (returns an empty `Vec`) so adapters that
-    /// don't own any platform resources don't need to override.
+    /// `deployed` carries the adapter's previously-persisted
+    /// deployed identifiers (e.g. Cloudflare KV namespace ids,
+    /// Fastly service id). Local-arm impls consult it for
+    /// precedence rules (spec §"CLI / trait surface"); cloud-arm
+    /// impls pass `None` — they produce, not consume, the deployed
+    /// state. `mode` selects cloud vs. local emulator paths
+    /// (spec §"CLI / trait surface", §"Writeback ownership").
+    ///
+    /// No default impl is provided — every adapter must update
+    /// explicitly so the compiler flags any missed call sites.
     ///
     /// # Errors
     /// Returns a human-readable error string if any platform
     /// invocation or manifest edit fails. `dry_run` impls should
     /// describe what they *would* do without performing it.
-    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "provision needs the manifest root, adapter manifest path, component selector, resolved stores, previously-deployed state (for local-arm precedence), dispatch mode (cloud vs local), and dry-run flag — 8 args. Each is distinct; an aggregate struct would be a larger ergonomic regression for adapter implementers."
+    )]
     fn provision(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        stores: &ProvisionStores<'_>,
+        deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String>;
+
+    /// Typed-secret companion to `provision`. Runs ONLY in local mode
+    /// (`mode == Local`); cloud mode is a no-op by spec §"CLI / trait
+    /// surface". The CLI dispatches this AFTER `provision` on the same
+    /// `manifest_root`, so per-store bindings are already in place; this
+    /// method only adds adapter-specific per-secret placeholders sourced
+    /// from `C::SECRET_FIELDS` (the generic CLI walks them; bundled
+    /// `edgezero` cannot).
+    ///
+    /// The default impl is a no-op so existing adapters compile
+    /// untouched while the per-adapter overrides land in Section 5.
+    ///
+    /// # Errors
+    /// The default impl never errors. Adapter overrides may return
+    /// human-readable error strings if local placeholder setup fails.
+    #[inline]
+    fn provision_typed(
         &self,
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _stores: &ProvisionStores<'_>,
+        _typed_secrets: &[TypedSecretEntry<'_>],
+        _mode: ProvisionMode,
         _dry_run: bool,
-    ) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+    ) -> Result<ProvisionOutcome, String> {
+        Ok(ProvisionOutcome::default())
     }
 
     /// Push config entries into the platform's config store backing
@@ -532,6 +896,61 @@ pub trait Adapter: Sync + Send {
         &[]
     }
 
+    /// First-run bootstrap synthesiser, called by the CLI ONLY when
+    /// `mode == Local` AND the adapter manifest (or related local
+    /// files like `runtime-config.toml`) is absent. All four
+    /// bundled adapters (axum, cloudflare, fastly, spin) override
+    /// this — the `Ok(Vec::new())` default is retained only for
+    /// downstream / experimental adapters that own no synthesised
+    /// local state. The 2026-07 amendment folded `axum.toml` into
+    /// the same gitignored / provision-generated model as the
+    /// other three, so the earlier "Axum has no synthesised local
+    /// state" carve-out no longer applies.
+    ///
+    /// Each `(relative_path, contents)` tuple is written by the CLI
+    /// under `manifest_root` BEFORE `validate_adapter_manifest`
+    /// runs, so a clean clone can pass validation.
+    ///
+    /// **Boundary contract (MUST):** signature uses only `std` +
+    /// types defined IN this crate. Adapters that need values from
+    /// the parent manifest receive them through neutral arguments
+    /// (`Option<&AdapterDeployedState>`, `&[String]`) — the CLI
+    /// translates from `&Manifest` at the call site.
+    ///
+    /// `allowed_outbound_hosts` carries
+    /// `[adapters.<name>.adapter].allowed_outbound_hosts` verbatim.
+    /// Only the Spin adapter consumes it (it emits
+    /// `[component.<id>].allowed_outbound_hosts`); the empty default
+    /// keeps the synthesised manifest at Spin's deny-all baseline.
+    /// Other adapters ignore it.
+    ///
+    /// # Errors
+    /// The default impl never errors. Adapter overrides may return
+    /// human-readable error strings if baseline synthesis fails.
+    /// `adapter_crate_path` is the authoritative
+    /// `[adapters.<name>.adapter].crate` (root-relative), when declared.
+    /// Adapters that derive a crate name / artifact path MUST prefer it
+    /// over an ancestor `Cargo.toml` search: a nested package sitting
+    /// between the platform manifest and the intended crate root would
+    /// otherwise be mis-selected.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "baseline synthesis needs the manifest root, adapter manifest path, authoritative crate path, component selector, app name, previously-deployed state, and allowed-outbound-hosts. Each is distinct; an aggregate struct would be a larger ergonomic regression for adapter implementers, matching the sibling `provision` methods."
+    )]
+    #[inline]
+    fn synthesise_baseline_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _adapter_crate_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _app_name: &str,
+        _deployed: Option<&AdapterDeployedState>,
+        _allowed_outbound_hosts: &[String],
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        Ok(Vec::new())
+    }
+
     /// Adapter-specific manifest check — e.g. Spin's
     /// `[component.*]` discovery in `spin.toml`. The adapter
     /// resolves its own per-adapter manifest path relative to
@@ -540,6 +959,13 @@ pub trait Adapter: Sync + Send {
     /// `component_selector` come from
     /// `[adapters.<name>.adapter].manifest` and `.component`
     /// respectively. Default: no-op.
+    ///
+    /// `allow_component_refresh` is `true` only on the `provision`
+    /// pre-flight, where a recoverable transient mismatch (Spin's
+    /// single-component selector-refresh) must NOT block provision
+    /// from performing the refresh. `config validate` passes `false`,
+    /// keeping the standard static check strict: an out-of-phase
+    /// selector is reported as the inconsistency it is.
     ///
     /// # Errors
     /// Returns a human-readable error string on any manifest
@@ -550,6 +976,7 @@ pub trait Adapter: Sync + Send {
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
+        _allow_component_refresh: bool,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -581,7 +1008,7 @@ pub trait Adapter: Sync + Send {
     ///
     /// Note: the previous signature took a `_config_keys` parameter
     /// so Spin could detect cross-namespace collision with KV-stored
-    /// values; KV-backed config dropped that need in Stage 6, and no
+    /// values; KV-backed config dropped that need, and no
     /// remaining adapter consults it. If a future adapter needs the
     /// flattened config-key set here, add it back via a builder
     /// context rather than re-introducing a positional parameter
@@ -627,6 +1054,111 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex};
 
+    fn ids(logicals: &[&str]) -> Vec<ResolvedStoreId> {
+        logicals
+            .iter()
+            .map(|logical| ResolvedStoreId::from_logical(*logical))
+            .collect()
+    }
+
+    #[test]
+    fn exec_context_apply_sets_cwd_and_env_on_command() {
+        let env = vec![("EDGEZERO_TEST_CTX".to_owned(), "value".to_owned())];
+        let cwd = Path::new("/tmp/edgezero-ctx-test");
+        let ctx = AdapterExecContext::new().with_cwd(cwd).with_env(&env);
+
+        let mut command = Command::new("true");
+        ctx.apply(&mut command);
+
+        assert_eq!(command.get_current_dir(), Some(cwd));
+        let applied: Vec<(String, String)> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned()))
+            })
+            .collect();
+        assert_eq!(
+            applied,
+            vec![("EDGEZERO_TEST_CTX".to_owned(), "value".to_owned())]
+        );
+    }
+
+    #[test]
+    fn exec_context_default_is_inert() {
+        // An empty context must not touch a command -- this is what
+        // keeps the manifest-`commands` shell path (which builds its
+        // own command) behaving exactly as before.
+        let ctx = AdapterExecContext::new();
+        assert!(ctx.cwd().is_none());
+        assert!(ctx.env().is_empty());
+
+        let mut command = Command::new("true");
+        ctx.apply(&mut command);
+        assert_eq!(command.get_current_dir(), None);
+        assert_eq!(command.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn case_collision_check_passes_for_distinct_ids() {
+        let kv = ids(&["sessions", "cache"]);
+        ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect("distinct ids must pass");
+    }
+
+    /// Regression: both ids
+    /// upper-case to `EDGEZERO__STORES__KV__MYSTORE__NAME`, so the
+    /// env-file dedup would keep one line and silently point the
+    /// other store at the wrong platform name.
+    #[test]
+    fn case_collision_check_rejects_ids_differing_only_by_case() {
+        let kv = ids(&["myStore", "MYSTORE"]);
+        let err = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect_err("ids differing only by case must be rejected");
+        assert!(
+            err.contains("myStore") && err.contains("MYSTORE") && err.contains("stores.kv"),
+            "error names both ids and the kind: {err}"
+        );
+    }
+
+    /// The kind is part of the derived variable name, so the SAME
+    /// logical id under two different kinds does not collide.
+    #[test]
+    fn case_collision_check_allows_same_id_across_kinds() {
+        let kv = ids(&["shared"]);
+        let config = ids(&["shared"]);
+        ProvisionStores {
+            config: &config,
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect("kind is part of the env name, so cross-kind reuse is fine");
+    }
+
+    /// An id repeated verbatim within a kind is not a case collision
+    /// -- same id, same variable, same platform name.
+    #[test]
+    fn case_collision_check_allows_exact_duplicate_id() {
+        let kv = ids(&["sessions", "sessions"]);
+        ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        }
+        .reject_case_colliding_logical_ids()
+        .expect("an exact duplicate is not a case collision");
+    }
+
     static FIRST: TestAdapter = TestAdapter {
         hit_value: 1,
         name: "dummy",
@@ -652,13 +1184,31 @@ mod tests {
         reason = "TestAdapter only exercises register / get / execute; the validation methods inherit the trait defaults (no-ops)"
     )]
     impl Adapter for TestAdapter {
-        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+        fn execute(
+            &self,
+            _action: AdapterAction,
+            _args: &[String],
+            _ctx: &AdapterExecContext<'_>,
+        ) -> Result<(), String> {
             HIT.store(self.hit_value, Ordering::SeqCst);
             Ok(())
         }
 
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn provision(
+            &self,
+            _manifest_root: &Path,
+            _adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+            _stores: &ProvisionStores<'_>,
+            _deployed: Option<&AdapterDeployedState>,
+            _mode: ProvisionMode,
+            _dry_run: bool,
+        ) -> Result<ProvisionOutcome, String> {
+            Ok(ProvisionOutcome::default())
         }
     }
 
@@ -675,7 +1225,7 @@ mod tests {
         register_adapter(&FIRST);
         let adapter = get_adapter("dummy").expect("adapter present");
         adapter
-            .execute(AdapterAction::Build, &[])
+            .execute(AdapterAction::Build, &[], &AdapterExecContext::new())
             .expect("execute succeeds");
         assert_eq!(HIT.load(Ordering::SeqCst), 1);
     }
@@ -688,7 +1238,7 @@ mod tests {
         register_adapter(&SECOND);
         let adapter = get_adapter("dummy").expect("adapter present");
         adapter
-            .execute(AdapterAction::Deploy, &[])
+            .execute(AdapterAction::Deploy, &[], &AdapterExecContext::new())
             .expect("execute succeeds");
         assert_eq!(HIT.load(Ordering::SeqCst), 2);
     }
@@ -725,10 +1275,45 @@ mod tests {
     }
 
     #[test]
+    fn provision_outcome_default_is_empty() {
+        let outcome = ProvisionOutcome::default();
+        assert!(outcome.status_lines.is_empty());
+        assert!(outcome.deployed.is_none());
+    }
+
+    #[test]
+    fn adapter_deployed_state_round_trips_via_btreemap() {
+        use std::collections::BTreeMap;
+        let mut state = AdapterDeployedState::default();
+        state.fields.insert("service_id".into(), "SVC1".into());
+        let mut kv = BTreeMap::new();
+        kv.insert("sessions".into(), "abc123".into());
+        state.sub_tables.insert("kv_namespaces".into(), kv);
+        assert_eq!(state.fields["service_id"], "SVC1");
+        assert_eq!(state.sub_tables["kv_namespaces"]["sessions"], "abc123");
+    }
+
+    #[test]
+    fn provision_typed_default_impl_returns_empty_outcome() {
+        let outcome = FIRST
+            .provision_typed(
+                Path::new("/tmp"),
+                None,
+                None,
+                &[],
+                ProvisionMode::Local,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.status_lines.is_empty());
+        assert!(outcome.deployed.is_none());
+    }
+
+    #[test]
     fn push_context_new_is_prod_with_no_paths() {
         let ctx = AdapterPushContext::new();
         assert!(!ctx.local);
-        assert_eq!(ctx.manifest_adapter_deploy_cmd, None);
+        assert!(!ctx.cloud_target);
         assert_eq!(ctx.runtime_config_path, None);
     }
 
@@ -737,10 +1322,10 @@ mod tests {
         let path = Path::new("runtime-config.toml");
         let ctx = AdapterPushContext::new()
             .with_local(true)
-            .with_manifest_adapter_deploy_cmd("spin cloud deploy")
+            .with_cloud_target(true)
             .with_runtime_config_path(path);
         assert!(ctx.local);
-        assert_eq!(ctx.manifest_adapter_deploy_cmd, Some("spin cloud deploy"));
+        assert!(ctx.cloud_target);
         assert_eq!(ctx.runtime_config_path, Some(path));
     }
 
@@ -751,7 +1336,7 @@ mod tests {
         assert!(FIRST.merged_id_kinds().is_empty());
         assert!(FIRST.single_store_kinds().is_empty());
         assert_eq!(
-            FIRST.validate_adapter_manifest(Path::new("/tmp"), None, None),
+            FIRST.validate_adapter_manifest(Path::new("/tmp"), None, None, false),
             Ok(())
         );
         assert_eq!(
