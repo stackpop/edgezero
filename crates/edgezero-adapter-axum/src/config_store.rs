@@ -174,18 +174,41 @@ impl ConfigStore for AxumConfigStore {
     }
 }
 
-/// Walk up from the process cwd looking for an ancestor that
-/// contains an `edgezero.toml` file (the manifest marker, same
-/// convention cargo uses for `Cargo.toml`). Returns the first
-/// matching ancestor, or `None` if the walk hits the filesystem
-/// root without finding one.
+/// Resolve the project root that anchors the runtime `.edgezero`
+/// directory.
+///
+/// When `EDGEZERO_MANIFEST` is set (the manifest path can be renamed
+/// away from the default `edgezero.toml`), the root is that manifest's
+/// parent directory — the SAME root `provision --local` resolves the
+/// manifest from — so runtime reads land exactly where provisioning
+/// wrote. Only when the variable is unset does discovery fall back to
+/// the upward `edgezero.toml` search below.
 ///
 /// Used by [`AxumConfigStore::local_path`] to keep push and runtime
 /// on the same path regardless of launch cwd. Also reused by the dev
 /// server's KV path anchoring so config and KV state land in the SAME
 /// `.edgezero` directory.
 pub(crate) fn find_project_root_dir() -> Option<PathBuf> {
+    if let Some(root) = manifest_root_from_env() {
+        return Some(root);
+    }
     find_project_root_dir_from(&env::current_dir().ok()?)
+}
+
+/// Derive the project root from an explicitly set `EDGEZERO_MANIFEST`.
+///
+/// Mirrors the CLI's `manifest_root_from`: the manifest's parent is the
+/// project root, collapsing to `.` when the path has no parent
+/// component (a bare `EDGEZERO_MANIFEST=project.local.toml`). Returns
+/// `None` when the variable is unset so the caller falls back to the
+/// `edgezero.toml` upward search.
+fn manifest_root_from_env() -> Option<PathBuf> {
+    let manifest = PathBuf::from(env::var("EDGEZERO_MANIFEST").ok()?);
+    let root = manifest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    Some(root)
 }
 
 /// Test-visible inner walk: same behaviour as
@@ -211,6 +234,7 @@ mod tests {
     });
 
     use super::*;
+    use edgezero_core::test_env::{EnvOverride, env_lock};
     use futures::executor::block_on;
     use tempfile::tempdir;
 
@@ -300,6 +324,27 @@ mod tests {
         assert_eq!(
             fs::canonicalize(&resolved).expect("canonicalize resolved"),
             fs::canonicalize(&inner).expect("canonicalize inner")
+        );
+    }
+
+    #[test]
+    fn find_project_root_dir_honors_renamed_manifest_env() {
+        // A renamed top-level manifest (`EDGEZERO_MANIFEST=<dir>/project.local.toml`)
+        // must anchor the runtime `.edgezero` directory on that
+        // manifest's parent — the same root `provision --local` writes
+        // under — NOT the `edgezero.toml` upward-search fallback. Note
+        // the tempdir deliberately has NO `edgezero.toml`, so a fallback
+        // would resolve somewhere else entirely.
+        let _lock = env_lock().lock().expect("env lock");
+        let temp = tempdir().expect("tempdir");
+        let manifest = temp.path().join("project.local.toml");
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest);
+
+        let resolved = find_project_root_dir().expect("manifest env must resolve a root");
+        assert_eq!(
+            fs::canonicalize(&resolved).expect("canonicalize resolved"),
+            fs::canonicalize(temp.path()).expect("canonicalize tempdir"),
+            "runtime root must be the renamed manifest's parent directory"
         );
     }
 

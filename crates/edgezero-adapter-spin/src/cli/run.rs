@@ -3,6 +3,8 @@
 //! `synthesise_*_toml` baselines emitted by the CLI's `provision`
 //! bootstrap.
 
+use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -75,20 +77,68 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
     // target dir OR an operator-edited `source` never leaves a stale module.
     // Falls back to the CONVENTIONAL workspace target path when the manifest
     // can't be parsed or declares no matching source.
-    refresh_declared_source(&manifest, &underscored, &artifact)?;
+    refresh_declared_source(&manifest, &workspace_root, &underscored, &artifact)?;
     refresh_conventional_source(&workspace_root, &underscored, &artifact)?;
 
     Ok(dest)
 }
 
+/// True when both paths refer to the SAME existing file (resolving `.`,
+/// `..`, and symlinks). CRUCIAL guard against a self-copy: `fs::copy`
+/// TRUNCATES the file to 0 bytes when source and destination are the same
+/// inode -- which is exactly the default case, where the declared `source`
+/// (`../../target/<triple>/release/<crate>.wasm`, a relative path with `..`)
+/// resolves to the very artifact cargo just built.
+fn is_same_existing_file(first: &Path, second: &Path) -> bool {
+    match (fs::canonicalize(first), fs::canonicalize(second)) {
+        (Ok(first_real), Ok(second_real)) => first_real == second_real,
+        (Err(_), _) | (_, Err(_)) => false,
+    }
+}
+
+/// Lexically resolve `.` / `..` in `path` WITHOUT touching the filesystem
+/// (so it works for a not-yet-created destination). Symlinks are NOT
+/// followed -- that's intentional: the caller separately refuses a symlinked
+/// final component so a link can't redirect the write outside the tree.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    out
+}
+
 /// Refresh the DECLARED `source` path of THIS crate's component in
-/// `spin.toml` with the freshly built `artifact`. Only the component whose
-/// `source` filename is `<crate>.wasm` (`underscored_wasm`) is touched, so a
-/// multi-component manifest's other components are never clobbered. A local
-/// file `source` is resolved relative to the manifest's directory; registry
-/// (`{ url = ... }`) sources are skipped. Best-effort on parse failure.
+/// `spin.toml` with the freshly built `artifact`, so `spin up` / `spin
+/// deploy` (which read `source`) never serve a stale module after a
+/// custom-target build. A local file `source` is resolved relative to the
+/// manifest's directory; registry (`{ url = ... }`) sources are skipped.
+/// Best-effort on parse failure.
+///
+/// Safety / correctness:
+/// - Never self-copies (which would TRUNCATE the artifact to 0) -- the
+///   default `source` resolves to the artifact itself.
+/// - Refuses a `source` that resolves OUTSIDE `workspace_root`, or whose
+///   final component is a symlink, so an operator-controlled `source` can't
+///   overwrite files elsewhere on disk.
+/// - In a single-component manifest the sole component is refreshed
+///   regardless of its `source` basename (an operator may rename it); a
+///   multi-component manifest matches by basename so siblings aren't
+///   clobbered.
 fn refresh_declared_source(
     manifest: &Path,
+    workspace_root: &Path,
     underscored_wasm: &str,
     artifact: &Path,
 ) -> Result<(), String> {
@@ -102,16 +152,45 @@ fn refresh_declared_source(
     let Some(components) = doc.get("component").and_then(toml::Value::as_table) else {
         return Ok(());
     };
+    let single_component = components.len() == 1;
+    let root = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     for component in components.values() {
         let Some(source) = component.get("source").and_then(toml::Value::as_str) else {
             continue;
         };
-        if Path::new(source).file_name().and_then(|name| name.to_str()) != Some(underscored_wasm) {
+        // A single-component manifest's sole component is this crate's, whatever
+        // its source basename; only a MULTI-component manifest needs the basename
+        // match to avoid clobbering a sibling component.
+        let basename_matches =
+            Path::new(source).file_name().and_then(|name| name.to_str()) == Some(underscored_wasm);
+        if !single_component && !basename_matches {
             continue;
         }
         let src_path = manifest_dir.join(source);
-        if src_path == artifact {
+        // Self-copy guard: the default source IS the artifact -- copying it
+        // onto itself truncates it to 0 bytes.
+        if is_same_existing_file(&src_path, artifact) {
             continue;
+        }
+        // Containment: never write through `..` / an absolute source / a
+        // symlink to a location outside the build tree.
+        let normalized = lexically_normalize(&src_path);
+        if !normalized.starts_with(&root) {
+            return Err(format!(
+                "spin component source `{source}` resolves to {} -- outside the project tree {}; \
+                 refusing to write there",
+                normalized.display(),
+                root.display()
+            ));
+        }
+        if src_path
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(format!(
+                "spin component source {} is a symlink; refusing to overwrite through it",
+                src_path.display()
+            ));
         }
         if let Some(parent) = src_path.parent() {
             fs::create_dir_all(parent)
@@ -142,7 +221,9 @@ fn refresh_conventional_source(
         .join(TARGET_TRIPLE)
         .join("release")
         .join(underscored_wasm);
-    if artifact == source_path {
+    // Self-copy guard: on the default (non-custom-target) build the artifact
+    // IS this path; copying it onto itself would truncate it to 0 bytes.
+    if is_same_existing_file(artifact, &source_path) {
         return Ok(());
     }
     if let Some(parent) = source_path.parent() {
@@ -171,10 +252,16 @@ pub fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(),
 
     let mut command = Command::new("spin");
     command
-        .args(["deploy"])
-        // Pass the DECLARED manifest explicitly. `current_dir` alone makes
-        // `spin` load whatever `spin.toml` sits in that dir -- wrong when the
-        // declared manifest has a non-standard filename (e.g. `spin.prod.toml`).
+        // `spin cloud deploy`, NOT bare `spin deploy`: on Spin 3+/4 a bare
+        // `spin deploy` errors ("needs to be told which deployment plugin to
+        // use") -- it now requires a `SPIN_DEPLOY_PLUGIN` / `spin <plugin>
+        // deploy`. Fermyon Cloud is EdgeZero's Spin deploy target, and
+        // `spin cloud deploy` is its first-class command.
+        .args(["cloud", "deploy"])
+        // Pass the DECLARED manifest explicitly (`-f/--from`). `current_dir`
+        // alone makes `spin` load whatever `spin.toml` sits in that dir --
+        // wrong when the declared manifest has a non-standard filename
+        // (e.g. `spin.prod.toml`).
         .arg("--from")
         .arg(&manifest)
         .args(extra_args)
@@ -279,15 +366,36 @@ fn locate_artifact(
 /// Returns an error if the Spin CLI up command fails.
 #[inline]
 /// The `KEY=VALUE` strings to hand `spin up --env` so the EDGEZERO__*
-/// runtime-config overlay reaches the GUEST's WASI env. A wasip2 component
+/// runtime-config overrides reach the GUEST's WASI env. A wasip2 component
 /// reads its own sandboxed `std::env`, which Spin populates from `--env` /
 /// `[component.<id>.environment]` -- NOT from the `spin` host process env --
 /// so store `__NAME` / `__KEY` overrides must be forwarded explicitly. Only
 /// the `EDGEZERO__` namespace is forwarded (secrets travel as Spin variables,
 /// and unrelated host env stays out of the sandbox).
-fn guest_env_forwards(env: &[(String, String)]) -> Vec<String> {
-    env.iter()
-        .filter(|(key, _)| key.starts_with("EDGEZERO__"))
+///
+/// Merges TWO sources, with the PARENT shell winning:
+/// - `overlay` -- the provisioned `.env` / manifest values `ctx.env()`
+///   carries (adapter.rs deliberately keeps parent-exported keys OUT of this
+///   overlay, since the host process inherits them directly);
+/// - `parent` -- the process env `edgezero serve` was launched with. Without
+///   this, a highest-precedence shell `EDGEZERO__...__KEY` reaches the spin
+///   HOST (inherited) but silently never reaches the sandboxed guest, which
+///   then falls back to the store's logical id.
+fn guest_env_forwards(overlay: &[(String, String)], parent: &[(String, String)]) -> Vec<String> {
+    let mut merged: BTreeMap<&str, &str> = BTreeMap::new();
+    for (key, value) in overlay {
+        if key.starts_with("EDGEZERO__") {
+            merged.insert(key, value);
+        }
+    }
+    // Parent shell overrides the provisioned overlay (last write wins).
+    for (key, value) in parent {
+        if key.starts_with("EDGEZERO__") {
+            merged.insert(key, value);
+        }
+    }
+    merged
+        .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect()
 }
@@ -330,7 +438,12 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
     // inherited environment. Without this the store `__NAME` / `__KEY`
     // overrides provision writes into `.env` are invisible to the runtime and
     // every store silently falls back to its logical id.
-    for pair in guest_env_forwards(ctx.env()) {
+    // Include the operator's PARENT shell env: an exported
+    // `EDGEZERO__...__KEY` is the highest-precedence override and is kept out
+    // of `ctx.env()` (adapter.rs "parent wins" -> the host inherits it
+    // directly), so it must be merged in HERE or it never reaches the guest.
+    let parent_env: Vec<(String, String)> = env::vars().collect();
+    for pair in guest_env_forwards(ctx.env(), &parent_env) {
         command.arg("--env").arg(pair);
     }
     command.args(extra_args).current_dir(manifest_dir);
@@ -541,7 +654,7 @@ mod tests {
             ),
             ("HOME".to_owned(), "/home/dev".to_owned()),
         ];
-        let forwards = guest_env_forwards(&env);
+        let forwards = guest_env_forwards(&env, &[]);
         assert_eq!(
             forwards,
             vec![
@@ -549,6 +662,39 @@ mod tests {
                 "EDGEZERO__STORES__KV__SESSIONS__NAME=sessions".to_owned(),
             ],
             "only EDGEZERO__* forwards; secrets and host env stay out of the guest"
+        );
+    }
+
+    #[test]
+    fn guest_env_forwards_lets_the_parent_shell_override_the_overlay() {
+        // A highest-precedence `EDGEZERO__...__KEY` exported in the operator's
+        // shell must reach the guest and WIN over the provisioned overlay --
+        // otherwise a shell override silently falls back to the logical id.
+        let overlay = vec![
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+                "from_overlay".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__KV__SESSIONS__NAME".to_owned(),
+                "sessions".to_owned(),
+            ),
+        ];
+        let parent = vec![
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+                "from_shell".to_owned(),
+            ),
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+        ];
+        let forwards = guest_env_forwards(&overlay, &parent);
+        assert_eq!(
+            forwards,
+            vec![
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=from_shell".to_owned(),
+                "EDGEZERO__STORES__KV__SESSIONS__NAME=sessions".to_owned(),
+            ],
+            "parent-shell EDGEZERO__* overrides the overlay; non-EDGEZERO__ parent env stays out"
         );
     }
 

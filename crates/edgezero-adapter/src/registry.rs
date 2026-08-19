@@ -395,20 +395,11 @@ pub struct AdapterPushContext<'ctx> {
     /// right writeback target; adapters where local == default
     /// can ignore it.
     pub local: bool,
-    /// `[adapters.<name>.commands].deploy` from the manifest, if set.
-    /// Adapters use this to auto-detect the deployment target —
-    /// e.g. Spin treats `spin deploy` / `spin cloud deploy` as a
-    /// signal to shell out to `spin cloud key-value set` instead of
-    /// writing local `SQLite`. `None` means the operator left the
-    /// deploy command unset (or no manifest entry exists for this
-    /// adapter), in which case auto-detection silently does not
-    /// fire.
-    pub manifest_adapter_deploy_cmd: Option<&'ctx str>,
-    /// `true` when `[adapters.<name>.adapter].cloud = true` -- the explicit
+    /// `true` when `[adapters.<name>.adapter].cloud = true` -- the SOLE
     /// signal that config `push`/`diff` should target the platform CLOUD
-    /// store. The authoritative replacement for the `manifest_adapter_deploy_cmd`
-    /// heuristic (the hard-cutoff manifest no longer emits a `commands` block
-    /// to sniff). Adapters treat cloud as `cloud_target || <deploy-cmd sniff>`.
+    /// store (Spin's Fermyon Cloud KV). There is no deploy-command heuristic
+    /// and no backward-compatibility fallback: a project reaches cloud only
+    /// when it sets this flag explicitly.
     pub cloud_target: bool,
     /// Already-resolved path to the adapter's runtime configuration
     /// file (e.g. Spin's `runtime-config.toml`, which declares the
@@ -444,14 +435,6 @@ impl<'ctx> AdapterPushContext<'ctx> {
     #[inline]
     pub fn with_cloud_target(mut self, cloud: bool) -> Self {
         self.cloud_target = cloud;
-        self
-    }
-
-    /// Set the manifest-adapter deploy command.
-    #[must_use]
-    #[inline]
-    pub fn with_manifest_adapter_deploy_cmd(mut self, cmd: &'ctx str) -> Self {
-        self.manifest_adapter_deploy_cmd = Some(cmd);
         self
     }
 
@@ -1330,7 +1313,7 @@ mod tests {
     fn push_context_new_is_prod_with_no_paths() {
         let ctx = AdapterPushContext::new();
         assert!(!ctx.local);
-        assert_eq!(ctx.manifest_adapter_deploy_cmd, None);
+        assert!(!ctx.cloud_target);
         assert_eq!(ctx.runtime_config_path, None);
     }
 
@@ -1339,10 +1322,10 @@ mod tests {
         let path = Path::new("runtime-config.toml");
         let ctx = AdapterPushContext::new()
             .with_local(true)
-            .with_manifest_adapter_deploy_cmd("spin cloud deploy")
+            .with_cloud_target(true)
             .with_runtime_config_path(path);
         assert!(ctx.local);
-        assert_eq!(ctx.manifest_adapter_deploy_cmd, Some("spin cloud deploy"));
+        assert!(ctx.cloud_target);
         assert_eq!(ctx.runtime_config_path, Some(path));
     }
 

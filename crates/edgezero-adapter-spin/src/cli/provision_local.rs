@@ -8,6 +8,7 @@ use std::path::Path;
 
 use edgezero_adapter::env_file::{
     EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, reject_symlinked_target,
+    upsert_lines_with_header,
 };
 use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores, TypedSecretEntry};
 
@@ -115,7 +116,7 @@ pub(super) fn provision(
     // (CONFIG only). Dedup honours operator overrides -- an operator
     // who already uncommented + edited a __KEY line does NOT get the
     // commented placeholder re-added on a subsequent provision.
-    let env_lines = build_env_lines(stores);
+    let (name_lines, comment_lines) = build_env_lines(stores);
 
     if spin_changed && !dry_run {
         fs::write(&spin_path, spin_doc.to_string())
@@ -133,20 +134,31 @@ pub(super) fn provision(
     // reported as a write. In dry-run the writer returns `false` (nothing
     // written); the status still describes intent via the change flags,
     // but we treat a would-write as changed so the preview lists the file.
-    let env_written = append_lines_dedup_with_header(
+    // Managed `__NAME` overlay lines go through the CONVERGING upsert so a
+    // reprovision after a platform-name change lands the new value. The
+    // commented `__KEY` placeholders are operator-owned and stay on the
+    // insert-only append path (an uncommented + edited one survives).
+    let name_written = upsert_lines_with_header(
         &env_path,
         Some(EDGEZERO_PROVISION_HEADER),
-        &env_lines,
+        &name_lines,
         dry_run,
     )
     .map_err(|err| format!("write {}: {err}", env_path.display()))?;
-    // On a real run, trust the writer's verdict. On dry-run the writer
-    // reports `false` unconditionally, so fall back to "have candidates"
+    let comment_written = append_lines_dedup_with_header(
+        &env_path,
+        Some(EDGEZERO_PROVISION_HEADER),
+        &comment_lines,
+        dry_run,
+    )
+    .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+    // On a real run, trust the writers' verdicts. On dry-run the writers
+    // report `false` unconditionally, so fall back to "have candidates"
     // for the preview.
     let env_changed = if dry_run {
-        !env_lines.is_empty()
+        !name_lines.is_empty() || !comment_lines.is_empty()
     } else {
-        env_written
+        name_written || comment_written
     };
 
     let status_lines = build_provision_status_lines(
@@ -692,8 +704,12 @@ fn normalise_runtime_config_header(serialised: String) -> String {
 /// commented and uncommented forms normalise to the same key, so an
 /// operator who already uncommented + edited a `__KEY` line survives
 /// a re-run of provision (the commented placeholder is NOT re-added).
-fn build_env_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
+///
+/// Returns `(name_lines, comment_lines)`: the `__NAME` overlay lines
+/// (converging upsert path) and the commented `__KEY` placeholders
+/// (operator-owned, insert-only append path) split apart.
+fn build_env_lines(stores: &ProvisionStores<'_>) -> (Vec<String>, Vec<String>) {
+    let mut name_lines: Vec<String> = Vec::new();
     for (kind, kind_stores) in [
         ("KV", stores.kv),
         ("CONFIG", stores.config),
@@ -702,19 +718,20 @@ fn build_env_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
         for store in kind_stores {
             let logical_upper = store.logical.to_ascii_uppercase();
             let platform = &store.platform;
-            lines.push(format!(
+            name_lines.push(format!(
                 "EDGEZERO__STORES__{kind}__{logical_upper}__NAME={platform}"
             ));
         }
     }
+    let mut comment_lines: Vec<String> = Vec::new();
     for store in stores.config {
         let logical_upper = store.logical.to_ascii_uppercase();
         let logical = &store.logical;
-        lines.push(format!(
+        comment_lines.push(format!(
             "# EDGEZERO__STORES__CONFIG__{logical_upper}__KEY={logical}_staging"
         ));
     }
-    lines
+    (name_lines, comment_lines)
 }
 
 #[cfg(test)]
@@ -1534,6 +1551,74 @@ mod tests {
         assert_eq!(
             key_lines, 1,
             "exactly one __KEY line after dedup: {env_after}"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_env_converges_changed_platform_name() {
+        // Operator changes a store's platform NAME (app_config ->
+        // prod_config) and REPROVISIONS. The `__NAME` overlay line in
+        // `.env` must CONVERGE to the new value with no stale
+        // `=app_config` line lingering, while an operator-added sibling
+        // line survives.
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        let env_path = dir.path().join(".env");
+
+        // First provision with platform `app_config`.
+        let first_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "app_config")];
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &ProvisionStores {
+                    config: &first_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first local provision succeeds");
+        // Operator hand-adds a sibling secret line.
+        let first = fs::read_to_string(&env_path).expect("read .env");
+        fs::write(&env_path, format!("{first}OPERATOR_SECRET=keepme\n"))
+            .expect("append operator line");
+
+        // Reprovision with the platform renamed to `prod_config`.
+        let second_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &ProvisionStores {
+                    config: &second_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("reprovision succeeds");
+
+        let after = fs::read_to_string(&env_path).expect("read .env");
+        assert!(
+            after.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config"),
+            "reprovision must converge the __NAME value to prod_config: {after}"
+        );
+        assert!(
+            !after
+                .lines()
+                .any(|line| line == "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config"),
+            "no stale =app_config __NAME line may linger: {after}"
+        );
+        assert!(
+            after.contains("OPERATOR_SECRET=keepme"),
+            "operator-added sibling line must survive: {after}"
         );
     }
 

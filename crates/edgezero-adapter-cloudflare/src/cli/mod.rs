@@ -38,10 +38,21 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &["cloudflare"],
     },
     commands: CommandTemplates {
-        build: "wrangler build --cwd {crate_dir}",
-        deploy: "wrangler deploy --cwd {crate_dir}",
-        serve: "wrangler dev --cwd {crate_dir}",
-        emit_commands: true,
+        // Omit the `[adapters.cloudflare.commands]` shell block. A static
+        // shell override (a) bakes `--cwd <crate_dir>` at scaffold time, so a
+        // custom `[adapters.cloudflare.adapter].manifest` like
+        // `config/prod.toml` is ignored (wrangler loads the default
+        // `wrangler.toml` instead); and (b) `wrangler build` is not a valid
+        // Wrangler v4 command AND would need `build/worker/shim.mjs`, which
+        // nothing generates. With no block, build/serve/deploy route through
+        // the registry adapter, which passes `--config <manifest>` and lets
+        // `wrangler deploy`/`dev` run the `[build]` `worker-build` command the
+        // synthesised `wrangler.toml` declares (generating the shim). These
+        // strings are unused while `emit_commands` is false; kept for parity.
+        build: "wrangler deploy --dry-run --config {manifest}",
+        deploy: "wrangler deploy --config {manifest}",
+        serve: "wrangler dev --config {manifest}",
+        emit_commands: false,
     },
     logging: LoggingDefaults {
         endpoint: None,
@@ -220,22 +231,44 @@ impl Adapter for CloudflareCliAdapter {
     /// SAME `.dev.vars` that `provision_local` seeds with generated
     /// `EDGEZERO__*` runtime-config lines (store `__NAME` / `__KEY` overlays,
     /// plus `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*`), and both batches
-    /// share one `append_lines_dedup_with_header` pass. A typed secret whose
-    /// key falls anywhere in that reserved `EDGEZERO__` namespace would
-    /// collide with runtime config and resolve to configuration data instead
-    /// of the credential. Reject the collision here, in preflight, before any
-    /// write.
+    /// share one `append_lines_dedup_with_header` pass. Reject any key that
+    /// cannot round-trip through the `.dev.vars` `KEY=VALUE` format — an empty
+    /// key, or one containing `=`, a newline/carriage-return, leading/trailing
+    /// whitespace, or a leading `#` — because such a line would corrupt the
+    /// file or parse back as a different key/value. Also reject keys anywhere
+    /// in the reserved `EDGEZERO__` namespace: a secret there would collide
+    /// with runtime config and resolve to configuration data instead of the
+    /// credential. All checks run here, in preflight, before any write.
     fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
         const RESERVED_PREFIX: &str = "EDGEZERO__";
         for entry in entries {
-            if entry
-                .key_value
-                .to_ascii_uppercase()
-                .starts_with(RESERVED_PREFIX)
-            {
+            let key = entry.key_value;
+            let reason = if key.is_empty() {
+                Some("is empty")
+            } else if key.contains('=') {
+                Some("contains `=`")
+            } else if key.contains('\n') || key.contains('\r') {
+                Some("contains a newline")
+            } else if key.trim() != key {
+                Some("has leading or trailing whitespace")
+            } else if key.starts_with('#') {
+                Some("starts with `#`, which `.dev.vars` readers treat as a comment")
+            } else if key.to_ascii_uppercase().starts_with(RESERVED_PREFIX) {
+                Some(
+                    "is in the reserved `EDGEZERO__` namespace used for runtime configuration \
+                     (store overlays, `EDGEZERO__ADAPTER__*`, `EDGEZERO__LOGGING__*`, ...) in \
+                     `.dev.vars`; a secret there would collide with config and resolve to \
+                     configuration data instead of the credential",
+                )
+            } else {
+                None
+            };
+            if let Some(rejection) = reason {
                 return Err(format!(
-                    "cloudflare: typed secret key `{}` is reserved: the `{RESERVED_PREFIX}` namespace is used for runtime configuration in `.dev.vars` (store overlays, `EDGEZERO__ADAPTER__*`, `EDGEZERO__LOGGING__*`, ...), so a secret there would collide with config and resolve to configuration data instead of the credential. Rename the secret.",
-                    entry.key_value
+                    "cloudflare: typed secret key `{key}` (field `{field}`) {rejection}; cloudflare \
+                     writes typed secrets as `<key>=\"\"` lines in `.dev.vars`, and this key cannot \
+                     round-trip through that format. Rename the key on the `#[secret]` field.",
+                    field = entry.field_name,
                 ));
             }
         }
@@ -584,6 +617,28 @@ mod tests {
         CloudflareCliAdapter
             .validate_typed_secrets(&entries)
             .expect("an ordinary secret key must pass preflight");
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_keys_that_cannot_round_trip() {
+        // Each key would corrupt the `.dev.vars` `<key>=""` line or parse
+        // back as a different key/value: empty, `=`, `#`-prefixed, an
+        // embedded newline, and leading/trailing whitespace.
+        for bad in [
+            "",
+            "partner=token",
+            "#commented",
+            "with\nnewline",
+            " padded",
+            "padded ",
+        ] {
+            let entries = [TypedSecretEntry::new(TEST_SECRET_ID, "field", bad)];
+            CloudflareCliAdapter
+                .validate_typed_secrets(&entries)
+                .expect_err(
+                    "a key that cannot round-trip through a .dev.vars line must be rejected",
+                );
+        }
     }
 
     #[test]

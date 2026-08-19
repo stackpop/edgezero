@@ -30,10 +30,9 @@
 //! accepts MULTIPLE pairs in one invocation — so a 1000-entry batch
 //! is one shellout, not 1000.
 //!
-//! Auto-detection: the dispatcher activates this writer when the
-//! manifest's `[adapters.spin.commands].deploy` shells to `spin
-//! deploy` or `spin cloud deploy` (operator intent: this app deploys
-//! to Fermyon Cloud) AND the operator did NOT pass `--local`.
+//! Selection: the dispatcher activates this writer when the manifest sets
+//! `[adapters.spin.adapter].cloud = true` (the SOLE cloud selector -- no
+//! deploy-command heuristic) AND the operator did NOT pass `--local`.
 
 use std::io;
 use std::mem;
@@ -47,29 +46,14 @@ use edgezero_adapter::registry::AdapterPushContext;
 /// 256 KiB. Stay well under the floor so a long argv doesn't `E2BIG`.
 const MAX_ARGV_BYTES_PER_INVOCATION: usize = 96 * 1024;
 
-/// Detect whether the spin adapter's deploy command targets Fermyon
-/// Cloud. Looks for `spin deploy` or `spin cloud deploy` as a substring
-/// of the configured command. Substring match (not equality) so a
-/// pre-deploy hook like `cd dist && spin deploy --provider …` still
-/// trips it.
-#[must_use]
-pub(crate) fn deploy_command_targets_fermyon_cloud(deploy_cmd: Option<&str>) -> bool {
-    let Some(cmd) = deploy_cmd else {
-        return false;
-    };
-    cmd.contains("spin cloud deploy") || cmd.contains("spin deploy")
-}
-
-/// Whether a `config push`/`diff` should target Fermyon Cloud. Prefers the
-/// EXPLICIT `[adapters.spin.adapter].cloud = true` flag (the hard-cutoff
-/// manifest omits the `[adapters.spin.commands]` block, so the deploy-command
-/// heuristic can no longer fire on generated projects), falling back to the
-/// legacy deploy-command sniff for hand-written manifests that still carry a
-/// `commands.deploy`.
+/// Whether a `config push`/`diff` should target Fermyon Cloud. The EXPLICIT
+/// `[adapters.spin.adapter].cloud = true` flag is the SOLE selector -- there
+/// is no deploy-command heuristic and no backward-compatibility fallback, so
+/// `config push` and `config diff` agree, and a project only reaches Fermyon
+/// Cloud when it opts in explicitly.
 #[must_use]
 pub(crate) fn push_targets_fermyon_cloud(push_ctx: &AdapterPushContext<'_>) -> bool {
     push_ctx.cloud_target
-        || deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)
 }
 
 /// Build the `key=value` argv strings for one chunk. Each entry's
@@ -279,53 +263,15 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     #[test]
-    fn detect_fermyon_cloud_from_spin_deploy() {
-        assert!(deploy_command_targets_fermyon_cloud(Some("spin deploy")));
-        assert!(deploy_command_targets_fermyon_cloud(Some(
-            "spin deploy --from crates/foo"
-        )));
-        assert!(deploy_command_targets_fermyon_cloud(Some(
-            "cd dist && spin deploy"
-        )));
-    }
-
-    #[test]
-    fn detect_fermyon_cloud_from_spin_cloud_deploy() {
-        assert!(deploy_command_targets_fermyon_cloud(Some(
-            "spin cloud deploy"
-        )));
-    }
-
-    #[test]
-    fn non_cloud_deploy_commands_are_not_detected() {
-        assert!(!deploy_command_targets_fermyon_cloud(Some("echo no-op")));
-        assert!(!deploy_command_targets_fermyon_cloud(Some(
-            "kubectl apply -f spin.yaml"
-        )));
-        // Sanity: just having "spin" or "deploy" alone doesn't count.
-        assert!(!deploy_command_targets_fermyon_cloud(Some("spin build")));
-        assert!(!deploy_command_targets_fermyon_cloud(Some("./deploy.sh")));
-    }
-
-    #[test]
-    fn missing_deploy_command_returns_false() {
-        assert!(!deploy_command_targets_fermyon_cloud(None));
-    }
-
-    #[test]
-    fn push_targets_cloud_via_explicit_flag_without_commands_block() {
-        // The hard-cutoff manifest omits `[adapters.spin.commands]`, so the
-        // deploy-command heuristic can't fire. The explicit
-        // `[adapters.spin.adapter].cloud = true` flag must still route to
-        // cloud; unset must stay local; and a legacy `commands.deploy` sniff
-        // must still work for hand-written manifests.
+    fn cloud_is_selected_only_by_the_explicit_flag() {
+        // `[adapters.spin.adapter].cloud = true` is the SOLE cloud selector:
+        // set routes to Fermyon Cloud, unset stays local. There is no
+        // deploy-command heuristic and no backward-compatibility fallback, so
+        // `config push` and `config diff` can never disagree.
         assert!(push_targets_fermyon_cloud(
             &AdapterPushContext::new().with_cloud_target(true)
         ));
         assert!(!push_targets_fermyon_cloud(&AdapterPushContext::new()));
-        assert!(push_targets_fermyon_cloud(
-            &AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin cloud deploy")
-        ));
     }
 
     // ---------- argv shape ----------
@@ -728,7 +674,7 @@ exit {exit}
         )
         .expect("write spin.toml");
         let mut ctx = AdapterPushContext::new();
-        ctx.manifest_adapter_deploy_cmd = Some("spin deploy");
+        ctx.cloud_target = true;
         let result = SpinCliAdapter
             .read_config_entry(
                 dir.path(),

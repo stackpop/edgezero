@@ -224,9 +224,10 @@ blob model needs the typed `AppConfig<C>`.) Resolution order:
    `unknown key_value_stores label <name>` and the file you just
    wrote is unreadable from the running app, so the dispatcher
    refuses the push and tells you exactly which stanza to add.
-2. **Manifest's `deploy` command targets Fermyon Cloud** (auto-detected
-   from `[adapters.spin.commands].deploy` containing `spin deploy` or
-   `spin cloud deploy`): one batched shellout per ≤96 KiB chunk of
+2. **`[adapters.spin.adapter].cloud = true`** — the SOLE Fermyon Cloud
+   selector (there is no deploy-command heuristic, and `config push` and
+   `config diff` read the same flag, so they never disagree): one batched
+   shellout per ≤96 KiB chunk of
    `spin cloud key-value set --app <APP> --label <LABEL>
 KEY=VALUE [KEY=VALUE …]`. `<APP>` comes from
    `[application].name` in `spin.toml`; `<LABEL>` is the env-resolved

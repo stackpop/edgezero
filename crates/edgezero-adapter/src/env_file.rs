@@ -163,6 +163,138 @@ pub fn append_lines_dedup_with_header(
     Ok(true)
 }
 
+/// Upsert each managed `<key>=<value>` line into `path`, CONVERGING an
+/// existing file to the managed values instead of skipping keys that
+/// already appear.
+///
+/// For every managed line whose normalised key matches an EXISTING line
+/// in the file, the existing line's value is replaced in place (first
+/// occurrence wins; any later duplicate of that same key is dropped).
+/// A managed key that is absent is appended. Every operator-authored
+/// line -- other keys, comment-only lines, blanks -- is preserved
+/// verbatim and in order. Within `managed_lines`, a later line sharing a
+/// key with an earlier one is ignored (the FIRST is authoritative,
+/// matching [`append_lines_dedup_with_header`]'s within-batch dedup).
+///
+/// Unlike [`append_lines_dedup_with_header`], which is insert-only by
+/// key, this is used for the provision-generated `__NAME` overlay lines
+/// so that reprovisioning after an operator changes a store's platform
+/// name lands the new value rather than retaining the stale one.
+///
+/// Returns `Ok(true)` when the file content actually changed and
+/// `Ok(false)` on a no-op (content already current, or `dry_run`). Like
+/// the append fn, a no-op still repairs an existing file's mode to 0600.
+///
+/// # Errors
+/// Same as [`append_lines_dedup_with_header`].
+#[inline]
+pub fn upsert_lines_with_header(
+    path: &Path,
+    header: Option<&str>,
+    managed_lines: &[String],
+    dry_run: bool,
+) -> Result<bool, String> {
+    reject_symlinked_target(path)?;
+    let mut existing = String::new();
+    if path.exists() {
+        existing =
+            fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    }
+
+    // Ordered managed set, first-wins per normalised key. Reject embedded
+    // newlines/carriage-returns for the same env-injection reason the
+    // append path does.
+    let mut managed: Vec<(String, &str)> = Vec::with_capacity(managed_lines.len());
+    let mut managed_keys: BTreeSet<String> = BTreeSet::new();
+    for line in managed_lines {
+        if line.contains('\n') || line.contains('\r') {
+            return Err(format!(
+                "refusing to write line-oriented entry with embedded newline/carriage-return to {} -- \
+                 an env-var value with `\\n` or `\\r` would split into multiple lines and let a \
+                 downstream reader see an unintended KEY=VALUE injection",
+                path.display()
+            ));
+        }
+        let Some(key) = normalised_key(line) else {
+            continue;
+        };
+        if managed_keys.insert(key.clone()) {
+            managed.push((key, line.as_str()));
+        }
+    }
+
+    // Rebuild the file: replace the FIRST existing occurrence of each
+    // managed key with its managed line, drop later duplicates of that
+    // key, and pass every other line (operator keys, comments, blanks)
+    // through verbatim and in order.
+    let mut consumed: BTreeSet<String> = BTreeSet::new();
+    let mut out_lines: Vec<&str> = Vec::new();
+    for line in existing.lines() {
+        match normalised_key(line) {
+            Some(key) if managed_keys.contains(&key) => {
+                if consumed.insert(key.clone()) {
+                    let replacement = managed
+                        .iter()
+                        .find(|(managed_key, _)| *managed_key == key)
+                        .map_or(line, |(_, managed_line)| *managed_line);
+                    out_lines.push(replacement);
+                }
+                // A later duplicate of an already-consumed managed key:
+                // drop it so the file converges to a single entry.
+            }
+            _ => out_lines.push(line),
+        }
+    }
+    // Append managed keys that never appeared in the file, in order.
+    for (key, line) in &managed {
+        if !consumed.contains(key) {
+            out_lines.push(line);
+        }
+    }
+
+    // Header decision mirrors the append fn: prepend only when the caller
+    // asked for one AND no trimmed-equal line already exists.
+    let header_needed = header.filter(|hdr| {
+        let trimmed_hdr = hdr.trim();
+        !existing.lines().any(|line| line.trim() == trimmed_hdr)
+    });
+
+    let mut combined = String::new();
+    if let Some(hdr) = header_needed {
+        combined.push_str(hdr);
+        if !hdr.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+    for line in &out_lines {
+        combined.push_str(line);
+        combined.push('\n');
+    }
+
+    // `dry_run` previews only: never touch the file or its mode.
+    if dry_run {
+        return Ok(false);
+    }
+    // Content already current: no write, but still repair a loose mode on
+    // an existing file (symmetric with the append fn). Report `false`.
+    if combined == existing {
+        #[cfg(unix)]
+        if path.exists() {
+            set_restrictive_mode(path)?;
+        }
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+    fs::write(path, &combined).map_err(|err| format!("write {}: {err}", path.display()))?;
+    #[cfg(unix)]
+    set_restrictive_mode(path)?;
+    Ok(true)
+}
+
 /// Reject a target whose final component is a symlink, before a
 /// provision/push write follows it.
 ///
@@ -633,6 +765,147 @@ mod tests {
             .filter(|line| line.trim() == "# edgezero-provision: v1")
             .count();
         assert_eq!(header_count, 1, "trim-equality must dedup: {after}");
+    }
+
+    #[test]
+    fn upsert_replaces_existing_value_appends_missing_and_preserves_operator_lines() {
+        // Upsert must CONVERGE: rewrite the value of a managed key that
+        // already exists, append a managed key that is absent, and leave
+        // operator-authored lines (other keys, comments, blanks) intact
+        // and in order.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(
+            &path,
+            "# operator note\nEDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config\n\nOPERATOR_SECRET=keepme\n",
+        )
+        .unwrap();
+        let changed = upsert_lines_with_header(
+            &path,
+            None,
+            &[
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config".to_owned(),
+                "EDGEZERO__STORES__KV__SESSIONS__NAME=sessions".to_owned(),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(changed, "a value replacement + append must report a write");
+        let after = fs::read_to_string(&path).unwrap();
+        // Managed value converged to the new platform name.
+        assert!(
+            after.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config"),
+            "existing managed value replaced: {after}"
+        );
+        assert!(
+            !after.contains("=app_config\n") && !after.ends_with("=app_config"),
+            "stale value must not linger: {after}"
+        );
+        // Absent managed key appended.
+        assert!(
+            after.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=sessions"),
+            "absent managed key appended: {after}"
+        );
+        // Operator lines preserved.
+        assert!(
+            after.contains("# operator note"),
+            "comment preserved: {after}"
+        );
+        assert!(
+            after.contains("OPERATOR_SECRET=keepme"),
+            "operator key preserved: {after}"
+        );
+    }
+
+    #[test]
+    fn upsert_is_a_no_op_when_values_already_current() {
+        // Re-running upsert with the same managed values must not rewrite
+        // the file (returns false), so a converged file is stable.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(
+            &path,
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config\n",
+        )
+        .unwrap();
+        let changed = upsert_lines_with_header(
+            &path,
+            None,
+            &["EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config".to_owned()],
+            false,
+        )
+        .unwrap();
+        assert!(!changed, "unchanged content must report no write");
+    }
+
+    #[test]
+    fn upsert_drops_later_duplicate_of_a_managed_key() {
+        // A file carrying two lines for the same managed key converges to
+        // ONE line at the first position, holding the managed value.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(
+            &path,
+            "EDGEZERO__STORES__KV__SESSIONS__NAME=old_a\nKEEP=me\nEDGEZERO__STORES__KV__SESSIONS__NAME=old_b\n",
+        )
+        .unwrap();
+        upsert_lines_with_header(
+            &path,
+            None,
+            &["EDGEZERO__STORES__KV__SESSIONS__NAME=sessions".to_owned()],
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        let occurrences = after
+            .lines()
+            .filter(|line| {
+                normalised_key(line).as_deref() == Some("EDGEZERO__STORES__KV__SESSIONS__NAME")
+            })
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "duplicate managed-key lines collapse: {after}"
+        );
+        assert!(
+            after.contains("KEEP=me"),
+            "operator line preserved: {after}"
+        );
+        assert!(!after.contains("old_b"), "later duplicate dropped: {after}");
+    }
+
+    #[test]
+    fn upsert_prepends_header_and_creates_file_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested/.env");
+        let changed = upsert_lines_with_header(
+            &path,
+            Some(EDGEZERO_PROVISION_HEADER),
+            &["EDGEZERO__STORES__KV__SESSIONS__NAME=sessions".to_owned()],
+            false,
+        )
+        .unwrap();
+        assert!(changed);
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.starts_with(EDGEZERO_PROVISION_HEADER),
+            "header prepended: {after}"
+        );
+        assert!(after.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=sessions"));
+    }
+
+    #[test]
+    fn upsert_dry_run_does_not_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        upsert_lines_with_header(
+            &path,
+            Some(EDGEZERO_PROVISION_HEADER),
+            &["EDGEZERO__STORES__KV__SESSIONS__NAME=sessions".to_owned()],
+            true,
+        )
+        .unwrap();
+        assert!(!path.exists(), "dry-run must not create the file");
     }
 
     #[test]

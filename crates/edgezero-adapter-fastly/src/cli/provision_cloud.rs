@@ -211,6 +211,9 @@ pub(super) fn provision(
         out.push(line);
     }
 
+    // Populate the runtime store-NAME mappings into `edgezero_runtime_env`.
+    populate_runtime_name_mappings(stores, runtime_env_name, dry_run, &mut out)?;
+
     if out.is_empty() {
         out.push("fastly has no declared stores to provision".to_owned());
     }
@@ -228,6 +231,65 @@ pub(super) fn provision(
     // TRACKED id INTO fastly.toml (the spec-blessed direction); only
     // this reverse auto-capture is removed.
     Ok(ProvisionOutcome::from_status_lines(out))
+}
+
+/// Write the per-store `EDGEZERO__STORES__<KIND>__<LOGICAL_UPPER>__NAME`
+/// mappings the runtime needs into the `edgezero_runtime_env` config store.
+/// The runtime resolves each store's PLATFORM name from these entries (see
+/// `edgezero_runtime_env_from_config_store` in lib.rs), falling back to the
+/// logical id -- so a store whose platform name was OVERRIDDEN away from its
+/// logical id (a rename) is UNREACHABLE at runtime unless the mapping is
+/// written here; creating the store alone is not enough. Only RENAMED stores
+/// (platform != logical) need an entry; the rest resolve via the fallback.
+fn populate_runtime_name_mappings(
+    stores: &ProvisionStores<'_>,
+    runtime_env_name: &str,
+    dry_run: bool,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let renamed: Vec<(&str, String, &str)> = [
+        ("KV", stores.kv),
+        ("CONFIG", stores.config),
+        ("SECRETS", stores.secrets),
+    ]
+    .into_iter()
+    .flat_map(|(kind, ids)| {
+        ids.iter()
+            .filter(|store| store.platform != store.logical)
+            .map(move |store| {
+                (
+                    kind,
+                    store.logical.to_ascii_uppercase(),
+                    store.platform.as_str(),
+                )
+            })
+    })
+    .collect();
+    if renamed.is_empty() {
+        return Ok(());
+    }
+    if dry_run {
+        for (kind, id_upper, platform) in &renamed {
+            out.push(format!(
+                "would set `EDGEZERO__STORES__{kind}__{id_upper}__NAME={platform}` in the `{runtime_env_name}` config store (runtime store-name mapping)"
+            ));
+        }
+        return Ok(());
+    }
+    let store_id = super::push_cloud::resolve_remote_config_store_id(runtime_env_name)?
+        .ok_or_else(|| {
+            format!(
+                "created `{runtime_env_name}` but could not resolve its store id to write the runtime store-name mappings; re-run `edgezero provision --adapter fastly`"
+            )
+        })?;
+    for (kind, id_upper, platform) in &renamed {
+        let key = format!("EDGEZERO__STORES__{kind}__{id_upper}__NAME");
+        super::push_cloud::create_config_store_entry(&store_id, &key, platform)?;
+        out.push(format!(
+            "set `{key}={platform}` in `{runtime_env_name}` (runtime store-name mapping)"
+        ));
+    }
+    Ok(())
 }
 
 /// Shell out to `fastly <kind>-store create --name=<platform-name>`. The

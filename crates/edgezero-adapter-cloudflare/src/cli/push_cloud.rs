@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf, absolute};
 use std::process::Command;
 
+use edgezero_adapter::env_file::reject_symlink_components;
 use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
 
 use super::WRANGLER_INSTALL_HINT;
@@ -197,6 +198,15 @@ pub(super) fn write_entries_local(
             "no config entries to push to local KV namespace `{binding}` (logical id `{logical}`)"
         )]);
     }
+    // Refuse a symlinked `.wrangler` / `.wrangler/state` before shelling out:
+    // wrangler's `--local` push writes Miniflare state under
+    // `.wrangler/state`, and a checked-in symlink at either component would
+    // redirect those writes OUTSIDE the project tree. Walk from the project
+    // dir down so a symlinked intermediate `.wrangler` is caught too;
+    // components that don't exist yet (first push) pass. Only the LOCAL path
+    // needs this -- the remote push writes to Cloudflare, not `.wrangler`.
+    let wrangler_state = project_dir.join(".wrangler").join("state");
+    reject_symlink_components(project_dir, &wrangler_state)?;
     let payload = bulk_payload(entries)?;
     let temp = tempfile::Builder::new()
         .prefix("edgezero-cf-push-local-")
@@ -1092,6 +1102,45 @@ mod tests {
         assert!(
             captured.contains("--config") && captured.contains("cloudflare.prod.toml"),
             "local push must anchor --config at the DECLARED manifest; got argv:\n{captured}"
+        );
+    }
+
+    /// A symlinked `.wrangler` directory (pointing outside the project)
+    /// must be refused BEFORE `wrangler` is ever spawned, so the `--local`
+    /// push can't redirect Miniflare's `.wrangler/state` writes off the
+    /// tree. No fake wrangler is installed here: if the guard were missing,
+    /// the shell-out would fail with a "not found" error instead of the
+    /// symlink refusal this asserts.
+    #[cfg(unix)]
+    #[test]
+    fn local_push_refuses_a_symlinked_wrangler_dir() {
+        use std::os::unix::fs::symlink;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let outside = tempdir().expect("outside tempdir");
+        symlink(outside.path(), project_dir.path().join(".wrangler")).expect("symlink .wrangler");
+
+        let err = CloudflareCliAdapter
+            .push_config_entries_local(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "hello".to_owned())],
+                &AdapterPushContext::new().with_local(true),
+                false,
+            )
+            .expect_err("a symlinked .wrangler must be refused before shelling out");
+        assert!(
+            err.contains("symlink"),
+            "error must name the symlink refusal: {err}"
+        );
+        // The guard must fire before any wrangler shell-out -- the error is
+        // the symlink refusal, not a spawn/exit failure.
+        assert!(
+            !err.contains("wrangler kv bulk put") && !err.contains("not found on PATH"),
+            "refusal must precede the wrangler invocation: {err}"
         );
     }
 

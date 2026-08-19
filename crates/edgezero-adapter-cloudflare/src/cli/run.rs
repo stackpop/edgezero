@@ -246,13 +246,17 @@ pub(super) fn synthesise_wrangler_toml(crate_name: &str) -> String {
     doc.insert("main", value("build/worker/shim.mjs"));
     doc.insert("compatibility_date", value("2024-01-01"));
 
-    // No `[build]` table: the spec's normative Cloudflare baseline
-    // (spec §"Cloudflare (wrangler.toml)") is exactly `name` + `main`
-    // + `compatibility_date`. EdgeZero drives builds through its own
-    // `edgezero build --adapter cloudflare` (which runs `cargo build`
-    // + artifact copy), not bare `wrangler deploy`, so emitting a
-    // `[build]` command exceeded that baseline. Operators who invoke wrangler directly add it by hand;
-    // the merge path preserves it.
+    // `[build] command = "worker-build --release"`: `main` points at
+    // `build/worker/shim.mjs`, the wasm-bindgen glue that ONLY `worker-build`
+    // produces (a plain `cargo build` emits just the raw wasm). Without this
+    // command a fresh scaffold cannot serve or deploy -- `wrangler dev` /
+    // `wrangler deploy` load `main` but nothing ever creates the shim.
+    // `wrangler` runs this `[build].command` automatically before dev/deploy,
+    // so `edgezero serve` / `edgezero deploy` (which shell out to wrangler
+    // with `--config`) get the shim built for them.
+    let mut build_table = toml_edit::Table::new();
+    build_table.insert("command", value("worker-build --release"));
+    doc.insert("build", toml_edit::Item::Table(build_table));
 
     doc.to_string()
 }
@@ -353,17 +357,20 @@ mod tests {
 
     #[test]
     fn synthesises_wrangler_toml_matches_spec_baseline_exactly() {
-        // Exact-content test: the
-        // synthesised wrangler.toml must equal the spec's normative
-        // Cloudflare baseline byte-for-byte -- no `[build]` table, no
-        // other extras. A loose `contains` check let the baseline
-        // drift above the spec; this pins it.
+        // Exact-content test: the synthesised wrangler.toml must equal the
+        // Cloudflare baseline byte-for-byte. The `[build]` command is REQUIRED
+        // (not an extra): `main` points at the `worker-build`-generated shim,
+        // so without it a fresh scaffold cannot serve or deploy. A loose
+        // `contains` check let the baseline drift; this pins it.
         let out = synthesise_wrangler_toml("demo-adapter-cloudflare");
         let expected = "# edgezero-provision: v1\n\
              name = \"demo-adapter-cloudflare\"\n\
              main = \"build/worker/shim.mjs\"\n\
-             compatibility_date = \"2024-01-01\"\n";
-        assert_eq!(out, expected, "wrangler.toml baseline drifted from spec");
+             compatibility_date = \"2024-01-01\"\n\
+             \n\
+             [build]\n\
+             command = \"worker-build --release\"\n";
+        assert_eq!(out, expected, "wrangler.toml baseline drifted");
     }
 
     #[test]

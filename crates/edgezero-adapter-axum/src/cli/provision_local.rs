@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
+use edgezero_adapter::env_file::{
+    EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, upsert_lines_with_header,
+};
 use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores};
 
 /// Local-mode `provision` arm.
@@ -36,18 +38,30 @@ pub(super) fn provision(
             .map_err(|err| format!("create {}: {err}", dot_edgezero.display()))?;
     }
     let env_path = dot_edgezero.join(".env");
-    let env_lines = build_axum_env_lines(stores);
+    let (name_lines, comment_lines) = build_axum_env_lines(stores);
+    // Managed `__NAME` overlay lines go through the CONVERGING upsert so a
+    // reprovision after a platform-name change lands the new value instead
+    // of retaining the stale one. The commented `__KEY` placeholders are
+    // operator-owned and stay on the insert-only append path so an
+    // operator who uncommented + edited one is never clobbered.
+    upsert_lines_with_header(
+        &env_path,
+        Some(EDGEZERO_PROVISION_HEADER),
+        &name_lines,
+        dry_run,
+    )
+    .map_err(|err| format!("write {}: {err}", env_path.display()))?;
     append_lines_dedup_with_header(
         &env_path,
         Some(EDGEZERO_PROVISION_HEADER),
-        &env_lines,
+        &comment_lines,
         dry_run,
     )
     .map_err(|err| format!("write {}: {err}", env_path.display()))?;
     let status_lines = vec![format!(
-        "axum: ensured {} + appended {} lines to {}",
+        "axum: ensured {} + wrote {} lines to {}",
         dot_edgezero.display(),
-        env_lines.len(),
+        name_lines.len().saturating_add(comment_lines.len()),
         env_path.display()
     )];
     Ok(ProvisionOutcome::from_status_lines(status_lines))
@@ -66,8 +80,12 @@ pub(super) fn provision(
 /// override. Env-var VALUE uses the PLATFORM name so the runtime
 /// resolves the same backend the rest of the toolchain (Cloudflare,
 /// Fastly, Spin, and here the Axum local file store) points at.
-fn build_axum_env_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
+///
+/// Returns `(name_lines, comment_lines)`: the `__NAME` overlay lines
+/// (converging upsert path) and the commented `__KEY` placeholders
+/// (operator-owned, insert-only append path) split apart.
+fn build_axum_env_lines(stores: &ProvisionStores<'_>) -> (Vec<String>, Vec<String>) {
+    let mut name_lines: Vec<String> = Vec::new();
     for (kind, kind_stores) in [
         ("KV", stores.kv),
         ("CONFIG", stores.config),
@@ -76,19 +94,20 @@ fn build_axum_env_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
         for store in kind_stores {
             let logical_upper = store.logical.to_ascii_uppercase();
             let platform = &store.platform;
-            lines.push(format!(
+            name_lines.push(format!(
                 "EDGEZERO__STORES__{kind}__{logical_upper}__NAME={platform}"
             ));
         }
     }
+    let mut comment_lines: Vec<String> = Vec::new();
     for store in stores.config {
         let logical_upper = store.logical.to_ascii_uppercase();
         let logical = &store.logical;
-        lines.push(format!(
+        comment_lines.push(format!(
             "# EDGEZERO__STORES__CONFIG__{logical_upper}__KEY={logical}_staging"
         ));
     }
-    lines
+    (name_lines, comment_lines)
 }
 
 #[cfg(test)]
@@ -590,6 +609,73 @@ mod tests {
         assert!(
             env.contains("# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging"),
             "commented __KEY placeholder present for CONFIG only: {env}"
+        );
+    }
+
+    #[test]
+    fn re_provision_converges_changed_platform_name() {
+        // Operator changes a store's platform NAME (app_config ->
+        // prod_config) and REPROVISIONS. The `__NAME` overlay line must
+        // CONVERGE to the new value -- no stale `=app_config` line may
+        // linger -- while an operator-added sibling line survives.
+        let dir = tempdir().unwrap();
+        let dot_edgezero = dir.path().join(".edgezero");
+        fs::create_dir_all(&dot_edgezero).unwrap();
+        let env_path = dot_edgezero.join(".env");
+
+        // First provision with platform `app_config`.
+        let first_ids = vec![ResolvedStoreId::new("app_config", "app_config")];
+        AxumCliAdapter
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &ProvisionStores {
+                    config: &first_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        // Operator hand-adds a sibling secret line.
+        let first = fs::read_to_string(&env_path).unwrap();
+        fs::write(&env_path, format!("{first}OPERATOR_SECRET=keepme\n")).unwrap();
+
+        // Reprovision with the platform renamed to `prod_config`.
+        let second_ids = vec![ResolvedStoreId::new("app_config", "prod_config")];
+        AxumCliAdapter
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &ProvisionStores {
+                    config: &second_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+
+        let after = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            after.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config"),
+            "reprovision must converge the __NAME value to prod_config: {after}"
+        );
+        assert!(
+            !after
+                .lines()
+                .any(|line| line == "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config"),
+            "no stale =app_config __NAME line may linger: {after}"
+        );
+        assert!(
+            after.contains("OPERATOR_SECRET=keepme"),
+            "operator-added sibling line must survive the reprovision: {after}"
         );
     }
 

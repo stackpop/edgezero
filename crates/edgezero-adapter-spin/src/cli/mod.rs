@@ -52,7 +52,7 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         // pinned `--target-dir`. These strings are unused while
         // `emit_commands` is false; kept for parity with the other blueprints.
         build: "cargo build --target wasm32-wasip2 --release --target-dir target -p {crate}",
-        deploy: "spin deploy --from {manifest}",
+        deploy: "spin cloud deploy --from {manifest}",
         serve: "spin up --from {manifest} --runtime-config-file {manifest_dir}/runtime-config.toml",
         emit_commands: false,
     },

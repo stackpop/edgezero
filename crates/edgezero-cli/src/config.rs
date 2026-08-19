@@ -429,10 +429,8 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
         .unwrap_or_else(|| Path::new("."));
     let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
     let component_selector = adapter_cfg.adapter.component.clone();
-    let mut push_ctx = adapter_registry::AdapterPushContext::new();
-    if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
-        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
-    }
+    let push_ctx = adapter_registry::AdapterPushContext::new()
+        .with_cloud_target(adapter_cfg.adapter.cloud.unwrap_or(false));
 
     // A dry-run reports and deletes nothing. It is the DEFAULT (no `--yes`), and
     // `--dry-run` states that intent explicitly (clap makes the two mutually
@@ -780,28 +778,28 @@ where
         .filter(|pp| !pp.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let manifest_data = ctx.manifest();
-    let (adapter_manifest_path, component_selector, deploy_cmd) =
+    let (adapter_manifest_path, component_selector, cloud_target) =
         if let Some((_canonical, adapter_cfg)) = manifest_data.adapter_entry(&args.adapter) {
             (
                 adapter_cfg.adapter.manifest.clone(),
                 adapter_cfg.adapter.component.clone(),
-                adapter_cfg.commands.deploy.clone(),
+                adapter_cfg.adapter.cloud.unwrap_or(false),
             )
         } else {
-            (None, None, None)
+            (None, None, false)
         };
     let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(args.local);
     if let Some(path) = args.runtime_config.as_deref() {
         push_ctx = push_ctx.with_runtime_config_path(path);
     }
-    // Thread the manifest's deploy command, exactly as `resolve_push_paths`
-    // does for push. Without it the Spin adapter's remote read can't tell a
-    // Fermyon Cloud config apart from local, and `config diff` would read
-    // local SQLite as if it were remote state -- producing a false diff or
-    // false "no changes" instead of the Cloud-unsupported signal.
-    if let Some(cmd) = deploy_cmd.as_deref() {
-        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(cmd);
-    }
+    // Thread the explicit `[adapters.spin.adapter].cloud` flag, exactly as
+    // `resolve_push_paths` does for push. Without it the Spin adapter's remote
+    // read can't tell a Fermyon Cloud config apart from local, and `config
+    // diff` would read local SQLite as if it were remote state -- producing a
+    // false diff or false "no changes" instead of the Cloud-unsupported
+    // signal. `cloud = true` is the SOLE cloud selector (no deploy-command
+    // heuristic).
+    push_ctx = push_ctx.with_cloud_target(cloud_target);
     let paths = PushPathRefs {
         manifest_root,
         adapter_manifest_path: adapter_manifest_path.as_deref(),
@@ -1312,9 +1310,6 @@ fn resolve_push_paths(ctx: &PushContext) -> Result<ResolvedPushPaths<'_>, String
     let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(resolved.local);
     if let Some(path) = resolved.runtime_config_path.as_deref() {
         push_ctx = push_ctx.with_runtime_config_path(path);
-    }
-    if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
-        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
     }
     push_ctx = push_ctx.with_cloud_target(adapter_cfg.adapter.cloud.unwrap_or(false));
     let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
@@ -4791,6 +4786,7 @@ ids = ["default"]
     /// Manifest fixture for the 8.3 tests: Spin adapter with a Fermyon
     /// Cloud deploy command so `read_config_entry` returns `Unsupported`.
     fn spin_cloud_manifest() -> String {
+        // `cloud = true` is the SOLE Fermyon Cloud selector.
         r#"
 [app]
 name = "demo-app"
@@ -4798,11 +4794,7 @@ name = "demo-app"
 [adapters.spin.adapter]
 crate = "crates/demo-spin"
 manifest = "spin.toml"
-
-[adapters.spin.commands]
-build = "echo"
-deploy = "spin deploy"
-serve = "echo"
+cloud = true
 
 [stores.config]
 ids = ["app_config"]

@@ -240,6 +240,18 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
             // created KV namespaces) against what the team already has
             // committed, rather than blindly overwriting it -- the
             // writeback below `insert`s whatever the adapter returns.
+            //
+            // Durability preflight: cloud provision MUTATES the account
+            // (creates real resources) and records their ids in
+            // `edgezero.toml` only AFTERWARDS. If that writeback then fails
+            // on a read-only manifest, the resource is created but UNTRACKED
+            // -- an orphan the operator must clean up by hand. Prove the
+            // manifest is writable BEFORE any account mutation, so an
+            // unwritable manifest aborts first. Only when a writeback will
+            // actually happen (real run + the adapter tracks deployed ids).
+            if !dry_run && !adapter.deployed_fields().is_empty() {
+                assert_manifest_writable(&args.manifest)?;
+            }
             let dispatch = DispatchContext {
                 adapter,
                 adapter_cfg,
@@ -918,6 +930,28 @@ fn get_or_insert_table_like<'parent>(
         })
 }
 
+/// Prove the manifest can be opened for writing BEFORE a cloud provision
+/// mutates the account. `merge_deployed_into_manifest` records created
+/// resource ids here with a truncating `fs::write` AFTER the account
+/// mutation; opening the file `O_WRONLY` (without truncating) is a faithful
+/// proxy for that write succeeding, so a read-only manifest / directory is
+/// caught while nothing has been created yet.
+fn assert_manifest_writable(manifest_path: &Path) -> Result<(), String> {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(manifest_path)
+        .map(drop)
+        .map_err(|err| {
+            format!(
+                "manifest {} is not writable ({err}); cloud provision records the ids of resources \
+                 it creates back into this file, so an unwritable manifest would leave a created \
+                 remote resource UNTRACKED. Fix the manifest (or its directory) permissions and \
+                 re-run.",
+                manifest_path.display()
+            )
+        })
+}
+
 pub(crate) fn merge_deployed_into_manifest(
     manifest_path: &Path,
     adapter_name: &str,
@@ -1269,7 +1303,20 @@ pub(crate) fn render_dry_run_report(
             continue;
         }
         let new = fs::read_to_string(staged_path).unwrap_or_default();
-        let old = fs::read_to_string(proj_path).unwrap_or_default();
+        // Do NOT follow a symlinked project file. The real provision writer
+        // rejects a symlinked `.env` / `.dev.vars` target, so following the
+        // link HERE would read (and render into the dry-run diff) the content
+        // of whatever it points at -- e.g. `~/.aws/credentials`. Treat a
+        // symlinked source as empty so the preview shows the staged content as
+        // added, never the external target's bytes.
+        let old = if proj_path
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            String::new()
+        } else {
+            fs::read_to_string(proj_path).unwrap_or_default()
+        };
         if old == new {
             // Content is identical, but a PERMISSION-only repair (e.g.
             // tightening a 0644 secret-carriage file to 0600) is still a
@@ -1597,6 +1644,25 @@ where
     let tempdir = tempfile::TempDir::new()
         .map_err(|err| format!("failed to create staging tempdir: {err}"))?;
     let staged_root = tempdir.path();
+
+    // The staging tempdir MUST NOT live INSIDE the project tree. `TempDir`
+    // honours `TMPDIR`; when that points into a `crate = "."` project,
+    // `staged_root` becomes a DESCENDANT of `project_root`, and the crate copy
+    // below (`src_crate == project_root`) then recurses into its own
+    // destination -- an unbounded self-copy that fills the disk. Refuse with
+    // guidance instead.
+    let project_canon =
+        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let staged_canon = fs::canonicalize(staged_root).unwrap_or_else(|_| staged_root.to_path_buf());
+    if staged_canon.starts_with(&project_canon) {
+        return Err(format!(
+            "staging tempdir {} is inside the project tree {} -- `TMPDIR` points into the \
+             project, so a dry-run would recursively copy the project into its own descendant. \
+             Set `TMPDIR` to a directory OUTSIDE the project and re-run.",
+            staged_canon.display(),
+            project_canon.display()
+        ));
+    }
 
     // Copy `edgezero.toml` (read-only input). Symlinking would be
     // tempting as an optimisation, but for the default
@@ -2738,6 +2804,47 @@ ids = ["default"]
         // Staged copies existed during body execution:
         assert!(staged_root.is_absolute());
         assert!(staged_crate.starts_with(&staged_root));
+    }
+
+    #[test]
+    fn run_with_staging_refuses_a_tempdir_inside_the_project() {
+        // When TMPDIR points into a `crate = "."` project, the staging tempdir
+        // would be a DESCENDANT of the project, so copying the crate (== the
+        // project) into it recurses without bound. It must be refused.
+        use edgezero_core::test_env::{EnvOverride, env_lock};
+        let _lock = env_lock().lock().expect("env lock");
+        let project = tempfile::TempDir::new().unwrap();
+        fs::write(project.path().join("edgezero.toml"), "x").unwrap();
+        let inside = project.path().join("inside-tmp");
+        fs::create_dir_all(&inside).unwrap();
+        let _tmp = EnvOverride::set("TMPDIR", &inside);
+        let err = run_with_staging(project.path(), Path::new("."), |_root, _crate| Ok(()))
+            .expect_err("a staging tempdir inside the project must be refused");
+        assert!(
+            err.contains("inside the project tree"),
+            "error explains the containment failure: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assert_manifest_writable_rejects_a_read_only_manifest() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest = dir.path().join("edgezero.toml");
+        fs::write(&manifest, "x").unwrap();
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o444)).unwrap();
+        let result = assert_manifest_writable(&manifest);
+        // Restore write so the tempdir can be cleaned up regardless.
+        drop(fs::set_permissions(
+            &manifest,
+            fs::Permissions::from_mode(0o644),
+        ));
+        let err = result.expect_err("a read-only manifest must be refused before account mutation");
+        assert!(
+            err.contains("not writable") && err.contains("UNTRACKED"),
+            "error explains the orphan-resource risk: {err}"
+        );
     }
 
     #[test]

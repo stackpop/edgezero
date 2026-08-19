@@ -428,7 +428,11 @@ where
 ///    `--stdin` reads the value from stdin instead — keeps value
 ///    bytes out of argv and lifts the size cap to whatever the OS
 ///    pipe buffer + the CLI's read accept (megabytes in practice).
-fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(), String> {
+pub(super) fn create_config_store_entry(
+    store_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
     let mut child = Command::new("fastly")

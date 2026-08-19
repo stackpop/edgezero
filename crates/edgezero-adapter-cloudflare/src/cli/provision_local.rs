@@ -2,7 +2,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
+use edgezero_adapter::env_file::{
+    EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header, upsert_lines_with_header,
+};
 use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
 
 use super::provision_cloud::is_real_namespace_id;
@@ -321,17 +323,28 @@ pub(super) fn provision(
         .parent()
         .unwrap_or(manifest_root)
         .join(".dev.vars");
-    let dev_vars_lines = build_dev_vars_lines(stores);
+    let (name_lines, comment_lines) = build_dev_vars_lines(stores);
+    // Managed `__NAME` overlay lines go through the CONVERGING upsert so a
+    // reprovision after a platform-name change lands the new value. The
+    // commented `__KEY` placeholders are operator-owned and stay on the
+    // insert-only append path (an uncommented + edited one survives).
+    upsert_lines_with_header(
+        &dev_vars_path,
+        Some(EDGEZERO_PROVISION_HEADER),
+        &name_lines,
+        dry_run,
+    )
+    .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
     append_lines_dedup_with_header(
         &dev_vars_path,
         Some(EDGEZERO_PROVISION_HEADER),
-        &dev_vars_lines,
+        &comment_lines,
         dry_run,
     )
     .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
     status_lines.push(format!(
         "cloudflare: wrote {} .dev.vars entries to {}",
-        dev_vars_lines.len(),
+        name_lines.len().saturating_add(comment_lines.len()),
         dev_vars_path.display()
     ));
 
@@ -351,8 +364,12 @@ pub(super) fn provision(
 /// commented and uncommented forms normalise to the same key, an
 /// operator who already uncommented + edited a KEY line survives a
 /// re-run of provision — the commented placeholder is not re-added.
-fn build_dev_vars_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
+///
+/// Returns `(name_lines, comment_lines)`: the `__NAME` overlay lines
+/// (converging upsert path) and the commented `__KEY` placeholders
+/// (operator-owned, insert-only append path) split apart.
+fn build_dev_vars_lines(stores: &ProvisionStores<'_>) -> (Vec<String>, Vec<String>) {
+    let mut name_lines: Vec<String> = Vec::new();
     for (kind, kind_stores) in [
         ("KV", stores.kv),
         ("CONFIG", stores.config),
@@ -361,19 +378,20 @@ fn build_dev_vars_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
         for store in kind_stores {
             let logical_upper = store.logical.to_ascii_uppercase();
             let platform = &store.platform;
-            lines.push(format!(
+            name_lines.push(format!(
                 r#"EDGEZERO__STORES__{kind}__{logical_upper}__NAME="{platform}""#
             ));
         }
     }
+    let mut comment_lines: Vec<String> = Vec::new();
     for store in stores.config {
         let logical_upper = store.logical.to_ascii_uppercase();
         let logical = &store.logical;
-        lines.push(format!(
+        comment_lines.push(format!(
             r#"# EDGEZERO__STORES__CONFIG__{logical_upper}__KEY="{logical}_staging""#
         ));
     }
-    lines
+    (name_lines, comment_lines)
 }
 
 /// In-memory upsert of a single `[[kv_namespaces]]` entry inside
@@ -1163,6 +1181,76 @@ mod tests {
         assert_eq!(
             key_lines, 1,
             "exactly one KEY line remains after dedup: {dev_vars}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_dev_vars_converges_changed_platform_name() {
+        // Operator changes a store's platform NAME (app_config ->
+        // prod_config) and REPROVISIONS. The `__NAME` overlay line must
+        // CONVERGE to the new value with no stale `="app_config"` line
+        // lingering, while an operator-added sibling line survives.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let dev_vars_path = dir.path().join(".dev.vars");
+
+        // First provision with platform `app_config`.
+        let first_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "app_config")];
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ProvisionStores {
+                    config: &first_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first local provision succeeds");
+        // Operator hand-adds a sibling secret line.
+        let first = fs::read_to_string(&dev_vars_path).expect("read .dev.vars");
+        fs::write(
+            &dev_vars_path,
+            format!("{first}OPERATOR_SECRET=\"keepme\"\n"),
+        )
+        .expect("append operator line");
+
+        // Reprovision with the platform renamed to `prod_config`.
+        let second_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ProvisionStores {
+                    config: &second_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("reprovision succeeds");
+
+        let after = fs::read_to_string(&dev_vars_path).expect("read .dev.vars");
+        assert!(
+            after.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME="prod_config""#),
+            "reprovision must converge the __NAME value to prod_config: {after}"
+        );
+        assert!(
+            !after
+                .lines()
+                .any(|line| line == r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME="app_config""#),
+            "no stale =app_config __NAME line may linger: {after}"
+        );
+        assert!(
+            after.contains(r#"OPERATOR_SECRET="keepme""#),
+            "operator-added sibling line must survive: {after}"
         );
     }
 

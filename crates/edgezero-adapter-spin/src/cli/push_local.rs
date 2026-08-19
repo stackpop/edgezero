@@ -1245,7 +1245,7 @@ mod tests {
 
         let push_ctx = AdapterPushContext::new()
             .with_local(true)
-            .with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+            .with_cloud_target(true);
         let out = dispatch_push(
             dir.path(),
             Some("spin.toml"),
@@ -1297,8 +1297,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         write_minimal_spin_toml(dir.path()); // [application].name = "x"
 
-        let push_ctx =
-            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let push_ctx = AdapterPushContext::new().with_cloud_target(true);
         let out = dispatch_push(
             dir.path(),
             Some("spin.toml"),
@@ -1343,8 +1342,7 @@ mod tests {
         )
         .expect("write malformed runtime-config");
 
-        let push_ctx =
-            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let push_ctx = AdapterPushContext::new().with_cloud_target(true);
         let out = dispatch_push(
             dir.path(),
             Some("spin.toml"),
@@ -1373,8 +1371,7 @@ mod tests {
         write_minimal_spin_toml(dir.path());
         let bad = vec![("svc=timeout".to_owned(), "1500".to_owned())];
 
-        let push_ctx =
-            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let push_ctx = AdapterPushContext::new().with_cloud_target(true);
         let err = dispatch_push(
             dir.path(),
             Some("spin.toml"),
@@ -1406,8 +1403,7 @@ mod tests {
         )
         .expect("write spin.toml");
 
-        let push_ctx =
-            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let push_ctx = AdapterPushContext::new().with_cloud_target(true);
         let err = dispatch_push(
             dir.path(),
             Some("spin.toml"),
@@ -2037,7 +2033,7 @@ mod tests {
         ctx.local = true;
         // Even though Fermyon Cloud auto-detect would fire via deploy_cmd,
         // local flag must win.
-        ctx.manifest_adapter_deploy_cmd = Some("spin deploy");
+        ctx.cloud_target = true;
         let result = SpinCliAdapter
             .read_config_entry(
                 dir.path(),

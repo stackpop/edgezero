@@ -328,7 +328,23 @@ fn merge_runtime_env_keys(
         contents_tbl.iter().map(|(key, _)| key.to_owned()).collect();
     let mut added = false;
     for (key, platform) in managed_keys {
-        if !contents_tbl.contains_key(key) {
+        // CONVERGE the managed `__NAME` mapping: when the key already
+        // exists but its platform value changed (an operator renamed the
+        // store's platform NAME and reprovisioned), rewrite the value IN
+        // PLACE preserving decor -- the commented `__KEY` hints are
+        // stashed as a suffix on the last value's decor, so cloning it
+        // onto the replacement keeps them. An absent key is inserted.
+        if let Some(existing) = contents_tbl
+            .get_mut(key)
+            .and_then(toml_edit::Item::as_value_mut)
+        {
+            if existing.as_str() != Some(platform.as_str()) {
+                let mut replacement = toml_edit::Value::from(platform.as_str());
+                *replacement.decor_mut() = existing.decor().clone();
+                *existing = replacement;
+                added = true;
+            }
+        } else {
             contents_tbl.insert(key, value(platform.as_str()));
             added = true;
         }
@@ -597,16 +613,40 @@ pub(super) fn assert_local_config_store_provisioned(
             format!("failed to read {}: {err}", path.display())
         }
     })?;
-    let doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-    doc.get("local_server")
+    // REDACT the parse error: a `toml_edit` parse failure can quote the
+    // offending stored VALUE (an operator secret), so a dry-run that surfaced
+    // it verbatim would leak what the real writer (which redacts the same
+    // failure) never does.
+    let doc: DocumentMut = raw.parse().map_err(|_err| {
+        format!(
+            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
+            path.display()
+        )
+    })?;
+    let store_tbl = doc
+        .get("local_server")
         .and_then(Item::as_table)
         .and_then(|tbl| tbl.get("config_stores"))
         .and_then(Item::as_table)
         .and_then(|tbl| tbl.get(platform_name))
         .and_then(Item::as_table)
-        .and_then(|tbl| tbl.get("contents"))
+        .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
+    // Model the real writer's inline-toml requirement. `ensure_inline_toml_format`
+    // REJECTS a store whose `format` is not `inline-toml` (an external-file
+    // store it must not rewrite); a dry-run that ignored the format would
+    // preview a push the real run refuses.
+    if let Some(other) = store_tbl.get("format").and_then(Item::as_str)
+        && other != "inline-toml"
+    {
+        return Err(format!(
+            "refusing to push: `local_server.config_stores.{platform_name}` uses `format = \
+             \"{other}\"` (an external-file store), which is incompatible with the inline \
+             `contents` this command writes. Migrate the store to `format = \"inline-toml\"` (or a \
+             fresh store id) yourself, then re-run."
+        ));
+    }
+    store_tbl
+        .get("contents")
         .and_then(Item::as_table)
         .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
     Ok(())
@@ -852,6 +892,42 @@ mod tests {
     // store ids the fastly adapter operates on, not arbitrary strings.
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
+
+    #[test]
+    fn dry_run_preflight_rejects_a_non_inline_toml_store() {
+        // The real writer (`ensure_inline_toml_format`) refuses an
+        // external-file store; the dry-run preflight must MODEL that refusal
+        // so a dry-run never previews a push the real run rejects.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "name = \"demo\"\n[local_server.config_stores.app_config]\nformat = \"json\"\nfile = \"cfg.json\"\n",
+        )
+        .expect("write fastly.toml");
+        let err = assert_local_config_store_provisioned(&path, "app_config")
+            .expect_err("a non-inline-toml store must be rejected in preflight");
+        assert!(
+            err.contains("format = \"json\"") && err.contains("inline-toml"),
+            "error models the inline-toml requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn dry_run_preflight_redacts_a_malformed_manifest_parse_error() {
+        // A TOML parse error can quote a stored secret value; the preflight
+        // must redact it (the real writer does).
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "this is not = = valid toml with SECRET_abc123 in it")
+            .expect("write fastly.toml");
+        let err = assert_local_config_store_provisioned(&path, "app_config")
+            .expect_err("a malformed manifest must be rejected");
+        assert!(
+            err.contains("details redacted") && !err.contains("SECRET_abc123"),
+            "parse error must be redacted, never quoting stored content: {err}"
+        );
+    }
 
     /// A shell script named `fastly` that exits non-zero and prints an
     /// unambiguous diagnostic to stderr — installed on `$PATH` to
@@ -1173,6 +1249,92 @@ mod tests {
             after_second
                 .contains(r#"# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging""#),
             "additive provision must emit the __KEY hint for the newly-added CONFIG store: {after_second}"
+        );
+    }
+
+    /// Regression: an operator changes a store's platform NAME
+    /// (`app_config` -> `prod_config`) and REPROVISIONS. The managed
+    /// `__NAME` mapping in the `edgezero_runtime_env` block must
+    /// CONVERGE to the new value -- the prior insert-only merge retained
+    /// the stale `= "app_config"` while the manifest binding moved on.
+    /// An operator-added sibling key in the same contents table must
+    /// survive.
+    #[test]
+    fn fastly_local_provision_converges_changed_platform_name_in_runtime_env() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+
+        // First provision with platform `app_config`.
+        let first_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "app_config")];
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ProvisionStores {
+                    config: &first_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first provision succeeds");
+
+        // Operator hand-adds a sibling key into the runtime-env contents.
+        let after_first = fs::read_to_string(&path).expect("read");
+        assert!(
+            after_first.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME = "app_config""#),
+            "first provision seeds the __NAME mapping: {after_first}"
+        );
+        let mut doc: toml_edit::DocumentMut = after_first.parse().expect("parse");
+        doc["local_server"]["config_stores"]["edgezero_runtime_env"]["contents"]["OPERATOR_EXTRA"] =
+            toml_edit::value("keepme");
+        fs::write(&path, doc.to_string()).expect("write operator edit");
+
+        // Reprovision with the platform renamed to `prod_config`.
+        let second_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ProvisionStores {
+                    config: &second_ids,
+                    kv: &[],
+                    secrets: &[],
+                },
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("reprovision succeeds");
+
+        let after = fs::read_to_string(&path).expect("read");
+        let reparsed: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        let contents =
+            reparsed["local_server"]["config_stores"]["edgezero_runtime_env"]["contents"]
+                .as_table()
+                .expect("runtime-env contents table");
+        assert_eq!(
+            contents
+                .get("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME")
+                .and_then(toml_edit::Item::as_str),
+            Some("prod_config"),
+            "reprovision must converge the __NAME value to prod_config: {after}"
+        );
+        assert!(
+            !after.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME = "app_config""#),
+            "no stale = \"app_config\" __NAME entry may linger: {after}"
+        );
+        assert_eq!(
+            contents
+                .get("OPERATOR_EXTRA")
+                .and_then(toml_edit::Item::as_str),
+            Some("keepme"),
+            "operator-added sibling key must survive the reprovision: {after}"
         );
     }
 
