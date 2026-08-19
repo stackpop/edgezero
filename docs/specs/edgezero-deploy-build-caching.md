@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions — Build Caching Spec
 
-**Status:** Design (proposed) — v6.7
+**Status:** Design (proposed) — v6.8
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md` (the deploy-actions spec),
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -15,17 +15,15 @@ builds its CLI). Caching must work for that **cross-repository deployer** topolo
 
 ## 2. Trust model
 
-- **The build compiles trusted code** (the deploy target), so `build.rs` is already trusted;
-  caching does not widen the boundary.
+- **The build compiles trusted code** (the deploy target), so `build.rs` is already trusted.
 - **The runtime credential is trusted, not hidden.** The runner injects
-  `ACTIONS_RUNTIME_TOKEN` into the job's Node actions regardless, so "skip rust-cache ⇒ no
-  cache token" is false and removed. The boundary is: the cached workflow runs **only for
-  authorized deployer events/refs (fail before compiling otherwise)**, and there the runtime
-  credential is explicitly trusted.
-- **The deployer owns and writes its repo-scoped cache**, so the cross-repository build warms.
+  `ACTIONS_RUNTIME_TOKEN` into the job's Node actions regardless, so caching runs **only for
+  authorized deployer events/refs (fail before compiling otherwise)**, where the runtime
+  credential **and the narrow app-checkout PAT** are explicitly trusted (a trusted `build.rs`
+  could read either; both are in the trusted boundary, and the PAT is kept `contents: read`).
+- **The deployer owns and writes its repo-scoped cache.**
 
-A reusable workflow (`on: workflow_call`) owns the build job; a composite cannot keep later
-caller steps (or the provider token) out of the job.
+A reusable workflow (`on: workflow_call`) owns the build job.
 
 ```
 job build  = uses: stackpop/edgezero/.github/workflows/build-app-cli.yml@<ref>
@@ -34,56 +32,66 @@ job deploy = (provider secrets) download artifact → deploy-fastly / lifecycle
 
 ## 3. Design
 
-### 3.1 Reusable-workflow public contract
+### 3.1 Reusable-workflow contract
 
-`inputs`: `app-repository` (default: caller repo), `app-ref` (required full SHA when
-`app-repository` set), `working-directory` (default `.`), **`workspace-root`** (static path
-of the Cargo workspace root relative to the checkout, so `workspace-id` is known without a
-runtime Cargo discovery), `app-cli-package` (required), `app-cli-bin` (default: package
-name), `rust-toolchain` (default `auto`), `app-cli-artifact` (default `edgezero-cli`),
-`cache` (default `false`), `cache-key-suffix`, `timeout-minutes`. **No `runs-on`** (fixed,
-§3.8). **`persist-credentials: false` normative.**
+| Input               | Type    | Req.             | Default        | Meaning                                                                                         |
+| ------------------- | ------- | ---------------- | -------------- | ----------------------------------------------------------------------------------------------- |
+| `app-repository`    | string  | no               | caller repo    | `owner/repo` of the app.                                                                        |
+| `app-ref`           | string  | if repo          | —              | Full commit SHA (required when `app-repository` is set).                                        |
+| `working-directory` | string  | no               | `.`            | Compile cwd; must resolve **beneath** `workspace-root`.                                         |
+| `workspace-root`    | string  | **yes** (cache)  | —              | Cargo workspace root, relative to the checkout (§3.3).                                          |
+| `app-cli-package`   | string  | yes              | —              | Cargo package.                                                                                  |
+| `app-cli-bin`       | string  | no               | package name   | Binary target.                                                                                  |
+| `rust-toolchain`    | string  | no               | `auto`         | Toolchain or `auto`.                                                                            |
+| `app-cli-artifact`  | string  | **yes** (matrix) | `edgezero-cli` | Artifact name; **must be unique per matrix leg** (the default is only safe for a single build). |
+| `cache`             | boolean | no               | `false`        | Enable caching.                                                                                 |
+| `cache-key-suffix`  | string  | no               | `""`           | Namespaces the cache.                                                                           |
+| `timeout-minutes`   | number  | no               | (set by wf)    | Job timeout.                                                                                    |
 
-**Normative job permissions.** The reusable workflow declares, at the job level,
-**`permissions: { contents: read }`** — which forces `id-token` and every unspecified scope
-to `none` regardless of what the caller granted (a caller granting `id-token: write` is
-tested to still yield `none` in the build job). No OIDC.
+Secret: `app-checkout-token` (narrow `contents: read` PAT; required for a private
+`app-repository`, else fail closed).
 
-`secrets`: `app-checkout-token` (optional narrow `contents: read` PAT for a private app;
-private `app-repository` without it fails closed).
+| Output                    | Meaning                                                         |
+| ------------------------- | --------------------------------------------------------------- |
+| `app-cli-artifact`        | Uploaded artifact name.                                         |
+| `app-cli-bin`             | Binary name.                                                    |
+| `app-cli-package`         | Package name.                                                   |
+| `app-cli-version`         | **Informational** crate version (NOT validated identity, §3.7). |
+| `app-cli-source-revision` | Built revision.                                                 |
+| `app-cli-workspace-id`    | Static id from `app-repository` + `workspace-root`.             |
+| `app-cli-platform-id`     | Static id (§3.8): image label + **ImageVersion** + baseline.    |
 
-`outputs` (single CLI per call): `app-cli-artifact`, `app-cli-bin`, `app-cli-package`,
-**`app-cli-version`**, `app-cli-source-revision`, `app-cli-workspace-id`, `app-cli-platform-id`.
-`workspace-id` (from `app-repository` + `workspace-root`) and `platform-id` (the fixed image
-label + forced CPU baseline, §3.8) are **static, deterministic** — a matrix consumer computes
-its own from static inputs; it never reads them from the artifact. Runtime **producer ABI
-metadata** (image version, glibc, ELF needs, §3.8) is separate and lives only in provenance.
-**Matrix handoff never uses the shared workflow outputs** (GitHub keeps only the last leg's).
+`workspace-id`/`platform-id` are **static, deterministic**, so a matrix consumer computes
+its own from static inputs; it never reads them from the artifact. **Matrix handoff never
+uses the shared workflow outputs** (GitHub keeps only the last leg's).
+
+**Permissions.** The reusable workflow declares job-level **`permissions: { contents: read }`**
+(forcing `id-token`/all others to `none`; a caller granting `id-token: write` is tested to
+still yield `none`). A called workflow can only **reduce** caller permissions, so the caller
+must grant **at least** `contents: read` — documented as a caller prerequisite.
+**`persist-credentials: false` is normative** (Git-persistence only, not same-UID isolation).
 
 ### 3.2 Self-composite reference
 
-Via **`$/.github/actions/build-app-cli`** (self-repo, commit-aligned) with a **narrow
-pin-gate exemption** for `$/.github/actions/...` and a **targeted actionlint suppression**.
+Via **`$/.github/actions/build-app-cli`** with a narrow pin-gate exemption for
+`$/.github/actions/...` and a targeted actionlint suppression.
 
-### 3.3 Internal lifecycle boundary
+### 3.3 Workspace root, cwd, and Git identity
 
-```
-authorize writer (§3.5 — fail before compile if unauthorized)
-  → prepare (resolve/install toolchain; RUSTUP_TOOLCHAIN; host triple; identities;
-             config/source policy §3.6; validated dirs)
-  → cargo metadata --locked preflight (§3.5)
-  → validate + reset the stable target (§3.4)
-  → rust-cache restore  → verify Cargo.lock byte-identical (§3.5)
-  → compile + stage + upload (single owner; MUST NOT reset the restored target)
-```
+`workspace-root` (required under `cache: true`) is **canonicalized and confined beneath the
+app Git root**; `working-directory` must resolve **beneath** it; and it is asserted **exactly
+equal to `cargo metadata --format-version=1 .workspace_root`** (fail closed on any mismatch),
+so the key, cleanup target, and provenance describe the workspace Cargo actually builds.
+`app-repo`/Git root are the **canonical `git rev-parse --show-toplevel`** from
+`working-directory` (defined for both producers, including nested checkouts).
 
-The public `build-app-cli` composite keeps its uncached behavior but is **upgraded to emit
-`workspace-id` + `platform-id`** so provenance is producer-agnostic; it gains no `cache` input.
+### 3.4 Stable, deterministic paths
 
-### 3.4 Stable target
-
-Stable path **outside** the per-invocation workspace; **reset before every restore, and
-NEVER after**; path + key scoped by app-repo + workspace identity.
+`CARGO_HOME` and `CARGO_TARGET_DIR` are **deterministic, identity-scoped stable paths outside
+the per-invocation workspace**, exported **unchanged from preflight through post-save** (a
+per-invocation path would enter rust-cache's env/path hash and defeat warm restores; deleting
+before the post hook would break save). The target is **reset before every restore and NEVER
+after**; dependency artifacts survive post-save cleanup.
 
 ### 3.5 rust-cache pin, key, writer authorization, metadata guards
 
@@ -95,174 +103,183 @@ Pin gate requires a **40-hex SHA specifically for `Swatinem/rust-cache`**.
 
 - `cache-bin: false`; `cache-workspace-crates: false`.
 - **`prefix-key` = `edgezero-build-app-cli-v1-<tuple-hash>`**, `tuple-hash` = SHA-256 of a
-  **canonical length-prefixed tuple** of: `app-repo-id`, `workspace-id`, `app-cli-package`,
-  `app-cli-bin`, workspace-root `Cargo.toml` content hash (keys virtual-root
-  `[profile]`/`[patch]`/`[workspace]` changes), **`platform-id`** (static), and the bounded
-  `cache-key-suffix`. (Runtime ABI metadata is **not** in the key.)
-- `workspaces:` maps the canonical workspace root (from `workspace-root`) to the stable
-  target (relative path). **`RUSTUP_TOOLCHAIN`** exported for restore, compile, post-save.
+  canonical length-prefixed tuple of: `app-repo-id`, `workspace-id`, `app-cli-package`,
+  `app-cli-bin`, workspace-root `Cargo.toml` content hash, **`platform-id` (image label +
+  `ImageVersion` + `x86-64` baseline)**, and the bounded `cache-key-suffix`. Including
+  `ImageVersion` means a weekly image rollout starts a fresh cache (accepted cost) rather than
+  restoring objects built against different system libraries.
+- `workspaces:` maps the canonical workspace root to the stable target (relative path).
+  `RUSTUP_TOOLCHAIN` exported for restore, compile, post-save.
 
-**Writer authorization — fail before compiling.** Caching runs only when the event is
-`push`, `workflow_dispatch`, or `schedule` on a **protected/trusted deployer ref** (a
-`workflow_dispatch` on an arbitrary user-selected branch is **not** authorized — the ref must
-be protected) **and** the checkout `HEAD` **==** the resolved app SHA. Anything else —
-including a fork PR to the deployer — **does not run the cached workflow** (fails before
-compilation). For authorized contexts the runtime credential is explicitly trusted.
+**Writer authorization — fail before compiling.** Caching runs only when the event is `push`,
+`workflow_dispatch`, or `schedule` on a **protected deployer ref** **and** `HEAD == resolved
+app SHA`. A `workflow_dispatch` on an unprotected/user-selected branch, a fork PR, or any
+other context **does not run the cached workflow**.
 
-**Metadata guards (bounding rust-cache's bare `cargo metadata`).** rust-cache runs bare
-`cargo metadata` both before restore (membership) and in its post hook, swallowing failures.
-The workflow therefore runs a **`cargo metadata --locked` preflight** that must succeed
-(fail closed) and **verifies `Cargo.lock` is byte-identical after restore** (fail closed on
-mutation). The parent's "all Cargo commands `--locked`" is scoped to our invocations; the
-rust-cache bare-metadata exception affects only keying and is bounded by these guards.
+**Metadata guards.** A **`cargo metadata --locked` preflight** must succeed (fail closed), and
+**`Cargo.lock` is verified byte-identical after restore** (fail closed), bounding rust-cache's
+swallowed bare-`metadata` (which runs before restore and in the post hook). The parent's
+"all Cargo commands `--locked`" is scoped to our invocations.
 
-**Empty-save residual (accepted):** stock rust-cache can publish an empty immutable entry on
-a post-hook metadata failure that an exact hit never repairs — recover by rotating
-`cache-key-suffix`; no "no empty save" guarantee. Owned/forked save = §7.
+**Empty-save residual (accepted):** a post-hook metadata failure can publish an empty
+immutable entry — recover via `cache-key-suffix` rotation; owned/forked save = §7.
 
-### 3.6 Cargo execution, target, config, and source closure
+### 3.6 Cargo config/source closure and codegen baseline
 
-- **Preserve the current `working-directory` cwd** for the compile.
-- **Isolated `CARGO_HOME`** (action-owned) so runner-global config (wrappers/mirrors) does
-  not silently affect a cached build.
-- **Fail closed (complete policy)** under `cache: true` if the **effective in-tree Cargo
-  configuration** — the full precedence chain from cwd up to the workspace root, including
-  **extensionless `config`, ancestor files, and recursive `include`s** — sets any
-  codegen-affecting or source-affecting key rust-cache does not hash: a `rustc-wrapper`/
-  `rustc-workspace-wrapper`, a `target.*.runner`/linker override, **source replacement/
-  mirrors**, a `[patch]` outside the root manifest, or `include` directives. Plain registry/
-  net config is fine.
-- **Reject external path dependencies** (fail closed) whose canonical source is **outside the
-  workspace root** — not only out-of-root workspace **members** — because rust-cache strips
-  their path from manifests, omits source-less packages from the lock hash, and keeps them as
-  deps. v1 requires all sources beneath the workspace root.
-- **Implicit host-target only** (reject `build.target`/`CARGO_BUILD_TARGET`); **forced CPU
-  baseline** (reject `RUSTFLAGS`/`target-cpu`/`target-feature`/`CFLAGS`/`CXXFLAGS` that deviate
-  from the `x86-64` baseline); **confined build dirs** (`CARGO_TARGET_DIR` + `build.build-dir`
-  to the owned root, Cargo ≥ 1.91).
-- Executable = the single JSON `compiler-artifact` (matched `package_id`, binary `target.name`,
-  `target.kind` ⊇ `bin`, non-null `executable`) after `build-finished`.
+- **Isolated deterministic `CARGO_HOME`** (§3.4).
+- **Full-chain config closure with a SAFE-KEY ALLOWLIST.** Cargo reads `config`/`config.toml`
+  from the invocation dir up through **every filesystem parent to `/`** plus `CARGO_HOME`
+  (in the cross-repo layout, deployer-owned config **above** the app workspace is effective).
+  Under `cache: true` the effective config is scanned over that full chain and **fails closed
+  unless every present key is on an explicit safe allowlist** (registries, source registry
+  URLs, `net.*`, `http.*` retry/timeout). Anything else — `[env]`, `build.rustc`/`rustc-wrapper`/
+  `rustc-workspace-wrapper`, `build.rustflags`, `[target.<triple>]` rustflags/runner/linker,
+  `[profile.*]` overrides, `paths`, source replacement/mirrors, `include` — **fails closed**.
+- **Reject external path dependencies** whose canonical source is outside the workspace root.
+- **Reject every incoming Rust-flag channel** (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`,
+  `CARGO_BUILD_RUSTFLAGS`, target-qualified rustflags, `[build.rustflags]`) and **inject one
+  canonical baseline**; reject `build.target`/`CARGO_BUILD_TARGET` (implicit host only) and
+  raised `target-cpu`/`target-feature`. **Native/assembly portability** (a `build.rs` invoking
+  a C compiler with its own `-march`) is an **application responsibility**, bounded by the
+  same-image requirement (§3.8), not hermetically sandboxed in v1.
+- **Confined build dirs** (`CARGO_TARGET_DIR` + `build.build-dir` to the owned root; Cargo ≥
+  1.91). Executable = the single JSON `compiler-artifact` after `build-finished`.
 
-### 3.7 Provenance and public APIs
+### 3.7 Source cleanliness, provenance, and public actions
 
-`app-cli-meta.json` (both producers) carries a **schema version** and `app-repo`,
-`source-revision`, `app-cli-package`, `app-cli-bin`, **`app-cli-version`**, `workspace-id`,
-`platform-id`, and **runtime ABI metadata** (image version, glibc version, the ELF's
-`DT_NEEDED` list + required glibc symbol versions, §3.8) — from the actual checkout/build.
+**Cleanliness.** A canonical Git root is required and source is asserted **clean — tracked,
+untracked, and recursive submodules — BEFORE and AFTER all app-controlled commands** (a
+`build.rs` can mutate source after an initial check); dirty at either point fails closed.
 
-**`validate-app-cli-provenance` action** — inputs: **exactly one** artifact tar + the
-**required** expected `app-repo`, `source-revision`, `app-cli-package`, `app-cli-bin`,
-`app-cli-version`, `workspace-id`, `platform-id`. It **owns extraction**: a fresh
-action-owned root, the tar's **unique expected members only** (the binary +
-`app-cli-meta.json`), **no traversal/symlinks/special files**, then a strict-schema parse
-(reject unknown schema), compares **every** expected field (never defaulting from the
-artifact), and returns a **canonical regular executable path confined beneath the owned
-root**. No CLI execution. Every consumer calls it before any downloaded CLI runs (incl.
-`--help`) and before credentials.
+**Provenance.** `app-cli-meta.json` (both producers) carries a schema version and `app-repo`,
+`source-revision`, `app-cli-package`, `app-cli-bin`, `app-cli-version` (informational),
+`workspace-id`, `platform-id`, plus **runtime ABI metadata** (§3.8). Identity **validated** by
+consumers is `app-repo`, `source-revision`, `app-cli-package`, `app-cli-bin`, `workspace-id`,
+`platform-id` — **not** `app-cli-version` (runtime-derived; not an externally-known handoff
+identity).
 
-**`active-version-fastly` action** — inputs: the tar + full expected identity + `service-id`
+**`validate-app-cli-provenance` action**
 
-- token; runs `validate-app-cli-provenance`, then the validated CLI's `active-version`;
-  output `version` (**empty on first-ever deploy = success**), non-zero on failure. Recovery
-  calls this action (replacing the manual extract-and-run).
+| Input                      | Req. | Meaning                               |
+| -------------------------- | ---- | ------------------------------------- |
+| `artifact-tar`             | yes  | Path to **exactly one** artifact tar. |
+| `expected-app-repo`        | yes  | —                                     |
+| `expected-source-revision` | yes  | —                                     |
+| `expected-app-cli-package` | yes  | —                                     |
+| `expected-app-cli-bin`     | yes  | —                                     |
+| `expected-workspace-id`    | yes  | —                                     |
+| `expected-platform-id`     | yes  | —                                     |
 
-Consistency check, not a cryptographic boundary.
+Behavior: extract into a **fresh action-owned root** (unique expected members = the binary +
+`app-cli-meta.json`; reject traversal/symlinks/special files); strict-schema parse (reject
+unknown schema); **recompute the ELF's `DT_NEEDED` + required glibc symbol versions from the
+extracted binary** and check them against the running environment (and the recorded metadata);
+compare every expected field (never defaulting from the artifact); fail closed on any mismatch.
+Output: `app-cli-path` — a canonical regular executable **confined beneath the owned root**. No
+CLI execution.
+
+**`active-version-fastly` action** — inputs: `artifact-tar`, all `expected-*` identity,
+`service-id`, `fastly-api-token`; runs `validate-app-cli-provenance`, then the validated CLI's
+`active-version`; output `version` (**empty on first-ever deploy = success**), non-zero on
+failure. Recovery calls this action.
+
+Every consumer (deploy-fastly, config-push, healthcheck, rollback, recovery) supplies the
+`expected-*` inputs (checkout-backed consumers derive repo/revision/workspace from their
+checkout; checkout-less consumers and matrix legs pass the deterministic values) and validates
+**before any downloaded CLI runs** (incl. `--help`) and before credentials.
 
 ### 3.8 Runner and ABI
 
-- Fixed **literal `ubuntu-24.04`**; verify the runner is **GitHub-hosted** (a hosted-only
-  marker) and `ImageOS`/`ImageVersion` present, else fail closed.
-- **`platform-id`** (static, in key/outputs) = canonical(image label, `x86-64` baseline).
-- **Runtime ABI metadata** (provenance): `ImageVersion`, glibc version, and the produced
-  ELF's `DT_NEEDED` + required glibc symbol versions.
-- **Compatibility guarantee (narrowed, honest).** v1 requires the deploy/lifecycle consumer
-  to run on the **same literal `ubuntu-24.04` image** — so DT_NEEDED libraries, glibc, and CPU
-  are trivially satisfied; the consumer additionally re-checks the recorded ABI metadata as
-  defense in depth and rejects a mismatch **before** the binary reaches a credentialed step.
-  Cross-image / directional compatibility (with real ELF `DT_NEEDED` + symbol-version and CPU
-  analysis for arbitrary consumers) is **§7 future work**.
+- **Cached (reusable-workflow) path:** fixed literal **`ubuntu-24.04`**; verify GitHub-hosted
+  and `ImageOS`/`ImageVersion` present (fail closed). `platform-id` = canonical(image label,
+  **`ImageVersion`**, `x86-64`). **Consumers must run on the same literal image AND the same
+  `ImageVersion`** (exact equality; cross-image directional analysis = §7); the validator's
+  recomputed `DT_NEEDED`/glibc-symver check is the defense-in-depth backstop.
+- **Direct-composite path (unchanged runner support):** the existing composite still supports
+  Linux x86-64 including **ephemeral self-hosted**. It records its **actual runtime
+  environment** (OS/arch/hosted-status/`ImageOS`/`ImageVersion` when hosted, glibc) as its
+  `platform-id`/ABI metadata, and its consumers require an **exact environment match**. The
+  hosted-`ubuntu-24.04` requirement is **cached-path only**; the direct path is a separate ABI
+  policy (no breaking change).
 
-### 3.9 Security — reader/writer trust and cache ownership
+### 3.9 Security preconditions (operator-enforced)
 
-- **Cache ownership = the deployer repository.** Rejecting fork-PR calls to _this_ workflow
-  does **not** stop **another** PR-triggered workflow in the deployer repo from restoring its
-  base-branch caches (GitHub allows fork PRs to read base caches). Therefore **`cache: true`
-  is a hard precondition** that the deployer either **prohibits untrusted-PR workflow
-  execution** or all cached dependency source is **disclosure-safe** (no private deps). The
-  action cannot see other workflows, so this is an operator precondition, stated plainly.
-- **Reader trust.** The cache stores dependency source + `target/` for the whole workspace.
-- **Writer trust.** §3.5 — protected-ref authorized event + `HEAD == resolved SHA`, before
-  compilation; runtime credential explicitly trusted there.
-- **Build-environment identity.** Literal image + `platform-id` (key) + runtime ABI metadata
-  (provenance).
+- **Cache reader trust.** Fork PRs can read the deployer's base-branch caches; another
+  PR-triggered workflow in the deployer repo can restore them. `cache: true` requires the
+  deployer to **prohibit untrusted-PR workflow execution** or that all cached dependency source
+  is **disclosure-safe** (no private deps).
+- **Artifact disclosure (independent of caching).** The compiled CLI artifact belongs to the
+  **deployer** workflow; anyone with read on the deployer repo can download it. A **public
+  deployer building a private app** therefore exposes the private binary even with
+  `cache: false`. The workflow **fails closed** when the app is private (private
+  `app-repository` / a checkout PAT) and the deployer repo is public (repo visibility is
+  queryable), unless the caller explicitly opts into the disclosure.
 
 ## 4. Testing
 
-- **Contract/permissions:** `workflow_call` I/O/secrets incl. `app-cli-version`; a caller
-  granting `id-token: write` still yields `none` in the build job; `$/…` carve-outs;
-  matrix legs compute their own static `workspace-id`/`platform-id`; cross-repo (+PAT) **warm
-  second run**; private fail-closed; `persist-credentials: false`.
-- **Writer authorization:** unauthorized event, unprotected `workflow_dispatch` ref, or
-  `HEAD != resolved SHA` **fails before compilation**; a fork-PR does not run the cached
-  workflow.
-- **Cache lifecycle/key:** **reset before restore; NO reset after**; **dependency artifacts
-  survive post-save cleanup**; canonical tuple distinguishes `(foo-bar,baz)` from
-  `(foo,bar-baz)` and busts on a root-`Cargo.toml` profile mutation with unchanged
-  `Cargo.lock`.
-- **Cargo/config/source:** member-local, extensionless, ancestor, or `include`d config
-  setting a wrapper/runner/source-replacement, an external path dependency, a forced target,
-  and a raised `target-cpu`/`target-feature` all **fail closed**; the `cargo metadata --locked`
-  preflight failing and a post-restore `Cargo.lock` mutation both fail closed; cached-vs-direct
-  member-local-rustflags is a fail-closed case; virtual root supported; Cargo < 1.91 fails
-  closed.
-- **Provenance/ABI/APIs:** `validate-app-cli-provenance` enforces one-tar / owned-root /
-  no-traversal / unique-members / confined-executable and rejects wrong repo/revision/package/
-  bin/version/workspace/platform and unknown schema (incl. same-repo/SHA wrong-package — no
-  self-validation); `active-version-fastly` validates then runs, empty-version = success; a
-  non-`ubuntu-24.04` consumer is rejected before any CLI execution; both producers emit
-  `workspace-id`/`platform-id` (direct, `cache: false`, cached flows).
+- **Contract/permissions:** exact I/O/types (the tables above) before the golden test; a caller
+  granting `id-token: write` yields `none`; a caller granting less than `contents: read` fails;
+  matrix legs compute their own static `workspace-id`/`platform-id` and use **unique** artifact
+  names (a real two-leg handoff); cross-repo (+PAT) warm second run; private fail-closed.
+- **Writer authz:** unauthorized event, unprotected `workflow_dispatch` ref, or `HEAD !=
+resolved SHA` **fails before compilation**; fork-PR does not run cached.
+- **Cache/key:** reset-before / no-reset-after / deps-survive-post; tuple distinguishes
+  `(foo-bar,baz)`/`(foo,bar-baz)`; **`ImageVersion` rollover busts the key**; root-`Cargo.toml`
+  profile mutation with unchanged `Cargo.lock` busts the key.
+- **Workspace/config/source:** `workspace-root` ≠ `cargo metadata.workspace_root` fails; a
+  config **above** the app workspace setting a wrapper/rustflags/env/profile/target-link/source-
+  replacement fails closed (allowlist); external path dep fails; every rustflag channel + raised
+  CPU fails; preflight `--locked` failure and post-restore `Cargo.lock` mutation fail; **dirty
+  source (tracked, untracked, submodule, and build-script mutation) fails before and after**.
+- **Provenance/ABI/APIs:** one-tar/owned-root/no-traversal/confined-executable; recomputed
+  `DT_NEEDED`/symver; rejects wrong repo/revision/package/bin/workspace/platform and unknown
+  schema (incl. same-repo/SHA wrong-package); every consumer validates **before `--help`, CLI
+  execution, and credential exposure**; `active-version-fastly` empty-version = success; a
+  non-`ubuntu-24.04`/older-`ImageVersion` consumer is rejected; both producers emit
+  `workspace-id`/`platform-id`; direct and cached ABI policies.
 
 ## 5. Docs and migration
 
-- Scope the parent's exact-key/target-only caching language to **`deploy-fastly.cache`**;
-  define **`build-app-cli.cache`** as a separate rolling, deployer-owned cache.
-- Correct the guide/adoption-guide claims that consumers own checkout/runner/timeout and the
-  actions never call `checkout`. Document the two-job cross-repository topology, the fixed
-  `ubuntu-24.04`/same-image policy, the `validate-app-cli-provenance` + `active-version-fastly`
-  actions and the composite's new provenance outputs, the protected-ref writer rule, and the
-  §3.9 reader precondition (deployer prohibits untrusted-PR execution or has no private deps).
+- Scope the parent's exact-key/target-only caching language to **`deploy-fastly.cache`**; define
+  **`build-app-cli.cache`** as a separate rolling, deployer-owned cache; and add the parent's
+  **runner and provenance** updates (the reusable workflow owns checkout/runner/timeout; the new
+  provenance outputs and validation/active-version actions; the same-image cached-path policy).
+- Correct the guide/adoption-guide "consumers own checkout/runner/timeout; actions never call
+  `checkout`" claims. Document the three checkout cases (same-repo default token; public
+  cross-repo no token; private cross-repo PAT), the reader/artifact-disclosure preconditions,
+  and the two-job topology.
 - Pin gate/`zizmor`/actionlint: rust-cache SHA + non-SHA regression; `$/` carve-outs.
-- Public-surface golden: exact names/types/defaults for all new inputs/outputs (incl.
-  `workspace-root`, `app-cli-version`, `platform-id`) and both new actions, defined **before**
-  the golden test.
+- Public-surface golden: the tables in §3.1/§3.7 (exact names/types/defaults) and both actions.
 
 ## 6. Default and effect
 
-**Off by default.** With `cache: true` on an authorized deployer build, a warm run restores
-compiled **dependencies** (the bulk of the ~10 min); app + workspace-local crates recompile.
+**Off by default.** With `cache: true` on an authorized deployer build, a warm run (same image
+version) restores compiled **dependencies** (the bulk of the ~10 min); app + workspace-local
+crates recompile.
 
 ## 7. Out of scope / future
 
 - An owned/forked rust-cache **save** that refuses to save on its own metadata failure.
-- **Cross-image / directional** ABI compatibility (real `DT_NEEDED`/symbol-version/CPU
-  analysis) for non-same-image consumers; a self-hosted trust mode with an immutable image.
+- **Cross-image / directional** ABI compatibility (real `DT_NEEDED`/symbol-version/CPU analysis)
+  and hermetic native-build sandboxing; a self-hosted trust mode with an immutable image.
 - `cli-profile`; private-registry/git dependency authentication; non-Fastly adapters.
 
 ## 8. History
 
-… v6.4 (cross-repo deployer owns cache) → v6.5 (decisions) → v6.6 (runtime-token correction,
-canonical-tuple key, composite provenance) → **v6.7**: split static `platform-id`/`workspace-id`
-(+ a static `workspace-root` input) from runtime ABI provenance; complete fail-closed Cargo
-config/source closure (isolated `CARGO_HOME`; reject wrappers/runners/source-replacement/
-includes/ancestors/external-path-deps); `cargo metadata --locked` preflight + post-restore
-`Cargo.lock` identity; normative job `permissions: { contents: read }` (no OIDC, tested);
-narrow ABI to same literal `ubuntu-24.04` with recorded `DT_NEEDED`/glibc-symver; hardened
-validator extraction contract; restore `app-cli-version`; protected-ref `workflow_dispatch`;
-fix the reset-after test.
+… v6.5 (decisions) → v6.6 (runtime-token correction, canonical-tuple key) → v6.7 (static
+platform/workspace ids, config/source closure start, locked-metadata guard, hosted permissions,
+same-image ABI, hardened extraction) → **v6.8**: `ImageVersion` in the key with exact-equality
+consumption and ELF metadata recomputed from the binary; `app-cli-version` demoted to
+informational + unique matrix artifact names; `workspace-root` required/canonical/`==
+cargo metadata.workspace_root`; full-chain (cwd→/) config closure via a **safe-key allowlist**;
+clean source **before and after** incl. submodules; the private-app/public-deployer
+artifact-disclosure precondition; deterministic stable `CARGO_HOME`; reject **all** rustflag
+channels (native/assembly = app responsibility); the direct composite keeps its runner support
+under a separate ABI policy; concrete contract tables; caller-permission and three-checkout-case
+precision.
 
 ## 9. Deferred to the implementation plan (mechanics only)
 
-Exact `prepare`/`compile` interface signatures; the provenance-schema and identity
-canonicalization byte layouts and length bounds; and the exact writer-authorization /
-config-closure predicate expressions. No open **design** decisions remain — string/interface
-mechanics only.
+Exact `prepare`/`compile` interface signatures; the identity/config-closure canonicalization
+byte layouts and the safe-key allowlist's exact key set; and the writer-authorization predicate
+expression. String/interface mechanics only.
