@@ -13,6 +13,8 @@
 ## Global Constraints
 
 - **Rust toolchain baked = `1.95.0`** (verbatim from `.tool-versions`); a build that resolves a different toolchain must fail closed downstream, so this image is the single source of truth.
+- **Full build+deploy runtime baked** (spec §3.7): `1.95.0` + `wasm32-wasip1` + the pinned **Fastly CLI `15.1.0`** (`.tool-versions`) + `git jq tar curl cc` — the container is the deploy runtime, not only the CLI-compile runtime.
+- **Runtime posture:** consumed **read-only root filesystem, non-root user**, explicit writable mounts only (spec §3.7).
 - **Single-manifest `linux/amd64` only** — no multi-arch index (an index digest can select another architecture).
 - **No Python in CI tooling** — Bash + `jq` only.
 - **Pin policy:** every referenced image/action is pinned; the base image is pinned by `sha256` digest, and the published image is recorded by `sha256` digest.
@@ -141,25 +143,39 @@ git commit -m "build-cache container: fail-closed image.json digest-pin validato
 
 ```dockerfile
 # .github/docker/build-app-cli/Dockerfile
-# Single-manifest linux/amd64 build environment for build-app-cli (spec §3.7).
+# Single-manifest linux/amd64 FULL build+deploy runtime (spec §3.7): the pinned
+# Rust toolchain, wasm32-wasip1, the pinned Fastly CLI, and build tools. This
+# image IS the toolchain/ABI identity; it runs read-only/non-root at runtime.
 # Base pinned by digest; replace the digest below with a current
 # rust:1.95.0-bookworm linux/amd64 manifest digest (see README in this dir).
 FROM rust:1.95.0-bookworm@sha256:0000000000000000000000000000000000000000000000000000000000000000
 
-# Tools build-app-cli and its build scripts need. Pin nothing that Cargo keys;
-# this image IS the toolchain/ABI identity.
+# Match .tool-versions: fastly 15.1.0 (spec §3.7, versions.json parity).
+ARG FASTLY_CLI_VERSION=15.1.0
+
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      git jq tar curl ca-certificates; \
-    rm -rf /var/lib/apt/lists/*
+      git jq tar curl ca-certificates build-essential; \
+    rm -rf /var/lib/apt/lists/*; \
+    rustup target add wasm32-wasip1; \
+    curl -fsSL -o /tmp/fastly.tar.gz \
+      "https://github.com/fastly/cli/releases/download/v${FASTLY_CLI_VERSION}/fastly_${FASTLY_CLI_VERSION}_linux_amd64.tar.gz"; \
+    tar -xzf /tmp/fastly.tar.gz -C /usr/local/bin fastly; \
+    rm /tmp/fastly.tar.gz; \
+    fastly version
 
-# Non-root, no ambient rustflags/wrapper env (spec §3.8 scrub happens at runtime too).
+# No ambient rustflags/wrapper env (spec §3.8 also scrubs at runtime); non-root.
 ENV CARGO_TERM_COLOR=never RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS=""
 RUN useradd -m -u 1001 build
 USER build
 WORKDIR /home/build
 ```
+
+> The Fastly CLI download SHOULD be checksum-verified against `versions.json` in the
+> real Dockerfile (the placeholder above omits it for brevity); the publish workflow
+> (Task 3) builds on a hosted runner, and the image is consumed **read-only/non-root**
+> with explicit writable mounts per spec §3.7.
 
 - [ ] **Step 2: Write the placeholder pin record**
 
@@ -179,9 +195,13 @@ Run (requires Docker + a real base digest substituted into the `FROM`):
 ```bash
 docker build --platform linux/amd64 -t edgezero-build-app-cli:local .github/docker/build-app-cli
 docker run --rm --platform linux/amd64 edgezero-build-app-cli:local rustc --version
+docker run --rm --platform linux/amd64 edgezero-build-app-cli:local rustc --print target-list | grep -x wasm32-wasip1
+docker run --rm --platform linux/amd64 edgezero-build-app-cli:local fastly version
 docker run --rm --platform linux/amd64 edgezero-build-app-cli:local sh -c 'command -v git jq tar curl cc'
+# read-only/non-root smoke (spec §3.7): a read-only rootfs run still works with a tmpfs.
+docker run --rm --read-only --tmpfs /tmp --user 1001 --platform linux/amd64 edgezero-build-app-cli:local rustc --version
 ```
-Expected: `rustc 1.95.0 (...)`, and all five tools resolve.
+Expected: `rustc 1.95.0 (...)`, `wasm32-wasip1` present, `fastly` reports 15.1.0, all five tools resolve, and the read-only/non-root run succeeds.
 
 - [ ] **Step 4: Commit**
 
