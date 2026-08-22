@@ -8,7 +8,7 @@
 
 **Tech Stack:** Docker (BuildKit), GitHub Actions (`docker/build-push-action`), GHCR, Bash, `jq`.
 
-**Spec:** `docs/specs/edgezero-deploy-build-caching.md` (v6.11) — §2 (container-only v1), §3.7 (image contract), §5 (digest pin in the pin gate).
+**Spec:** `docs/specs/edgezero-deploy-build-caching.md` (v6.13) — §2 (single-producer, crates.io-only, hosted-only v1), §3.7 (image contract: baked Rust + `wasm32-wasip1` + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
 
 ## Global Constraints
 
@@ -150,8 +150,9 @@ git commit -m "build-cache container: fail-closed image.json digest-pin validato
 # rust:1.95.0-bookworm linux/amd64 manifest digest (see README in this dir).
 FROM rust:1.95.0-bookworm@sha256:0000000000000000000000000000000000000000000000000000000000000000
 
-# Match .tool-versions: fastly 15.1.0 (spec §3.7, versions.json parity).
-ARG FASTLY_CLI_VERSION=15.1.0
+# Match .tool-versions + versions.json (spec §3.7): fastly 15.1.0, exact URL + sha256.
+ARG FASTLY_URL="https://github.com/fastly/cli/releases/download/v15.1.0/fastly_v15.1.0_linux-amd64.tar.gz"
+ARG FASTLY_SHA256="3ba3d8a739b7a88d0a612825a9755d735efb87a9b02ea67e53a11b96d178d500"
 
 RUN set -eux; \
     apt-get update; \
@@ -159,8 +160,8 @@ RUN set -eux; \
       git jq tar curl ca-certificates build-essential; \
     rm -rf /var/lib/apt/lists/*; \
     rustup target add wasm32-wasip1; \
-    curl -fsSL -o /tmp/fastly.tar.gz \
-      "https://github.com/fastly/cli/releases/download/v${FASTLY_CLI_VERSION}/fastly_${FASTLY_CLI_VERSION}_linux_amd64.tar.gz"; \
+    curl -fsSL -o /tmp/fastly.tar.gz "$FASTLY_URL"; \
+    echo "${FASTLY_SHA256}  /tmp/fastly.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/fastly.tar.gz -C /usr/local/bin fastly; \
     rm /tmp/fastly.tar.gz; \
     fastly version
@@ -172,10 +173,10 @@ USER build
 WORKDIR /home/build
 ```
 
-> The Fastly CLI download SHOULD be checksum-verified against `versions.json` in the
-> real Dockerfile (the placeholder above omits it for brevity); the publish workflow
-> (Task 3) builds on a hosted runner, and the image is consumed **read-only/non-root**
-> with explicit writable mounts per spec §3.7.
+> The Fastly CLI download is checksum-verified against `versions.json`'s pinned
+> `sha256` (above). The publish workflow (Task 3) builds on a hosted runner and
+> **makes the GHCR package public** (GHCR packages are private on first publish); the
+> image is consumed **read-only/non-root** with explicit writable mounts (spec §3.7).
 
 - [ ] **Step 2: Write the placeholder pin record**
 
@@ -278,6 +279,13 @@ git commit -m "build-cache container: GHCR publish workflow recording the manife
 
 Tag `build-container-v1` and push it; confirm the workflow updates `image.json` with a real `sha256` digest and that `check-image-pin.sh` passes on it. Commit the updated `image.json` (the digest is the pin the rest of the feature keys on).
 
+**One-time GHCR visibility + retention (operator):** GHCR packages are **private on first publish** and there is no clean REST endpoint to flip a container package public, so set the package `edgezero-build-app-cli` to **public** in its GHCR package settings (or set the org's default package visibility) so consumers can **anonymously** pull by digest (spec §3.7), and enable a retention policy that never prunes a digest referenced by a committed `image.json`. Verify anonymous access:
+```bash
+docker logout ghcr.io
+docker pull "ghcr.io/stackpop/edgezero-build-app-cli@$(jq -r .digest .github/docker/build-app-cli/image.json)"
+```
+Expected: the pull succeeds without credentials.
+
 ---
 
 ### Task 4: Wire the digest pin into the pin gate
@@ -339,4 +347,4 @@ git commit -m "build-cache container: gate the build-container digest pin in the
 
 ## Downstream sub-plans (not written yet)
 
-2. Cached build path (reusable workflow + `prepare`/`compile` split + rust-cache + owned save + config/source closure). 3. Provenance (JSON Schema, `validate-app-cli-provenance`, `compute-app-cli-identity`, composite outputs). 4. Consumer integration (`active-version-fastly`, per-consumer `expected-*`, the Docker launcher, recovery). Each is its own plan; sub-plan 2 consumes this container's digest as `platform-id`.
+2. Cached build path (reusable workflow + `prepare`/`compile` split + **owned `actions/cache` restore+save with the four-root prune** + config/source closure, spec §3.4/§3.8). 3. Provenance (JSON Schema + procedural validation, `validate-app-cli-provenance`, `compute-app-cli-identity`, `ExpectedIdentity`). 4. Consumer integration (`active-version-fastly`, per-consumer `ExpectedIdentity` inputs, the Docker launcher, production-only recovery). Each is its own plan; sub-plan 2 consumes this container's digest as `platform-id`.
