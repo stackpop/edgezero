@@ -8,12 +8,12 @@
 
 **Tech Stack:** Docker (BuildKit), GitHub Actions (`docker/build-push-action`), GHCR, Bash, `jq`.
 
-**Spec:** `docs/specs/edgezero-deploy-build-caching.md` (v6.13) — §2 (single-producer, crates.io-only, hosted-only v1), §3.7 (image contract: baked Rust + `wasm32-wasip1` + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
+**Spec:** `docs/specs/edgezero-deploy-build-caching.md` (v6.14, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
 
 ## Global Constraints
 
 - **Rust toolchain baked = `1.95.0`** (verbatim from `.tool-versions`); a build that resolves a different toolchain must fail closed downstream, so this image is the single source of truth.
-- **Full build+deploy runtime baked** (spec §3.7): `1.95.0` + `wasm32-wasip1` + the pinned **Fastly CLI `15.1.0`** (`.tool-versions`) + `git jq tar curl cc` — the container is the deploy runtime, not only the CLI-compile runtime.
+- **Full build+deploy runtime baked** (spec §3.6): `1.95.0` + `wasm32-wasip1` + a pinned **`sccache`** (the cache mechanism, spec §3.1) + the pinned **Fastly CLI `15.1.0`** (`.tool-versions`) + `git jq tar curl cc` — the container is the deploy runtime, not only the CLI-compile runtime.
 - **Runtime posture:** consumed **read-only root filesystem, non-root user**, explicit writable mounts only (spec §3.7).
 - **Single-manifest `linux/amd64` only** — no multi-arch index (an index digest can select another architecture).
 - **No Python in CI tooling** — Bash + `jq` only.
@@ -150,9 +150,14 @@ git commit -m "build-cache container: fail-closed image.json digest-pin validato
 # rust:1.95.0-bookworm linux/amd64 manifest digest (see README in this dir).
 FROM rust:1.95.0-bookworm@sha256:0000000000000000000000000000000000000000000000000000000000000000
 
-# Match .tool-versions + versions.json (spec §3.7): fastly 15.1.0, exact URL + sha256.
+# Pinned downloads (spec §3.6): fastly 15.1.0 (versions.json) and a pinned sccache.
+# Each ARG carries the exact release URL + sha256 (fill the sccache values from the
+# chosen sccache release; the fastly values are versions.json's).
 ARG FASTLY_URL="https://github.com/fastly/cli/releases/download/v15.1.0/fastly_v15.1.0_linux-amd64.tar.gz"
 ARG FASTLY_SHA256="3ba3d8a739b7a88d0a612825a9755d735efb87a9b02ea67e53a11b96d178d500"
+ARG SCCACHE_VERSION="0.10.0"
+ARG SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz"
+ARG SCCACHE_SHA256="REPLACE_WITH_RELEASE_SHA256"
 
 RUN set -eux; \
     apt-get update; \
@@ -163,8 +168,12 @@ RUN set -eux; \
     curl -fsSL -o /tmp/fastly.tar.gz "$FASTLY_URL"; \
     echo "${FASTLY_SHA256}  /tmp/fastly.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/fastly.tar.gz -C /usr/local/bin fastly; \
-    rm /tmp/fastly.tar.gz; \
-    fastly version
+    curl -fsSL -o /tmp/sccache.tar.gz "$SCCACHE_URL"; \
+    echo "${SCCACHE_SHA256}  /tmp/sccache.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/bin "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"; \
+    chmod +x /usr/local/bin/sccache; \
+    rm /tmp/fastly.tar.gz /tmp/sccache.tar.gz; \
+    fastly version; sccache --version
 
 # No ambient rustflags/wrapper env (spec §3.8 also scrubs at runtime); non-root.
 ENV CARGO_TERM_COLOR=never RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS=""
@@ -198,6 +207,7 @@ docker build --platform linux/amd64 -t edgezero-build-app-cli:local .github/dock
 docker run --rm --platform linux/amd64 edgezero-build-app-cli:local rustc --version
 docker run --rm --platform linux/amd64 edgezero-build-app-cli:local rustc --print target-list | grep -x wasm32-wasip1
 docker run --rm --platform linux/amd64 edgezero-build-app-cli:local fastly version
+docker run --rm --platform linux/amd64 edgezero-build-app-cli:local sccache --version
 docker run --rm --platform linux/amd64 edgezero-build-app-cli:local sh -c 'command -v git jq tar curl cc'
 # read-only/non-root smoke (spec §3.7): a read-only rootfs run still works with a tmpfs.
 docker run --rm --read-only --tmpfs /tmp --user 1001 --platform linux/amd64 edgezero-build-app-cli:local rustc --version
@@ -231,15 +241,18 @@ on:
   push:
     tags: ["build-container-v*"]
 permissions:
-  contents: read
-  packages: write
+  contents: write # push the pin branch
+  packages: write # push the image to GHCR
+  pull-requests: write # open the image.json PR
 jobs:
   publish:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        # Trusted publish job (no app code runs here); keep the token so the
+        # pin-record PR branch can be pushed.
         with:
-          persist-credentials: false
+          persist-credentials: true
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Build and push (single-arch amd64)
@@ -253,15 +266,45 @@ jobs:
             --tag "$REPO:$TAG" --push .github/docker/build-app-cli
           DIGEST=$(docker buildx imagetools inspect "$REPO:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-      - name: Record and validate the pin
+      - name: Verify the pushed image BY DIGEST before recording it
+        env:
+          REPO: ghcr.io/stackpop/edgezero-build-app-cli
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          REF="$REPO@$DIGEST"
+          # Single-manifest linux/amd64 (reject a multi-arch index).
+          n=$(docker buildx imagetools inspect "$REF" --format '{{json .}}' \
+                | jq '[.. | .manifests? // empty | .[] | select(.platform.os != "unknown")] | length')
+          [ "${n:-1}" -le 1 ] || { echo "::error::not single-manifest ($n)"; exit 1; }
+          # Anonymous pull (the package must be public) + the runtime smoke contract.
+          docker logout ghcr.io || true
+          docker run --rm --platform linux/amd64 "$REF" rustc --version | grep -F '1.95.0'
+          docker run --rm --platform linux/amd64 "$REF" sh -c 'rustc --print target-list | grep -qx wasm32-wasip1'
+          docker run --rm --platform linux/amd64 "$REF" fastly version
+          docker run --rm --platform linux/amd64 "$REF" sccache --version
+          docker run --rm --read-only --tmpfs /tmp --user 1001 --platform linux/amd64 "$REF" rustc --version
+      - name: Open a reviewable image.json PR (not an in-place commit)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
           f=.github/docker/build-app-cli/image.json
-          jq --arg t "${GITHUB_REF_NAME}" --arg d "${{ steps.push.outputs.digest }}" \
-             '.tag=$t | .digest=$d' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          jq --arg t "${GITHUB_REF_NAME}" --arg d "${DIGEST}" '.tag=$t | .digest=$d' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           bash .github/docker/build-app-cli/check-image-pin.sh "$f"
-          cat "$f"
+          br="build-container-pin-${GITHUB_REF_NAME}"
+          git switch -c "$br"
+          git add "$f"
+          git -c user.name=edgezero-ci -c user.email=ci@stackpop \
+            commit -m "build container: pin ${GITHUB_REF_NAME} = ${DIGEST}"
+          git push -u origin "$br"
+          gh pr create --fill --base main --head "$br" \
+            --title "Pin build container ${GITHUB_REF_NAME}" \
+            --body "Digest verified by the publish workflow (single-manifest, anonymous pull, runtime smoke)."
 ```
+
+The publish thus **pushes → inspects by digest → verifies single-manifest + anonymous pull + the runtime smoke → then opens a reviewable `image.json` PR** — the pin the rest of the feature keys on is never recorded until it has been proven against the actual pushed digest.
 
 - [ ] **Step 2: Actionlint the workflow**
 
@@ -277,7 +320,7 @@ git commit -m "build-cache container: GHCR publish workflow recording the manife
 
 - [ ] **Step 4: Publish (operator step, out of band)**
 
-Tag `build-container-v1` and push it; confirm the workflow updates `image.json` with a real `sha256` digest and that `check-image-pin.sh` passes on it. Commit the updated `image.json` (the digest is the pin the rest of the feature keys on).
+Tag `build-container-v1` and push it. The workflow pushes the image, **verifies it by digest** (single-manifest, anonymous pull, runtime smoke), and **opens a PR** updating `image.json` to the real `sha256` digest. Review and merge that PR — the digest is the pin the rest of the feature keys on, and it is only recorded after passing verification against the actual pushed image.
 
 **One-time GHCR visibility + retention (operator):** GHCR packages are **private on first publish** and there is no clean REST endpoint to flip a container package public, so set the package `edgezero-build-app-cli` to **public** in its GHCR package settings (or set the org's default package visibility) so consumers can **anonymously** pull by digest (spec §3.7), and enable a retention policy that never prunes a digest referenced by a committed `image.json`. Verify anonymous access:
 ```bash
