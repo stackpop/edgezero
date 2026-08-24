@@ -578,7 +578,7 @@ impl Adapter for FastlyCliAdapter {
             // selector via `edgezero_runtime_env_staging`, wired automatically by
             // a staged deploy; nothing here should be edited to stage config.
             let mut line = format!(
-                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  It already selects each store's default key, so no edit is needed for a normal setup.\n  To point PRODUCTION at a different key (e.g. a renamed store), and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  Provision writes non-default store-name mappings below. Config stores still select their logical id as the default key.\n  To point PRODUCTION at a different config key, and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
                 fastly_path.display()
             );
             if let Some(note) = post_create_note {
@@ -589,6 +589,8 @@ impl Adapter for FastlyCliAdapter {
         } else {
             // Already declared; nothing to do.
         }
+
+        out.extend(persist_runtime_env_store_name_entries(stores, dry_run)?);
 
         // The STAGING twin of the runtime-override store is created and
         // populated entirely by a staged deploy (see
@@ -3455,6 +3457,62 @@ fn staging_entries_from_production(
     out
 }
 
+fn is_runtime_store_name_key(key: &str) -> bool {
+    let mut segments = key.split("__");
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some("EDGEZERO"),
+            Some("STORES"),
+            Some("CONFIG" | "KV" | "SECRETS"),
+            Some(id),
+            Some("NAME"),
+            None,
+        ) if !id.is_empty()
+    )
+}
+
+fn runtime_store_name_entries_from_vars(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+    for (key, value) in vars {
+        if !is_runtime_store_name_key(&key) {
+            continue;
+        }
+        if value.is_empty() || value.trim() != value {
+            return Err(format!(
+                "runtime store-name override `{key}` must be non-empty and contain no surrounding whitespace"
+            ));
+        }
+        entries.push((key, value));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+fn overlay_runtime_store_name_entries(
+    base: &[(String, String)],
+    overrides: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut entries = base.to_vec();
+    for (key, value) in overrides {
+        if let Some((_, current)) = entries.iter_mut().find(|(candidate, _)| candidate == key) {
+            current.clone_from(value);
+        } else {
+            entries.push((key.clone(), value.clone()));
+        }
+    }
+    entries
+}
+
 /// Resolve the staging twin store, creating it on demand. A staged deploy owns
 /// this store end to end (it is never linked on the ACTIVE version), so it does
 /// not depend on `provision` having created it first. Fails closed on a lookup
@@ -3520,7 +3578,9 @@ fn mirror_production_to_staging(
     config_logical_ids: &[String],
     cwd: &Path,
 ) -> Result<(), String> {
-    let desired = staging_entries_from_production(production, config_logical_ids);
+    let process_overrides = runtime_store_name_entries_from_vars(env::vars())?;
+    let effective_production = overlay_runtime_store_name_entries(production, &process_overrides);
+    let desired = staging_entries_from_production(&effective_production, config_logical_ids);
 
     for (key, value) in &desired {
         create_config_store_entry(staging_id, key, value)?;
@@ -3532,6 +3592,61 @@ fn mirror_production_to_staging(
         }
     }
     Ok(())
+}
+
+/// Return the runtime entries required when logical store ids map to different
+/// Fastly resource names.
+fn runtime_env_store_name_entries(stores: &ProvisionStores<'_>) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for (kind, ids) in [
+        ("CONFIG", stores.config),
+        ("KV", stores.kv),
+        ("SECRETS", stores.secrets),
+    ] {
+        for store in ids {
+            if store.logical == store.platform {
+                continue;
+            }
+            entries.push((
+                format!(
+                    "EDGEZERO__STORES__{kind}__{}__NAME",
+                    store.logical.to_ascii_uppercase()
+                ),
+                store.platform.clone(),
+            ));
+        }
+    }
+    entries
+}
+
+fn persist_runtime_env_store_name_entries(
+    stores: &ProvisionStores<'_>,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    let entries = runtime_env_store_name_entries(stores);
+    if dry_run {
+        return Ok(entries
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "would upsert `{key}={value}` into fastly config-store `{RUNTIME_ENV_STORE}`"
+                )
+            })
+            .collect());
+    }
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let runtime_env_store_id = resolve_remote_config_store_id(RUNTIME_ENV_STORE)?
+        .ok_or_else(|| no_matching_store_error(RUNTIME_ENV_STORE))?;
+    push_entries_with_committer(&entries, |key, value| {
+        create_config_store_entry(&runtime_env_store_id, key, value)
+    })?;
+    Ok(vec![format!(
+        "persisted {} non-default store-name mapping(s) in fastly config-store `{RUNTIME_ENV_STORE}`",
+        entries.len()
+    )])
 }
 
 /// The runtime-override entry naming the config-store KEY for logical store
@@ -6628,6 +6743,27 @@ build = \"cargo build --release\"
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
+    }
+
+    #[test]
+    fn provision_dry_run_reports_non_default_store_name_mapping() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let secret_ids = vec![ResolvedStoreId::new("default", "production_secrets")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &secret_ids,
+        };
+
+        let out = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+
+        assert!(out.iter().any(|line| {
+            line.contains("EDGEZERO__STORES__SECRETS__DEFAULT__NAME=production_secrets")
+        }));
     }
 
     #[test]
@@ -10209,6 +10345,40 @@ echo 'unexpected' >&2; exit 1
     }
 
     #[test]
+    fn runtime_env_store_name_entries_include_only_non_default_mappings() {
+        use edgezero_core::env_config::EnvConfig;
+
+        let config = vec![ResolvedStoreId::from_logical("app_config")];
+        let kv = vec![ResolvedStoreId::new("sessions", "production_sessions")];
+        let secrets = vec![ResolvedStoreId::new("default", "production_secrets")];
+        let stores = ProvisionStores {
+            config: &config,
+            kv: &kv,
+            secrets: &secrets,
+        };
+
+        let entries = runtime_env_store_name_entries(&stores);
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "EDGEZERO__STORES__KV__SESSIONS__NAME".to_owned(),
+                    "production_sessions".to_owned(),
+                ),
+                (
+                    "EDGEZERO__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                    "production_secrets".to_owned(),
+                ),
+            ]
+        );
+
+        let env = EnvConfig::from_vars(entries);
+        assert_eq!(env.store_name("config", "app_config"), "app_config");
+        assert_eq!(env.store_name("kv", "sessions"), "production_sessions");
+        assert_eq!(env.store_name("secrets", "default"), "production_secrets");
+    }
+
+    #[test]
     fn runtime_env_key_matches_what_the_runtime_reads() {
         use edgezero_core::env_config::EnvConfig;
 
@@ -10287,6 +10457,66 @@ echo 'unexpected' >&2; exit 1
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn runtime_store_name_entries_from_vars_filters_and_validates() {
+        let entries = runtime_store_name_entries_from_vars([
+            (
+                "EDGEZERO__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                "physical_secrets".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+                "ignored_selector".to_owned(),
+            ),
+            ("UNRELATED".to_owned(), "ignored".to_owned()),
+        ])
+        .expect("valid store-name override");
+
+        assert_eq!(
+            entries,
+            vec![(
+                "EDGEZERO__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                "physical_secrets".to_owned(),
+            )]
+        );
+        assert!(
+            runtime_store_name_entries_from_vars([(
+                "EDGEZERO__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                String::new(),
+            )])
+            .is_err(),
+            "an empty mapped resource name must fail closed"
+        );
+    }
+
+    #[test]
+    fn process_store_name_overrides_win_before_staging_mirror() {
+        let production = vec![
+            (
+                "EDGEZERO__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                "old_secrets".to_owned(),
+            ),
+            ("EDGEZERO__LOGGING__LEVEL".to_owned(), "info".to_owned()),
+        ];
+        let overrides = vec![(
+            "EDGEZERO__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+            "new_secrets".to_owned(),
+        )];
+
+        let effective = overlay_runtime_store_name_entries(&production, &overrides);
+        let staging = staging_entries_from_production(&effective, &["app_config".to_owned()]);
+
+        assert!(staging.contains(&(
+            "EDGEZERO__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+            "new_secrets".to_owned(),
+        )));
+        assert!(!staging.iter().any(|(_, value)| value == "old_secrets"));
+        assert!(staging.contains(&(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+            "app_config_staging".to_owned(),
+        )));
     }
 
     #[test]
