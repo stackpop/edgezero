@@ -32,12 +32,16 @@ use validator::{Validate, ValidationErrors};
 
 /// One segment of a [`SecretField`] path.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SecretPathSegment {
     /// Every element of an array/`Vec` at this position.
     ArrayEach,
     /// An object key — a Rust field name, verbatim (no `serde(rename)`).
     Field(Cow<'static, str>),
     /// An optional field that skips the rest of this secret path when absent or null.
+    ///
+    /// Available to hand-written [`AppConfigMeta`] implementations. The
+    /// `AppConfig` derive does not currently emit optional intermediate fields.
     OptionalField(Cow<'static, str>),
 }
 

@@ -1733,6 +1733,10 @@ fn collect_secret_leaves<'raw>(
                 }
                 Ok(())
             }
+            Some((_unsupported, _)) => Err(format!(
+                "unsupported secret path segment in `{}`",
+                field.dotted_path()
+            )),
             None => Ok(()),
         }
     }
