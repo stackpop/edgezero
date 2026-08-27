@@ -480,25 +480,12 @@ for suite in "${SUITES[@]}"; do
   # `provision --local` (warm-up), the reset below, the secret seed, and
   # the push all mutate these; backing up first captures the developer's
   # ORIGINAL state (present or absent), and `restore_backups` returns it
-  # exactly on cleanup. The emulator-state DIRECTORIES (.edgezero /
-  # .wrangler / .spin) can hold real config / KV / SQLite state, so they
-  # must be preserved, not just the manifests.
-  case "$adapter" in
-    axum)
-      backup_in_tree "$DEMO_DIR/.edgezero"
-      ;;
-    cloudflare)
-      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
-      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-      ;;
-    spin)
-      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
-      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-      ;;
-    fastly)
-      backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-      ;;
-  esac
+  # exactly on cleanup. The full provision-owned set -- manifests plus the
+  # emulator-state DIRECTORIES (.edgezero / .wrangler / .spin) that can hold
+  # real config / KV / SQLite state -- is registered by the shared helper in
+  # scripts/lib/smoke_warmup.sh so this row can't drift from what provision
+  # actually writes.
+  smoke_backup_provision_local "$adapter"
 
   # Warm up per-row local state — provision --local regenerates the
   # gitignored adapter manifest + .env / .dev.vars.
@@ -615,10 +602,12 @@ else
   trap 'cleanup; rm -rf "$tmp"' EXIT
   trap 'cleanup; rm -rf "$tmp"; exit 130' INT TERM
 
-  # Back up fastly.toml BEFORE warm-up regenerates it (and before the
-  # push / `seed_fastly_runtime_env` edit it in place), so cleanup
-  # restores the developer's ORIGINAL, not the post-provision copy.
-  backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+  # Back up the full provision-owned Fastly set BEFORE warm-up regenerates
+  # it (and before the push / `seed_fastly_runtime_env` edit it in place),
+  # so cleanup restores the developer's ORIGINAL, not the post-provision
+  # copy. The shared helper in scripts/lib/smoke_warmup.sh is the single
+  # source of truth for that set.
+  smoke_backup_provision_local fastly
   # Warm up Fastly local state — provision --local synthesises fastly.toml.
   smoke_warmup_provision_local fastly
 
@@ -656,7 +645,8 @@ TOML
   # Seed the demo_api_token secret so /config/typed's secret walk
   # resolves; without it the assertion would fail in the extractor
   # before testing the chunk-pointer round-trip. Any fastly.toml edit is
-  # covered by the `backup_in_tree` above and restored on cleanup.
+  # covered by the `smoke_backup_provision_local fastly` above and restored
+  # on cleanup.
   seed_secret_for_adapter fastly || true
 
   if boot_runtime fastly; then

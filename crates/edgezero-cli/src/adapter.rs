@@ -277,6 +277,15 @@ pub(crate) fn execute_with_env_overlay(
     if let Some(crate_abs) = adapter_crate_abs.as_deref() {
         ctx = ctx.with_adapter_crate(crate_abs);
     }
+    // The declared `[adapters.<name>.adapter].component` selector, so a
+    // multi-component Spin build refreshes the SELECTED component's module
+    // rather than one guessed by source basename.
+    let adapter_component = manifest_loader
+        .and_then(|loader| loader.manifest().adapter_entry(adapter_name))
+        .and_then(|(_canonical, cfg)| cfg.adapter.component.as_deref());
+    if let Some(component) = adapter_component {
+        ctx = ctx.with_adapter_component(component);
+    }
     adapter.execute(AdapterAction::from(action), adapter_args, &ctx)
 }
 

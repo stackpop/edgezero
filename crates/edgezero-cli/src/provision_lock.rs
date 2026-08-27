@@ -86,6 +86,26 @@ static TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
 /// already caught (the non-blocking acquire succeeds and we own the lock),
 /// so the token only needs to be unforgeable-by-accident across live
 /// holders, which pid+time+seq satisfies.
+/// Whether the advertised `LOCK_ENV` path and this process's calculated lock
+/// path name the SAME lock file. A plain textual `==` is not enough: a
+/// symlinked or otherwise aliased project root (e.g. `/tmp/proj` vs a symlink
+/// `/tmp/link` -> `/tmp/proj`) opens the SAME inode under two spellings, and a
+/// borrower that failed to recognise its ancestor's advertisement would block
+/// on the very lock the ancestor holds -- a self-deadlock. Compare by resolved
+/// identity (`canonicalize`), falling back to the textual check when either
+/// path can't be resolved.
+fn same_lock_target(advertised: &Path, calculated: &Path) -> bool {
+    if advertised == calculated {
+        return true;
+    }
+    match (fs::canonicalize(advertised), fs::canonicalize(calculated)) {
+        (Ok(resolved_advertised), Ok(resolved_calculated)) => {
+            resolved_advertised == resolved_calculated
+        }
+        (Err(_), _) | (_, Err(_)) => false,
+    }
+}
+
 fn mint_token() -> String {
     let pid = process::id();
     let nanos = SystemTime::now()
@@ -232,7 +252,7 @@ impl ProvisionLock {
         // borrow; if we acquire it, the advertisement was false and we KEEP
         // the lock (own it) rather than run unserialized.
         let abs = absolute(&path).unwrap_or_else(|_| path.clone());
-        if env::var_os(LOCK_ENV).is_some_and(|held| Path::new(&held) == abs) {
+        if env::var_os(LOCK_ENV).is_some_and(|held| same_lock_target(Path::new(&held), &abs)) {
             let acquired = file.try_lock_exclusive().map_err(|err| {
                 format!(
                     "failed to test the advertised provision lock on {}: {err}",
@@ -264,7 +284,25 @@ impl ProvisionLock {
                 // Depth-keying (not one shared sibling file) is what keeps a
                 // NESTED borrower from dead-locking on an ancestor's sibling
                 // lock.
-                return Self::borrow_via_sibling(manifest_root, &dot_edgezero, path, file_token);
+                let sibling_guard = Self::borrow_via_sibling(
+                    manifest_root,
+                    &dot_edgezero,
+                    path.clone(),
+                    file_token,
+                )?;
+                // RE-AUTHENTICATE after the sibling lock. Acquiring it may have
+                // QUEUED behind a co-sibling; while we waited the advertising
+                // ancestor could have EXITED (releasing the main lock) and an
+                // UNRELATED process could have acquired it and stamped its own
+                // token. Proceeding on the pre-wait authentication would let us
+                // race that new, unrelated main-lock owner. If the main token no
+                // longer matches the advertisement, drop the borrow and OWN the
+                // main lock (block) -- serialising behind the new owner instead.
+                let current_token = read_token(&path);
+                if !current_token.is_empty() && current_token == env_token {
+                    return Ok(sibling_guard);
+                }
+                drop(sibling_guard);
             }
         }
         // Own the main lock: either no advertisement matched, or a matching
@@ -616,6 +654,51 @@ mod tests {
             start.elapsed() >= Duration::from_millis(30),
             "the co-sibling must serialise behind the deploy's depth-1 sibling lock"
         );
+        drop(owner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn borrows_through_an_aliased_symlinked_lock_path() {
+        // The ancestor advertises `LOCK_ENV` via a SYMLINK spelling of the
+        // project root; the child calculates the REAL spelling. A textual `==`
+        // would not match, so the child would BLOCK on -- self-deadlock
+        // against -- the very lock the ancestor holds. Identity comparison
+        // (`same_lock_target`) must recognise the two spellings as one file and
+        // BORROW instead.
+        use crate::test_support::{EnvOverride, manifest_guard};
+        use std::os::unix::fs::symlink;
+        use std::sync::PoisonError;
+        let _g = manifest_guard()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let real = TempDir::new().expect("tempdir");
+        let link_parent = TempDir::new().expect("tempdir");
+        let link = link_parent.path().join("link");
+        symlink(real.path(), &link).expect("symlink");
+        // Owner holds the lock via the REAL path; advertise via the SYMLINK.
+        let owner = ProvisionLock::acquire(real.path()).expect("owner");
+        let _env = EnvOverride::set(
+            super::LOCK_ENV,
+            ProvisionLock::lock_path_for(&link).as_os_str(),
+        );
+        let _tok = EnvOverride::set(super::LOCK_TOKEN_ENV, OsStr::new(owner.token()));
+        // The child acquires via the real path in a thread: it must BORROW
+        // (recognise the symlinked advertisement), not deadlock.
+        let root = real.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let borrow = ProvisionLock::acquire(&root).expect("borrow");
+            assert!(
+                !borrow.owns_os_lock(),
+                "the symlinked advertisement is recognised -> borrow, not own"
+            );
+            tx.send(()).expect("signal");
+            drop(borrow);
+        });
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("must borrow through the symlinked path, not deadlock");
+        handle.join().expect("join borrow");
         drop(owner);
     }
 

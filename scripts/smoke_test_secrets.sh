@@ -29,7 +29,12 @@ SERVER_PID=""
 # developer's tree is never changed regardless of success/failure.
 # shellcheck source=lib/smoke_backup.sh
 . "$ROOT_DIR/scripts/lib/smoke_backup.sh"
-# Path vars the seed arms below write to (set in the backup case block).
+# Sourced early (side-effect-free) so the shared provision-owned backup set
+# is available before the backup block below. `smoke_backup_provision_local`
+# is the single source of truth for which files warm-up can mutate.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+# Path vars the seed arms below write to (set in the case block below).
 DEV_VARS_FILE=""
 FASTLY_TOML_FILE=""
 SPIN_TOML_FILE=""
@@ -53,22 +58,20 @@ cleanup() {
 # Back up operator files/dirs BEFORE arming the restore trap and BEFORE
 # warm-up (and the boot-time seeds) mutate them. A failed backup aborts
 # HERE -- before the trap is armed and before any mutation -- so the tree
-# is never left half-restored.
+# is never left half-restored. The full provision-owned set is registered by
+# the shared helper in scripts/lib/smoke_warmup.sh so this list can't drift
+# from what warm-up and the boot-time seeds actually write; the case block
+# below only sets the path vars the seed arms reference.
+smoke_backup_provision_local "$ADAPTER"
 case "$ADAPTER" in
   cloudflare)
     DEV_VARS_FILE="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-    backup_in_tree "$DEV_VARS_FILE"
     ;;
   fastly)
     FASTLY_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-    backup_in_tree "$FASTLY_TOML_FILE"
     ;;
   spin)
     SPIN_TOML_FILE="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-    backup_in_tree "$SPIN_TOML_FILE"
-    ;;
-  axum)
-    backup_in_tree "$DEMO_DIR/.edgezero"
     ;;
 esac
 
@@ -84,9 +87,8 @@ trap 'cleanup; exit 143' TERM
 # and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
 # this because those adapter manifests are gitignored. Crucial for
 # this smoke: the typed dispatch writes SPIN_VARIABLE_* /
-# .dev.vars placeholders that the emulator boot reads.
-# shellcheck source=lib/smoke_warmup.sh
-. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+# .dev.vars placeholders that the emulator boot reads. (smoke_warmup.sh is
+# already sourced above, alongside the backup set it defines.)
 echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
 smoke_warmup_provision_local "$ADAPTER"
 

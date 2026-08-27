@@ -120,8 +120,9 @@ spin up --from spin.toml --runtime-config-file runtime-config.toml
 # Using the CLI
 edgezero deploy --adapter spin
 
-# Or directly
-spin deploy --from crates/my-app-adapter-spin
+# Or directly (Fermyon Cloud). Bare `spin deploy` needs a deployment
+# plugin on Spin 3+/4; `spin cloud deploy` is the first-class command.
+spin cloud deploy --from crates/my-app-adapter-spin/spin.toml
 ```
 
 ## KV Storage

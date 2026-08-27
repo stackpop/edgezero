@@ -762,7 +762,10 @@ mod tests {
         // Expect the freshly-written entry to carry the placeholder id,
         // and NOT emit a preview_id at all (deployed lookup only).
         let dir = tempdir().expect("tempdir");
-        let path = write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let path = write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
@@ -810,7 +813,10 @@ mod tests {
         // wrangler.toml to be that id (deployed wins over placeholder).
         const REAL_ID: &str = "abcdefabcdefabcdefabcdefabcdef00";
         let dir = tempdir().expect("tempdir");
-        let path = write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let path = write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
@@ -847,7 +853,10 @@ mod tests {
         // rejects the same value, and writing it into wrangler.toml would bind
         // a fake namespace under `wrangler dev`.
         let dir = tempdir().expect("tempdir");
-        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
@@ -964,7 +973,11 @@ mod tests {
         let nested_dir = dir.path().join("crates").join("cf");
         fs::create_dir_all(&nested_dir).expect("mkdir nested");
         let nested_path = nested_dir.join("wrangler.toml");
-        fs::write(&nested_path, synthesise_wrangler_toml("demo")).expect("seed nested");
+        fs::write(
+            &nested_path,
+            synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        )
+        .expect("seed nested");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
@@ -1046,7 +1059,10 @@ mod tests {
         // OR fail to find the deployed id (wrong: lookup used
         // platform instead of logical).
         let dir = tempdir().expect("tempdir");
-        let path = write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let path = write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
         let stores = ProvisionStores {
             config: &config_ids,
@@ -1090,7 +1106,10 @@ mod tests {
         // __NAME line per store and a commented __KEY placeholder for
         // the config store.
         let dir = tempdir().expect("tempdir");
-        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
         let stores = ProvisionStores {
@@ -1132,7 +1151,10 @@ mod tests {
         // placeholder — normalised_key collapses commented and
         // uncommented forms, so the operator's value survives.
         let dir = tempdir().expect("tempdir");
-        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let dev_vars_path = dir.path().join(".dev.vars");
         fs::write(
             &dev_vars_path,
@@ -1191,7 +1213,10 @@ mod tests {
         // CONVERGE to the new value with no stale `="app_config"` line
         // lingering, while an operator-added sibling line survives.
         let dir = tempdir().expect("tempdir");
-        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let dev_vars_path = dir.path().join(".dev.vars");
 
         // First provision with platform `app_config`.
@@ -1264,7 +1289,10 @@ mod tests {
         // LOGICAL id in upper-case (`APP_CONFIG`) so the runtime's
         // env-overlay lookup finds it.
         let dir = tempdir().expect("tempdir");
-        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        write_wrangler(
+            dir.path(),
+            &synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        );
         let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
         let stores = ProvisionStores {
             config: &config_ids,
@@ -1354,8 +1382,11 @@ mod tests {
         // `sessions`; `.dev.vars` has the __NAME overlay line.
         let dir = tempdir().expect("tempdir");
         let wrangler_path = dir.path().join("wrangler.toml");
-        fs::write(&wrangler_path, synthesise_wrangler_toml("demo"))
-            .expect("bootstrap wrangler.toml");
+        fs::write(
+            &wrangler_path,
+            synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        )
+        .expect("bootstrap wrangler.toml");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
@@ -1409,7 +1440,7 @@ mod tests {
 
     /// Locks the header-preservation contract for the case the sibling
     /// first-run test misses. The seeded fixture there uses
-    /// `synthesise_wrangler_toml("demo")` which ALREADY carries the
+    /// `synthesise_wrangler_toml("demo", "build/worker/shim.mjs")` which ALREADY carries the
     /// header at line 1 -- a merge bug that stripped the header on
     /// re-serialisation would pass `starts_with(EDGEZERO_PROVISION_HEADER)`
     /// only because the seed matched, not because provision preserved it.
@@ -1471,8 +1502,11 @@ mod tests {
         // a byte mismatch.
         let dir = tempdir().expect("tempdir");
         let wrangler_path = dir.path().join("wrangler.toml");
-        fs::write(&wrangler_path, synthesise_wrangler_toml("demo"))
-            .expect("bootstrap wrangler.toml");
+        fs::write(
+            &wrangler_path,
+            synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        )
+        .expect("bootstrap wrangler.toml");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
         let stores = ProvisionStores {
@@ -1531,8 +1565,11 @@ mod tests {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let wrangler_path = dir.path().join("wrangler.toml");
-        fs::write(&wrangler_path, synthesise_wrangler_toml("demo"))
-            .expect("bootstrap wrangler.toml");
+        fs::write(
+            &wrangler_path,
+            synthesise_wrangler_toml("demo", "build/worker/shim.mjs"),
+        )
+        .expect("bootstrap wrangler.toml");
         let fake = fake_wrangler_panicking();
         let _path = PathPrepend::new(fake.path());
 

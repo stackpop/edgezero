@@ -34,3 +34,46 @@ smoke_warmup_provision_local() {
             provision --adapter "$adapter" --local
     )
 }
+
+# Register (for backup + restore) EVERY provision-owned local file/dir that
+# smoke_warmup_provision_local -- and a smoke body's `config push --local` --
+# can create or mutate for ADAPTER. This is the SINGLE SOURCE OF TRUTH for
+# the provision-owned file set that pairs with the warm-up above: whenever
+# provision learns to write a new gitignored local file, add it HERE and
+# every smoke inherits the coverage, so no individual script can forget it
+# and leave operator-local state changed after a run (success OR failure).
+#
+# All these paths are gitignored per-machine state (see the app-demo entries
+# in the root .gitignore). Requires scripts/lib/smoke_backup.sh sourced first
+# (uses `backup_in_tree`, which fail-closed-aborts if a capture fails).
+# Callers MUST invoke this BEFORE arming their restore trap and BEFORE
+# calling smoke_warmup_provision_local, so a failed capture aborts before any
+# mutation.
+smoke_backup_provision_local() {
+    local adapter
+    adapter="$(smoke_canonical_adapter "$1")"
+    # `.edgezero/` is created by EVERY adapter's provision: it anchors the
+    # cross-process `provision.lock`, plus Axum's `.env` and local-config
+    # JSON. Back it up regardless of adapter so a non-Axum run can't leave a
+    # stray `.edgezero/` (or clobber existing Axum state) behind.
+    backup_in_tree "$DEMO_DIR/.edgezero"
+    case "$adapter" in
+        axum)
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-axum/axum.toml"
+            ;;
+        cloudflare)
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/wrangler.toml"
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
+            ;;
+        fastly)
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+            ;;
+        spin)
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/runtime-config.toml"
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.env"
+            backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
+            ;;
+    esac
+}

@@ -10,9 +10,7 @@ use crate::chunked_config::{
     resolve_fastly_config_value_typed, value_announces_our_kind, value_is_future_format,
 };
 
-use super::provision_local::{
-    assert_local_config_store_provisioned, write_fastly_local_config_store,
-};
+use super::provision_local::write_fastly_local_config_store;
 use super::{classify_resolved_read, expand_root, reject_generated_key_collisions};
 
 /// Local-emulator `push_config_entries_local`: edit
@@ -56,12 +54,12 @@ pub(super) fn write_entries(
         gc_roots.push((key.clone(), new_keys));
     }
     if dry_run {
-        // Model the real operation: the writer below refuses when the
-        // provision-owned `[local_server.config_stores.<name>.contents]`
-        // table is absent, so a dry-run that happily previewed the edit
-        // would promise a push the real run rejects. This probe is
-        // read-only -- a dry-run must not touch the file.
-        assert_local_config_store_provisioned(&fastly_path, name)?;
+        // Per the chunk-GC dry-run contract (spec 2026-07-07 §"Error
+        // semantics"), a dry-run MUST NOT newly fail: it previews the edit and
+        // DEGRADES the orphan count (absent prior -> 0; unreadable / malformed
+        // / non-string prior -> "unknown") rather than rejecting. The REAL
+        // push still fails fatally at the writer on malformed / not-yet-
+        // provisioned state; only this preview count degrades. Read-only.
         let counts = local_orphan_counts_for_dry_run(&fastly_path, name, entries);
         let mut out = Vec::with_capacity(entries.len().saturating_mul(2).saturating_add(1));
         out.push(format!(
@@ -819,18 +817,19 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn push_config_entries_local_dry_run_refuses_when_store_not_provisioned() {
-        // The dry-run must model the real operation: the real push
-        // refuses to fabricate an unprovisioned store block, so previewing
-        // a successful edit would promise something that cannot happen.
+    fn push_config_entries_local_dry_run_continues_over_unprovisioned_store() {
+        // Per the chunk-GC dry-run contract (spec 2026-07-07 §"Error
+        // semantics"), a dry-run MUST NOT fail on absent / unprovisioned prior
+        // state: it PREVIEWS the edit and degrades the orphan count (absent
+        // prior -> 0). The REAL push still refuses at the writer -- that path
+        // is unchanged.
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
         let original = "name = \"demo\"\n";
         fs::write(&fastly_toml, original).expect("write");
 
-        let err = FastlyCliAdapter
+        let out = FastlyCliAdapter
             .push_config_entries_local(
                 dir.path(),
                 Some("fastly.toml"),
@@ -840,14 +839,41 @@ mod tests {
                 &AdapterPushContext::new(),
                 true, // dry_run
             )
-            .expect_err("dry-run must surface the same refusal as the real push");
+            .expect("dry-run must NOT fail on an unprovisioned store");
         assert!(
-            err.contains("provision --adapter fastly --local"),
-            "error points at provision: {err}"
+            out.iter().any(|line| line.contains("would set `greeting`")),
+            "dry-run previews the edit: {out:?}"
         );
-        // The read-only probe must leave the file byte-identical.
+        // Read-only: the probe must leave the file byte-identical.
         let after = fs::read_to_string(&fastly_toml).expect("read back");
-        assert_eq!(after, original, "dry-run probe must not edit fastly.toml");
+        assert_eq!(after, original, "dry-run must not edit fastly.toml");
+    }
+
+    #[test]
+    fn push_config_entries_local_dry_run_degrades_over_malformed_prior() {
+        // Malformed prior TOML -> the orphan count degrades to "unknown" and
+        // the dry-run CONTINUES (does not error, does not leak the raw value).
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let original = "this is not = = valid toml with SECRET_abc in it\n";
+        fs::write(&fastly_toml, original).expect("write");
+
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "{\"envelope\":\"A\"}".to_owned())],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run must degrade over malformed prior, not fail");
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("unknown number of orphan chunks") && !joined.contains("SECRET_abc"),
+            "count degrades to unknown without leaking the raw value: {joined}"
+        );
     }
 
     // ---------- local read integration tests ----------

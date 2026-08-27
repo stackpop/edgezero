@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 use std::process::Command;
 
 use edgezero_adapter::cli_support::{
     self, find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
-use edgezero_adapter::env_file::reject_symlinked_target;
+use edgezero_adapter::env_file::{reject_symlink_components, reject_symlinked_target};
 use edgezero_adapter::registry::AdapterExecContext;
 use walkdir::WalkDir;
 
@@ -77,7 +77,13 @@ pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<Path
     // target dir OR an operator-edited `source` never leaves a stale module.
     // Falls back to the CONVENTIONAL workspace target path when the manifest
     // can't be parsed or declares no matching source.
-    refresh_declared_source(&manifest, &workspace_root, &underscored, &artifact)?;
+    refresh_declared_source(
+        &manifest,
+        &workspace_root,
+        ctx.adapter_component(),
+        &underscored,
+        &artifact,
+    )?;
     refresh_conventional_source(&workspace_root, &underscored, &artifact)?;
 
     Ok(dest)
@@ -100,6 +106,12 @@ fn is_same_existing_file(first: &Path, second: &Path) -> bool {
 /// (so it works for a not-yet-created destination). Symlinks are NOT
 /// followed -- that's intentional: the caller separately refuses a symlinked
 /// final component so a link can't redirect the write outside the tree.
+/// Make `path` absolute (prepending the cwd) WITHOUT resolving symlinks or
+/// `..`, so containment comparisons stay in one consistent lexical form.
+fn absolute_path(path: &Path) -> PathBuf {
+    absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn lexically_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -139,6 +151,7 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 fn refresh_declared_source(
     manifest: &Path,
     workspace_root: &Path,
+    component_selector: Option<&str>,
     underscored_wasm: &str,
     artifact: &Path,
 ) -> Result<(), String> {
@@ -153,17 +166,33 @@ fn refresh_declared_source(
         return Ok(());
     };
     let single_component = components.len() == 1;
-    let root = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
-    for component in components.values() {
+    // Compare containment on ABSOLUTE + LEXICALLY-normalised paths (NOT
+    // `canonicalize`d): canonicalize resolves symlinks, so on macOS it maps
+    // `/var/...` -> `/private/var/...` for the root while the source path stays
+    // `/var/...`, spuriously failing `starts_with`. Symlink ESCAPE is handled
+    // separately by `reject_symlink_components` below.
+    let root = lexically_normalize(&absolute_path(workspace_root));
+    for (component_id, component) in components {
         let Some(source) = component.get("source").and_then(toml::Value::as_str) else {
             continue;
         };
-        // A single-component manifest's sole component is this crate's, whatever
-        // its source basename; only a MULTI-component manifest needs the basename
-        // match to avoid clobbering a sibling component.
-        let basename_matches =
-            Path::new(source).file_name().and_then(|name| name.to_str()) == Some(underscored_wasm);
-        if !single_component && !basename_matches {
+        // Identify THIS crate's component. The explicit
+        // `[adapters.spin.adapter].component` selector is authoritative:
+        // refresh EXACTLY that component (whatever its source basename), and no
+        // other. Only WITHOUT a selector do we fall back to the sole component
+        // (single-component manifest) or a source-basename match -- the
+        // basename heuristic both SKIPS a selected component with a custom
+        // filename and CLOBBERS multiple components sharing the crate basename,
+        // which is why the selector takes precedence.
+        let is_target = match component_selector {
+            Some(selector) => component_id.as_str() == selector,
+            None => {
+                single_component
+                    || Path::new(source).file_name().and_then(|name| name.to_str())
+                        == Some(underscored_wasm)
+            }
+        };
+        if !is_target {
             continue;
         }
         let src_path = manifest_dir.join(source);
@@ -172,9 +201,10 @@ fn refresh_declared_source(
         if is_same_existing_file(&src_path, artifact) {
             continue;
         }
-        // Containment: never write through `..` / an absolute source / a
-        // symlink to a location outside the build tree.
-        let normalized = lexically_normalize(&src_path);
+        // Containment: never write through `..` / an absolute source to a
+        // location outside the build tree (a lexical check on the same
+        // absolute + normalised form as `root`).
+        let normalized = lexically_normalize(&absolute_path(&src_path));
         if !normalized.starts_with(&root) {
             return Err(format!(
                 "spin component source `{source}` resolves to {} -- outside the project tree {}; \
@@ -183,15 +213,12 @@ fn refresh_declared_source(
                 root.display()
             ));
         }
-        if src_path
-            .symlink_metadata()
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
-            return Err(format!(
-                "spin component source {} is a symlink; refusing to overwrite through it",
-                src_path.display()
-            ));
-        }
+        // Symlink containment: reject a symlink at ANY component from the
+        // workspace root to the destination, not just the final one. A source
+        // like `escaped/app.wasm` where `escaped` is a symlink passes the
+        // lexical check above yet `fs::copy` would follow it OUTSIDE the tree.
+        reject_symlink_components(&root, &normalized)
+            .map_err(|err| format!("spin component source `{source}` is unsafe to write: {err}"))?;
         if let Some(parent) = src_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
@@ -442,7 +469,19 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
     // `EDGEZERO__...__KEY` is the highest-precedence override and is kept out
     // of `ctx.env()` (adapter.rs "parent wins" -> the host inherits it
     // directly), so it must be merged in HERE or it never reaches the guest.
-    let parent_env: Vec<(String, String)> = env::vars().collect();
+    // Collect from `vars_os()`, NOT `vars()`: `vars()` PANICS if ANY (even
+    // unrelated) environment entry holds non-Unicode bytes, which would crash
+    // `spin serve` before it started. Convert only the `EDGEZERO__*` keys we
+    // forward, skipping any whose key or value is not valid UTF-8.
+    let parent_env: Vec<(String, String)> = env::vars_os()
+        .filter_map(|(key_os, value_os)| {
+            let key = key_os.to_str()?;
+            if !key.starts_with("EDGEZERO__") {
+                return None;
+            }
+            Some((key.to_owned(), value_os.to_str()?.to_owned()))
+        })
+        .collect();
     for pair in guest_env_forwards(ctx.env(), &parent_env) {
         command.arg("--env").arg(pair);
     }
@@ -633,6 +672,71 @@ mod tests {
     /// The common case: no `[adapters.spin.adapter].allowed_outbound_hosts`
     /// declared, so synthesis stays at Spin's deny-all baseline.
     const NO_HOSTS: &[String] = &[];
+
+    #[test]
+    fn refresh_declared_source_honours_the_component_selector() {
+        // A MULTI-component manifest where the SELECTED component has a CUSTOM
+        // source basename (not `<crate>.wasm`). The selector must refresh
+        // exactly that component, and the sibling (which happens to carry the
+        // crate basename) must be left UNTOUCHED.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let artifact = root.join("artifact.wasm");
+        fs::write(&artifact, b"FRESH-BYTES").unwrap();
+        // Two components: `demo` with a custom source name, `other` with the
+        // crate-basename source.
+        fs::write(root.join("selected.wasm"), b"stale").unwrap();
+        fs::write(root.join("app_demo.wasm"), b"sibling").unwrap();
+        let manifest = root.join("spin.toml");
+        fs::write(
+            &manifest,
+            "[component.demo]\nsource = \"selected.wasm\"\n[component.other]\nsource = \"app_demo.wasm\"\n",
+        )
+        .unwrap();
+        refresh_declared_source(&manifest, root, Some("demo"), "app_demo.wasm", &artifact).unwrap();
+        assert_eq!(
+            fs::read(root.join("selected.wasm")).unwrap(),
+            b"FRESH-BYTES",
+            "the SELECTED component's custom source is refreshed"
+        );
+        assert_eq!(
+            fs::read(root.join("app_demo.wasm")).unwrap(),
+            b"sibling",
+            "a sibling sharing the crate basename must NOT be clobbered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_declared_source_rejects_an_intermediate_symlink() {
+        // A source `escaped/app.wasm` where `escaped` is a symlink pointing
+        // OUTSIDE the workspace passes lexical containment yet `fs::copy` would
+        // follow it. Every path component must be checked, not just the last.
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let outside = tempdir().unwrap();
+        let artifact = root.join("artifact.wasm");
+        fs::write(&artifact, b"FRESH").unwrap();
+        symlink(outside.path(), root.join("escaped")).unwrap();
+        let manifest = root.join("spin.toml");
+        fs::write(
+            &manifest,
+            "[component.demo]\nsource = \"escaped/app.wasm\"\n",
+        )
+        .unwrap();
+        let err =
+            refresh_declared_source(&manifest, root, Some("demo"), "app_demo.wasm", &artifact)
+                .expect_err("a source through an intermediate symlink must be refused");
+        assert!(
+            err.contains("symlink") || err.contains("unsafe"),
+            "error explains the symlink refusal: {err}"
+        );
+        assert!(
+            !outside.path().join("app.wasm").exists(),
+            "nothing may be written outside the project through the symlink"
+        );
+    }
 
     #[test]
     fn guest_env_forwards_only_edgezero_namespace() {

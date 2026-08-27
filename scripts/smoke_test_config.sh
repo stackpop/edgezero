@@ -32,6 +32,11 @@ DEMO_SECRET_VALUE="resolved-token"
 # regenerable, is edited in place by the push and by warm-up.
 # shellcheck source=lib/smoke_backup.sh
 . "$ROOT_DIR/scripts/lib/smoke_backup.sh"
+# Sourced early (side-effect-free) so the shared provision-owned backup set
+# is available before the backup block below. `smoke_backup_provision_local`
+# is the single source of truth for which files warm-up can mutate.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
 
 cleanup() {
   # Kill the server AND its descendants (workerd/spin) and free the port
@@ -44,26 +49,12 @@ cleanup() {
 # Back up operator files BEFORE arming the restore trap and BEFORE warm-up
 # (warm-up's `provision --local` and the later `config push` write them).
 # A failed backup aborts HERE, before the trap is armed and before any
-# mutation, so the tree is never left in a half-restored state.
-case "$ADAPTER" in
-  axum)
-    # `config push --local` / provision write `.edgezero/` (local config
-    # JSON + `.env`); back the whole dir up so operator state survives.
-    backup_in_tree "$DEMO_DIR/.edgezero"
-    ;;
-  cloudflare|cf)
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
-    # `config push --local` seeds Miniflare state under `.wrangler/`.
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.wrangler"
-    ;;
-  fastly)
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-    ;;
-  spin)
-    # `config push --local` writes the SQLite store under `.spin/`.
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/.spin"
-    ;;
-esac
+# mutation, so the tree is never left in a half-restored state. The full
+# provision-owned set (manifests + `.env`/`.dev.vars` + emulator-state dirs
+# like `.edgezero`/`.wrangler`/`.spin`) is registered by the shared helper in
+# scripts/lib/smoke_warmup.sh so this list can't drift from what warm-up and
+# `config push --local` actually write.
+smoke_backup_provision_local "$ADAPTER"
 
 # Install the trap AFTER a successful backup so an abort mid-warm-up still
 # restores, while a failed backup aborts before the trap can run. A signal
@@ -76,9 +67,8 @@ trap 'cleanup; exit 143' TERM
 # Warm up per-adapter local state — provision --local synthesises
 # wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
 # and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
-# this because those adapter manifests are gitignored.
-# shellcheck source=lib/smoke_warmup.sh
-. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+# this because those adapter manifests are gitignored. (smoke_warmup.sh is
+# already sourced above, alongside the backup set it defines.)
 echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
 smoke_warmup_provision_local "$ADAPTER"
 

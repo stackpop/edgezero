@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 use std::process::Command;
 
 use edgezero_adapter::cli_support::{
@@ -74,18 +74,27 @@ pub(super) fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Res
     let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
         find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())
     })?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
-    let config = manifest
+    // Run wrangler from the CRATE ROOT, not the manifest dir. `wrangler
+    // deploy`/`dev` run the `[build]` `worker-build` command in the CWD --
+    // which is where `Cargo.toml` lives and where the `build/worker/shim.mjs`
+    // it emits must land. For a NESTED manifest (e.g.
+    // `crates/server/config/wrangler.toml`) the manifest dir is NOT the crate
+    // root, so running there leaves worker-build unable to find `Cargo.toml`
+    // and the shim in the wrong place. The synthesised `main` is written
+    // relative to the manifest dir (see `wrangler_main_relpath`) so it still
+    // resolves to the crate-root output.
+    let crate_dir = cli_support::adapter_crate_dir(ctx, &manifest)?;
+    let config = absolute(&manifest)
+        .unwrap_or(manifest.clone())
         .to_str()
-        .ok_or_else(|| "invalid wrangler config path".to_owned())?;
+        .ok_or_else(|| "invalid wrangler config path".to_owned())?
+        .to_owned();
 
     let mut command = Command::new("wrangler");
     command
-        .args(["deploy", "--config", config])
+        .args(["deploy", "--config", config.as_str()])
         .args(extra_args)
-        .current_dir(manifest_dir);
+        .current_dir(&crate_dir);
     for (key, value) in ctx.env() {
         command.env(key, value);
     }
@@ -105,18 +114,19 @@ pub(super) fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Resu
     let manifest = cli_support::declared_or_discovered_manifest(ctx, || {
         find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())
     })?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
-    let config = manifest
+    // Run from the crate root, same rationale as `deploy` above.
+    let crate_dir = cli_support::adapter_crate_dir(ctx, &manifest)?;
+    let config = absolute(&manifest)
+        .unwrap_or(manifest.clone())
         .to_str()
-        .ok_or_else(|| "invalid wrangler config path".to_owned())?;
+        .ok_or_else(|| "invalid wrangler config path".to_owned())?
+        .to_owned();
 
     let mut command = Command::new("wrangler");
     command
-        .args(["dev", "--config", config])
+        .args(["dev", "--config", config.as_str()])
         .args(extra_args)
-        .current_dir(manifest_dir);
+        .current_dir(&crate_dir);
     for (key, value) in ctx.env() {
         command.env(key, value);
     }
@@ -232,7 +242,32 @@ fn locate_artifact(
 /// Built via `toml_edit::DocumentMut` (NOT raw `format!`) so any
 /// legal name — including values with TOML-significant characters
 /// like `"`, `\`, or newlines — is escaped correctly.
-pub(super) fn synthesise_wrangler_toml(crate_name: &str) -> String {
+/// The `main` value for a wrangler.toml at `manifest_rel` (relative to the
+/// project root) whose crate root is `crate_rel`. Wrangler resolves `main`
+/// against the config-file's directory, while `worker-build` emits
+/// `build/worker/shim.mjs` at the CRATE ROOT (where `Cargo.toml` lives and
+/// where wrangler runs it). So for a manifest nested BELOW the crate root the
+/// value must climb back up with `../` before `build/worker/shim.mjs`.
+pub(super) fn wrangler_main_relpath(manifest_rel: &Path, crate_rel: Option<&str>) -> String {
+    const SHIM: &str = "build/worker/shim.mjs";
+    let manifest_dir = manifest_rel.parent().unwrap_or_else(|| Path::new(""));
+    let Some(crate_root) = crate_rel else {
+        return SHIM.to_owned();
+    };
+    // How far the manifest dir sits BELOW the crate root.
+    let Ok(suffix) = manifest_dir.strip_prefix(Path::new(crate_root)) else {
+        // Manifest not under the declared crate (unusual layout) -- fall back
+        // to the crate-root-adjacent default rather than guess.
+        return SHIM.to_owned();
+    };
+    let depth = suffix.components().count();
+    if depth == 0 {
+        return SHIM.to_owned();
+    }
+    format!("{}{SHIM}", "../".repeat(depth))
+}
+
+pub(super) fn synthesise_wrangler_toml(crate_name: &str, main_rel: &str) -> String {
     use toml_edit::{DocumentMut, value};
 
     let mut doc = DocumentMut::new();
@@ -243,7 +278,12 @@ pub(super) fn synthesise_wrangler_toml(crate_name: &str) -> String {
     // instead of `doc["..."] = ...` sidesteps `clippy::indexing_slicing`
     // (the index form panics if the key is missing; `insert` doesn't).
     doc.insert("name", value(crate_name));
-    doc.insert("main", value("build/worker/shim.mjs"));
+    // `main` is written RELATIVE TO THE MANIFEST DIR (wrangler resolves it
+    // against the config file's location), pointing at the crate-root
+    // `build/worker/shim.mjs` `worker-build` emits. For a manifest at the
+    // crate root this is just `build/worker/shim.mjs`; for a NESTED manifest
+    // it prefixes enough `../` to climb back to the crate root.
+    doc.insert("main", value(main_rel));
     doc.insert("compatibility_date", value("2024-01-01"));
 
     // `[build] command = "worker-build --release"`: `main` points at
@@ -353,6 +393,34 @@ mod tests {
         assert_eq!(located, artifact);
     }
 
+    // ---------- wrangler_main_relpath ----------
+
+    #[test]
+    fn wrangler_main_relpath_climbs_to_the_crate_root() {
+        // Manifest at the crate root -> plain path.
+        assert_eq!(
+            wrangler_main_relpath(Path::new("wrangler.toml"), None),
+            "build/worker/shim.mjs"
+        );
+        assert_eq!(
+            wrangler_main_relpath(Path::new("crates/cf/wrangler.toml"), Some("crates/cf")),
+            "build/worker/shim.mjs"
+        );
+        // Nested one level below the crate root -> one `../`.
+        assert_eq!(
+            wrangler_main_relpath(
+                Path::new("crates/cf/config/wrangler.toml"),
+                Some("crates/cf")
+            ),
+            "../build/worker/shim.mjs"
+        );
+        // Nested two levels.
+        assert_eq!(
+            wrangler_main_relpath(Path::new("crates/cf/a/b/wrangler.toml"), Some("crates/cf")),
+            "../../build/worker/shim.mjs"
+        );
+    }
+
     // ---------- synthesise_wrangler_toml ----------
 
     #[test]
@@ -362,7 +430,7 @@ mod tests {
         // (not an extra): `main` points at the `worker-build`-generated shim,
         // so without it a fresh scaffold cannot serve or deploy. A loose
         // `contains` check let the baseline drift; this pins it.
-        let out = synthesise_wrangler_toml("demo-adapter-cloudflare");
+        let out = synthesise_wrangler_toml("demo-adapter-cloudflare", "build/worker/shim.mjs");
         let expected = "# edgezero-provision: v1\n\
              name = \"demo-adapter-cloudflare\"\n\
              main = \"build/worker/shim.mjs\"\n\
@@ -387,7 +455,7 @@ mod tests {
             "has\nnewline",
             "has = equals",
         ] {
-            let out = synthesise_wrangler_toml(name);
+            let out = synthesise_wrangler_toml(name, "build/worker/shim.mjs");
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
             assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
         }

@@ -1460,12 +1460,21 @@ contract.
 name = "<crate_name>"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-01-01"
+
+[build]
+command = "worker-build --release"
 ```
 
-`build/worker/shim.mjs` matches Wrangler's standard Rust
-worker entrypoint convention. Operators using a different
-build output edit the synthesised file once; re-runs preserve
-the change.
+`main` points at `build/worker/shim.mjs` — the wasm-bindgen glue that
+ONLY `worker-build` produces (a plain `cargo build` emits just the raw
+wasm). The `[build] command` is therefore REQUIRED, not optional: without
+it a fresh scaffold cannot `serve` or `deploy` (`wrangler dev` / `wrangler
+deploy` load `main` but nothing would ever create the shim). `wrangler`
+runs `[build].command` in the CRATE ROOT before dev/deploy; for a NESTED
+manifest `main` is emitted relative to the manifest dir (e.g.
+`../build/worker/shim.mjs`) so it still resolves to that crate-root output.
+Operators using a different build output edit the synthesised file once;
+re-runs preserve the change.
 
 ### Fastly (`fastly.toml`)
 

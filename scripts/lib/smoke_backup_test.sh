@@ -148,6 +148,59 @@ check "unrelated-pid-not-descendant" \
 kill "$child_pid" 2>/dev/null
 wait "$child_pid" 2>/dev/null
 
+# 11. smoke_backup_provision_local registers the FULL provision-owned set for
+#     each adapter, so no smoke script can silently drop a gitignored file
+#     that warm-up (`provision --local`) mutates. Absent fixture paths are
+#     fine: backup_in_tree records an absent path without copying, so this
+#     asserts only WHICH paths get registered, without running provision.
+ROOT_DIR="$work/fixture"
+# shellcheck source=scripts/lib/smoke_warmup.sh
+. "$DIR/smoke_warmup.sh"
+
+registered_has() {  # $1 = path; true if present in BK_ORIG
+  local p
+  for p in ${BK_ORIG[@]+"${BK_ORIG[@]}"}; do
+    [ "$p" = "$1" ] && return 0
+  done
+  return 1
+}
+has() {  # convenience: echo yes/no for a path's registration
+  registered_has "$1" && echo yes || echo no
+}
+
+AX="$DEMO_DIR/crates/app-demo-adapter-axum"
+CF="$DEMO_DIR/crates/app-demo-adapter-cloudflare"
+FA="$DEMO_DIR/crates/app-demo-adapter-fastly"
+SP="$DEMO_DIR/crates/app-demo-adapter-spin"
+
+# `.edgezero/` is created by EVERY adapter's provision (provision.lock), so
+# it must be registered no matter which adapter is warmed up.
+reset_backups; smoke_backup_provision_local axum
+check "provset-axum-edgezero"   "$(has "$DEMO_DIR/.edgezero")" "yes"
+check "provset-axum-toml"       "$(has "$AX/axum.toml")"       "yes"
+
+reset_backups; smoke_backup_provision_local cloudflare
+check "provset-cf-edgezero"     "$(has "$DEMO_DIR/.edgezero")" "yes"
+check "provset-cf-wrangler"     "$(has "$CF/wrangler.toml")"   "yes"
+check "provset-cf-devvars"      "$(has "$CF/.dev.vars")"       "yes"
+check "provset-cf-wranglerdir"  "$(has "$CF/.wrangler")"       "yes"
+
+# The `cf` alias must resolve to the same cloudflare set.
+reset_backups; smoke_backup_provision_local cf
+check "provset-cfalias-wrangler" "$(has "$CF/wrangler.toml")"  "yes"
+
+reset_backups; smoke_backup_provision_local fastly
+check "provset-fastly-edgezero" "$(has "$DEMO_DIR/.edgezero")" "yes"
+check "provset-fastly-toml"     "$(has "$FA/fastly.toml")"     "yes"
+
+reset_backups; smoke_backup_provision_local spin
+check "provset-spin-edgezero"   "$(has "$DEMO_DIR/.edgezero")" "yes"
+check "provset-spin-toml"       "$(has "$SP/spin.toml")"       "yes"
+check "provset-spin-runtime"    "$(has "$SP/runtime-config.toml")" "yes"
+check "provset-spin-env"        "$(has "$SP/.env")"            "yes"
+check "provset-spin-spindir"    "$(has "$SP/.spin")"           "yes"
+reset_backups
+
 rm -rf "$work"
 
 printf 'smoke_backup_test: %d passed, %d failed\n' "$pass" "$fail"

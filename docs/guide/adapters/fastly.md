@@ -72,8 +72,11 @@ All adapter manifests follow the same gitignored-generated model
 `#[secret]` field on your typed `MyAppConfig`, keyed to
 `[stores.secrets].ids` — so Viceroy resolves secrets during
 `fastly compute serve` without touching the real Fastly Secret Store.
-Fill in real values before running Viceroy; the entries live inside
-gitignored `fastly.toml` so they stay per-developer.
+Each entry is `key = "<name>"` with `env = "<NAME_UPPER>"`, so the value
+is read from an ENVIRONMENT VARIABLE, NOT stored in `fastly.toml`. Set the
+`<NAME_UPPER>` env var before running Viceroy (e.g.
+`DEMO_API_TOKEN=… edgezero serve --adapter fastly`); nothing secret is
+written into the (gitignored) manifest.
 :::
 
 ### Entrypoint

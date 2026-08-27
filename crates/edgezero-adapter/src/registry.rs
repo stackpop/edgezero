@@ -264,6 +264,7 @@ pub struct AdapterExecContext<'ctx> {
     env: &'ctx [(String, String)],
     adapter_manifest: Option<&'ctx Path>,
     adapter_crate: Option<&'ctx Path>,
+    adapter_component: Option<&'ctx str>,
 }
 
 impl<'ctx> AdapterExecContext<'ctx> {
@@ -277,6 +278,7 @@ impl<'ctx> AdapterExecContext<'ctx> {
             env: &[],
             adapter_manifest: None,
             adapter_crate: None,
+            adapter_component: None,
         }
     }
 
@@ -319,6 +321,18 @@ impl<'ctx> AdapterExecContext<'ctx> {
         self
     }
 
+    /// The manifest-declared `[adapters.<name>.adapter].component` selector,
+    /// naming WHICH `[component.*]` this build targets in a multi-component
+    /// `spin.toml`. Adapters use it to refresh the SELECTED component's module
+    /// (not one matched by source basename, which skips a custom filename and
+    /// clobbers siblings sharing the crate basename).
+    #[must_use]
+    #[inline]
+    pub fn with_adapter_component(mut self, adapter_component: &'ctx str) -> Self {
+        self.adapter_component = Some(adapter_component);
+        self
+    }
+
     /// Fully-resolved `(key, value)` pairs to set on the child.
     #[must_use]
     #[inline]
@@ -358,6 +372,13 @@ impl<'ctx> AdapterExecContext<'ctx> {
     #[inline]
     pub fn adapter_crate(&self) -> Option<&'ctx Path> {
         self.adapter_crate
+    }
+
+    /// The declared `[adapters.<name>.adapter].component` selector, when set.
+    #[must_use]
+    #[inline]
+    pub fn adapter_component(&self) -> Option<&'ctx str> {
+        self.adapter_component
     }
 
     /// Apply this context to a [`Command`] the adapter is about to

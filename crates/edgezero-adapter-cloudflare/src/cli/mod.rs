@@ -490,7 +490,14 @@ impl Adapter for CloudflareCliAdapter {
                     }
                 }),
         };
-        Ok(vec![(rel, run::synthesise_wrangler_toml(&crate_name))])
+        // `main` must climb from the manifest dir back to the crate root's
+        // `build/worker/shim.mjs` (see `run::wrangler_main_relpath`) so a
+        // nested manifest still resolves the worker-build output.
+        let main_rel = run::wrangler_main_relpath(&rel, adapter_crate_path);
+        Ok(vec![(
+            rel,
+            run::synthesise_wrangler_toml(&crate_name, &main_rel),
+        )])
     }
 }
 

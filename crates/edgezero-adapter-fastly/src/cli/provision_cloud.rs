@@ -239,37 +239,43 @@ pub(super) fn provision(
 /// `edgezero_runtime_env_from_config_store` in lib.rs), falling back to the
 /// logical id -- so a store whose platform name was OVERRIDDEN away from its
 /// logical id (a rename) is UNREACHABLE at runtime unless the mapping is
-/// written here; creating the store alone is not enough. Only RENAMED stores
-/// (platform != logical) need an entry; the rest resolve via the fallback.
+/// written here; creating the store alone is not enough.
+///
+/// Convergence: reprovision writes the managed key for EVERY declared store,
+/// not just renamed ones. Writing only when `platform != logical` leaves a
+/// STALE mapping behind when an earlier rename is later REVERTED (platform put
+/// back to the logical id): the old override entry keeps steering the runtime
+/// at the wrong store while `config push` targets the logical name -- a silent
+/// split. Upserting the current platform name (which EQUALS the logical id
+/// when there is no override) for every store is idempotent and keeps the
+/// mapping self-consistent with what `config push` uses.
 fn populate_runtime_name_mappings(
     stores: &ProvisionStores<'_>,
     runtime_env_name: &str,
     dry_run: bool,
     out: &mut Vec<String>,
 ) -> Result<(), String> {
-    let renamed: Vec<(&str, String, &str)> = [
+    let mappings: Vec<(&str, String, &str)> = [
         ("KV", stores.kv),
         ("CONFIG", stores.config),
         ("SECRETS", stores.secrets),
     ]
     .into_iter()
     .flat_map(|(kind, ids)| {
-        ids.iter()
-            .filter(|store| store.platform != store.logical)
-            .map(move |store| {
-                (
-                    kind,
-                    store.logical.to_ascii_uppercase(),
-                    store.platform.as_str(),
-                )
-            })
+        ids.iter().map(move |store| {
+            (
+                kind,
+                store.logical.to_ascii_uppercase(),
+                store.platform.as_str(),
+            )
+        })
     })
     .collect();
-    if renamed.is_empty() {
+    if mappings.is_empty() {
         return Ok(());
     }
     if dry_run {
-        for (kind, id_upper, platform) in &renamed {
+        for (kind, id_upper, platform) in &mappings {
             out.push(format!(
                 "would set `EDGEZERO__STORES__{kind}__{id_upper}__NAME={platform}` in the `{runtime_env_name}` config store (runtime store-name mapping)"
             ));
@@ -282,7 +288,7 @@ fn populate_runtime_name_mappings(
                 "created `{runtime_env_name}` but could not resolve its store id to write the runtime store-name mappings; re-run `edgezero provision --adapter fastly`"
             )
         })?;
-    for (kind, id_upper, platform) in &renamed {
+    for (kind, id_upper, platform) in &mappings {
         let key = format!("EDGEZERO__STORES__{kind}__{id_upper}__NAME");
         super::push_cloud::create_config_store_entry(&store_id, &key, platform)?;
         out.push(format!(
@@ -918,8 +924,10 @@ mod tests {
                 true,
             )
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret + 1 runtime-env = 4 status lines.
-        assert_eq!(out.status_lines.len(), 4);
+        // 1 KV + 1 config + 1 secret + 1 runtime-env create rows, then the
+        // convergence rows: one runtime store-name mapping PER declared store
+        // (written unconditionally now, even when platform == logical) = 7.
+        assert_eq!(out.status_lines.len(), 7);
         assert!(out.status_lines[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(
             out.status_lines[1]
@@ -933,9 +941,81 @@ mod tests {
                 .contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
             "runtime-env store row: {out:?}",
         );
+        // Every declared store gets a store-name mapping converged to its
+        // platform name (== logical id here, since nothing is renamed).
+        assert!(
+            out.status_lines[4]
+                .contains("would set `EDGEZERO__STORES__KV__SESSIONS__NAME=sessions`"),
+            "kv mapping row: {out:?}",
+        );
+        assert!(
+            out.status_lines[5]
+                .contains("would set `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config`"),
+            "config mapping row: {out:?}",
+        );
+        assert!(
+            out.status_lines[6]
+                .contains("would set `EDGEZERO__STORES__SECRETS__DEFAULT__NAME=default`"),
+            "secret mapping row: {out:?}",
+        );
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
+    }
+
+    // ---------- populate_runtime_name_mappings (convergence) ----------
+
+    /// Reprovision must CONVERGE the managed store-name key for EVERY declared
+    /// store, not only renamed ones. Sequence that used to break: an operator
+    /// renames `app_config` -> `prod_config` (writing
+    /// `...APP_CONFIG__NAME=prod_config`), then REVERTS the override (platform
+    /// back to the logical `app_config`). The old code wrote nothing on the
+    /// revert because platform == logical, leaving the stale `prod_config`
+    /// mapping so the runtime kept opening `prod_config` while `config push`
+    /// targeted `app_config`. Now the reverted store still gets its mapping
+    /// re-emitted, converged back to the logical name.
+    #[test]
+    fn populate_runtime_name_mappings_converges_reverted_store() {
+        // Reverted store: platform back in line with the logical id.
+        let config_ids = vec![ResolvedStoreId::new("app_config", "app_config")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        let mut out = Vec::new();
+        // Dry-run so no `fastly` shellout -- it still models the exact write.
+        populate_runtime_name_mappings(&stores, "edgezero_runtime_env", true, &mut out)
+            .expect("dry-run mapping succeeds");
+        assert_eq!(
+            out.len(),
+            1,
+            "reverted store still gets a mapping row: {out:?}"
+        );
+        assert!(
+            out[0].contains("would set `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config`"),
+            "revert converges the managed key back to the logical name: {out:?}"
+        );
+    }
+
+    /// A genuine rename (platform != logical) still writes the override name --
+    /// convergence did not regress the rename path.
+    #[test]
+    fn populate_runtime_name_mappings_writes_override_for_rename() {
+        let config_ids = vec![ResolvedStoreId::new("app_config", "prod_config")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        let mut out = Vec::new();
+        populate_runtime_name_mappings(&stores, "edgezero_runtime_env", true, &mut out)
+            .expect("dry-run mapping succeeds");
+        assert_eq!(out.len(), 1, "renamed store gets a mapping row: {out:?}");
+        assert!(
+            out[0].contains("would set `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config`"),
+            "rename maps the logical id to the platform name: {out:?}"
+        );
     }
 
     /// Spec contract: cloud provision
@@ -1248,11 +1328,14 @@ mod tests {
 
     #[test]
     fn provision_skips_id_when_setup_block_already_present() {
-        // setup_block_present's role in the flow: re-running
-        // provision after the user already declared a store in
-        // fastly.toml must be a no-op (no shell-out to fastly).
-        // We can verify this in a real (non-dry-run) call because
-        // the skip path bypasses create_fastly_store entirely.
+        // setup_block_present's role in the flow: re-running provision after
+        // the user already declared a store in fastly.toml must not re-create
+        // it (no `fastly *-store create` shell-out). We drive this in dry-run:
+        // the loop's skip-check runs BEFORE the dry-run branch, so an
+        // already-present block yields the same "already declared; skipping"
+        // line the real run emits, while never invoking the CLI. (A real run
+        // now still shells out at the convergence step to reconcile the
+        // runtime store-name mappings, so it can't run without `fastly`.)
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(
@@ -1275,13 +1358,21 @@ mod tests {
                 &stores,
                 None,
                 ProvisionMode::Cloud,
-                false,
+                true,
             )
             .expect("skip path succeeds without invoking fastly");
-        assert_eq!(out.status_lines.len(), 1);
+        // The declared store is skipped (not re-created); the convergence step
+        // still models its runtime store-name mapping.
+        assert_eq!(out.status_lines.len(), 2, "got: {out:?}");
         assert!(
-            out.status_lines[0].contains("already declared"),
-            "got: {out:?}"
+            out.status_lines[0].contains("already declared")
+                && !out.status_lines[0].contains("would run"),
+            "declared store skipped, not re-created: {out:?}"
+        );
+        assert!(
+            out.status_lines[1]
+                .contains("would set `EDGEZERO__STORES__KV__SESSIONS__NAME=sessions`"),
+            "convergence still reconciles the mapping on a skip run: {out:?}"
         );
     }
 

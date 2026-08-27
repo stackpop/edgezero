@@ -8,6 +8,7 @@
 //! each `edgezero-adapter-*` crate's `Adapter::provision` impl, not
 //! here.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -152,6 +153,11 @@ fn enforce_adapter_path_guard(
 
 fn acquire_provision_lock(args: &ProvisionArgs) -> Result<Option<ProvisionLock>, String> {
     if args.dry_run {
+        // A dry-run stays truly non-mutating: it must NOT create the
+        // `.edgezero/provision.lock` sentinel in the worktree. Snapshot
+        // consistency is achieved instead by diffing against a PRISTINE copy
+        // captured at staging time (see `run_local_dry_run` /
+        // `run_with_staging`), so no live re-read races a concurrent writer.
         Ok(None)
     } else {
         Ok(Some(ProvisionLock::acquire(manifest_root_from(
@@ -170,10 +176,9 @@ fn acquire_provision_lock(args: &ProvisionArgs) -> Result<Option<ProvisionLock>,
 pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // Serialise concurrent invocations against the same tree so
     // read-modify-write on `.env` / `.dev.vars` / `edgezero.toml`
-    // never silently drops a competing writer's edits. Dry-run
-    // skips: nothing is written, and holding the lock during a
-    // long staging + diff would starve real writers. See
-    // `provision_lock.rs` for the design rationale.
+    // never silently drops a competing writer's edits. Dry-run skips the lock
+    // (it must not create the lock sentinel) and gets snapshot consistency from
+    // a pristine staged copy instead. See `provision_lock.rs` for the design.
     let _lock = acquire_provision_lock(args)?;
     run_provision_inner(args)
 }
@@ -536,9 +541,12 @@ fn merge_and_render_typed_dry_run(
     synthesised: &[PathBuf],
     canonical_adapter_name: &str,
     adapter_manifest_rel: Option<&str>,
-    manifest_root: &Path,
-    staged_root: &Path,
+    // `(project_root, staged_root)` -- bundled so the arg count stays within
+    // the restriction-lint limit now that the pristine snapshot is threaded.
+    roots: (&Path, &Path),
+    pristine: Option<&BTreeMap<PathBuf, String>>,
 ) -> (String, Option<String>) {
+    let (manifest_root, staged_root) = roots;
     let staged_str = staged_root.to_string_lossy().into_owned();
     let project_str = manifest_root.to_string_lossy().into_owned();
 
@@ -584,7 +592,8 @@ fn merge_and_render_typed_dry_run(
         &adapter_lower,
         &adapter_manifest_abs,
     );
-    let report = render_dry_run_report(manifest_root, staged_root, &allow_list, &combined);
+    let report =
+        render_dry_run_report(manifest_root, staged_root, &allow_list, &combined, pristine);
     (report, merged_error)
 }
 
@@ -628,6 +637,15 @@ fn run_local_dry_run_typed(
             let staged_str = staged_root.to_string_lossy().into_owned();
             let project_str = manifest_root.to_string_lossy().into_owned();
             let sanitize = |err: String| err.replace(&staged_str, &project_str);
+            // Snapshot the diff-target files NOW, before any baseline or
+            // provision write mutates the staged tree, so the report's
+            // "before" side is a single consistent worktree instant.
+            let pristine = capture_pristine_snapshot(&resolve_dry_run_allow_list(
+                manifest_root,
+                staged_root,
+                canonical_adapter_name,
+                adapter_manifest_rel,
+            ));
             let synthesised =
                 write_baseline_to_disk(staged_root, &baseline_pairs).map_err(&sanitize)?;
             adapter
@@ -683,8 +701,8 @@ fn run_local_dry_run_typed(
                 &synthesised,
                 canonical_adapter_name,
                 adapter_manifest_rel,
-                manifest_root,
-                staged_root,
+                (manifest_root, staged_root),
+                Some(&pristine),
             ))
         },
     )?;
@@ -1229,6 +1247,49 @@ pub(crate) fn build_dry_run_allow_list(
     DryRunAllowList { pairs }
 }
 
+/// Snapshot the pre-provision content of every diff-target file in the
+/// staged tree, keyed by its staged path. Captured at staging time (T1),
+/// BEFORE the adapter writes into the tempdir, so the dry-run diff's
+/// "before" side reflects a single consistent worktree snapshot instead of
+/// re-reading the live project files at render time (T2). An external
+/// process rewriting `edgezero.toml` / `.env` mid-run can then no longer
+/// smear two snapshots together into a misleading diff. Files absent at T1
+/// are simply omitted -- their "before" side is empty, exactly as a
+/// freshly synthesised manifest should read.
+fn capture_pristine_snapshot(allow_list: &DryRunAllowList) -> BTreeMap<PathBuf, String> {
+    allow_list
+        .pairs
+        .iter()
+        .filter_map(|(_project, staged)| {
+            fs::read_to_string(staged)
+                .ok()
+                .map(|body| (staged.clone(), body))
+        })
+        .collect()
+}
+
+/// Resolve the dry-run allow-list for `adapter_name` against the staged
+/// tree: lowercase the adapter, fall back to its default manifest name when
+/// unset, and build the `(project, staged)` diff pairs. Shared by the
+/// snapshot capture (T1, pre-provision) and the report render (T2), so both
+/// key off identical staged paths.
+fn resolve_dry_run_allow_list(
+    manifest_root: &Path,
+    staged_root: &Path,
+    adapter_name: &str,
+    adapter_manifest_rel: Option<&str>,
+) -> DryRunAllowList {
+    let adapter_lower = adapter_name.to_lowercase();
+    let manifest_rel =
+        adapter_manifest_rel.unwrap_or_else(|| default_adapter_manifest_for(&adapter_lower));
+    build_dry_run_allow_list(
+        manifest_root,
+        staged_root,
+        &adapter_lower,
+        &staged_root.join(manifest_rel),
+    )
+}
+
 /// Per-adapter default manifest filename. Fallback for when
 /// `[adapters.<name>.adapter].manifest` is unset. Mirrors each
 /// adapter crate's default.
@@ -1268,6 +1329,7 @@ pub(crate) fn render_dry_run_report(
     staged_root: &Path,
     allow_list: &DryRunAllowList,
     outcome: &adapter_registry::ProvisionOutcome,
+    pristine: Option<&BTreeMap<PathBuf, String>>,
 ) -> String {
     let mut out = String::new();
 
@@ -1303,19 +1365,31 @@ pub(crate) fn render_dry_run_report(
             continue;
         }
         let new = fs::read_to_string(staged_path).unwrap_or_default();
-        // Do NOT follow a symlinked project file. The real provision writer
-        // rejects a symlinked `.env` / `.dev.vars` target, so following the
-        // link HERE would read (and render into the dry-run diff) the content
-        // of whatever it points at -- e.g. `~/.aws/credentials`. Treat a
-        // symlinked source as empty so the preview shows the staged content as
-        // added, never the external target's bytes.
-        let old = if proj_path
-            .symlink_metadata()
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
-            String::new()
-        } else {
-            fs::read_to_string(proj_path).unwrap_or_default()
+        // The "before" side. In snapshot mode (`pristine` is `Some`) it is
+        // read from the T1 staging snapshot keyed by `staged_path`, so the
+        // diff reflects one consistent worktree instant even if an external
+        // process rewrites the live file mid-run; an absent key means the
+        // file did not exist at T1 (empty "before"). The snapshot was taken
+        // from the staged copy, which `copy_dir_recursive` builds WITHOUT
+        // following symlinks, so no external target's bytes can leak in.
+        //
+        // Legacy mode (`None`, unit tests only) reads the live project file.
+        // We still must NOT follow a symlinked project file there: the real
+        // provision writer rejects a symlinked `.env` / `.dev.vars` target,
+        // so following the link would read (and render into the diff) the
+        // content of whatever it points at -- e.g. `~/.aws/credentials`.
+        let old = match pristine {
+            Some(snapshot) => snapshot.get(staged_path).cloned().unwrap_or_default(),
+            None => {
+                if proj_path
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    String::new()
+                } else {
+                    fs::read_to_string(proj_path).unwrap_or_default()
+                }
+            }
         };
         if old == new {
             // Content is identical, but a PERMISSION-only repair (e.g.
@@ -1398,8 +1472,44 @@ fn is_env_secret_carriage_path(path: &Path) -> bool {
 /// `.dev.vars` never surfaces operator secrets as context in the
 /// unified-diff output. Structural changes (added/removed KEYS,
 /// added comment lines) still show up as normal +/- hunks.
+/// Does an env value OPEN a multiline quoted value -- i.e. start with a
+/// quote (`"` or `'`) that it does not close (unescaped) on the same line?
+/// Returns the quote char when so, so continuation lines get redacted.
+fn env_value_opens_multiline_quote(value: &str) -> Option<char> {
+    let mut chars = value.trim_start().chars();
+    let quote = chars.next().filter(|ch| *ch == '"' || *ch == '\'')?;
+    // Closed (unescaped) on this same line -> a single-line quoted value.
+    if env_line_closes_quote(chars.as_str(), quote) {
+        return None;
+    }
+    Some(quote)
+}
+
+/// Does `line` contain an UNESCAPED occurrence of `quote` (closing an open
+/// multiline quoted value)?
+fn env_line_closes_quote(line: &str, quote: char) -> bool {
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return true;
+        } else {
+            // An ordinary character -- keep scanning.
+        }
+    }
+    false
+}
+
 fn redact_env_body_for_diff(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
+    // The quote char of a multiline quoted value we are INSIDE. A dotenv
+    // value like `KEY="line1\nline2"` spans lines; only its first line is
+    // `KEY=`-shaped, so without this state the CONTINUATION lines (real secret
+    // bytes) would fall through and surface in the unified-diff context.
+    let mut in_multiline: Option<char> = None;
     for line in body.split_inclusive('\n') {
         // Split off the trailing newline (if any) — env-file content
         // is normally 7-bit ASCII, but redaction of a hand-authored
@@ -1408,6 +1518,16 @@ fn redact_env_body_for_diff(body: &str) -> String {
             Some(idx) => line.split_at(idx),
             None => (line, ""),
         };
+        // A continuation line of a multiline quoted value: the WHOLE line is
+        // secret content -- redact it, and end the state at the closing quote.
+        if let Some(quote) = in_multiline {
+            out.push_str("<redacted>");
+            out.push_str(tail);
+            if env_line_closes_quote(content, quote) {
+                in_multiline = None;
+            }
+            continue;
+        }
         let trimmed = content.trim_start();
         if trimmed.is_empty() {
             out.push_str(line);
@@ -1429,7 +1549,7 @@ fn redact_env_body_for_diff(body: &str) -> String {
         // context stays readable.
         if let Some(after_hash) = trimmed.strip_prefix('#') {
             let body_after_hash = after_hash.trim_start();
-            if let Some((key, _value)) = body_after_hash.split_once('=') {
+            if let Some((key, value)) = body_after_hash.split_once('=') {
                 // Preserve the operator's original indent + leading
                 // `#` shape (e.g. `#`, `# `, `  # `). Iterate chars
                 // rather than byte-slice so a multi-byte UTF-8
@@ -1453,17 +1573,22 @@ fn redact_env_body_for_diff(body: &str) -> String {
                 out.push_str(key);
                 out.push_str("=<redacted>");
                 out.push_str(tail);
+                // A commented value can also open a multiline quote.
+                in_multiline = env_value_opens_multiline_quote(value);
                 continue;
             }
             // Pure comment — no `=` in the body.
             out.push_str(line);
             continue;
         }
-        if let Some((key, _value)) = content.split_once('=') {
+        if let Some((key, value)) = content.split_once('=') {
             out.push_str(key);
             out.push('=');
             out.push_str("<redacted>");
             out.push_str(tail);
+            // If the value opens a quote it doesn't close on this line, the
+            // secret continues onto the next lines -- redact those too.
+            in_multiline = env_value_opens_multiline_quote(value);
         } else {
             // Malformed line without `=`; emit as-is so the operator
             // sees the structural anomaly. Not a secret leak: any
@@ -1509,7 +1634,7 @@ fn run_local_dry_run(
         .crate_path
         .as_deref()
         .map_or_else(|| Path::new("."), Path::new);
-    let (outcome, tempdir) = run_with_staging(
+    let (staged_result, tempdir) = run_with_staging(
         manifest_root,
         adapter_crate_rel,
         |staged_root, _staged_crate| {
@@ -1522,6 +1647,17 @@ fn run_local_dry_run(
             let staged_str = staged_root.to_string_lossy().into_owned();
             let project_str = manifest_root.to_string_lossy().into_owned();
             let sanitize = |err: String| err.replace(&staged_str, &project_str);
+            // Snapshot the diff-target files NOW, before any baseline or
+            // provision write mutates the staged tree, so the report's
+            // "before" side is a single consistent worktree instant. Keys
+            // match the allow-list rebuilt below the closure (same
+            // `staged_root` + manifest resolution).
+            let pristine = capture_pristine_snapshot(&resolve_dry_run_allow_list(
+                manifest_root,
+                staged_root,
+                &args.adapter,
+                adapter_cfg.adapter.manifest.as_deref(),
+            ));
             let synthesised =
                 write_baseline_to_disk(staged_root, &baseline_pairs).map_err(sanitize)?;
             adapter
@@ -1557,7 +1693,7 @@ fn run_local_dry_run(
             // Prepend baseline-write lines with staged paths rewritten
             // back to project-relative form (spec §"Dry-run": stdout
             // must NEVER carry raw tempdir paths).
-            Ok(prepend_baseline_status_lines_with_rewrite(
+            let rewritten = prepend_baseline_status_lines_with_rewrite(
                 &args.adapter,
                 &synthesised,
                 outcome,
@@ -1566,25 +1702,26 @@ fn run_local_dry_run(
                         .to_string()
                         .replace(&staged_str, &project_str)
                 },
-            ))
+            );
+            Ok((rewritten, pristine))
         },
     )?;
+    let (outcome, pristine) = staged_result;
 
     let staged_root = tempdir.path();
-    let adapter_lower = args.adapter.to_lowercase();
-    let adapter_manifest_rel = adapter_cfg
-        .adapter
-        .manifest
-        .as_deref()
-        .unwrap_or_else(|| default_adapter_manifest_for(&adapter_lower));
-    let adapter_manifest_staged = staged_root.join(adapter_manifest_rel);
-    let allow_list = build_dry_run_allow_list(
+    let allow_list = resolve_dry_run_allow_list(
         manifest_root,
         staged_root,
-        &adapter_lower,
-        &adapter_manifest_staged,
+        &args.adapter,
+        adapter_cfg.adapter.manifest.as_deref(),
     );
-    let report = render_dry_run_report(manifest_root, staged_root, &allow_list, &outcome);
+    let report = render_dry_run_report(
+        manifest_root,
+        staged_root,
+        &allow_list,
+        &outcome,
+        Some(&pristine),
+    );
     // Only emit the report if it's non-empty (avoids extraneous blank
     // log lines when the adapter status_lines are empty and no
     // allow-list file differs).
@@ -2985,10 +3122,51 @@ ids = ["default"]
             pairs: vec![(proj.clone(), staged.clone())],
         };
         let outcome = ProvisionOutcome::from_status_lines(vec![]);
-        let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome);
+        let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome, None);
         assert!(
             report.contains("would change file mode 0644 -> 0600"),
             "a permission-only repair must be previewed: {report}"
+        );
+    }
+
+    #[test]
+    fn dry_run_snapshot_mode_diffs_against_the_captured_before_not_the_live_file() {
+        // Snapshot consistency: the "before" side must come from the T1
+        // staging snapshot, so a concurrent external rewrite of the live
+        // project file between staging and render cannot smear two
+        // worktree instants into one misleading diff.
+        let temp = TempDir::new().expect("temp dir");
+        let proj = temp.path().join("wrangler.toml");
+        let staged = temp.path().join("staged.wrangler.toml");
+        // T1: the file held `name = "before"` when staging copied it.
+        fs::write(&proj, "name = \"before\"\n").expect("write proj");
+        fs::write(&staged, "name = \"before\"\n").expect("write staged");
+        let allow_list = DryRunAllowList {
+            pairs: vec![(proj.clone(), staged.clone())],
+        };
+        let pristine = capture_pristine_snapshot(&allow_list);
+
+        // Provision writes the staged twin (`new` side).
+        fs::write(&staged, "name = \"after\"\n").expect("rewrite staged");
+        // An external process concurrently rewrites the LIVE file. Legacy
+        // mode would read this as `old`; snapshot mode must ignore it.
+        fs::write(&proj, "name = \"CONCURRENT\"\n").expect("rewrite proj");
+
+        let outcome = ProvisionOutcome::from_status_lines(vec![]);
+        let report = render_dry_run_report(
+            temp.path(),
+            temp.path(),
+            &allow_list,
+            &outcome,
+            Some(&pristine),
+        );
+        assert!(
+            report.contains("-name = \"before\"") && report.contains("+name = \"after\""),
+            "snapshot mode must diff the captured before against the staged after: {report}"
+        );
+        assert!(
+            !report.contains("CONCURRENT"),
+            "the concurrently-rewritten live file must never enter the diff: {report}"
         );
     }
 
@@ -3017,7 +3195,7 @@ ids = ["default"]
                 .to_owned(),
         ]);
         let allow_list = DryRunAllowList { pairs: vec![] };
-        let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome);
+        let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome, None);
         assert!(
             report.contains("would write crates/spin/spin.toml"),
             "verb-rewriting must turn 'wrote' into 'would write': {report}"
@@ -3102,8 +3280,8 @@ ids = ["default"]
             &[],
             "axum",
             Some("axum.toml"),
-            dir.path(),
-            dir.path(),
+            (dir.path(), dir.path()),
+            None,
         );
         assert_eq!(
             error.as_deref(),
@@ -3123,7 +3301,7 @@ ids = ["default"]
             "wrote /tmp/staging-xyz/proj/crates/spin/spin.toml".to_owned(),
         ]);
         let allow_list = DryRunAllowList { pairs: vec![] };
-        let report = render_dry_run_report(project, staged, &allow_list, &outcome);
+        let report = render_dry_run_report(project, staged, &allow_list, &outcome, None);
         assert!(
             report.contains("would write /home/dev/proj/crates/spin/spin.toml"),
             "staged path rewritten to project-relative: {report}"
@@ -3157,6 +3335,7 @@ ids = ["default"]
             staged.path(),
             &cf_allow,
             &ProvisionOutcome::default(),
+            None,
         );
         assert!(
             cf_report.contains("wrangler.toml"),
@@ -3193,6 +3372,7 @@ ids = ["default"]
             axum_staged.path(),
             &axum_allow,
             &ProvisionOutcome::default(),
+            None,
         );
         assert!(
             axum_report.contains(".edgezero/.env"),
@@ -3243,6 +3423,7 @@ ids = ["default"]
             staged.path(),
             &allow,
             &ProvisionOutcome::default(),
+            None,
         );
 
         // Positive: nested paths present
@@ -4508,7 +4689,8 @@ ids = ["default"]
             pairs: vec![(project_env.clone(), staged_env.clone())],
         };
         let outcome = adapter_registry::ProvisionOutcome::default();
-        let report = render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome);
+        let report =
+            render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome, None);
 
         assert!(
             !report.contains(secret_value),
@@ -4542,7 +4724,8 @@ ids = ["default"]
             pairs: vec![(project_env.clone(), staged_env.clone())],
         };
         let outcome = adapter_registry::ProvisionOutcome::default();
-        let report = render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome);
+        let report =
+            render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome, None);
 
         assert!(!report.contains("old-secret"), "old value leaked: {report}");
         assert!(!report.contains("new-secret"), "new value leaked: {report}");
@@ -4569,7 +4752,8 @@ ids = ["default"]
             pairs: vec![(project_toml.clone(), staged_toml.clone())],
         };
         let outcome = adapter_registry::ProvisionOutcome::default();
-        let report = render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome);
+        let report =
+            render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome, None);
 
         assert!(
             report.contains("old-name") && report.contains("new-name"),
@@ -4633,6 +4817,34 @@ ids = ["default"]
             !redacted.contains("live-secret"),
             "SECURITY: non-comment value redacted (sanity check): {redacted}"
         );
+    }
+
+    #[test]
+    fn redact_env_body_redacts_multiline_quoted_values() {
+        // A dotenv multiline quoted value: only the first line is `KEY=`-
+        // shaped. The CONTINUATION lines carry secret bytes and must be
+        // redacted, not passed through into the diff. A following ordinary
+        // line must resume normal handling once the quote closes.
+        let body = "\
+API_KEY=\"line-one-SECRET\n\
+line-two-SECRET\n\
+line-three-SECRET\"\n\
+GREETING=hello\n";
+        let redacted = redact_env_body_for_diff(body);
+        assert!(
+            !redacted.contains("SECRET"),
+            "no secret continuation bytes may survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("API_KEY=<redacted>"),
+            "the opening line is redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("GREETING=<redacted>"),
+            "handling resumes after the closing quote: {redacted}"
+        );
+        // Line count is preserved (each continuation becomes `<redacted>`).
+        assert_eq!(redacted.lines().count(), 4, "line structure preserved");
     }
 
     #[test]

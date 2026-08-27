@@ -588,70 +588,6 @@ fn missing_local_config_store_error(path: &Path, platform_name: &str) -> String 
     )
 }
 
-/// Read-only counterpart to [`write_fastly_local_config_store`]'s
-/// structural precondition: succeeds only when the provision-owned
-/// `[local_server.config_stores.<platform_name>.contents]` table already
-/// exists.
-///
-/// `config push --local --dry-run` calls this so the preview models the
-/// real run's refusal WITHOUT touching the file -- previewing an edit the
-/// real push would reject is worse than no preview at all.
-pub(super) fn assert_local_config_store_provisioned(
-    path: &Path,
-    platform_name: &str,
-) -> Result<(), String> {
-    use std::io::ErrorKind;
-    use toml_edit::{DocumentMut, Item};
-
-    let raw = fs::read_to_string(path).map_err(|err| {
-        if err.kind() == ErrorKind::NotFound {
-            format!(
-                "{}: not found; run `provision --adapter fastly --local` first to create the local config store, then re-run config push",
-                path.display()
-            )
-        } else {
-            format!("failed to read {}: {err}", path.display())
-        }
-    })?;
-    // REDACT the parse error: a `toml_edit` parse failure can quote the
-    // offending stored VALUE (an operator secret), so a dry-run that surfaced
-    // it verbatim would leak what the real writer (which redacts the same
-    // failure) never does.
-    let doc: DocumentMut = raw.parse().map_err(|_err| {
-        format!(
-            "failed to parse {} as TOML (details redacted: the error can quote a stored value)",
-            path.display()
-        )
-    })?;
-    let store_tbl = doc
-        .get("local_server")
-        .and_then(Item::as_table)
-        .and_then(|tbl| tbl.get("config_stores"))
-        .and_then(Item::as_table)
-        .and_then(|tbl| tbl.get(platform_name))
-        .and_then(Item::as_table)
-        .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
-    // Model the real writer's inline-toml requirement. `ensure_inline_toml_format`
-    // REJECTS a store whose `format` is not `inline-toml` (an external-file
-    // store it must not rewrite); a dry-run that ignored the format would
-    // preview a push the real run refuses.
-    if let Some(other) = store_tbl.get("format").and_then(Item::as_str)
-        && other != "inline-toml"
-    {
-        return Err(format!(
-            "refusing to push: `local_server.config_stores.{platform_name}` uses `format = \
-             \"{other}\"` (an external-file store), which is incompatible with the inline \
-             `contents` this command writes. Migrate the store to `format = \"inline-toml\"` (or a \
-             fresh store id) yourself, then re-run."
-        ));
-    }
-    store_tbl
-        .get("contents")
-        .and_then(Item::as_table)
-        .ok_or_else(|| missing_local_config_store_error(path, platform_name))?;
-    Ok(())
-}
-
 /// Write the local-server config-store entries to `fastly.toml`:
 /// `[local_server.config_stores.<platform_name>]` becomes
 /// `format = "inline-toml"`, and `[local_server.config_stores.<platform_name>.contents]`
@@ -892,42 +828,6 @@ mod tests {
     // store ids the fastly adapter operates on, not arbitrary strings.
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
-
-    #[test]
-    fn dry_run_preflight_rejects_a_non_inline_toml_store() {
-        // The real writer (`ensure_inline_toml_format`) refuses an
-        // external-file store; the dry-run preflight must MODEL that refusal
-        // so a dry-run never previews a push the real run rejects.
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
-            "name = \"demo\"\n[local_server.config_stores.app_config]\nformat = \"json\"\nfile = \"cfg.json\"\n",
-        )
-        .expect("write fastly.toml");
-        let err = assert_local_config_store_provisioned(&path, "app_config")
-            .expect_err("a non-inline-toml store must be rejected in preflight");
-        assert!(
-            err.contains("format = \"json\"") && err.contains("inline-toml"),
-            "error models the inline-toml requirement: {err}"
-        );
-    }
-
-    #[test]
-    fn dry_run_preflight_redacts_a_malformed_manifest_parse_error() {
-        // A TOML parse error can quote a stored secret value; the preflight
-        // must redact it (the real writer does).
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("fastly.toml");
-        fs::write(&path, "this is not = = valid toml with SECRET_abc123 in it")
-            .expect("write fastly.toml");
-        let err = assert_local_config_store_provisioned(&path, "app_config")
-            .expect_err("a malformed manifest must be rejected");
-        assert!(
-            err.contains("details redacted") && !err.contains("SECRET_abc123"),
-            "parse error must be redacted, never quoting stored content: {err}"
-        );
-    }
 
     /// A shell script named `fastly` that exits non-zero and prints an
     /// unambiguous diagnostic to stderr — installed on `$PATH` to
