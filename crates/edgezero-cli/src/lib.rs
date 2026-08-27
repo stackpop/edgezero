@@ -516,8 +516,9 @@ pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
         return Err(
             "a production rollback requires --rollback-to (the version to re-activate). Fastly \
              exposes no metadata to infer it, so it must be captured before the deploy that \
-             superseded it -- use `deploy`'s `previous-version` output. Pass --staging to \
-             deactivate a staged version instead."
+             superseded it -- run `active-version` before deploying (the deploy-fastly GitHub \
+             action does this and exposes it as its `previous-version` output). Pass --staging \
+             to deactivate a staged version instead."
                 .to_owned(),
         );
     }
