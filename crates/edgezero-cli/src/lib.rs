@@ -55,7 +55,9 @@ pub use config::{
 pub use provision::run_provision;
 
 #[cfg(feature = "cli")]
-use args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
+use args::{
+    ActiveVersionArgs, BuildArgs, DeployArgs, HealthcheckArgs, NewArgs, RollbackArgs, ServeArgs,
+};
 #[cfg(feature = "cli")]
 use edgezero_core::manifest::ManifestLoader;
 #[cfg(feature = "cli")]
@@ -158,13 +160,394 @@ pub fn run_build(args: &BuildArgs) -> Result<(), String> {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
+    // Reject reserved staging-lifecycle spellings in the passthrough. `--staging` is
+    // a typed flag (before `--`); if it — or the renamed-away `--stage` — appears in
+    // the passthrough (after `--`), the operator meant to stage but `args.staging` is
+    // false, so this would silently run a PRODUCTION deploy and forward the token to
+    // a manifest deploy command that ignores the flag. Fail closed instead of aliasing.
+    if let Some(flag) = args.adapter_args.iter().find(|arg| {
+        let text = arg.as_str();
+        // Bare (`--staging`) AND equals-forms (`--staging=true`, `--stage=1`): a
+        // prefix match closes the `--stage=…` bypass that a bare `==` would miss.
+        matches!(text, "--staging" | "--stage")
+            || text.starts_with("--staging=")
+            || text.starts_with("--stage=")
+    }) {
+        return Err(format!(
+            "`{flag}` is not a passthrough deploy arg. To stage, use the typed flag: \
+             `deploy --adapter {} --staging` (before any `--`). Refusing to run a \
+             production deploy with `{flag}` after `--`.",
+            args.adapter
+        ));
+    }
+
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+
+    // Thread `--service-id` into the adapter invocation
+    // when provided, ahead of any operator passthrough args. Fastly
+    // consumes it; adapters that don't need a service id ignore it.
+    let action = if args.staging {
+        adapter::Action::DeployStaged
+    } else {
+        adapter::Action::Deploy
+    };
+
+    let mut passthrough: Vec<String> = Vec::new();
+    // Thread the manifest-configured platform manifest path (resolved
+    // from `[adapters.<adapter>.adapter].manifest` relative to the
+    // `EDGEZERO_MANIFEST`-honoring manifest root) into BOTH the staged
+    // and the production deploy, so each targets the app the operator
+    // selected — not whichever `fastly.toml` a bare working-directory
+    // search finds first in a monorepo. The adapter falls back to a cwd
+    // search only when the manifest declares no adapter `manifest` key.
+    //
+    // `--manifest-path` is an EdgeZero-internal directive that only the
+    // built-in adapter understands, so it is threaded only when the
+    // action actually dispatches to the adapter. A manifest-declared
+    // shell `deploy` command receives the adapter args VERBATIM, and
+    // `fastly compute deploy` has no `--manifest-path` flag — such a
+    // command already runs in the manifest root and picks its own
+    // project directory. (Staged deploys are never manifest-declared
+    // commands, so they always get the flag.)
+    if !adapter::has_manifest_command(manifest.as_ref(), &args.adapter, action)
+        && let Some(manifest_path) =
+            resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)?
+    {
+        passthrough.push("--manifest-path".to_owned());
+        passthrough.push(manifest_path);
+    }
+    if let Some(service_id) = &args.service_id {
+        passthrough.push("--service-id".to_owned());
+        passthrough.push(service_id.clone());
+    }
+    passthrough.extend_from_slice(&args.adapter_args);
+
+    if args.staging {
+        // Thread the app's declared config-store logical ids so the staged
+        // relink knows which selectors to redirect to `<logical>_staging`. The
+        // adapter reads config usage from THIS list, never a remote probe —
+        // avoiding a lookup that fails open. One inline token per store; the
+        // adapter strips them before `fastly compute update`.
+        if let Some(loader) = manifest.as_ref()
+            && let Some(config) = loader.manifest().stores.config.as_ref()
+        {
+            for id in &config.ids {
+                passthrough.push(format!("--edgezero-staging-config={id}"));
+            }
+        }
+        // Staged deploy: clone the active version, upload the built
+        // package to a new draft, mark it staged, and emit the staged
+        // version. Never runs the manifest `deploy`
+        // command, which would activate production.
+        return adapter::execute(
+            &args.adapter,
+            adapter::Action::DeployStaged,
+            manifest.as_ref(),
+            &passthrough,
+        );
+    }
+
+    // Production deploy also emits the activated version
+    // so the deploy-fastly action can surface `fastly-version` and the
+    // deploy→healthcheck→rollback chain has a real version to thread.
+    //
+    // Resolution precedence (cheapest + most reliable first):
+    //   1. The deploy command's OWN output. We tee it (echoed live to
+    //      the operator, captured for us) and look for a canonical
+    //      `version=<N>` line, then for Fastly's native phrasing
+    //      ("... version 12"). The deploy command already knows the
+    //      version it activated, so this needs no API round-trip and
+    //      works under a manifest `[adapters.fastly.commands].deploy`
+    //      override (including test fixtures with dummy credentials).
+    //   2. Only when the output yields nothing: the Fastly API lookup
+    //      (`EmitVersion`), which needs a live API + a real token.
+    //   3. If BOTH fail: a clear `Err`. We never silently emit an empty
+    //      version — that was the original bug.
+    if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
+        let captured = adapter::execute_capture(
+            &args.adapter,
+            adapter::Action::Deploy,
+            manifest.as_ref(),
+            &passthrough,
+        )?;
+        if let Some(version) = captured.as_deref().and_then(parse_deploy_version) {
+            log::info!("version={version}");
+            return Ok(());
+        }
+        // Fallback: resolve the version the deploy just activated via the Fastly
+        // API. `--require-active` makes EmitVersion FAIL (not emit an empty
+        // `version=`) when the API reports no active version — a deploy that
+        // activated a version but resolves to none is an error, never a silent
+        // empty-version success.
+        let mut emit_args = passthrough.clone();
+        emit_args.push("--require-active".to_owned());
+        return adapter::execute(
+            &args.adapter,
+            adapter::Action::EmitVersion,
+            manifest.as_ref(),
+            &emit_args,
+        )
+        .map_err(|err| {
+            format!(
+                "deploy succeeded but the activated version could not be resolved: no `version=<N>` \
+                 (or Fastly `version <N>`) line in the deploy output, and the Fastly API fallback \
+                 failed: {err}"
+            )
+        });
+    }
+
     adapter::execute(
         &args.adapter,
         adapter::Action::Deploy,
         manifest.as_ref(),
-        &args.adapter_args,
+        &passthrough,
+    )
+}
+
+/// Parse an activated service version out of a deploy command's output.
+///
+/// Precedence:
+///   1. A canonical `version=<N>` line (what a manifest
+///      `[adapters.fastly.commands].deploy` override — or a CI fixture —
+///      emits, and what `EdgeZero` itself prints).
+///   2. Fastly's native phrasing, e.g.
+///      `SUCCESS: Deployed package (service abc, version 12)`. The LAST
+///      mention wins, which is the version the deploy ended on.
+///
+/// Returns `None` when neither shape is present, which sends the caller
+/// to the Fastly API fallback.
+#[cfg(feature = "cli")]
+fn parse_deploy_version(output: &str) -> Option<u64> {
+    parse_canonical_version_line(output).or_else(|| parse_native_version_mention(output))
+}
+
+/// Last `version=<N>` line in `output` (leading/trailing whitespace on
+/// the line is ignored).
+///
+/// FAIL CLOSED: the whole value after `version=` must be ASCII digits.
+/// A `take_while(is_ascii_digit)` prefix scan would read `version=15.2.0`
+/// as `15` and `version=12abc` as `12`, threading a WRONG version into
+/// healthcheck / rollback. `None` sends the caller to the Fastly API
+/// fallback (the version the deploy actually activated) instead.
+#[cfg(feature = "cli")]
+fn parse_canonical_version_line(output: &str) -> Option<u64> {
+    output.lines().rev().find_map(|line| {
+        let digits = line.trim().strip_prefix("version=")?;
+        if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u64>().ok()
+    })
+}
+
+/// Last `, version <N>)` mention in `output` (case-insensitive) — the
+/// Fastly CLI's own success line, whose Go format string is
+/// `"Deployed package (service %s, version %v)"`.
+///
+/// Deliberately narrow: it previously accepted ANY digits appearing
+/// after the word "version", so `Fastly CLI version 15.2.0` or
+/// `... service 12345, version unchanged` parsed as a service version.
+/// A misparse here emits a WRONG `version=<N>` line, which the deploy →
+/// healthcheck → rollback chain would then act on. When this returns
+/// `None`, `run_deploy` falls back to the Fastly API's *active* version
+/// (the version the deploy actually activated) rather than guessing.
+#[cfg(feature = "cli")]
+fn parse_native_version_mention(output: &str) -> Option<u64> {
+    let lower = output.to_ascii_lowercase();
+    let mut result = None;
+    for (idx, _) in lower.match_indices(", version ") {
+        let after = idx.saturating_add(", version ".len());
+        let Some(rest) = lower.get(after..) else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        // The number must be closed by the success line's `)`.
+        if digits.is_empty() || rest.chars().nth(digits.len()) != Some(')') {
+            continue;
+        }
+        if let Ok(parsed) = digits.parse::<u64>() {
+            result = Some(parsed);
+        }
+    }
+    result
+}
+
+/// Resolve the absolute path of the adapter's platform manifest
+/// (`[adapters.<adapter>.adapter].manifest`), CONFINED to the loaded
+/// manifest's own directory. Used by the Fastly staged deploy to target
+/// the operator-selected app in a monorepo.
+///
+/// `Ok(None)` when there is no loaded manifest, no root, no entry for the
+/// adapter, or no `manifest` key (the adapter then does its own cwd
+/// search). The `manifest` value is committed app source, but an absolute
+/// path, a `../` traversal, or a symlink escape would otherwise let a
+/// credential-bearing `fastly compute build/deploy` run against source
+/// OUTSIDE the repository `source-revision` describes and outside the
+/// dirty-source guard — so the resolved target is canonicalized and
+/// required to be a regular file beneath the (canonicalized) manifest
+/// root, and any escape is a hard error.
+#[cfg(feature = "cli")]
+fn resolve_adapter_manifest_path(
+    loader: Option<&ManifestLoader>,
+    adapter: &str,
+) -> Result<Option<String>, String> {
+    use std::fs;
+    use std::path::Path;
+
+    let Some(manifest) = loader.map(ManifestLoader::manifest) else {
+        return Ok(None);
+    };
+    let (Some(root), Some((_canonical, cfg))) = (manifest.root(), manifest.adapter_entry(adapter))
+    else {
+        return Ok(None);
+    };
+    let Some(rel) = cfg.adapter.manifest.as_deref() else {
+        return Ok(None);
+    };
+    if Path::new(rel).is_absolute() {
+        return Err(format!(
+            "adapter '{adapter}' manifest path {rel:?} must be relative to the manifest, not absolute"
+        ));
+    }
+    let root_real = fs::canonicalize(root).map_err(|err| {
+        format!(
+            "could not resolve the manifest root {}: {err}",
+            root.display()
+        )
+    })?;
+    let candidate = root.join(rel);
+    let candidate_real = fs::canonicalize(&candidate).map_err(|err| {
+        format!(
+            "could not resolve adapter '{adapter}' manifest {}: {err}",
+            candidate.display()
+        )
+    })?;
+    if !candidate_real.starts_with(&root_real) {
+        return Err(format!(
+            "adapter '{adapter}' manifest {} resolves outside the application manifest root {}",
+            candidate_real.display(),
+            root_real.display()
+        ));
+    }
+    if !candidate_real.is_file() {
+        return Err(format!(
+            "adapter '{adapter}' manifest {} is not a regular file",
+            candidate_real.display()
+        ));
+    }
+    Ok(Some(candidate_real.to_string_lossy().into_owned()))
+}
+
+/// Probe a deployed version's health (Fastly staging lifecycle)
+/// and return `Err` when the probe is unhealthy after retries so
+/// the process exits non-zero (letting a CI caller gate rollback on
+/// failure).
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be loaded, the adapter is
+/// not configured / registered, the adapter does not support
+/// healthchecks, or the probe is unhealthy after all retries.
+#[cfg(feature = "cli")]
+#[inline]
+pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
+    // Manifest-independent, like `active-version`: a pure API/curl probe keyed on
+    // explicit flags, never a manifest-command override. Not loading the manifest
+    // keeps it correct regardless of the current directory (monorepo safety).
+    let mut passthrough: Vec<String> = vec![
+        "--service-id".to_owned(),
+        args.service_id.clone(),
+        "--version".to_owned(),
+        args.version.clone(),
+        "--domain".to_owned(),
+        args.domain.clone(),
+        "--path".to_owned(),
+        args.path.clone(),
+    ];
+    if args.staging {
+        passthrough.push("--staging".to_owned());
+    }
+    passthrough.extend([
+        "--retry".to_owned(),
+        args.retry.to_string(),
+        "--retry-delay".to_owned(),
+        args.retry_delay.to_string(),
+        "--timeout".to_owned(),
+        args.timeout.to_string(),
+    ]);
+    adapter::execute(
+        &args.adapter,
+        adapter::Action::Healthcheck,
+        None,
+        &passthrough,
+    )
+}
+
+/// Roll a service back (Fastly staging lifecycle):
+/// production activates the previous version; staging deactivates the
+/// staged version.
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be loaded, the adapter is
+/// not configured / registered, the adapter does not support
+/// rollback, or the rollback API call fails.
+#[cfg(feature = "cli")]
+#[inline]
+pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
+    // Manifest-independent, like `active-version` / `healthcheck`: a pure API
+    // operation keyed on explicit flags, never a manifest-command override.
+    let mut passthrough: Vec<String> = vec![
+        "--service-id".to_owned(),
+        args.service_id.clone(),
+        "--version".to_owned(),
+        args.version.clone(),
+    ];
+    if args.staging {
+        passthrough.push("--staging".to_owned());
+    } else if let Some(target) = args.rollback_to.as_deref() {
+        // Production activates an EXPLICIT target — Fastly has no field to infer
+        // a previously-live version from a staged one, so the caller passes the
+        // version captured before the superseding deploy.
+        passthrough.push("--rollback-to".to_owned());
+        passthrough.push(target.to_owned());
+    } else {
+        return Err(
+            "a production rollback requires --rollback-to (the version to re-activate). Fastly \
+             exposes no metadata to infer it, so it must be captured before the deploy that \
+             superseded it -- use `deploy`'s `previous-version` output. Pass --staging to \
+             deactivate a staged version instead."
+                .to_owned(),
+        );
+    }
+    adapter::execute(&args.adapter, adapter::Action::Rollback, None, &passthrough)
+}
+
+/// Resolve and print the currently-active service version as `version=<N>`.
+///
+/// Captured BEFORE a deploy so it can be threaded to a later production
+/// rollback — Fastly's version list has no field to infer a previously-live
+/// version afterward.
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be loaded, the adapter is not
+/// configured, or the active version cannot be resolved.
+#[cfg(feature = "cli")]
+#[inline]
+pub fn run_active_version(args: &ActiveVersionArgs) -> Result<(), String> {
+    // No manifest load: `active-version` is a pure Fastly-API operation keyed on
+    // `--adapter` + `--service-id`, and `EmitVersion` can never be a
+    // manifest-command override (see `adapter::manifest_command`). Loading the
+    // manifest would only couple it to the current directory — breaking it in a
+    // monorepo where a stray root `edgezero.toml` shadows the app's. The adapter
+    // registry still validates `--adapter`.
+    adapter::execute(
+        &args.adapter,
+        adapter::Action::EmitVersion,
+        None,
+        &["--service-id".to_owned(), args.service_id.clone()],
     )
 }
 
@@ -297,6 +680,7 @@ mod tests {
     use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use edgezero_core::manifest::ManifestLoader;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -350,6 +734,151 @@ mod tests {
         assert!(manifest.manifest().adapters.contains_key("fastly"));
     }
 
+    // ── deploy-output version parsing ─────────────────────────────────
+
+    #[test]
+    fn parse_deploy_version_reads_canonical_line() {
+        // What a manifest `[adapters.fastly.commands].deploy` override
+        // (or a CI fixture running with dummy creds) emits. Must be
+        // parsed WITHOUT any Fastly API round-trip.
+        let output = "building...\nversion=7\ndone\n";
+        assert_eq!(parse_deploy_version(output), Some(7));
+    }
+
+    #[test]
+    fn parse_deploy_version_reads_fastly_native_phrasing() {
+        let output = "SUCCESS: Deployed package (service abc123, version 12)\n";
+        assert_eq!(parse_deploy_version(output), Some(12));
+    }
+
+    #[test]
+    fn parse_deploy_version_none_when_absent_triggers_fallback() {
+        // No version anywhere -> `None`, which routes run_deploy to the
+        // Fastly API fallback (and to a clear Err if that also fails).
+        let output = "Building package...\nUploading...\nAll good.\n";
+        assert_eq!(parse_deploy_version(output), None);
+        assert_eq!(parse_deploy_version(""), None);
+    }
+
+    #[test]
+    fn parse_deploy_version_prefers_canonical_over_native_mention() {
+        // A fixture that both narrates a clone AND emits the canonical
+        // line: the canonical line is authoritative.
+        let output = "Cloning version 3...\nversion=9\n";
+        assert_eq!(parse_deploy_version(output), Some(9));
+    }
+
+    #[test]
+    fn parse_deploy_version_native_takes_last_success_line() {
+        let output = "SUCCESS: Deployed package (service abc, version 3)\n\
+             SUCCESS: Deployed package (service abc, version 4)\n";
+        assert_eq!(parse_deploy_version(output), Some(4));
+    }
+
+    #[test]
+    fn parse_deploy_version_rejects_confusable_mentions() {
+        // Loose `version <N>` narration is NOT a service version. Each of
+        // these used to parse (and would have emitted a wrong `version=<N>`
+        // for healthcheck/rollback to act on). `None` routes run_deploy to
+        // the Fastly API's *active* version instead — the safe answer.
+        assert_eq!(parse_deploy_version("Fastly CLI version 15.2.0\n"), None);
+        assert_eq!(
+            parse_deploy_version("Uploaded to service 12345, version unchanged\n"),
+            None
+        );
+        assert_eq!(
+            parse_deploy_version("Cloning version 3... created version 4\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_deploy_version_rejects_malformed_canonical_lines() {
+        // The canonical-line parser must be FAIL CLOSED: a prefix scan
+        // (`take_while(is_ascii_digit)`) read `version=15.2.0` as 15 and
+        // `version=12abc` as 12, threading a WRONG version into
+        // healthcheck / rollback. `None` routes run_deploy to the Fastly
+        // API fallback instead.
+        assert_eq!(parse_deploy_version("version=15.2.0\n"), None);
+        assert_eq!(parse_deploy_version("version=12abc\n"), None);
+        assert_eq!(parse_deploy_version("version=\n"), None);
+        // A well-formed line is still accepted (leading zeros included).
+        assert_eq!(parse_deploy_version("version=007\n"), Some(7));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_deploy_manifest_command_forwards_adapter_args_verbatim() {
+        // With `[adapters.fastly.commands] deploy = ...` the deploy runs
+        // as a shell command, NOT the built-in Fastly path — so anything
+        // the caller (e.g. the deploy action) passes as an adapter arg,
+        // `--non-interactive` included, must reach that command verbatim.
+        // The EdgeZero-internal `--manifest-path` must NOT: the shell
+        // command's own CLI has no such flag.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let args_file = temp.path().join("argv.txt");
+        let script = temp.path().join("record.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\necho version=42\n",
+                args_file.display()
+            ),
+        )
+        .expect("write record script");
+
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[adapters.fastly.adapter]\ncrate = \"crates/demo-fastly\"\nmanifest = \"crates/demo-fastly/fastly.toml\"\n\n[adapters.fastly.commands]\ndeploy = \"sh {}\"\n",
+                script.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let args = DeployArgs {
+            adapter: "fastly".to_owned(),
+            adapter_args: vec!["--non-interactive".to_owned()],
+            service_id: Some("SVC1".to_owned()),
+            staging: false,
+        };
+        run_deploy(&args).expect("manifest deploy command runs");
+
+        let forwarded = fs::read_to_string(&args_file).expect("command recorded its args");
+        assert_eq!(
+            forwarded.trim(),
+            "--service-id SVC1 --non-interactive",
+            "manifest deploy command must receive the adapter args verbatim"
+        );
+    }
+
+    #[test]
+    fn run_deploy_rejects_staging_spellings_in_passthrough() {
+        // A reserved lifecycle spelling after `--` must FAIL CLOSED before any deploy
+        // action runs — never silently route to production. The guard is the first
+        // thing run_deploy does, so no manifest/adapter setup is needed to reach it.
+        // Bare AND equals-forms: `--stage=true`/`--staging=1` must not slip past a
+        // bare-equality check and route to production.
+        for flag in ["--stage", "--staging", "--stage=true", "--staging=1"] {
+            let args = DeployArgs {
+                adapter: "fastly".to_owned(),
+                adapter_args: vec![flag.to_owned()],
+                service_id: Some("SVC1".to_owned()),
+                staging: false,
+            };
+            let err = run_deploy(&args)
+                .expect_err("a reserved staging spelling in passthrough must be rejected");
+            assert!(
+                err.contains("--staging") && err.contains(flag),
+                "the error must name the flag and point at the typed --staging: {err}"
+            );
+        }
+    }
+
     #[test]
     fn ensure_adapter_defined_accepts_known_adapter() {
         let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
@@ -397,6 +926,11 @@ mod tests {
         let args = DeployArgs {
             adapter: "fastly".to_owned(),
             adapter_args: Vec::new(),
+            // No service id → the production version-emit step is
+            // skipped, so this test exercises only the
+            // manifest `deploy` command path.
+            service_id: None,
+            staging: false,
         };
         run_deploy(&args).expect("deploy command runs");
     }
@@ -414,6 +948,91 @@ mod tests {
             adapter: "fastly".to_owned(),
         };
         run_serve(&args).expect("serve command runs");
+    }
+
+    // Write an edgezero.toml declaring an adapter `manifest` and load it, so
+    // `manifest.root()` is set — the confinement is only meaningful for a
+    // file-backed manifest with a real root. Returns the loader so each test can
+    // call `resolve_adapter_manifest_path` and assert on its Result.
+    #[cfg(not(windows))]
+    fn manifest_loader_declaring(dir: &Path, manifest_rel: &str) -> ManifestLoader {
+        let manifest_path = dir.join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\nentry = \"crates/demo-core\"\n\n[adapters.fastly.adapter]\ncrate = \"crates/demo-fastly\"\nmanifest = \"{manifest_rel}\"\n"
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        load_manifest_optional()
+            .expect("load manifest")
+            .expect("manifest present")
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_accepts_an_in_root_file() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        fs::create_dir_all(temp.path().join("crates/demo-fastly")).expect("mkdir");
+        fs::write(temp.path().join("crates/demo-fastly/fastly.toml"), "")
+            .expect("write fastly.toml");
+        let loader = manifest_loader_declaring(temp.path(), "crates/demo-fastly/fastly.toml");
+        let resolved = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect("in-root manifest resolves")
+            .expect("a path is returned");
+        assert!(resolved.ends_with("crates/demo-fastly/fastly.toml"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_rejects_absolute() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let loader = manifest_loader_declaring(temp.path(), "/etc/passwd");
+        let err = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect_err("an absolute manifest path must be rejected");
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_rejects_traversal() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let outside = TempDir::new().expect("outside dir");
+        fs::write(outside.path().join("fastly.toml"), "").expect("write outside fastly.toml");
+        let temp = TempDir::new().expect("temp dir");
+        // A `../` escape to a real file outside the manifest root must fail closed.
+        let rel = format!(
+            "../{}/fastly.toml",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        let loader = manifest_loader_declaring(temp.path(), &rel);
+        let err = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect_err("a traversal manifest path must be rejected");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_adapter_manifest_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let outside = TempDir::new().expect("outside dir");
+        fs::write(outside.path().join("fastly.toml"), "").expect("write outside fastly.toml");
+        let temp = TempDir::new().expect("temp dir");
+        // A symlink that points at a file outside the root must not smuggle it in.
+        symlink(
+            outside.path().join("fastly.toml"),
+            temp.path().join("fastly.toml"),
+        )
+        .expect("create symlink");
+        let loader = manifest_loader_declaring(temp.path(), "fastly.toml");
+        let err = resolve_adapter_manifest_path(Some(&loader), "fastly")
+            .expect_err("a symlink escaping the manifest root must be rejected");
+        assert!(err.contains("outside"), "{err}");
     }
 
     #[test]

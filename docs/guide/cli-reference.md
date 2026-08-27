@@ -155,12 +155,24 @@ edgezero deploy --adapter <name>
 **Arguments:**
 
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`)
+- `--service-id <id>` - Platform service id the deploy targets (Fastly). Passed
+  through to the provider; adapters that don't need one ignore it.
+- `--staging` - Deploy to a **staged** draft version instead of activating
+  production (Fastly staging lifecycle). Non-Fastly adapters reject it. This is the
+  same `--staging` verb `healthcheck`/`rollback`/`config push` use.
+- `-- <passthrough...>` - Args after `--` are forwarded verbatim to the adapter
+  deploy command (e.g. `-- --comment "ci build"`). A hyphenated token before `--`
+  is rejected, so a mistyped flag can never silently route a staging deploy to
+  production.
 
 **Examples:**
 
 ```bash
 # Deploy to Fastly
 edgezero deploy --adapter fastly
+
+# Stage a Fastly draft version (no activation)
+edgezero deploy --adapter fastly --service-id "$FASTLY_SERVICE_ID" --staging
 
 # Deploy to Cloudflare
 edgezero deploy --adapter cloudflare
@@ -178,6 +190,76 @@ edgezero deploy --adapter spin
 ::: warning
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.
 :::
+
+### edgezero active-version
+
+Resolve and print the currently-active service version as `version=<N>`
+(Fastly staging lifecycle). Used to capture a production rollback target
+**before** a deploy supersedes it, since Fastly exposes no metadata to
+infer it afterward. The `deploy-fastly` recovery snippets in the
+[GitHub Actions guide](/guide/deploy-github-actions) invoke it directly.
+
+```bash
+edgezero active-version --adapter <name> --service-id <id>
+```
+
+**Arguments:**
+
+- `--adapter <name>` — target adapter (required). Fastly implements it; other adapters have no active-version concept.
+- `--service-id <id>` — platform service id whose active version to resolve (required).
+
+Reads the Fastly API token from `FASTLY_API_TOKEN` in the environment. Emits
+`version=<N>` on stdout, or an empty `version=` when the service has no active
+version yet (a first-ever deploy). Exits non-zero with a one-line diagnostic on
+error.
+
+### edgezero healthcheck
+
+Probe a deployed (or staged) version's health, retrying until it responds
+or the attempts are exhausted (Fastly staging lifecycle). **Exits non-zero
+when the deployment is not provably healthy** — that non-zero exit is what
+gates a rollback.
+
+```bash
+edgezero healthcheck --adapter <name> --service-id <id> --version <n> --domain <domain> [--path </>] [--staging] [--retry <n>] [--retry-delay <secs>] [--timeout <secs>]
+```
+
+**Arguments:**
+
+- `--adapter <name>` — target adapter (required).
+- `--service-id <id>` — platform service id to probe (required).
+- `--version <n>` — service version to probe (required; thread it from a prior deploy/stage).
+- `--domain <domain>` — public domain to probe, e.g. `www.example.com` (required).
+- `--path <path>` — URL path to probe; must begin with `/`. Applies to production and staging alike (staging reroutes the same URL to the resolved staging IP). Default: `/`.
+- `--staging` — probe the staged version via its resolved staging IP rather than the live production endpoint. The same `--staging` verb `deploy`/`rollback`/`config push` use.
+- `--retry <n>` — total number of attempts before declaring the probe unhealthy. Default: `3`.
+- `--retry-delay <secs>` — seconds to wait between attempts. Default: `5`.
+- `--timeout <secs>` — per-attempt connect/read timeout in seconds. Default: `10`.
+
+Only a **staging** probe needs `FASTLY_API_TOKEN` (to resolve the staging IP); a
+production probe just curls the domain and needs no token. Emits `healthy=<bool>`
+and `status-code=<code>`. Exits `0` only when the probe succeeds.
+
+### edgezero rollback
+
+Roll a service back to a previous version, or deactivate a staged version
+(Fastly staging lifecycle).
+
+```bash
+edgezero rollback --adapter <name> --service-id <id> --version <n> [--rollback-to <n>] [--staging]
+```
+
+**Arguments:**
+
+- `--adapter <name>` — target adapter (required).
+- `--service-id <id>` — platform service id to roll back (required).
+- `--version <n>` — the current (bad) version to roll back **from** (required; staging deactivates it).
+- `--rollback-to <n>` — **production only:** the version to re-activate. Fastly cannot tell a previously-live version from a staged draft, so the target **cannot be inferred** — capture it before the superseding deploy (`deploy-fastly`'s `previous-version`) and pass it here. Required for a production rollback; ignored for staging.
+- `--staging` — deactivate the staged version instead of activating `--rollback-to`.
+
+Reads the Fastly API token from `FASTLY_API_TOKEN` in the environment. A
+production rollback emits `rolled-back-to=<N>` (the version it activated). Exits
+non-zero with a one-line diagnostic on error.
 
 ### edgezero config validate
 
@@ -220,8 +302,13 @@ config store (spec §13). Same dispatch shape as the other commands:
 each adapter crate owns its own implementation, the CLI is a thin
 delegate.
 
+The flags below belong to your app's typed CLI (`<your-app>-cli`). On the
+bundled `edgezero` binary `config push` is a hidden stub that absorbs any
+flags and exits `2` with a pointer to the typed CLI — it cannot push (see
+**Two flavours** below).
+
 ```bash
-edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--no-env] [--local] [--runtime-config <path>] [--no-diff] [--yes] [--dry-run]
+<your-app>-cli config push --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--staging] [--no-env] [--local] [--runtime-config <path>] [--no-diff] [--yes] [--dry-run]
 ```
 
 **Arguments:**
@@ -230,17 +317,24 @@ edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] 
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to push to. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
-- `--key <key>` — override the config-store key the blob is written under (spec §5.4). Defaults to the logical store id. Use it to publish a side channel (e.g. `--key app_config_staging`); the runtime selects it back via `EDGEZERO__STORES__CONFIG__<ID>__KEY` (see [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
+- `--key <key>` — override the config-store key the blob is written under (spec §5.4).
+- `--staging` — write the `<logical-store-id>_staging` variant in the SAME store,
+  so a staged push never overwrites the key the live service reads. The staging
+  key is _derived_ from the store's logical id and is mutually exclusive with
+  `--key` (an explicit staging key would be written where no staged version reads,
+  so the combination is refused). A staged deploy points the staged version's
+  `edgezero_runtime_env` link at this key via `EDGEZERO__STORES__CONFIG__<ID>__KEY`
+  in its staging selector store (see [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config. By default the loader reads the overlay so the push sends the same values the runtime would.
 - `--local` — push into the adapter's local-emulator state instead of the live platform. Fastly edits `[local_server.config_stores]` in `fastly.toml` (Viceroy reads it on startup); Cloudflare runs `wrangler kv bulk put --local` so writes land in `.wrangler/state`; Spin forces SQLite-direct against `<spin.toml dir>/.spin/sqlite_key_value.db` even when the manifest's deploy command targets Fermyon Cloud (the runtime-config `[key_value_store.<label>].type` is also ignored for SQLite path resolution); Axum is local-only already so it's a no-op there.
 - `--runtime-config <path>` — adapter runtime configuration file. Currently only consumed by Spin, which reads `[key_value_store.<label>]` stanzas to dispatch per-backend (`type = "spin"` → SQLite-direct, `redis` / `azure_cosmos` / other → error pointing at the native backend CLI). Default: `runtime-config.toml` next to the adapter manifest. Ignored by the Fermyon Cloud branch — cloud pushes consult only `spin.toml`'s `[application].name`.
 - `--no-diff` — skip the inline diff render of local-vs-remote before writing. By default the push reads back the current remote blob and shows what would change.
-- `--yes` / `-y` — skip the confirmation prompt and write unconditionally (for non-interactive/CI use). Without it, an interactive push prompts before overwriting a differing remote blob.
+- `--yes` / `-y` — skip the confirmation prompt and write unconditionally (for non-interactive/CI use). Without it, an interactive push prompts before overwriting a differing remote blob — but with **no TTY** (a CI runner, a piped shell) there is no prompt to answer, so a push **without `--yes` fails closed** with `non-interactive run requires --yes`. Always pass `--yes` when invoking `config push` yourself in CI. The `config-push-fastly` action appends `--yes --no-diff` for you, so a push run through the action needs neither flag.
 - `--dry-run` — print the would-be operations without performing them. It makes **no WRITE and no delete** — but it is NOT fully offline: because dry-run's contract is to show the diff, it does a **read-only** remote read-back (a shell-out on Fastly/Cloudflare). That read is **one logical read** but may be **several provider calls** for a chunked Fastly value (describe the root pointer, then describe each referenced chunk to reassemble it). It errors against **Spin Cloud** (whose read-back is unsupported); use `--local` for the on-disk SQLite write, or drop `--dry-run` and write unconditionally with `--yes`.
 
 **Two flavours (same split as `config validate`):**
 
-- The default `edgezero` binary **does not push** — `config push` on the bundled binary always errors with a pointer to the typed downstream CLI. The blob app-config model needs the app's typed `AppConfig<C>` (for validation and canonical serialisation), which the bundled binary doesn't embed.
+- The default `edgezero` binary **does not push** — `config push` on the bundled binary is a hidden stub that absorbs whatever flags you pass and exits `2` with a pointer to the typed downstream CLI. The blob app-config model needs the app's typed `AppConfig<C>` (for validation and canonical serialisation), which the bundled binary doesn't embed.
 - A downstream CLI built on `edgezero-cli` that owns its app-config struct (e.g. `app-demo-cli`) runs the **typed** push: strict pre-flight validation (`validator::Validate`, secret presence, store-ref membership, adapter checks), then serialises the struct into a single [`BlobEnvelope`](./blob-app-config-migration.md) — one JSON `{ version, generated_at, sha256, data }` value written under one config-store key. `data` carries **every field VERBATIM, including `#[secret]` / `#[secret(store_ref)]` fields**: their value at rest is the operator-supplied key NAME (e.g. `"demo_api_token"`), which the runtime `AppConfig<C>` extractor swaps for the resolved secret at request time. Nothing is flattened or stripped, and the blob never contains resolved secret bytes.
 
 **Per-adapter behaviour:** every adapter writes the **single blob envelope** as one `(key, envelope_json)` config-store entry — with one exception: on Fastly, an oversized envelope is split into multiple content-addressed chunk entries plus a root pointer, all under the one logical key. Fastly's documented per-entry cap is 8,000 **characters**; EdgeZero splits at 8,000 **bytes**, a deliberately conservative v1 threshold (bytes are always ≥ characters, so it never over-stores) that is fixed so previously stored values stay readable.
@@ -279,8 +373,12 @@ local-emulator) config-store entry, without writing anything. Like
 errors with a pointer to the downstream CLI, since the diff needs the
 app's typed `AppConfig<C>`.
 
+Like `config push`, the flags below belong to your app's typed CLI
+(`<your-app>-cli`); on the bundled `edgezero` binary `config diff` is a hidden
+stub that absorbs its flags and exits `2` with a pointer to the typed CLI.
+
 ```bash
-edgezero config diff --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--no-env] [--local] [--runtime-config <path>] [--format <fmt>] [--exit-code]
+<your-app>-cli config diff --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--key <key>] [--staging] [--no-env] [--local] [--runtime-config <path>] [--format <fmt>] [--exit-code]
 ```
 
 **Arguments:**
@@ -290,11 +388,14 @@ edgezero config diff --adapter <name> [--manifest <path>] [--app-config <path>] 
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to diff against. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
 - `--key <key>` — override the config-store key to diff against (spec §5.4). Defaults to the logical store id; matches `config push --key`.
+- `--staging` — diff against the derived `<logical-store-id>_staging` variant,
+  matching what `config push --staging` would write. Mutually exclusive with
+  `--key`, like `config push`.
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config.
 - `--local` — diff against the adapter's local-emulator state instead of the live platform (same resolution as `config push --local`).
 - `--runtime-config <path>` — adapter runtime configuration file (Spin only; same semantics as `config push`).
 - `--format <fmt>` — output format: `unified` (default, POSIX unified-diff text), `json` (`{ local_sha256, remote_sha256, added, removed, changed }`), or `structured` (key/old/new triples).
-- `--exit-code` — exit non-zero when the local and remote blobs differ, for CI gating (like `git diff --exit-code`). Without it, `config diff` exits `0` whether or not there are changes.
+- `--exit-code` — exit `1` when the local and remote blobs differ, for CI gating (like `git diff --exit-code`). Without it, a completed diff exits `0` whether or not there are changes. Either way, if the adapter cannot read back the remote (an **`Unsupported`** outcome — e.g. Spin Cloud), the diff is structurally impossible and exits `2` regardless of `--exit-code`.
 
 **Examples:**
 
@@ -306,7 +407,7 @@ app-demo-cli config diff --adapter fastly
 app-demo-cli config diff --adapter fastly --exit-code --format json
 ```
 
-**Exit codes:** `0` on success (or when there are no changes); with `--exit-code`, `0` when local and remote match and a non-zero code when they differ. Errors return non-zero with a one-line diagnostic.
+**Exit codes:** `0` on success (or when there are no changes); with `--exit-code`, `0` when local and remote match and `1` when they differ. An `Unsupported` outcome (the adapter cannot read back the remote, e.g. Spin Cloud) exits `2` regardless of `--exit-code`. Errors return non-zero (≥ 2) with a one-line diagnostic.
 
 ### edgezero config gc
 
@@ -489,9 +590,11 @@ not from a remote auth provider.
 
 The CLI respects these environment variables:
 
-| Variable            | Description                                 |
-| ------------------- | ------------------------------------------- |
-| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`) |
+| Variable            | Description                                                                                                                                                         |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`)                                                                                                                         |
+| `FASTLY_API_TOKEN`  | Fastly API token. Required by the Fastly lifecycle commands (`deploy`, `active-version`, `rollback`, and a **staging** `healthcheck`); they fail closed without it. |
+| `FASTLY_SERVICE_ID` | Default Fastly service id, used when `--service-id` is not passed. The lifecycle commands need a service id from one source or the other.                           |
 
 ## Working Directory
 
@@ -548,10 +651,12 @@ Install the provider CLI:
 ## Building Your Own CLI
 
 `edgezero-cli` ships a library as well as a binary. Every downstream command is
-exposed as a `(*Args, run_*)` pair (`BuildArgs` / `run_build`, `DeployArgs` /
-`run_deploy`, `NewArgs` / `run_new`, `ServeArgs` / `run_serve`), so a downstream
-project can build its own CLI binary that reuses any subset of the built-ins and
-adds its own subcommands.
+exposed as a `(*Args, run_*)` pair — `BuildArgs` / `run_build`, `DeployArgs` /
+`run_deploy` (with `--staging` and `--service-id`), the Fastly staging-lifecycle
+trio `HealthcheckArgs` / `run_healthcheck`, `RollbackArgs` / `run_rollback`, and
+`ActiveVersionArgs` / `run_active_version`, plus `NewArgs` / `run_new` and
+`ServeArgs` / `run_serve` — so a downstream project can build its own CLI binary
+that reuses any subset of the built-ins and adds its own subcommands.
 
 The crate is not on crates.io — EdgeZero crates are `publish = false` until the
 first registry release — so depend on it by Git (or by path, in a local
@@ -559,7 +664,14 @@ checkout):
 
 ```toml
 [dependencies]
-edgezero-cli = { git = "https://github.com/stackpop/edgezero.git", default-features = false }
+# The `args` types and `run_*` handlers live behind the `cli` feature, and you
+# need at least one adapter to deploy — so enable them explicitly. (Omitting
+# `default-features = false` also works: the defaults are `cli` plus all four
+# adapters.)
+edgezero-cli = { git = "https://github.com/stackpop/edgezero.git", default-features = false, features = [
+  "cli",
+  "edgezero-adapter-fastly",
+] }
 ```
 
 ```rust
