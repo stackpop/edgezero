@@ -25,7 +25,9 @@ pub mod response;
 pub mod secret_store;
 
 #[cfg(feature = "fastly")]
-use edgezero_core::app::{Hooks, StoresMetadata};
+use edgezero_core::app::Hooks;
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::app::StoresMetadata;
 #[cfg(feature = "fastly")]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
@@ -139,7 +141,7 @@ where
     F: FnOnce(&fastly::Request, &mut Extensions),
 {
     let stores = A::stores();
-    let env = env_config_from_runtime_dictionary(stores);
+    let env = runtime_env_config(stores);
     let logging = logging_from_env(&env);
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -158,23 +160,24 @@ where
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
-/// Fastly Config Store. Compute@Edge has no process env -- the
-/// `EDGEZERO__*` runtime overrides spec 5.2/5.4 expects must come
-/// from a Config Store the operator pre-populates (locally via
-/// `fastly.toml`'s `[local_server.config_stores.edgezero_runtime_env]`
-/// block; remotely via a `fastly config-store` named `edgezero_runtime_env`).
+/// Fastly Config Store.
 ///
-/// The Cloudflare adapter does the same thing through `env.var(...)`
-/// (lib.rs:55) -- Workers also have no `std::env`. Mirroring the
-/// approach here closes the spec 12.7 gap where `__KEY` runtime
-/// overrides silently fell back to the binding's default id.
+/// Compute@Edge has no process env, so the `EDGEZERO__*` runtime overrides
+/// (logging settings, per-store platform names, the config-store `__KEY`
+/// selector) come from a Config Store the operator pre-populates: locally via
+/// `fastly.toml`'s `[local_server.config_stores.edgezero_runtime_env]` block,
+/// remotely via a `fastly config-store` named `edgezero_runtime_env`.
 ///
-/// If the store is missing or empty, returns an empty `EnvConfig` --
-/// the rest of the runtime then uses the baked-in defaults (which is
-/// what the pre-fix code did, just without the env-driven override
-/// path the spec promises).
+/// If the store is missing or empty, returns an empty `EnvConfig` and the rest
+/// of the runtime uses its baked-in defaults.
+///
+/// [`run_app`] calls this itself. A custom Fastly entry point that bypasses
+/// [`run_app`] should call it with its own `A::stores()` so staged and
+/// overridden store selectors resolve identically.
 #[cfg(feature = "fastly")]
-fn env_config_from_runtime_dictionary(stores: StoresMetadata) -> EnvConfig {
+#[must_use]
+#[inline]
+pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
     use fastly::ConfigStore;
     use std::iter::empty;
     let Ok(dict) = ConfigStore::try_open("edgezero_runtime_env") else {
@@ -194,6 +197,17 @@ fn env_config_from_runtime_dictionary(stores: StoresMetadata) -> EnvConfig {
         );
         return EnvConfig::from_vars(empty::<(String, String)>());
     };
+    let vars = runtime_env_keys(stores)
+        .into_iter()
+        .filter_map(|key| dict.get(&key).map(|value| (key, value)));
+    EnvConfig::from_vars(vars)
+}
+
+/// The `EDGEZERO__*` keys the Fastly runtime looks up: the fixed adapter and
+/// logging settings, plus a `__NAME` selector for every declared store id and
+/// a `__KEY` selector for config-store ids only.
+#[cfg(any(feature = "fastly", test))]
+fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
     let mut keys: Vec<String> = vec![
         "EDGEZERO__ADAPTER__HOST".to_owned(),
         "EDGEZERO__ADAPTER__PORT".to_owned(),
@@ -217,10 +231,7 @@ fn env_config_from_runtime_dictionary(stores: StoresMetadata) -> EnvConfig {
             }
         }
     }
-    let vars = keys
-        .into_iter()
-        .filter_map(|key| dict.get(&key).map(|value| (key, value)));
-    EnvConfig::from_vars(vars)
+    keys
 }
 
 /// Dispatch with a config store wired explicitly. Use `run_app` for
@@ -268,5 +279,52 @@ mod tests {
         assert_eq!(logging.level, log::LevelFilter::Debug);
         assert!(!logging.echo_stdout);
         assert!(logging.use_fastly_logger);
+    }
+}
+
+#[cfg(test)]
+mod runtime_env_key_tests {
+    use super::runtime_env_keys;
+    use edgezero_core::app::{StoreMetadata, StoresMetadata};
+
+    fn contains(keys: &[String], key: &str) -> bool {
+        keys.iter().any(|candidate| candidate.as_str() == key)
+    }
+
+    #[test]
+    fn runtime_env_keys_name_every_store_and_key_only_config_stores() {
+        let stores = StoresMetadata {
+            config: Some(StoreMetadata {
+                default: "main",
+                ids: &["main", "edge"],
+            }),
+            kv: Some(StoreMetadata {
+                default: "cache",
+                ids: &["cache"],
+            }),
+            secrets: Some(StoreMetadata {
+                default: "vault",
+                ids: &["vault"],
+            }),
+        };
+
+        let keys = runtime_env_keys(stores);
+
+        assert!(contains(&keys, "EDGEZERO__ADAPTER__HOST"));
+        assert!(contains(&keys, "EDGEZERO__ADAPTER__PORT"));
+        assert!(contains(&keys, "EDGEZERO__LOGGING__LEVEL"));
+        assert!(contains(&keys, "EDGEZERO__LOGGING__ENDPOINT"));
+        assert!(contains(&keys, "EDGEZERO__LOGGING__USE_FASTLY_LOGGER"));
+        assert!(contains(&keys, "EDGEZERO__LOGGING__ECHO_STDOUT"));
+
+        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__MAIN__NAME"));
+        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__EDGE__NAME"));
+        assert!(contains(&keys, "EDGEZERO__STORES__KV__CACHE__NAME"));
+        assert!(contains(&keys, "EDGEZERO__STORES__SECRETS__VAULT__NAME"));
+
+        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__MAIN__KEY"));
+        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__EDGE__KEY"));
+        assert!(!contains(&keys, "EDGEZERO__STORES__KV__CACHE__KEY"));
+        assert!(!contains(&keys, "EDGEZERO__STORES__SECRETS__VAULT__KEY"));
     }
 }

@@ -132,7 +132,7 @@ const FASTLY_INSTALL_HINT: &str = "install the Fastly CLI (https://www.fastly.co
 
 /// The config store the runtime opens for `EDGEZERO__*` overrides. Compute@Edge
 /// has no process env, so the runtime reads its config-store KEY selector from
-/// here (see `env_config_from_runtime_dictionary` in lib.rs).
+/// here (see `runtime_env_config` in lib.rs).
 const RUNTIME_ENV_STORE: &str = "edgezero_runtime_env";
 
 /// Base name of the staging twin of [`RUNTIME_ENV_STORE`]. The actual store is
@@ -546,12 +546,11 @@ impl Adapter for FastlyCliAdapter {
         // Store named `edgezero_runtime_env`. Compute@Edge has no
         // process env, so `EDGEZERO__STORES__CONFIG__<ID>__KEY` and
         // similar overrides have to come from a platform Config Store
-        // the runtime opens by name (see
-        // `env_config_from_runtime_dictionary` in lib.rs). Provision
-        // owns the store creation alongside the operator's declared
-        // stores so the runtime override path is wired correctly out
-        // of the box; if the store already appears in
-        // `[setup.config_stores.edgezero_runtime_env]`, skip.
+        // the runtime opens by name (see `runtime_env_config` in
+        // lib.rs). Provision owns the store creation alongside the
+        // operator's declared stores so the runtime override path is
+        // wired correctly out of the box; if the store already appears
+        // in `[setup.config_stores.edgezero_runtime_env]`, skip.
         let runtime_env_kind = "config";
         let runtime_env_name = "edgezero_runtime_env";
         if dry_run {
