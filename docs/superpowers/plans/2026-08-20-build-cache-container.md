@@ -8,7 +8,7 @@
 
 **Tech Stack:** Docker (BuildKit), GitHub Actions (`docker/build-push-action`), GHCR, Bash, `jq`.
 
-**Spec:** `docs/specs/edgezero-deploy-build-caching.md` (v6.14, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
+**Spec:** `docs/superpowers/specs/edgezero-deploy-build-caching.md` (v6.14, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
 
 ## Global Constraints
 
