@@ -277,8 +277,10 @@ jobs:
           n=$(docker buildx imagetools inspect "$REF" --format '{{json .}}' \
                 | jq '[.. | .manifests? // empty | .[] | select(.platform.os != "unknown")] | length')
           [ "${n:-1}" -le 1 ] || { echo "::error::not single-manifest ($n)"; exit 1; }
-          # Anonymous pull (the package must be public) + the runtime smoke contract.
-          docker logout ghcr.io || true
+          # Runtime smoke, pulled with the AUTHENTICATED session (a GHCR package is
+          # PRIVATE on first publish, so an anonymous pull here would deadlock the very
+          # first release). The anonymous-pull check is the operator's post-make-public
+          # step below, once the package visibility is public.
           docker run --rm --platform linux/amd64 "$REF" rustc --version | grep -F '1.95.0'
           docker run --rm --platform linux/amd64 "$REF" sh -c 'rustc --print target-list | grep -qx wasm32-wasip1'
           docker run --rm --platform linux/amd64 "$REF" fastly version
@@ -301,10 +303,10 @@ jobs:
           git push -u origin "$br"
           gh pr create --fill --base main --head "$br" \
             --title "Pin build container ${GITHUB_REF_NAME}" \
-            --body "Digest verified by the publish workflow (single-manifest, anonymous pull, runtime smoke)."
+            --body "Digest verified by the publish workflow (single-manifest + authenticated runtime smoke). Anonymous-pull verification is the operator's post-make-public step."
 ```
 
-The publish thus **pushes → inspects by digest → verifies single-manifest + anonymous pull + the runtime smoke → then opens a reviewable `image.json` PR** — the pin the rest of the feature keys on is never recorded until it has been proven against the actual pushed digest.
+The publish thus **pushes → inspects by digest → verifies single-manifest + the runtime smoke (authenticated) → then opens a reviewable `image.json` PR** — the pin the rest of the feature keys on is never recorded until it has been proven against the actual pushed digest. The **anonymous** pull is verified separately, after the operator makes the package public (below), avoiding a first-publish deadlock.
 
 - [ ] **Step 2: Actionlint the workflow**
 
@@ -320,7 +322,7 @@ git commit -m "build-cache container: GHCR publish workflow recording the manife
 
 - [ ] **Step 4: Publish (operator step, out of band)**
 
-Tag `build-container-v1` and push it. The workflow pushes the image, **verifies it by digest** (single-manifest, anonymous pull, runtime smoke), and **opens a PR** updating `image.json` to the real `sha256` digest. Review and merge that PR — the digest is the pin the rest of the feature keys on, and it is only recorded after passing verification against the actual pushed image.
+Tag `build-container-v1` and push it. The workflow pushes the image, **verifies it by digest** (single-manifest + an **authenticated** runtime smoke — the package is private on first publish), and **opens a PR** updating `image.json` to the real `sha256` digest. **Make the GHCR package public** (below), then verify the **anonymous** pull. Review and merge the PR — the digest is the pin the rest of the feature keys on, and it is only recorded after passing verification against the actual pushed image.
 
 **One-time GHCR visibility + retention (operator):** GHCR packages are **private on first publish** and there is no clean REST endpoint to flip a container package public, so set the package `edgezero-build-app-cli` to **public** in its GHCR package settings (or set the org's default package visibility) so consumers can **anonymously** pull by digest (spec §3.7), and enable a retention policy that never prunes a digest referenced by a committed `image.json`. Verify anonymous access:
 ```bash
@@ -390,4 +392,4 @@ git commit -m "build-cache container: gate the build-container digest pin in the
 
 ## Downstream sub-plans (not written yet)
 
-2. Cached build path (reusable workflow + `prepare`/`compile` split + **owned `actions/cache` restore+save with the four-root prune** + config/source closure, spec §3.4/§3.8). 3. Provenance (JSON Schema + procedural validation, `validate-app-cli-provenance`, `compute-app-cli-identity`, `ExpectedIdentity`). 4. Consumer integration (`active-version-fastly`, per-consumer `ExpectedIdentity` inputs, the Docker launcher, production-only recovery). Each is its own plan; sub-plan 2 consumes this container's digest as `platform-id`.
+2. Cached build path (reusable workflow + `prepare`/`compile` split + **an action-owned `sccache` disk cache**: fresh `CARGO_TARGET_DIR` + owned `actions/cache` restore/save over `SCCACHE_DIR` under a bounded rolling generation key + the constructed minimal env + config/source closure, spec §3.1–§3.4/§3.8). 3. Provenance (JCS canonical JSON + JSON Schema + procedural validation, `validate-app-cli-provenance`, `compute-app-cli-identity`, `ExpectedIdentity`). 4. Consumer integration (`active-version-fastly`, per-consumer `ExpectedIdentity` inputs, the Docker launcher, production-only recovery). Each is its own plan; sub-plan 2 consumes this container's digest as `platform-id`.
