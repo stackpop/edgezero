@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fail-closed: the build container reference must be pinned by a sha256 manifest
-# digest, never a mutable tag (spec docs/superpowers/specs/edgezero-deploy-build-caching.md
+# digest, never a mutable tag (spec docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md
 # §3.6/§5). image.json records the canonical repository, tag, and pinned digest;
 # the rest of the build-caching feature keys `platform-id` on that digest, so a
 # non-digest or malformed pin must never pass.
