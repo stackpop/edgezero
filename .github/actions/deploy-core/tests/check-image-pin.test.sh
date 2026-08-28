@@ -38,6 +38,9 @@ if run "$WORK/nodigest.json"; then no "a missing digest is rejected"; else ok "a
 printf '{"tag":"v1","digest":"sha256:%064d"}\n' 0 >"$WORK/norepo.json"
 if run "$WORK/norepo.json"; then no "a missing repository is rejected"; else ok "a missing repository is rejected"; fi
 
+printf '{"repository":123,"tag":1,"digest":"sha256:%064d"}\n' 0 >"$WORK/numeric.json"
+if run "$WORK/numeric.json"; then no "numeric (non-string) repository/tag is rejected"; else ok "numeric (non-string) repository/tag is rejected"; fi
+
 printf 'not json\n' >"$WORK/bad.json"
 if run "$WORK/bad.json"; then no "malformed JSON fails closed"; else ok "malformed JSON fails closed"; fi
 

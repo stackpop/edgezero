@@ -22,12 +22,21 @@ if ! json=$(jq -e . "$file" 2>/dev/null); then
   exit 1
 fi
 
-repo=$(jq -r '.repository // empty' <<<"$json")
-tag=$(jq -r '.tag // empty' <<<"$json")
-digest=$(jq -r '.digest // empty' <<<"$json")
+# Require string TYPES: `jq -r` would coerce a numeric repository/tag/digest to a
+# string, so a `"repository": 123` would otherwise slip through. Check the JSON type.
+if [[ "$(jq -r '.repository | type' <<<"$json")" != "string" ||
+  "$(jq -r '.tag | type' <<<"$json")" != "string" ||
+  "$(jq -r '.digest | type' <<<"$json")" != "string" ]]; then
+  echo "::error::$file 'repository', 'tag', and 'digest' must all be JSON strings" >&2
+  exit 1
+fi
+
+repo=$(jq -r '.repository' <<<"$json")
+tag=$(jq -r '.tag' <<<"$json")
+digest=$(jq -r '.digest' <<<"$json")
 
 if [[ -z "$repo" || -z "$tag" ]]; then
-  echo "::error::$file must set a non-empty string 'repository' and 'tag'" >&2
+  echo "::error::$file must set a non-empty 'repository' and 'tag'" >&2
   exit 1
 fi
 
