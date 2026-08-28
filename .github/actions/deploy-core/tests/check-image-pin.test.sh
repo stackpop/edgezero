@@ -26,17 +26,20 @@ echo "== build container image.json digest-pin validator =="
 printf '{"repository":"ghcr.io/stackpop/edgezero-build-app-cli","tag":"v1","digest":"sha256:%064d"}\n' 0 >"$WORK/ok.json"
 if run "$WORK/ok.json"; then ok "a digest-pinned reference passes"; else no "a digest-pinned reference passes"; fi
 
-printf '{"repository":"ghcr.io/x","tag":"v1","digest":"v1"}\n' >"$WORK/tag.json"
+printf '{"repository":"ghcr.io/stackpop/edgezero-build-app-cli","tag":"v1","digest":"v1"}\n' >"$WORK/tag.json"
 if run "$WORK/tag.json"; then no "a non-digest (tag) reference is rejected"; else ok "a non-digest (tag) reference is rejected"; fi
 
-printf '{"repository":"ghcr.io/x","tag":"v1","digest":"sha256:deadbeef"}\n' >"$WORK/short.json"
+printf '{"repository":"ghcr.io/stackpop/edgezero-build-app-cli","tag":"v1","digest":"sha256:deadbeef"}\n' >"$WORK/short.json"
 if run "$WORK/short.json"; then no "a short/invalid digest is rejected"; else ok "a short/invalid digest is rejected"; fi
 
-printf '{"repository":"ghcr.io/x","tag":"v1"}\n' >"$WORK/nodigest.json"
+printf '{"repository":"ghcr.io/stackpop/edgezero-build-app-cli","tag":"v1"}\n' >"$WORK/nodigest.json"
 if run "$WORK/nodigest.json"; then no "a missing digest is rejected"; else ok "a missing digest is rejected"; fi
 
 printf '{"tag":"v1","digest":"sha256:%064d"}\n' 0 >"$WORK/norepo.json"
 if run "$WORK/norepo.json"; then no "a missing repository is rejected"; else ok "a missing repository is rejected"; fi
+
+printf '{"repository":"ghcr.io/attacker/edgezero-build-app-cli","tag":"v1","digest":"sha256:%064d"}\n' 0 >"$WORK/foreign.json"
+if run "$WORK/foreign.json"; then no "a foreign repository is rejected"; else ok "a foreign repository is rejected"; fi
 
 printf '{"repository":123,"tag":1,"digest":"sha256:%064d"}\n' 0 >"$WORK/numeric.json"
 if run "$WORK/numeric.json"; then no "numeric (non-string) repository/tag is rejected"; else ok "numeric (non-string) repository/tag is rejected"; fi
