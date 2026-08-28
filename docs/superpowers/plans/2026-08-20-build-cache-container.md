@@ -8,7 +8,7 @@
 
 **Tech Stack:** Docker (BuildKit), GitHub Actions (`docker/build-push-action`), GHCR, Bash, `jq`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` (v6.14, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` (v6.16, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
 
 ## Global Constraints
 
@@ -17,7 +17,7 @@
 - **Runtime posture:** consumed **read-only root filesystem, non-root user**, explicit writable mounts only (spec §3.7).
 - **Single-manifest `linux/amd64` only** — no multi-arch index (an index digest can select another architecture).
 - **No Python in CI tooling** — Bash + `jq` only.
-- **Pin policy:** every referenced image/action is pinned; the base image is pinned by `sha256` digest, and the published image is recorded by `sha256` digest.
+- **Pin policy (two-tier, matching the repo's `check-action-pins.sh` gate):** **actions** are pinned to a **released version tag** — a major tag such as `@v7` — per the repo's standing convention (`actions/checkout@v7` passes the gate; the gate accepts a major tag or a full commit SHA, never a floating `@main`/`@latest`); **images** are pinned by `sha256` digest (the base image's digest in the `FROM`, and the published image's digest recorded in `image.json`). Digest immutability is required only where the toolchain/ABI identity depends on it — i.e. the container.
 - **No AI bylines** in commits or PR bodies.
 - **Bash 3.2-compatible** scripts (macOS dev parity); scripts are `shellcheck -S warning` clean.
 
@@ -40,7 +40,7 @@
 
 **Interfaces:**
 - Consumes: nothing (leaf).
-- Produces: `check-image-pin.sh <path-to-image.json>` — exit `0` iff the JSON has string `repository`, string `tag`, and a `digest` matching `^sha256:[0-9a-f]{64}$`; prints `::error::` and exits `1` otherwise. Reused by the pin gate and the publish workflow.
+- Produces: `check-image-pin.sh <path-to-image.json>` — exit `0` iff the JSON has string-typed `repository`/`tag`/`digest`, `repository` **equals the canonical `ghcr.io/stackpop/edgezero-build-app-cli`** (a foreign repository can never become `platform-id`), and `digest` matches `^sha256:[0-9a-f]{64}$`; prints `::error::` and exits `1` otherwise. Reused by the pin gate and the publish workflow. (`image.json` is a committed, PR-reviewed 3-field pin record; its rigor is this type+repo+digest gate. The JCS/JSON-Schema/duplicate-key **provenance** machinery is for *produced* artifacts — `app-cli-meta.json`, spec §3.7 — and belongs to sub-plan 3, not this committed record.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -57,14 +57,18 @@ ok(){ printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 no(){ printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
 run(){ bash "$CHECK" "$1" >/dev/null 2>&1; }
 
-printf '{"repository":"ghcr.io/stackpop/edgezero-build-app-cli","tag":"v1","digest":"sha256:%064d"}\n' 0 >"$WORK/ok.json"
+R="ghcr.io/stackpop/edgezero-build-app-cli"
+printf '{"repository":"%s","tag":"v1","digest":"sha256:%064d"}\n' "$R" 0 >"$WORK/ok.json"
 run "$WORK/ok.json" && ok "a digest-pinned reference passes" || no "a digest-pinned reference passes"
 
-printf '{"repository":"ghcr.io/x","tag":"v1","digest":"v1"}\n' >"$WORK/tag.json"
+printf '{"repository":"%s","tag":"v1","digest":"v1"}\n' "$R" >"$WORK/tag.json"
 run "$WORK/tag.json" && no "a non-digest (tag) reference is rejected" || ok "a non-digest (tag) reference is rejected"
 
-printf '{"repository":"ghcr.io/x","tag":"v1"}\n' >"$WORK/nodigest.json"
+printf '{"repository":"%s","tag":"v1"}\n' "$R" >"$WORK/nodigest.json"
 run "$WORK/nodigest.json" && no "a missing digest is rejected" || ok "a missing digest is rejected"
+
+printf '{"repository":"ghcr.io/attacker/edgezero-build-app-cli","tag":"v1","digest":"sha256:%064d"}\n' 0 >"$WORK/foreign.json"
+run "$WORK/foreign.json" && no "a foreign repository is rejected" || ok "a foreign repository is rejected"
 
 printf 'not json\n' >"$WORK/bad.json"
 run "$WORK/bad.json" && no "malformed JSON fails closed" || ok "malformed JSON fails closed"
@@ -87,6 +91,7 @@ Expected: FAIL (the `check-image-pin.sh` file does not exist yet).
 # never a mutable tag (spec §3.7/§5). Requires mikefarah yq/jq-free: uses jq.
 set -euo pipefail
 
+EXPECTED_REPO="ghcr.io/stackpop/edgezero-build-app-cli"
 file="${1:?usage: check-image-pin.sh <image.json>}"
 if ! command -v jq >/dev/null 2>&1; then
   echo "::error::check-image-pin.sh requires jq" >&2
@@ -96,11 +101,21 @@ if ! json=$(jq -e . "$file" 2>/dev/null); then
   echo "::error::$file is not valid JSON — refusing to pass an unreadable image pin" >&2
   exit 1
 fi
-repo=$(jq -r '.repository // empty' <<<"$json")
-tag=$(jq -r '.tag // empty' <<<"$json")
-digest=$(jq -r '.digest // empty' <<<"$json")
+# String TYPES (jq -r would coerce a numeric value to a string).
+if [[ "$(jq -r '.repository|type' <<<"$json")" != string ||
+  "$(jq -r '.tag|type' <<<"$json")" != string ||
+  "$(jq -r '.digest|type' <<<"$json")" != string ]]; then
+  echo "::error::$file 'repository', 'tag', 'digest' must be JSON strings" >&2
+  exit 1
+fi
+repo=$(jq -r '.repository' <<<"$json"); tag=$(jq -r '.tag' <<<"$json"); digest=$(jq -r '.digest' <<<"$json")
 if [[ -z "$repo" || -z "$tag" ]]; then
-  echo "::error::$file must set string 'repository' and 'tag'" >&2
+  echo "::error::$file must set non-empty 'repository' and 'tag'" >&2
+  exit 1
+fi
+# The repository must be the canonical EdgeZero build container, not merely non-empty.
+if [[ "$repo" != "$EXPECTED_REPO" ]]; then
+  echo "::error::$file 'repository' must be '$EXPECTED_REPO', not '$repo'" >&2
   exit 1
 fi
 if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -113,7 +128,7 @@ echo "build container reference is pinned: $repo@$digest"
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `chmod +x .github/docker/build-app-cli/check-image-pin.sh && bash .github/actions/deploy-core/tests/check-image-pin.test.sh`
-Expected: `Passed: 4  Failed: 0`.
+Expected: `Passed: N  Failed: 0` (the committed test carries the full case set — string-type, foreign-repo, tag, short/missing digest, missing repository, malformed JSON).
 
 - [ ] **Step 5: Shellcheck**
 
