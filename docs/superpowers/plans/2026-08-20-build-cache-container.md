@@ -8,16 +8,17 @@
 
 **Tech Stack:** Docker (BuildKit), GitHub Actions (`docker/build-push-action`), GHCR, Bash, `jq`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` (v6.16, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` (v6.17, sccache pivot) — §2 (build-only single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI + baked provenance validator, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
 
 ## Global Constraints
 
 - **Rust toolchain baked = `1.95.0`** (verbatim from `.tool-versions`); a build that resolves a different toolchain must fail closed downstream, so this image is the single source of truth.
 - **Full build+deploy runtime baked** (spec §3.6): `1.95.0` + `wasm32-wasip1` + a pinned **`sccache`** (the cache mechanism, spec §3.1) + the pinned **Fastly CLI `15.1.0`** (`.tool-versions`) + `git jq tar curl cc` — the container is the deploy runtime, not only the CLI-compile runtime.
+- **Baked provenance validator** (spec §3.7): the image also bakes a single pinned, **project-owned validator binary** (a small Rust tool built from this repo at the same SHA — not a network-fetched helper) that performs JCS canonicalization, duplicate-key detection, JSON-Schema-2020-12 validation, strict `ustar` parsing, and ELF inspection (`jq`/`tar` cannot). Its capabilities are smoke-tested **before the digest is published** (a downstream sub-plan wires the validator itself; this plan reserves its place in the image and the publish smoke).
 - **Runtime posture:** consumed **read-only root filesystem, non-root user**, explicit writable mounts only (spec §3.7).
 - **Single-manifest `linux/amd64` only** — no multi-arch index (an index digest can select another architecture).
 - **No Python in CI tooling** — Bash + `jq` only.
-- **Pin policy (two-tier, matching the repo's `check-action-pins.sh` gate):** **actions** are pinned to a **released version tag** — a major tag such as `@v7` — per the repo's standing convention (`actions/checkout@v7` passes the gate; the gate accepts a major tag or a full commit SHA, never a floating `@main`/`@latest`); **images** are pinned by `sha256` digest (the base image's digest in the `FROM`, and the published image's digest recorded in `image.json`). Digest immutability is required only where the toolchain/ABI identity depends on it — i.e. the container.
+- **Pin policy (risk-tiered, at or above the repo's `check-action-pins.sh` gate):** **images** are pinned by `sha256` digest (the base image's digest in the `FROM`, and the published image's digest recorded in `image.json`). **Actions in this write-privileged publish workflow are pinned to a full 40-hex commit SHA** — GitHub identifies a full commit SHA as the only immutable action reference, and this workflow holds `contents: write` + `packages: write` + `pull-requests: write`, a supply-chain-sensitive privilege class where a re-tagged major version is an unacceptable risk. (Elsewhere in the repo, low-privilege read-only actions follow the standing major-tag convention the gate accepts; **whether to migrate those existing references to SHAs is a separate, repo-wide decision** — see the review note — not made by this container plan.)
 - **No AI bylines** in commits or PR bodies.
 - **Bash 3.2-compatible** scripts (macOS dev parity); scripts are `shellcheck -S warning` clean.
 
@@ -263,7 +264,11 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      # SHA-PINNED (not @v7): this job is write-privileged (contents/packages/PRs),
+      # so every action is pinned to a full 40-hex commit SHA — the only immutable
+      # action reference. Replace <full-40-hex> with the pinned actions/checkout
+      # release SHA (recorded in a comment as its version, e.g. # v4.3.0).
+      - uses: actions/checkout@<full-40-hex-commit-sha> # vX.Y.Z
         # Trusted publish job (no app code runs here); keep the token so the
         # pin-record PR branch can be pushed.
         with:
@@ -288,10 +293,22 @@ jobs:
         run: |
           set -euo pipefail
           REF="$REPO@$DIGEST"
-          # Single-manifest linux/amd64 (reject a multi-arch index).
-          n=$(docker buildx imagetools inspect "$REF" --format '{{json .}}' \
-                | jq '[.. | .manifests? // empty | .[] | select(.platform.os != "unknown")] | length')
-          [ "${n:-1}" -le 1 ] || { echo "::error::not single-manifest ($n)"; exit 1; }
+          # Require a LEAF image manifest, not an index — reject ANY manifest list,
+          # including a one-entry OCI index (a count `<= 1` would wrongly accept it,
+          # and an index digest can be repointed to select a different image). The
+          # digest must resolve to an image manifest (has .config + .layers, no
+          # .manifests), whose platform is linux/amd64.
+          mt=$(docker buildx imagetools inspect "$REF" --raw | jq -r '.mediaType // ""')
+          case "$mt" in
+            *"image.index"*|*"manifest.list"*)
+              echo "::error::$REF is an index/manifest-list ($mt), not a leaf image manifest"; exit 1 ;;
+          esac
+          docker buildx imagetools inspect "$REF" --raw \
+            | jq -e '(.config != null) and (.layers != null) and (.manifests == null)' >/dev/null \
+            || { echo "::error::$REF is not a leaf image manifest (config+layers, no manifests)"; exit 1; }
+          plat=$(docker buildx imagetools inspect "$REF" --format '{{json .Image.Platform}}')
+          echo "$plat" | jq -e '.os=="linux" and .architecture=="amd64"' >/dev/null \
+            || { echo "::error::$REF is not linux/amd64 ($plat)"; exit 1; }
           # Runtime smoke, pulled with the AUTHENTICATED session (a GHCR package is
           # PRIVATE on first publish, so an anonymous pull here would deadlock the very
           # first release). The anonymous-pull check is the operator's post-make-public
@@ -325,7 +342,9 @@ The publish thus **pushes → inspects by digest → verifies single-manifest + 
 
 - [ ] **Step 2: Actionlint the workflow**
 
-Run: `actionlint .github/workflows/publish-build-container.yml`
+Run: `actionlint .github/workflows/publish-build-container.yml` (after substituting the real
+`actions/checkout` release SHA for the `<full-40-hex-commit-sha>` placeholder, as with the
+Dockerfile's base-image digest).
 Expected: no output.
 
 - [ ] **Step 3: Commit**
@@ -337,7 +356,7 @@ git commit -m "build-cache container: GHCR publish workflow recording the manife
 
 - [ ] **Step 4: Publish (operator step, out of band)**
 
-Tag `build-container-v1` and push it. The workflow pushes the image, **verifies it by digest** (single-manifest + an **authenticated** runtime smoke — the package is private on first publish), and **opens a PR** updating `image.json` to the real `sha256` digest. **Make the GHCR package public** (below), then verify the **anonymous** pull. Review and merge the PR — the digest is the pin the rest of the feature keys on, and it is only recorded after passing verification against the actual pushed image.
+Tag `build-container-v1` and push it. The workflow pushes the image, **verifies it by digest** (leaf image manifest, linux/amd64 + an **authenticated** runtime smoke — the package is private on first publish), and **opens a PR** updating `image.json` to the real `sha256` digest. Ordering matters: **review and merge the PR FIRST** — only then does the committed `image.json` carry the real digest — **then make the GHCR package public and verify the anonymous pull reading the merged `image.json`** (verifying before merge would read the still-placeholder digest). The digest is the pin the rest of the feature keys on, and it is only recorded after passing verification against the actual pushed image.
 
 **One-time GHCR visibility + retention (operator):** GHCR packages are **private on first publish** and there is no clean REST endpoint to flip a container package public, so set the package `edgezero-build-app-cli` to **public** in its GHCR package settings (or set the org's default package visibility) so consumers can **anonymously** pull by digest (spec §3.7), and enable a retention policy that never prunes a digest referenced by a committed `image.json`. Verify anonymous access:
 ```bash

@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions — Build Caching Spec
 
-**Status:** Design (proposed) — v6.16 (sccache pivot, hardened)
+**Status:** Design (proposed) — v6.17 (sccache pivot, hardened)
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md`,
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -22,10 +22,15 @@ git dependencies** (so a crates.io-only rule is unusable).
 - **The deployer owns and writes its repo-scoped cache**; every writer that can write the
   deployer's **current-/default-branch** cache is trusted; the deployer's protected workflow
   allowlists `app-repository`/`app-ref`.
-- **The reusable workflow is the only SUPPORTED producer** (build + deploy in one **pinned
-  container**, §3.6). Provenance is a **consistency check, not producer authentication** (an
-  other-job archive can self-assert; attestation is §7). The direct composite is an internal `$/`
-  step only.
+- **The reusable workflow is the only SUPPORTED producer, and it is BUILD-ONLY.** It compiles the app
+  CLI in the **pinned container** (§3.6), caches via sccache, and **emits an artifact plus every
+  `ExpectedIdentity` field as workflow outputs** (§3.8) — it takes **no provider inputs and never
+  deploys**. Deployment is the **consumer's own job**: it validates the artifact
+  (`validate-app-cli-provenance`) then runs the CLI, whose `fastly compute deploy` compiles the wasm
+  target under a token-bearing **deploy-compile** profile (§3.3) and deploys. The shared writable
+  working copy / build→deploy lifecycle (§3.6) lives in that **consumer deployment job**, not the
+  reusable workflow. Provenance is a **consistency check, not producer authentication** (an other-job
+  archive can self-assert; attestation is §7). The direct composite is an internal `$/` step only.
 - **GitHub-hosted `linux/amd64` runners only** (no reliable ephemeral self-hosted predicate).
 
 ## 3. Design
@@ -40,23 +45,28 @@ for shared dependency acceleration:
   cached, never inside the checkout) — so there is no stale-`target/`, no source-in-target, no
   workspace-crate-output, and no unit-graph classification problem.
 - **`RUSTC_WRAPPER` is set (action-owned) to the pinned `sccache`** (an **absolute path**,
-  `/usr/local/bin/sccache`, §3.3) baked into the container. sccache keys a rustc invocation on its
-  **preprocessed source, `dep-info` inputs, compiler arguments, dependency artifacts, a subset of
-  the environment, and the working directory** (v0.10) — so a cached object is reused only when all
-  of those match, and **restoring an older `SCCACHE_DIR` never yields an incorrect object**.
-  **Correctness caveat (accepted risk, not a condition apps satisfy):** sccache's own Rust guidance
-  warns it may **not** cache correctly when a **`build.rs` or a proc-macro reads files or environment
-  not declared as inputs** (undeclared inputs). Rust has **no general mechanism for a proc-macro to
-  declare its filesystem inputs**, so this cannot be posed as a precondition an application meets — it
-  is simply the risk `cache: true` **accepts**. v1 does not detect it; enabling `cache: true` is an
-  **explicit acceptance** of possible staleness for build scripts / proc-macros with undeclared
-  inputs (documented on the input), with the fallback that a wrong object still fails the downstream
-  provenance/ABI checks. No custom pruning; `SCCACHE_CACHE_SIZE` bounds each snapshot (§3.2).
-- **Cache contents = `SCCACHE_DIR` only** (compiled objects + sccache's index). **No `.crate`
-  sources, no `registry/src`, no `git/*`, no `CARGO_HOME/bin`, no config, no credentials** are
-  cached — so a cold build's `registry/src` extraction is irrelevant to the audit, and **no
-  dependency source is ever cached** (only compiled objects). Re-downloading crates each run is the
-  small remaining cost; caching `.crate` archives is §7.
+  `/usr/local/bin/sccache`, §3.3) baked into the container. sccache keys a rustc invocation on the
+  inputs it **observes** — **preprocessed source, `dep-info` inputs, compiler arguments, dependency
+  artifacts, a subset of the environment, and the working directory** (v0.10) — so a cached result is
+  reused only when all of *those* match. **Correctness is guaranteed only for observed inputs.**
+  **Undeclared-input caveat (accepted risk, may pass every downstream check):** sccache's own Rust
+  guidance warns it may **not** cache correctly when a **`build.rs` or a proc-macro reads files or
+  environment not among those observed inputs** (undeclared inputs). Rust has **no general mechanism
+  for a proc-macro to declare its filesystem inputs**, so this cannot be posed as a precondition an
+  application meets — it is simply the risk `cache: true` **accepts**. A stale result from an
+  undeclared input can be **internally consistent** and therefore **pass digest, ELF, and `--help`
+  validation** — the downstream provenance/ABI checks are consistency checks, **not** a staleness
+  detector, so they are **not** a safety net for this. v1 does not detect it; enabling `cache: true`
+  is an **explicit acceptance** of that staleness risk (documented on the input). No custom pruning;
+  `SCCACHE_CACHE_SIZE` bounds each snapshot (§3.2).
+- **Cache contents = `SCCACHE_DIR` only** — sccache stores each cached compilation's **object output,
+  its index, AND the compiler's stdout/stderr** (which sccache **replays** on a hit). That replayed
+  diagnostic text can contain **warning messages, absolute paths, source excerpts, and compile-time
+  values**, so the cache holds **more than object files** (this widens the disclosure surface, §3.7).
+  **No `.crate` sources, no `registry/src`, no `git/*`, no `CARGO_HOME/bin`, no config, no
+  credentials** are cached — so a cold build's `registry/src` extraction is irrelevant to the audit,
+  and **no dependency source is ever cached** (only compiled results). Re-downloading crates each run
+  is the small remaining cost; caching `.crate` archives is §7.
 - **Public, anonymously-fetchable sources only.** sccache caches the compilation of any source, but
   the minimal build environment (§3.3) carries **no credentials**, so the dependency graph must be
   **anonymously fetchable** — `crates.io` and **public git** (e.g. the public EdgeZero repo the
@@ -74,15 +84,15 @@ for shared dependency acceleration:
   (constant across runs of a given runner-arch), **emptied before restore**, and bind-mounted at the
   constant in-container `SCCACHE_DIR=/work/sccache` (§3.6). Only `SCCACHE_DIR` is archived.
 - **Key** = `<family>-<generation>`, `<family>` = `edgezero-sccache-v1-<platform-id>-<suffix-hash>`,
-  restore-keys prefix `<family>-`. `<generation>` = `<github.run_id>-<github.run_attempt>-<invocation-id>`,
-  where **`invocation-id` is unique across every cache-writing invocation** — not merely per matrix
-  leg but per reusable-workflow call in a run (two calls in one run share `run_id`/`run_attempt` and
-  can share a default `app-cli-artifact`, so the artifact **name alone is insufficient**). It is the
-  **`suffix-hash`-bound `app-cli-artifact`** (required unique per writer, §3.8) **hashed into the key**;
-  `run_attempt` additionally distinguishes **re-runs** (same `run_id`). Each writer thus saves a
-  **distinct immutable entry** and restores the **newest** in its `<family>`. `platform-id` = the
-  container digest; `suffix-hash` = the validated `cache-key-suffix` (§3.8). No lockfile/manifest
-  hashing — sccache content-addresses internally.
+  restore-keys prefix `<family>-`. `<generation>` = `<job.check_run_id>` — GitHub's **per-job unique
+  check-run id**, which differs for every job in a run (so two reusable-workflow calls in one run, and
+  every matrix leg, get distinct generations without relying on `run_id`/`run_attempt`/artifact-name
+  collision reasoning). The validated `app-cli-artifact` (unique per writer, §3.8) is **hashed into
+  `<family>`** so distinct writers also occupy distinct families. Each writer saves a **distinct
+  immutable entry** and restores the **newest** in its `<family>`; the immutable artifact/cache name
+  is **reserved (the save key computed and committed to) before save**, so a late collision fails
+  closed rather than clobbering. `platform-id` = the container digest; `suffix-hash` = the validated
+  `cache-key-suffix` (§3.8). No lockfile/manifest hashing — sccache content-addresses internally.
 - **Concurrent lineages (accepted).** Concurrent matrix/sibling writers each restore the same newest
   snapshot and **fork** it; entries are immutable and **not merged**, so only one lineage's warmth is
   carried forward per family and the others' incremental warmth is **lost** (re-warmed next run). v1
@@ -96,14 +106,21 @@ for shared dependency acceleration:
   **billable**. v1 **explicitly accepts** repository-global LRU/thrashing under the rolling scheme (no
   action-side cleanup; the actor lacks a cross-workflow cache-delete permission by default). Bump the
   `-v1-` family namespace when the mechanism changes.
-- **Restore → audit → build → stop-server → best-effort save, with fail-cold contracts.** After
-  restore, **audit** that the restored path is exactly `SCCACHE_DIR` and contains only sccache's
-  blob/index layout. **Any restore, audit, or sccache-read failure resets to a cold build** (discard
-  the restored dir, build once from empty) rather than aborting. Run `sccache --show-stats` for
-  observability. Before save, **`sccache --stop-server`** flushes and shuts the server down so
-  `SCCACHE_DIR` is consistent on disk; **if `--stop-server` fails, the save is SKIPPED** (never
-  archive a live/again-mutating cache). `actions/cache/save` under the run's `<generation>` key is
-  otherwise **best-effort** (failures are warnings).
+- **Restore → audit → build → stop-server → best-effort save, with executable failure contracts.**
+  Two distinct failure classes, handled differently:
+  - **Restore/audit failure → clear and build cold.** After restore, **audit** that the restored path
+    is exactly `SCCACHE_DIR` and contains only sccache's blob/index layout. A **restore download
+    failure or a failed audit** discards the restored dir and **builds once from empty** (the whole
+    cache is suspect).
+  - **An sccache per-object read/IO error → that object MISSES, the build continues** (not a cold
+    reset): `SCCACHE_IGNORE_SERVER_IO_ERROR=1` makes sccache treat a storage IO error as a cache miss
+    and compile directly, so one unreadable object does not fail the build.
+  - **Ordinary compiler failures are NEVER retried** — a `rustc` error is the app's, surfaced as-is;
+    the cache layer does not re-invoke it.
+  Run `sccache --show-stats` for observability. Before save, **`sccache --stop-server`** flushes and
+  shuts the server down so `SCCACHE_DIR` is consistent on disk; **if `--stop-server` fails, the save
+  is SKIPPED** (never archive a live/again-mutating cache). `actions/cache/save` under the run's
+  reserved `<generation>` key is otherwise **best-effort** (failures are warnings).
 
 ### 3.3 Action-owned Cargo/sccache environment
 
@@ -116,16 +133,24 @@ enumerated allowlist exist. **`PATH` = `/usr/local/bin:/usr/local/cargo/bin:/usr
 
 **Enumerated env profiles** (each an exact, closed set — no inherited namespace):
 
-- **compile/build:** `PATH` (above), `RUSTUP_HOME=/usr/local/rustup`, `CARGO_HOME` (§below),
-  `RUSTC_WRAPPER=/usr/local/bin/sccache` (absolute), `RUSTUP_TOOLCHAIN`, `CARGO_TARGET_DIR` (fresh),
-  `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE=2G`, `HOME`, `TMPDIR`, `CARGO_ENCODED_RUSTFLAGS=""`,
-  `CARGO_INCREMENTAL=0`. **No** `sccache`/wrapper vars in the deploy/validation profiles.
+- **cached compile/build (credential-free):** `PATH` (above), `RUSTUP_HOME=/usr/local/rustup`,
+  `CARGO_HOME` (§below), `RUSTC_WRAPPER=/usr/local/bin/sccache` (absolute),
+  `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, `RUSTUP_TOOLCHAIN`, `CARGO_TARGET_DIR` (fresh), `SCCACHE_DIR`,
+  `SCCACHE_CACHE_SIZE=2G`, `HOME`, `TMPDIR`, `CARGO_ENCODED_RUSTFLAGS=""`, `CARGO_INCREMENTAL=0`.
+  **No** provider token.
+- **deploy-compile (`fastly compute deploy`, token-bearing):** `fastly compute deploy` **compiles the
+  wasm target**, so this profile carries the **pinned Rustup/Cargo state** — `PATH`,
+  `RUSTUP_HOME=/usr/local/rustup`, `RUSTUP_TOOLCHAIN`, a **fresh** `CARGO_TARGET_DIR` and a **fresh**
+  `CARGO_HOME` (no restored state), `CARGO_ENCODED_RUSTFLAGS=""`, `CARGO_INCREMENTAL=0`, `HOME`,
+  `TMPDIR` — **but NO `RUSTC_WRAPPER`, NO `SCCACHE_DIR`, and no cache save** (the deploy compile is not
+  cached; the token must never touch the sccache path), plus the **single** provider token
+  (`FASTLY_API_TOKEN`) and the enumerated `EDGEZERO_*` allowlist (below).
 - **validation (`validate-app-cli-provenance`):** `PATH`, `HOME`, `TMPDIR` only (no cargo/sccache, no
   token) — it recomputes ELF metadata and runs the hardened smoke (§3.7).
-- **deploy (`active-version-fastly`, config-push):** `PATH`, `HOME`, `TMPDIR`, the **single** provider
-  token (`FASTLY_API_TOKEN`), and an **enumerated** `EDGEZERO_*` allowlist — the specific public
-  variables the deploy CLI reads are **listed by name** (not the whole `EDGEZERO_*` namespace); an
-  unlisted `EDGEZERO_*` is not present.
+- **read-only provider query / config-push (`active-version-fastly`, config-push):** `PATH`, `HOME`,
+  `TMPDIR`, the **single** provider token (`FASTLY_API_TOKEN`), and an **enumerated** `EDGEZERO_*`
+  allowlist — the specific public variables the deploy CLI reads are **listed by name** (not the whole
+  `EDGEZERO_*` namespace); an unlisted `EDGEZERO_*` is not present. No cargo/sccache.
 
 A **caller-supplied** `RUSTC`/`RUSTC_WRAPPER`/`RUSTC_WORKSPACE_WRAPPER`/`RUSTDOC`/`RUSTFLAGS`/
 native-tool/`PATH` var simply is **not present** in any constructed profile (never inherited).
@@ -143,7 +168,9 @@ flattened single-directory mount would break `working-directory: apps/api`), `CA
 The effective **Cargo config** over the full chain (cwd → `/`, incl. the working directory, plus
 `CARGO_HOME`) must contain only benign allowlisted keys (registry index URLs, `net.retry`,
 `http.timeout`/`check-revoke`); anything else fails closed. Default-features-only; `Cargo.lock` must
-be a tracked, regular file. External path deps outside the workspace root are rejected.
+be a tracked, regular file. **Path dependencies are permitted anywhere beneath `git-root`** (so a
+sibling crate such as `../shared` in the same repository resolves — the whole repo is mounted, §3.6);
+only a path that **escapes `git-root`** (a repository escape) is rejected.
 
 ### 3.4 Identity
 
@@ -160,21 +187,35 @@ commit SHA** (short refs/branches/tags rejected). `workspace-root` canonicalized
 **All identity hashes are SHA-256 over a canonical, length-framed encoding.** Each field is encoded
 as its UTF-8 bytes prefixed by a length frame: the byte length as **ASCII decimal with no leading
 zeros** followed by a single `:` separator (`<len>:<bytes>`), fields concatenated in a fixed order —
-so no field boundary is ambiguous and no fixed width can overflow. **Path fields are normalized
-first** — expressed **relative to `git-root`**, `/`-separated, no `.`/`..`/empty segments, no
-trailing slash, NFC — so the same logical path hashes identically across runners. `workspace-id` =
-that hash over (`app-repo-id`, normalized workspace-root path relative to `git-root`);
-`suffix-hash` = that hash over the validated `cache-key-suffix`. **Golden vectors** (including the
-exact `<len>:<bytes>` framing) for each hash are committed with the plan.
+so no field boundary is ambiguous and no fixed width can overflow. **Path fields are byte-exact, not
+Unicode-folded.** A path is expressed **relative to `git-root`** with a **defined root
+representation** — the root itself encodes as the single byte `.` (never the empty string) — is
+`/`-separated with **no `.`/`..`/empty segments and no trailing slash**, and is hashed as its **exact
+UTF-8 bytes with NO Unicode normalization** (no NFC/NFD): Linux and Git treat a path as a byte string,
+so two byte-distinct paths (e.g. an NFC vs. NFD spelling of the same character) are **distinct files**
+and must hash **distinctly** — folding them would collide two real workspaces onto one `workspace-id`.
+A **non-UTF-8 path byte sequence is rejected** (fail closed). `workspace-id` = that hash over
+(`app-repo-id`, workspace-root path relative to `git-root`); `suffix-hash` = that hash over the
+validated `cache-key-suffix`. **Golden vectors** — including the `<len>:<bytes>` framing, the `.`
+root, and an **NFC-vs-NFD pair that must produce different hashes** — are committed with the plan.
 `platform-id` = the container digest, **read inside every action from `image.json` at the same
 EdgeZero SHA — never caller-supplied**; `container-ref` = `<repo>@<platform-id>`.
 
 ### 3.5 Writer fidelity vs. source authorization
 
-Cache runs only on `push`/`workflow_dispatch`/`schedule` on a **protected deployer ref** with
-`HEAD == resolved app SHA` (action fidelity); the deployer's protected workflow allowlists the app
-identity, and every writer of the deployer's **current-/default-branch** cache scope is trusted
-(deployer authorization). Normative in the guide.
+Cache runs only on `push`/`workflow_dispatch`/`schedule` on a **protected deployer ref**. Because the
+**deployer and the app can be separate repositories**, the deployer's `HEAD` is **not** the app SHA —
+the predicates are **checked separately**, never conflated into one equality:
+
+1. **Deployer workflow identity** — the calling workflow runs on a protected deployer ref
+   (`push`/`dispatch`/`schedule`), whose protected config allowlists the app identity.
+2. **Called-workflow SHA** — the reusable workflow is called at a pinned EdgeZero SHA (the `$/`
+   self-repo floor, §3.8).
+3. **App-checkout SHA** — the mounted app checkout's `HEAD` equals the resolved `app-ref` (a full
+   40-hex SHA, §3.4), asserted against the **app** repo — independently of the deployer's own `HEAD`.
+
+Every writer of the deployer's **current-/default-branch** cache scope is trusted (deployer
+authorization). Normative in the guide.
 
 ### 3.6 Container, runner, launcher
 
@@ -193,21 +234,29 @@ identity, and every writer of the deployer's **current-/default-branch** cache s
   into the deploy instance** (as derived build state, not re-copied), so generated files (`dist/`,
   staged `pkg/`, produced manifests) reach the deploy step without a lossy re-clone. Freeze
   assertions (§3.7) run against the **read-only original**, never this mutated copy.
-- **One launcher `run-app-cli-in-container`** with a **complete fixed mount table** (constant
-  in-container paths, so sccache's cwd/path hashing is stable regardless of the host checkout
-  location; never `RUNNER_TEMP` wholesale):
+- **One launcher `run-app-cli-in-container`** with a **maximum mount allowlist** and a **minimal
+  per-operation mount profile** (constant in-container paths, so sccache's cwd/path hashing is stable
+  regardless of the host checkout location; never `RUNNER_TEMP` wholesale). **No operation receives
+  more than its profile lists** — in particular the **archive-supplied validator is not authenticated,
+  so its `--help` smoke gets NONE of the writable repo/target/cargo-home/sccache mounts.** The table
+  is the ceiling; each row's "Ops" column is the closed set of operations that may mount it:
 
-  | In-container path | Mode | Source |
-  | --- | --- | --- |
-  | `/work/repo` (repo root; compile cwd = `/work/repo/<working-directory>`) | **writable** | a **verified faithful copy** of the whole app checkout, layout preserved |
-  | `/work/target` | writable | fresh `CARGO_TARGET_DIR` |
-  | `/work/cargo-home` | writable | `CARGO_HOME` |
-  | `/work/sccache` | writable | `SCCACHE_DIR` (restored from the stable host path, §3.2) |
-  | `/work/home`, `/work/tmp` | writable (tmpfs) | provider/Fastly `HOME`, `TMPDIR` |
-  | the package/output dir | writable | staged CLI / Fastly `pkg/` |
-  | the validated CLI binary | read-only | consumer input |
-  | the specific inline-config temp file | read-only | config-push only, by exact path |
+  | In-container path | Mode | Ops (only these mount it) | Source |
+  | --- | --- | --- | --- |
+  | `/work/repo` (repo root; compile cwd = `/work/repo/<working-directory>`) | **writable** | cached-compile, deploy-compile | a **verified faithful copy** of the whole app checkout, layout preserved |
+  | `/work/target` | writable | cached-compile, deploy-compile (each its own **fresh** dir) | fresh `CARGO_TARGET_DIR` |
+  | `/work/cargo-home` | writable | cached-compile, deploy-compile (fresh) | `CARGO_HOME` |
+  | `/work/sccache` | writable | **cached-compile only** | `SCCACHE_DIR` (restored from the stable host path, §3.2) |
+  | `/work/home`, `/work/tmp` | writable (tmpfs) | all | provider/Fastly `HOME`, `TMPDIR` |
+  | the package/output dir | writable | deploy-compile, config-push | staged CLI / Fastly `pkg/` |
+  | the validated CLI binary | read-only | **validation, provider-query, deploy** | consumer input |
+  | the specific inline-config temp file | read-only | **config-push only**, by exact path | config-push only |
 
+  So: **validation** (`--help` smoke) mounts only the read-only binary + `/work/home,/work/tmp` — no
+  repo/target/cargo/sccache; **read-only provider query** mounts the read-only binary + tmpfs +
+  (host-side) token, nothing writable-source; **config-push** adds only the one read-only inline-config
+  file; **cached-compile** is the only operation that mounts `/work/sccache`; **deploy-compile** mounts
+  the (re-verified, §3.7) `/work/repo` + fresh target/cargo + output dir + token, **never sccache**.
   UID/GID mapping so the non-root container user owns the writable mounts.
   - **Writable working COPY (whole repo, layout preserved).** The CLI runs arbitrary manifest commands
     via `sh -c` in the manifest root and may create `dist/`, `node_modules/`, generated manifests — so
@@ -232,12 +281,19 @@ identity, and every writer of the deployer's **current-/default-branch** cache s
 - **Source freezing:** the writable `/work/repo` copy is proven a **faithful copy** of the read-only
   original (§3.6) before compilation — **tracked files + initialized submodules only, git-ignored/
   untracked detritus excluded**, so the copy is exactly what `source-revision` represents — and that
-  **same copy (now with build outputs) is reused for the deploy instance** (§3.6), so the frozen
-  source, the executed bytes, and the deployed artifacts are one lineage. On the **read-only
+  **same copy (now with build outputs) is reused for the deploy instance** (§3.6). On the **read-only
   original**, assert the initial `HEAD` SHA unchanged + tree clean (tracked + untracked + recursive
-  submodules) **before and after** all app-controlled commands; reject escaping symlinks. Consumers
-  additionally **verify their mounted checkout's repository id, `HEAD`, and workspace against the
-  artifact before and after commands**.
+  submodules) **before and after** all app-controlled commands; reject escaping symlinks.
+  - **Re-verify the shared copy before the token-bearing deploy-compile.** A `build.rs`/manifest
+    command in the credential-free build could have **mutated a tracked file inside `/work/repo`**;
+    the read-only-original assertions would still pass while the deploy step compiles the **changed
+    bytes** with the token present. So **before deploy-compile, re-verify every initially-tracked
+    path** in the copy against the frozen source — **content, mode, symlink target, and gitlink
+    (submodule commit)** — and **permit divergence only in explicitly declared output paths**
+    (`target/`, the staged package dir, and any manifest-declared build outputs). Any change to a
+    tracked source file outside those declared paths **fails closed** before the token is used.
+  Consumers additionally **verify their mounted checkout's repository id, `HEAD`, and workspace against
+  the artifact before and after commands**.
 - **`ExpectedIdentity`:** `app-repo-id` (decimal string), `source-revision` (full SHA, explicit),
   `app-cli-package`, `app-cli-bin`, `workspace-id` — **caller-supplied and checkout-verified**;
   `platform-id`/`container-ref` are **derived inside every action from same-SHA `image.json`, not
@@ -268,7 +324,15 @@ identity, and every writer of the deployer's **current-/default-branch** cache s
 - **`validate-app-cli-provenance`** (fresh pinned container, minimal env, hardened): enforce the
   archive contract; JCS + JSON-Schema validate; re-verify binary digest/size; **ABI loadability
   proof** — recompute `PT_INTERP`, `DT_NEEDED`, and search paths from the binary, **resolve every
-  required library inside the immutable image**, then run a **credential-free `--help` smoke**. The
+  required library inside the immutable image**, then run a **credential-free `--help` smoke**.
+  - **Trusted validation runtime (baked, project-owned).** JCS canonicalization, duplicate-key
+    detection, JSON-Schema-2020-12 validation, strict `ustar` parsing, and ELF inspection are **not
+    expressible in `jq`/`tar`**, so the image **bakes a single pinned, project-owned validator binary**
+    (a small Rust tool built from the EdgeZero repo at the same SHA — **not** a network-fetched helper,
+    keeping the validation runtime credential-free and offline) that performs all of them. The
+    container plan **smoke-tests every required capability** (JCS, dup-key reject, schema reject,
+    non-ustar/pax reject, ELF read) **before the image digest is published**, so a missing capability
+    fails the publish, not a deploy. The
   smoke runs the archive-supplied binary under **`--network=none --read-only --user 1001
   --cap-drop=ALL --security-opt=no-new-privileges`, a bounded `--memory`/`--pids-limit`, and a wall
   timeout** (Docker enforces these directly). Compare every caller `ExpectedIdentity` field. Output
@@ -284,9 +348,10 @@ identity, and every writer of the deployer's **current-/default-branch** cache s
   `ExpectedIdentity`.
 - **Disclosure (enforceable):** because the action cannot compare reader sets, require
   **`disclosure-acknowledged: true` for every cross-repository build** (`app-repo-id` ≠ the deployer
-  repo id), **exempting only equal repository ids**. The sccache cache holds **compiled objects**
-  (not dependency source), so the exposure it acknowledges is compiled artifacts; `deploy-fastly.cache`
-  carries the same acknowledgement.
+  repo id), **exempting only equal repository ids**. The sccache cache holds **compiled results — not
+  only object files but the replayed compiler stdout/stderr** (warnings, absolute paths, source
+  excerpts, compile-time values, §3.1) — so the exposure it acknowledges is **compiled artifacts and
+  build diagnostics**, not merely objects; `deploy-fastly.cache` carries the same acknowledgement.
 
 ### 3.8 Reusable-workflow contract
 
@@ -296,9 +361,16 @@ Inputs: `app-repository`, `app-ref`, **`app-repo-id`** (string, always required)
 reusable-workflow call in a run; the action **fails closed** on a collision it can detect, since two
 calls sharing `run_id`/`run_attempt` and a default artifact name would otherwise write the same key),
 `cache` (default `false`), `cache-key-suffix`, `disclosure-acknowledged` (required-true for cross-repo),
-`timeout-minutes` (30). **No `rust-toolchain`/feature inputs.** Secret `app-checkout-token`. Job
-`permissions: { contents: read }` (caller grants ≥ that); `persist-credentials: false`. **Runner floor
-2.336.0** (self-repo `$/`).
+`timeout-minutes` (30). **No `rust-toolchain`/feature inputs, and NO provider inputs** (the workflow is
+**build-only**, §2 — it never deploys). Secret `app-checkout-token`. Job `permissions: { contents:
+read }` (caller grants ≥ that); `persist-credentials: false`. **Runner floor 2.336.0** (self-repo `$/`).
+
+**Outputs (build-only):** the built **`artifact-name`** (the uploaded provenance tar, §3.7) plus
+**every `ExpectedIdentity` field explicitly** — `app-repo-id`, `source-revision`, `app-cli-package`,
+`app-cli-bin`, `workspace-id`, `platform-id`, `container-ref` — so a single-build caller can pass them
+straight into its **own deployment job** (`validate-app-cli-provenance` → `active-version-fastly` →
+the CLI's `fastly compute deploy`, §2). The shared writable copy / deploy-compile (§3.3/§3.6) lives in
+that consumer job, never here.
 
 **Matrix:** v1's shared workflow outputs are **single-build** (GitHub returns only the last matrix
 leg's outputs). A **matrix caller uses unique per-leg `app-cli-artifact` names** (which also key each
@@ -320,26 +392,42 @@ version misses); a corrupt/failed restore **resets cold** (one rebuild from empt
 (fixed `/work/repo/<working-directory>` cwd); a **nested working directory** (`working-directory:
 apps/api` under a parent workspace) builds with its enclosing Cargo config/sibling path-deps intact;
 **a public git dependency (the EdgeZero repo) builds and caches**; two writers with distinct
-`app-cli-artifact` names save **distinct entries** (no key collision). Container/runner/launcher
-(self-hosted fails closed; read-only rootfs; **separate build/deploy container instances sharing one
-`/work/repo` copy** so build outputs reach deploy; the faithful `/work/repo` copy matches the original
-in content/modes/symlinks/**initialized-submodule** state with hardlinks broken and **git-ignored
-files excluded**; a manifest command creating `dist/` succeeds in the copy while the original stays
-clean; enumerated fixed mount table only; host-side `mutation-attempted` before mutation; cancellation
+`job.check_run_id` generations save **distinct entries** (no key collision); an sccache per-object IO
+error **misses and continues** (`SCCACHE_IGNORE_SERVER_IO_ERROR=1`) while a bad restore **resets cold**;
+a `rustc` error is **surfaced, not retried**. **Wall-time drop is telemetry, not a pass/fail assertion**
+(only the sccache hit-rate rise is asserted). Topology (**build-only reusable workflow**: it exposes the
+artifact + every `ExpectedIdentity` field as outputs, takes **no provider input**, and never deploys;
+the **consumer's own job** validates then deploy-compiles; the cross-repo predicates — deployer ref,
+called-workflow SHA, app-checkout SHA — are checked **separately** (deployer HEAD ≠ app SHA is fine);
+a **path dep beneath `git-root` resolves**, only a `git-root` escape is rejected). Container/runner/
+launcher (self-hosted fails closed; read-only rootfs; **full recursive, non-sparse checkout** with LFS/
+smudge-filter content materialized (not pointer files); **separate build/deploy container instances
+sharing one `/work/repo` copy** so build outputs reach deploy; the faithful `/work/repo` copy matches the
+original in content/modes/symlinks/**initialized-submodule** state with hardlinks broken and **git-ignored
+files excluded**; **before deploy-compile the copy's tracked files/modes/symlinks/gitlinks are
+re-verified** and a `build.rs` that mutated a tracked file fails closed; a manifest command creating
+`dist/` succeeds in the copy while the original stays clean; **per-operation mount profiles** — the
+unauthenticated validator `--help` smoke gets **no** writable repo/target/cargo/sccache, and only
+cached-compile mounts `/work/sccache`; host-side `mutation-attempted` before mutation; cancellation
 `docker stop -t`+reconcile). Env/config (constructed minimal env; **`PATH` includes `/usr/local/bin`**
-so `fastly` resolves; `RUSTUP_HOME` set and an absolute `RUSTC_WRAPPER`; the deploy profile exposes
-only the **enumerated** `EDGEZERO_*` allowlist + the single token; a caller `RUSTC_WRAPPER`/`PATH` is
-absent, not merely rejected; non-allowlisted config anywhere fails). Identity (`app-repo-id`
-API-verified **with `app-checkout-token` host-side, never forwarded into a container/copy/artifact/
-cache**; `app-ref` rejected unless a full 40-hex SHA; **length-framed `<len>:<bytes>` hash golden
-vectors** with normalized paths; `platform-id` from `image.json`, not caller; consumer re-verifies
-checkout id/HEAD/workspace before+after). Provenance (JCS canonical + dup-key rejection; ustar-only
-exactly-two-members with **normalized headers** — zero `mtime`/`uid`/`gid`, fixed names — `pax`
-rejected, binary size equality; **ABI loadability** — `abi` = recomputed `machine`/`interp`(`null` if
-static)/direct-`DT_NEEDED`, transitive resolved in the image, `dlopen` out of scope — + a hardened
-`--help` smoke (`--network=none --cap-drop=ALL --no-new-privileges`, memory/pids/timeout); a real
-wrong-runtime rejected; provenance documented consistency-only). Disclosure required for every
-cross-repo build (equal-id exempt). Recovery production-only.
+so `fastly` resolves; the **deploy-compile profile** carries Rustup/Cargo + fresh target/cargo but
+**no `RUSTC_WRAPPER`/`SCCACHE_DIR`/save**; `RUSTUP_HOME` set and an absolute `RUSTC_WRAPPER` in the
+cached-compile profile; the deploy profile exposes only the **enumerated** `EDGEZERO_*` allowlist + the
+single token; a caller `RUSTC_WRAPPER`/`PATH` is absent, not merely rejected; non-allowlisted config
+anywhere fails). Identity (`app-repo-id` API-verified **with `app-checkout-token` host-side, never
+forwarded into a container/copy/artifact/cache**; `app-ref` rejected unless a full 40-hex SHA;
+**length-framed `<len>:<bytes>` hash golden vectors** with the `.` root and a **byte-exact NFC-vs-NFD
+pair that hashes differently** (no Unicode folding); a **non-UTF-8 path rejected**; `platform-id` from
+`image.json`, not caller; consumer re-verifies checkout id/HEAD/workspace before+after). Provenance
+(the **baked project-owned validator** smoke-tests JCS/dup-key/schema/ustar/ELF capability at publish;
+JCS canonical + dup-key rejection; ustar-only exactly-two-members with **normalized headers** — zero
+`mtime`/`uid`/`gid`, fixed names — `pax` rejected, binary size equality; **ABI loadability** — `abi` =
+recomputed `machine`/`interp`(`null` if static)/direct-`DT_NEEDED`, transitive resolved in the image,
+`dlopen` out of scope — + a hardened `--help` smoke (`--network=none --cap-drop=ALL --no-new-privileges`,
+memory/pids/timeout); a real wrong-runtime rejected; **a stale undeclared-input object can pass every
+check** (documented, not caught); provenance documented consistency-only). Disclosure required for every
+cross-repo build (equal-id exempt), acknowledging **compiled artifacts and build diagnostics**. Recovery
+production-only.
 
 ## 5. Rollout, docs, migration
 
@@ -407,7 +495,26 @@ containers/copies/artifacts/caches; **length-framed `<len>:<bytes>` hash encodin
 relative paths, **normalized ustar headers** (zero `mtime`/`uid`/`gid`, fixed names), and **`abi` as
 recomputed ELF metadata** (`machine`/`interp`=`null`-if-static/direct-`DT_NEEDED`; transitive resolved,
 `dlopen` out of scope). Container sub-plan: two-tier pin policy (major action tags, image digests) and a
-**canonical-repository** check in `check-image-pin.sh`.
+**canonical-repository** check in `check-image-pin.sh`. → **v6.17 (contract revision)**: the reusable
+workflow is **build-only** — no provider inputs, emits the artifact + every `ExpectedIdentity` field as
+outputs, and the shared-copy build→deploy lifecycle moves to the **consumer's deploy job** (resolving the
+"one container builds+deploys" contradiction); a **deploy-compile env/mount profile** (Rustup/Cargo +
+fresh target/cargo, **no wrapper/`SCCACHE_DIR`/save**) because `fastly compute deploy` compiles the wasm;
+**per-operation mount profiles** (the unauthenticated validator smoke gets **no** writable repo/target/
+cargo/sccache; only cached-compile mounts sccache); the shared copy's tracked files/modes/symlinks/
+gitlinks **re-verified before the token-bearing deploy** (derived state only in declared output paths);
+the cross-repo topology predicates **split** (deployer ref, called-workflow SHA, app-checkout SHA — not
+one HEAD==app-SHA equality) and **path deps permitted anywhere beneath `git-root`**; the undeclared-input
+staleness restated as **may pass every downstream check** (provenance/ABI is not a staleness detector);
+the cache described as holding **compiled results incl. replayed compiler stdout/stderr**, widening the
+**disclosure** to build diagnostics; **byte-exact path hashing** (drop NFC — Linux/Git paths are bytes;
+NFC/NFD are distinct), a defined `.` root, non-UTF-8 rejected; **`job.check_run_id` generation** +
+`SCCACHE_IGNORE_SERVER_IO_ERROR=1` (per-object IO error → miss, not cold) + name reserved before save +
+compiler errors never retried; **full recursive non-sparse checkout** with LFS/filter content
+materialized; wall-time as **telemetry**. Container sub-plan: a **baked project-owned validator**
+(JCS/dup-key/schema/ustar/ELF, smoke-tested at publish); **SHA-pinned actions in the write-privileged
+publish workflow**; the single-manifest check **rejects a one-entry OCI index** (leaf manifest required);
+the anonymous-pull check reads the **merged** digest.
 
 ## 9. Deferred to the implementation plan (mechanics only)
 
