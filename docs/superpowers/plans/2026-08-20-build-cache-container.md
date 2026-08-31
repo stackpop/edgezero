@@ -1,429 +1,516 @@
-# Build-Cache Container Implementation Plan (sub-plan 1 of 4)
+# Build-Cache Container Implementation Plan (plan 1 of 4)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Use `superpowers:subagent-driven-development` or
+> `superpowers:executing-plans`. Follow the tasks in order and stop at every release checkpoint.
 
-**Goal:** Publish a pinned, single-manifest `linux/amd64` build container that bakes the exact Rust toolchain + build tools, so `platform-id` for the cached-build feature is an immutable digest.
+**Goal:** Publish and pin a public, leaf `linux/amd64` runtime image containing the exact EdgeZero
+build/deploy toolchain and the trusted provenance validator required by build caching.
 
-**Architecture:** A versioned in-repo Dockerfile builds an image FROM a digest-pinned base with the workspace's pinned Rust toolchain and the tools `build-app-cli` needs (`git`, `jq`, `tar`, `curl`, `ca-certificates`, a C toolchain for `build.rs`). A publish workflow builds it single-arch, pushes it to GHCR, and records its **manifest digest** in a committed `image.json`. A fail-closed `check-image-pin.sh` (wired into the existing pin gate's test harness) proves the recorded reference is pinned by a 64-hex `sha256` digest, never a mutable tag.
+**Architecture:** Source revision `S` builds the image from the repository root. The publish workflow
+captures and verifies immutable digest `D`, proves anonymous access, and opens an idempotent PR adding
+`image.json`. That pin plus its permanent gate forms baseline `B`. The remaining feature plans land on
+top, and their final passing action revision `P` contains the unchanged `{D, S, protocol}` record.
+Consumers pin all EdgeZero actions and reusable workflows to full SHA `P`.
 
-**Tech Stack:** Docker (BuildKit), GitHub Actions (`docker/build-push-action`), GHCR, Bash, `jq`.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.18.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` (v6.17, sccache pivot) — §2 (build-only single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI + baked provenance validator, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
+**Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
+`shellcheck`, and `zizmor`.
 
-## Global Constraints
+## 1. Non-negotiable contracts
 
-- **Rust toolchain baked = `1.95.0`** (verbatim from `.tool-versions`); a build that resolves a different toolchain must fail closed downstream, so this image is the single source of truth.
-- **Full build+deploy runtime baked** (spec §3.6): `1.95.0` + `wasm32-wasip1` + a pinned **`sccache`** (the cache mechanism, spec §3.1) + the pinned **Fastly CLI `15.1.0`** (`.tool-versions`) + `git jq tar curl cc` — the container is the deploy runtime, not only the CLI-compile runtime.
-- **Baked provenance validator** (spec §3.7): the image also bakes a single pinned, **project-owned validator binary** (a small Rust tool built from this repo at the same SHA — not a network-fetched helper) that performs JCS canonicalization, duplicate-key detection, JSON-Schema-2020-12 validation, strict `ustar` parsing, and ELF inspection (`jq`/`tar` cannot). Its capabilities are smoke-tested **before the digest is published** (a downstream sub-plan wires the validator itself; this plan reserves its place in the image and the publish smoke).
-- **Runtime posture:** consumed **read-only root filesystem, non-root user**, explicit writable mounts only (spec §3.7).
-- **Single-manifest `linux/amd64` only** — no multi-arch index (an index digest can select another architecture).
-- **No Python in CI tooling** — Bash + `jq` only.
-- **Pin policy (risk-tiered, at or above the repo's `check-action-pins.sh` gate):** **images** are pinned by `sha256` digest (the base image's digest in the `FROM`, and the published image's digest recorded in `image.json`). **Actions in this write-privileged publish workflow are pinned to a full 40-hex commit SHA** — GitHub identifies a full commit SHA as the only immutable action reference, and this workflow holds `contents: write` + `packages: write` + `pull-requests: write`, a supply-chain-sensitive privilege class where a re-tagged major version is an unacceptable risk. (Elsewhere in the repo, low-privilege read-only actions follow the standing major-tag convention the gate accepts; **whether to migrate those existing references to SHAs is a separate, repo-wide decision** — see the review note — not made by this container plan.)
-- **No AI bylines** in commits or PR bodies.
-- **Bash 3.2-compatible** scripts (macOS dev parity); scripts are `shellcheck -S warning` clean.
+- Rust is the exact version in `.tool-versions` (`1.95.0` at plan time).
+- Fastly CLI is the exact version/checksum in `.github/actions/deploy-fastly/versions.json`
+  (`15.1.0` at plan time).
+- sccache is exactly `0.10.0`, fetched from its release artifact and checksum-verified.
+- The base image uses a real `sha256` digest. No placeholder digest or checksum is committed.
+- The final image is a leaf `linux/amd64` image manifest, not an OCI index.
+- The final image contains an installed `wasm32-wasip1` target, not merely a rustc target-list entry.
+- The project-owned validator, schema, and capability fixtures are baked and tested before push.
+- Runtime is non-root uid/gid 1001 and works with a read-only root filesystem plus explicit tmpfs.
+- Every non-local external action and reusable workflow ref is a full lowercase 40-hex commit SHA.
+  Docker image refs use immutable `sha256` digests. Local `./...` actions remain local refs.
+- Bash scripts are Bash 3.2-compatible and `shellcheck -S warning` clean. CI helper scripts do not use
+  Python. No AI bylines appear in commits or PRs.
+- Publication never records a digest before the image passes authenticated verification and a clean,
+  anonymous pull by digest.
 
-## File Structure
+## 2. Dependency order
 
-- `.github/docker/build-app-cli/Dockerfile` — the image definition (one responsibility: the build environment).
-- `.github/docker/build-app-cli/image.json` — the published image's canonical reference + digest (the pin record).
-- `.github/docker/build-app-cli/check-image-pin.sh` — fail-closed validator of `image.json`.
-- `.github/actions/deploy-core/tests/check-image-pin.test.sh` — unit tests for the validator (colocated with the existing action test harness).
-- `.github/workflows/publish-build-container.yml` — build + push + digest capture (runs on a `build-container-v*` tag).
-- `.github/actions/deploy-core/tests/run.sh` — modified to invoke the new validator suite.
+Although this is plan 1 of the feature set, its image task cannot run first. Execute these gates:
 
----
+1. Land the trusted validator contract and capability fixtures (Task 0).
+2. Land the repository-wide full-SHA policy migration (Task 1).
+3. Implement image pinning, the Dockerfile, publisher, local-image CI, and pin-change CI (Tasks 2-4).
+4. Merge all pre-publication code and tests; record that exact full commit as source revision `S`.
+5. Run the already-landed publisher at `S`, verify digest `D`, and merge its required-check pin PR to
+   create baseline `B` (Tasks 4-5).
+6. Execute the cached-build, provenance integration, launcher, and consumer plans on `B`; their final
+   passing commit becomes action revision `P`.
 
-### Task 1: Fail-closed `image.json` validator (pure TDD)
+Do not publish a provisional image without the validator. Do not use a placeholder `image.json` to
+break the dependency cycle.
 
-**Files:**
-- Create: `.github/docker/build-app-cli/check-image-pin.sh`
-- Test: `.github/actions/deploy-core/tests/check-image-pin.test.sh`
+## 3. Planned file surface
 
-**Interfaces:**
-- Consumes: nothing (leaf).
-- Produces: `check-image-pin.sh <path-to-image.json>` — exit `0` iff the JSON has string-typed `repository`/`tag`/`digest`, `repository` **equals the canonical `ghcr.io/stackpop/edgezero-build-app-cli`** (a foreign repository can never become `platform-id`), and `digest` matches `^sha256:[0-9a-f]{64}$`; prints `::error::` and exits `1` otherwise. Reused by the pin gate and the publish workflow. (`image.json` is a committed, PR-reviewed 3-field pin record; its rigor is this type+repo+digest gate. The JCS/JSON-Schema/duplicate-key **provenance** machinery is for *produced* artifacts — `app-cli-meta.json`, spec §3.7 — and belongs to sub-plan 3, not this committed record.)
+Create:
 
-- [ ] **Step 1: Write the failing test**
+- `crates/edgezero-provenance-validator/Cargo.toml`
+- `crates/edgezero-provenance-validator/src/{main,json_contract,archive,elf,extract}.rs`
+- `crates/edgezero-provenance-validator/tests/cli.rs`
+- `.github/docker/build-app-cli/provenance.schema.json`
+- `.github/docker/build-app-cli/fixtures/provenance/**`
+- `.github/docker/build-app-cli/fixtures/wasm-smoke.rs`
+- `.github/docker/build-app-cli/Dockerfile`
+- `.dockerignore`
+- `.github/docker/build-app-cli/verify-toolchain.sh`
+- `.github/docker/build-app-cli/verify-published-image.sh`
+- `.github/docker/build-app-cli/update-image-pin-pr.sh`
+- `.github/actions/deploy-core/tests/verify-toolchain.test.sh`
+- `.github/actions/deploy-core/tests/verify-published-image.test.sh`
+- `.github/actions/deploy-core/tests/update-image-pin-pr.test.sh`
+- `.github/actions/deploy-core/tests/check-doc-action-pins.sh`
+- `.github/workflows/publish-build-container.yml`
 
-```bash
-#!/usr/bin/env bash
-# .github/actions/deploy-core/tests/check-image-pin.test.sh
-set -euo pipefail
-DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-CHECK="$DIR/../../../docker/build-app-cli/check-image-pin.sh"
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
-pass=0 fail=0
-ok(){ printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
-no(){ printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
-run(){ bash "$CHECK" "$1" >/dev/null 2>&1; }
+Created by the release PR, not source revision `S`:
 
-R="ghcr.io/stackpop/edgezero-build-app-cli"
-printf '{"repository":"%s","tag":"v1","digest":"sha256:%064d"}\n' "$R" 0 >"$WORK/ok.json"
-run "$WORK/ok.json" && ok "a digest-pinned reference passes" || no "a digest-pinned reference passes"
+- `.github/docker/build-app-cli/image.json`
 
-printf '{"repository":"%s","tag":"v1","digest":"v1"}\n' "$R" >"$WORK/tag.json"
-run "$WORK/tag.json" && no "a non-digest (tag) reference is rejected" || ok "a non-digest (tag) reference is rejected"
+Modify:
 
-printf '{"repository":"%s","tag":"v1"}\n' "$R" >"$WORK/nodigest.json"
-run "$WORK/nodigest.json" && no "a missing digest is rejected" || ok "a missing digest is rejected"
+- workspace `Cargo.toml` / `Cargo.lock`
+- `.github/docker/build-app-cli/check-image-pin.sh`
+- `.github/actions/deploy-core/tests/check-image-pin.test.sh`
+- `.github/actions/deploy-core/tests/check-action-pins.sh`
+- `.github/actions/deploy-core/tests/run.sh`
+- `.github/workflows/deploy-action.yml`
+- every existing `.github` workflow/composite containing a non-local external `uses:` ref
+- the four deploy/adoption documents containing consumer `uses:` examples
 
-printf '{"repository":"ghcr.io/attacker/edgezero-build-app-cli","tag":"v1","digest":"sha256:%064d"}\n' 0 >"$WORK/foreign.json"
-run "$WORK/foreign.json" && no "a foreign repository is rejected" || ok "a foreign repository is rejected"
+## 4. Task 0: Land the validator capability contract
 
-printf 'not json\n' >"$WORK/bad.json"
-run "$WORK/bad.json" && no "malformed JSON fails closed" || ok "malformed JSON fails closed"
-
-printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
-```
-
-- [ ] **Step 2: Run it to verify it fails**
-
-Run: `bash .github/actions/deploy-core/tests/check-image-pin.test.sh`
-Expected: FAIL (the `check-image-pin.sh` file does not exist yet).
-
-- [ ] **Step 3: Write the minimal implementation**
-
-```bash
-#!/usr/bin/env bash
-# .github/docker/build-app-cli/check-image-pin.sh
-# Fail-closed: the build container reference must be pinned by a sha256 digest,
-# never a mutable tag (spec §3.7/§5). Requires mikefarah yq/jq-free: uses jq.
-set -euo pipefail
-
-EXPECTED_REPO="ghcr.io/stackpop/edgezero-build-app-cli"
-file="${1:?usage: check-image-pin.sh <image.json>}"
-if ! command -v jq >/dev/null 2>&1; then
-  echo "::error::check-image-pin.sh requires jq" >&2
-  exit 2
-fi
-if ! json=$(jq -e . "$file" 2>/dev/null); then
-  echo "::error::$file is not valid JSON — refusing to pass an unreadable image pin" >&2
-  exit 1
-fi
-# String TYPES (jq -r would coerce a numeric value to a string).
-if [[ "$(jq -r '.repository|type' <<<"$json")" != string ||
-  "$(jq -r '.tag|type' <<<"$json")" != string ||
-  "$(jq -r '.digest|type' <<<"$json")" != string ]]; then
-  echo "::error::$file 'repository', 'tag', 'digest' must be JSON strings" >&2
-  exit 1
-fi
-repo=$(jq -r '.repository' <<<"$json"); tag=$(jq -r '.tag' <<<"$json"); digest=$(jq -r '.digest' <<<"$json")
-if [[ -z "$repo" || -z "$tag" ]]; then
-  echo "::error::$file must set non-empty 'repository' and 'tag'" >&2
-  exit 1
-fi
-# The repository must be the canonical EdgeZero build container, not merely non-empty.
-if [[ "$repo" != "$EXPECTED_REPO" ]]; then
-  echo "::error::$file 'repository' must be '$EXPECTED_REPO', not '$repo'" >&2
-  exit 1
-fi
-if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "::error::$file 'digest' must be a sha256 manifest digest (sha256:<64-hex>), not a tag: '$digest'" >&2
-  exit 1
-fi
-echo "build container reference is pinned: $repo@$digest"
-```
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `chmod +x .github/docker/build-app-cli/check-image-pin.sh && bash .github/actions/deploy-core/tests/check-image-pin.test.sh`
-Expected: `Passed: N  Failed: 0` (the committed test carries the full case set — string-type, foreign-repo, tag, short/missing digest, missing repository, malformed JSON).
-
-- [ ] **Step 5: Shellcheck**
-
-Run: `shellcheck -S warning .github/docker/build-app-cli/check-image-pin.sh`
-Expected: no output (clean).
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add .github/docker/build-app-cli/check-image-pin.sh .github/actions/deploy-core/tests/check-image-pin.test.sh
-git commit -m "build-cache container: fail-closed image.json digest-pin validator"
-```
-
----
-
-### Task 2: The pinned Dockerfile
+This task is implemented as part of this plan because no separate prerequisite plan exists. It is a
+hard dependency of Task 3 and must merge into source revision `S`.
 
 **Files:**
-- Create: `.github/docker/build-app-cli/Dockerfile`
-- Create: `.github/docker/build-app-cli/image.json` (placeholder digest until Task 3 publishes)
 
-**Interfaces:**
-- Consumes: the Global Constraints (Rust `1.95.0`, single-arch amd64).
-- Produces: an image whose `rustc --version` is `1.95.0` and which has `git jq tar curl cc` on `PATH`; consumed by Task 3's publish and by sub-plans 2–4 as `platform-id`.
+- Create `crates/edgezero-provenance-validator/Cargo.toml` and
+  `src/{main,json_contract,archive,elf,extract}.rs`.
+- Put module unit tests beside their implementation under `src/`; create only the true process-level
+  integration test `crates/edgezero-provenance-validator/tests/cli.rs`.
+- Create `.github/docker/build-app-cli/provenance.schema.json`.
+- Create `.github/docker/build-app-cli/fixtures/provenance/{valid,invalid}/**`.
+- Modify workspace `Cargo.toml` and `Cargo.lock`.
 
-- [ ] **Step 1: Write the Dockerfile**
+### 4.1 JSON/schema tranche
 
-```dockerfile
-# .github/docker/build-app-cli/Dockerfile
-# Single-manifest linux/amd64 FULL build+deploy runtime (spec §3.7): the pinned
-# Rust toolchain, wasm32-wasip1, the pinned Fastly CLI, and build tools. This
-# image IS the toolchain/ABI identity; it runs read-only/non-root at runtime.
-# Base pinned by digest; replace the digest below with a current
-# rust:1.95.0-bookworm linux/amd64 manifest digest (see README in this dir).
-FROM rust:1.95.0-bookworm@sha256:0000000000000000000000000000000000000000000000000000000000000000
+- [ ] Add the exact JSON Schema and valid/invalid metadata fixtures. Write colocated failing tests for
+  RFC 8785 canonical bytes, duplicate-key rejection before object construction, exact field/type/
+  bounds checks, unknown fields, caller/platform identity mismatch, and schema-version mismatch.
+- [ ] Run `cargo test -p edgezero-provenance-validator json_contract::tests`; expected: non-zero with
+  the new assertions failing for unimplemented behavior.
+- [ ] Implement only `json_contract.rs`; rerun the same command, then the full crate test; expected:
+  both pass. Commit the green JSON/schema tranche.
 
-# Pinned downloads (spec §3.6): fastly 15.1.0 (versions.json) and a pinned sccache.
-# Each ARG carries the exact release URL + sha256 (fill the sccache values from the
-# chosen sccache release; the fastly values are versions.json's).
-ARG FASTLY_URL="https://github.com/fastly/cli/releases/download/v15.1.0/fastly_v15.1.0_linux-amd64.tar.gz"
-ARG FASTLY_SHA256="3ba3d8a739b7a88d0a612825a9755d735efb87a9b02ea67e53a11b96d178d500"
-ARG SCCACHE_VERSION="0.10.0"
-ARG SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz"
-ARG SCCACHE_SHA256="REPLACE_WITH_RELEASE_SHA256"
+### 4.2 Archive/extraction tranche
 
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      git jq tar curl ca-certificates build-essential; \
-    rm -rf /var/lib/apt/lists/*; \
-    rustup target add wasm32-wasip1; \
-    curl -fsSL -o /tmp/fastly.tar.gz "$FASTLY_URL"; \
-    echo "${FASTLY_SHA256}  /tmp/fastly.tar.gz" | sha256sum -c -; \
-    tar -xzf /tmp/fastly.tar.gz -C /usr/local/bin fastly; \
-    curl -fsSL -o /tmp/sccache.tar.gz "$SCCACHE_URL"; \
-    echo "${SCCACHE_SHA256}  /tmp/sccache.tar.gz" | sha256sum -c -; \
-    tar -xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/bin "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"; \
-    chmod +x /usr/local/bin/sccache; \
-    rm /tmp/fastly.tar.gz /tmp/sccache.tar.gz; \
-    fastly version; sccache --version
+- [ ] Add a byte-for-byte golden ustar archive plus malformed PAX/GNU, duplicate, extra, traversal,
+  link, special-file, bad-header, bad-order, bad-size, and trailing-data fixtures.
+- [ ] Write colocated archive/extraction tests, then run
+  `cargo test -p edgezero-provenance-validator archive::tests`; expected: non-zero for unimplemented
+  strict parsing/extraction.
+- [ ] Implement `archive.rs` and `extract.rs` without invoking system `tar`. Require exact normalized
+  headers and exactly one confined regular output file. Rerun focused and full crate tests; expected:
+  pass. Commit the green archive/extraction tranche.
 
-# No ambient rustflags/wrapper env (spec §3.8 also scrubs at runtime); non-root.
-ENV CARGO_TERM_COLOR=never RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS=""
-RUN useradd -m -u 1001 build
-USER build
-WORKDIR /home/build
+### 4.3 ELF/loadability tranche
+
+- [ ] Add controlled valid/wrong-architecture/unresolved-interpreter/unresolved-library ELF
+  fixtures. Write failing tests for machine, interpreter/null, sorted direct `DT_NEEDED`, digest, size,
+  and immutable-image dependency resolution.
+- [ ] Run `cargo test -p edgezero-provenance-validator elf::tests`; expected: non-zero for
+  unimplemented inspection/loadability behavior.
+- [ ] Implement `elf.rs`; rerun focused and full crate tests; expected: pass. Commit the green ELF
+  tranche.
+
+### 4.4 CLI/capability tranche
+
+- [ ] Write failing `tests/cli.rs` process tests that combine the three modules and verify clean failure
+  leaves the output directory empty. Run `cargo test -p edgezero-provenance-validator --test cli`;
+  expected: non-zero until the CLI is wired. Implement this stable credential-free interface:
+
+```text
+edgezero-provenance-validator validate \
+  --archive /work/input/artifact.tar \
+  --schema /usr/local/share/edgezero/provenance.schema.json \
+  --expected /work/input/expected.json \
+  --output /work/validated/app-cli
+
+edgezero-provenance-validator self-test \
+  --fixtures /usr/local/share/edgezero/provenance-fixtures
 ```
 
-> The Fastly CLI download is checksum-verified against `versions.json`'s pinned
-> `sha256` (above). The publish workflow (Task 3) builds on a hosted runner and
-> **makes the GHCR package public** (GHCR packages are private on first publish); the
-> image is consumed **read-only/non-root** with explicit writable mounts (spec §3.7).
+- [ ] Make `validate` create exactly one regular output file and fail if the output parent is not
+  empty, canonical, writable, and confined. The validator never executes the extracted binary.
+- [ ] Implement `self-test` as a fixed manifest of expected valid and invalid fixture outcomes plus
+  fixture SHA-256 values; a missing, extra, or changed fixture fails.
+- [ ] Use synchronous Rust; do not add Tokio, and do not change dependencies of core/adapter crates.
+- [ ] Run `cargo test -p edgezero-provenance-validator --test cli`, then the full focused crate suite;
+  expected: pass. Commit the green CLI/capability tranche.
+- [ ] Run the focused crate tests, then the repository-required Rust checks.
 
-- [ ] **Step 2: Write the placeholder pin record**
+```bash
+cargo test -p edgezero-provenance-validator
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+cargo check --workspace --all-targets --features "fastly cloudflare spin"
+cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
+npm --prefix docs ci
+npm --prefix docs run format
+npm --prefix docs run lint
+npm --prefix docs run build
+```
+
+**Gate:** all capability tests and fixture hashes pass from a clean checkout. Task 3 must copy this
+exact built binary, schema, and fixtures into the image.
+
+## 5. Task 1: Enforce full-SHA external references repository-wide
+
+The current pin gate accepts version tags. That contradicts v6.18 and must be migrated before adding
+the write-privileged publisher.
+
+**Files:**
+
+- Modify `.github/actions/deploy-core/tests/check-action-pins.sh` and its tests in `run.sh`.
+- Create `.github/actions/deploy-core/tests/check-doc-action-pins.sh`.
+- Modify external refs in `.github/workflows/{codeql,deploy-action,deploy-docs,fastly-installer-check,format,test}.yml`.
+- Modify external refs in `.github/actions/{build-app-cli,config-push-fastly,deploy-fastly,healthcheck-fastly,rollback-fastly}/action.yml`.
+- Modify examples in `docs/specs/edgezero-deploy-github-action.md`,
+  `docs/specs/edgezero-deploy-action-implementation-plan.md`,
+  `docs/specs/edgezero-deploy-adoption-guide.md`, and `docs/guide/deploy-github-actions.md`.
+
+- [ ] Write failing pin-gate tests proving `@v1`, `@v1.2.3`, branches, abbreviated SHAs, malformed
+  SHAs, and empty refs fail; full lowercase 40-hex SHAs pass; local actions and digest-pinned Docker
+  actions remain valid. Generate invalid YAML fixtures under the test's temporary directory; do not
+  commit them into a surface scanned by the production gate.
+- [ ] Resolve each existing version to a reviewed upstream commit SHA. Preserve the human-readable
+  release in an adjacent comment, for example `# v6.0.1`.
+- [ ] Change the structural YAML scanner to require full 40-hex SHAs for every non-local external
+  action and reusable workflow. Its default scan is exactly workflow `*.yml`/`*.yaml` files directly
+  under `.github/workflows`, plus every repository-wide `action.yml`/`action.yaml`, pruning `.git`,
+  `target`, and `node_modules`. Shell source and arbitrary YAML test data are not inputs. Do not add a
+  low-privilege exception.
+- [ ] Require Docker action refs to match an immutable lowercase
+  `docker://<name>@sha256:<64-lowercase-hex>` form; tags, uppercase hex, short digests, and other
+  algorithms fail unless a separately reviewed digest algorithm is added to the policy.
+- [ ] Update documentation examples to use a named `<FULL_EDGEZERO_COMMIT_SHA>` placeholder where the
+  consumer must substitute release `P`; examples for third-party actions use real reviewed SHAs.
+- [ ] Add `check-doc-action-pins.sh` to extract `uses:` lines from fenced YAML in the four named docs.
+  It allows the exact EdgeZero placeholder only in documentation, requires full SHAs for concrete
+  third-party refs, and rejects version/branch refs. Add positive/negative cases to `run.sh`.
+- [ ] Scan that exact default surface, including reusable-workflow job-level `uses`, and require at
+  least one parsed external ref so a broken parser cannot pass vacuously.
+- [ ] Run the pin suite, actionlint, and zizmor.
+
+```bash
+bash .github/actions/deploy-core/tests/run.sh
+.github/actions/deploy-core/tests/check-action-pins.sh
+.github/actions/deploy-core/tests/check-doc-action-pins.sh
+actionlint
+zizmor --offline .github/workflows .github/actions
+```
+
+**Gate:** both structural scanners pass their exact surfaces and report non-zero parsed-reference
+counts; no broad `rg` gate scans intentional invalid test strings.
+
+## 6. Task 2: Implement the exact `image.json` validator
+
+`image.json` has five fields and is created only after publication succeeds.
+
+**Files:**
+
+- Modify `.github/docker/build-app-cli/check-image-pin.sh`.
+- Modify `.github/actions/deploy-core/tests/check-image-pin.test.sh`.
+
+- [ ] Write failing tests for the valid five-field record and rejection of malformed JSON, duplicate
+  or extra/missing fields, non-string string fields, foreign/empty repository, mutable/zero/uppercase
+  digest, malformed/zero/uppercase source revision, non-integer protocol, protocol other than `1`,
+  an empty/malformed release tag, and tag use as the runtime reference.
+- [ ] Implement `check-image-pin.sh <path>` using Bash and `jq`. Detect duplicate top-level keys from
+  `jq --stream` events before normal object parsing; ordinary `jq` object parsing alone loses duplicate
+  keys. It accepts exactly:
 
 ```json
 {
   "repository": "ghcr.io/stackpop/edgezero-build-app-cli",
   "tag": "build-container-v1",
-  "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  "digest": "sha256:<64-lowercase-hex>",
+  "image-source-revision": "<40-lowercase-hex>",
+  "provenance-protocol": 1
 }
 ```
 
-(The placeholder digest is intentional; Task 3's publish workflow overwrites it with the real one, and `check-image-pin.sh` still passes on shape. The pin-gate wiring in Task 4 additionally forbids the all-zero placeholder in a release.)
+  `tag` must match `^build-container-v[1-9][0-9]*$`; it remains informational.
 
-- [ ] **Step 3: Verify the image builds and bakes the toolchain (local integration check)**
-
-Run (requires Docker + a real base digest substituted into the `FROM`):
-```bash
-docker build --platform linux/amd64 -t edgezero-build-app-cli:local .github/docker/build-app-cli
-docker run --rm --platform linux/amd64 edgezero-build-app-cli:local rustc --version
-docker run --rm --platform linux/amd64 edgezero-build-app-cli:local rustc --print target-list | grep -x wasm32-wasip1
-docker run --rm --platform linux/amd64 edgezero-build-app-cli:local fastly version
-docker run --rm --platform linux/amd64 edgezero-build-app-cli:local sccache --version
-docker run --rm --platform linux/amd64 edgezero-build-app-cli:local sh -c 'command -v git jq tar curl cc'
-# read-only/non-root smoke (spec §3.7): a read-only rootfs run still works with a tmpfs.
-docker run --rm --read-only --tmpfs /tmp --user 1001 --platform linux/amd64 edgezero-build-app-cli:local rustc --version
-```
-Expected: `rustc 1.95.0 (...)`, `wasm32-wasip1` present, `fastly` reports 15.1.0, all five tools resolve, and the read-only/non-root run succeeds.
-
-- [ ] **Step 4: Commit**
+- [ ] Output only the canonical runtime ref, source revision, and protocol through explicit
+  subcommands or shell-safe output fields. Never use `tag` for a pull.
+- [ ] Run unit tests and shellcheck. Do not create a placeholder `image.json`.
 
 ```bash
-git add .github/docker/build-app-cli/Dockerfile .github/docker/build-app-cli/image.json
-git commit -m "build-cache container: pinned single-arch Dockerfile + image pin record"
+bash .github/actions/deploy-core/tests/check-image-pin.test.sh
+shellcheck -S warning .github/docker/build-app-cli/check-image-pin.sh
 ```
 
----
-
-### Task 3: Publish workflow (build, push, record digest)
+## 7. Task 3: Build the pinned image from repository root
 
 **Files:**
-- Create: `.github/workflows/publish-build-container.yml`
 
-**Interfaces:**
-- Consumes: `.github/docker/build-app-cli/Dockerfile`, `check-image-pin.sh`.
-- Produces: a GHCR image `ghcr.io/stackpop/edgezero-build-app-cli` whose **manifest digest** is written back to `image.json` on the release tag; consumed by sub-plans 2–4.
+- Create `.github/docker/build-app-cli/Dockerfile`.
+- Create `.dockerignore`, `.github/docker/build-app-cli/verify-toolchain.sh`, and
+  `.github/docker/build-app-cli/fixtures/wasm-smoke.rs`.
+- Extend validator/image tests under `.github/actions/deploy-core/tests/`.
 
-- [ ] **Step 1: Write the workflow**
-
-```yaml
-# .github/workflows/publish-build-container.yml
-name: Publish build container
-on:
-  push:
-    tags: ["build-container-v*"]
-permissions:
-  contents: write # push the pin branch
-  packages: write # push the image to GHCR
-  pull-requests: write # open the image.json PR
-jobs:
-  publish:
-    runs-on: ubuntu-24.04
-    steps:
-      # SHA-PINNED (not @v7): this job is write-privileged (contents/packages/PRs),
-      # so every action is pinned to a full 40-hex commit SHA — the only immutable
-      # action reference. Replace <full-40-hex> with the pinned actions/checkout
-      # release SHA (recorded in a comment as its version, e.g. # v4.3.0).
-      - uses: actions/checkout@<full-40-hex-commit-sha> # vX.Y.Z
-        # Trusted publish job (no app code runs here); keep the token so the
-        # pin-record PR branch can be pushed.
-        with:
-          persist-credentials: true
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Build and push (single-arch amd64)
-        id: push
-        run: |
-          set -euo pipefail
-          REPO="ghcr.io/stackpop/edgezero-build-app-cli"
-          TAG="${GITHUB_REF_NAME}"
-          docker buildx build --platform linux/amd64 \
-            --provenance=false --sbom=false \
-            --tag "$REPO:$TAG" --push .github/docker/build-app-cli
-          DIGEST=$(docker buildx imagetools inspect "$REPO:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-      - name: Verify the pushed image BY DIGEST before recording it
-        env:
-          REPO: ghcr.io/stackpop/edgezero-build-app-cli
-          DIGEST: ${{ steps.push.outputs.digest }}
-        run: |
-          set -euo pipefail
-          REF="$REPO@$DIGEST"
-          # Require a LEAF image manifest, not an index — reject ANY manifest list,
-          # including a one-entry OCI index (a count `<= 1` would wrongly accept it,
-          # and an index digest can be repointed to select a different image). The
-          # digest must resolve to an image manifest (has .config + .layers, no
-          # .manifests), whose platform is linux/amd64.
-          mt=$(docker buildx imagetools inspect "$REF" --raw | jq -r '.mediaType // ""')
-          case "$mt" in
-            *"image.index"*|*"manifest.list"*)
-              echo "::error::$REF is an index/manifest-list ($mt), not a leaf image manifest"; exit 1 ;;
-          esac
-          docker buildx imagetools inspect "$REF" --raw \
-            | jq -e '(.config != null) and (.layers != null) and (.manifests == null)' >/dev/null \
-            || { echo "::error::$REF is not a leaf image manifest (config+layers, no manifests)"; exit 1; }
-          plat=$(docker buildx imagetools inspect "$REF" --format '{{json .Image.Platform}}')
-          echo "$plat" | jq -e '.os=="linux" and .architecture=="amd64"' >/dev/null \
-            || { echo "::error::$REF is not linux/amd64 ($plat)"; exit 1; }
-          # Runtime smoke, pulled with the AUTHENTICATED session (a GHCR package is
-          # PRIVATE on first publish, so an anonymous pull here would deadlock the very
-          # first release). The anonymous-pull check is the operator's post-make-public
-          # step below, once the package visibility is public.
-          docker run --rm --platform linux/amd64 "$REF" rustc --version | grep -F '1.95.0'
-          docker run --rm --platform linux/amd64 "$REF" sh -c 'rustc --print target-list | grep -qx wasm32-wasip1'
-          docker run --rm --platform linux/amd64 "$REF" fastly version
-          docker run --rm --platform linux/amd64 "$REF" sccache --version
-          docker run --rm --read-only --tmpfs /tmp --user 1001 --platform linux/amd64 "$REF" rustc --version
-      - name: Open a reviewable image.json PR (not an in-place commit)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DIGEST: ${{ steps.push.outputs.digest }}
-        run: |
-          set -euo pipefail
-          f=.github/docker/build-app-cli/image.json
-          jq --arg t "${GITHUB_REF_NAME}" --arg d "${DIGEST}" '.tag=$t | .digest=$d' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-          bash .github/docker/build-app-cli/check-image-pin.sh "$f"
-          br="build-container-pin-${GITHUB_REF_NAME}"
-          git switch -c "$br"
-          git add "$f"
-          git -c user.name=edgezero-ci -c user.email=ci@stackpop \
-            commit -m "build container: pin ${GITHUB_REF_NAME} = ${DIGEST}"
-          git push -u origin "$br"
-          gh pr create --fill --base main --head "$br" \
-            --title "Pin build container ${GITHUB_REF_NAME}" \
-            --body "Digest verified by the publish workflow (single-manifest + authenticated runtime smoke). Anonymous-pull verification is the operator's post-make-public step."
-```
-
-The publish thus **pushes → inspects by digest → verifies single-manifest + the runtime smoke (authenticated) → then opens a reviewable `image.json` PR** — the pin the rest of the feature keys on is never recorded until it has been proven against the actual pushed digest. The **anonymous** pull is verified separately, after the operator makes the package public (below), avoiding a first-publish deadlock.
-
-- [ ] **Step 2: Actionlint the workflow**
-
-Run: `actionlint .github/workflows/publish-build-container.yml` (after substituting the real
-`actions/checkout` release SHA for the `<full-40-hex-commit-sha>` placeholder, as with the
-Dockerfile's base-image digest).
-Expected: no output.
-
-- [ ] **Step 3: Commit**
+- [ ] Before editing, resolve the amd64 digest for the exact Rust base image and the upstream sccache
+  v0.10.0 release checksum. Record provenance in comments. Never commit `000...` or `REPLACE_ME`.
+- [ ] Use a multi-stage Dockerfile. The builder stage copies the repository and runs:
 
 ```bash
-git add .github/workflows/publish-build-container.yml
-git commit -m "build-cache container: GHCR publish workflow recording the manifest digest"
+cargo build --locked --release -p edgezero-provenance-validator
 ```
 
-- [ ] **Step 4: Publish (operator step, out of band)**
+- [ ] Copy only the validator binary, schema, and capability fixtures from the builder into the final
+  runtime. BuildKit context is repository root; the Dockerfile remains under
+  `.github/docker/build-app-cli/`.
+- [ ] Add a root `.dockerignore` excluding `.git`, `.claude`, every `target/`, `node_modules/`, local
+  editor/temp/env files, and other non-source detritus while retaining the workspace, `.github`
+  schema/fixtures, lockfile, and Dockerfile. CI also requires a clean checkout, so `.dockerignore` is
+  defense in depth rather than permission to build untracked source.
+- [ ] Install the exact Rust toolchain, `wasm32-wasip1`, checksum-verified Fastly CLI and sccache,
+  `git`, `jq`, `tar`, `curl`, CA certificates, and a C toolchain. Remove package/download caches.
+- [ ] Accept required build args `IMAGE_SOURCE_REVISION` and `PROVENANCE_PROTOCOL`. Fail the build
+  unless they are a lowercase full SHA and exactly `1`.
+- [ ] Add OCI labels `org.opencontainers.image.revision=$IMAGE_SOURCE_REVISION` and
+  `org.edgezero.provenance-protocol=$PROVENANCE_PROTOCOL`.
+- [ ] Create uid/gid 1001, set it as final `USER`, and avoid writable data under the image root.
+- [ ] Build locally from root:
 
-Tag `build-container-v1` and push it. The workflow pushes the image, **verifies it by digest** (leaf image manifest, linux/amd64 + an **authenticated** runtime smoke — the package is private on first publish), and **opens a PR** updating `image.json` to the real `sha256` digest. Ordering matters: **review and merge the PR FIRST** — only then does the committed `image.json` carry the real digest — **then make the GHCR package public and verify the anonymous pull reading the merged `image.json`** (verifying before merge would read the still-placeholder digest). The digest is the pin the rest of the feature keys on, and it is only recorded after passing verification against the actual pushed image.
-
-**One-time GHCR visibility + retention (operator):** GHCR packages are **private on first publish** and there is no clean REST endpoint to flip a container package public, so set the package `edgezero-build-app-cli` to **public** in its GHCR package settings (or set the org's default package visibility) so consumers can **anonymously** pull by digest (spec §3.7), and enable a retention policy that never prunes a digest referenced by a committed `image.json`. Verify anonymous access:
 ```bash
-docker logout ghcr.io
-docker pull "ghcr.io/stackpop/edgezero-build-app-cli@$(jq -r .digest .github/docker/build-app-cli/image.json)"
+docker build --platform linux/amd64 \
+  --build-arg IMAGE_SOURCE_REVISION="$(git rev-parse HEAD)" \
+  --build-arg PROVENANCE_PROTOCOL=1 \
+  -f .github/docker/build-app-cli/Dockerfile \
+  -t edgezero-build-app-cli:local .
 ```
-Expected: the pull succeeds without credentials.
 
----
+- [ ] Parse each tool's documented version line and compare the normalized semantic version for exact
+  equality; substring matching is forbidden. Assert target installation with
+  `rustup target list --installed`, then compile the committed `wasm-smoke.rs` as a library for
+  `wasm32-wasip1` into writable tmpfs and assert the output starts with wasm magic `00 61 73 6d`.
+- [ ] Put those assertions in `verify-toolchain.sh` and unit-test its parsers with exact, prerelease,
+  extra-text, missing-line, and malformed output fixtures before copying it into the image.
+- [ ] Run the baked validator `self-test`; then run one valid and each malformed fixture through the
+  baked `validate` command.
+- [ ] Verify image config is linux/amd64, `User` is 1001, and OCI labels equal the build args.
+- [ ] Verify a read-only/non-root smoke with `--network=none`, `--cap-drop=ALL`,
+  `--security-opt=no-new-privileges`, bounded memory/pids, and only `/tmp` as tmpfs.
 
-### Task 4: Wire the digest pin into the pin gate
+```bash
+docker run --rm --platform linux/amd64 --read-only --network=none --cap-drop=ALL \
+  --security-opt=no-new-privileges --memory=512m --pids-limit=128 \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec --user 1001:1001 \
+  edgezero-build-app-cli:local verify-toolchain.sh \
+  --rust 1.95.0 --fastly 15.1.0 --sccache 0.10.0 \
+  --target wasm32-wasip1 \
+  --fixture /usr/local/share/edgezero/wasm-smoke.rs
+docker run --rm --read-only --network=none --cap-drop=ALL \
+  --security-opt=no-new-privileges --memory=512m --pids-limit=128 \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec --user 1001:1001 \
+  edgezero-build-app-cli:local \
+  edgezero-provenance-validator self-test \
+  --fixtures /usr/local/share/edgezero/provenance-fixtures
+```
+
+**Gate:** no image is pushed until every command above passes with the exact source SHA and protocol.
+
+## 8. Task 4: Publish, verify, and open an idempotent pin PR
 
 **Files:**
-- Modify: `.github/actions/deploy-core/tests/run.sh` (add the validator suite)
-- Modify: `.github/actions/deploy-core/tests/check-image-pin.test.sh` (add a reject-placeholder case)
 
-**Interfaces:**
-- Consumes: `check-image-pin.sh`, `image.json`.
-- Produces: a CI gate that fails if the build container is not digest-pinned (or is the all-zero placeholder), alongside the existing action-pin gate.
+- Create `.github/docker/build-app-cli/verify-published-image.sh`.
+- Create `.github/docker/build-app-cli/update-image-pin-pr.sh`.
+- Create `.github/actions/deploy-core/tests/verify-published-image.test.sh`.
+- Create `.github/actions/deploy-core/tests/update-image-pin-pr.test.sh`.
+- Create `.github/workflows/publish-build-container.yml`.
+- Modify `.github/actions/deploy-core/tests/run.sh` and `.github/workflows/deploy-action.yml`.
 
-- [ ] **Step 1: Add the failing placeholder-rejection test**
+### 8.1 Testable verification helper
 
-Append to `check-image-pin.test.sh` (before the summary), a case asserting the real repo `image.json` is not the all-zero placeholder:
+- [ ] Write fixture-driven failing tests for leaf manifest media types, required config/layers,
+  rejection of one-entry and multi-entry indexes, `.Image` os/architecture, both image labels, exact
+  tool versions, installed target, validator self-test, and malformed BuildKit metadata.
+- [ ] Implement a helper that takes `repository`, `digest`, `source SHA`, and protocol. It verifies the
+  immutable digest only and never rereads a mutable tag to discover identity.
+- [ ] Use `docker buildx imagetools inspect "$REF" --raw` to require a leaf manifest. Use
+  `docker buildx imagetools inspect "$REF" --format '{{json .Image}}'` and inspect `.os` and
+  `.architecture` directly; do not use nonexistent `.Image.Platform`.
+- [ ] Inspect image config labels and run the same exact-version, installed-target/minimal-compile,
+  validator-capability, and read-only/non-root tests as Task 3.
+
+### 8.2 Pre-`S` publisher and required CI
+
+- [ ] Implement the publisher before designating `S`. Trigger only protected `build-container-v*`
+  tags and configure the protected `build-container-release` environment and repository tag ruleset.
+- [ ] Serialize the entire workflow under repository-global concurrency group
+  `edgezero-build-container-publication` with `cancel-in-progress: false`; different tags must not
+  race the one pin record.
+- [ ] Use job permissions `contents: read` and `packages: write`. Mint a short-lived token from a
+  dedicated GitHub App, stored in the protected environment and scoped only to branch contents and
+  pull requests, for the pin branch/PR. `GITHUB_TOKEN` is forbidden for this operation because its
+  push does not trigger push workflows and its automation-created PR checks require manual approval;
+  it cannot guarantee the automatic required-check path. Pin the token-minting and checkout actions
+  to reviewed full SHAs.
+- [ ] Mint the GitHub App token only after build, digest verification, and anonymous verification have
+  completed, so neither its private key nor installation token exists while repository-root context is
+  assembled or app-owned Rust code is built.
+- [ ] Checkout with `persist-credentials: false` and full history. Resolve
+  `S=$(git rev-parse "${GITHUB_SHA}^{commit}")`, validate it as 40 lowercase hex, fetch the protected
+  default branch, and require `S` to be its ancestor.
+- [ ] Immediately before BuildKit receives root context, require `HEAD == S`, no tracked/index
+  changes, no untracked files, and clean initialized submodules. Re-run the same assertions after
+  extracting metadata. No credential may exist in Git config or a file under the context.
+- [ ] Build with repository-root context, explicit `-f`, `--platform linux/amd64`, exact source/protocol
+  args, `--provenance=false`, `--sbom=false`, and `--metadata-file`:
 
 ```bash
-REAL="$DIR/../../../docker/build-app-cli/image.json"
-zero="sha256:$(printf '%064d' 0)"
-if [ "$(jq -r '.digest' "$REAL")" = "$zero" ]; then
-  no "committed image.json is still the all-zero placeholder"
-else
-  ok "committed image.json carries a real digest"
-fi
+docker buildx build --platform linux/amd64 \
+  --build-arg "IMAGE_SOURCE_REVISION=$S" \
+  --build-arg PROVENANCE_PROTOCOL=1 \
+  --provenance=false --sbom=false \
+  --metadata-file "$RUNNER_TEMP/build-metadata.json" \
+  -f .github/docker/build-app-cli/Dockerfile \
+  --tag "$REPOSITORY:$GITHUB_REF_NAME" --push .
+D=$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/build-metadata.json")
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [ ] Validate `D` immediately and pass it to `verify-published-image.sh`. Never derive `D` by
+  inspecting the mutable tag.
+- [ ] After authenticated verification, remove the local image reference, use a fresh empty
+  `DOCKER_CONFIG`, and pull/run `REPOSITORY@D` without credentials. The anonymous check must make a
+  registry request and fail if the package is private.
+- [ ] On first publication, a private GHCR package intentionally stops before pin PR creation. An
+  operator makes the package public and reruns the same workflow/tag. Do not merge a pin first.
+- [ ] Generate the exact five-field `image.json`, run `check-image-pin.sh`, and use a branch derived
+  from both `S` and `D`.
+- [ ] Implement and fixture-test the branch/PR state machine. Fetch an existing remote branch and
+  record its exact OID; update it only with
+  `--force-with-lease=refs/heads/<branch>:<recorded-oid>`. Create an absent branch without force.
+  Update one open matching PR. Reopen a closed-unmerged matching PR or fail for operator review.
+  Treat an already-merged exact `{S,D}` record as idempotent success. If the same `S` produces a new
+  `D`, close/supersede any older open pin PR before opening the new digest PR. Multiple or ambiguous
+  states fail closed.
+- [ ] Put this state machine in `update-image-pin-pr.sh`. Its tests inject fake `git` and `gh` through
+  `PATH`, record every argv/stdin mutation, and cover absent branch, matching remote OID, lease race,
+  one open PR, closed-unmerged PR, already-merged exact record, same-`S`/new-`D` supersession, multiple
+  matches, API failure, and rerun idempotency. Run the focused test red before implementation and green
+  afterward, then run shellcheck.
+- [ ] Include `S`, `D`, protocol, verified platform, and anonymous-pull result in the PR body. Never
+  include an AI byline.
+- [ ] Before `S`, extend `.github/workflows/deploy-action.yml` with a required local-image job that
+  builds from root and runs all Task 3 smokes. Its PR/push trigger set is exactly `.tool-versions`,
+  root `Cargo.toml`/`Cargo.lock`, `crates/edgezero-provenance-validator/**`,
+  `.github/actions/deploy-fastly/versions.json`, `.dockerignore`,
+  `.github/docker/build-app-cli/**`,
+  `.github/actions/deploy-core/tests/check-image-pin.test.sh`,
+  `.github/actions/deploy-core/tests/verify-toolchain.test.sh`,
+  `.github/actions/deploy-core/tests/verify-published-image.test.sh`,
+  `.github/actions/deploy-core/tests/update-image-pin-pr.test.sh`,
+  `.github/actions/deploy-core/tests/run.sh`,
+  `.github/workflows/publish-build-container.yml`, and `.github/workflows/deploy-action.yml`.
+- [ ] Before `S`, add a required pin-change job for every add/change/delete of `image.json`. It must
+  require the file to exist, run `check-image-pin.sh`, use a clean anonymous Docker config, and run the
+  complete `verify-published-image.sh` against the committed digest. This job is the pre-merge gate
+  for every future pin, not a one-time release checklist.
+- [ ] Wire all helper unit suites into `run.sh`; assert the explicit trigger set above in contract
+  tests so existing-path omissions regress visibly; make actionlint, shellcheck, and
+  `zizmor --offline` cover the publisher and helpers.
 
-Run: `bash .github/actions/deploy-core/tests/check-image-pin.test.sh`
-Expected: FAIL on "committed image.json carries a real digest" until Task 3's publish lands a real digest.
+### 8.3 Land `S`, then execute publication
 
-- [ ] **Step 3: Invoke the suite from the contract runner**
+- [ ] Run all Task 0-4 local and CI tests, merge validator, Dockerfile, `.dockerignore`, helpers,
+  publisher, and required CI jobs, then record the resulting full default-branch commit as `S`.
+- [ ] Create the protected release tag at exactly `S`. The publisher must verify the tag resolves to
+  that commit and perform the build/verification logic already reviewed at `S`.
+- [ ] On first publication, a private GHCR package intentionally stops before pin PR creation. An
+  operator makes the package public and reruns the same workflow/tag. Do not merge a pin first.
+- [ ] Require the GitHub-App-created pin PR's local shape and remote anonymous image verification jobs
+  to pass before review or merge.
 
-Add to `.github/actions/deploy-core/tests/run.sh` (near the other suite invocations):
+**Gate:** the pin PR cannot exist unless the exact digest passed all checks including anonymous pull.
+
+## 9. Task 5: Merge and verify pin baseline `B`
+
+**Files:**
+
+- Add `.github/docker/build-app-cli/image.json` through the publisher PR.
+- No post-merge gate wiring: all required checks were part of source `S`.
+
+- [ ] Review the generated record and confirm its source revision is the published `S`, digest is the
+  verified `D`, and protocol is `1`.
+- [ ] Confirm the GitHub App push triggered all required pin-change workflows and that every check
+  passed. Merge the pin-only PR and record the merge/full commit SHA as baseline `B`, not final action
+  revision `P`.
+- [ ] Confirm a deletion or syntactically valid but unverifiable replacement of `image.json` fails the
+  required pin-change job in a test PR.
+- [ ] Run the full repository verification suite from a clean checkout at baseline `B`:
 
 ```bash
-bash "$(dirname -- "${BASH_SOURCE[0]}")/check-image-pin.test.sh"
+bash .github/actions/deploy-core/tests/run.sh
+.github/actions/deploy-core/tests/check-action-pins.sh
+.github/actions/deploy-core/tests/check-doc-action-pins.sh
+actionlint
+zizmor --offline .github/workflows .github/actions
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+cargo check --workspace --all-targets --features "fastly cloudflare spin"
+cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
+npm --prefix docs ci
+npm --prefix docs run format
+npm --prefix docs run lint
+npm --prefix docs run build
 ```
 
-- [ ] **Step 4: Run the full suite**
+- [ ] Pull `repository@digest` anonymously again after merge and rerun image verification by the
+  committed record.
 
-Run: `bash .github/actions/deploy-core/tests/run.sh`
-Expected: the image-pin cases run and (after Task 3) pass.
+**Gate:** downstream plans build on baseline `B`; they do not reference source revision `S` as an
+action ref or recompute a tag digest. Their final integration plan designates full SHA `P` only after
+all feature contracts pass.
 
-- [ ] **Step 5: Commit**
+## 10. Task 6: Release and retention runbook
 
-```bash
-git add .github/actions/deploy-core/tests/run.sh .github/actions/deploy-core/tests/check-image-pin.test.sh
-git commit -m "build-cache container: gate the build-container digest pin in the contract suite"
-```
+- [ ] Protect the publisher tag pattern and environment; require review for release execution.
+- [ ] Confirm GHCR package visibility is public before the pin PR can be generated.
+- [ ] Configure retention so no digest referenced by any supported `image.json` is deleted.
+- [ ] Document rollback as reverting to an earlier reviewed `image.json` digest/protocol and pinning
+  consumers to the corresponding earlier action SHA. Never move a tag to simulate rollback.
+- [ ] Document the release record: image source `S`, digest `D`, pin baseline `B`, final action pin
+  `P`, image tag (informational), checksums, and exact third-party action SHAs.
+- [ ] Update the parent spec, implementation plan, adoption guide, and public guide in the downstream
+  integration plan. Consumer examples must use one full `P` for all EdgeZero references.
 
----
+## 11. Completion review
 
-## Self-Review
+Before declaring this plan complete, run two independent reviews:
 
-- **Spec coverage (container scope only):** §3.7 image contract → Tasks 2/3; digest = `platform-id` → Tasks 2/3; single-manifest amd64 → Task 3 (`--platform linux/amd64`, single-arch); baked toolchain `1.95.0` → Task 2 + verify; digest pinned/checked (§5) → Tasks 1/4. The *use* of the container (reusable workflow, launcher, provenance) is sub-plans 2–4, out of scope here.
-- **Placeholder scan:** the only intentional placeholder is the all-zero digest, which Task 3 overwrites and Task 4 forbids in a release — flagged, not silent.
-- **Type consistency:** `check-image-pin.sh <image.json>` contract is used identically in Tasks 1, 3, 4; the `image.json` keys (`repository`/`tag`/`digest`) match across Tasks 1–4.
+1. **Contract review:** compare every file and test with design v6.18 Sections 3, 5, 6.3, 8, 9, and
+   10. Verify there is no same-SHA claim, no platform identity output, no tag runtime pull, no
+   placeholder, and no legacy `--stage` guidance.
+2. **Release-adversary review:** test mutable tags, private package state, stale/idempotent PR branches,
+   malformed BuildKit metadata, index manifests, wrong platform/labels/versions/protocol, deleted
+   image pin, publication reruns, and concurrent release attempts.
 
-## Downstream sub-plans (not written yet)
-
-2. Cached build path (reusable workflow + `prepare`/`compile` split + **an action-owned `sccache` disk cache**: fresh `CARGO_TARGET_DIR` + owned `actions/cache` restore/save over `SCCACHE_DIR` under a bounded rolling generation key + the constructed minimal env + config/source closure, spec §3.1–§3.4/§3.8). 3. Provenance (JCS canonical JSON + JSON Schema + procedural validation, `validate-app-cli-provenance`, `compute-app-cli-identity`, `ExpectedIdentity`). 4. Consumer integration (`active-version-fastly`, per-consumer `ExpectedIdentity` inputs, the Docker launcher, production-only recovery). Each is its own plan; sub-plan 2 consumes this container's digest as `platform-id`.
+The container plan is complete only when source `S`, verified digest `D`, and pin baseline `B` are
+recorded and all repository gates pass. The remaining plans may then implement cached compilation and
+eventually designate final action revision `P`.
