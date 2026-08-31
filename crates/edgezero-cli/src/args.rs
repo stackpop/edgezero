@@ -381,7 +381,8 @@ pub struct RollbackArgs {
     /// Production only: the version to re-activate. Fastly exposes no
     /// metadata to tell a previously-live version from a staged one, so
     /// the rollback target CANNOT be inferred; it is captured before the
-    /// deploy that superseded it (see `deploy`'s `previous-version`) and
+    /// deploy that superseded it (run `active-version` before that deploy,
+    /// or wire the deploy-fastly action's `previous-version` output) and
     /// passed here. Required for a production rollback; ignored for staging.
     #[arg(long)]
     pub rollback_to: Option<String>,
