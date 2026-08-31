@@ -246,13 +246,20 @@ provisioning:
 # Look up the platform store id (matches by name).
 fastly config-store list --json | jq -r '.[] | select(.name=="edgezero_runtime_env") | .id'
 
-# Set the override.
+# Set the override for one service. Config Store keys are case-sensitive.
 fastly config-store-entry update \
   --store-id=<STORE-ID> \
-  --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY \
+  --key=EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__APP_CONFIG__KEY \
   --value=app_config_staging \
   --upsert
 ```
+
+Fastly runtime overrides are service-scoped because the Config Store can be
+linked to multiple services. Legacy unscoped `EDGEZERO__STORES__...` entries are
+not read; migrate manually managed entries by rewriting them under the service
+prefix shown above. Provisioning a non-default store-name mapping requires
+`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID` so the command cannot write
+into an ambiguous namespace. If both are set, they must match.
 
 Locally (Viceroy), the store lives in fastly.toml's
 `[local_server.config_stores.edgezero_runtime_env]` block. If the

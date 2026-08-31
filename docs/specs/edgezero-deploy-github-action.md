@@ -530,9 +530,12 @@ lifecycle actions.
 
 #### 5.5.2 What makes a staged version _read_ the staged key
 
-Writing `<logical>_staging` is only half of it. The runtime picks its config key from
-the `EDGEZERO__STORES__CONFIG__<ID>__KEY` entry of a config store it opens by the
-name `edgezero_runtime_env`. A staged deploy clones the active version, and **a
+Writing `<logical>_staging` is only half of it. The runtime picks its config key
+from the service-scoped
+`EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__KEY` entry of a Config
+Store it opens by the name `edgezero_runtime_env`. Legacy unscoped keys are not
+read because they have no safe owner in a store linked to multiple services. A
+staged deploy clones the active version, and **a
 clone inherits its resource links** — so on its own, a staged version opens the
 same selector store as production and reads production's key. Flipping that
 shared store's selector is not an answer either: it would redirect production
@@ -543,10 +546,13 @@ alias. That is the seam:
 
 - A staged deploy owns a second, **per-service** store,
   `edgezero_runtime_env_staging_<service-id>`, creating it on demand and
-  **mirroring** production's runtime overrides into it — copying
-  adapter/logging/`__NAME` entries verbatim and redirecting only each declared
-  config store's selector to `<id>_staging`. Because the mirror runs at deploy
-  time, the twin always reflects production's _current_ overrides. The name is
+  **mirroring** only the current service's scoped production overrides into it.
+  Unscoped entries and entries belonging to other services are excluded, and
+  only the current service's declared config selectors are
+  redirected to `<id>_staging`. Ambient process mappings are not overlaid, so a
+  staged healthcheck exercises the mappings production actually uses. Because
+  the mirror runs at deploy time, the twin always reflects production's
+  _current_ overrides. The name is
   per service because Fastly config stores are account-wide, versionless
   resources: a single shared twin would let one service's staged deploy clobber
   another's selectors.

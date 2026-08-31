@@ -1028,8 +1028,14 @@ fn resolve_secret_field<'walk>(
                 }
             }
             Some((SecretPathSegment::OptionalField(name), rest)) => {
+                let Some(parent) = node.as_object_mut() else {
+                    return Err(EdgeError::config_out_of_date(
+                        format!("expected an object at `{rendered}`"),
+                        rendered,
+                    ));
+                };
                 let next_rendered = join_field(&rendered, name.as_ref());
-                match node.get_mut(name.as_ref()) {
+                match parent.get_mut(name.as_ref()) {
                     None | Some(serde_json::Value::Null) => Ok(()),
                     Some(child) => {
                         resolve_secret_field(ctx, child, field, rest, next_rendered).await
@@ -1075,9 +1081,9 @@ async fn resolve_leaf(
     rendered_parent: &str,
 ) -> Result<(), EdgeError> {
     // `StoreRef` is filtered out in `secret_walk` before any descent, so it
-    // never reaches here. The leaf's parent is a required intermediate, so a
-    // non-object parent is always an error — only the leaf key below honors
-    // `field.optional`.
+    // never reaches here. Traversal handles optional intermediates; once a leaf
+    // is reached, its present parent must be an object and only the leaf key
+    // below honors `field.optional`.
     let leaf_path = join_field(rendered_parent, key);
 
     let Some(parent_obj) = parent.as_object_mut() else {
@@ -2892,6 +2898,24 @@ mod tests {
         let mut data = serde_json::json!({ "integrations": { "datadome": null } });
         block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
             .expect("null optional intermediate is fine");
+    }
+
+    #[test]
+    fn secret_walk_rejects_scalar_parent_of_optional_intermediate() {
+        let ctx = ctx_with_default_secret_store("unused", "unused");
+        let mut data = serde_json::json!({ "integrations": "not-an-object" });
+        let err = block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+            .expect_err("a present optional intermediate must have an object parent");
+
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.to_string().contains("integrations"),
+            "error names the malformed parent: {err}"
+        );
+        let EdgeError::ConfigOutOfDate { field_path, .. } = &err else {
+            panic!("malformed optional parent must be ConfigOutOfDate: {err:?}");
+        };
+        assert_eq!(field_path, "integrations");
     }
 
     #[test]

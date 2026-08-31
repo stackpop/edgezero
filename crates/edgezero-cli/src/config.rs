@@ -2877,6 +2877,27 @@ other = "x"
     }
 
     #[test]
+    fn collect_secret_leaves_rejects_scalar_parent_of_optional_intermediate() {
+        let raw: Value = toml::from_str("integrations = \"not-a-table\"\n").expect("toml");
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                SecretPathSegment::OptionalField(Cow::Borrowed("datadome")),
+                SecretPathSegment::Field(Cow::Borrowed("webhook_key")),
+            ],
+            optional: true,
+        };
+
+        let err = collect_secret_leaves(&raw, &field)
+            .expect_err("a present optional intermediate must have a table parent");
+        assert!(
+            err.contains("integrations"),
+            "collector error names the malformed parent: {err}"
+        );
+    }
+
+    #[test]
     fn collect_secret_leaves_errors_on_missing_required_intermediate() {
         let raw: Value = toml::from_str("other = \"x\"\n").expect("toml");
         let field = SecretField {

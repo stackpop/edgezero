@@ -190,6 +190,24 @@ Fastly uses a native Config Store resource link for runtime configuration. Decla
 ids in `edgezero.toml`; each id opens its own platform store via
 `EDGEZERO__STORES__CONFIG__<ID>__NAME` (default = the logical id):
 
+Because `edgezero_runtime_env` is an account-wide Fastly resource, its stored
+keys are scoped by the current service ID:
+
+```text
+EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__NAME
+EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__KEY
+```
+
+The runtime obtains `<SERVICE_ID>` from Fastly and translates these entries back
+to the portable `EDGEZERO__STORES__*` form. Legacy unscoped entries are ignored
+because they have no safe owner when the Config Store is linked to multiple
+services. Re-run `edgezero provision --adapter fastly` to write scoped `__NAME`
+entries, and rewrite any manually managed adapter, logging, or `__KEY` entries
+under the service prefix. Provision writes only the selected service's
+namespace; a non-default store-name mapping therefore requires top-level
+`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must
+match.
+
 ```toml
 [stores.config]
 ids     = ["app_config"]
