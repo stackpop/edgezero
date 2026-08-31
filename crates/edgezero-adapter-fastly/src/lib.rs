@@ -34,6 +34,15 @@ use edgezero_core::env_config::EnvConfig;
 use edgezero_core::http::Extensions;
 #[cfg(feature = "fastly")]
 use edgezero_core::manifest::ResolvedLoggingConfig;
+
+/// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
+/// overrides.
+///
+/// The fixed name is load-bearing: a staged deploy creates a per-service
+/// staging twin and links it into the staged version under THIS name, which is
+/// how the runtime resolves staged selectors without knowing the twin exists.
+pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
+
 #[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
 pub struct FastlyLogging {
@@ -52,6 +61,38 @@ impl From<ResolvedLoggingConfig> for FastlyLogging {
             endpoint: config.endpoint,
             level: config.level.into(),
             use_fastly_logger: true,
+        }
+    }
+}
+
+/// Resolve [`FastlyLogging`] from the `EDGEZERO__LOGGING__*` overlay.
+///
+/// Two rules live here rather than in the caller. An unset or unparseable
+/// `EDGEZERO__LOGGING__LEVEL` falls back to [`log::LevelFilter::Info`], and
+/// `use_fastly_logger` is DERIVED from `endpoint.is_some()` so a Viceroy run
+/// with no endpoint is never handed the reserved `stdout` name.
+#[cfg(feature = "fastly")]
+impl From<&EnvConfig> for FastlyLogging {
+    #[inline]
+    fn from(env: &EnvConfig) -> Self {
+        use std::str::FromStr as _;
+
+        let level = env
+            .logging_level()
+            .and_then(|raw| log::LevelFilter::from_str(raw).ok())
+            .unwrap_or(log::LevelFilter::Info);
+        // Only attach Fastly's named-endpoint logger when `EDGEZERO__LOGGING__ENDPOINT`
+        // is set. Production deployments set it to a real `[log_endpoints]` entry from
+        // `fastly.toml`; local Viceroy runs leave it unset and avoid the
+        // "endpoint not found, or is reserved" error that fires when the adapter
+        // would otherwise fall back to a reserved name like `stdout`.
+        let endpoint = env.logging_endpoint().map(str::to_owned);
+        let use_fastly_logger = endpoint.is_some();
+        Self {
+            echo_stdout: true,
+            endpoint,
+            level,
+            use_fastly_logger,
         }
     }
 }
@@ -81,31 +122,6 @@ pub fn init_logger(
     _echo_stdout: bool,
 ) -> Result<(), log::SetLoggerError> {
     Ok(())
-}
-
-/// Resolve [`FastlyLogging`] from `EDGEZERO__LOGGING__LEVEL`, falling back to
-/// the adapter default when the variable is unset or unparseable.
-#[cfg(feature = "fastly")]
-fn logging_from_env(env: &EnvConfig) -> FastlyLogging {
-    use std::str::FromStr as _;
-
-    let level = env
-        .logging_level()
-        .and_then(|raw| log::LevelFilter::from_str(raw).ok())
-        .unwrap_or(log::LevelFilter::Info);
-    // Only attach Fastly's named-endpoint logger when `EDGEZERO__LOGGING__ENDPOINT`
-    // is set. Production deployments set it to a real `[log_endpoints]` entry from
-    // `fastly.toml`; local Viceroy runs leave it unset and avoid the
-    // "endpoint not found, or is reserved" error that fires when the adapter
-    // would otherwise fall back to a reserved name like `stdout`.
-    let endpoint = env.logging_endpoint().map(str::to_owned);
-    let use_fastly_logger = endpoint.is_some();
-    FastlyLogging {
-        echo_stdout: true,
-        endpoint,
-        level,
-        use_fastly_logger,
-    }
 }
 
 /// Entry point for a Fastly Compute application.
@@ -142,21 +158,13 @@ where
 {
     let stores = A::stores();
     let env = runtime_env_config(stores);
-    let logging = logging_from_env(&env);
+    let logging = FastlyLogging::from(&env);
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
     let app = A::build_app();
-    request::dispatch_with_registries(
-        &app,
-        req,
-        stores.config,
-        stores.kv,
-        stores.secrets,
-        &env,
-        extend,
-    )
+    request::dispatch_with_registries(&app, req, stores, &env, extend)
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
@@ -171,16 +179,42 @@ where
 /// If the store is missing or empty, returns an empty `EnvConfig` and the rest
 /// of the runtime uses its baked-in defaults.
 ///
-/// [`run_app`] calls this itself. A custom Fastly entry point that bypasses
-/// [`run_app`] should call it with its own `A::stores()` so staged and
-/// overridden store selectors resolve identically.
+/// [`run_app`] and [`run_app_with_request_extensions`] call this themselves.
+/// [`run_app_with_config`] does NOT, and neither does a hand-built
+/// [`FastlyService`](request::FastlyService): a custom entry point on either of
+/// those paths must call this explicitly, or staged and overridden store
+/// selectors silently fall back to baked defaults.
+///
+/// The `stores` argument must name the app's logical store ids. A handwritten
+/// [`Hooks`] impl inherits the default `stores()`, which is EMPTY
+/// ([`StoresMetadata::default`]), and empty metadata derives no
+/// `EDGEZERO__STORES__*` keys at all — every selector override silently never
+/// resolves. Such an impl must override `stores()`, or pass explicit
+/// [`StoresMetadata`] here.
+///
+/// ```rust,ignore
+/// use edgezero_adapter_fastly::request::dispatch_with_registries;
+/// use edgezero_adapter_fastly::runtime_env_config;
+/// use edgezero_core::app::{StoreMetadata, StoresMetadata};
+///
+/// let stores = StoresMetadata {
+///     config: Some(StoreMetadata {
+///         default: "app_config",
+///         ids: &["app_config"],
+///     }),
+///     ..StoresMetadata::default()
+/// };
+/// let env = runtime_env_config(stores);
+/// let app = MyApp::build_app();
+/// dispatch_with_registries(&app, req, stores, &env, |_req, _extensions| {})
+/// ```
 #[cfg(feature = "fastly")]
 #[must_use]
 #[inline]
 pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
     use fastly::ConfigStore;
     use std::iter::empty;
-    let Ok(dict) = ConfigStore::try_open("edgezero_runtime_env") else {
+    let Ok(dict) = ConfigStore::try_open(RUNTIME_ENV_STORE_NAME) else {
         // The store is optional -- a clean cutover deploy with all
         // baked-in defaults works without it. But the absence means
         // EDGEZERO__* runtime overrides (spec 5.4 __KEY, spec 5.2
@@ -203,9 +237,16 @@ pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
     EnvConfig::from_vars(vars)
 }
 
-/// The `EDGEZERO__*` keys the Fastly runtime looks up: the fixed adapter and
-/// logging settings, plus a `__NAME` selector for every declared store id and
-/// a `__KEY` selector for config-store ids only.
+/// The `EDGEZERO__*` keys resolved from the store into the [`EnvConfig`]: the
+/// fixed adapter and logging settings, plus a `__NAME` selector for every
+/// declared store id and a `__KEY` selector for config-store ids only.
+///
+/// The Fastly runtime itself consumes only the logging level / endpoint and the
+/// per-store selectors; the rest are resolved so downstream readers can fetch
+/// them from the returned `EnvConfig`.
+// The `test` arm is load-bearing: the crate's default features exclude
+// `fastly`, so gating on the feature alone would keep this helper and the test
+// pinning its key-derivation rules out of a plain `cargo test --workspace`.
 #[cfg(any(feature = "fastly", test))]
 fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
     let mut keys: Vec<String> = vec![
@@ -287,10 +328,6 @@ mod runtime_env_key_tests {
     use super::runtime_env_keys;
     use edgezero_core::app::{StoreMetadata, StoresMetadata};
 
-    fn contains(keys: &[String], key: &str) -> bool {
-        keys.iter().any(|candidate| candidate.as_str() == key)
-    }
-
     #[test]
     fn runtime_env_keys_name_every_store_and_key_only_config_stores() {
         let stores = StoresMetadata {
@@ -308,23 +345,43 @@ mod runtime_env_key_tests {
             }),
         };
 
-        let keys = runtime_env_keys(stores);
+        let mut keys = runtime_env_keys(stores);
+        keys.sort();
 
-        assert!(contains(&keys, "EDGEZERO__ADAPTER__HOST"));
-        assert!(contains(&keys, "EDGEZERO__ADAPTER__PORT"));
-        assert!(contains(&keys, "EDGEZERO__LOGGING__LEVEL"));
-        assert!(contains(&keys, "EDGEZERO__LOGGING__ENDPOINT"));
-        assert!(contains(&keys, "EDGEZERO__LOGGING__USE_FASTLY_LOGGER"));
-        assert!(contains(&keys, "EDGEZERO__LOGGING__ECHO_STDOUT"));
+        assert_eq!(
+            keys,
+            vec![
+                "EDGEZERO__ADAPTER__HOST",
+                "EDGEZERO__ADAPTER__PORT",
+                "EDGEZERO__LOGGING__ECHO_STDOUT",
+                "EDGEZERO__LOGGING__ENDPOINT",
+                "EDGEZERO__LOGGING__LEVEL",
+                "EDGEZERO__LOGGING__USE_FASTLY_LOGGER",
+                "EDGEZERO__STORES__CONFIG__EDGE__KEY",
+                "EDGEZERO__STORES__CONFIG__EDGE__NAME",
+                "EDGEZERO__STORES__CONFIG__MAIN__KEY",
+                "EDGEZERO__STORES__CONFIG__MAIN__NAME",
+                "EDGEZERO__STORES__KV__CACHE__NAME",
+                "EDGEZERO__STORES__SECRETS__VAULT__NAME",
+            ]
+        );
+    }
 
-        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__MAIN__NAME"));
-        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__EDGE__NAME"));
-        assert!(contains(&keys, "EDGEZERO__STORES__KV__CACHE__NAME"));
-        assert!(contains(&keys, "EDGEZERO__STORES__SECRETS__VAULT__NAME"));
+    #[test]
+    fn runtime_env_keys_without_declared_stores_are_the_fixed_keys_only() {
+        let mut keys = runtime_env_keys(StoresMetadata::default());
+        keys.sort();
 
-        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__MAIN__KEY"));
-        assert!(contains(&keys, "EDGEZERO__STORES__CONFIG__EDGE__KEY"));
-        assert!(!contains(&keys, "EDGEZERO__STORES__KV__CACHE__KEY"));
-        assert!(!contains(&keys, "EDGEZERO__STORES__SECRETS__VAULT__KEY"));
+        assert_eq!(
+            keys,
+            vec![
+                "EDGEZERO__ADAPTER__HOST",
+                "EDGEZERO__ADAPTER__PORT",
+                "EDGEZERO__LOGGING__ECHO_STDOUT",
+                "EDGEZERO__LOGGING__ENDPOINT",
+                "EDGEZERO__LOGGING__LEVEL",
+                "EDGEZERO__LOGGING__USE_FASTLY_LOGGER",
+            ]
+        );
     }
 }

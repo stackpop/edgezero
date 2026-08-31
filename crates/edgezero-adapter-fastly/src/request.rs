@@ -3,7 +3,7 @@ use std::fmt::Display;
 use std::io::Read as _;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use edgezero_core::app::{App, StoreMetadata};
+use edgezero_core::app::{App, StoreMetadata, StoresMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
@@ -305,28 +305,38 @@ where
     dispatch_core_request(app, core_request, stores)
 }
 
-/// Dispatch with per-id store registries built from baked metadata.
+/// Dispatch with per-id store registries built from baked metadata — the same
+/// store wiring [`run_app`](crate::run_app) uses.
 ///
 /// Fastly is `Multi` for all three kinds, so each declared id resolves to
-/// its own platform store via `EDGEZERO__STORES__<KIND>__<ID>__NAME` (or the
-/// id default). KV failures escalate via [`resolve_kv_handle`]'s
-/// `kv_required=true` path; missing config / secret stores degrade silently
-/// with a one-time warning.
-pub(crate) fn dispatch_with_registries<F>(
+/// its own platform store through the [`EnvConfig`] overlay: the
+/// `EDGEZERO__STORES__CONFIG__<ID>__NAME` selector (and its KV / secrets
+/// counterparts) picks the platform store, and the config-only `__KEY`
+/// selector picks that store's [`ConfigStoreBinding::default_key`]. Pair this
+/// with [`runtime_env_config`](crate::runtime_env_config) in a custom entry
+/// point for full parity with `run_app`. Contrast [`FastlyService`], whose
+/// bare-handle path binds `default_key: "default"` and ignores those selectors.
+///
+/// KV failures escalate via [`resolve_kv_handle`]'s `kv_required=true` path;
+/// missing config / secret stores degrade silently with a one-time warning.
+///
+/// # Errors
+/// Returns an error if a declared KV store cannot be opened, or if the
+/// underlying handler returns an error.
+#[inline]
+pub fn dispatch_with_registries<F>(
     app: &App,
     req: FastlyRequest,
-    config_meta: Option<StoreMetadata>,
-    kv_meta: Option<StoreMetadata>,
-    secret_meta: Option<StoreMetadata>,
+    stores: StoresMetadata,
     env: &EnvConfig,
     extend: F,
 ) -> Result<FastlyResponse, FastlyError>
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
-    let kv_registry = build_kv_registry(kv_meta, env)?;
-    let config_registry = build_config_registry(config_meta, env);
-    let secret_registry = build_secret_registry(secret_meta, env);
+    let kv_registry = build_kv_registry(stores.kv, env)?;
+    let config_registry = build_config_registry(stores.config, env);
+    let secret_registry = build_secret_registry(stores.secrets, env);
     dispatch_with_handles(
         app,
         req,
