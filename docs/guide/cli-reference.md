@@ -254,7 +254,7 @@ edgezero rollback --adapter <name> --service-id <id> --version <n> [--rollback-t
 - `--adapter <name>` — target adapter (required).
 - `--service-id <id>` — platform service id to roll back (required).
 - `--version <n>` — the current (bad) version to roll back **from** (required; staging deactivates it).
-- `--rollback-to <n>` — **production only:** the version to re-activate. Fastly cannot tell a previously-live version from a staged draft, so the target **cannot be inferred** — capture it before the superseding deploy (`deploy-fastly`'s `previous-version`) and pass it here. Required for a production rollback; ignored for staging.
+- `--rollback-to <n>` — **production only:** the version to re-activate. Fastly cannot tell a previously-live version from a staged draft, so the target **cannot be inferred** — capture it before the superseding deploy (run [`active-version`](#edgezero-active-version), or use `deploy-fastly`'s `previous-version` output) and pass it here. Required for a production rollback; ignored for staging.
 - `--staging` — deactivate the staged version instead of activating `--rollback-to`.
 
 Reads the Fastly API token from `FASTLY_API_TOKEN` in the environment. A
