@@ -13,6 +13,7 @@ use std::process::id as process_id;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::RUNTIME_ENV_STORE_NAME;
 use crate::chunked_config::{
     CHUNK_KEY_INFIX, GcPointer, GcRootValue, ResolveFailure, chunk_key_generation, chunk_key_index,
     chunk_lengths, gc_classify_root, gc_verify_generation, prepare_fastly_config_entries,
@@ -130,12 +131,7 @@ static FASTLY_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
 
 const FASTLY_INSTALL_HINT: &str = "install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again";
 
-/// The config store the runtime opens for `EDGEZERO__*` overrides. Compute@Edge
-/// has no process env, so the runtime reads its config-store KEY selector from
-/// here (see `env_config_from_runtime_dictionary` in lib.rs).
-const RUNTIME_ENV_STORE: &str = "edgezero_runtime_env";
-
-/// Base name of the staging twin of [`RUNTIME_ENV_STORE`]. The actual store is
+/// Base name of the staging twin of [`RUNTIME_ENV_STORE_NAME`]. The actual store is
 /// named PER SERVICE — [`staging_selector_store_name`] appends the service id —
 /// because Fastly config stores are account-wide, versionless resources: a
 /// single shared twin would let a staged deploy of service B destructively
@@ -546,14 +542,13 @@ impl Adapter for FastlyCliAdapter {
         // Store named `edgezero_runtime_env`. Compute@Edge has no
         // process env, so `EDGEZERO__STORES__CONFIG__<ID>__KEY` and
         // similar overrides have to come from a platform Config Store
-        // the runtime opens by name (see
-        // `env_config_from_runtime_dictionary` in lib.rs). Provision
-        // owns the store creation alongside the operator's declared
-        // stores so the runtime override path is wired correctly out
-        // of the box; if the store already appears in
-        // `[setup.config_stores.edgezero_runtime_env]`, skip.
+        // the runtime opens by name (see `runtime_env_config` in
+        // lib.rs). Provision owns the store creation alongside the
+        // operator's declared stores so the runtime override path is
+        // wired correctly out of the box; if the store already appears
+        // in `[setup.config_stores.edgezero_runtime_env]`, skip.
         let runtime_env_kind = "config";
-        let runtime_env_name = "edgezero_runtime_env";
+        let runtime_env_name = RUNTIME_ENV_STORE_NAME;
         if dry_run {
             out.push(format!(
                 "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
@@ -4852,12 +4847,12 @@ fn relink_runtime_env_for_staging(
     // isolated. There is simply nothing to mirror — the twin gets only the
     // derived `<logical>_staging` selectors, and the staged draft is relinked to
     // it so it reads staged config while production keeps its default key.
-    let production = match classify_remote_config_store(RUNTIME_ENV_STORE)? {
+    let production = match classify_remote_config_store(RUNTIME_ENV_STORE_NAME)? {
         ConfigStoreLookup::Found(id) => read_config_store_entries(&id, manifest_dir)?,
         ConfigStoreLookup::NotFound => Vec::new(),
         ConfigStoreLookup::SchemaDrift(detail) => {
             return Err(format!(
-                "could not parse `fastly config-store list --json` while resolving `{RUNTIME_ENV_STORE}` for a staged deploy: {detail}.\n  Refusing to stage rather than risk serving PRODUCTION config. Pin a known-compatible fastly CLI version and retry."
+                "could not parse `fastly config-store list --json` while resolving `{RUNTIME_ENV_STORE_NAME}` for a staged deploy: {detail}.\n  Refusing to stage rather than risk serving PRODUCTION config. Pin a known-compatible fastly CLI version and retry."
             ));
         }
     };
@@ -4887,7 +4882,7 @@ fn relink_runtime_env_for_staging(
         ],
         manifest_dir,
     )?;
-    if let Some(link_id) = find_resource_link_id(&existing, RUNTIME_ENV_STORE) {
+    if let Some(link_id) = find_resource_link_id(&existing, RUNTIME_ENV_STORE_NAME) {
         run_fastly_status(
             &[
                 "resource-link".to_owned(),
@@ -4910,7 +4905,7 @@ fn relink_runtime_env_for_staging(
             format!("--service-id={service_id}"),
             format!("--version={version}"),
             format!("--resource-id={staging_store_id}"),
-            format!("--name={RUNTIME_ENV_STORE}"),
+            format!("--name={RUNTIME_ENV_STORE_NAME}"),
         ],
         manifest_dir,
     )?;
