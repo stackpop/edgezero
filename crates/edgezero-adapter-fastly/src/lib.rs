@@ -28,11 +28,11 @@ pub mod secret_store;
 use edgezero_core::app::Hooks;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::app::StoresMetadata;
-#[cfg(feature = "fastly")]
+#[cfg(any(feature = "fastly", test))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
 use edgezero_core::http::Extensions;
-#[cfg(feature = "fastly")]
+#[cfg(any(feature = "fastly", test))]
 use edgezero_core::manifest::ResolvedLoggingConfig;
 
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
@@ -43,7 +43,7 @@ use edgezero_core::manifest::ResolvedLoggingConfig;
 /// how the runtime resolves staged selectors without knowing the twin exists.
 pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
 
-#[cfg(feature = "fastly")]
+#[cfg(any(feature = "fastly", test))]
 #[derive(Debug, Clone)]
 pub struct FastlyLogging {
     pub echo_stdout: bool,
@@ -52,7 +52,7 @@ pub struct FastlyLogging {
     pub use_fastly_logger: bool,
 }
 
-#[cfg(feature = "fastly")]
+#[cfg(any(feature = "fastly", test))]
 impl From<ResolvedLoggingConfig> for FastlyLogging {
     #[inline]
     fn from(config: ResolvedLoggingConfig) -> Self {
@@ -67,11 +67,13 @@ impl From<ResolvedLoggingConfig> for FastlyLogging {
 
 /// Resolve [`FastlyLogging`] from the `EDGEZERO__LOGGING__*` overlay.
 ///
-/// Two rules live here rather than in the caller. An unset or unparseable
+/// Three rules live here rather than in the caller. An unset or unparseable
 /// `EDGEZERO__LOGGING__LEVEL` falls back to [`log::LevelFilter::Info`], and
 /// `use_fastly_logger` is DERIVED from `endpoint.is_some()` so a Viceroy run
-/// with no endpoint is never handed the reserved `stdout` name.
-#[cfg(feature = "fastly")]
+/// with no endpoint is never handed the reserved `stdout` name. `echo_stdout`
+/// is always `true` on this path: `EDGEZERO__LOGGING__ECHO_STDOUT` is resolved
+/// into the [`EnvConfig`] for downstream readers but is not applied here.
+#[cfg(any(feature = "fastly", test))]
 impl From<&EnvConfig> for FastlyLogging {
     #[inline]
     fn from(env: &EnvConfig) -> Self {
@@ -139,7 +141,7 @@ pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastl
 }
 
 /// Like [`run_app`], but runs `extend` against a scratch
-/// [`Extensions`](edgezero_core::http::Extensions) populated from the raw
+/// [`Extensions`] populated from the raw
 /// `fastly::Request` (TLS JA4, H2 fingerprint, client IP, …) before the request
 /// is converted; the scratch values are merged into the core request's
 /// extensions and are visible to middleware and the `State`/extractor layer.
@@ -193,8 +195,8 @@ where
 /// [`StoresMetadata`] here.
 ///
 /// ```rust,ignore
+/// use edgezero_adapter_fastly::{FastlyLogging, init_logger, runtime_env_config};
 /// use edgezero_adapter_fastly::request::dispatch_with_registries;
-/// use edgezero_adapter_fastly::runtime_env_config;
 /// use edgezero_core::app::{StoreMetadata, StoresMetadata};
 ///
 /// let stores = StoresMetadata {
@@ -205,8 +207,14 @@ where
 ///     ..StoresMetadata::default()
 /// };
 /// let env = runtime_env_config(stores);
+/// let logging = FastlyLogging::from(&env);
+/// if logging.use_fastly_logger {
+///     let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
+///     init_logger(endpoint, logging.level, logging.echo_stdout)?;
+/// }
 /// let app = MyApp::build_app();
-/// dispatch_with_registries(&app, req, stores, &env, |_req, _extensions| {})
+/// let _response =
+///     dispatch_with_registries(&app, req, stores, &env, |_req, _extensions| {})?;
 /// ```
 #[cfg(feature = "fastly")]
 #[must_use]
@@ -275,10 +283,14 @@ fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
     keys
 }
 
-/// Dispatch with a config store wired explicitly. Use `run_app` for
-/// the manifest-driven flow that resolves stores automatically. KV
-/// is NOT auto-injected on this path; chain `.with_kv(name)` on a
-/// `FastlyService` builder if you need KV alongside the config store.
+/// Dispatch with a config store wired explicitly. This path does NOT apply the
+/// [`EnvConfig`] overlay: the store name comes directly from
+/// `config_store_name`, and its default key is always `"default"`, so staged or
+/// overridden `__NAME` / `__KEY` selectors are ignored. Use
+/// [`runtime_env_config`] with [`request::dispatch_with_registries`] for the
+/// same selector resolution as [`run_app`]. KV is not auto-injected on this
+/// path; chain `.with_kv(name)` on a [`request::FastlyService`] builder if you
+/// need KV alongside the config store.
 ///
 /// # Errors
 /// Returns an error if logger setup fails or the underlying handler returns an error.
@@ -302,8 +314,7 @@ pub fn run_app_with_config<A: Hooks>(
 }
 
 #[cfg(test)]
-#[cfg(feature = "fastly")]
-mod tests {
+mod fastly_logging_tests {
     use super::*;
     use edgezero_core::manifest::LogLevel;
 
@@ -320,6 +331,36 @@ mod tests {
         assert_eq!(logging.level, log::LevelFilter::Debug);
         assert!(!logging.echo_stdout);
         assert!(logging.use_fastly_logger);
+    }
+
+    #[test]
+    fn fastly_logging_from_env_falls_back_without_an_endpoint() {
+        let env = EnvConfig::from_vars([
+            ("EDGEZERO__LOGGING__LEVEL", "not-a-level"),
+            ("EDGEZERO__LOGGING__ECHO_STDOUT", "false"),
+        ]);
+
+        let logging = FastlyLogging::from(&env);
+
+        assert_eq!(logging.level, log::LevelFilter::Info);
+        assert_eq!(logging.endpoint, None);
+        assert!(!logging.use_fastly_logger);
+        assert!(logging.echo_stdout);
+    }
+
+    #[test]
+    fn fastly_logging_from_env_enables_the_named_endpoint_logger() {
+        let env = EnvConfig::from_vars([
+            ("EDGEZERO__LOGGING__LEVEL", "debug"),
+            ("EDGEZERO__LOGGING__ENDPOINT", "edgezero-logs"),
+        ]);
+
+        let logging = FastlyLogging::from(&env);
+
+        assert_eq!(logging.level, log::LevelFilter::Debug);
+        assert_eq!(logging.endpoint.as_deref(), Some("edgezero-logs"));
+        assert!(logging.use_fastly_logger);
+        assert!(logging.echo_stdout);
     }
 }
 

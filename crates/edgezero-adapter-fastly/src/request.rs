@@ -196,6 +196,12 @@ impl<'app> FastlyService<'app> {
     /// handle into request extensions. If the store is unavailable
     /// at request time, the dispatcher logs the warning once and
     /// proceeds without it.
+    ///
+    /// Env-overlay limitation: this bare-handle path does not resolve
+    /// `EDGEZERO__STORES__CONFIG__*` selectors and binds the config registry's
+    /// default key to `"default"`. Use [`runtime_env_config`](crate::runtime_env_config)
+    /// with [`dispatch_with_registries`] when a custom entry point needs the
+    /// same `__NAME` / `__KEY` resolution as [`run_app`](crate::run_app).
     #[must_use]
     #[inline]
     pub fn with_config<S: Into<String>>(mut self, name: S) -> Self {
@@ -206,6 +212,10 @@ impl<'app> FastlyService<'app> {
     /// Inject a pre-built `ConfigStoreHandle`. Use this when the
     /// caller has already opened (or mocked) the backend. Mutually
     /// exclusive with `with_config(name)` -- the last call wins.
+    /// Like [`Self::with_config`], this binds the config registry's default key
+    /// to `"default"` and does not apply the [`EnvConfig`] overlay. Use
+    /// [`runtime_env_config`](crate::runtime_env_config) with
+    /// [`dispatch_with_registries`] for manifest-driven selector resolution.
     #[must_use]
     #[inline]
     pub fn with_config_handle(mut self, handle: ConfigStoreHandle) -> Self {
@@ -317,7 +327,7 @@ where
 /// point for full parity with `run_app`. Contrast [`FastlyService`], whose
 /// bare-handle path binds `default_key: "default"` and ignores those selectors.
 ///
-/// KV failures escalate via [`resolve_kv_handle`]'s `kv_required=true` path;
+/// KV failures escalate via `resolve_kv_handle`'s `kv_required=true` path;
 /// missing config / secret stores degrade silently with a one-time warning.
 ///
 /// # Errors
