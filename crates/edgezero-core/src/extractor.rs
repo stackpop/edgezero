@@ -1004,10 +1004,12 @@ fn resolve_secret_field<'walk>(
                 resolve_leaf(ctx, node, field, name.as_ref(), &rendered).await
             }
             Some((SecretPathSegment::OptionalField(name), [])) => {
-                if matches!(
-                    node.get(name.as_ref()),
-                    None | Some(serde_json::Value::Null)
-                ) {
+                if node.as_object().is_some_and(|parent| {
+                    matches!(
+                        parent.get(name.as_ref()),
+                        None | Some(serde_json::Value::Null)
+                    )
+                }) {
                     return Ok(());
                 }
                 resolve_leaf(ctx, node, field, name.as_ref(), &rendered).await
@@ -1429,6 +1431,22 @@ mod tests {
                     SecretPathSegment::Field(Cow::Borrowed("webhook_key")),
                 ],
                 optional: true,
+            }]
+        }
+    }
+
+    // Optional terminal segment supplied by hand-written metadata:
+    // integrations.webhook_key
+    struct TerminalOptionalCfg;
+    impl AppConfigMeta for TerminalOptionalCfg {
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInDefault,
+                path: vec![
+                    SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                    SecretPathSegment::OptionalField(Cow::Borrowed("webhook_key")),
+                ],
+                optional: false,
             }]
         }
     }
@@ -2916,6 +2934,20 @@ mod tests {
             panic!("malformed optional parent must be ConfigOutOfDate: {err:?}");
         };
         assert_eq!(field_path, "integrations");
+    }
+
+    #[test]
+    fn secret_walk_rejects_scalar_parent_of_terminal_optional_field() {
+        let ctx = ctx_with_default_secret_store("unused", "unused");
+        let mut data = serde_json::json!({ "integrations": "not-an-object" });
+        let err = block_on(secret_walk::<TerminalOptionalCfg>(&ctx, &mut data))
+            .expect_err("a terminal optional field must have an object parent");
+
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let EdgeError::ConfigOutOfDate { field_path, .. } = &err else {
+            panic!("malformed optional parent must be ConfigOutOfDate: {err:?}");
+        };
+        assert_eq!(field_path, "integrations.webhook_key");
     }
 
     #[test]

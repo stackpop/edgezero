@@ -50,7 +50,7 @@ main() {
   local expected
   for expected in \
     'token=dummy-token' \
-    'service-id=dummy-service' \
+    'service-id=dummyservice' \
     'endpoint=CLEARED' \
     'home=CLEARED' \
     'action-token-carrier=CLEARED' \

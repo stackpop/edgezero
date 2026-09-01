@@ -25,7 +25,7 @@ main() {
   local healthy="${EDGEZERO__TEST__HEALTHY:-}"
   local status_code="${EDGEZERO__TEST__STATUS_CODE:-}"
 
-  grep -qE "^GET https://api\.fastly\.com/service/dummy-service/version/$staged/domain\?include=staging_ips\$" "$log" ||
+  grep -qE "^GET https://api\.fastly\.com/service/dummyservice/version/$staged/domain\?include=staging_ips\$" "$log" ||
     fail "the staging-IP lookup was never performed for version $staged"
 
   grep -qE '^PROBE .*--connect-to ::151\.101\.2\.10:443 .*https://staging\.example\.com/' "$log" ||

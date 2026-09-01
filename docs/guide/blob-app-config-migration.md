@@ -261,13 +261,18 @@ prefix shown above. Provisioning a non-default store-name mapping requires
 `service_id` in `fastly.toml` or `FASTLY_SERVICE_ID` so the command cannot write
 into an ambiguous namespace. If both are set, they must match.
 
-Locally (Viceroy), the store lives in fastly.toml's
-`[local_server.config_stores.edgezero_runtime_env]` block. If the
-store is missing at runtime, EdgeZero logs a one-line warning to
-Fastly logs (`Fastly Config Store 'edgezero_runtime_env' not found;
-EDGEZERO__* runtime overrides will use baked-in defaults`) and falls
-back to the binding's default id -- so the runtime keeps serving, but
-your per-environment override is silently inactive until you provision.
+Locally, Viceroy reports the fixed service ID
+`0000000000000000000000`, regardless of the deployment `service_id` in
+`fastly.toml`. Put local overrides under that namespace:
+
+```toml
+[local_server.config_stores.edgezero_runtime_env.contents]
+EDGEZERO__SERVICES__0000000000000000000000__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging"
+```
+
+If the local `edgezero_runtime_env` store is missing, EdgeZero logs a one-line
+warning and falls back to the binding's default id. The runtime keeps serving,
+but the per-environment override is inactive.
 
 ### Drift detection in CI
 

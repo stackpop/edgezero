@@ -208,6 +208,11 @@ namespace; a non-default store-name mapping therefore requires top-level
 `service_id` in `fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must
 match.
 
+Viceroy reports `0000000000000000000000` as its local service ID. Entries in a
+local `[local_server.config_stores.edgezero_runtime_env.contents]` block must
+therefore use `EDGEZERO__SERVICES__0000000000000000000000__...`, not the
+production service ID or the unscoped canonical key.
+
 ```toml
 [stores.config]
 ids     = ["app_config"]

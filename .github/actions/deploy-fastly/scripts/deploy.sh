@@ -28,7 +28,7 @@ main() {
   local service_id="${EDGEZERO__FASTLY__SERVICE_ID:-}"
 
   require_input fastly-api-token "$token"
-  require_input_matching fastly-service-id "$service_id" '^[A-Za-z0-9_-]+$'
+  require_input_matching fastly-service-id "$service_id" '^[A-Za-z0-9]+$'
   require_cmd jq
 
   EDGEZERO__PROVIDER__ENV=$(jq -n --arg t "$token" --arg s "$service_id" \
