@@ -9719,6 +9719,8 @@ echo 'unexpected' >&2; exit 1
                printf '%s\\n' '{update_stdout}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                case \"$*\" in\n    \
                  *--store-id=ENVSEL1*) printf '%s\\n' '[{{\"item_key\":\"EDGEZERO__SERVICES__SVC1__LOGGING__LEVEL\",\"item_value\":\"debug\"}}]' ;;\n    \
@@ -11401,6 +11403,8 @@ echo 'unexpected' >&2; exit 1
                else\n    \
                  printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}}]'\n  \
                fi\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[]'\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
@@ -11467,6 +11471,8 @@ echo 'unexpected' >&2; exit 1
                else\n    \
                  printf '%s\\n' '[]'\n  \
                fi\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[]'\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
