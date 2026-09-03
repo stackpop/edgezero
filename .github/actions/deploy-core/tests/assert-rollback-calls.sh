@@ -22,7 +22,7 @@ main() {
   local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
   local staged="${EDGEZERO__TEST__STAGED_VERSION:?EDGEZERO__TEST__STAGED_VERSION is required}"
   local rolled_back_to="${EDGEZERO__TEST__ROLLED_BACK_TO:-}"
-  local api='https://api\.fastly\.com/service/dummy-service'
+  local api='https://api\.fastly\.com/service/dummyservice'
   # The EXPLICIT rollback-to the smoke passes to the production rollback (it rolls
   # back FROM the active version 40 TO 39; the best-effort staleness guard requires the
   # rolled-back-from version to still be active).

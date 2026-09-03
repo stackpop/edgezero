@@ -1633,6 +1633,44 @@ pub(crate) fn reject_merged_id_collisions(
     Ok(())
 }
 
+fn collect_secret_leaf<'raw>(
+    node: &'raw Value,
+    field: &SecretField,
+    name: &str,
+    rendered: &str,
+    optional_segment: bool,
+    out: &mut Vec<ResolvedTomlLeaf<'raw>>,
+) -> Result<(), String> {
+    let parent = node
+        .as_table()
+        .ok_or_else(|| format!("expected a table containing `{name}` at `{rendered}`"))?;
+    let leaf_label = if rendered.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{rendered}.{name}")
+    };
+    match parent.get(name).and_then(Value::as_str) {
+        Some(value) => {
+            let store_ref_value = match field.kind {
+                SecretKind::KeyInNamedStore { store_ref_field } => {
+                    parent.get(store_ref_field).and_then(Value::as_str)
+                }
+                SecretKind::KeyInDefault | SecretKind::StoreRef => None,
+            };
+            out.push(ResolvedTomlLeaf {
+                label: leaf_label,
+                store_ref_value,
+                value,
+            });
+            Ok(())
+        }
+        None if (field.optional || optional_segment) && parent.get(name).is_none() => Ok(()),
+        None => Err(format!(
+            "`#[secret]` field `{leaf_label}` is missing or not a string"
+        )),
+    }
+}
+
 /// Collect every concrete secret leaf a `SecretField` resolves to in the
 /// raw app-config TOML, navigating `Field` (table descent) and `ArrayEach`
 /// (per-element) segments. `label` uses concrete `[n]` indices and, for a
@@ -1652,34 +1690,10 @@ fn collect_secret_leaves<'raw>(
     ) -> Result<(), String> {
         match remaining.split_first() {
             Some((SecretPathSegment::Field(name), [])) => {
-                let parent = node.as_table().ok_or_else(|| {
-                    format!("expected a table containing `{name}` at `{rendered}`")
-                })?;
-                let leaf_label = if rendered.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{rendered}.{name}")
-                };
-                match parent.get(name.as_ref()).and_then(Value::as_str) {
-                    Some(value) => {
-                        let store_ref_value = match field.kind {
-                            SecretKind::KeyInNamedStore { store_ref_field } => {
-                                parent.get(store_ref_field).and_then(Value::as_str)
-                            }
-                            SecretKind::KeyInDefault | SecretKind::StoreRef => None,
-                        };
-                        out.push(ResolvedTomlLeaf {
-                            label: leaf_label,
-                            store_ref_value,
-                            value,
-                        });
-                        Ok(())
-                    }
-                    None if field.optional && parent.get(name.as_ref()).is_none() => Ok(()),
-                    None => Err(format!(
-                        "`#[secret]` field `{leaf_label}` is missing or not a string"
-                    )),
-                }
+                collect_secret_leaf(node, field, name, rendered, false, out)
+            }
+            Some((SecretPathSegment::OptionalField(name), [])) => {
+                collect_secret_leaf(node, field, name, rendered, true, out)
             }
             Some((SecretPathSegment::Field(name), rest)) => {
                 let table = node
@@ -1690,13 +1704,23 @@ fn collect_secret_leaves<'raw>(
                 } else {
                     format!("{rendered}.{name}")
                 };
-                // Intermediates are always required — `field.optional` reflects
-                // only the leaf, and the derive never nests through `Option`. This
-                // matches the runtime walk (`resolve_secret_field`) so `config
-                // validate` catches exactly what the runtime would reject.
                 match table.get(name.as_ref()) {
                     Some(child) => walk(child, field, rest, &next_rendered, out),
                     None => Err(format!("missing `{next_rendered}`")),
+                }
+            }
+            Some((SecretPathSegment::OptionalField(name), rest)) => {
+                let table = node
+                    .as_table()
+                    .ok_or_else(|| format!("expected a table at `{rendered}`"))?;
+                let next_rendered = if rendered.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{rendered}.{name}")
+                };
+                match table.get(name.as_ref()) {
+                    Some(child) => walk(child, field, rest, &next_rendered, out),
+                    None => Ok(()),
                 }
             }
             Some((SecretPathSegment::ArrayEach, rest)) => {
@@ -1709,6 +1733,10 @@ fn collect_secret_leaves<'raw>(
                 }
                 Ok(())
             }
+            Some((_unsupported, _)) => Err(format!(
+                "unsupported secret path segment in `{}`",
+                field.dotted_path()
+            )),
             None => Ok(()),
         }
     }
@@ -2829,11 +2857,48 @@ other = "x"
     }
 
     #[test]
+    fn collect_secret_leaves_skips_absent_optional_intermediate() {
+        let raw: Value = toml::from_str("[integrations]\n").expect("toml");
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                SecretPathSegment::OptionalField(Cow::Borrowed("datadome")),
+                SecretPathSegment::Field(Cow::Borrowed("webhook_key")),
+            ],
+            optional: true,
+        };
+        let leaves = collect_secret_leaves(&raw, &field)
+            .expect("absent optional intermediate should be skipped");
+        assert!(
+            leaves.is_empty(),
+            "absent optional intermediate yields nothing"
+        );
+    }
+
+    #[test]
+    fn collect_secret_leaves_rejects_scalar_parent_of_optional_intermediate() {
+        let raw: Value = toml::from_str("integrations = \"not-a-table\"\n").expect("toml");
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                SecretPathSegment::OptionalField(Cow::Borrowed("datadome")),
+                SecretPathSegment::Field(Cow::Borrowed("webhook_key")),
+            ],
+            optional: true,
+        };
+
+        let err = collect_secret_leaves(&raw, &field)
+            .expect_err("a present optional intermediate must have a table parent");
+        assert!(
+            err.contains("integrations"),
+            "collector error names the malformed parent: {err}"
+        );
+    }
+
+    #[test]
     fn collect_secret_leaves_errors_on_missing_required_intermediate() {
-        // A missing INTERMEDIATE (the `integrations` table) is an error even
-        // when the leaf is optional — `optional` reflects only the leaf, and
-        // intermediates are structurally required. Locks alignment with the
-        // runtime walk (`resolve_secret_field`).
         let raw: Value = toml::from_str("other = \"x\"\n").expect("toml");
         let field = SecretField {
             kind: SecretKind::KeyInDefault,

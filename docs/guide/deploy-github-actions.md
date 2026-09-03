@@ -576,9 +576,12 @@ written where no staged version ever reads).
 
 What makes a _staged version_ actually read that key is the other half: a staged
 deploy re-points its own `edgezero_runtime_env` link at a **per-service**
-`edgezero_runtime_env_staging_<service-id>` selector store, mirroring
-production's runtime overrides into it and redirecting only the config selectors
-to `<logical-store-id>_staging`. The staged deploy creates and populates that
+`edgezero_runtime_env_staging_<service-id>` selector store, mirroring only that
+service's scoped production overrides into it while redirecting the
+service-scoped config selectors to
+`<logical-store-id>_staging`. Ambient `EDGEZERO__STORES__*__NAME` process values
+are not overlaid here; staging verifies the mappings production actually uses.
+The staged deploy creates and populates that
 twin on demand — no separate setup step — so the staged version reads
 `<logical>_staging` while production keeps reading `<logical>`. (The store is
 named per service because Fastly config stores are account-wide and versionless,

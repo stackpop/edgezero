@@ -414,7 +414,7 @@ test_wrapper_validate() {
   run_dfl() {
     env EDGEZERO__APP__CLI__ARTIFACT_PRESENT="${A:-true}" \
       EDGEZERO__FASTLY__API_TOKEN_PRESENT="${T:-true}" \
-      EDGEZERO__FASTLY__SERVICE_ID="${S-svc_1}" \
+      EDGEZERO__FASTLY__SERVICE_ID="${S-svc1}" \
       EDGEZERO__ADAPTER=fastly EDGEZERO__RUNNER__OS=Linux EDGEZERO__RUNNER__ARCH=X64 \
       EDGEZERO__ACTION__STATE_DIR="$WORK_DIR/dfl-state" \
       GITHUB_OUTPUT="$WORK_DIR/dfl-out.txt" \
@@ -424,6 +424,8 @@ test_wrapper_validate() {
   A=false assert_fails "deploy-fastly: missing artifact is rejected" run_dfl
   T=false assert_fails "deploy-fastly: missing token (by presence) is rejected" run_dfl
   S='bad id!' assert_fails "deploy-fastly: malformed service-id is rejected" run_dfl
+  S='svc_1' assert_fails "deploy-fastly: service-id with underscore is rejected" run_dfl
+  S='svc-1' assert_fails "deploy-fastly: service-id with hyphen is rejected" run_dfl
   S='' assert_fails "deploy-fastly: empty service-id is rejected" run_dfl
 
   # config-push-fastly: artifact + token presence, deploy-to fail-closed.

@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -20,6 +21,7 @@ use crate::chunked_config::{
     prior_chunk_keys, resolve_fastly_config_value_typed, sha256_hex, value_announces_our_kind,
     value_is_future_format, value_is_inert_foreign, verify_writer_split_layout,
 };
+use crate::service_scoped_runtime_env_key;
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
@@ -349,6 +351,19 @@ struct TempFileGuard {
     path: Option<PathBuf>,
 }
 
+struct EntryCommitFailure {
+    committed: Vec<String>,
+    error: String,
+    failed_key: String,
+    not_attempted: Vec<String>,
+    total: usize,
+}
+
+struct RuntimeStoreNameReconciliation {
+    deletes: Vec<String>,
+    upserts: Vec<(String, String)>,
+}
+
 // The three `validate_*` trait methods exist on `Adapter` because
 // spin requires them (variable-name regex, `[component.*]`
 // discovery, flat-namespace collision). The trait surface is typed
@@ -464,6 +479,9 @@ impl Adapter for FastlyCliAdapter {
             );
         };
         let fastly_path = manifest_root.join(rel);
+        let manifest_dir = fastly_path.parent().unwrap_or(manifest_root);
+        let runtime_env_service_id =
+            provision_runtime_env_service_id_for_stores(&fastly_path, stores)?;
 
         let mut out = Vec::new();
         for (kind, ids) in [
@@ -494,7 +512,7 @@ impl Adapter for FastlyCliAdapter {
                     ));
                     continue;
                 }
-                create_fastly_store(kind, name)?;
+                create_fastly_store_in(kind, name, manifest_dir)?;
                 // If the platform store was created but the
                 // writeback fails, remote state and the local
                 // manifest are out of sync. Re-running `provision`
@@ -555,7 +573,7 @@ impl Adapter for FastlyCliAdapter {
                 fastly_path.display()
             ));
         } else if !setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
-            create_fastly_store(runtime_env_kind, runtime_env_name)?;
+            create_fastly_store_in(runtime_env_kind, runtime_env_name, manifest_dir)?;
             append_fastly_setup(&fastly_path, runtime_env_kind, runtime_env_name).map_err(
                 |err| {
                     format!(
@@ -577,8 +595,12 @@ impl Adapter for FastlyCliAdapter {
             // make production serve staged config. Staged versions get their own
             // selector via `edgezero_runtime_env_staging`, wired automatically by
             // a staged deploy; nothing here should be edited to stage config.
+            let production_selector_key = runtime_env_key_for(
+                runtime_env_service_id.as_deref().unwrap_or("<SERVICE_ID>"),
+                "app_config",
+            );
             let mut line = format!(
-                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  It already selects each store's default key, so no edit is needed for a normal setup.\n  To point PRODUCTION at a different key (e.g. a renamed store), and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  Provision writes service-scoped non-default store-name mappings below. Config stores still select their logical id as the default key.\n  To point PRODUCTION at a different config key, and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key={production_selector_key} --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
                 fastly_path.display()
             );
             if let Some(note) = post_create_note {
@@ -589,6 +611,13 @@ impl Adapter for FastlyCliAdapter {
         } else {
             // Already declared; nothing to do.
         }
+
+        out.extend(persist_runtime_env_store_name_entries(
+            stores,
+            runtime_env_service_id.as_deref(),
+            dry_run,
+            manifest_dir,
+        )?);
 
         // The STAGING twin of the runtime-override store is created and
         // populated entirely by a staged deploy (see
@@ -1460,19 +1489,20 @@ fn classify_resolved_read(
 /// # Errors
 /// Returns an error if `fastly` isn't on `PATH`, the child fails to
 /// spawn, or the exit status is non-zero.
-fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
+fn create_fastly_store_in(kind: &str, name: &str, cwd: &Path) -> Result<(), String> {
     let subcommand = format!("{kind}-store");
     let name_arg = format!("--name={name}");
-    let output = Command::new("fastly")
+    let mut command = Command::new("fastly");
+    command
         .args([subcommand.as_str(), "create", name_arg.as_str()])
-        .output()
-        .map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
-            } else {
-                format!("failed to spawn `fastly`: {err}")
-            }
-        })?;
+        .current_dir(cwd);
+    let output = command.output().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+        } else {
+            format!("failed to spawn `fastly`: {err}")
+        }
+    })?;
     if output.status.success() {
         return Ok(());
     }
@@ -1549,18 +1579,67 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
     Ok(svc)
 }
 
-/// If fastly.toml declares `service_id`, the next
-/// `fastly compute deploy` skips `[setup]` entirely (it only runs on
-/// the FIRST deploy of a service). Any store created by provision
-/// after that needs a separate `fastly resource-link create` to link
-/// the platform store to the service version. This helper returns the
-/// remediation note to surface in the provision output, or `None`
-/// when the service hasn't been deployed yet (so the next
-/// `compute deploy` will pick up the `[setup]` row automatically).
+/// Resolve the service namespace provision uses for account-wide runtime-env
+/// entries. A manifest id and environment id must agree so Fastly CLI project
+/// context cannot write mappings owned by a different service.
+fn provision_runtime_env_service_id(path: &Path) -> Result<Option<String>, String> {
+    resolve_provision_runtime_env_service_id(path, env::var_os(FASTLY_SERVICE_ID_ENV))
+}
+
+fn resolve_provision_runtime_env_service_id(
+    path: &Path,
+    env_value: Option<OsString>,
+) -> Result<Option<String>, String> {
+    let manifest_id = read_fastly_service_id(path)?;
+    let env_id = match env_value {
+        None => None,
+        Some(value) => Some(
+            value
+                .into_string()
+                .map_err(|_value| format!("{FASTLY_SERVICE_ID_ENV} must contain valid UTF-8"))?,
+        ),
+    };
+
+    if let Some(service_id) = manifest_id.as_deref() {
+        validate_service_id(service_id)?;
+    }
+    if let Some(service_id) = env_id.as_deref() {
+        validate_service_id(service_id)?;
+    }
+    match (manifest_id, env_id) {
+        (Some(manifest), Some(environment)) if manifest != environment => Err(format!(
+            "Fastly service id mismatch: {} declares `{manifest}` but {FASTLY_SERVICE_ID_ENV} is `{environment}`; refusing to write runtime mappings across service namespaces",
+            path.display()
+        )),
+        (Some(manifest), _) => Ok(Some(manifest)),
+        (None, Some(environment)) => Ok(Some(environment)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn provision_runtime_env_service_id_for_stores(
+    path: &Path,
+    stores: &ProvisionStores<'_>,
+) -> Result<Option<String>, String> {
+    let service_id = provision_runtime_env_service_id(path)?;
+    if has_non_default_store_name_mappings(stores) && service_id.is_none() {
+        return Err(format!(
+            "cannot persist non-default Fastly store-name mappings without a service namespace: set top-level `service_id` in {} or set {FASTLY_SERVICE_ID_ENV}",
+            path.display()
+        ));
+    }
+    Ok(service_id)
+}
+
+/// If fastly.toml declares `service_id` or `FASTLY_SERVICE_ID` selects one,
+/// the next `fastly compute deploy` targets an existing service and skips
+/// `[setup]`. Any store created by provision then needs a separate resource
+/// link. This helper returns that remediation or `None` before a service has
+/// been selected.
 fn resource_link_note(path: &Path, kind: &str, name: &str) -> Result<Option<String>, String> {
-    let note = read_fastly_service_id(path)?.map(|svc_id| {
+    let note = provision_runtime_env_service_id(path)?.map(|svc_id| {
         format!(
-            "  fastly.toml declares `service_id = \"{svc_id}\"`, so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
+            "  Fastly service id resolves to `{svc_id}`, so `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
         )
     });
     Ok(note)
@@ -3169,48 +3248,90 @@ fn chunk_key_generation_any(key: &str) -> Option<String> {
     chunk_key_generation(root, key)
 }
 
-/// Drive a sequential per-entry commit loop and produce the
-/// partial-failure diagnostic when the committer fails mid-way.
-/// Pure (no I/O) so the diagnostic shape is unit-testable without
-/// the fastly CLI on PATH; production calls it with a closure that
-/// shells out via `create_config_store_entry`. On success returns
-/// the count of committed entries; on failure returns an error
-/// string. The FAILED entry's outcome is UNKNOWN — Fastly may have
-/// committed it before returning the error — so the message does not
-/// claim a clean boundary; it directs the operator to re-run the whole
-/// idempotent push rather than hand-resume from a supposed cut point.
-fn push_entries_with_committer<F>(
+/// Drive the common sequential commit mechanics while leaving recovery policy
+/// to the operation that owns the writes.
+fn commit_entries_with_committer<F>(
     entries: &[(String, String)],
     mut committer: F,
+) -> Result<usize, EntryCommitFailure>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    let mut written_keys = Vec::with_capacity(entries.len());
+    for (index, (key, value)) in entries.iter().enumerate() {
+        if let Err(error) = committer(key, value) {
+            return Err(EntryCommitFailure {
+                committed: written_keys,
+                error,
+                failed_key: key.clone(),
+                not_attempted: entries
+                    .iter()
+                    .skip(index.saturating_add(1))
+                    .map(|(remaining_key, _)| remaining_key.clone())
+                    .collect(),
+                total: entries.len(),
+            });
+        }
+        written_keys.push(key.clone());
+    }
+    Ok(written_keys.len())
+}
+
+/// Commit config-push entries and retain its chunk-aware retry guidance.
+fn push_entries_with_committer<F>(
+    entries: &[(String, String)],
+    committer: F,
 ) -> Result<usize, String>
 where
     F: FnMut(&str, &str) -> Result<(), String>,
 {
-    let mut pushed: Vec<String> = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        if let Err(err) = committer(key, value) {
-            let remaining: Vec<&str> = entries
-                .iter()
-                .skip(pushed.len().saturating_add(1))
-                .map(|(remaining_key, _)| remaining_key.as_str())
-                .collect();
-            return Err(format!(
-                "fastly push failed at entry `{key}` while committing {committed} of {total} entries.\n  \
-                 The failed entry's outcome is UNKNOWN: Fastly may have committed it before the error \
-                 (a timeout can arrive after the write lands), including when it is the root pointer.\n  \
-                 Recovery: re-run the SAME `config push`. It is idempotent -- chunk keys are content-addressed \
-                 and writes use `--upsert` -- so entries already written are rewritten harmlessly and any \
-                 missing ones are filled. Do NOT hand-delete the failed key.\n  \
-                 Already written (a retry rewrites them): {pushed:?}\n  \
-                 Failed: `{key}` (outcome unknown) -- {err}\n  \
-                 Not attempted: {remaining:?}",
-                committed = pushed.len(),
-                total = entries.len(),
-            ));
-        }
-        pushed.push(key.clone());
-    }
-    Ok(pushed.len())
+    commit_entries_with_committer(entries, committer).map_err(|failure| {
+        format!(
+            "fastly push failed at entry `{failed_key}` while committing {committed} of {total} entries.\n  \
+             The failed entry's outcome is UNKNOWN: Fastly may have committed it before the error \
+             (a timeout can arrive after the write lands), including when it is the root pointer.\n  \
+             Recovery: re-run the SAME `config push`. It is idempotent -- chunk keys are content-addressed \
+             and writes use `--upsert` -- so entries already written are rewritten harmlessly and any \
+             missing ones are filled. Do NOT hand-delete the failed key.\n  \
+             Already written (a retry rewrites them): {already_written:?}\n  \
+             Failed: `{failed_key}` (outcome unknown) -- {error}\n  \
+             Not attempted: {not_attempted:?}",
+            failed_key = failure.failed_key,
+            committed = failure.committed.len(),
+            total = failure.total,
+            already_written = failure.committed,
+            error = failure.error,
+            not_attempted = failure.not_attempted,
+        )
+    })
+}
+
+/// Commit runtime store-name mappings with provision-specific recovery advice.
+fn push_runtime_store_name_entries_with_committer<F>(
+    entries: &[(String, String)],
+    committer: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    commit_entries_with_committer(entries, committer).map_err(|failure| {
+        format!(
+            "fastly provision failed while writing runtime store-name mapping `{failed_key}` after committing {committed} of {total} mappings.\n  \
+             The failed mapping's outcome is UNKNOWN: Fastly may have committed it before the error.\n  \
+             Recovery: re-run the SAME `edgezero provision --adapter fastly` command with the same \
+             `EDGEZERO__STORES__*__NAME` environment. Mapping writes use `--upsert`, so mappings \
+             already written are rewritten harmlessly and missing ones are filled.\n  \
+             Already written (a retry rewrites them): {already_written:?}\n  \
+             Failed: `{failed_key}` (outcome unknown) -- {error}\n  \
+             Not attempted: {not_attempted:?}",
+            failed_key = failure.failed_key,
+            committed = failure.committed.len(),
+            total = failure.total,
+            already_written = failure.committed,
+            error = failure.error,
+            not_attempted = failure.not_attempted,
+        )
+    })
 }
 
 /// Shell `fastly config-store-entry update --upsert --stdin` with
@@ -3238,17 +3359,39 @@ where
 ///    bytes out of argv and lifts the size cap to whatever the OS
 ///    pipe buffer + the CLI's read accept (megabytes in practice).
 fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(), String> {
+    create_config_store_entry_with_cwd(store_id, key, value, None)
+}
+
+fn create_config_store_entry_in(
+    store_id: &str,
+    key: &str,
+    value: &str,
+    cwd: &Path,
+) -> Result<(), String> {
+    create_config_store_entry_with_cwd(store_id, key, value, Some(cwd))
+}
+
+fn create_config_store_entry_with_cwd(
+    store_id: &str,
+    key: &str,
+    value: &str,
+    cwd: Option<&Path>,
+) -> Result<(), String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
-    let mut child = Command::new("fastly")
-        .args([
-            "config-store-entry",
-            "update",
-            store_arg.as_str(),
-            key_arg.as_str(),
-            "--upsert",
-            "--stdin",
-        ])
+    let mut command = Command::new("fastly");
+    command.args([
+        "config-store-entry",
+        "update",
+        store_arg.as_str(),
+        key_arg.as_str(),
+        "--upsert",
+        "--stdin",
+    ]);
+    if let Some(command_cwd) = cwd {
+        command.current_dir(command_cwd);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3407,9 +3550,9 @@ fn parse_config_store_entries(stdout: &str) -> Result<Vec<(String, String)>, Str
 
 /// `fastly config-store-entry delete --store-id=<id> --key=<k>`, run in the
 /// app manifest directory. Distinct from the `config gc` `delete_config_store_entry`
-/// (which runs in the process cwd with redacted diagnostics); staging reconciliation
-/// must run `fastly` in `cwd` so it resolves the right service context.
-fn delete_staging_config_store_entry(store_id: &str, key: &str, cwd: &Path) -> Result<(), String> {
+/// (which runs in the process cwd with redacted diagnostics); runtime-env
+/// reconciliation must run `fastly` in `cwd` so it resolves the right service context.
+fn delete_config_store_entry_in(store_id: &str, key: &str, cwd: &Path) -> Result<(), String> {
     run_fastly_status(
         &[
             "config-store-entry".to_owned(),
@@ -3424,10 +3567,10 @@ fn delete_staging_config_store_entry(store_id: &str, key: &str, cwd: &Path) -> R
 /// Compute the staging selector store's entries from production's, given the
 /// declared config-store logical ids.
 ///
-/// The twin is a faithful MIRROR of production's runtime overrides — adapter
-/// host, logging level, `__NAME` redirects — with exactly one transform: every
-/// declared config store's selector key (`EDGEZERO__STORES__CONFIG__<ID>__KEY`)
-/// points at `<logical>_staging`, the key `config push --staging` writes. A
+/// The twin is a faithful mirror of this service's production runtime
+/// overrides, with exactly one transform: every declared config store's
+/// service-scoped selector points at
+/// `<logical>_staging`, the key `config push --staging` writes. A
 /// declared store gets that selector even when production has no explicit entry
 /// for it (production relies on the runtime's default = the logical id; staging
 /// must NOT inherit that default, or it would read production's key).
@@ -3435,20 +3578,24 @@ fn delete_staging_config_store_entry(store_id: &str, key: &str, cwd: &Path) -> R
 /// Pure so the transform is unit-testable without the fastly CLI.
 fn staging_entries_from_production(
     production: &[(String, String)],
+    service_id: &str,
     config_logical_ids: &[String],
 ) -> Vec<(String, String)> {
-    // selector key -> staging value, one per declared config store.
+    let service_prefix = service_scoped_runtime_env_key(service_id, "EDGEZERO__");
+    // Scoped selector key -> staging value, one per declared config store.
     let selectors: Vec<(String, String)> = config_logical_ids
         .iter()
-        .map(|id| (runtime_env_key_for(id), format!("{id}_staging")))
+        .map(|id| (runtime_env_key_for(service_id, id), format!("{id}_staging")))
         .collect();
-    let is_selector = |key: &str| selectors.iter().any(|(sel, _)| sel == key);
+    let is_selector = |key: &str| selectors.iter().any(|(selector, _)| selector == key);
 
-    // Copy every non-selector production override verbatim; selectors are
-    // supplied from `selectors` below (whether or not production carried one).
+    // Copy only current-service production overrides. Legacy unscoped entries
+    // have no safe owner, and another service's namespace does not belong in
+    // this per-service staging twin. Selectors are supplied below whether or
+    // not production carried one.
     let mut out: Vec<(String, String)> = production
         .iter()
-        .filter(|(key, _)| !is_selector(key))
+        .filter(|(key, _)| key.starts_with(&service_prefix) && !is_selector(key))
         .cloned()
         .collect();
     out.extend(selectors);
@@ -3466,15 +3613,15 @@ fn staging_selector_store_name(service_id: &str) -> String {
     format!("{RUNTIME_ENV_STAGING_STORE_PREFIX}_{service_id}")
 }
 
-fn ensure_staging_selector_store(store_name: &str) -> Result<String, String> {
-    match classify_remote_config_store(store_name)? {
+fn ensure_staging_selector_store(store_name: &str, cwd: &Path) -> Result<String, String> {
+    match classify_remote_config_store_in(store_name, cwd)? {
         ConfigStoreLookup::Found(id) => Ok(id),
         ConfigStoreLookup::NotFound => {
-            create_fastly_store("config", store_name)?;
+            create_fastly_store_in("config", store_name, cwd)?;
             // resolve_remote_config_store_id now yields a typed absence; we just
             // created the store, so a None here is fail-closed (the listing did
             // not reflect our own create), not a genuine absence.
-            resolve_remote_config_store_id(store_name)
+            resolve_remote_config_store_id_in(store_name, cwd)
                 .map_err(|err| {
                     format!(
                         "created fastly config-store `{store_name}` but could not resolve its id: {err}"
@@ -3492,9 +3639,8 @@ fn ensure_staging_selector_store(store_name: &str) -> Result<String, String> {
     }
 }
 
-/// Reconcile the staging twin so it MIRRORS production's runtime overrides
-/// (`production`) with only the config selectors redirected to
-/// `<logical>_staging`.
+/// Reconcile the staging twin so it mirrors the current service's production
+/// overrides, with only its config selectors redirected to `<logical>_staging`.
 ///
 /// Upserts the full desired set FIRST, then deletes twin entries production no
 /// longer has (so a removed override does not linger and diverge staging from
@@ -3517,36 +3663,219 @@ fn ensure_staging_selector_store(store_name: &str) -> Result<String, String> {
 fn mirror_production_to_staging(
     production: &[(String, String)],
     staging_id: &str,
+    service_id: &str,
     config_logical_ids: &[String],
     cwd: &Path,
 ) -> Result<(), String> {
-    let desired = staging_entries_from_production(production, config_logical_ids);
+    let desired = staging_entries_from_production(production, service_id, config_logical_ids);
 
     for (key, value) in &desired {
-        create_config_store_entry(staging_id, key, value)?;
+        create_config_store_entry_in(staging_id, key, value, cwd)?;
     }
     let current = read_config_store_entries(staging_id, cwd)?;
     for (key, _) in &current {
         if !desired.iter().any(|(dk, _)| dk == key) {
-            delete_staging_config_store_entry(staging_id, key, cwd)?;
+            delete_config_store_entry_in(staging_id, key, cwd)?;
         }
     }
     Ok(())
 }
 
-/// The runtime-override entry naming the config-store KEY for logical store
-/// `id` — `EDGEZERO__STORES__CONFIG__<ID>__KEY`.
-///
-/// Must match what the runtime reads: `EnvConfig::from_vars` strips the
-/// `EDGEZERO__` prefix, splits on `__`, and lowercases each segment, and
-/// `store_key("config", id)` looks up `["stores", "config", id, "key"]`. So the
-/// entry name is the id uppercased. A near-miss here is silent — the runtime
-/// would just fall back to the id and read production config.
-fn runtime_env_key_for(logical_id: &str) -> String {
+fn canonical_runtime_store_name_key(kind: &str, logical: &str) -> String {
+    format!(
+        "EDGEZERO__STORES__{kind}__{}__NAME",
+        logical.to_ascii_uppercase()
+    )
+}
+
+fn runtime_store_name_key(service_id: &str, kind: &str, logical: &str) -> String {
+    service_scoped_runtime_env_key(service_id, &canonical_runtime_store_name_key(kind, logical))
+}
+
+fn has_declared_stores(stores: &ProvisionStores<'_>) -> bool {
+    !stores.config.is_empty() || !stores.kv.is_empty() || !stores.secrets.is_empty()
+}
+
+fn has_non_default_store_name_mappings(stores: &ProvisionStores<'_>) -> bool {
+    [stores.config, stores.kv, stores.secrets]
+        .into_iter()
+        .flatten()
+        .any(|store| store.logical != store.platform)
+}
+
+/// Return the service-scoped runtime entries required when logical store ids
+/// map to different Fastly resource names.
+fn runtime_env_store_name_entries(
+    stores: &ProvisionStores<'_>,
+    service_id: &str,
+) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for (kind, ids) in [
+        ("CONFIG", stores.config),
+        ("KV", stores.kv),
+        ("SECRETS", stores.secrets),
+    ] {
+        for store in ids {
+            if store.logical == store.platform {
+                continue;
+            }
+            entries.push((
+                runtime_store_name_key(service_id, kind, &store.logical),
+                store.platform.clone(),
+            ));
+        }
+    }
+    entries
+}
+
+fn runtime_env_store_name_keys(stores: &ProvisionStores<'_>, service_id: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for (kind, ids) in [
+        ("CONFIG", stores.config),
+        ("KV", stores.kv),
+        ("SECRETS", stores.secrets),
+    ] {
+        keys.extend(
+            ids.iter()
+                .map(|store| runtime_store_name_key(service_id, kind, &store.logical)),
+        );
+    }
+    keys
+}
+
+/// Compute the minimal changes needed for store-name mappings owned by this
+/// Fastly service and the logical ids the app currently declares. Legacy
+/// unscoped entries, other service namespaces, undeclared ids, and unrelated
+/// runtime settings are preserved.
+fn runtime_store_name_reconciliation(
+    stores: &ProvisionStores<'_>,
+    service_id: &str,
+    current: &[(String, String)],
+) -> RuntimeStoreNameReconciliation {
+    let desired = runtime_env_store_name_entries(stores, service_id);
+    let declared = runtime_env_store_name_keys(stores, service_id);
+
+    let mut upserts = desired
+        .iter()
+        .filter(|(key, value)| {
+            current
+                .iter()
+                .find(|(current_key, _)| current_key == key)
+                .is_none_or(|(_, current_value)| current_value != value)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut deletes = current
+        .iter()
+        .filter(|(key, _)| {
+            declared.iter().any(|declared_key| declared_key == key)
+                && !desired.iter().any(|(desired_key, _)| desired_key == key)
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    upserts.sort_by(|left, right| left.0.cmp(&right.0));
+    deletes.sort();
+
+    RuntimeStoreNameReconciliation { deletes, upserts }
+}
+
+fn persist_runtime_env_store_name_entries(
+    stores: &ProvisionStores<'_>,
+    service_id_hint: Option<&str>,
+    dry_run: bool,
+    cwd: &Path,
+) -> Result<Vec<String>, String> {
+    if !has_declared_stores(stores) {
+        return Ok(Vec::new());
+    }
+    let Some(service_id) = service_id_hint else {
+        if has_non_default_store_name_mappings(stores) {
+            return Err(format!(
+                "cannot persist non-default Fastly store-name mappings without top-level `service_id` or {FASTLY_SERVICE_ID_ENV}"
+            ));
+        }
+        return Ok(vec![
+            "no Fastly service id and no non-default store-name mappings; skipping runtime-env reconciliation"
+                .to_owned(),
+        ]);
+    };
+    let entries = runtime_env_store_name_entries(stores, service_id);
+    let declared = runtime_env_store_name_keys(stores, service_id);
+    if dry_run {
+        let mut out = entries
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "would upsert `{key}={value}` into fastly config-store `{RUNTIME_ENV_STORE_NAME}`"
+                )
+            })
+            .collect::<Vec<_>>();
+        out.extend(
+            declared
+                .iter()
+                .filter(|key| !entries.iter().any(|(entry_key, _)| entry_key == *key))
+                .map(|key| {
+                    format!(
+                        "would remove `{key}` from fastly config-store `{RUNTIME_ENV_STORE_NAME}` if a stale mapping is present"
+                    )
+                }),
+        );
+        return Ok(out);
+    }
+
+    let Some(runtime_env_store_id) =
+        resolve_remote_config_store_id_in(RUNTIME_ENV_STORE_NAME, cwd)?
+    else {
+        if entries.is_empty() {
+            return Ok(vec![format!(
+                "fastly config-store `{RUNTIME_ENV_STORE_NAME}` not found; no non-default store-name mappings to write for service `{service_id}`, skipping reconciliation"
+            )]);
+        }
+        return Err(format!(
+            "cannot write non-default store-name mappings for service `{service_id}`: fastly config-store `{RUNTIME_ENV_STORE_NAME}` does not exist remotely even though its setup block is declared. Create it with `fastly config-store create --name={RUNTIME_ENV_STORE_NAME}` (and link it to an existing service when needed), then re-run provision"
+        ));
+    };
+    let current = read_config_store_entries(&runtime_env_store_id, cwd)?;
+    let reconciliation = runtime_store_name_reconciliation(stores, service_id, &current);
+    if reconciliation.upserts.is_empty() && reconciliation.deletes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    push_runtime_store_name_entries_with_committer(&reconciliation.upserts, |key, value| {
+        create_config_store_entry_in(&runtime_env_store_id, key, value, cwd)
+    })?;
+    for key in &reconciliation.deletes {
+        delete_config_store_entry_in(&runtime_env_store_id, key, cwd).map_err(|error| {
+            format!(
+                "fastly provision failed while deleting stale runtime store-name mapping `{key}`.\n  \
+                 The delete's outcome is UNKNOWN: Fastly may have committed it before the error, \
+                 and earlier mapping upserts may already have committed.\n  \
+                 Recovery: re-run the SAME `edgezero provision --adapter fastly` command with the same \
+                 `EDGEZERO__STORES__*__NAME` environment. Reconciliation rereads the current store and \
+                 is idempotent, so it will safely finish any remaining work.\n  \
+                 Failed: `{key}` (outcome unknown) -- {error}"
+            )
+        })?;
+    }
+    Ok(vec![format!(
+        "reconciled store-name mappings for service `{service_id}` in fastly config-store `{RUNTIME_ENV_STORE_NAME}`: upserted {}, removed {} stale mapping(s)",
+        reconciliation.upserts.len(),
+        reconciliation.deletes.len()
+    )])
+}
+
+fn canonical_runtime_env_key_for(logical_id: &str) -> String {
     format!(
         "EDGEZERO__STORES__CONFIG__{}__KEY",
         logical_id.to_ascii_uppercase()
     )
+}
+
+/// The service-scoped runtime-override entry naming the config-store key for a
+/// logical store. The runtime converts this stored key back to canonical
+/// `EDGEZERO__STORES__CONFIG__<ID>__KEY` before building `EnvConfig`.
+fn runtime_env_key_for(service_id: &str, logical_id: &str) -> String {
+    service_scoped_runtime_env_key(service_id, &canonical_runtime_env_key_for(logical_id))
 }
 
 /// Find the id of the resource link published under `link_name` in
@@ -3701,7 +4030,23 @@ fn shape_summary(value: &serde_json::Value) -> &'static str {
 /// spawn/list failure, schema drift) stays `Err` -- callers that read for a diff
 /// must not treat an operational failure as "store absent" and overwrite.
 fn resolve_remote_config_store_id(name: &str) -> Result<Option<String>, String> {
-    match classify_remote_config_store(name)? {
+    resolve_remote_config_store_id_with_cwd(name, None)
+}
+
+fn resolve_remote_config_store_id_in(name: &str, cwd: &Path) -> Result<Option<String>, String> {
+    resolve_remote_config_store_id_with_cwd(name, Some(cwd))
+}
+
+fn resolve_remote_config_store_id_with_cwd(
+    name: &str,
+    cwd: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let lookup = if let Some(command_cwd) = cwd {
+        classify_remote_config_store_in(name, command_cwd)?
+    } else {
+        classify_remote_config_store(name)?
+    };
+    match lookup {
         ConfigStoreLookup::Found(id) => Ok(Some(id)),
         ConfigStoreLookup::NotFound => Ok(None),
         ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
@@ -3719,16 +4064,29 @@ fn resolve_remote_config_store_id(name: &str) -> Result<Option<String>, String> 
 /// `Err` is only for a failure to OBTAIN an answer; a successful listing that
 /// simply doesn't contain `name` is `Ok(ConfigStoreLookup::NotFound)`.
 fn classify_remote_config_store(name: &str) -> Result<ConfigStoreLookup, String> {
-    let output = Command::new("fastly")
-        .args(["config-store", "list", "--json"])
-        .output()
-        .map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
-            } else {
-                format!("failed to spawn `fastly`: {err}")
-            }
-        })?;
+    classify_remote_config_store_with_cwd(name, None)
+}
+
+fn classify_remote_config_store_in(name: &str, cwd: &Path) -> Result<ConfigStoreLookup, String> {
+    classify_remote_config_store_with_cwd(name, Some(cwd))
+}
+
+fn classify_remote_config_store_with_cwd(
+    name: &str,
+    cwd: Option<&Path>,
+) -> Result<ConfigStoreLookup, String> {
+    let mut command = Command::new("fastly");
+    command.args(["config-store", "list", "--json"]);
+    if let Some(command_cwd) = cwd {
+        command.current_dir(command_cwd);
+    }
+    let output = command.output().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+        } else {
+            format!("failed to spawn `fastly`: {err}")
+        }
+    })?;
     if !output.status.success() {
         return Err(format!(
             "`fastly config-store list --json` exited with status {}\nstderr: {}",
@@ -4544,20 +4902,21 @@ fn curl_quote(value: &str) -> String {
 }
 
 /// Validate an operator-supplied Fastly service id before it is
-/// interpolated into an API URL. Fastly service ids are opaque
-/// alphanumeric handles; constrain to `^[A-Za-z0-9_-]+$` so a value
-/// carrying a quote / newline / space (which could inject curl options
-/// via the `--config` file) is rejected with a clear error.
+/// interpolated into an API URL or runtime-env key. Fastly service ids are
+/// opaque alphanumeric handles, so constrain them to `^[A-Za-z0-9]+$`.
+/// Values carrying a quote, newline, or space could inject curl options via
+/// the `--config` file.
 fn validate_service_id(id: &str) -> Result<(), String> {
-    if !id.is_empty()
-        && id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
+    if id.contains("__") {
+        return Err(format!(
+            "invalid service id {id:?}: `__` is the runtime-env namespace delimiter"
+        ));
+    }
+    if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_alphanumeric()) {
         Ok(())
     } else {
         Err(format!(
-            "invalid service id {id:?}: expected only ASCII letters, digits, `_`, or `-`"
+            "invalid service id {id:?}: expected only ASCII letters or digits"
         ))
     }
 }
@@ -4847,7 +5206,7 @@ fn relink_runtime_env_for_staging(
     // isolated. There is simply nothing to mirror — the twin gets only the
     // derived `<logical>_staging` selectors, and the staged draft is relinked to
     // it so it reads staged config while production keeps its default key.
-    let production = match classify_remote_config_store(RUNTIME_ENV_STORE_NAME)? {
+    let production = match classify_remote_config_store_in(RUNTIME_ENV_STORE_NAME, manifest_dir)? {
         ConfigStoreLookup::Found(id) => read_config_store_entries(&id, manifest_dir)?,
         ConfigStoreLookup::NotFound => Vec::new(),
         ConfigStoreLookup::SchemaDrift(detail) => {
@@ -4862,10 +5221,11 @@ fn relink_runtime_env_for_staging(
     // THIS draft at the twin. Create the twin on demand so a staged deploy never
     // depends on a prior provision having created it.
     let staging_store_name = staging_selector_store_name(service_id);
-    let staging_store_id = ensure_staging_selector_store(&staging_store_name)?;
+    let staging_store_id = ensure_staging_selector_store(&staging_store_name, manifest_dir)?;
     mirror_production_to_staging(
         &production,
         &staging_store_id,
+        service_id,
         config_logical_ids,
         manifest_dir,
     )?;
@@ -5209,9 +5569,11 @@ fn rollback(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use edgezero_adapter::cli_support::read_package_name;
+    use edgezero_core::app::{StoreMetadata, StoresMetadata};
+    use edgezero_core::env_config::EnvConfig;
     #[cfg(unix)]
     use edgezero_core::test_env::{EnvOverride, PathPrepend};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
     #[cfg(unix)]
     use std::sync::Mutex;
@@ -5291,8 +5653,8 @@ mod tests {
 
     #[test]
     fn resolve_service_id_prefers_flag() {
-        let args = vec!["--service-id".to_owned(), "SVC_FROM_ARG".to_owned()];
-        assert_eq!(resolve_service_id(&args).unwrap(), "SVC_FROM_ARG");
+        let args = vec!["--service-id".to_owned(), "SVCFROMARG".to_owned()];
+        assert_eq!(resolve_service_id(&args).unwrap(), "SVCFROMARG");
     }
 
     // ── `compute update` passthrough filtering (`--comment`) ─────────
@@ -5528,9 +5890,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_service_id_accepts_opaque_handles() {
+    fn validate_service_id_accepts_fastly_handle() {
         validate_service_id("SU1Z0isxPaozGVKXdv0eY").expect("alphanumeric handle");
-        validate_service_id("abc_DEF-123").expect("underscore + dash handle");
+    }
+
+    #[test]
+    fn validate_service_id_rejects_non_alphanumeric_characters() {
+        validate_service_id("SVC1_").expect_err("trailing underscore");
+        validate_service_id("SVC-1").expect_err("hyphen");
+    }
+
+    #[test]
+    fn validate_service_id_rejects_runtime_env_namespace_delimiter() {
+        let err = validate_service_id("SVC__OTHER")
+            .expect_err("the runtime-env namespace delimiter must be unambiguous");
+        assert!(
+            err.contains("namespace delimiter"),
+            "error explains the reserved delimiter: {err}"
+        );
     }
 
     #[test]
@@ -6597,7 +6974,7 @@ build = \"cargo build --release\"
     fn provision_dry_run_does_not_invoke_fastly() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write");
+        fs::write(&path, "name = \"demo\"\nservice_id = \"SVC1\"\n").expect("write");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
         let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_SECRET_ID]);
@@ -6609,10 +6986,10 @@ build = \"cargo build --release\"
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret + runtime-env = 4 status lines. The staging
-        // twin is created and populated by a staged deploy, NOT by provision, so
-        // it does not appear here.
-        assert_eq!(out.len(), 4, "dry-run rows: {out:?}");
+        // 1 KV + 1 config + 1 secret + runtime-env + 3 possible stale-mapping
+        // removals = 7 status lines. The staging twin is created and populated by
+        // a staged deploy, NOT by provision, so it does not appear here.
+        assert_eq!(out.len(), 7, "dry-run rows: {out:?}");
         assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
         assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
@@ -6621,13 +6998,367 @@ build = \"cargo build --release\"
             "runtime-env store row: {out:?}",
         );
         assert!(
+            out.iter()
+                .any(|row| row.contains("EDGEZERO__SERVICES__SVC1__STORES__KV__SESSIONS__NAME")),
+            "dry-run reports possible stale mapping cleanup: {out:?}",
+        );
+        assert!(
             !out.iter()
                 .any(|row| row.contains("edgezero_runtime_env_staging")),
             "provision must NOT create the staging twin (a staged deploy owns it): {out:?}",
         );
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
-        assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
+        assert_eq!(
+            after, "name = \"demo\"\nservice_id = \"SVC1\"\n",
+            "dry-run mutated fastly.toml"
+        );
+    }
+
+    #[test]
+    fn provision_dry_run_reports_non_default_store_name_mapping() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\nservice_id = \"SVC1\"\n").expect("write");
+        let secret_ids = vec![ResolvedStoreId::new("default", "production_secrets")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &secret_ids,
+        };
+
+        let out = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+
+        assert!(out.iter().any(|line| {
+            line.contains(
+                "EDGEZERO__SERVICES__SVC1__STORES__SECRETS__DEFAULT__NAME=production_secrets",
+            )
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_non_default_mapping_requires_service_id_before_fastly_mutation() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let _service_id = EnvOverride::remove(FASTLY_SERVICE_ID_ENV);
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("fastly.toml"), "name = \"demo\"\n").expect("write");
+        let kv = vec![ResolvedStoreId::new("sessions", "production_sessions")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        };
+
+        let err = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
+            .expect_err("a non-default mapping needs an unambiguous service namespace");
+
+        assert!(
+            err.contains("service_id"),
+            "error names the missing identity: {err}"
+        );
+        assert!(
+            err.contains(FASTLY_SERVICE_ID_ENV),
+            "error gives the environment fallback: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_default_mappings_skip_an_absent_runtime_env_store() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "[setup.kv_stores.sessions]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
+        let kv = vec![ResolvedStoreId::from_logical("sessions")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        };
+        // This fake lists only `app_config`, so `edgezero_runtime_env` is
+        // genuinely absent remotely even though its setup block is committed.
+        let fake = fake_fastly_returning("", "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect("default mappings need no remote runtime-env store");
+
+        assert!(
+            out.iter()
+                .any(|line| line.contains("no non-default store-name mappings")),
+            "provision explains why reconciliation was skipped: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_non_default_mapping_requires_a_runtime_env_store() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "service_id = \"SVC1\"\n\
+             [setup.kv_stores.production_sessions]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
+        let kv = vec![ResolvedStoreId::new("sessions", "production_sessions")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        };
+        let fake = fake_fastly_returning("", "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect_err("a required mapping cannot be written without the runtime-env store");
+
+        assert!(
+            err.contains("edgezero_runtime_env"),
+            "missing store is named: {err}"
+        );
+        assert!(
+            !err.contains("did you run `edgezero provision"),
+            "provision must not recommend the command already running: {err}"
+        );
+        assert!(
+            err.contains("fastly config-store create --name=edgezero_runtime_env"),
+            "missing-store recovery gives an actionable create command: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_creates_declared_store_in_fastly_manifest_directory() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let adapter_dir = dir.path().join("adapters/fastly");
+        fs::create_dir_all(&adapter_dir).expect("adapter dir");
+        let path = adapter_dir.join("fastly.toml");
+        fs::write(&path, "[setup.config_stores.edgezero_runtime_env]\n").expect("write");
+        let kv = vec![ResolvedStoreId::from_logical("sessions")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        };
+        let oplog = dir.path().join("oplog.txt");
+        let fake = fake_fastly_runtime_mapping(&[], &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("adapters/fastly/fastly.toml"),
+                None,
+                &stores,
+                false,
+            )
+            .expect("provision succeeds");
+
+        let log = fs::read_to_string(&oplog).expect("oplog");
+        let manifest_dir = fs::canonicalize(&adapter_dir).expect("canonical manifest dir");
+        assert!(
+            log.contains(&format!(
+                "kv-store-create name=--name=sessions cwd={}",
+                manifest_dir.display()
+            )),
+            "declared store creation uses the Fastly manifest directory: {log}"
+        );
+        assert!(
+            fs::read_to_string(path)
+                .expect("manifest")
+                .contains("[setup.kv_stores.sessions]"),
+            "declared store setup block is written"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_reconciles_runtime_store_name_mappings() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "service_id = \"SVCA\"\n\
+             [setup.kv_stores.production_sessions]\n\
+             [setup.secret_stores.default]\n",
+        )
+        .expect("write");
+        let kv = vec![ResolvedStoreId::new("sessions", "production_sessions")];
+        let secrets = vec![ResolvedStoreId::from_logical("default")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &secrets,
+        };
+        let current = vec![
+            (
+                "EDGEZERO__SERVICES__SVCA__STORES__KV__SESSIONS__NAME".to_owned(),
+                "old_sessions".to_owned(),
+            ),
+            (
+                "EDGEZERO__SERVICES__SVCA__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                "old_secrets".to_owned(),
+            ),
+            (
+                "EDGEZERO__SERVICES__SVCB__STORES__KV__SESSIONS__NAME".to_owned(),
+                "service_b_sessions".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__KV__SESSIONS__NAME".to_owned(),
+                "legacy_sessions".to_owned(),
+            ),
+            ("EDGEZERO__LOGGING__LEVEL".to_owned(), "debug".to_owned()),
+        ];
+        let oplog = dir.path().join("oplog.txt");
+        let fake = fake_fastly_runtime_mapping(&current, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect("mapping reconciliation succeeds");
+        let log = fs::read_to_string(&oplog).expect("oplog");
+        let manifest_dir = fs::canonicalize(dir.path()).expect("canonical manifest dir");
+
+        assert!(
+            log.contains(&format!("store-create cwd={}", manifest_dir.display())),
+            "runtime-env store creation runs in the manifest directory: {log}"
+        );
+        assert!(
+            log.contains(&format!("store-list cwd={}", manifest_dir.display())),
+            "runtime-env store lookup runs in the manifest directory: {log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "update EDGEZERO__SERVICES__SVCA__STORES__KV__SESSIONS__NAME=production_sessions cwd={}",
+                manifest_dir.display()
+            )),
+            "changed non-default mapping is upserted in the manifest directory: {log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "delete EDGEZERO__SERVICES__SVCA__STORES__SECRETS__DEFAULT__NAME cwd={}",
+                manifest_dir.display()
+            )),
+            "stale mapping is removed in the manifest directory: {log}"
+        );
+        assert!(
+            !log.contains("delete EDGEZERO__SERVICES__SVCB__STORES__KV__SESSIONS__NAME")
+                && !log.contains("delete EDGEZERO__STORES__KV__SESSIONS__NAME")
+                && !log.contains("EDGEZERO__LOGGING__LEVEL="),
+            "other services, legacy mappings, and unrelated runtime entries are preserved: {log}"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("upserted 1, removed 1")),
+            "status reports both mutations: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_mapping_failure_recommends_provision_recovery() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "service_id = \"SVC1\"\n\
+             [setup.kv_stores.production_sessions]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
+        let kv = vec![ResolvedStoreId::new("sessions", "production_sessions")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        };
+        let oplog = dir.path().join("oplog.txt");
+        let fake = fake_fastly_runtime_mapping_with_update_exit(&[], &oplog, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect_err("mapping update fails");
+
+        assert!(
+            err.contains("UNKNOWN"),
+            "failed write outcome is explicit: {err}"
+        );
+        assert!(
+            err.contains("edgezero provision --adapter fastly"),
+            "recovery names the command to retry: {err}"
+        );
+        assert!(
+            !err.contains("config push"),
+            "wrong command is not recommended: {err}"
+        );
+        assert!(
+            !err.contains("chunk") && !err.contains("root pointer"),
+            "mapping recovery contains no blob-specific guidance: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_delete_failure_recommends_provision_recovery() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "service_id = \"SVC1\"\n\
+             [setup.kv_stores.production_sessions]\n\
+             [setup.secret_stores.default]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
+        let kv = vec![ResolvedStoreId::new("sessions", "production_sessions")];
+        let secrets = vec![ResolvedStoreId::from_logical("default")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &secrets,
+        };
+        let current = vec![(
+            "EDGEZERO__SERVICES__SVC1__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+            "old_secrets".to_owned(),
+        )];
+        let oplog = dir.path().join("oplog.txt");
+        let fake = fake_fastly_runtime_mapping_with_exits(&current, &oplog, 0, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect_err("stale mapping delete fails");
+
+        assert!(err.contains("UNKNOWN"), "delete outcome is explicit: {err}");
+        assert!(
+            err.contains("edgezero provision --adapter fastly") && err.contains("idempotent"),
+            "recovery names the safe retry: {err}"
+        );
+        let log = fs::read_to_string(&oplog).expect("oplog");
+        assert!(
+            log.contains("update EDGEZERO__SERVICES__SVC1__STORES__KV__SESSIONS__NAME")
+                && log.contains("delete EDGEZERO__SERVICES__SVC1__STORES__SECRETS__DEFAULT__NAME"),
+            "the failure follows a committed upsert: {log}"
+        );
     }
 
     #[test]
@@ -6671,18 +7402,18 @@ build = \"cargo build --release\"
         assert_eq!(out, vec!["fastly has no declared stores to provision"]);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn provision_skips_id_when_setup_block_already_present() {
-        // setup_block_present's role in the flow: re-running
-        // provision after the user already declared a store in
-        // fastly.toml must be a no-op (no shell-out to fastly).
-        // We can verify this in a real (non-dry-run) call because
-        // the skip path bypasses create_fastly_store entirely.
+    fn provision_skips_store_creation_when_setup_block_already_present() {
+        // Re-running provision skips resource creation but still reads the
+        // runtime-env store to reconcile a mapping that may have been removed.
+        let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(
             &path,
-            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n\
+            "service_id = \"SVC1\"\n\
+             [setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n\
              [setup.config_stores.edgezero_runtime_env]\n",
         )
         .expect("write");
@@ -6692,11 +7423,44 @@ build = \"cargo build --release\"
             kv: &kv_ids,
             secrets: &[],
         };
+        let oplog = dir.path().join("oplog.txt");
+        let fake = fake_fastly_runtime_mapping(&[], &oplog);
+        let _path = PathPrepend::new(fake.path());
+
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
-            .expect("skip path succeeds without invoking fastly");
+            .expect("skip path succeeds");
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("already declared"), "got: {out:?}");
+        let manifest_dir = fs::canonicalize(dir.path()).expect("canonical manifest dir");
+        assert_eq!(
+            fs::read_to_string(oplog).expect("oplog"),
+            format!("store-list cwd={0}\nlist cwd={0}\n", manifest_dir.display()),
+            "runtime mapping is inspected in the manifest directory without mutation"
+        );
+    }
+
+    #[test]
+    fn provision_service_namespace_uses_env_and_rejects_manifest_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+
+        assert_eq!(
+            resolve_provision_runtime_env_service_id(&path, Some("SVCENV".into()))
+                .expect("env fallback"),
+            Some("SVCENV".to_owned())
+        );
+
+        fs::write(&path, "name = \"demo\"\nservice_id = \"SVCMANIFEST\"\n")
+            .expect("write manifest service id");
+        let err = resolve_provision_runtime_env_service_id(&path, Some("SVCENV".into()))
+            .expect_err("two target service ids must not select different namespaces");
+        assert!(err.contains("mismatch"), "mismatch is explicit: {err}");
+        assert!(
+            err.contains("SVCMANIFEST") && err.contains("SVCENV"),
+            "both conflicting ids are named: {err}"
+        );
     }
 
     /// When `fastly.toml` declares `service_id`, the next
@@ -6722,7 +7486,7 @@ build = \"cargo build --release\"
             .expect("read service_id")
             .expect("note present when service_id set");
         assert!(
-            note.contains("service_id = \"abc123svc\""),
+            note.contains("service id resolves to `abc123svc`"),
             "note quotes the service id: {note}"
         );
         assert!(
@@ -7207,6 +7971,84 @@ build = \"cargo build --release\"
     }
 
     // ---------- read_config_entry (fake fastly, remote shell-out) ----------
+
+    /// Build a fake `fastly` for live runtime store-name reconciliation.
+    /// The current runtime-env entries are listed verbatim and every update or
+    /// delete is recorded in `oplog`.
+    #[cfg(unix)]
+    fn fake_fastly_runtime_mapping(
+        current: &[(String, String)],
+        oplog: &Path,
+    ) -> tempfile::TempDir {
+        fake_fastly_runtime_mapping_with_update_exit(current, oplog, 0)
+    }
+
+    #[cfg(unix)]
+    fn fake_fastly_runtime_mapping_with_update_exit(
+        current: &[(String, String)],
+        oplog: &Path,
+        update_exit: i32,
+    ) -> tempfile::TempDir {
+        fake_fastly_runtime_mapping_with_exits(current, oplog, update_exit, 0)
+    }
+
+    #[cfg(unix)]
+    fn fake_fastly_runtime_mapping_with_exits(
+        current: &[(String, String)],
+        oplog: &Path,
+        update_exit: i32,
+        delete_exit: i32,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let store_list = dir.path().join("stores.json");
+        let entry_list = dir.path().join("entries.json");
+        fs::write(
+            &store_list,
+            format!(r#"[{{"name":"{RUNTIME_ENV_STORE_NAME}","id":"runtime-env-123"}}]"#),
+        )
+        .expect("store list");
+        let entries = current
+            .iter()
+            .map(|(key, value)| {
+                serde_json::json!({
+                    "item_key": key,
+                    "item_value": value,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &entry_list,
+            serde_json::to_string(&entries).expect("entry list json"),
+        )
+        .expect("entry list");
+
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "config-store" ] && [ "$2" = "create" ]; then printf 'store-create cwd=%s\n' "$PWD" >> '{oplog}'; exit 0; fi
+if [ "$1" = "kv-store" ] && [ "$2" = "create" ]; then printf 'kv-store-create name=%s cwd=%s\n' "$3" "$PWD" >> '{oplog}'; exit 0; fi
+if [ "$1" = "config-store" ]; then printf 'store-list cwd=%s\n' "$PWD" >> '{oplog}'; cat '{stores}'; exit 0; fi
+sub="$2"
+key=""
+for arg in "$@"; do case "$arg" in --key=*) key="${{arg#--key=}}";; esac; done
+if [ "$sub" = "list" ]; then printf 'list cwd=%s\n' "$PWD" >> '{oplog}'; cat '{entries}'; exit 0; fi
+if [ "$sub" = "update" ]; then value=$(cat); printf 'update %s=%s cwd=%s\n' "$key" "$value" "$PWD" >> '{oplog}'; exit {update_exit}; fi
+if [ "$sub" = "delete" ]; then printf 'delete %s cwd=%s\n' "$key" "$PWD" >> '{oplog}'; exit {delete_exit}; fi
+echo 'unexpected fastly invocation' >&2
+exit 1
+"#,
+            stores = store_list.display(),
+            entries = entry_list.display(),
+            oplog = oplog.display(),
+        );
+        let script_path = dir.path().join("fastly");
+        fs::write(&script_path, script).expect("script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        dir
+    }
 
     /// Build a tempdir containing a `fastly` shim script that:
     /// - Responds to `config-store list --json` with a store-list JSON containing
@@ -8877,9 +9719,11 @@ echo 'unexpected' >&2; exit 1
                printf '%s\\n' '{update_stdout}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                case \"$*\" in\n    \
-                 *--store-id=ENVSEL1*) printf '%s\\n' '[{{\"item_key\":\"EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL\",\"item_value\":\"debug\"}}]' ;;\n    \
+                 *--store-id=ENVSEL1*) printf '%s\\n' '[{{\"item_key\":\"EDGEZERO__SERVICES__SVC1__LOGGING__LEVEL\",\"item_value\":\"debug\"}}]' ;;\n    \
                  *) printf '%s\\n' '[]' ;;\n  \
                esac\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
@@ -8902,6 +9746,15 @@ echo 'unexpected' >&2; exit 1
         update_stdout: &str,
         extra: &[&str],
     ) -> (Result<(), String>, Vec<String>) {
+        run_deploy_staged_with_fake_and_env(update_stdout, extra, None)
+    }
+
+    #[cfg(unix)]
+    fn run_deploy_staged_with_fake_and_env(
+        update_stdout: &str,
+        extra: &[&str],
+        store_name_override: Option<(&str, &str)>,
+    ) -> (Result<(), String>, Vec<String>) {
         let _lock = path_mutation_guard().lock().expect("guard");
         let (fake, record) = fake_fastly_recorder(update_stdout);
         let _path = PathPrepend::new(fake.path());
@@ -8909,10 +9762,11 @@ echo 'unexpected' >&2; exit 1
         let manifest = app.path().join("fastly.toml");
         fs::write(&manifest, "name = \"app\"\n").expect("write fastly.toml");
 
-        // RAII: set the token for the call, restore it on drop. Uses the shared
-        // guard (edition-2024 wraps the env mutation's `unsafe` and holds the
-        // lock we already took above).
+        // RAII: set the variables for the call, then restore them on drop. The
+        // shared guard serializes every process-environment mutation in tests.
         let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+        let _store_name_override =
+            store_name_override.map(|(key, value)| EnvOverride::set(key, value));
         let mut args = vec![
             "--service-id".to_owned(),
             "SVC1".to_owned(),
@@ -10209,81 +11063,158 @@ echo 'unexpected' >&2; exit 1
     }
 
     #[test]
-    fn runtime_env_key_matches_what_the_runtime_reads() {
-        use edgezero_core::env_config::EnvConfig;
+    fn runtime_env_store_name_entries_include_only_non_default_scoped_mappings() {
+        let config = vec![ResolvedStoreId::from_logical("app_config")];
+        let kv = vec![ResolvedStoreId::new("sessions", "production_sessions")];
+        let secrets = vec![ResolvedStoreId::new("default", "production_secrets")];
+        let stores = ProvisionStores {
+            config: &config,
+            kv: &kv,
+            secrets: &secrets,
+        };
 
-        // EnvConfig::from_vars strips `EDGEZERO__`, splits on `__`, lowercases;
-        // store_key("config", id) looks up ["stores","config",id,"key"]. So the
-        // entry name is the id uppercased. A near-miss is SILENT: the runtime
-        // would fall back to the id and read production config.
+        let entries = runtime_env_store_name_entries(&stores, "SVCA");
         assert_eq!(
-            runtime_env_key_for("app_config"),
-            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
-        );
-
-        // Prove it against the real reader rather than restating the format.
-        let cfg = EnvConfig::from_vars([(
-            runtime_env_key_for("app_config"),
-            "app_config_staging".to_owned(),
-        )]);
-        assert_eq!(
-            cfg.store_key("config", "app_config"),
-            "app_config_staging",
-            "the entry provision writes must be the one the runtime reads"
+            entries,
+            vec![
+                (
+                    "EDGEZERO__SERVICES__SVCA__STORES__KV__SESSIONS__NAME".to_owned(),
+                    "production_sessions".to_owned(),
+                ),
+                (
+                    "EDGEZERO__SERVICES__SVCA__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                    "production_secrets".to_owned(),
+                ),
+            ]
         );
     }
 
     #[test]
-    fn staging_entries_from_production_mirrors_and_overrides() {
-        // Production carries a non-config override, an explicit config selector,
-        // and a __NAME redirect. The twin must copy the non-config entries
-        // verbatim and redirect EVERY declared config store to `<logical>_staging`
-        // — including one production has no explicit entry for (it relies on the
-        // runtime default; the twin must NOT inherit that default).
+    fn runtime_dictionary_uses_only_the_current_service_namespace() {
+        let stores = StoresMetadata {
+            config: Some(StoreMetadata {
+                default: "app_config",
+                ids: &["app_config"],
+            }),
+            kv: Some(StoreMetadata {
+                default: "sessions",
+                ids: &["sessions"],
+            }),
+            secrets: None,
+        };
+        let scoped_sessions =
+            service_scoped_runtime_env_key("SVCA", "EDGEZERO__STORES__KV__SESSIONS__NAME");
+        let values = BTreeMap::from([
+            (scoped_sessions.clone(), "service_a_sessions".to_owned()),
+            (
+                service_scoped_runtime_env_key("SVCB", "EDGEZERO__STORES__KV__SESSIONS__NAME"),
+                "service_b_sessions".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
+                "legacy_config".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__KV__SESSIONS__NAME".to_owned(),
+                "legacy_sessions".to_owned(),
+            ),
+        ]);
+
+        assert_eq!(
+            scoped_sessions,
+            "EDGEZERO__SERVICES__SVCA__STORES__KV__SESSIONS__NAME"
+        );
+        let vars =
+            crate::runtime_env_vars_for_service(stores, "SVCA", |key| values.get(key).cloned());
+        let env = EnvConfig::from_vars(vars);
+
+        assert_eq!(env.store_name("kv", "sessions"), "service_a_sessions");
+        assert_eq!(env.store_name("config", "app_config"), "app_config");
+        assert_ne!(env.store_name("kv", "sessions"), "service_b_sessions");
+
+        let default_service_vars =
+            crate::runtime_env_vars_for_service(stores, "SVCDEFAULT", |key| {
+                values.get(key).cloned()
+            });
+        let default_service_env = EnvConfig::from_vars(default_service_vars);
+        assert_eq!(default_service_env.store_name("kv", "sessions"), "sessions");
+        assert_eq!(
+            default_service_env.store_name("config", "app_config"),
+            "app_config"
+        );
+    }
+
+    #[test]
+    fn runtime_env_key_is_scoped_for_the_runtime_reader() {
+        assert_eq!(
+            canonical_runtime_env_key_for("app_config"),
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+        );
+        assert_eq!(
+            runtime_env_key_for("SVCA", "app_config"),
+            "EDGEZERO__SERVICES__SVCA__STORES__CONFIG__APP_CONFIG__KEY"
+        );
+    }
+
+    #[test]
+    fn staging_entries_from_production_mirrors_only_current_service_entries() {
+        // Production carries an unscoped legacy override, this service's
+        // explicit selector and name mapping, and another service's mapping.
+        // The per-service twin keeps only current-service values, replacing
+        // every declared selector with its scoped staging value.
         let production = vec![
             (
                 "EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL".to_owned(),
                 "debug".to_owned(),
             ),
             (
-                "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+                "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
                 "custom_prod_key".to_owned(),
             ),
             (
-                "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
+                "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
                 "app_config".to_owned(),
+            ),
+            (
+                "EDGEZERO__SERVICES__SVC2__STORES__SECRETS__DEFAULT__NAME".to_owned(),
+                "other_service_secrets".to_owned(),
             ),
         ];
         let out = staging_entries_from_production(
             &production,
+            "SVC1",
             &["app_config".to_owned(), "feature_flags".to_owned()],
         );
 
-        // Non-selector overrides copied verbatim.
+        assert!(
+            !out.iter()
+                .any(|(key, _)| key == "EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL"),
+            "legacy unscoped entries are not part of a service-owned twin: {out:?}"
+        );
         assert!(out.contains(&(
-            "EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL".to_owned(),
-            "debug".to_owned()
-        )));
-        assert!(out.contains(&(
-            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
+            "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
             "app_config".to_owned()
         )));
-        // The selector production HAD is overridden to `<logical>_staging`, NOT
-        // production's custom value.
         assert!(out.contains(&(
-            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
+            "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__KEY".to_owned(),
             "app_config_staging".to_owned()
         )));
         assert!(!out.iter().any(|(_, value)| value == "custom_prod_key"));
-        // The declared store production LACKED a selector for still gets one.
         assert!(out.contains(&(
-            "EDGEZERO__STORES__CONFIG__FEATURE_FLAGS__KEY".to_owned(),
+            "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__FEATURE_FLAGS__KEY".to_owned(),
             "feature_flags_staging".to_owned()
         )));
-        // Exactly one entry per selector key (no duplicate from the copy path).
+        assert!(
+            !out.iter().any(|(key, value)| {
+                key.contains("__SVC2__") || value == "other_service_secrets"
+            }),
+            "another service's scoped entries must not enter this twin: {out:?}"
+        );
         assert_eq!(
             out.iter()
-                .filter(|(key, _)| key == "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY")
+                .filter(|(key, _)| {
+                    key == "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__KEY"
+                })
                 .count(),
             1
         );
@@ -10315,6 +11246,28 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
+    fn deploy_staged_ignores_ambient_store_name_overrides() {
+        let (result, argv) = run_deploy_staged_with_fake_and_env(
+            "SUCCESS: Updated package (service SVC1, version 7)",
+            &["--edgezero-staging-config=app_config"],
+            Some((
+                "EDGEZERO__STORES__SECRETS__DEFAULT__NAME",
+                "ambient_secrets",
+            )),
+        );
+        result.expect("staged deploy succeeds");
+
+        assert!(
+            !argv.iter().any(|line| {
+                line.contains("EDGEZERO__STORES__SECRETS__DEFAULT__NAME")
+                    || line.contains("ambient_secrets")
+            }),
+            "staging must mirror persisted production mappings, not ambient process env: {argv:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deploy_staged_points_the_draft_at_the_staging_selector_store() {
         // The defect this closes: a clone inherits the active version's links,
         // so without a relink the staged version opens production's selector
@@ -10332,13 +11285,13 @@ echo 'unexpected' >&2; exit 1
         // `app_config_staging` via stdin) into the staging store.
         assert!(
             argv.iter().any(|line| line.starts_with(
-                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL"
+                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__SERVICES__SVC1__LOGGING__LEVEL"
             )),
             "production's non-config override must be mirrored into the twin: {argv:?}"
         );
         assert!(
             argv.iter().any(|line| line.starts_with(
-                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__KEY"
             )),
             "the config selector must be written into the twin: {argv:?}"
         );
@@ -10450,6 +11403,8 @@ echo 'unexpected' >&2; exit 1
                else\n    \
                  printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}}]'\n  \
                fi\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[]'\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
@@ -10516,6 +11471,8 @@ echo 'unexpected' >&2; exit 1
                else\n    \
                  printf '%s\\n' '[]'\n  \
                fi\n\
+             elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
+               cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[]'\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
@@ -10547,7 +11504,7 @@ echo 'unexpected' >&2; exit 1
         let argv = fs::read_to_string(&record).unwrap_or_default();
         assert!(
             argv.lines().any(|line| line.starts_with(
-                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+                "config-store-entry update --store-id=STAGEID1 --key=EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__KEY"
             )),
             "the staging selector must be written even with no production store: {argv}"
         );

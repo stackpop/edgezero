@@ -34,6 +34,11 @@ use edgezero_core::env_config::EnvConfig;
 use edgezero_core::http::Extensions;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::manifest::ResolvedLoggingConfig;
+#[cfg(feature = "fastly")]
+use fastly::compute_runtime::service_id;
+
+#[cfg(any(feature = "cli", feature = "fastly", test))]
+const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
 /// overrides.
@@ -97,6 +102,19 @@ impl From<&EnvConfig> for FastlyLogging {
             use_fastly_logger,
         }
     }
+}
+
+/// Prefix a canonical `EDGEZERO__*` key with its owning Fastly service.
+///
+/// The shared `edgezero_runtime_env` Config Store is account-wide. Service
+/// scoping prevents two linked services that declare the same logical store id
+/// from overwriting one another's runtime mappings.
+#[cfg(any(feature = "cli", feature = "fastly", test))]
+fn service_scoped_runtime_env_key(service_id: &str, canonical_key: &str) -> String {
+    let suffix = canonical_key
+        .strip_prefix(RUNTIME_ENV_PREFIX)
+        .unwrap_or(canonical_key);
+    format!("{RUNTIME_ENV_PREFIX}SERVICES__{service_id}__{suffix}")
 }
 
 /// # Errors
@@ -173,49 +191,26 @@ where
 /// Fastly Config Store.
 ///
 /// Compute@Edge has no process env, so the `EDGEZERO__*` runtime overrides
-/// (logging settings, per-store platform names, the config-store `__KEY`
-/// selector) come from a Config Store the operator pre-populates: locally via
-/// `fastly.toml`'s `[local_server.config_stores.edgezero_runtime_env]` block,
-/// remotely via a `fastly config-store` named `edgezero_runtime_env`.
+/// come from the Config Store. The function reads a fixed allowlist: adapter
+/// host and port, logging settings, `__NAME` entries for declared stores, and
+/// `__KEY` entries for declared config stores.
 ///
-/// If the store is missing or empty, returns an empty `EnvConfig` and the rest
-/// of the runtime uses its baked-in defaults.
+/// Each lookup uses the current Fastly service's
+/// `EDGEZERO__SERVICES__<SERVICE_ID>__*` key. Legacy unscoped entries are not
+/// read because they have no safe owner when this Config Store is linked to more
+/// than one service. The returned [`EnvConfig`] contains canonical unscoped keys.
 ///
 /// [`run_app`] and [`run_app_with_request_extensions`] call this themselves.
 /// [`run_app_with_config`] does NOT, and neither does a hand-built
-/// [`FastlyService`](request::FastlyService): a custom entry point on either of
-/// those paths must call this explicitly, or staged and overridden store
-/// selectors silently fall back to baked defaults.
+/// [`FastlyService`](request::FastlyService). A custom entry point on either path
+/// must call this explicitly.
 ///
 /// The `stores` argument must name the app's logical store ids. A handwritten
-/// [`Hooks`] impl inherits the default `stores()`, which is EMPTY
-/// ([`StoresMetadata::default`]), and empty metadata derives no
-/// `EDGEZERO__STORES__*` keys at all — every selector override silently never
-/// resolves. Such an impl must override `stores()`, or pass explicit
-/// [`StoresMetadata`] here.
+/// [`Hooks`] impl inherits the empty [`StoresMetadata::default`] and must
+/// override `stores()` or pass explicit metadata here.
 ///
-/// ```rust,ignore
-/// use edgezero_adapter_fastly::{FastlyLogging, init_logger, runtime_env_config};
-/// use edgezero_adapter_fastly::request::dispatch_with_registries;
-/// use edgezero_core::app::{StoreMetadata, StoresMetadata};
-///
-/// let stores = StoresMetadata {
-///     config: Some(StoreMetadata {
-///         default: "app_config",
-///         ids: &["app_config"],
-///     }),
-///     ..StoresMetadata::default()
-/// };
-/// let env = runtime_env_config(stores);
-/// let logging = FastlyLogging::from(&env);
-/// if logging.use_fastly_logger {
-///     let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
-///     init_logger(endpoint, logging.level, logging.echo_stdout)?;
-/// }
-/// let app = MyApp::build_app();
-/// let _response =
-///     dispatch_with_registries(&app, req, stores, &env, |_req, _extensions| {})?;
-/// ```
+/// If the store cannot be opened, the function logs a warning and returns an
+/// empty [`EnvConfig`]. Callers then use their baked-in adapter and store defaults.
 #[cfg(feature = "fastly")]
 #[must_use]
 #[inline]
@@ -239,22 +234,33 @@ pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
         );
         return EnvConfig::from_vars(empty::<(String, String)>());
     };
-    let vars = runtime_env_keys(stores)
-        .into_iter()
-        .filter_map(|key| dict.get(&key).map(|value| (key, value)));
+    let current_service_id = service_id();
+    let vars = runtime_env_vars_for_service(stores, current_service_id, |key| dict.get(key));
     EnvConfig::from_vars(vars)
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn runtime_env_vars_for_service<F>(
+    stores: StoresMetadata,
+    service_id: &str,
+    mut get: F,
+) -> Vec<(String, String)>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    runtime_env_keys(stores)
+        .into_iter()
+        .filter_map(|canonical_key| {
+            let scoped_key = service_scoped_runtime_env_key(service_id, &canonical_key);
+            get(&scoped_key).map(|value| (canonical_key, value))
+        })
+        .collect()
 }
 
 /// The `EDGEZERO__*` keys resolved from the store into the [`EnvConfig`]: the
 /// fixed adapter and logging settings, plus a `__NAME` selector for every
 /// declared store id and a `__KEY` selector for config-store ids only.
-///
-/// The Fastly runtime itself consumes only the logging level / endpoint and the
-/// per-store selectors; the rest are resolved so downstream readers can fetch
-/// them from the returned `EnvConfig`.
-// The `test` arm is load-bearing: the crate's default features exclude
-// `fastly`, so gating on the feature alone would keep this helper and the test
-// pinning its key-derivation rules out of a plain `cargo test --workspace`.
+// The `test` arm keeps the key derivation tests in default workspace tests.
 #[cfg(any(feature = "fastly", test))]
 fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
     let mut keys: Vec<String> = vec![
