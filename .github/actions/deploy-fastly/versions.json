@@ -1,0 +1,10 @@
+{
+  "fastly": {
+    "version": "15.1.0",
+    "linux_amd64": {
+      "url": "https://github.com/fastly/cli/releases/download/v15.1.0/fastly_v15.1.0_linux-amd64.tar.gz",
+      "sha256": "3ba3d8a739b7a88d0a612825a9755d735efb87a9b02ea67e53a11b96d178d500"
+    }
+  },
+  "rust_target": "wasm32-wasip1"
+}

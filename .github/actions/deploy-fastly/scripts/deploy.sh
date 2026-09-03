@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Runs the application CLI's deploy through the provider-env credential boundary
+# and emits the resulting Fastly version.
+#
+# Credentials are handed to run-app-cli.sh as DATA (a JSON object), not as FASTLY_*
+# aliases on this step. run-app-cli.sh clears every declared alias — including any
+# inherited FASTLY_ENDPOINT / FASTLY_TOKEN — exports only these typed values, and
+# then scrubs its own private variables (including this JSON) before exec'ing the
+# CLI. Building the JSON here, from step `env:`, is also what keeps the secret out
+# of an interpolated `run:` block.
+#
+# Reads (env):
+#   EDGEZERO__FASTLY__API_TOKEN           required  typed Fastly API token
+#   EDGEZERO__FASTLY__SERVICE_ID          required  typed Fastly service id
+#   (plus the run-app-cli.sh Reads contract, which this delegates to)
+# Writes (outputs):
+#   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
+#   fastly-version                        the deployed/staged Fastly version
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../../deploy-core/scripts/common.sh
+source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+
+main() {
+  local token="${EDGEZERO__FASTLY__API_TOKEN:-}"
+  local service_id="${EDGEZERO__FASTLY__SERVICE_ID:-}"
+
+  require_input fastly-api-token "$token"
+  require_input_matching fastly-service-id "$service_id" '^[A-Za-z0-9]+$'
+  require_cmd jq
+
+  EDGEZERO__PROVIDER__ENV=$(jq -n --arg t "$token" --arg s "$service_id" \
+    '{FASTLY_API_TOKEN: $t, FASTLY_SERVICE_ID: $s}')
+  export EDGEZERO__PROVIDER__ENV
+
+  new_private_log
+  # run-app-cli.sh publishes `mutation-attempted=true` itself, immediately before
+  # it invokes the CLI — so a setup failure never falsely signals, and the signal
+  # lands in GITHUB_OUTPUT before the mutation starts (best-effort durable across a
+  # cancel/timeout; a hard runner loss can still drop it). This wrapper only threads
+  # the resulting version out.
+  local rc=0
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail_with "$rc" "deploy failed (CLI exit $rc or setup error before invocation)"
+  fi
+
+  # Resolve the deployed version, tolerant of it legitimately appearing more than
+  # once (the app CLI tees the provider output — which can itself carry a `version=`
+  # line — BEFORE emitting its own canonical `version=<N>`), but FAIL CLOSED on any
+  # broken contract:
+  #   1. EVERY `^version=` line must be well-formed `version=<digits>`. A malformed
+  #      line (`version=43x`, empty `version=`) fails closed even when a SIBLING line
+  #      is valid — dropping the malformed one and trusting the rest would let a
+  #      corrupt contract slip a wrong version through.
+  #   2. Then the well-formed lines must agree on ONE distinct value. Benign
+  #      duplicates collapse; two DIFFERENT versions are genuine ambiguity and fail.
+  #   3. No `version=` line at all is a missing contract.
+  local all_lines malformed version_values distinct version
+  all_lines=$(grep -E '^version=' "$LIFECYCLE_LOG" || true)
+  if [[ -z "$all_lines" ]]; then
+    fail "deploy reported success but emitted no canonical 'version=<digits>' line, so there is no version to thread into healthcheck or rollback"
+  fi
+  malformed=$(printf '%s\n' "$all_lines" | grep -vE '^version=[0-9]+$' || true)
+  if [[ -n "$malformed" ]]; then
+    fail "deploy emitted a malformed 'version=' line ($(printf '%s' "$malformed" | tr '\n' ' ')); expected 'version=<N>'. Refusing to thread an unparseable version into healthcheck or rollback"
+  fi
+  version_values=$(printf '%s\n' "$all_lines" | sort -u)
+  distinct=$(printf '%s\n' "$version_values" | grep -c . || true)
+  if [[ "$distinct" -gt 1 ]]; then
+    fail "deploy emitted conflicting version values ($(printf '%s' "$version_values" | tr '\n' ' ')); refusing to guess which version was deployed"
+  fi
+  version="${version_values#version=}"
+
+  append_output fastly-version "$version"
+}
+
+main "$@"
