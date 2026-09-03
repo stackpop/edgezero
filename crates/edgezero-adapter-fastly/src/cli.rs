@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -1582,8 +1583,15 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
 /// entries. A manifest id and environment id must agree so Fastly CLI project
 /// context cannot write mappings owned by a different service.
 fn provision_runtime_env_service_id(path: &Path) -> Result<Option<String>, String> {
+    resolve_provision_runtime_env_service_id(path, env::var_os(FASTLY_SERVICE_ID_ENV))
+}
+
+fn resolve_provision_runtime_env_service_id(
+    path: &Path,
+    env_value: Option<OsString>,
+) -> Result<Option<String>, String> {
     let manifest_id = read_fastly_service_id(path)?;
-    let env_id = match env::var_os(FASTLY_SERVICE_ID_ENV) {
+    let env_id = match env_value {
         None => None,
         Some(value) => Some(
             value
@@ -7432,23 +7440,21 @@ build = \"cargo build --release\"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn provision_service_namespace_uses_env_and_rejects_manifest_mismatch() {
-        let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
-        let _service_id = EnvOverride::set(FASTLY_SERVICE_ID_ENV, "SVCENV");
 
         assert_eq!(
-            provision_runtime_env_service_id(&path).expect("env fallback"),
+            resolve_provision_runtime_env_service_id(&path, Some("SVCENV".into()))
+                .expect("env fallback"),
             Some("SVCENV".to_owned())
         );
 
         fs::write(&path, "name = \"demo\"\nservice_id = \"SVCMANIFEST\"\n")
             .expect("write manifest service id");
-        let err = provision_runtime_env_service_id(&path)
+        let err = resolve_provision_runtime_env_service_id(&path, Some("SVCENV".into()))
             .expect_err("two target service ids must not select different namespaces");
         assert!(err.contains("mismatch"), "mismatch is explicit: {err}");
         assert!(

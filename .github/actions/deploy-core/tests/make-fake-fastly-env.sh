@@ -69,10 +69,10 @@ case "\${1:-} \${2:-}" in
     ;;
   "config-store-entry list")
     # A staged deploy MIRRORS the production selector store into the staging twin.
-    # Production (ENVSEL1) carries a non-config override the twin must copy
-    # verbatim; the twin (STAGESEL1) starts empty.
+    # Production (ENVSEL1) carries this service's scoped logging override, which
+    # the twin must copy verbatim; the twin (STAGESEL1) starts empty.
     case "\$*" in
-      *--store-id=ENVSEL1*) echo '[{"item_key":"EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL","item_value":"debug"}]' ;;
+      *--store-id=ENVSEL1*) echo '[{"item_key":"EDGEZERO__SERVICES__dummyservice__LOGGING__LEVEL","item_value":"debug"}]' ;;
       *) echo '[]' ;;
     esac
     ;;
