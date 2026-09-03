@@ -281,3 +281,25 @@ bytes.) §5.4 pins this: permissive read (caches) → stricter `body_bytes` (ove
 cell stays `Cached`) → permissive retry (succeeds) — asserting the stricter failure does
 **not** poison an intact cache.
 
+#### Inbound body memory bound
+
+*(Moved here from the outbound spec's §3.4.4 batch-memory model — this is the inbound-body
+half; the outbound spec keeps only the per-response and batch terms.)*
+
+- **Per-inbound-body.** *Persistent* memory — the cached `Bytes` after a successful drain —
+  is bounded by the `max` passed to `body_bytes(max)` / `json_within(max)` /
+  `form_within(max)`. *Transient* worst-case during the drain is the same shape:
+  `max + sizeof(current_chunk)`, with the in-flight chunk source-controlled. Outbound's
+  `OutboundResponse::into_bytes_bounded` mirrors this same accounting.
+
+#### `src/extractor.rs` migration
+
+*(Moved here from the outbound spec's §7 file-by-file migration — this is inbound-only.)*
+
+- `src/extractor.rs` — extractor migration: `Json<T>` / `ValidatedJson<T>` route through
+  `ctx.json_within(DEFAULT_INBOUND_JSON_BYTES)`; `Form<T>` / `ValidatedForm<T>` route
+  through `ctx.form_within(DEFAULT_INBOUND_FORM_BYTES)`; add `ValidatedJsonWithin<T, MAX>`
+  and `ValidatedFormWithin<T, MAX>` for explicit caps. Constants exposed:
+  `pub const DEFAULT_INBOUND_JSON_BYTES: usize = 8 * 1024 * 1024;` and
+  `pub const DEFAULT_INBOUND_FORM_BYTES: usize = 1 * 1024 * 1024;`.
+
