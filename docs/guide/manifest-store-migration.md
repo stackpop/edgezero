@@ -98,6 +98,12 @@ id. The literal `__KEY` selector is config-only — it swaps which blob
 the `AppConfig<C>` extractor loads (see
 [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
 
+These are the canonical names EdgeZero presents to each adapter. Fastly stores
+an override in `edgezero_runtime_env` as
+`EDGEZERO__SERVICES__<SERVICE_ID>__<canonical suffix>` and translates it back
+at runtime. Do not write the unscoped canonical key directly into that Config
+Store; see the [Fastly adapter guide](./adapters/fastly.md#config-store).
+
 ## What this means for handler code
 
 `Hooks::config_store()` is gone; the `app!` macro now bakes the

@@ -151,7 +151,7 @@ upper() {
 # Seed the Fastly local config store `edgezero_runtime_env` with the
 # runtime override env vars. The Fastly Compute@Edge runtime has no
 # process env, so EDGEZERO__* overrides are read from this dedicated
-# Config Store (see env_config_from_runtime_dictionary in
+# Config Store (see runtime_env_config in
 # crates/edgezero-adapter-fastly/src/lib.rs). $1 is the fastly.toml
 # path; $2 is the per-row __KEY override value (empty -> no override).
 seed_fastly_runtime_env() {

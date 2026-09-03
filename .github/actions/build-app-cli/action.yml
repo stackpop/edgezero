@@ -1,0 +1,317 @@
+name: EdgeZero build-app-cli
+description: Compile the CLI package the application provides and publish it as a self-describing artifact.
+
+inputs:
+  app-cli-package:
+    description: Cargo package name of the CLI to build, defined in the application's own workspace.
+    required: true
+  app-cli-bin:
+    description: Binary name produced by app-cli-package. Defaults to the package name.
+    required: false
+    default: ""
+  working-directory:
+    description: Application directory (relative to github.workspace) whose workspace defines app-cli-package.
+    required: false
+    default: .
+  rust-toolchain:
+    description: Explicit host Rust toolchain, or 'auto' to follow application discovery.
+    required: false
+    default: auto
+  app-cli-artifact:
+    description: Name for the uploaded app-CLI artifact.
+    required: false
+    default: edgezero-cli
+  provider-env-clear:
+    description: >-
+      The DYNAMIC half of a two-layer credential scrub. A JSON array of
+      environment variable names re-exec'd out of the process before any
+      app-controlled command runs (cargo metadata, cargo build, the built CLI's
+      --help). The STATIC half lives in this action's step env, which blanks the
+      shipped adapters' aliases outright (and is the only layer that also protects
+      the upload step). This input exists so a consumer can add a provider this
+      action does not know about; its default repeats the shipped aliases so the
+      dynamic layer is self-contained too. Must be a JSON array of non-empty
+      identifier strings or the build fails closed.
+    required: false
+    default: >-
+      ["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_CARGO_PROFILE","FASTLY_HOME","CLOUDFLARE_API_TOKEN","CLOUDFLARE_API_KEY","CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_EMAIL","CF_API_TOKEN","CF_API_KEY","CF_ACCOUNT_ID","SPIN_AUTH_TOKEN","FERMYON_TOKEN"]
+
+outputs:
+  app-cli-version:
+    description: CLI package version read from cargo metadata.
+    value: ${{ steps.build.outputs['app-cli-version'] }}
+  app-cli-package:
+    description: The application CLI package that was built.
+    value: ${{ steps.build.outputs['app-cli-package'] }}
+  app-cli-bin:
+    description: The binary name inside the artifact.
+    value: ${{ steps.build.outputs['app-cli-bin'] }}
+  app-cli-artifact:
+    description: Artifact name the deploy, healthcheck, rollback, and config-push-fastly actions consume.
+    value: ${{ steps.build.outputs['app-cli-artifact'] }}
+
+runs:
+  using: composite
+  steps:
+    # A UNIQUE per-invocation workspace root under RUNNER_TEMP. Two concurrent
+    # invocations in one job (e.g. `background: true`) must not share fixed temp
+    # paths, or one could overwrite the other's build/outputs. Every temp path
+    # below hangs off steps.ws.outputs.root; the cleanup step removes it.
+    - name: Prepare action workspace
+      id: ws
+      shell: bash
+      # This step runs before validation, so it scrubs like every other step: it
+      # blanks the shipped provider aliases and BASH_ENV/ENV (a caller's job env
+      # could otherwise point BASH_ENV at checkout code that runs at bash startup —
+      # before this body — with an inherited token in scope).
+      env:
+        BASH_ENV: ""
+        ENV: ""
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/prepare-workspace.sh"
+
+    - name: Compile application CLI package
+      id: compile
+      shell: bash
+      env:
+        EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
+        EDGEZERO__APP__CLI__PACKAGE: ${{ inputs['app-cli-package'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
+        EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        EDGEZERO__PROJECT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
+        EDGEZERO__APP__CLI__ARTIFACT: ${{ inputs['app-cli-artifact'] }}
+        # This step runs app-controlled code, so it emits NO outputs through the
+        # runner's GITHUB_OUTPUT (blanked below). It collects them into this
+        # action-owned file; the separate "Publish CLI outputs" step re-emits them.
+        EDGEZERO__ACTION__OUTPUT_FILE: ${{ steps.ws.outputs.root }}/outputs.env
+        # This step runs APP-CONTROLLED code (cargo metadata/build, and the built
+        # CLI's `--help`), which must never see a provider token.
+        #
+        # Two layers, because neither alone is sufficient:
+        #   1. STATIC (below): blank the shipped adapters' aliases in the step's
+        #      own `env:`. A `uses:`/`run:` step's environment can only be set
+        #      statically, so these must be spelled out — and because they are set
+        #      here, even this step's own `/proc/<pid>/environ` never contained
+        #      them. This is the only layer that also protects the upload step.
+        #   2. DYNAMIC (`provider-env-clear`): covers aliases this action cannot
+        #      know about (a caller's OWN provider). The `run:` body `exec`s the
+        #      script, replacing the generated wrapper shell, and the script then
+        #      re-execs itself with those names stripped — so no ancestor process
+        #      that app code could walk up to still holds them.
+        EDGEZERO__PROVIDER__ENV_CLEAR: ${{ inputs['provider-env-clear'] }}
+        # BASH_ENV (bash) and ENV (POSIX sh) name a file the shell SOURCES AT
+        # STARTUP — before the first line of this step's script, and so before the
+        # credential scrub re-exec runs. If a caller's job env pointed either at
+        # checkout-controlled code, that code would run with the provider token
+        # still present AND could forge the re-exec sentinel argument (`set --
+        # <sentinel>`) to skip the scrub entirely. Blank both so no startup file
+        # is sourced.
+        BASH_ENV: ""
+        ENV: ""
+        # Isolate the app-controlled build from the runner's command storage. The
+        # runner keeps GITHUB_ENV/OUTPUT/PATH/STATE/step-summary as files in ONE
+        # directory, so holding ANY of their real paths lets a build script derive
+        # the siblings and append (e.g.) LD_PRELOAD to the real GITHUB_ENV, which
+        # the runner then applies to a LATER, secret-bearing step. The authoritative
+        # defense is the script's re-exec: it does `env -u` on all five channels, so
+        # the process that runs cargo (and every child) has none of their real
+        # paths in its environment or /proc. We do NOT blank them in this step's
+        # `env:` — the runner reinjects reserved GITHUB_* values after step-env
+        # evaluation, so that would be an ineffective no-op. Outputs are emitted by
+        # the separate publish step instead. NOTE: this closes the env/proc vectors,
+        # but a fully malicious build can still enumerate the runner's command
+        # directory at the same uid. This step is therefore credential-free by design,
+        # so a caller who must keep a provider secret away from the compile-heavy
+        # build can isolate it in a separate job; deploying a trusted first-party app
+        # in the same job is fine, since the deploy runs the app's own code with the
+        # credential regardless (see the guide's security notes).
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      # `exec` REPLACES the generated wrapper shell with the script, so there is
+      # no wrapper-shell ancestor still holding the caller's custom provider
+      # secret (from its own execve environment) for app-controlled Cargo code to
+      # read via `/proc/<ppid>/environ`. The script then re-execs itself with the
+      # `provider-env-clear` names stripped.
+      run: exec "$GITHUB_ACTION_PATH/scripts/build-app-cli.sh"
+
+    # The trusted output boundary: a step that runs NO app-controlled code reads
+    # the compile step's handoff file and re-emits the outputs to the real
+    # GITHUB_OUTPUT, re-validating each (first-occurrence-wins; tarball-path
+    # confined to the action-owned temp area). Its `id` is `build` so the action's
+    # `outputs:` mapping (steps.build.outputs.*) is unchanged for consumers.
+    - name: Publish CLI outputs
+      id: build
+      shell: bash
+      env:
+        EDGEZERO__BUILD__OUTPUTS_FILE: ${{ steps.ws.outputs.root }}/outputs.env
+        # Confine the published tarball-path to THIS invocation's workspace, not all
+        # of RUNNER_TEMP (a tampered handoff could otherwise select a sibling
+        # invocation's file).
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
+        # This step holds the REAL GITHUB_OUTPUT and is the handoff-validation
+        # boundary. Blank BASH_ENV/ENV so a caller's job env cannot point them at
+        # checkout code that runs at bash startup — before publish-outputs.sh — with
+        # a custom provider alias in scope, and write forged outputs directly.
+        BASH_ENV: ""
+        ENV: ""
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      run: exec "$GITHUB_ACTION_PATH/scripts/publish-outputs.sh"
+
+    # A script-level scrub cannot reach a LATER step: each step gets its own
+    # process with the job environment re-applied. This non-provider step blanks
+    # the SHIPPED aliases itself rather than inheriting them.
+    #
+    # A `uses:` step's `env:` is static, so it CANNOT blank a caller's custom
+    # `provider-env-clear` alias (only the compile step, which runs a script, can
+    # do that dynamically). That is an accepted boundary: this step runs no
+    # application code — it hands the publish step's confined tarball path to a
+    # pinned first-party action. The compile step runs every app-controlled command
+    # with all GitHub file-command channels blanked, so a build script cannot
+    # inject an environment variable (e.g. `LD_PRELOAD`) or PATH entry into this
+    # later step through them. That closes the demonstrated vectors, but is not a
+    # hard boundary against a fully malicious same-uid build (see the compile
+    # step's note): a custom provider secret should be scoped to the one step that
+    # needs it, never to job-level `env:` shared with the build.
+    - name: Upload CLI artifact
+      uses: actions/upload-artifact@v7
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      with:
+        name: ${{ steps.build.outputs['app-cli-artifact'] }}
+        path: ${{ steps.build.outputs['tarball-path'] }}
+        if-no-files-found: error
+        # No forced retention: the repository/org default applies, so the artifact
+        # survives an environment-approval gate that delays the deploy job past a day
+        # (a forced `retention-days: 1` would expire the CLI before it downloads).
+
+    # Remove the per-invocation workspace (build/stage dirs, the outputs handoff)
+    # now that the artifact is uploaded. Runs no application code.
+    - name: Cleanup workspace
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
+        BASH_ENV: ""
+        ENV: ""
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh"

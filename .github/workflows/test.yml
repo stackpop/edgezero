@@ -68,6 +68,13 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 
+      # The adapter CLI dispatch (build/deploy/stage/healthcheck/rollback) and
+      # its tests live behind the `cli` feature, which the unfeatured
+      # `cargo test --workspace` step above does not enable — so none of those
+      # tests compile or run there. Exercise them explicitly.
+      - name: Adapter CLI dispatch tests
+        run: cargo test -p edgezero-adapter-fastly --all-targets --features cli
+
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
 

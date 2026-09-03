@@ -1,0 +1,700 @@
+name: Deploy actions
+
+on:
+  pull_request:
+    paths:
+      # ANY workflow or action change must start the repository-wide pin gate (and
+      # the smokes) — including a brand-new action directory or an unrelated
+      # workflow like test.yml that could introduce a floating ref.
+      - .github/actions/**
+      - .github/workflows/**
+      - .github/zizmor.yml
+      - scripts/install-actionlint.sh
+      - scripts/install-yq.sh
+      # The smoke fixture is a real Cargo app built against this workspace's crate
+      # graph, so a change to the CLI/core/macro crates, the workspace manifest and
+      # lockfile, or the pinned toolchain can change what the smoke compiles.
+      - Cargo.toml
+      - Cargo.lock
+      - .tool-versions
+      - crates/edgezero-adapter/**
+      - crates/edgezero-adapter-fastly/**
+      - crates/edgezero-cli/**
+      - crates/edgezero-core/**
+      - crates/edgezero-macros/**
+      - docs/guide/deploy-github-actions.md
+      - docs/specs/**
+  push:
+    branches: [main]
+    paths:
+      # ANY workflow or action change must start the repository-wide pin gate (and
+      # the smokes) — including a brand-new action directory or an unrelated
+      # workflow like test.yml that could introduce a floating ref.
+      - .github/actions/**
+      - .github/workflows/**
+      - .github/zizmor.yml
+      - scripts/install-actionlint.sh
+      - scripts/install-yq.sh
+      # The smoke fixture is a real Cargo app built against this workspace's crate
+      # graph, so a change to the CLI/core/macro crates, the workspace manifest and
+      # lockfile, or the pinned toolchain can change what the smoke compiles.
+      - Cargo.toml
+      - Cargo.lock
+      - .tool-versions
+      - crates/edgezero-adapter/**
+      - crates/edgezero-adapter-fastly/**
+      - crates/edgezero-cli/**
+      - crates/edgezero-core/**
+      - crates/edgezero-macros/**
+      - docs/guide/deploy-github-actions.md
+      - docs/specs/**
+
+permissions:
+  contents: read
+
+env:
+  ACTIONLINT_VERSION: 1.7.7
+  ZIZMOR_VERSION: 1.16.3
+  YQ_VERSION: 4.53.3
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned validation binaries under RUNNER_TEMP (checksum-verified)
+        # Per the action's binary-isolation rule (§5.4/security principle 5),
+        # validation tools live under RUNNER_TEMP, not a shared PATH dir. Prepend the
+        # dir so these verified copies win over any runner-provided ones, and confirm
+        # each reports its pinned version — the check steps below also call them by
+        # ABSOLUTE path, so it is provably these that run.
+        run: |
+          bin="$RUNNER_TEMP/tools/bin"
+          mkdir -p "$bin"
+          INSTALL_DIR="$bin" scripts/install-actionlint.sh "$ACTIONLINT_VERSION"
+          INSTALL_DIR="$bin" scripts/install-yq.sh "$YQ_VERSION"
+          cargo install zizmor --version "$ZIZMOR_VERSION" --locked --root "$RUNNER_TEMP/tools"
+          echo "$bin" >>"$GITHUB_PATH"
+          "$bin/actionlint" -version | grep -qF "$ACTIONLINT_VERSION"
+          "$bin/yq" --version | grep -qF "version v$YQ_VERSION"
+          "$bin/zizmor" --version | grep -qF "$ZIZMOR_VERSION"
+
+      # ShellCheck must be installed BEFORE actionlint: actionlint's `-shellcheck`
+      # integration silently disables itself (and the step exits 0) when shellcheck
+      # is not on PATH, so a `run:` defect could pass unchecked on a runner that does
+      # not preinstall it.
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Actionlint (all workflows)
+        # No file args → actionlint validates every .github/workflows/*.{yml,yaml}.
+        # The `-shellcheck` integration runs shellcheck on each `run:` block at a
+        # warning floor (info-level notes in unrelated workflows are not failures).
+        run: |
+          "$RUNNER_TEMP/tools/bin/actionlint" -shellcheck='shellcheck -S warning'
+
+      - name: Third-party actions pinned to a ref
+        run: .github/actions/deploy-core/tests/check-action-pins.sh
+
+      - name: Zizmor security scan
+        run: |
+          "$RUNNER_TEMP/tools/bin/zizmor" --offline \
+            .github/workflows/deploy-action.yml \
+            .github/workflows/fastly-installer-check.yml \
+            .github/actions/build-app-cli/action.yml \
+            .github/actions/deploy-fastly/action.yml \
+            .github/actions/healthcheck-fastly/action.yml \
+            .github/actions/rollback-fastly/action.yml \
+            .github/actions/config-push-fastly/action.yml
+
+      - name: ShellCheck action scripts
+        # -e SC1091: the `source "$SCRIPT_DIR/common.sh"` path is dynamic, so
+        # shellcheck can't follow it from the repo root — that info finding is
+        # not a real defect. Everything else is checked.
+        run: |
+          shellcheck -e SC1091 \
+            .github/actions/*/scripts/*.sh \
+            .github/actions/deploy-core/tests/*.sh \
+            scripts/install-actionlint.sh \
+            scripts/install-yq.sh
+
+      - name: Bash contract tests
+        run: .github/actions/deploy-core/tests/run.sh
+
+      - name: Validate docs
+        run: |
+          cd docs
+          npm ci
+          npm run format
+          npm run lint
+          npm run build
+
+  # Production path: build the app's OWN CLI, deploy through the wrapper, and
+  # prove the whole chain ran with the credential boundary intact. Every
+  # assertion lives in a script under deploy-core/tests/ so it is shellcheck'd
+  # and readable outside the YAML.
+  composite-smoke:
+    runs-on: ubuntu-latest
+    # Inherited provider aliases the deploy MUST clear (provider-env boundary).
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The fixture is a REAL app-owned CLI (its own crate depending on
+      # edgezero-cli) — the contract build-app-cli actually promises.
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          # Distinct per job: parallel jobs each upload their own artifact, so a
+          # download-by-name never has to disambiguate between same-named uploads.
+          app-cli-artifact: edgezero-cli-composite
+
+      # The production deploy runs a manifest-command deploy (fake-deploy.sh), but
+      # deploy-fastly now also captures the rollback target first via a real
+      # `active-version` Fastly API call. Provide a fake `curl` (and `fastly`) so
+      # that capture resolves the active version (40) instead of hitting the real
+      # API. The deploy itself still exercises the manifest command.
+      - name: Set up fake Fastly API for rollback-target capture
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+
+      - name: Deploy fixture (production) with local action
+        id: deploy
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          deploy-args: '["--comment","smoke"]'
+
+      - name: Assert production deploy, version threading, and credential boundary
+        env:
+          EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs['fastly-version'] }}
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
+        run: .github/actions/deploy-core/tests/assert-production-deploy.sh
+
+      # Prove the real rollback wiring: a production rollback consumes the deploy's
+      # `previous-version` output as `rollback-to` (no hardcoded version), and the
+      # activated target threads back out as `rolled-back-to`.
+      - name: Roll back production using the captured previous-version
+        id: rollback
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          fastly-version: ${{ steps.deploy.outputs['fastly-version'] }}
+          rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
+          deploy-to: production
+
+      - name: Assert the rollback activated the captured previous-version
+        env:
+          EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.rollback.outputs['rolled-back-to'] }}
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
+        run: .github/actions/deploy-core/tests/assert-rollback-threaded.sh
+
+  # Separate-job artifact handoff: build the CLI in ONE job, deploy in a DEPENDENT
+  # job that downloads the artifact by a LITERAL name (a `steps.*.outputs` value
+  # cannot cross a job boundary). This is the layout the guide recommends for keeping
+  # the credential entirely out of the build phase, and the only smoke that exercises
+  # cross-job artifact download.
+  handoff-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      # No provider credentials in this job at all: it only builds and uploads.
+      - name: Build the APP's own CLI package (build job)
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          app-cli-artifact: edgezero-cli-handoff
+
+  handoff-deploy:
+    needs: handoff-build
+    runs-on: ubuntu-latest
+    # The deploy job carries the token; inherited aliases it MUST still clear.
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The deploy job needs the app SOURCE (working-directory); the CLI binary comes
+      # from the build job's artifact, downloaded inside deploy-fastly by its literal
+      # name — NOT a step output, which cannot cross jobs.
+      - name: Recreate the fixture app source
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      - name: Set up fake Fastly API for rollback-target capture
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+      - name: Deploy using the artifact built in the other job (literal name)
+        id: deploy
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: edgezero-cli-handoff
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+      - name: Assert the cross-job handoff produced a real production deploy
+        env:
+          EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs['fastly-version'] }}
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
+        run: .github/actions/deploy-core/tests/assert-production-deploy.sh
+
+  # Cache POPULATION + RESTORE HIT end to end. build-mode: always runs the
+  # credential-free seed build that populates target/ and saves the cache; a second
+  # deploy in the same job restores it. Deleting target/ between the two proves the
+  # marker comes back from the CACHE (a real restore hit), not from disk — and the
+  # idempotent seed build leaves a restored marker untouched, so a rebuild would be
+  # caught as a different value.
+  cache-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          app-cli-artifact: edgezero-cli-cache
+      - name: Set up fake Fastly API
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+      - name: Deploy (populate cache via the credential-free seed build)
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          build-mode: always
+          cache: true
+      - name: Capture the seeded marker, then delete target/
+        run: .github/actions/deploy-core/tests/cache-smoke-capture.sh
+      - name: Deploy again (restore cache)
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          build-mode: always
+          cache: true
+      - name: Assert the marker was restored from cache (not rebuilt)
+        run: .github/actions/deploy-core/tests/cache-smoke-assert.sh
+      # Negative regression: build-mode: never must SKIP restore (gated on always).
+      # Delete target/, deploy with build-mode: never + cache: true, and assert the
+      # cache did NOT come back. Reintroducing the old restore condition would fail
+      # here instead of leaving the smoke green.
+      - name: Delete target/ before the build-mode never deploy
+        run: .github/actions/deploy-core/tests/cache-smoke-capture.sh
+      - name: Deploy with build-mode never (restore must be skipped)
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          build-mode: never
+          cache: true
+      - name: Assert the cache was NOT restored under build-mode never
+        run: .github/actions/deploy-core/tests/cache-smoke-assert-no-restore.sh
+
+  # Lost-version RECOVERY through the actual actions. A production deploy mutates the
+  # service (activates v7) but loses its version line AND breaks the API fallback, so
+  # deploy-fastly fails with mutation-attempted=true. The operator then recovers:
+  # download the CLI artifact, ask active-version what is live now (7), and roll back
+  # to the previously-captured version (40). Exercises artifact download,
+  # active-version recovery, and rollback together — the flow the guide documents.
+  recovery-smoke:
+    runs-on: ubuntu-latest
+    # fake-deploy reads this (only it, and only during the deploy step): it loses the
+    # version line and trips the API-break sentinel so the fallback also fails.
+    env:
+      FAKE_LOSE_VERSION: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          app-cli-artifact: edgezero-cli-recovery
+      - name: Set up fake Fastly API
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+      - name: Deploy (mutates, then loses the version — must fail)
+        id: deploy
+        continue-on-error: true
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+      - name: Assert the deploy failed but signalled a possible mutation
+        env:
+          EDGEZERO__TEST__DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          EDGEZERO__TEST__MUTATION_ATTEMPTED: ${{ steps.deploy.outputs['mutation-attempted'] }}
+          # The rollback target captured BEFORE the deploy must still thread out of a
+          # FAILED deploy — that is what a real recovery rolls back to.
+          EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
+        run: .github/actions/deploy-core/tests/assert-lost-version.sh
+      - name: Download the CLI artifact for recovery
+        uses: actions/download-artifact@v8
+        with:
+          name: edgezero-cli-recovery
+          path: recover-cli
+      - name: Recover the live version from the provider (operator flow)
+        id: recover
+        env:
+          FASTLY_API_TOKEN: dummy-token
+          FASTLY_SERVICE_ID: dummyservice
+        run: .github/actions/deploy-core/tests/recovery-active-version.sh recover-cli
+      - name: Roll back to the captured previous version, keyed on the recovered live version
+        id: rollback
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: edgezero-cli-recovery
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          fastly-version: ${{ steps.recover.outputs.version }}
+          # Thread the deploy's OWN previous-version output (captured pre-mutation),
+          # exactly as the guide's recovery documents — not a hardcoded value.
+          rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
+          deploy-to: production
+      - name: Assert recovery rolled the service back to the captured version
+        env:
+          EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.rollback.outputs['rolled-back-to'] }}
+        run: .github/actions/deploy-core/tests/assert-recovery-rollback.sh
+
+  # Config push: the real config-push-fastly wrapper against a fake `fastly`,
+  # proving the whole chain — artifact download, Fastly CLI install, the app
+  # CLI's TYPED `config push` (the bundled stub cannot do this), and the
+  # staging-key contract. Config push is deliberately NOT part of deploy, so it
+  # gets its own job.
+  config-push-smoke:
+    runs-on: ubuntu-latest
+    # Inherited provider aliases the push MUST clear.
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Create fixture app (app-owned CLI with typed config)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          # Distinct per job: parallel jobs each upload their own artifact, so a
+          # download-by-name never has to disambiguate between same-named uploads.
+          app-cli-artifact: edgezero-cli-config-push
+
+      - name: Install fake fastly + curl
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+
+      - name: Push config to staging
+        id: staged
+        uses: ./.github/actions/config-push-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          deploy-to: staging
+
+      # Asserted before the re-seed below, which truncates the call log.
+      - name: Assert staging wrote the _staging key and never the production key
+        env:
+          EDGEZERO__TEST__EXPECT_KEY: app_config_staging
+          EDGEZERO__TEST__REJECT_KEY: app_config
+          EDGEZERO__TEST__PUSHED_KEY: ${{ steps.staged.outputs['pushed-key'] }}
+          EDGEZERO__TEST__PUSHED_STORE: ${{ steps.staged.outputs.store }}
+        run: .github/actions/deploy-core/tests/assert-config-push.sh
+
+      # Each action's cleanup runs with `if: always()` and removes the SHARED
+      # action-owned tool root, so a second tool-installing action in the same
+      # job reinstalls the Fastly CLI from scratch. A real job re-downloads it;
+      # this job re-seeds the fake instead, keeping the test hermetic (and this
+      # resets the call log, so each push is asserted against its own).
+      - name: Re-seed fake fastly (the previous push's cleanup removed the tool root)
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+
+      - name: Push config to production
+        id: prod
+        uses: ./.github/actions/config-push-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+
+      - name: Assert production wrote the base key and never the staging key
+        env:
+          EDGEZERO__TEST__EXPECT_KEY: app_config
+          EDGEZERO__TEST__REJECT_KEY: app_config_staging
+          EDGEZERO__TEST__PUSHED_KEY: ${{ steps.prod.outputs['pushed-key'] }}
+          EDGEZERO__TEST__PUSHED_STORE: ${{ steps.prod.outputs.store }}
+        run: .github/actions/deploy-core/tests/assert-config-push.sh
+
+  # Staging path: the full lifecycle through the REAL wrappers — deploy-fastly
+  # with `deploy-to: staging`, then healthcheck-fastly, then rollback-fastly — against
+  # fake `fastly`/`curl` binaries that mirror the real contracts.
+  #
+  # The version is never hard-coded: it is threaded out of the deploy action's
+  # `fastly-version` output and into the two lifecycle actions, which is the
+  # contract an operator's workflow depends on. Because the defects a review
+  # found were argv/verb defects, the assertions check argv and verbs — see the
+  # assert-*.sh scripts for what each one regression-tests.
+  lifecycle-smoke:
+    runs-on: ubuntu-latest
+    # Inherited provider aliases that every step MUST clear. FASTLY_API_TOKEN is
+    # here on purpose: a PRODUCTION healthcheck must probe with no token even when
+    # the job env carries one.
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
+      FASTLY_API_TOKEN: inherited-must-not-reach-production-probes
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Create fixture app (app-owned CLI)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+          # Distinct per job: parallel jobs each upload their own artifact, so a
+          # download-by-name never has to disambiguate between same-named uploads.
+          app-cli-artifact: edgezero-cli-lifecycle
+
+      # Packages a fake `fastly` as a checksum-verified archive and a fake `curl`
+      # that serves it to each invocation's unique tool root (file:// copy). So
+      # install-fastly.sh runs its REAL download+verify+extract path — never
+      # adopting a planted binary — and the staged path runs through the real
+      # wrapper without contacting Fastly.
+      - name: Install fake fastly + curl
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+
+      - name: Staged deploy through the deploy-fastly wrapper
+        id: stage
+        uses: ./.github/actions/deploy-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          deploy-args: '["--comment","staged smoke"]'
+          deploy-to: staging
+
+      - name: Assert the staged Fastly call sequence
+        env:
+          EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
+        run: .github/actions/deploy-core/tests/assert-staged-calls.sh
+
+      - name: Health check the staged version
+        id: health
+        uses: ./.github/actions/healthcheck-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          retry: "1"
+          retry-delay: "1"
+
+      - name: Assert the staging IP was resolved and probed
+        env:
+          EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
+          EDGEZERO__TEST__HEALTHY: ${{ steps.health.outputs.healthy }}
+          EDGEZERO__TEST__STATUS_CODE: ${{ steps.health.outputs['status-code'] }}
+        run: .github/actions/deploy-core/tests/assert-staging-probe.sh
+
+      - name: Health check must FAIL when the probe is unhealthy
+        id: unhealthy
+        continue-on-error: true
+        uses: ./.github/actions/healthcheck-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          retry: "1"
+          retry-delay: "1"
+        env:
+          # Flips the fake probe to 503 for this step only.
+          FORCE_UNHEALTHY: "1"
+
+      - name: Assert the unhealthy check failed the wrapper
+        env:
+          EDGEZERO__TEST__OUTCOME: ${{ steps.unhealthy.outcome }}
+          EDGEZERO__TEST__HEALTHY: ${{ steps.unhealthy.outputs.healthy }}
+          EDGEZERO__TEST__STATUS_CODE: ${{ steps.unhealthy.outputs['status-code'] }}
+        run: .github/actions/deploy-core/tests/assert-unhealthy-failed.sh
+
+      # A PRODUCTION probe needs no credential — it just curls the public domain.
+      # The job env carries an inherited FASTLY_API_TOKEN, so this proves the
+      # wrapper withholds it rather than merely not requiring it.
+      - name: Snapshot the call log before the production probe
+        run: printf 'PROD_PROBE_SNAPSHOT=%s\n' "$(wc -l <"$FAKE_CALL_LOG")" >>"$GITHUB_ENV"
+
+      - name: Production health check (no token supplied)
+        id: prod-health
+        uses: ./.github/actions/healthcheck-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: production
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-service-id: dummyservice
+          retry: "1"
+          retry-delay: "1"
+
+      - name: Assert the production probe ran without any provider token
+        env:
+          EDGEZERO__TEST__LOG_SNAPSHOT: ${{ env.PROD_PROBE_SNAPSHOT }}
+          EDGEZERO__TEST__HEALTHY: ${{ steps.prod-health.outputs.healthy }}
+        run: .github/actions/deploy-core/tests/assert-production-probe-tokenless.sh
+
+      # A STAGING probe genuinely needs the token (staging-IP resolution), so
+      # omitting it must fail fast rather than probe the wrong thing.
+      - name: Staging health check without a token must fail
+        id: staging-no-token
+        continue-on-error: true
+        uses: ./.github/actions/healthcheck-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-service-id: dummyservice
+          retry: "1"
+          retry-delay: "1"
+
+      - name: Assert the tokenless staging check was refused
+        env:
+          EDGEZERO__TEST__OUTCOME: ${{ steps.staging-no-token.outcome }}
+        run: |
+          [[ "${EDGEZERO__TEST__OUTCOME}" == "failure" ]] ||
+            { echo "::error::a staging healthcheck with no token must fail, got '${EDGEZERO__TEST__OUTCOME}'"; exit 1; }
+
+      - name: Roll back the staged version
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+
+      - name: Roll back production
+        id: prod-rollback
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: production
+          # The fake Fastly API reports version 40 as active, and the
+          # best-effort staleness guard requires the rolled-back-from `--version` to
+          # still be active — so roll back FROM 40 TO 39. Fastly cannot infer the
+          # previous version, so `rollback-to` is explicit (a real caller wires
+          # deploy-fastly's `previous-version`; the composite-smoke proves that).
+          fastly-version: "40"
+          rollback-to: "39"
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+
+      - name: Assert rollback verbs, paths, and version threading
+        env:
+          EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
+          EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.prod-rollback.outputs['rolled-back-to'] }}
+        run: .github/actions/deploy-core/tests/assert-rollback-calls.sh
+
+      # A production rollback with NO rollback-to must fail closed rather than
+      # guess a target — Fastly cannot infer the previously-live version.
+      - name: Production rollback without a target must fail
+        id: rollback-no-target
+        continue-on-error: true
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: production
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+
+      - name: Assert the targetless production rollback was refused
+        env:
+          EDGEZERO__TEST__OUTCOME: ${{ steps.rollback-no-target.outcome }}
+        run: |
+          [[ "${EDGEZERO__TEST__OUTCOME}" == "failure" ]] ||
+            { echo "::error::a production rollback with no rollback-to must fail, got '${EDGEZERO__TEST__OUTCOME}'"; exit 1; }
+
+      # A STALE rollback — one whose rolled-back-from version is no longer active
+      # because a newer deploy landed — must be refused BEFORE it mutates anything.
+      - name: Simulate a newer deploy becoming active, snapshot the call log
+        run: |
+          printf '99\n' >"$FAKE_ACTIVE_VERSION_FILE"
+          # Snapshot the call log so the assertion inspects ONLY the stale
+          # rollback's calls (the delta), not the whole job's history.
+          printf 'STALE_LOG_SNAPSHOT=%s\n' "$(wc -l <"$FAKE_CALL_LOG")" >>"$GITHUB_ENV"
+
+      - name: Stale production rollback must be refused
+        id: stale-rollback
+        continue-on-error: true
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: production
+          # 40 is no longer active (99 is), so this rollback is stale.
+          fastly-version: "40"
+          rollback-to: "38"
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+
+      - name: Assert the stale rollback was refused and activated nothing
+        env:
+          EDGEZERO__TEST__OUTCOME: ${{ steps.stale-rollback.outcome }}
+          EDGEZERO__TEST__LOG_SNAPSHOT: ${{ env.STALE_LOG_SNAPSHOT }}
+        run: .github/actions/deploy-core/tests/assert-stale-rollback-refused.sh
