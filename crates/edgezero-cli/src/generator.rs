@@ -272,7 +272,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "worker = { version = \"0.8\", default-features = false, features = [\"http\"] }"
             .to_owned(),
     );
-    deps.insert("fastly".to_owned(), "fastly = \"0.12\"".to_owned());
+    deps.insert("fastly".to_owned(), "fastly = \"0.13\"".to_owned());
     deps.insert("once_cell".to_owned(), "once_cell = \"1\"".to_owned());
     deps.insert(
         "tokio".to_owned(),
@@ -289,7 +289,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     // the generated core crate resolves cleanly.
     deps.insert(
         "validator".to_owned(),
-        "validator = { version = \"0.20\", features = [\"derive\"] }".to_owned(),
+        "validator = { version = \"0.21\", features = [\"derive\"] }".to_owned(),
     );
     deps
 }
@@ -867,6 +867,45 @@ mod tests {
     }
 
     // ---------- build_tool_versions ----------
+
+    #[test]
+    fn seeded_dependencies_track_the_edgezero_workspace() {
+        // The seeds above are hardcoded, but a generated crate takes
+        // `edgezero-core` as a path/version dependency and re-derives
+        // `#[derive(Validate)]` against whatever `validator` the workspace
+        // resolves. If the two majors drift apart the generated app fails to
+        // compile with a confusing "trait bound not satisfied" error, so the
+        // shared crates are checked against the root manifest here.
+        let root_manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"));
+        let seeds = seed_workspace_dependencies();
+        for crate_name in ["validator", "axum", "fastly", "worker"] {
+            let want = root_manifest
+                .lines()
+                .find(|line| line.starts_with(&format!("{crate_name} = ")))
+                .unwrap_or_else(|| panic!("root Cargo.toml must declare {crate_name}"));
+            let want_version = extract_version(want)
+                .unwrap_or_else(|| panic!("no version in root {crate_name} line: {want}"));
+            let got = seeds
+                .get(crate_name)
+                .unwrap_or_else(|| panic!("scaffold must seed {crate_name}"));
+            let got_version = extract_version(got)
+                .unwrap_or_else(|| panic!("no version in seeded {crate_name} line: {got}"));
+            assert_eq!(
+                got_version, want_version,
+                "scaffold seeds {crate_name} {got_version}, workspace uses {want_version}"
+            );
+        }
+    }
+
+    /// Pull the `version = "X"` (or bare `crate = "X"`) value out of a
+    /// dependency line, for comparing a seeded pin against the workspace.
+    fn extract_version(line: &str) -> Option<&str> {
+        let after = line.split_once("version = \"").map_or_else(
+            || line.split_once("= \"").map(|(_, rest)| rest),
+            |(_, rest)| Some(rest),
+        )?;
+        after.split_once('"').map(|(version, _)| version)
+    }
 
     #[test]
     fn build_tool_versions_pins_track_repo_tool_versions() {
