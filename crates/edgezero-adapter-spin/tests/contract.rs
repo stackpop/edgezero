@@ -11,8 +11,16 @@ mod store_trait_compile_checks {
     use edgezero_core::key_value_store::KvStore;
     use edgezero_core::secret_store::SecretStore;
 
-    fn assert_kv_impl<T: KvStore>() {}
-    fn assert_secret_impl<T: SecretStore>() {}
+    fn assert_kv_impl<T>()
+    where
+        T: KvStore,
+    {
+    }
+    fn assert_secret_impl<T>()
+    where
+        T: SecretStore,
+    {
+    }
 
     // Anonymous consts whose initializers are never called; the type bounds
     // are checked at type-check time.

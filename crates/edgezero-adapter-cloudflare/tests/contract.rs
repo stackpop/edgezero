@@ -5,7 +5,11 @@ mod secret_store_compile_check {
     use edgezero_adapter_cloudflare::secret_store::CloudflareSecretStore;
     use edgezero_core::secret_store::SecretStore;
 
-    fn assert_provider_impl<T: SecretStore>() {}
+    fn assert_provider_impl<T>()
+    where
+        T: SecretStore,
+    {
+    }
 
     // Anonymous const whose initializer is a never-called fn pointer; the
     // type bound is checked at type-check time.
