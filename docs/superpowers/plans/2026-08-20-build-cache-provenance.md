@@ -7,8 +7,8 @@
 CLI artifact and make every consumer independently validate exact caller and platform identity before
 the binary can execute.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.26 Sections
-3, 5.3, 6, 7, and 9.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.27 Sections
+3, 5.1, 5.3, 5.4, 6, 7, and 9.
 
 ## 1. Fixed actions and boundaries
 
@@ -22,6 +22,9 @@ the binary can execute.
   Shell, jq, workflow expressions, and generic JSON writers do not encode either protocol document.
 - Validation remains two invocations: trusted parse/extract, host output check, then hardened
   credential-free binary smoke.
+- Every expected-write, provenance-package, provenance-validate, and binary-smoke target uses the
+  design's exact `/usr/bin/env -S` placeholder protocol; no profile relies on Docker/image environment
+  replacement alone.
 - Plan 1 already implemented and baked the protocol owner, schema, canonical golden/malformed
   fixtures, and compiled fixture manifest into pinned image `D`. This plan integrates those bytes and
   may add only host-side workflow/action fixtures outside the canonical image context. It must not
@@ -39,6 +42,18 @@ the binary can execute.
       credential removal, artifact-name uniqueness, no platform output, typed identity output, exact
       EdgeZero/app checkout separation, no app-relative local action resolution, exact mount split,
       cleanup on every exit, and no provider input or secret.
+- [ ] Parse the reusable workflow and require the exact runner-eligibility call immediately after the
+      trusted EdgeZero action-source checkout and before app checkout, cache restore/save, artifact
+      work, Docker, or credential use. Negative fixtures cover missing, late, caller-input/env-derived,
+      differently cased, and self-hosted values; a `runs-on` label or host-command check never passes.
+- [ ] Add repository-wide structural tests that candidate revision `H` replaces
+      `.github/actions/build-app-cli/action.yml` with the exact fail-closed retirement stub: its first
+      executable step calls the runner helper, its next step always fails with migration guidance, and
+      it has no producer input/output, build helper, cache, Docker, or artifact-upload path. Reject any
+      executable repository workflow or runnable documentation producer call to that composite at
+      `H`. The four gated prepublication documents remain explicitly non-runnable until plan 5 removes
+      their legacy guidance at `R`; immutable older exact versions remain historical behavior, not a
+      supported compatibility path in `H` or `V`.
 - [ ] Add substitution fixtures: caller-supplied expected JSON, alternate schema/fixtures, candidate
       validator, shell-generated JSON, tar implementation, binary execution in parser container,
       writable parser input, and a second downloaded artifact must all fail.
@@ -70,12 +85,15 @@ the binary can execute.
       Reject tags, indexes, malformed records, mismatched protocol, and caller overrides.
 - [ ] Invoke `write-expected` in the exact expected-write profile with only fresh `/work/expected` and
       tmpfs. Require canonical `/work`, the baked schema, create-new/no-replace publication, exactly one
-      regular output, and complete host cleanup after abnormal exit.
+      regular output, and complete host cleanup after abnormal exit. Invoke it through the design's
+      fixed `/usr/bin/env -S` placeholder protocol and prove the target receives only `PATH`, `HOME`,
+      and `TMPDIR` despite image/Docker poison variables.
 - [ ] Select `cached-compile` only when validated boolean `cache:true`; select `uncached-compile` for
       the default `cache:false`. Compile the named app CLI in that selected profile and retain its
       exact host digest, size, mode, path, and single-link identity. Invoke `package` with either
       profile's output plus read-only expected input and a fresh `/work/packaged`; require exactly one
-      deterministic `artifact.tar`. Test cache-on and cache-off producer/package paths independently.
+      deterministic `artifact.tar`. Use the exact three-variable environment launcher and test cache-on
+      and cache-off producer/package paths independently.
 - [ ] Run `package` twice over identical inputs and compare bytes. Validate archive member order,
       headers, modes, owner fields, checksums, padding, end blocks, size caps, metadata digest/ELF
       closure, and no extra filesystem entry.
@@ -88,8 +106,10 @@ the binary can execute.
 
 - [ ] Implement the exact design input set and defaults. Validate booleans and numeric
       `timeout-minutes` as an integer in 1..120 before checkout. Require the hosted runner/workflow identity contract
-      with exact stable `action-version` plus resolved action SHA, and one action version across all
-      EdgeZero calls.
+      with exact context-derived `runner.environment:github-hosted`, `runner.os:Linux`, and
+      `runner.arch:X64`, exact stable `action-version` plus resolved action SHA, and one action version
+      across all EdgeZero calls. Run the shared runner assertion immediately after the trusted
+      EdgeZero action-source checkout and before app checkout, cache, artifact, or Docker work.
 - [ ] Declare required string inputs for repository/ref/id/workspace/package/bin/artifact, optional
       string defaults for working directory/suffix/app env, boolean defaults for cache/disclosure, the
       required `rust-toolchain`, numeric timeout default, and the required checkout secret exactly as specified. Parse the
@@ -108,6 +128,10 @@ the binary can execute.
       workflow. Add the first public cache-off, cold, warm, corrupt-restore, save-denied, and
       warning-only save hosted runs; preserve evidence for exactly one Cargo compile/build invocation
       after metadata preflight and for token absence.
+- [ ] Replace the legacy `.github/actions/build-app-cli` producer with the gated retirement stub and
+      migrate `.github/workflows/deploy-action.yml` plus its producer fixtures away from local
+      composite calls. Exercise reusable-workflow behavior through the trusted non-public harness until
+      plan 5 can run literal candidate `C`; no repository workflow may retain an alternate producer.
 - [ ] Expose only `artifact-name`, trusted `action-version`, resolved `action-revision`, and
       CallerExpectedIdentity fields. Never expose the host artifact
       path, container ref, platform digest/protocol, checkout token, cache path, or provider state.
@@ -122,6 +146,12 @@ the binary can execute.
       action. Implement the shared private artifact/expected/parse/extract/recheck/smoke helpers that
       later provider actions call. Implement only the expected-write, provenance-package,
       provenance-validate, and binary-smoke runner profiles here; plan 4 adds provider profiles.
+- [ ] Make the first executable step of both public actions call plan 2's sole runner-eligibility
+      helper with step-local values bound directly from `runner.environment`, `runner.os`, and
+      `runner.arch`. Reject missing/malformed/self-hosted values before token handling, authority
+      materialization, artifact download, or Docker execution; caller inputs and caller `env` cannot
+      substitute these bindings. Contract tests require this to remain the first executable internal
+      action step.
 - [ ] Give `compute-app-cli-identity` exactly the required string inputs `action-version`,
       `app-repository`, `app-ref`, `app-repo-id`, `workspace-root`, `app-cli-package`, `app-cli-bin`,
       and `rust-toolchain`, optional string `working-directory` default `.`, and required sensitive
@@ -140,6 +170,9 @@ the binary can execute.
       only the consumer-verified caller fields and locally derived platform fields before invoking
       `validate`. Reject caller-supplied JSON/platform values, stale or preexisting output, duplicate
       output, substitution, and cross-action expected-file reuse; clean the directory on every exit.
+- [ ] Consume plan 2's sole canonical launcher for every profile in this plan. Add only closed
+      operation variants and profile data; do not duplicate env-file serialization, placeholder argv,
+      Docker create/start/attach, timeout, or cleanup logic.
 - [ ] In the consumer job, invoke `compute-app-cli-identity` once with the exact source inputs and
       checkout-token secret, then compare every typed output with the reusable-workflow outputs before
       invoking any provider action. Pass those verified caller fields to later actions; do not retain
@@ -149,12 +182,15 @@ the binary can execute.
       workflow output can substitute. Pass producer `action-version`; every action requires its own
       `github.action_repository/ref` to equal `stackpop/edgezero@<action-version>` before work.
 - [ ] Run `validate` with read-only tar/expected/schema, fresh `/work/validated`, no network/credential/
-      repository/Cargo/cache/binary execution, and the exact design memory/pid/10-minute limits.
+      repository/Cargo/cache/binary execution, the exact `/usr/bin/env -S` closed-environment launch,
+      and the exact design memory/pid/10-minute limits.
       Host-check exactly one
       mode-0755 regular single-link output with recorded digest and size.
 - [ ] Start a new container for binary smoke with no network or credential and only the validated
-      binary plus tmpfs. Use direct controlled-loader argv for dynamic binaries and direct execution
-      for static binaries. Recheck path/device/inode/digest/size/mode/link count before every later use.
+      binary plus tmpfs. Use the fixed environment launcher to directly execute controlled-loader argv
+      for dynamic binaries or the binary for static binaries, with only `PATH`, `HOME`, and `TMPDIR`
+      at target-command entry. Recheck path/device/inode/digest/size/mode/link count before every later
+      use.
 - [ ] Ensure `if: always()` cleanup removes the private workspace and operation output parents without
       following links. Any cleanup or post-cleanup verification failure is fatal.
 - [ ] Keep the extracted path, digest, size, mode, device, and inode in action-private step state only;

@@ -8,7 +8,7 @@
 restore/compile/save primitive that later plans consume, without making cache availability part of
 build correctness or exposing credentials to compilation.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.26 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.27 Sections
 2 through 5 and 9.
 
 ## 1. Fixed decisions
@@ -85,8 +85,19 @@ build correctness or exposing credentials to compilation.
       call these helpers and must not reimplement them.
 - [ ] Emit shell-safe typed outputs and reject duplicate, missing, multiline, or malformed output.
       Tests independently recompute SHA-256 bytes; they do not call the implementation as oracle.
-- [ ] Require hosted `linux/amd64`, exact workflow repository/path/ref/SHA identity, full lowercase
-      app ref, and canonical positive `job.check_run_id` before any cache action runs.
+- [ ] Implement the sole runner-eligibility helper and require context-derived
+      `runner.environment:github-hosted`, `runner.os:Linux`, and `runner.arch:X64`, exact workflow
+      repository/path/ref/SHA identity, full lowercase app ref, and canonical positive
+      `job.check_run_id` before any cache action runs. The values are not caller inputs; missing,
+      empty, differently cased, self-hosted, or architecture-only proofs fail. Plans 3 and 4 must call
+      this helper as every public action's first executable step.
+- [ ] Implement the sole canonical container-launch helper. It owns the closed operation enum,
+      profile-to-environment mapping, sorted env-file serializer, placeholder split-string builder,
+      exact `/usr/bin/env -S` argv, `docker create` array construction, env-file deletion before
+      start, attach, timeout, named-container removal, and cleanup verification. Its tests require
+      exact placeholder/env-file name equality and prove no argv element is constructed by inserting
+      an environment value. Plans 3 and 4 may add reviewed enum variants and profile data, but must
+      call this serializer and lifecycle unchanged rather than reimplementing them.
 
 ## 4. Restore and pre-use audit
 
@@ -124,7 +135,11 @@ build correctness or exposing credentials to compilation.
       Checkout tokens, GitHub file-command paths, provider inputs, and provider tokens must be absent.
 - [ ] Construct the exact closed environment, including absolute `RUSTC_WRAPPER`, `SCCACHE_DIR`, 2G
       managed size, `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, zero incremental mode, empty encoded rustflags,
-      and validated `app-env`. Enforce the design's empty Cargo-config policy before launch.
+      and validated `app-env`. Use the sole canonical launcher to serialize sorted `NAME=value`
+      env-file lines and launch fixed `/usr/bin/env`, literal `-S`, and the exact sorted
+      `-i NAME=${NAME}` placeholder string before the absolute Cargo command. Prove inherited
+      `RUST_VERSION`, Docker `HOSTNAME`, and seeded poison are absent at target-command entry and no
+      argv element is value-derived. Enforce the design's empty Cargo-config policy before launch.
 - [ ] Start sccache, zero stats, invoke Cargo compile/build exactly once after metadata with locked inputs, capture exact
       `sccache --show-stats --stats-format=json`, and stop the server. Validate the complete closed
       v0.10.0 `ServerInfo`/`ServerStats` schema before reading `stats.cache_write_errors`: the six
@@ -157,10 +172,12 @@ build correctness or exposing credentials to compilation.
 
 ## 7. Integration and completion
 
-- [ ] Integrate the helper only into a non-public test harness under the protected contract suite. The
-      build-only reusable workflow does not exist before plan 3, and the current direct-composite
-      producer must not expose an intermediate cache/provenance contract. Do not change provider or
-      public producer behavior in this plan.
+- [ ] Integrate the cache/compile primitive only into a non-public test harness under the protected
+      contract suite. The build-only reusable workflow does not exist before plan 3, and the current
+      direct-composite producer must not expose an intermediate cache/provenance contract. Its sole
+      change in this plan is to call the shared runner-eligibility helper as its first executable step;
+      tests require rejection of missing/malformed/self-hosted context before existing producer work.
+      Do not otherwise change provider or public producer behavior in this plan.
 - [ ] Run cold, warm, corrupt-restore, concurrent-generation, stop-failure, write-error, audit-failure,
       save-denied, save-warning, and sccache response-loss fixtures. Assert the design's exact cold
       Rust miss/write counters, a new-job warm restore with at least one post-zero Rust cache hit and

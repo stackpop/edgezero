@@ -7,7 +7,7 @@
 can reach a credentialed provider command, and preserve the parent deploy lifecycle without ambient
 host state or the legacy `--stage` spelling.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.26 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.27 Sections
 2, 5, 6.1, 6.6, 7.2, and 9. The parent deploy spec remains normative where the addendum does not
 expressly replace it.
 
@@ -47,11 +47,15 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       aggregate UTF-8 bytes, 1..127-byte ASCII names matching
       `[A-Za-z_][A-Za-z0-9_]*`, values at most 8,192 UTF-8 bytes with no NUL/C0/DEL, and
       ASCII-case-insensitive exact/prefix/target-tool deny rules from the design.
-- [ ] Start every operation with `env -i`; emit only the fixed `PATH`, action-owned `HOME`/`TMPDIR`,
-      the operation's exact Rust/Cargo variables, validated `app-env`, selected typed `EDGEZERO_*`
-      values, and the one provider token required by that profile. Reject duplicate final names and
-      prove caller `PATH`, shell startup variables, wrappers, flags, and ambient workflow variables do
-      not survive.
+- [ ] Start every target operation with the exact GNU `/usr/bin/env -S` expansion-before-`-i`
+      protocol. Emit only the fixed `PATH`, action-owned `HOME`/`TMPDIR`, the operation's exact
+      Rust/Cargo variables, validated `app-env`, selected typed `EDGEZERO_*` values, and the one
+      provider token required by that profile. Sort final names by ascending ASCII bytes; create the
+      exact `-i NAME=${NAME}` placeholder string without literal values. Reject duplicate final names
+      and prove caller `PATH`, shell startup variables, wrappers, flags, ambient workflow variables,
+      inherited image variables, Docker `HOSTNAME`, and seeded poison do not survive. Cover spaces,
+      quotes, backslashes, dollar signs, `#`, `=`, literal `${...}`, and non-ASCII value bytes without
+      recursive expansion or splitting.
 - [ ] Consume plan 2's shared empty Cargo-config and toolchain checks over the cwd, every ancestor through git root,
       all copied enclosing workspace directories, and fresh `CARGO_HOME`. Reject either Cargo config
       filename and legacy credentials before app code starts.
@@ -61,14 +65,16 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
 
 ## 4. Runner and mount profiles
 
-- [ ] Refactor `run-app-cli-in-container` to accept a closed operation enum, not caller-provided
-      Docker flags, mounts, environment names, network settings, entrypoint, or command prefix. Build
-      argv as an array and reject newline/NUL/control-bearing scalar inputs before logging.
-- [ ] Serialize each validated operation environment to one mode-0600 single-link private env file;
-      pass only its path to `docker create`, remove and verify the file before `docker start --attach`,
-      and remove the uniquely named container on every exit. Never place a token or app-env value in
-      Docker argv. Test create/start/attach failure, env-file replacement, newline/NUL values,
-      container-name collision, inspectable lifetime, and mandatory removal/reconciliation.
+- [ ] Extend plan 2's closed operation enum with the provider variants; do not add caller-provided
+      Docker flags, mounts, environment names, network settings, entrypoint, or command prefix. Supply
+      only reviewed profile data, absolute operation executables, and separately validated arguments
+      to plan 2's canonical launcher. Reject newline/NUL/control-bearing scalar inputs before logging.
+- [ ] Use plan 2's env-file serializer, placeholder builder, Docker create/start/attach lifecycle,
+      timeout, and cleanup unchanged. Add provider-profile tests for create/start/attach failure,
+      env-file replacement, placeholder/env-file disagreement, newline/NUL values, container-name
+      collision, inspectable lifetime, and mandatory removal/reconciliation. Require exact sorted
+      placeholder/env-file name equality and prove no Docker or runtime argv element is constructed by
+      inserting a token or app-env value.
 - [ ] Implement the exact mount table from design Section 5.3. Never mount all of `RUNNER_TEMP`, the
       original checkout writable, the Docker socket, host credential directories, GitHub file-command
       files, or a cache in a token-bearing operation.
@@ -78,8 +84,9 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       container-sharing, caller-selected network, resource, and timeout flags.
 - [ ] Before every app-binary launch, reopen and verify the confined regular path, device/inode,
       SHA-256, size, mode 0755, and link count one. Dynamic binaries run only by direct argv through
+      the fixed environment launcher, which directly executes
       `/lib64/ld-linux-x86-64.so.2 --inhibit-cache --glibc-hwcaps-mask '' --library-path
-/opt/edgezero/runtime-lib <binary>`; static binaries execute directly. Never use a shell,
+      /opt/edgezero/runtime-lib <binary>`; for static binaries it directly executes the binary. Never use a shell,
       `PATH` lookup, implicit kernel interpreter launch, `ld.so.cache`, default library directory,
       preload file, or hardware-capability substitution.
 - [ ] Cover static/dynamic success, wrong interpreter, dependency replacement, hwcaps/default/cache/
@@ -153,6 +160,12 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
 
 ## 7. Provider lifecycle actions
 
+- [ ] Make the first executable step of every public provider action call plan 2's sole
+      runner-eligibility helper with step-local values bound directly from `runner.environment`,
+      `runner.os`, and `runner.arch`. Require exact `github-hosted`, `Linux`, and `X64` before artifact
+      download, source materialization, Docker, token handling, or mutation. Reject caller-input/env
+      substitution, missing values, and self-hosted Linux/X64 fixtures. Contract tests require this to
+      remain the first executable internal action step.
 - [ ] Make every public provider action accept the named artifact, trusted producer
       `action-version`, and complete `CallerExpectedIdentity`; require its own action repository/ref to
       equal that version, derive PlatformIdentity locally, independently download/validate/smoke the

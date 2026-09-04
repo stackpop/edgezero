@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions - Build Caching Spec
 
-**Status:** Design (proposed) - v6.26
+**Status:** Design (proposed) - v6.27
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md`,
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -26,7 +26,10 @@ contracts. It must not expose provider credentials to app CLI compilation or to 
   The checkout token is host-only. The provider token exists only in the minimum provider operation
   that requires it. Neither credential enters the cached-compile container or `SCCACHE_DIR`.
 - The reusable workflow is the only supported artifact producer. It is build-only: it accepts no
-  provider inputs and performs no provider mutation.
+  provider inputs and performs no provider mutation. Candidate revision `H` replaces the legacy
+  `.github/actions/build-app-cli` producer with a non-producing, fail-closed retirement stub whose
+  first executable step enforces the hosted-runner predicate and whose next step always fails with
+  migration guidance. The stub has no producer inputs, outputs, artifact upload, or build path.
 - Artifact provenance is a consistency and loadability check. It is not producer authentication or
   an attestation. A malicious producer can create a self-consistent archive. Attestation remains out
   of scope.
@@ -35,7 +38,10 @@ contracts. It must not expose provider credentials to app CLI compilation or to 
   pass digest, ELF, and smoke checks.
   `cache: true` explicitly accepts this risk; v1 does not and cannot generally detect it.
 - v1 supports GitHub-hosted `linux/amd64` runners only. It fails closed on self-hosted runners and
-  does not target GitHub Enterprise Server.
+  does not target GitHub Enterprise Server. The GitHub Actions service and selected runner runtime
+  are trusted infrastructure. The in-job predicate prevents EdgeZero work after context reports a
+  self-hosted runner; it cannot retract a secret a caller already supplied to that runner or defend
+  against a malicious runner implementation.
 - Image publication trusts the digest-pinned official Rust base, Rustup's manifest/checksum chain,
   Debian's signed package archive, and checksum-pinned Fastly/sccache release assets. Candidate source
   cannot change their coordinates or verification steps. The build is not claimed byte-reproducible
@@ -373,6 +379,17 @@ Runtime containers use a read-only root filesystem, uid/gid 1001, dropped capabi
 `no-new-privileges`, no GitHub file-command channels, explicit mounts, and operation-specific network,
 memory, pid, and timeout limits.
 
+Before cache access, artifact transfer, app-source materialization, Docker execution, provider-token
+handling, or provider mutation, the reusable workflow and every public composite action independently
+require context-derived `runner.environment == "github-hosted"`, `runner.os == "Linux"`, and
+`runner.arch == "X64"`. Composite metadata binds those three context values into private names for
+its first executable validation step; they are not action inputs and caller `env` cannot replace the
+step-local bindings. A missing, empty, differently cased, or otherwise different value fails closed.
+`runs-on`, Docker availability, uname output, and architecture alone are not proof of a GitHub-hosted
+runner. Repository-owned image-publication and gate-rotation jobs apply the same predicate before
+Docker, credential-consuming, or mutation steps. A job-level protected environment can be resolved
+before steps begin; the predicate does not claim to run before that GitHub control-plane event.
+
 ### 5.2 Working-copy topology
 
 There are two independent exported-copy roles because GitHub jobs do not share filesystems. The
@@ -471,7 +488,7 @@ mounts all of `RUNNER_TEMP`.
 | `/work/target`              | writable        | cached-compile, uncached-compile, app-build, provider-deploy | fresh or parent target cache as specified below |
 | `/work/cargo-home`          | writable, fresh | cached-compile, uncached-compile, app-build, provider-deploy | operation-specific directory                    |
 | `/work/sccache`             | writable        | cached-compile only                                          | stable host cache directory                     |
-| `/work/input/app-cli`       | read-only       | provenance-package only                                      | exact binary produced by cached-compile         |
+| `/work/input/app-cli`       | read-only       | provenance-package only                                      | exact binary produced by the selected cached-compile or uncached-compile profile |
 | `/work/input/artifact.tar`  | read-only       | provenance-validate only                                     | downloaded artifact                             |
 | `/work/expected`            | writable, fresh | expected-write                                               | empty host expected-identity output directory   |
 | `/work/release`             | writable, fresh | release-request-write                                        | empty host release-request output directory     |
@@ -553,8 +570,27 @@ mutation, cache-save, or reconciliation rules.
 
 ### 5.4 Constructed environments
 
-Every operation starts with `env -i` and a closed allowlist. `PATH` is
+Every target operation starts with `env -i` and receives a closed allowlist. `PATH` is
 `/usr/local/bin:/usr/local/cargo/bin:/usr/bin:/bin`.
+
+The exact environment-launch protocol is part of protocol 1. The container runtime entrypoint is
+`/usr/bin/env`. Its first two arguments are literal `-S` and one split-string argument consisting of
+literal `-i` followed by one `NAME=${NAME}` assignment for every name in the selected operation
+profile, sorted by ascending ASCII bytes and separated by one ASCII space. The next runtime argument
+is the operation's absolute executable path, followed by its already validated arguments as separate
+argv elements. There is no shell, `env -v`, caller-selected entrypoint, command prefix, bare
+environment name, or argv element constructed by inserting an environment value. The split-string
+argument contains only literal names and `${NAME}` placeholders. A runtime argument may
+coincidentally have the same bytes as a value; byte inequality is not the security assertion.
+
+GNU `env -S` expands each `${NAME}` from the initial Docker environment before processing `-i`, then
+clears that environment, installs only the expanded assignments, and directly executes the absolute
+operation command. Validated names make the placeholder grammar unambiguous. Expansion bytes are not
+recursively expanded or resplit; tests cover spaces, quotes, backslashes, dollar signs, `#`, `=`,
+literal `${...}` text, and non-ASCII values. The target process therefore cannot observe inherited
+image variables such as `RUST_VERSION` or Docker-created variables such as `HOSTNAME`. The image and
+publisher verifier treat `/usr/bin/env` with these exact `-S` expansion-before-clear semantics as a
+required runtime capability.
 
 - cached compile: `PATH`, `RUSTUP_HOME=/usr/local/rustup`, `RUSTUP_TOOLCHAIN`, fresh `CARGO_HOME`,
   fresh `CARGO_TARGET_DIR`, `RUSTC_WRAPPER=/usr/local/bin/sccache`, `SCCACHE_DIR`,
@@ -605,21 +641,25 @@ added to operations that execute app code or the app CLI. Config-push's separate
 config overlay remains subject to its own prefix and `no-env` rules. This explicit input replaces the
 parent's ambient workflow-`env` behavior and is a documented adoption migration.
 
-Caller `PATH`, `RUSTC`, `RUSTDOC`, compiler wrappers, Rust flags, native-tool variables, ambient
-application variables, and unlisted `EDGEZERO_*` variables are absent rather than scrubbed after
-inheritance. Cached and uncached profiles both prove those variables cannot be reintroduced through
-`app-env`.
+At target-command entry, caller `PATH`, `RUSTC`, `RUSTDOC`, compiler wrappers, Rust flags,
+native-tool variables, ambient application variables, unlisted `EDGEZERO_*` variables, inherited
+image variables, and Docker-created variables are absent. Cached and uncached profiles both prove
+those variables cannot be reintroduced through `app-env`.
 
-No environment value is placed literally in Docker CLI argv. The action writes the already validated
-operation environment to one fresh mode-0600, single-link, action-owned env file outside every
-checkout/cache/output root, invokes `docker create --env-file <path>` for a uniquely named container,
-and deletes and verifies absence of the env file before `docker start --attach`. File serialization
-rejects newline and NUL in every name/value; provider inputs whose token format permits either are
-therefore invalid. For token-bearing profiles, the final source/output/binary checks occur immediately
-before this env file is created. Create/start/attach failure still triggers named-container removal,
-env-file removal, private-workspace cleanup, and any required mutation reconciliation. The token may
-exist in the isolated runner's Docker container metadata while that container exists; no other
-container receives Docker-socket access, and removal is mandatory before the action completes.
+No Docker CLI or runtime argv element is constructed by inserting an environment value. The action
+writes the already validated operation environment to one fresh mode-0600, single-link, action-owned
+env file outside every checkout/cache/output root. It contains exactly one `NAME=value` line per
+profile name in the same ascending ASCII order as the split string, with no comments, blank lines,
+bare names, duplicates, or extra names. The action invokes `docker create --env-file <path>` with the
+fixed `/usr/bin/env` entrypoint and placeholder-only argv above for a uniquely named container, then
+deletes and verifies absence of the env file before `docker start --attach`. File serialization rejects
+newline and NUL in every name/value; provider inputs whose token format permits either are therefore invalid. For
+token-bearing profiles, the final source/output/binary checks occur immediately before this env file
+is created. Create/start/attach failure still triggers named-container removal, env-file removal,
+private-workspace cleanup, and any required mutation reconciliation. Values may exist in the isolated
+runner's Docker container metadata while that container exists, but the launched target receives only
+the post-`env -i` profile. No other container receives Docker-socket access, and removal is mandatory
+before the action completes.
 
 Protocol 1's Cargo-config allowlist is empty. Before compilation, the action rejects `.cargo/config`,
 `.cargo/config.toml`, and legacy `.cargo/credentials*` at the cwd, every ancestor through `git-root`,
@@ -882,13 +922,14 @@ member of the validator's visited runtime closure but is not added to the primar
 `abi.needed` metadata array.
 
 The final image has no `/etc/ld.so.preload`. Every dynamic `binary-smoke` and provider-action launch
-uses the container runtime's argv/entrypoint API directly, without a shell, to invoke that validated
-interpreter with exact arguments `--inhibit-cache`, `--glibc-hwcaps-mask`, the empty-string mask,
-`--library-path`, `/opt/edgezero/runtime-lib`, then `/work/bin/app-cli` and the validated operation
-arguments. Thus `/etc/ld.so.cache`, default-directory precedence, and hardware-capability
-subdirectories cannot select a different object for the validated startup closure. A static primary
-is launched directly and has no `PT_INTERP` or `PT_DYNAMIC`. The verifier never invokes `ldd` and
-never infers trust from loader output. Tests include preload presence, cache-only libraries,
+uses the fixed environment-launch protocol through the container runtime's argv/entrypoint API,
+without a shell. After constructing the closed environment, `/usr/bin/env` directly executes the
+validated interpreter with exact arguments `--inhibit-cache`, `--glibc-hwcaps-mask`, the empty-string
+mask, `--library-path`, `/opt/edgezero/runtime-lib`, then `/work/bin/app-cli` and the validated
+operation arguments. Thus `/etc/ld.so.cache`, default-directory precedence, and hardware-capability
+subdirectories cannot select a different object for the validated startup closure. For a static
+primary, `/usr/bin/env` directly executes the binary, which has no `PT_INTERP` or `PT_DYNAMIC`. The
+verifier never invokes `ldd` and never infers trust from loader output. Tests include preload presence, cache-only libraries,
 hardware-capability alternates, default-directory duplicates, wrong interpreter, missing flat-closure
 members, and an application-directed `dlopen` fixture demonstrating that such runtime behavior is
 outside the metadata claim rather than silently certified.
@@ -1911,9 +1952,12 @@ Required automated coverage includes:
   original checkout;
 - every environment and mount profile, including token absence, production healthcheck tokenlessness,
   staging token presence, credential-free `app-build`, every exact `app-env` name/value/count/size
-  boundary, empty Cargo-config policy, config-push repo/config confinement, and deploy-without-sccache;
+  boundary, sorted placeholder-only `env -S` argv, expansion-before-clear edge values, inherited/image/
+  Docker variable removal, empty Cargo-config policy, config-push repo/config confinement, and
+  deploy-without-sccache;
 - strict caller identity, full-SHA app refs, exact-version workflow/action refs, resolved workflow
-  SHA, immutable EdgeZero release enforcement, locally derived platform identity, matrix artifacts,
+  SHA, exact GitHub-hosted Linux/X64 context checks in every public action and sensitive repository
+  job, immutable EdgeZero release enforcement, locally derived platform identity, matrix artifacts,
   and consumer recomputation for private repositories;
 - exact canonical metadata and expected JSON, typed `write-expected`, schema versions, duplicate keys,
   byte-exact ustar
@@ -1963,8 +2007,10 @@ To publish final action revision `P`, exact version `V`, and its adoption docume
    assertion-step evidence before tagging. Build only from the freshly staged `G` context.
 4. Publish and anonymously verify the image, then merge the ancestry-checked pin PR as baseline `B`.
 5. Select unused canonical patch version `C`. Land the reusable workflow, cache, provenance,
-   launcher, and consumer integration while leaving prepublication adoption examples at the gated
-   placeholder. Record resulting main commit `H`.
+   launcher, and consumer integration; replace the legacy direct-composite producer with its
+   fail-closed retirement stub; migrate repository integration coverage to the reusable workflow;
+   and leave prepublication adoption examples at the gated placeholder. Record resulting main commit
+   `H`.
 6. Rerun the complete local suite from detached `H`; have a verified active releaser-team member use
    a local credential to draft and publish immutable `C` at `H` with `prerelease:true`; and run the
    complete hosted cross-repository/provider suite through literal `C`. On success designate `H=P`,
@@ -2052,6 +2098,11 @@ Caching remains off by default. Container execution and provenance validation ar
   allowlist, actor proof, and credential handling; and defined the public consumer identity action
   plus per-invocation source materialization so no authority path crosses a public action boundary;
   and closed the documentation scanner's pull-request, merge-group, and protected-push ranges.
+- **v6.27:** froze the GNU `env -S` expansion-before-clear launch protocol so Docker/image-created
+  variables cannot violate closed target environments while no argv element is value-derived;
+  required a context-derived GitHub-hosted Linux/X64 check in every public action and sensitive
+  repository workflow job; retired the legacy direct-composite producer at candidate revision `H`;
+  and corrected provenance packaging to accept either compile profile's output.
 
 ## 13. Deferred implementation mechanics
 

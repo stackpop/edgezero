@@ -9,8 +9,8 @@
 full-SHA app identity and explicit inputs, publish exact stable action version `V`, then activate
 synchronized runnable documentation at revision `R` without ever merging an unpublished version ref.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.26 Sections
-3.3, 5.2, 7, 9, and 10, plus the parent deploy lifecycle contract.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.27 Sections
+3.3, 5.1, 5.2, 5.4, 7, 9, and 10, plus the parent deploy lifecycle contract.
 
 ## 1. Release structure
 
@@ -43,7 +43,9 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       reusable-workflow/action refs, unique artifact names, caller and action identity forwarding,
       public identity-action use, action-local source materialization with no authority-path handoff,
       no aggregate matrix identity, minimal permissions, secret confinement, and absence of
-      direct-composite producer use.
+      direct-composite producer use. Require the legacy path at candidate `H` to be only the exact
+      non-producing retirement stub, and reject any workflow or documentation that invokes it as a
+      producer.
 - [ ] Add public/private app repository fixtures, root/nested workspace fixtures, public Git and
       sibling path dependencies, submodules, no-filter and pinned-LFS cases, app-env migration,
       generated outputs, production/staging provider paths, and cache enabled/disabled cases.
@@ -154,8 +156,10 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       records artifact/image/action/app identities without logging credentials or app-env values.
 - [ ] Locally prove cold/warm/default-off cache behavior, source relocation, nested workspace identity,
       artifact transfer, identity-action/source-bearing authority separation, Copy A/Copy B
-      independence, expected-file freshness, and exact caller/platform/action validation using
-      generated fixtures.
+      independence, expected-file freshness, exact caller/platform/action validation, sorted
+      placeholder-only `env -S` launch argv, and exact post-`env -i` target environments using
+      generated fixtures. Every public action fixture also covers missing/malformed context bindings
+      and self-hosted Linux/X64 rejection before artifact, source, Docker, or token work.
 - [ ] Prepare production/staging provider fixtures for successful deploy, unhealthy rollback, first
       deploy, active-version, healthcheck, config push, and cancellation reconciliation. Assert no
       mutation on identity, source-freeze, output-root, loader, or token-order failure.
@@ -178,7 +182,7 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Run every protocol, cache, image, launcher, source-freeze, provider, workflow, fixture, docs/pin,
       actionlint, zizmor, shellcheck, Rust, and local integration suite at one clean candidate descended
       from `B`. Confirm `image.json` remains reviewed `{D,S,protocol}`.
-- [ ] Run independent contract and release-adversary reviews against design v6.26, including exact-tag
+- [ ] Run independent contract and release-adversary reviews against design v6.27, including exact-tag
       policy, third-party tag movement risk, EdgeZero immutable releases, action-version mixing,
       substitution, identity replay, malformed artifacts, host/container races, source mutation,
       generated-output escape, credential flow, cache disclosure, rollback, and cancellation.

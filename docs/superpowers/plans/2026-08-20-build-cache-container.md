@@ -17,7 +17,7 @@ plans land on top. Their final passing action revision `P` contains the unchange
 record and the adoption documents for exact stable version `V`; consumers pin immutable release
 version `V`, which resolves to `P`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.26.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.27.
 
 **Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
 `shellcheck`, and `zizmor`.
@@ -38,6 +38,12 @@ version `V`, which resolves to `P`.
 - The final image contains an installed `wasm32-wasip1` target, not merely a rustc target-list entry.
 - The project-owned validator, schema, and capability fixtures are baked and tested before push.
 - Runtime is non-root uid/gid 1001 and works with a read-only root filesystem plus explicit tmpfs.
+- Every target command is launched through baked GNU `/usr/bin/env` with the design's exact two-argument
+  `-S` placeholder protocol. Image and Docker-created variables are absent from target-command entry,
+  and no Docker or runtime argv element is constructed from an environment value.
+- Every repository-owned workflow job introduced by this plan requires context-derived
+  `runner.environment:github-hosted`, `runner.os:Linux`, and `runner.arch:X64` before Docker,
+  credential, or mutation work. Runner labels and host command output are not substitutes.
 - Every committed non-local external action and reusable workflow ref is a canonical exact stable
   `v<major>.<minor>.<patch>` release tag. Major/minor tags, prereleases, branches, commit SHAs, and
   floating refs fail. Docker image refs use immutable `sha256` digests. Local `./...` actions remain
@@ -151,7 +157,7 @@ Modify:
 ## 4. Task 0: Enforce exact-version external references repository-wide
 
 The current pin gate permits major/minor tags, prereleases, and commit SHAs. That is broader than
-v6.26 and must be narrowed before adding the write-privileged publisher.
+v6.27 and must be narrowed before adding the write-privileged publisher.
 
 **Files:**
 
@@ -520,12 +526,24 @@ release credential. Candidate code is always subject data. No image is published
 - [ ] Write failing command-fixture tests for `verify-toolchain.sh`. Cover exact, prerelease,
       extra-text, missing, and malformed Rust/Fastly/sccache version output; absent
       `wasm32-wasip1`; failed minimal compile; invalid wasm magic; validator self-test failure;
-      wrong uid/gid; and read-only-root failure.
+      wrong uid/gid; read-only-root failure; and missing, replaced, or semantically incompatible GNU
+      `/usr/bin/env -S`.
 - [ ] Snapshot the `self-test` container's complete create/run contract: digest-pinned linux/amd64
       image, uid/gid 1001, read-only root, all capabilities dropped, no-new-privileges, no network,
       2 GiB memory/swap, 64 pids, 10-minute wall limit, no host bind mounts, only `/work/home` and
-      `/work/tmp` tmpfs, exact three-variable environment, and exact baked-fixture argv. Reject every
-      extra mount, environment value, flag, or path.
+      `/work/tmp` tmpfs, fixed `/usr/bin/env` entrypoint, exact `-S` plus sorted placeholder split
+      string, exact three-variable target environment, and exact baked-fixture argv. Seed inherited
+      image/Docker poison variables and prove they are absent from the target. Reject every extra
+      target environment name, mount, flag, entrypoint, command prefix, non-placeholder assignment,
+      value-derived argv construction, or path. Snapshot the exact container `Path` and `Args`; do not
+      use accidental byte inequality between values and argv as the assertion.
+- [ ] Before publication, drive the verifier through real `docker create --env-file`, delete and
+      verify absence of that file before `docker start --attach`, and assert exact post-`env -i`
+      bytes for empty values plus spaces, quotes, backslashes, dollar signs, `#`, `=`, literal
+      `${...}` text, and non-ASCII values. Prove expansion is neither recursive nor resplit, the
+      placeholder list and env-file names agree exactly, and image/Docker poison is absent. Reject
+      newline/NUL serialization, duplicate/bare/comment/blank/extra env-file entries, missing
+      placeholders, and any argv element constructed by inserting a value.
 - [ ] Implement exact semantic-version parsing, installed-target inspection, and compilation of the
       committed `wasm-smoke.rs` library into tmpfs. Substring version matching is forbidden.
 - [ ] Write failing fixture tests for `verify-published-image.sh`. Cover accepted leaf Docker and
@@ -592,7 +610,8 @@ release credential. Candidate code is always subject data. No image is published
       no secret/environment/mutation token in either required job; - repository variable `EDGEZERO_BUILD_CONTAINER_GATE_SHA` validated as a full SHA; - separate gate and subject checkouts with persisted credentials disabled; - all classifier, driver, completion, and verifier commands resolved under the gate checkout; - exact protected workflow repository/path parsing from `github.workflow_ref` and exact
       `github.workflow_sha` assertions for required runs; - explicit not-applicable execution and an unconditional terminal completion assertion; and - fixed steps `assert-exact-g-dispatch-context` and `assert-exact-main-push-context`; generic
       protected-main push assertions for event, ref, `event.after`, current head `Q`, workflow SHA,
-      active gate SHA, and both latest-attempt job conclusions, plus separate release-request
+      active gate SHA, and both latest-attempt job conclusions; exact context-derived
+      `github-hosted`/`Linux`/`X64` assertions before Docker work in every job; plus separate release-request
       identity when `Q=S`.
 - [ ] Implement `build-container-ci.yml`. For organization-required runs,
       `github.workflow_ref` must identify `stackpop/edgezero` and the exact path, and
@@ -725,9 +744,15 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       changes to the gate-owned publisher topology, permissions, concurrency group, action versions,
       gate checkout, helper paths, output set, token ordering, package deletion/admin scope, build secret
       exposure, missing/late release-state and rotation checks, predictable/hard-coded/pre-verification
-      challenge generation, or pin mutation outside the trusted updater. Apply the same exact
+      challenge generation, missing or late hosted-Linux/X64 context assertions, or pin mutation
+      outside the trusted updater. Apply the same exact
       concurrency/group/queue checks to the gate-rotation workflow and reject any third workflow using
-      that group or either approved workflow using a different one.
+      that group or either approved workflow using a different one. Parse both workflows and require
+      the exact context-derived hosted/Linux/X64 assertion in every publisher and rotation job before
+      any step consumes environment data or credentials, creates an installation token, invokes
+      Docker, calls a mutation API, or mutates the repository; fixtures with a missing,
+      caller-derived, or late assertion fail. Do not claim that a step runs before GitHub resolves a
+      job-level protected environment.
 - [ ] Create gate-owned `publish-build-container.yml`. It triggers only protected
       `build-container-v*` tags and uses exact concurrency group
       `edgezero-build-container-publication` with `cancel-in-progress: false` and `queue: max`.
@@ -880,7 +905,8 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       archive bytes, every malformed fixture, controlled startup-loader behavior, and read-only/non-
       root runtime with no network/capabilities and bounded memory/pids.
 - [ ] Run the exact `write-expected`, package, validate, and binary-smoke mount profiles from
-      design Section 5. No shell or `jq` may produce expected identity. No
+      design Section 5 with fixed `/usr/bin/env`, exact sorted placeholder argv, and only each profile's
+      post-`env -i` target environment. No shell or `jq` may produce expected identity. No
       `/work/package` mount may appear.
 - [ ] Execute the bounded credential smoke while protected main is still `G`: temporarily add literal
       `main` as the sole extra environment deployment policy, dispatch with body `ref:"main"` and the
@@ -1038,11 +1064,12 @@ a digest from the mutable tag.
 
 Before declaring this plan complete, run two independent reviews:
 
-1. **Contract review:** compare every file and test with design v6.26 Sections 2 through 10. Verify one
+1. **Contract review:** compare every file and test with design v6.27 Sections 2 through 10. Verify one
    expected/package/validate wire authority, protected gate and image source `G`, isolated release
    request `S`, staged gate-only Docker context, API-visible exact post-merge `S` proof, forward-only
    pin ancestry, no tag runtime pull, no placeholder image digest/checksum, no `/work/package`
-   convention, and no legacy `--stage` guidance.
+   convention, fixed GNU `env -S` closed-environment launch, hosted-Linux/X64 job assertions, and no
+   legacy `--stage` guidance.
 2. **Release-adversary review:** test candidate workflow/helper substitution, forbidden
    major/minor/branch/SHA action refs, third-party exact-tag movement as recorded risk, immutable
    EdgeZero release enforcement, private
