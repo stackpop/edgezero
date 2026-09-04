@@ -1,10 +1,28 @@
 # EdgeZero Inbound Request-Body Design
 
-> Extracted from the outbound-HTTP spec (`2026-05-21-outbound-http-design.md`) so that spec stays focused on outbound HTTP. This doc owns the **inbound request-body** contract: `RequestContext` body reading and the `BodyCell` state machine. **It is shared, not purely inbound** — the outbound spec's streaming **proxy-forward** (`OutboundRequest::from_request(ctx.into_request()?, ..)`) depends on the `BodyCell`/`into_request()` contract defined here.
+> Extracted from the
+> [outbound-HTTP design](2026-05-21-outbound-http-design.md) so that specification stays
+> focused on outbound HTTP. This document owns the **inbound request-body** contract:
+> `RequestContext` body reading, adapter ingress, extractor limits, and the `BodyCell`
+> state machine. **It is shared, not purely inbound**: outbound streaming proxy-forward
+> (`OutboundRequest::from_request(ctx.into_request()?, ..)`) depends on the
+> `BodyCell`/`into_request()` contract defined here.
 
----
+## 1. Scope
 
-#### 3.4.2 Inbound request bodies
+The goal is to stop adapters from pre-buffering unbounded inbound bodies while preserving
+the existing `FromRequest::from_request(&RequestContext, ..)` extractor signature. A body
+is consumed from the platform at most once, bounded helpers cache successful bytes, and a
+partially consumed failed drain becomes sticky poison. This document does not define
+outbound response caps, outbound deadlines, or provider send behavior.
+
+The total `StoredError` match below targets the end-state `EdgeError` surface and therefore
+depends on the outbound error work landing first: `BudgetSource`, `BadGateway`,
+`GatewayTimeout`, and `ResponseTooLarge` are defined by the outbound design, not here. If
+the body-state migration is split across earlier commits, each commit must still compile
+against the variants present at that point; the final match covers all eleven.
+
+## 2. Bounded Context Helpers
 
 Wrap the existing `Body::into_bytes_bounded` with context-level helpers:
 
@@ -42,12 +60,9 @@ impl RequestContext {
 }
 ```
 
+## 3. Context and Adapter Migration
 
----
-
-#### 3.4.5 Inbound body migration
-
-The body-bound guarantee in §3.4.4 only holds if the adapter does not pre-buffer the
+The memory guarantee in §3.1 only holds if the adapter does not pre-buffer the
 inbound request body before core can apply a cap. Today every adapter pre-buffers
 (`crates/edgezero-adapter-axum/src/request.rs:24` buffers JSON with `usize::MAX`;
 `crates/edgezero-adapter-cloudflare/src/request.rs:60` calls `req.bytes()`;
@@ -110,8 +125,8 @@ the Fastly and Spin paths fully materialize the body too). This migration change
   enum StoredError {
       BadRequest         { message: String },
       BadGateway         { message: String },
-      GatewayTimeout     { message: String, cause: BudgetCause }, // carry the TYPED cause
-      ResponseTooLarge   { message: String }, // outbound over-cap (§3.4.1) — distinct kind
+      GatewayTimeout     { message: String, cause: BudgetSource }, // carry the TYPED cause
+      ResponseTooLarge   { message: String }, // outbound response over-cap — distinct kind
       Validation         { message: String },
       Internal           { rendered: String }, // ALREADY-rendered source; no re-prefixing
       ConfigOutOfDate    { message: String, field_path: String },
@@ -122,8 +137,9 @@ the Fastly and Spin paths fully materialize the body too). This migration change
       NotFound           { path: String },
       NotImplemented     { message: String }, // EdgeError has these too — a
       ServiceUnavailable { message: String }, // capture() claiming to be TOTAL must cover
- // ALL EdgeError variants: the 10 pre-existing PLUS `ResponseTooLarge` = 11 (and
- // `GatewayTimeout`'s `cause` round-trips). Miss one and the exhaustive match won't compile.
+ // ALL end-state EdgeError variants: the eight current baseline variants plus
+ // BadGateway, GatewayTimeout, and ResponseTooLarge = 11. GatewayTimeout's cause
+ // round-trips. Miss one and the exhaustive match won't compile.
   }
 
   impl StoredError {
@@ -148,14 +164,15 @@ the Fastly and Spin paths fully materialize the body too). This migration change
   error's `inner()` yields a fresh `anyhow::Error` carrying that string, not the original
   chain. Accepted trade: the alternatives are `EdgeError: Clone` (impossible without
   dropping `anyhow`) or `Rc<EdgeError>` on every accessor (an API wart for a
-  diagnostic-only benefit). Adapters needing the full chain log it before it poisons the
-  cell. *(A `BodyCell` drain only ever produces `bad_request` / `bad_gateway` /
+  diagnostic-only benefit). A platform stream that needs the original chain for
+  diagnostics must log at the stream-error production boundary, before yielding the typed
+  error. *(A `BodyCell` drain only ever produces `bad_request` / `bad_gateway` /
   `gateway_timeout` / `internal`; the structured variants are still covered so the enum
   is total and `capture` never needs a lossy fallback arm.)*
 
   **Cancelled drain.** A drain future dropped while `Draining` transitions the cell to
   `Poisoned(StoredError::Internal { rendered: "inbound body drain cancelled".into() })`
-  via a drop guard (§5.4), so a cancelled read is indistinguishable in shape from any
+  via a drop guard (§4), so a cancelled read is indistinguishable in shape from any
   other poison — the next access returns that stored error rather than silently
   re-reading a half-consumed body.
 
@@ -204,10 +221,9 @@ the Fastly and Spin paths fully materialize the body too). This migration change
      progress"))` rather than panicking; this would only occur in programmer-error
      scenarios but must not crash the host.
 
-  Tested in §5.4: drop-mid-drain → next call yields `cancelled` poison;
-  reentrant-during-drain → `internal` (no panic); successful drain → reentrant call
-  during drain is impossible because Phase 1 is non-async, so the test exercises the
-  paths a real async runtime can produce.
+  Tested in §4: a scripted stream first returns `Pending`, allowing a second accessor to
+  observe `Draining`; the second call returns `internal` without a panic, then the first
+  drain is either resumed to success or dropped to exercise cancellation poison.
 
 - **Public methods become coherent with the cache.** Their post-cache behaviour is
   explicit so middleware → handler → proxy-forward chains compose:
@@ -216,7 +232,7 @@ the Fastly and Spin paths fully materialize the body too). This migration change
   | --- | --- |
   | `method()` / `uri()` / `headers()` / `extensions()` | from `parts` — unaffected by body state |
   | `headers_mut()` / `extensions_mut()` | mutates `parts` — unaffected by body state |
-  | `parts() -> &http::request::Parts` / `parts_mut() -> &mut http::request::Parts` | direct access to the underlying `Parts` for middleware that needs the full snapshot; same body-state-irrelevance as the granular accessors above. These are the migration target for call sites currently doing `ctx.request()` / `ctx.request_mut()` (§6 sweep). |
+  | `parts() -> &http::request::Parts` / `parts_mut() -> &mut http::request::Parts` | direct access to the underlying `Parts` for middleware that needs the full snapshot; same body-state-irrelevance as the granular accessors above. These are the migration target for call sites currently doing `ctx.request()` / `ctx.request_mut()` (§5 sweep). |
   | `body_kind() -> BodyKind` | a non-consuming snapshot of the cell state — variants enumerated above (`Initial \| Draining \| Cached { len } \| Poisoned \| Taken`). There is **no** `body() -> &Body` / `body() -> Body` accessor — a `&Body` reference cannot span the cell's interior mutability, and a value-returning getter would either consume the stream (single-shot) or require a tee. Callers either buffer via `body_bytes`/`json_within` or consume via `take_body`/`into_request`. |
   | `take_body() -> Result<Body, EdgeError>` | consume the body out of the context: `Initial` → `Ok(Body::Stream(..))`, set state to `Taken`; `Cached(bytes)` → `Ok(Body::Once(bytes))`, set state to `Taken`; `Draining` → `Err(EdgeError::internal("body read in progress"))` (programmer error); `Poisoned(err)` → `Err(err.to_edge_error())`; `Taken` → `Ok(Body::empty())`. After a successful `take_body`, the body cannot be re-read or buffered. |
   | `body_bytes(max)` / `json_within(max)` / `form_within(max)` | from `Initial`: drains → `Cached`, returns clone (or → `Poisoned(err)` on drain failure, then returns that error). From `Cached`: re-validates `max` and returns a clone. From `Poisoned`: returns a fresh `EdgeError` reproduced from the stored error. From `Draining`: `Err(EdgeError::internal("body read in progress"))` — programmer error. From `Taken`: `Err(EdgeError::internal("body already consumed via take_body"))` — buffered helpers cannot resurrect a body that was handed out. |
@@ -277,11 +293,11 @@ is poisoned and every subsequent access (any cap) returns the stored error. The 
 about re-reading an intact cache at different caps. (The security property still holds:
 the *first* reader that actually drains sets the cache/poison; a cap check against an
 existing cache reveals nothing a caller couldn't compute from the already-materialized
-bytes.) §5.4 pins this: permissive read (caches) → stricter `body_bytes` (over-cap error,
+bytes.) §4 pins this: permissive read (caches) → stricter `body_bytes` (over-cap error,
 cell stays `Cached`) → permissive retry (succeeds) — asserting the stricter failure does
 **not** poison an intact cache.
 
-#### Inbound body memory bound
+### 3.1 Memory Bound
 
 *(Moved here from the outbound spec's §3.4.4 batch-memory model — this is the inbound-body
 half; the outbound spec keeps only the per-response and batch terms.)*
@@ -292,7 +308,7 @@ half; the outbound spec keeps only the per-response and batch terms.)*
   `max + sizeof(current_chunk)`, with the in-flight chunk source-controlled. Outbound's
   `OutboundResponse::into_bytes_bounded` mirrors this same accounting.
 
-#### `src/extractor.rs` migration
+### 3.2 Extractor Migration
 
 *(Moved here from the outbound spec's §7 file-by-file migration — this is inbound-only.)*
 
@@ -303,3 +319,43 @@ half; the outbound spec keeps only the per-response and batch terms.)*
   `pub const DEFAULT_INBOUND_JSON_BYTES: usize = 8 * 1024 * 1024;` and
   `pub const DEFAULT_INBOUND_FORM_BYTES: usize = 1 * 1024 * 1024;`.
 
+## 4. Test Plan
+
+Core tests use scripted local streams and `futures::executor::block_on`; they require no
+platform runtime or network.
+
+| Surface | Required assertions |
+| --- | --- |
+| Bounded drain | `Body::Once` and multi-chunk streams succeed at and below the cap; the first byte above the cap returns `bad_request` without unchecked accounting overflow. |
+| Successful cache | The platform stream is polled only once; repeated reads clone the same bytes. A permissive read followed by a stricter cached read returns an over-cap error while leaving the cell `Cached`; a later permissive read succeeds. |
+| Failed drain | Source error and initial-drain cap overflow transition to `Poisoned`; every later buffered accessor, `take_body`, and `into_request` reconstructs the same variant, status, message, and structured fields. The source is never polled again. |
+| Cancellation | A stream held at `Pending` leaves the cell `Draining`; dropping the first `body_bytes` future transitions it to the documented cancellation poison, and the next access returns that stored internal error. |
+| Reentrancy | While the first scripted drain is pending, a second body accessor returns `internal("body read already in progress")` without a `RefCell` panic. Resuming the first future can still complete and cache bytes. |
+| Consumption | `take_body` and `into_request` cover Initial, Cached, Draining, Poisoned, and Taken. Initial preserves a stream; Cached reassembles `Body::Once`; Taken deliberately produces an empty body only where specified. |
+| Extraction | JSON/form success, malformed input, default caps, explicit `Within` caps, and validator failures preserve their documented 400/validation behavior. Multiple extractors share the one cache. |
+| Stored errors | `StoredError::capture` exhaustively covers all end-state `EdgeError` variants. Round-trips preserve variant fields; `GatewayTimeout` preserves `BudgetSource`; `Internal` has the one documented source-chain loss without duplicating the `internal error:` prefix. |
+
+Each adapter contract test supplies a body stream whose first poll is observable and
+asserts that request conversion returns before that poll. The same adapter test then passes
+the converted core request through `RequestContext`, buffers it as middleware would, and
+reassembles it through `into_request`; the outbound-facing request receives the cached
+bytes unchanged. Tests must not substitute an already-buffered body for this lazy ingress
+assertion.
+
+## 5. File-by-File Change Summary
+
+- `crates/edgezero-core/src/context.rs`: split requests internally into private parts plus
+  `BodyCell`; add the state machine, bounded helpers, body-state accessors, `take_body`, and
+  fallible `into_request`; remove whole-request borrow accessors.
+- `crates/edgezero-core/src/extractor.rs`: route JSON/form extractors through bounded
+  helpers, add explicit-cap variants, and add the two public default constants.
+- `crates/edgezero-core/src/body.rs`: retain the core bounded-drain primitive used by the
+  context and use checked pre-append accounting if it has not already landed through the
+  outbound body work.
+- `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/request.rs`: stop eager body
+  collection and wrap each platform request body as a lazy `Body::Stream`; keep
+  `Body::Once` only when the platform already owns bounded bytes.
+- `crates/edgezero-core` call sites and tests: migrate `request()` / `request_mut()` users
+  to parts or body-specific accessors and update the now-fallible `into_request()` calls.
+- Adapter contract tests: prove lazy ingress as required by §4. No outbound send,
+  capability, or provider error-classification behavior is owned by this specification.

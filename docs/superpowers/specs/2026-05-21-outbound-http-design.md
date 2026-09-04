@@ -1,10 +1,10 @@
 # EdgeZero Outbound HTTP — Design Spec
 
-> **Status:** Draft, revised through review round 55 (round 55 = Fastly buffered-upload isolation, explicit stream-error constructors, absolute upload-boundary checks, and a concrete Spin exchange state machine) · **Date:** 2026-06-08
+> **Status:** Draft, revised through review round 56 (round 56 = current CLI dispatch coverage, pinned Spin RequestOptions errors, executable future-state acceptance, and a standalone inbound dependency) · **Date:** 2026-09-04
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). Relevant baseline changes are the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, expanded runtime `AdapterAction` variants, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the app-demo integration crate. Non-outbound store/config lifecycle changes remain outside this design.
-> **Current checkout (post-#269):** the CLI surface is now the #269 shape — `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`, `AdapterAction::{AuthLogin/Logout/Status, Build, Deploy, Serve}`, and the `edgezero_cli::adapter::execute(..)` dispatcher; `dev` is gone. This outbound spec gates only runtime production: `build` / `serve` / `deploy` through `execute(..)`, plus `demo` before Axum starts. Provisioning and config/store lifecycle policy belongs to its owning specifications (§3.5.3).
+> **Current checkout (post-#269 and staged-deploy work):** the CLI surface includes `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`; `Action` / `AdapterAction` additionally include `DeployStaged`, `EmitVersion`, `Healthcheck`, and `Rollback`; and adapter dispatch has both `execute(..)` and `execute_capture(..)` entry points. `dev` is gone. This outbound spec gates construction/deployment of the current runtime: `build` / `serve` / `deploy` / `deploy --staging` through both dispatch entry points, plus `demo` before Axum starts. Operational auth/version/health/rollback actions and provisioning/config/store lifecycle policy are exempt or belong to their owning specifications (§3.5.3).
 > **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape, §5.4 capability tests, and the §7 `edgezero-cli` migration bullet. The §3.5.3 + §7 active text is authoritative.
 
 ## 1. Overview
@@ -2947,47 +2947,99 @@ exact downstream-wire length where Workers owns framing.
 #### 3.5.3 Build / startup enforcement
 
 `ensure_capabilities` is an **outbound runtime gate**, not the owner of every CLI lifecycle.
-It runs in two places: before shell or registry dispatch for `build` / `serve` / `deploy`,
-and before the Axum `demo` runtime starts. The `execute(..)` gate is above the shell-command
-branch so a shell override cannot bypass a required outbound capability; it branches on the
-action so `auth *` remains exempt. `provision` and every `config` subcommand are outside
-this outbound specification. Their owning store/capability specifications decide whether
-they participate in any broader cross-capability gate.
+It runs before shell or registry dispatch for `build` / `serve` / `deploy` /
+`deploy --staging`, and before the Axum `demo` runtime starts. Both public adapter
+dispatch entry points, `execute(..)` and `execute_capture(..)`, call the same action-aware
+gate **before** inspecting a manifest shell override. This is required because
+`execute_capture(..)` owns a separate `run_shell_tee(..)` branch and can otherwise bypass
+a gate placed only in `execute(..)`. `auth *`, `EmitVersion`, `Healthcheck`, and `Rollback`
+are operational actions rather than construction/deployment of the current manifest's
+runtime and remain exempt; the latter three may be invoked without any manifest contract.
+`provision` and every `config` subcommand are outside this outbound specification. Their
+owning store/capability specifications decide whether they participate in any broader
+cross-capability gate.
 
 ```rust
-// 1. crates/edgezero-cli/src/adapter.rs — inside execute(..), BEFORE manifest_command
-// and BEFORE the registry lookup. NOT unconditional: auth is EXEMPT (credential
-// class), so the gate branches on the action.
+// crates/edgezero-cli/src/adapter.rs
+// Keep the action classification exhaustive over today's Action variants. A newly added
+// action must be deliberately classified here; it must not inherit an accidental default.
+fn produces_current_runtime(action: Action) -> bool {
+    match action {
+        Action::Build | Action::Deploy | Action::DeployStaged | Action::Serve => true,
+        Action::AuthLogin
+        | Action::AuthLogout
+        | Action::AuthStatus
+        | Action::EmitVersion
+        | Action::Healthcheck
+        | Action::Rollback => false,
+    }
+}
+
+fn ensure_action_capabilities(
+    adapter_name: &str,
+    action: Action,
+    manifest_loader: Option<&ManifestLoader>,
+) -> Result<(), String> {
+    if produces_current_runtime(action) {
+        ensure_capabilities(
+            adapter_name,
+            ManifestContract::from_opt(manifest_loader.map(ManifestLoader::manifest)),
+        )?;
+    }
+    Ok(())
+}
+
+// Public dispatch path 1. Gate BEFORE manifest_command and registry lookup.
 pub fn execute(
     adapter_name: &str,
     action: Action,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
 ) -> Result<(), String> {
- // Runtime-producing actions only. Auth* is exempt — a runtime capability
- // mismatch must never block credential login/logout/status.
-    if matches!(action, Action::Build | Action::Serve | Action::Deploy) {
- // file-backed: local borrow -> ManifestContract::Present / None (no 'static needed)
-        ensure_capabilities(adapter_name, ManifestContract::from_opt(manifest_loader.map(|l| l.manifest())))?;  // site 1
-    }
- // …existing shell-command / registry dispatch follows…
+    ensure_action_capabilities(adapter_name, action, manifest_loader)?;
+    // Existing shell-command / registry dispatch follows. The registered-adapter branch
+    // lives in a private helper so execute_capture can reuse it without gating twice.
+    execute_after_gate(adapter_name, action, manifest_loader, adapter_args)
 }
 
-// 2. crates/edgezero-cli/src/demo_server.rs — no manifest FILE exists; read the
+// Public dispatch path 2. This owns a distinct shell/tee branch, so it MUST gate too.
+pub fn execute_capture(
+    adapter_name: &str,
+    action: Action,
+    manifest_loader: Option<&ManifestLoader>,
+    adapter_args: &[String],
+) -> Result<Option<String>, String> {
+    ensure_action_capabilities(adapter_name, action, manifest_loader)?;
+    if let Some(loader) = manifest_loader
+        && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
+    {
+        // Existing root/environment/bind setup remains unchanged.
+        return run_shell_tee(command, /* existing arguments */).map(Some);
+    }
+    // Call the private already-gated registry path, NOT public execute(..): calling the
+    // public entry point would duplicate optional-capability warnings. Keep passing the
+    // loader so existing missing-adapter diagnostics preserve manifest-present/absent.
+    execute_registered_after_gate(adapter_name, action, manifest_loader, adapter_args)?;
+    Ok(None)
+}
+
+// crates/edgezero-cli/src/demo_server.rs — no manifest FILE exists; read the
 // manifest baked in by `app!` (Hooks::manifest).
 #[cfg(feature = "demo-example")]
 pub fn run_demo() -> Result<(), String> {
  // baked ('static): BakedManifest -> ManifestContract via as_contract
-    ensure_capabilities("axum", <App as Hooks>::manifest().as_contract())?;         // site 2
+    ensure_capabilities("axum", <App as Hooks>::manifest().as_contract())?;
     /* …Axum runner… */
 }
 
 ```
 
 `run_demo` is feature-gated (`demo-example`) and always selects Axum implicitly, so its
-gate hardcodes the adapter name and reads the **baked** manifest rather than a file.
-Sites 1–2 are exhaustive for the outbound runtime gate; unrelated CLI lifecycles are
-deliberately absent.
+gate hardcodes the adapter name and reads the **baked** manifest rather than a file. The
+two adapter dispatch entry points plus `run_demo` are exhaustive for the outbound runtime
+gate; unrelated CLI lifecycles are deliberately absent. The exact private-helper split may
+follow the current module, but the invariant is normative: each public dispatch path gates
+exactly once before either shell or registry work.
 
 `ensure_capabilities` itself reads from the **registry** (not from `Adapter::execute`)
 because capability metadata is the trait fact `capability(Capability) ->
@@ -3019,14 +3071,16 @@ before they've written the adapter stub). An app that declares a **required** ca
 needs a registered adapter that can answer the `capability(Capability) ->
 CapabilitySupport` question; there is no silent bypass of a required contract.
 
-Commands covered by the two outbound gate sites above:
+Commands covered by the outbound gate sites above:
 
-| PR-#269 command | Entry point | Gate site |
+| Command/action | Entry point | Gate site |
 | --- | --- | --- |
 | `edgezero build` | `run_build` → `execute(Action::Build, ..)` | `execute(..)` — **gated** |
 | `edgezero serve` | `run_serve` → `execute(Action::Serve, ..)` | `execute(..)` — **gated** |
-| `edgezero deploy` | `run_deploy` → `execute(Action::Deploy, ..)` | `execute(..)` — **gated** |
-| `edgezero auth login` / `logout` / `status` | `run_auth` → `execute(Action::AuthLogin/Logout/Status, ..)` | **EXEMPT** (credential + read-only class). The `execute(..)` gate must **branch on the action** and skip the `Auth*` actions. |
+| `edgezero deploy` | `run_deploy` → `execute(Action::Deploy, ..)` or, for captured Fastly output, `execute_capture(Action::Deploy, ..)` | whichever public dispatcher is selected — **gated before its shell branch** |
+| `edgezero deploy --staging` | `run_deploy` → `execute(Action::DeployStaged, ..)` | `execute(..)` — **gated** |
+| `edgezero auth login` / `logout` / `status` | `run_auth` → `execute(Action::AuthLogin/Logout/Status, ..)` | **EXEMPT** (credential + read-only class) |
+| version emission / healthcheck / rollback | `execute(Action::EmitVersion/Healthcheck/Rollback, ..)` | **EXEMPT** — operational follow-up or service-lifecycle actions; some have no manifest loader, and they do not construct/deploy the current manifest's runtime |
 | `edgezero demo` (feature `demo-example`) | `run_demo` → Axum runner. `run_demo()` takes **no path or loader** and reads no manifest file, so a file-based gate is impossible. **Locked resolution — gate on baked manifest metadata via a new `Hooks` accessor** (see below) | `run_demo()` calls `ensure_capabilities("axum", <App as Hooks>::manifest().as_contract())` before the Axum runner starts |
 
 **The `demo` gate needs a baked-manifest accessor — `app!` must emit one.**
@@ -3422,7 +3476,8 @@ pub(crate) fn ensure_capabilities(
 
 **Manifest-discovery invariant — `None` must mean "no manifest exists," NOT "none in the
 current directory."** `ManifestContract::None → proceed` is only safe if a file-backed
-runtime-producing command (`build` / `serve` / `deploy`) cannot reach the gate with `None`
+runtime-producing command (`build` / `serve` / `deploy` / `deploy --staging`) cannot
+reach the gate with `None`
 **while a real `edgezero.toml` exists at the project root**.
 Today the CLI resolves the default manifest as `./edgezero.toml` (cwd-relative), but the
 Spin adapter independently walks **upward** for `spin.toml` — so `edgezero build --adapter
@@ -3463,10 +3518,11 @@ impl ResolvedManifest {
 The loader is the feasible owned type: it already owns the non-`Clone` `Manifest` behind a
 private `Arc` and exposes `manifest() -> &Manifest`. Each of `run_build`, `run_serve`, and
 `run_deploy` binds one resolved value and passes
-`resolved.as_ref().map(|item| &item.loader)` into the existing `execute(..)` API; `execute`
-derives `ManifestContract` from that same loader and performs the single gate shown above.
-The `run_*` entry points do not gate a second time. There is no extraction or clone of
-`Manifest` and no second parse. Precedence is
+`resolved.as_ref().map(|item| &item.loader)` into `execute(..)` or
+`execute_capture(..)`; the selected public dispatcher derives `ManifestContract` from
+that same loader and performs the single gate shown above. The `run_*` entry points do not
+gate a second time, and an `execute_capture(..)` registry fallback does not re-enter public
+`execute(..)`. There is no extraction or clone of `Manifest` and no second parse. Precedence is
 `EDGEZERO_MANIFEST` verbatim, otherwise upward discovery from cwd, otherwise genuine
 `Ok(None)`. §5.4 runs each of the three actions from a nested subdirectory under both an
 upward-discovered root and an explicit `EDGEZERO_MANIFEST` path.
@@ -4693,9 +4749,12 @@ service — this distinction is explicit so a green capability check is not misr
       )))
   });
 
-  // The wasip3 option/request setters return `Result<(), ()>` (unit error), so bare `?`
-  // does NOT compile in an `EdgeError`-returning context; map `()` concretely.
-  let bad = |()| EdgeError::internal(anyhow::anyhow!("invalid outbound request component"));
+  // The pinned wasip3 API has TWO error shapes. Request component setters return
+  // `Result<(), ()>`; RequestOptions timer setters return
+  // `Result<(), types::RequestOptionsError>`. Do not route both through one closure.
+  let bad_request_component = |()| {
+      EdgeError::internal(anyhow::anyhow!("invalid outbound request component"))
+  };
   let opts = types::RequestOptions::new();
   // Set every available host transport/response timer from a nonzero nanosecond
   // snapshot of the remaining effective budget. Ignoring a setter result or leaving
@@ -4714,16 +4773,47 @@ service — this distinction is explicit so a green capability check is not misr
           "outbound deadline exceeds WASI duration range"
       )))?
       .max(1);
-  opts.set_between_bytes_timeout(Some(transport_ns)).map_err(bad)?;
-  opts.set_connect_timeout(Some(transport_ns)).map_err(bad)?;
-  opts.set_first_byte_timeout(Some(transport_ns)).map_err(bad)?;
+  let mut unsupported_timer_option = false;
+  let mut apply_timer_option = |option_result| {
+      match option_result {
+          Ok(()) => Ok(()),
+          // WASI explicitly permits a host not to implement an option. The outer
+          // monotonic race still provides the guest-visible deadline, so this is the
+          // documented BestEffort fallback rather than a request-fatal 500.
+          Err(types::RequestOptionsError::NotSupported) => {
+              unsupported_timer_option = true;
+              Ok(())
+          }
+          Err(types::RequestOptionsError::Immutable) => Err(EdgeError::internal(
+              anyhow::anyhow!(
+                  "WASI outbound request options unexpectedly immutable"
+              ),
+          )),
+          Err(types::RequestOptionsError::Other(detail)) => Err(EdgeError::internal(
+              anyhow::anyhow!(
+                  "WASI outbound request option failed: {detail:?}"
+              ),
+          )),
+      }
+  };
+  apply_timer_option(opts.set_between_bytes_timeout(Some(transport_ns)))?;
+  apply_timer_option(opts.set_connect_timeout(Some(transport_ns)))?;
+  apply_timer_option(opts.set_first_byte_timeout(Some(transport_ns)))?;
+  if unsupported_timer_option {
+      log::warn!(
+          "Spin host does not support one or more WASI HTTP timeout options; \
+           retaining the outer EdgeZero deadline race"
+      );
+  }
 
   // Bound as `wasi_req`, NOT `req` — the WASI request must not shadow the OUTBOUND
   // request `req`, whose `max_request_body_bytes` / `body` we read below.
   let (wasi_req, request_done) =
       types::Request::new(headers, Some(contents_rx), trailers_rx, Some(opts));
-  wasi_req.set_method(&method).map_err(bad)?;   wasi_req.set_scheme(scheme.as_ref()).map_err(bad)?;
-  wasi_req.set_authority(auth).map_err(bad)?;   wasi_req.set_path_with_query(pq).map_err(bad)?;
+  wasi_req.set_method(&method).map_err(bad_request_component)?;
+  wasi_req.set_scheme(scheme.as_ref()).map_err(bad_request_component)?;
+  wasi_req.set_authority(auth).map_err(bad_request_component)?;
+  wasi_req.set_path_with_query(pq).map_err(bad_request_component)?;
 
  // The pump lives INSIDE the raced future — no `wit_bindgen::spawn`.
  // `max_req` gates the cap by BODY KIND, matching the portable contract
@@ -4926,10 +5016,14 @@ service — this distinction is explicit so a green capability check is not misr
   **`RequestOptions` do not bound the upload.** WASI 0.3 keeps `set-connect-timeout` /
   `set-first-byte-timeout` / `set-between-bytes-timeout`, but these are transport /
   response-side only — the WIT states they are *"separate from any the user may use to
-  bound an asynchronous call."* They are **not** a substitute for the race above. Set all
-  three to the ceiled remaining effective budget, check every setter result, and let the
-  re-read raced timer own the absolute deadline. No host-default response timer remains
-  that can fire independently of the configured dispatch budget.
+  bound an asynchronous call."* They are **not** a substitute for the race above. Attempt
+  to set all three to the ceiled remaining effective budget and classify every
+  `RequestOptionsError`: `NotSupported` logs one degradation warning and proceeds under
+  the authoritative outer race; `Immutable` and `Other(..)` are internal setup failures.
+  When all three are accepted, no host-default response timer can fire independently of
+  the configured dispatch budget. When one is unsupported, the already-declared Spin
+  BestEffort deadline limitation covers host-side teardown/default-timer behavior; the
+  guest still observes the outer race's attributed 504.
 
   **This applies to STREAMED response mode ONLY.** In **Buffered** mode `to_core` already
   drained the full response body **inside** `exchange` (bounded by the outer deadline race),
@@ -5113,7 +5207,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 
 | Surface | Required assertions |
 | --- | --- |
-| Capability metadata | All four adapters return the exact seven cells in §3.5.2, including Cloudflare header fidelity = BestEffort and Spin deadline/upload = BestEffort; unknown future capabilities fail closed as Unsupported. |
+| Capability metadata | All four adapters return the exact seven known cells in §3.5.2, including Cloudflare header fidelity = BestEffort and Spin deadline/upload = BestEffort. A fixture adapter that relies on the trait default returns Unsupported. Because each adapter crate matches core's non-exhaustive `Capability` enum across a crate boundary, normal adapter compilation requires a wildcard; review asserts that its result is `_ => Unsupported`. A hypothetical future variant is a structural fail-closed invariant, not a value current Rust code can safely construct at runtime. |
 | Request conversion | Method/body/headers/canonical authority survive conversion; normalized hop-by-hop fields cannot reappear; buffered and streamed request caps map to 400. Typed `EdgeError` request chunks survive adapter conversion; in-tree paths never route them through `from_external_stream`. |
 | Response conversion | Every adapter normalizes raw headers before decode/cap logic, passes the originating method into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. |
 | Header fidelity | Axum/Fastly/Spin exercise raw malformed nomination and encoding lines; Cloudflare tests the visible-string baseline and does not assert unavailable octets/line boundaries. Cloudflare encoded passthrough uses `EncodeBody::Manual`; its streamed downstream `Content-Length` is asserted only to the documented BestEffort scope. |
@@ -5125,12 +5219,12 @@ Each adapter crate tests its shipped conversion and classification seams.
 | Streamed request deadline boundary | Axum and Cloudflare check expiry before every pull and after every ready source result. Fake-time streams cover a chunk, EOF, and source error becoming ready exactly at expiry, plus an always-ready sequence of empty chunks; every case returns the attributed 504 and cannot starve the timer. |
 | Timeout provenance | Each adapter's actual timed-out result covers timeout-wins, deadline-wins, and synthetic-default input selection in single send, buffered fan-out, and streamed error chunks; no adapter emits a bare un-attributed budget timeout. |
 | Fastly stages | Backend identity/canonical host/TLS/SNI inputs, phase-timer rounding, cold registration, serial harvest, and streamed-upload cooperative checks match §4.3. The feature-gated overhead seam proves the slack invariant. `SendFailure` exhaustively maps timeout -> attributed 504, transport/protocol -> 502, local invariants -> 500, and the separately named Fastly platform-internal class -> 500. |
-| Spin request protocol | Exercise every `run_exchange` transition and ownership boundary: after full upload, `send` continues to be polled but a ready result is retained until `request_done` succeeds; a `request_done` error wins over that stored result and is mapped; reader-gone retains but never polls `request_done` until `send` resolves, then drops it before response conversion; send-first drops all request handles; clean EOF/reader-gone writes `Ok(None)` trailers; source/cap/deadline failure leaves the default `Err`. Biased simultaneous readiness makes an already-ready pump failure beat `send`, while send ready before a later source failure remains authoritative. An always-ready empty-chunk source yields between chunks so send/timer polling cannot starve, and no request-side handle enters a streamed response wrapper. |
+| Spin request protocol | Exercise every `run_exchange` transition and ownership boundary: after full upload, `send` continues to be polled but a ready result is retained until `request_done` succeeds; a `request_done` error wins over that stored result and is mapped; reader-gone retains but never polls `request_done` until `send` resolves, then drops it before response conversion; send-first drops all request handles; clean EOF/reader-gone writes `Ok(None)` trailers; source/cap/deadline failure leaves the default `Err`. Biased simultaneous readiness makes an already-ready pump failure beat `send`, while send ready before a later source failure remains authoritative. An always-ready empty-chunk source yields between chunks so send/timer polling cannot starve, and no request-side handle enters a streamed response wrapper. RequestOptions tests cover all setters accepted, any setter NotSupported (warn once and retain the outer race), Immutable, and Other. |
 | Spin response protocol | `consume_body` receives the caller-result reader; stream/trailer handles retain the writer; clean EOF/trailers writes `Ok`; body/decode/deadline failure writes or defaults to `Err`; no handle is dropped before its terminal branch. |
 | Spin error classifier | Enumerate every pinned `ErrorCode`. The five timeout variants -> attributed 504; caller-controlled request denied/body/URI/header-size variants -> 400; demonstrated length/method/URI/trailer/config invariants -> 500; upstream/transport/protocol and host `InternalError` -> 502. Test both `client::send` and `request_done` mapping sites. |
 | Spin timer | Timer selection returns guest-visible 504 and drops owned guest handles. Tests do **not** claim bounded host teardown; that remains Tier 3 characterization and an upgrade criterion. |
 | Simultaneous terminal race | For decoder, transport, and Spin exchange seams, a result becoming ready at the absolute deadline yields attributed 504 whether the competing result is success or error. |
-| CLI runtime gates | Table-drive the full ladder: required Native/BoundedCooperative succeeds; required BestEffort/Unsupported/future support fails; optional degradation warns and proceeds. Cover missing-registry empty, optional-only, and required manifests; `ManifestContract::None` proceeds while Malformed/future state fails closed. Build/serve/deploy gate before shell dispatch and demo before startup; auth remains exempt. Provision/config commands are outside this spec and are not asserted. |
+| CLI runtime gates | Table-drive every constructible ladder state: required Native/BoundedCooperative succeeds; required BestEffort/Unsupported fails; optional degradation warns and proceeds. Cover missing-registry empty, optional-only, and required manifests; `ManifestContract::None` proceeds while Malformed fails closed. Normal CLI compilation matches core's non-exhaustive `CapabilitySupport` and `ManifestContract` across the crate boundary and therefore requires wildcard arms; review asserts that required-support and contract wildcards return errors, while the optional-support wildcard warns. Hypothetical future variants are not fabricated with unsafe runtime construction. Build/serve/deploy/deploy-staged gate before shell dispatch through both `execute` and `execute_capture`, and demo gates before startup. Auth/version/healthcheck/rollback remain exempt. Provision/config commands are outside this spec and are not asserted. |
 | Manifest resolver | Build, serve, and deploy from a nested cwd discover the root `edgezero.toml`; `EDGEZERO_MANIFEST` wins verbatim; absence is `Ok(None)`; malformed found input fails; the same owned `ManifestLoader` reaches gate and execution. |
 | Spin host drift | Build/serve/deploy compare canonicalized sets before shell dispatch. Equivalent spelling/order passes; actual drift fails with the expected canonical list. Rendering `None`/`https://*:*` must not produce bare `*` or any `http` atomic; explicit input `*` produces the two scheme-specific entries. |
 
@@ -5166,6 +5260,14 @@ Integration tests that need deterministic adapter states use a narrowly feature-
 the library's `cfg(test)` items. Seams inject clocks, transport results, or documented
 adapter-stage delays; they do not duplicate the behavior being tested or expose platform
 SDK types to core Tier 1 tests.
+
+`#[non_exhaustive]` future variants are a special case: stable Rust cannot safely construct
+a variant that does not exist in the pinned enum. Tests therefore exercise every known
+state; normal cross-crate compilation forces the production wildcard arms, and review pins
+their fail-closed result (`Unsupported` or an error). They must not use `unsafe` discriminant
+fabrication or add test-only public enum variants, which would alter serialization and the
+macro crate's textually included manifest definitions. When a real variant is added, it
+becomes a normal table-driven case in the same change.
 
 Required gates for implementation changes:
 
@@ -5234,10 +5336,11 @@ Outbound-facing changes:
 - `Adapter` gains the defaulted `capability()` method. Each in-tree adapter returns all
   seven matrix values and ends its non-exhaustive match with
   `_ => CapabilitySupport::Unsupported`.
-- Capability enforcement has two outbound runtime sites: `execute(..)` gates
-  `build` / `serve` / `deploy` before shell or registry dispatch, and `run_demo`
-  gates the Axum demo from its baked manifest. `auth *`, provision, and config commands
-  are not changed by this outbound specification.
+- Capability enforcement covers both adapter dispatch entry points: `execute(..)` and
+  `execute_capture(..)` share one helper that gates `build` / `serve` / `deploy` /
+  `deploy --staging` exactly once before shell or registry dispatch, and `run_demo` gates
+  the Axum demo from its baked manifest. `auth *`, version emission, healthcheck,
+  rollback, provision, and config commands are not changed by this outbound specification.
 - Build/serve/deploy share `resolve_root_manifest`; `ResolvedManifest` owns a
   `ManifestLoader`, is used for both gating and execution, and is never reparsed.
 - Scaffolding, `examples/app-demo`, and public proxying docs migrate to the renamed
@@ -5314,10 +5417,16 @@ the durable anchors.
 
 **`crates/edgezero-adapter`**
 
+- `Cargo.toml` adds `edgezero-core = { workspace = true }`. The registry trait's
+  public `capability(Capability) -> CapabilitySupport` signature uses types owned and
+  re-exported by core, so the adapter crate can no longer remain dependency-free from
+  `edgezero-core`. This creates no cycle: core depends on macros, while neither core nor
+  macros depends on `edgezero-adapter`.
 - `src/registry.rs` adds the defaulted `Adapter::capability()` method. In-tree
   overrides return all seven outbound matrix cells and use a final
-  `_ => Unsupported` arm for the non-exhaustive enum. No store/provision API changes
-  belong to this spec.
+  `_ => Unsupported` arm for the non-exhaustive enum. Update the trait rustdoc that
+  currently promises the crate remains dependency-free from core. No store/provision
+  API changes belong to this spec.
 
 **`crates/edgezero-adapter-{axum,cloudflare,fastly,spin}`**
 
@@ -5374,10 +5483,11 @@ Adapter-specific work:
 **`crates/edgezero-cli`**
 
 - The `run_build`, `run_serve`, and `run_deploy` command entry points call the shared root
-  resolver once and pass the resulting loader to `src/adapter.rs::execute`.
-  `execute` gates only `Build` / `Serve` / `Deploy` before its shell-command branch and
-  registry lookup, using that same loader; it does not rediscover or reparse. Auth actions
-  bypass the runtime gate.
+  resolver once and pass the resulting loader to `src/adapter.rs::execute` or
+  `execute_capture`. A shared private action gate runs exactly once at the start of both
+  public dispatch functions and gates `Build` / `Serve` / `Deploy` / `DeployStaged`
+  before either function's shell-command branch or registry lookup. It does not rediscover
+  or reparse. Auth, `EmitVersion`, `Healthcheck`, and `Rollback` bypass the runtime gate.
 - `src/manifest_source.rs` (or the existing manifest-loading module) adds
   `ManifestSource::{EnvVar, Defaulted}`, `ResolvedManifest { path, loader }`, and
   upward root discovery. A found malformed manifest is an error; genuine absence is

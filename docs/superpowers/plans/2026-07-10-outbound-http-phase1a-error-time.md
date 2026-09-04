@@ -14,7 +14,7 @@ change `Body`, `proxy`, or an adapter while landing the error/time primitives.
 
 **Tech Stack:** Rust 1.95 (edition 2024), `thiserror`, `serde_json`, `web-time` (for `Instant`), `futures::executor::block_on` for async tests.
 
-## Global Constraints (inherited from the master plan)
+## Global Constraints (from the master design and phase index)
 
 - **WASM-first:** no `tokio`/runtime deps; use `web-time::Instant`, not `std::time::Instant`. Core stays `default-features = false`.
 - **Colocated tests** (`#[cfg(test)]` same file); async tests use `futures::executor::block_on`.
