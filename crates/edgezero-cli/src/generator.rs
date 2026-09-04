@@ -660,7 +660,7 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
         lines.push("fastly 15.1.0".to_owned());
         lines.push("viceroy 0.17.0".to_owned());
     }
-    lines.push("rust 1.95.0".to_owned());
+    lines.push("rust 1.98.1".to_owned());
     // Sort + dedup so the file is stable regardless of adapter
     // declaration order (and asdf doesn't care).
     lines.sort();
@@ -869,13 +869,33 @@ mod tests {
     // ---------- build_tool_versions ----------
 
     #[test]
+    fn build_tool_versions_rust_pin_tracks_repo_tool_versions() {
+        // `build_tool_versions` hardcodes the versions it emits, and the
+        // scaffolded app is expected to build on the same toolchain this
+        // repo does. Without this check the two drift silently: the repo
+        // bumps `.tool-versions` and every newly generated app keeps
+        // pinning the superseded release.
+        let repo_tool_versions =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.tool-versions"));
+        let want = repo_tool_versions
+            .lines()
+            .find(|line| line.starts_with("rust "))
+            .expect("repo .tool-versions must pin rust");
+        let got = build_tool_versions(&[]);
+        assert!(
+            got.contains(want),
+            "scaffold pins a different rust than the repo: scaffold={got:?} repo={want:?}"
+        );
+    }
+
+    #[test]
     fn build_tool_versions_pins_rust_only_with_no_adapters() {
         // The scaffolder always picks at least axum in practice,
         // but the empty case is the trust boundary: zero adapters
         // produces a stable file containing exactly the
         // rust-toolchain pin and a trailing newline.
         let out = build_tool_versions(&[]);
-        assert_eq!(out, "rust 1.95.0\n");
+        assert_eq!(out, "rust 1.98.1\n");
     }
 
     #[test]
@@ -885,7 +905,7 @@ mod tests {
         // repo's own `.tool-versions` pins).
         let out = build_tool_versions(&["cloudflare".to_owned()]);
         assert!(out.contains("nodejs 24.12.0"), "must pin nodejs: {out}");
-        assert!(out.contains("rust 1.95.0"), "always pin rust: {out}");
+        assert!(out.contains("rust 1.98.1"), "always pin rust: {out}");
         assert!(
             !out.contains("fastly"),
             "no fastly pin without fastly adapter: {out}"
@@ -903,7 +923,7 @@ mod tests {
         let out = build_tool_versions(&["fastly".to_owned()]);
         assert!(out.contains("fastly 15.1.0"), "must pin fastly: {out}");
         assert!(out.contains("viceroy 0.17.0"), "must pin viceroy: {out}");
-        assert!(out.contains("rust 1.95.0"));
+        assert!(out.contains("rust 1.98.1"));
         assert!(
             !out.contains("nodejs"),
             "no nodejs pin without cloudflare adapter: {out}"
@@ -916,7 +936,7 @@ mod tests {
         // needed — same as the "no adapters" shape but exercised
         // through the realistic axum-only case.
         let out = build_tool_versions(&["axum".to_owned()]);
-        assert_eq!(out, "rust 1.95.0\n");
+        assert_eq!(out, "rust 1.98.1\n");
     }
 
     #[test]
@@ -926,7 +946,7 @@ mod tests {
         // we can't honour — explain why with an inline hint so the
         // operator isn't left guessing.
         let out = build_tool_versions(&["spin".to_owned()]);
-        assert!(out.contains("rust 1.95.0"));
+        assert!(out.contains("rust 1.98.1"));
         assert!(
             !out.contains("spin "),
             "must NOT pin spin via asdf shape: {out}"
@@ -956,7 +976,7 @@ mod tests {
             "nodejs 24.12.0",
             "fastly 15.1.0",
             "viceroy 0.17.0",
-            "rust 1.95.0",
+            "rust 1.98.1",
         ] {
             assert_eq!(
                 out.matches(pin).count(),

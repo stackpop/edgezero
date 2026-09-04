@@ -154,6 +154,13 @@ pub_with_shorthand = "allow"
 # names cannot be deprefixed without losing meaning.
 module_name_repetitions = "allow"
 
+# `inline_modules` (new in clippy 1.98) flags every `#[cfg(test)] mod tests
+# { .. }` block -- 77 of them workspace-wide. CLAUDE.md mandates the
+# opposite ("Colocate tests with implementation modules"), and splitting
+# each into a sibling `tests.rs` would separate every test from the code
+# it covers for no readability gain. Colocation wins.
+inline_modules = "allow"
+
 # `pattern_type_mismatch` and `ref_patterns` are mutually exclusive in modern
 # Rust — every `if let Some(x) = &foo` flags the first, every
 # `*foo { Variant(ref x) => ... }` flags the second. We pick match-ergonomics.

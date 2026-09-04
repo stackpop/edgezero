@@ -1284,13 +1284,16 @@ fn sort_keys_recursive(value: &serde_json::Value) -> serde_json::Value {
 /// in production) so operators can pipe through `git diff` colour
 /// wrappers. Informational messages go to stderr via `eprintln!` in the
 /// caller. Never `log::*` — prefixes corrupt TTY renders and `jq` consumers.
-pub(crate) fn print_unified_diff_to_writer<W: Write>(
+pub(crate) fn print_unified_diff_to_writer<W>(
     remote_data: &serde_json::Value,
     local_data: &serde_json::Value,
     remote_sha: &str,
     local_sha: &str,
     out: &mut W,
-) -> Result<(), IoError> {
+) -> Result<(), IoError>
+where
+    W: Write,
+{
     let remote_text = render_for_diff(remote_data);
     let local_text = render_for_diff(local_data);
     let diff = TextDiff::from_lines(&remote_text, &local_text);
@@ -1722,7 +1725,10 @@ fn collect_secret_leaves<'raw>(
 /// runtime store ids, not flat-namespace candidates) so adapters
 /// whose secret store has a flat-namespace constraint (Spin) can
 /// detect within-secrets collisions.
-fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+fn run_adapter_typed_checks<C>(ctx: &ValidationContext) -> Result<(), String>
+where
+    C: AppConfigMeta,
+{
     let default_store_id = ctx
         .manifest()
         .stores
@@ -1764,10 +1770,10 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
 // Typed secret checks
 // -------------------------------------------------------------------
 
-fn typed_secret_checks<C: AppConfigMeta>(
-    _typed: &C,
-    ctx: &ValidationContext,
-) -> Result<(), String> {
+fn typed_secret_checks<C>(_typed: &C, ctx: &ValidationContext) -> Result<(), String>
+where
+    C: AppConfigMeta,
+{
     for field in C::secret_fields() {
         for leaf in collect_secret_leaves(&ctx.raw_config, &field)? {
             let label = leaf.label;

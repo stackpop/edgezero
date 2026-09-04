@@ -82,11 +82,12 @@ pub struct ServiceConfig {
 mod tests {
     use super::*;
     use edgezero_core::app_config::{
-        load_app_config, load_app_config_with_options, AppConfigLoadOptions, AppConfigMeta as _,
-        SecretKind,
+        AppConfigLoadOptions, AppConfigMeta as _, SecretKind, load_app_config,
+        load_app_config_with_options,
     };
-    use std::env;
+    use edgezero_core::test_env::{EnvOverride, env_lock};
     use std::path::PathBuf;
+    use std::sync::PoisonError;
 
     /// Resolve `examples/app-demo/app-demo.toml` from this test file's
     /// directory — `CARGO_MANIFEST_DIR` for `app-demo-core` is
@@ -189,13 +190,14 @@ timeout_ms = 50
         // affected by this var. The key is otherwise unique to this
         // test.
         const KEY: &str = "APP_DEMO__SERVICE__TIMEOUT_MS";
-        env::set_var(KEY, "2500");
+        let _guard = env_lock().lock().unwrap_or_else(PoisonError::into_inner);
+        // Restores the previous value on drop, so a failed assertion below
+        // cannot leak the override into another test.
+        let _override = EnvOverride::set(KEY, "2500");
 
         let path = app_demo_toml_path();
         let cfg = load_app_config::<AppDemoConfig>(&path, "app-demo")
             .expect("load with env-overlay override");
-
-        env::remove_var(KEY);
 
         assert_eq!(cfg.service.timeout_ms, 2500);
         // Unrelated keys keep their on-disk values.

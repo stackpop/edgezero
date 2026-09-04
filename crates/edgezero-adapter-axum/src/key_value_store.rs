@@ -157,7 +157,10 @@ impl PersistentKvStore {
     /// # Errors
     /// Returns an error if the database file cannot be opened or initialised (corrupted file, locked by another process, or insufficient permissions).
     #[inline]
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, KvError> {
+    pub fn new<P>(path: P) -> Result<Self, KvError>
+    where
+        P: AsRef<Path>,
+    {
         let db_path = path.as_ref().display().to_string();
         let db = Database::create(path).map_err(|err| {
             KvError::Internal(anyhow::anyhow!(
@@ -220,12 +223,18 @@ impl KvStore for PersistentKvStore {
             .open_table(KV_TABLE)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open table: {err}")))?;
 
-        if let Some(entry) = table
+        // Copy the value out and end the `AccessGuard` borrow before the
+        // transaction is dropped: redb tracks live read references per page and
+        // asserts none outlive their transaction.
+        let found = table
             .get(key)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?
-        {
-            let (value_bytes, expires_at) = entry.value();
+            .map(|entry| {
+                let (value_bytes, expires_at) = entry.value();
+                (Bytes::copy_from_slice(value_bytes), expires_at)
+            });
 
+        if let Some((value, expires_at)) = found {
             // Check if expired
             if Self::is_expired(expires_at) {
                 // Drop read transaction before write
@@ -259,7 +268,7 @@ impl KvStore for PersistentKvStore {
                 return Ok(None);
             }
 
-            Ok(Some(Bytes::copy_from_slice(value_bytes)))
+            Ok(Some(value))
         } else {
             Ok(None)
         }

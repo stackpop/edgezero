@@ -2241,10 +2241,10 @@ mod tests {
     // -- AppConfig<C> extractor tests ----------------------------------------
 
     // Build a RequestContext with a ConfigRegistry wired to `store`.
-    fn ctx_with_config_store<S: ConfigStore + 'static>(
-        store: S,
-        default_key: &str,
-    ) -> RequestContext {
+    fn ctx_with_config_store<S>(store: S, default_key: &str) -> RequestContext
+    where
+        S: ConfigStore + 'static,
+    {
         let binding = ConfigStoreBinding {
             handle: ConfigStoreHandle::new(Arc::new(store)),
             default_key: default_key.to_owned(),
@@ -2260,12 +2260,16 @@ mod tests {
     }
 
     // Build a RequestContext with a ConfigRegistry AND a SecretRegistry.
-    fn ctx_with_config_and_secrets<CS: ConfigStore + 'static, SS: SecretStore + 'static>(
+    fn ctx_with_config_and_secrets<CS, SS>(
         config_store: CS,
         default_key: &str,
         secret_store: SS,
         secret_store_name: &str,
-    ) -> RequestContext {
+    ) -> RequestContext
+    where
+        CS: ConfigStore + 'static,
+        SS: SecretStore + 'static,
+    {
         let binding = ConfigStoreBinding {
             handle: ConfigStoreHandle::new(Arc::new(config_store)),
             default_key: default_key.to_owned(),

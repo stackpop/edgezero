@@ -124,7 +124,10 @@ mod tests {
 
     /// Reflect each derived `SecretField` down to the tuple the
     /// assertions compare: `(dotted_path, kind, optional)`.
-    fn reflect<C: AppConfigMeta>() -> Vec<(String, SecretKind, bool)> {
+    fn reflect<C>() -> Vec<(String, SecretKind, bool)>
+    where
+        C: AppConfigMeta,
+    {
         C::secret_fields()
             .into_iter()
             .map(|field| (field.dotted_path(), field.kind, field.optional))
@@ -218,7 +221,11 @@ mod tests {
     fn derive_emits_app_config_root_impl() {
         // The trait is a marker; we just need it to compile and the
         // blanket impl to be reachable via the trait object.
-        fn assert_root<T: AppConfigRoot>() {}
+        fn assert_root<T>()
+        where
+            T: AppConfigRoot,
+        {
+        }
         assert_root::<ConfigNoSecrets>();
         assert_root::<ConfigKeyInDefault>();
         assert_root::<ConfigStoreRef>();
