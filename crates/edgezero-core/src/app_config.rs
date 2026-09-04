@@ -32,11 +32,17 @@ use validator::{Validate, ValidationErrors};
 
 /// One segment of a [`SecretField`] path.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SecretPathSegment {
     /// Every element of an array/`Vec` at this position.
     ArrayEach,
     /// An object key — a Rust field name, verbatim (no `serde(rename)`).
     Field(Cow<'static, str>),
+    /// An optional field that skips the rest of this secret path when absent or null.
+    ///
+    /// Available to hand-written [`AppConfigMeta`] implementations. The
+    /// `AppConfig` derive does not currently emit optional intermediate fields.
+    OptionalField(Cow<'static, str>),
 }
 
 /// One field's worth of secret-annotation metadata.
@@ -64,7 +70,7 @@ impl SecretField {
         let mut out = String::new();
         for segment in &self.path {
             match segment {
-                SecretPathSegment::Field(name) => {
+                SecretPathSegment::Field(name) | SecretPathSegment::OptionalField(name) => {
                     if !out.is_empty() {
                         out.push('.');
                     }
@@ -329,10 +335,13 @@ fn prune_secret_leaf(errors: &mut ValidationErrors, path: &[SecretPathSegment]) 
     let Some((head, rest)) = path.split_first() else {
         return;
     };
-    let SecretPathSegment::Field(name) = head else {
-        // `ArrayEach` only appears immediately after a `Field` (the root is
-        // always a struct), so it is consumed by the peek below, never a head.
-        return;
+    let name = match head {
+        SecretPathSegment::Field(name) | SecretPathSegment::OptionalField(name) => name,
+        SecretPathSegment::ArrayEach => {
+            // `ArrayEach` only appears immediately after a field (the root is
+            // always a struct), so it is consumed by the peek below, never a head.
+            return;
+        }
     };
 
     // Leaf reached: drop the validator error keyed by this field name.
@@ -1559,7 +1568,7 @@ greeting = "hello"
             kind: SecretKind::KeyInDefault,
             path: vec![
                 Field(Cow::Borrowed("integrations")),
-                Field(Cow::Borrowed("datadome")),
+                OptionalField(Cow::Borrowed("datadome")),
                 Field(Cow::Borrowed("server_side_key")),
             ],
             optional: false,

@@ -45,16 +45,16 @@ case "\${1:-} \${2:-}" in
   "compute update")
     # A realistic success line: the version parser is fail-closed and will
     # refuse to stage if it cannot read a version out of this output.
-    echo "SUCCESS: Updated package (service dummy-service, version 42)"
+    echo "SUCCESS: Updated package (service dummyservice, version 42)"
     ;;
-  "compute deploy") echo "SUCCESS: Deployed package (service dummy-service, version 43)" ;;
+  "compute deploy") echo "SUCCESS: Deployed package (service dummyservice, version 43)" ;;
   "service-version update") echo "Updated version comment" ;;
   "service-version stage") echo "Staged version" ;;
   # An app WITH config selection: the app config store, the production selector
   # store edgezero_runtime_env (so a staged deploy relinks rather than skipping),
   # and its staging twin (the store the relink points at). config push resolves a
   # store id by name from this list, reads the current entry to diff, then upserts.
-  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging_dummy-service"}]' ;;
+  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging_dummyservice"}]' ;;
   # A cloned draft inherits the active version's links; the staged deploy drops
   # this one and re-links the staging store under the same name.
   "resource-link list") echo '[{"id":"LINK_ENV","name":"edgezero_runtime_env"}]' ;;
@@ -69,10 +69,10 @@ case "\${1:-} \${2:-}" in
     ;;
   "config-store-entry list")
     # A staged deploy MIRRORS the production selector store into the staging twin.
-    # Production (ENVSEL1) carries a non-config override the twin must copy
-    # verbatim; the twin (STAGESEL1) starts empty.
+    # Production (ENVSEL1) carries this service's scoped logging override, which
+    # the twin must copy verbatim; the twin (STAGESEL1) starts empty.
     case "\$*" in
-      *--store-id=ENVSEL1*) echo '[{"item_key":"EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL","item_value":"debug"}]' ;;
+      *--store-id=ENVSEL1*) echo '[{"item_key":"EDGEZERO__SERVICES__dummyservice__LOGGING__LEVEL","item_value":"debug"}]' ;;
       *) echo '[]' ;;
     esac
     ;;

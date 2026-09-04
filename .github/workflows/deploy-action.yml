@@ -179,7 +179,7 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           deploy-args: '["--comment","smoke"]'
 
       - name: Assert production deploy, version threading, and credential boundary
@@ -197,7 +197,7 @@ jobs:
         with:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           fastly-version: ${{ steps.deploy.outputs['fastly-version'] }}
           rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
           deploy-to: production
@@ -254,7 +254,7 @@ jobs:
           app-cli-artifact: edgezero-cli-handoff
           working-directory: fixture-app
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
       - name: Assert the cross-job handoff produced a real production deploy
         env:
           EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs['fastly-version'] }}
@@ -290,7 +290,7 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           build-mode: always
           cache: true
       - name: Capture the seeded marker, then delete target/
@@ -301,7 +301,7 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           build-mode: always
           cache: true
       - name: Assert the marker was restored from cache (not rebuilt)
@@ -318,7 +318,7 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           build-mode: never
           cache: true
       - name: Assert the cache was NOT restored under build-mode never
@@ -359,7 +359,7 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
       - name: Assert the deploy failed but signalled a possible mutation
         env:
           EDGEZERO__TEST__DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
@@ -377,7 +377,7 @@ jobs:
         id: recover
         env:
           FASTLY_API_TOKEN: dummy-token
-          FASTLY_SERVICE_ID: dummy-service
+          FASTLY_SERVICE_ID: dummyservice
         run: .github/actions/deploy-core/tests/recovery-active-version.sh recover-cli
       - name: Roll back to the captured previous version, keyed on the recovered live version
         id: rollback
@@ -385,7 +385,7 @@ jobs:
         with:
           app-cli-artifact: edgezero-cli-recovery
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           fastly-version: ${{ steps.recover.outputs.version }}
           # Thread the deploy's OWN previous-version output (captured pre-mutation),
           # exactly as the guide's recovery documents — not a hardcoded value.
@@ -521,7 +521,7 @@ jobs:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           deploy-args: '["--comment","staged smoke"]'
           deploy-to: staging
 
@@ -539,7 +539,7 @@ jobs:
           domain: staging.example.com
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           retry: "1"
           retry-delay: "1"
 
@@ -560,7 +560,7 @@ jobs:
           domain: staging.example.com
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           retry: "1"
           retry-delay: "1"
         env:
@@ -588,7 +588,7 @@ jobs:
           deploy-to: production
           domain: staging.example.com
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           retry: "1"
           retry-delay: "1"
 
@@ -609,7 +609,7 @@ jobs:
           deploy-to: staging
           domain: staging.example.com
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
           retry: "1"
           retry-delay: "1"
 
@@ -627,7 +627,7 @@ jobs:
           deploy-to: staging
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
 
       - name: Roll back production
         id: prod-rollback
@@ -643,7 +643,7 @@ jobs:
           fastly-version: "40"
           rollback-to: "39"
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
 
       - name: Assert rollback verbs, paths, and version threading
         env:
@@ -662,7 +662,7 @@ jobs:
           deploy-to: production
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
 
       - name: Assert the targetless production rollback was refused
         env:
@@ -691,7 +691,7 @@ jobs:
           fastly-version: "40"
           rollback-to: "38"
           fastly-api-token: dummy-token
-          fastly-service-id: dummy-service
+          fastly-service-id: dummyservice
 
       - name: Assert the stale rollback was refused and activated nothing
         env:

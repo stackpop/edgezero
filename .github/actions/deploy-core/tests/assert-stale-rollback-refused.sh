@@ -30,7 +30,7 @@ main() {
   local state="${FAKE_ACTIVE_VERSION_FILE:?FAKE_ACTIVE_VERSION_FILE is required}"
   local outcome="${EDGEZERO__TEST__OUTCOME:?EDGEZERO__TEST__OUTCOME is required}"
   local snapshot="${EDGEZERO__TEST__LOG_SNAPSHOT:?EDGEZERO__TEST__LOG_SNAPSHOT is required}"
-  local api='https://api\.fastly\.com/service/dummy-service'
+  local api='https://api\.fastly\.com/service/dummyservice'
 
   [[ "$outcome" == "failure" ]] ||
     fail "a stale production rollback must fail (the rolled-back-from version is no longer active), got outcome=$outcome"
