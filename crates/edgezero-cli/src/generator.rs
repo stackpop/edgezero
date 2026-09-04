@@ -654,11 +654,11 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
     let has = |id: &str| adapter_ids.iter().any(|adapter| adapter == id);
     let mut lines: Vec<String> = Vec::new();
     if has("cloudflare") {
-        lines.push("nodejs 24.12.0".to_owned());
+        lines.push("nodejs 24.20.0".to_owned());
     }
     if has("fastly") {
-        lines.push("fastly 15.1.0".to_owned());
-        lines.push("viceroy 0.17.0".to_owned());
+        lines.push("fastly 16.0.0".to_owned());
+        lines.push("viceroy 0.21.0".to_owned());
     }
     lines.push("rust 1.98.1".to_owned());
     // Sort + dedup so the file is stable regardless of adapter
@@ -869,6 +869,29 @@ mod tests {
     // ---------- build_tool_versions ----------
 
     #[test]
+    fn build_tool_versions_pins_track_repo_tool_versions() {
+        // Every version `build_tool_versions` emits is hardcoded above, and a
+        // scaffolded app is expected to build and deploy on the same tools this
+        // repo uses. Without this check they drift silently: the repo bumps
+        // `.tool-versions` and newly generated apps keep pinning superseded
+        // releases. Checks the adapter-gated pins too, so a bump to any of them
+        // has to touch both files.
+        let repo_tool_versions =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.tool-versions"));
+        let got = build_tool_versions(&["cloudflare".to_owned(), "fastly".to_owned()]);
+        for tool in ["rust", "nodejs", "fastly", "viceroy"] {
+            let want = repo_tool_versions
+                .lines()
+                .find(|line| line.starts_with(&format!("{tool} ")))
+                .unwrap_or_else(|| panic!("repo .tool-versions must pin {tool}"));
+            assert!(
+                got.contains(want),
+                "scaffold pins a different {tool} than the repo: scaffold={got:?} repo={want:?}"
+            );
+        }
+    }
+
+    #[test]
     fn build_tool_versions_rust_pin_tracks_repo_tool_versions() {
         // `build_tool_versions` hardcodes the versions it emits, and the
         // scaffolded app is expected to build on the same toolchain this
@@ -904,7 +927,7 @@ mod tests {
         // version we tested wrangler against (the same nodejs the
         // repo's own `.tool-versions` pins).
         let out = build_tool_versions(&["cloudflare".to_owned()]);
-        assert!(out.contains("nodejs 24.12.0"), "must pin nodejs: {out}");
+        assert!(out.contains("nodejs 24.20.0"), "must pin nodejs: {out}");
         assert!(out.contains("rust 1.98.1"), "always pin rust: {out}");
         assert!(
             !out.contains("fastly"),
@@ -921,8 +944,8 @@ mod tests {
         // project doesn't end up with a fastly-CLI install
         // requirement.
         let out = build_tool_versions(&["fastly".to_owned()]);
-        assert!(out.contains("fastly 15.1.0"), "must pin fastly: {out}");
-        assert!(out.contains("viceroy 0.17.0"), "must pin viceroy: {out}");
+        assert!(out.contains("fastly 16.0.0"), "must pin fastly: {out}");
+        assert!(out.contains("viceroy 0.21.0"), "must pin viceroy: {out}");
         assert!(out.contains("rust 1.98.1"));
         assert!(
             !out.contains("nodejs"),
@@ -973,9 +996,9 @@ mod tests {
         let out = build_tool_versions(&adapters);
         // Each pin appears exactly once.
         for pin in [
-            "nodejs 24.12.0",
-            "fastly 15.1.0",
-            "viceroy 0.17.0",
+            "nodejs 24.20.0",
+            "fastly 16.0.0",
+            "viceroy 0.21.0",
             "rust 1.98.1",
         ] {
             assert_eq!(
