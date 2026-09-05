@@ -47,7 +47,10 @@ impl RouteInfo {
     }
 
     #[inline]
-    pub fn new<S: Into<String>>(method: Method, path: S) -> Self {
+    pub fn new<S>(method: Method, path: S) -> Self
+    where
+        S: Into<String>,
+    {
         Self {
             method,
             path: path.into(),
@@ -193,7 +196,10 @@ impl RouterBuilder {
 
     #[must_use]
     #[inline]
-    pub fn with_manifest_json<S: Into<Arc<str>>>(mut self, json: S) -> Self {
+    pub fn with_manifest_json<S>(mut self, json: S) -> Self
+    where
+        S: Into<Arc<str>>,
+    {
         self.manifest_json = Some(json.into());
         self
     }

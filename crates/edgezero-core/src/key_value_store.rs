@@ -92,7 +92,10 @@ macro_rules! key_value_store_contract_tests {
             use bytes::Bytes;
             use $crate::key_value_store::KvStore;
 
-            fn run<Fut: std::future::Future>(future: Fut) -> Fut::Output {
+            fn run<Fut>(future: Fut) -> Fut::Output
+            where
+                Fut: std::future::Future,
+            {
                 ::futures::executor::block_on(future)
             }
 
@@ -375,7 +378,7 @@ impl KvHandle {
     /// Maximum TTL (1 year). Prevents overflow when adding to `SystemTime::now()`.
     #[expect(
         clippy::duration_suboptimal_units,
-        reason = "`Duration::from_days` is not stable in const context (1.95)"
+        reason = "`Duration::from_days` is not stable in const context (1.98)"
     )]
     pub const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
@@ -383,11 +386,7 @@ impl KvHandle {
     pub const MAX_VALUE_SIZE: usize = 25 * 1024 * 1024;
 
     /// Minimum TTL (Cloudflare limit).
-    #[expect(
-        clippy::duration_suboptimal_units,
-        reason = "`Duration::from_mins` is not stable in const context (1.95)"
-    )]
-    pub const MIN_TTL: Duration = Duration::from_secs(60);
+    pub const MIN_TTL: Duration = Duration::from_mins(1);
 
     fn decode_list_cursor(prefix: &str, cursor: Option<&str>) -> Result<Option<String>, KvError> {
         let Some(encoded) = cursor else {
@@ -460,7 +459,10 @@ impl KvHandle {
     /// # Errors
     /// Returns [`KvError`] if the lookup fails or the stored bytes cannot be deserialized into `T`.
     #[inline]
-    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, KvError> {
+    pub async fn get<T>(&self, key: &str) -> Result<Option<T>, KvError>
+    where
+        T: DeserializeOwned,
+    {
         Self::validate_key(key)?;
         let started_at = Self::kv_timing_start();
         let result = self.store.get_bytes(key).await;
@@ -497,7 +499,10 @@ impl KvHandle {
     /// # Errors
     /// Returns [`KvError`] if the lookup fails or the stored bytes cannot be deserialized into `T`.
     #[inline]
-    pub async fn get_or<T: DeserializeOwned>(&self, key: &str, default: T) -> Result<T, KvError> {
+    pub async fn get_or<T>(&self, key: &str, default: T) -> Result<T, KvError>
+    where
+        T: DeserializeOwned,
+    {
         Ok(self.get(key).await?.unwrap_or(default))
     }
 
@@ -619,7 +624,10 @@ impl KvHandle {
     /// # Errors
     /// Returns [`KvError`] if the value cannot be serialized or the backend rejects the write.
     #[inline]
-    pub async fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<(), KvError> {
+    pub async fn put<T>(&self, key: &str, value: &T) -> Result<(), KvError>
+    where
+        T: Serialize,
+    {
         Self::validate_key(key)?;
         let bytes = serde_json::to_vec(value)?;
         Self::validate_value(&bytes)?;
@@ -677,12 +685,10 @@ impl KvHandle {
     /// # Errors
     /// Returns [`KvError`] if the value cannot be serialized or the backend rejects the write.
     #[inline]
-    pub async fn put_with_ttl<T: Serialize>(
-        &self,
-        key: &str,
-        value: &T,
-        ttl: Duration,
-    ) -> Result<(), KvError> {
+    pub async fn put_with_ttl<T>(&self, key: &str, value: &T, ttl: Duration) -> Result<(), KvError>
+    where
+        T: Serialize,
+    {
         Self::validate_key(key)?;
         Self::validate_ttl(ttl)?;
         let bytes = serde_json::to_vec(value)?;

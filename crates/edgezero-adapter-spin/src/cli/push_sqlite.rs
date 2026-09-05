@@ -249,7 +249,7 @@ pub(crate) fn write_batch(
 
     {
         let mut statement = transaction
-            .prepare_cached(SPIN_KV_SET)
+            .prepare(SPIN_KV_SET)
             .map_err(|err| format!("failed to prepare INSERT in `{}`: {err}", db_path.display()))?;
 
         for (key, value) in entries {

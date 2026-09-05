@@ -33,6 +33,9 @@ blanket_clippy_restriction_lints = "allow"
 
 # Documentation -- private items don't need full docs in app code.
 missing_docs_in_private_items = "allow"
+# `inline_modules` flags every `#[cfg(test)] mod tests { .. }` block. Colocated
+# tests are the mainstream Rust idiom (std, tokio, serde); keep them in place.
+inline_modules = "allow"
 
 # Style / formatting -- match idiomatic Rust conventions.
 implicit_return = "allow"

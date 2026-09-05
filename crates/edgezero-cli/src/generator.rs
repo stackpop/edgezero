@@ -272,7 +272,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "worker = { version = \"0.8\", default-features = false, features = [\"http\"] }"
             .to_owned(),
     );
-    deps.insert("fastly".to_owned(), "fastly = \"0.12\"".to_owned());
+    deps.insert("fastly".to_owned(), "fastly = \"0.13\"".to_owned());
     deps.insert("once_cell".to_owned(), "once_cell = \"1\"".to_owned());
     deps.insert(
         "tokio".to_owned(),
@@ -289,7 +289,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     // the generated core crate resolves cleanly.
     deps.insert(
         "validator".to_owned(),
-        "validator = { version = \"0.20\", features = [\"derive\"] }".to_owned(),
+        "validator = { version = \"0.21\", features = [\"derive\"] }".to_owned(),
     );
     deps
 }
@@ -654,13 +654,13 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
     let has = |id: &str| adapter_ids.iter().any(|adapter| adapter == id);
     let mut lines: Vec<String> = Vec::new();
     if has("cloudflare") {
-        lines.push("nodejs 24.12.0".to_owned());
+        lines.push("nodejs 24.20.0".to_owned());
     }
     if has("fastly") {
-        lines.push("fastly 15.1.0".to_owned());
-        lines.push("viceroy 0.17.0".to_owned());
+        lines.push("fastly 16.0.0".to_owned());
+        lines.push("viceroy 0.21.0".to_owned());
     }
-    lines.push("rust 1.95.0".to_owned());
+    lines.push("rust 1.98.1".to_owned());
     // Sort + dedup so the file is stable regardless of adapter
     // declaration order (and asdf doesn't care).
     lines.sort();
@@ -869,13 +869,95 @@ mod tests {
     // ---------- build_tool_versions ----------
 
     #[test]
+    fn seeded_dependencies_track_the_edgezero_workspace() {
+        // The seeds above are hardcoded, but a generated crate takes
+        // `edgezero-core` as a path/version dependency and re-derives
+        // `#[derive(Validate)]` against whatever `validator` the workspace
+        // resolves. If the two majors drift apart the generated app fails to
+        // compile with a confusing "trait bound not satisfied" error, so the
+        // shared crates are checked against the root manifest here.
+        let root_manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"));
+        let seeds = seed_workspace_dependencies();
+        for crate_name in ["validator", "axum", "fastly", "worker"] {
+            let want = root_manifest
+                .lines()
+                .find(|line| line.starts_with(&format!("{crate_name} = ")))
+                .unwrap_or_else(|| panic!("root Cargo.toml must declare {crate_name}"));
+            let want_version = extract_version(want)
+                .unwrap_or_else(|| panic!("no version in root {crate_name} line: {want}"));
+            let got = seeds
+                .get(crate_name)
+                .unwrap_or_else(|| panic!("scaffold must seed {crate_name}"));
+            let got_version = extract_version(got)
+                .unwrap_or_else(|| panic!("no version in seeded {crate_name} line: {got}"));
+            assert_eq!(
+                got_version, want_version,
+                "scaffold seeds {crate_name} {got_version}, workspace uses {want_version}"
+            );
+        }
+    }
+
+    /// Pull the `version = "X"` (or bare `crate = "X"`) value out of a
+    /// dependency line, for comparing a seeded pin against the workspace.
+    fn extract_version(line: &str) -> Option<&str> {
+        let after = line.split_once("version = \"").map_or_else(
+            || line.split_once("= \"").map(|(_, rest)| rest),
+            |(_, rest)| Some(rest),
+        )?;
+        after.split_once('"').map(|(version, _)| version)
+    }
+
+    #[test]
+    fn build_tool_versions_pins_track_repo_tool_versions() {
+        // Every version `build_tool_versions` emits is hardcoded above, and a
+        // scaffolded app is expected to build and deploy on the same tools this
+        // repo uses. Without this check they drift silently: the repo bumps
+        // `.tool-versions` and newly generated apps keep pinning superseded
+        // releases. Checks the adapter-gated pins too, so a bump to any of them
+        // has to touch both files.
+        let repo_tool_versions =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.tool-versions"));
+        let got = build_tool_versions(&["cloudflare".to_owned(), "fastly".to_owned()]);
+        for tool in ["rust", "nodejs", "fastly", "viceroy"] {
+            let want = repo_tool_versions
+                .lines()
+                .find(|line| line.starts_with(&format!("{tool} ")))
+                .unwrap_or_else(|| panic!("repo .tool-versions must pin {tool}"));
+            assert!(
+                got.contains(want),
+                "scaffold pins a different {tool} than the repo: scaffold={got:?} repo={want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_tool_versions_rust_pin_tracks_repo_tool_versions() {
+        // `build_tool_versions` hardcodes the versions it emits, and the
+        // scaffolded app is expected to build on the same toolchain this
+        // repo does. Without this check the two drift silently: the repo
+        // bumps `.tool-versions` and every newly generated app keeps
+        // pinning the superseded release.
+        let repo_tool_versions =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.tool-versions"));
+        let want = repo_tool_versions
+            .lines()
+            .find(|line| line.starts_with("rust "))
+            .expect("repo .tool-versions must pin rust");
+        let got = build_tool_versions(&[]);
+        assert!(
+            got.contains(want),
+            "scaffold pins a different rust than the repo: scaffold={got:?} repo={want:?}"
+        );
+    }
+
+    #[test]
     fn build_tool_versions_pins_rust_only_with_no_adapters() {
         // The scaffolder always picks at least axum in practice,
         // but the empty case is the trust boundary: zero adapters
         // produces a stable file containing exactly the
         // rust-toolchain pin and a trailing newline.
         let out = build_tool_versions(&[]);
-        assert_eq!(out, "rust 1.95.0\n");
+        assert_eq!(out, "rust 1.98.1\n");
     }
 
     #[test]
@@ -884,8 +966,8 @@ mod tests {
         // version we tested wrangler against (the same nodejs the
         // repo's own `.tool-versions` pins).
         let out = build_tool_versions(&["cloudflare".to_owned()]);
-        assert!(out.contains("nodejs 24.12.0"), "must pin nodejs: {out}");
-        assert!(out.contains("rust 1.95.0"), "always pin rust: {out}");
+        assert!(out.contains("nodejs 24.20.0"), "must pin nodejs: {out}");
+        assert!(out.contains("rust 1.98.1"), "always pin rust: {out}");
         assert!(
             !out.contains("fastly"),
             "no fastly pin without fastly adapter: {out}"
@@ -901,9 +983,9 @@ mod tests {
         // project doesn't end up with a fastly-CLI install
         // requirement.
         let out = build_tool_versions(&["fastly".to_owned()]);
-        assert!(out.contains("fastly 15.1.0"), "must pin fastly: {out}");
-        assert!(out.contains("viceroy 0.17.0"), "must pin viceroy: {out}");
-        assert!(out.contains("rust 1.95.0"));
+        assert!(out.contains("fastly 16.0.0"), "must pin fastly: {out}");
+        assert!(out.contains("viceroy 0.21.0"), "must pin viceroy: {out}");
+        assert!(out.contains("rust 1.98.1"));
         assert!(
             !out.contains("nodejs"),
             "no nodejs pin without cloudflare adapter: {out}"
@@ -916,7 +998,7 @@ mod tests {
         // needed — same as the "no adapters" shape but exercised
         // through the realistic axum-only case.
         let out = build_tool_versions(&["axum".to_owned()]);
-        assert_eq!(out, "rust 1.95.0\n");
+        assert_eq!(out, "rust 1.98.1\n");
     }
 
     #[test]
@@ -926,7 +1008,7 @@ mod tests {
         // we can't honour — explain why with an inline hint so the
         // operator isn't left guessing.
         let out = build_tool_versions(&["spin".to_owned()]);
-        assert!(out.contains("rust 1.95.0"));
+        assert!(out.contains("rust 1.98.1"));
         assert!(
             !out.contains("spin "),
             "must NOT pin spin via asdf shape: {out}"
@@ -953,10 +1035,10 @@ mod tests {
         let out = build_tool_versions(&adapters);
         // Each pin appears exactly once.
         for pin in [
-            "nodejs 24.12.0",
-            "fastly 15.1.0",
-            "viceroy 0.17.0",
-            "rust 1.95.0",
+            "nodejs 24.20.0",
+            "fastly 16.0.0",
+            "viceroy 0.21.0",
+            "rust 1.98.1",
         ] {
             assert_eq!(
                 out.matches(pin).count(),
