@@ -223,55 +223,55 @@ impl KvStore for PersistentKvStore {
             .open_table(KV_TABLE)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open table: {err}")))?;
 
-        // Copy the value out and end the `AccessGuard` borrow before the
-        // transaction is dropped: redb tracks live read references per page and
-        // asserts none outlive their transaction.
-        let found = table
+        // End the `AccessGuard` borrow before the transaction is dropped: redb
+        // tracks live read references per page and asserts none outlive their
+        // transaction. Expiry is decided here, while the guard is alive, so an
+        // entry that is about to be deleted never has its bytes copied.
+        let live_value = match table
             .get(key)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?
-            .map(|entry| {
+        {
+            None => return Ok(None),
+            Some(entry) => {
                 let (value_bytes, expires_at) = entry.value();
-                (Bytes::copy_from_slice(value_bytes), expires_at)
-            });
-
-        if let Some((value, expires_at)) = found {
-            // Check if expired
-            if Self::is_expired(expires_at) {
-                // Drop read transaction before write
-                drop(table);
-                drop(read_txn);
-
-                // Delete the expired key
-                let write_txn = self.begin_write()?;
-                {
-                    let mut write_table = Self::open_table(&write_txn)?;
-                    // Re-check expiry inside write txn to avoid TOCTOU race:
-                    // a concurrent put_bytes may have overwritten the key with
-                    // a fresh value between our read and this write.
-                    let still_expired = write_table
-                        .get(key)
-                        .map_err(|err| {
-                            KvError::Internal(anyhow::anyhow!("failed to get key: {err}"))
-                        })?
-                        .is_some_and(|fresh_entry| {
-                            let (_, exp) = fresh_entry.value();
-                            Self::is_expired(exp)
-                        });
-                    if still_expired {
-                        write_table.remove(key).map_err(|err| {
-                            KvError::Internal(anyhow::anyhow!("failed to remove: {err}"))
-                        })?;
-                    }
+                if Self::is_expired(expires_at) {
+                    None
+                } else {
+                    Some(Bytes::copy_from_slice(value_bytes))
                 }
-                Self::commit(write_txn)?;
-
-                return Ok(None);
             }
+        };
 
-            Ok(Some(value))
-        } else {
-            Ok(None)
+        if let Some(value) = live_value {
+            return Ok(Some(value));
         }
+
+        // Expired: drop the read transaction before opening the write one.
+        drop(table);
+        drop(read_txn);
+
+        let write_txn = self.begin_write()?;
+        {
+            let mut write_table = Self::open_table(&write_txn)?;
+            // Re-check expiry inside write txn to avoid TOCTOU race:
+            // a concurrent put_bytes may have overwritten the key with
+            // a fresh value between our read and this write.
+            let still_expired = write_table
+                .get(key)
+                .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?
+                .is_some_and(|fresh_entry| {
+                    let (_, exp) = fresh_entry.value();
+                    Self::is_expired(exp)
+                });
+            if still_expired {
+                write_table
+                    .remove(key)
+                    .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to remove: {err}")))?;
+            }
+        }
+        Self::commit(write_txn)?;
+
+        Ok(None)
     }
 
     #[inline]

@@ -185,14 +185,12 @@ timeout_ms = 50
 
     #[test]
     fn env_overlay_overrides_nested_value() {
-        // Mutate process env in-place; the sibling round-trip test
-        // uses `env_overlay: false`, so a parallel run can't be
-        // affected by this var. The key is otherwise unique to this
-        // test.
+        // The overlay reads process env, so this test has to set a real
+        // variable. `env_lock` serialises it against any other test that
+        // touches the environment, and `EnvOverride` restores the previous
+        // value on drop -- including when an assertion below panics.
         const KEY: &str = "APP_DEMO__SERVICE__TIMEOUT_MS";
         let _guard = env_lock().lock().unwrap_or_else(PoisonError::into_inner);
-        // Restores the previous value on drop, so a failed assertion below
-        // cannot leak the override into another test.
         let _override = EnvOverride::set(KEY, "2500");
 
         let path = app_demo_toml_path();

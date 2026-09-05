@@ -22,9 +22,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Extract the first `version = "X"` from the validator line in a file.
+# Extract validator's version from a file, accepting both the table form
+# (`validator = { version = "X", .. }`) and the bare form
+# (`validator = "X"`), so reformatting a pin does not blind this gate.
 pin_in() {
-  grep -hoE 'validator = \{ version = "[^"]+"' "$1" 2>/dev/null |
+  grep -hoE 'validator = (\{ version = )?"[^"]+"' "$1" 2>/dev/null |
     head -1 | grep -oE '"[^"]+"' | tr -d '"'
 }
 
