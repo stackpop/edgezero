@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions - Build Caching Spec
 
-**Status:** Design (proposed) - v6.27
+**Status:** Design (proposed) - v6.28
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md`,
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -37,11 +37,15 @@ contracts. It must not expose provider credentials to app CLI compilation or to 
   inputs, including changed `app-env` values, read by `build.rs` or proc macros. A stale object can
   pass digest, ELF, and smoke checks.
   `cache: true` explicitly accepts this risk; v1 does not and cannot generally detect it.
-- v1 supports GitHub-hosted `linux/amd64` runners only. It fails closed on self-hosted runners and
-  does not target GitHub Enterprise Server. The GitHub Actions service and selected runner runtime
-  are trusted infrastructure. The in-job predicate prevents EdgeZero work after context reports a
-  self-hosted runner; it cannot retract a secret a caller already supplied to that runner or defend
-  against a malicious runner implementation.
+- v1 supports only the standard GitHub-hosted `ubuntu-24.04` `linux/amd64` runner label. Every
+  repository-owned job in this design and every published consumer job that invokes a public
+  EdgeZero action uses literal `runs-on: ubuntu-24.04`; larger, custom-image, and other hosted labels
+  are unsupported even when their runner context is Linux/X64. It fails closed on self-hosted runners
+  and does not target GitHub Enterprise Server. The GitHub Actions service and selected runner
+  runtime are trusted infrastructure. The in-job predicate prevents EdgeZero work after context
+  reports a self-hosted runner; it cannot prove the caller selected the supported label, retract a
+  secret a caller already supplied to that runner, or defend against a malicious runner
+  implementation.
 - Image publication trusts the digest-pinned official Rust base, Rustup's manifest/checksum chain,
   Debian's signed package archive, and checksum-pinned Fastly/sccache release assets. Candidate source
   cannot change their coordinates or verification steps. The build is not claimed byte-reproducible
@@ -154,6 +158,15 @@ Inside the called workflow:
   revision for that invocation (`H` under `C`, final `P` under `V`). It is not compared textually with the tag-bearing
   `job.workflow_ref`.
 
+The reusable job declares literal `runs-on: ubuntu-24.04`. Its first executable step is a fixed,
+checkout-independent producer bootstrap assertion. Through step-local bindings directly from the
+GitHub contexts and the declared `app-ref` input, that step validates the exact runner triplet from
+Section 5.1, all four workflow properties above, the canonical action version encoded by
+`job.workflow_ref`, full lowercase `app-ref`, and a canonical positive `job.check_run_id`. It runs
+before any checkout, cache or artifact action, Docker command, source materialization, credential
+use, or other repository-supplied executable. It cannot call or source a repository helper because
+the trusted EdgeZero checkout does not yet exist.
+
 These hosted-runner context properties identify the workflow that defines the current job. They are
 part of the hosted-only v1 floor.
 
@@ -163,7 +176,7 @@ It is generic: during this rollout it may be a gate candidate `G'`, release sour
 workflow/context identity at `Q`; a release check separately proves that `Q=S` when qualifying the
 image source. `H` is reserved for the final action candidate defined in Section 8.
 
-After those checks, the reusable job uses `actions/checkout@v7.0.1` only to place repository
+After that bootstrap passes, the reusable job uses `actions/checkout@v7.0.1` only to place repository
 `stackpop/edgezero` at `ref: job.workflow_sha` in a fixed private action-source directory with
 `persist-credentials:false`. The trusted Section 5.2 materializer fetches the application at
 `app-ref` into a distinct fixed private authority root without initially creating a worktree, proves
@@ -379,16 +392,31 @@ Runtime containers use a read-only root filesystem, uid/gid 1001, dropped capabi
 `no-new-privileges`, no GitHub file-command channels, explicit mounts, and operation-specific network,
 memory, pid, and timeout limits.
 
-Before cache access, artifact transfer, app-source materialization, Docker execution, provider-token
-handling, or provider mutation, the reusable workflow and every public composite action independently
-require context-derived `runner.environment == "github-hosted"`, `runner.os == "Linux"`, and
-`runner.arch == "X64"`. Composite metadata binds those three context values into private names for
-its first executable validation step; they are not action inputs and caller `env` cannot replace the
-step-local bindings. A missing, empty, differently cased, or otherwise different value fails closed.
-`runs-on`, Docker availability, uname output, and architecture alone are not proof of a GitHub-hosted
-runner. Repository-owned image-publication and gate-rotation jobs apply the same predicate before
-Docker, credential-consuming, or mutation steps. A job-level protected environment can be resolved
-before steps begin; the predicate does not claim to run before that GitHub control-plane event.
+Every repository-owned workflow job specified by this design declares literal
+`runs-on: ubuntu-24.04`. Published consumer examples and tested adoption workflows declare the same
+literal label on every ordinary job that invokes a public EdgeZero composite action. A caller job
+that uses a different standard, larger, or custom-image runner label is outside the v1 compatibility
+contract. The label selects the supported host image family; it is not security evidence and is not
+observable from inside a composite action.
+
+Before checkout or any other credential use, cache access, artifact transfer, app-source
+materialization, Docker execution, provider-token handling, or provider mutation, every
+repository-owned workflow job performs a fixed first-executable-step bootstrap that requires
+context-derived `runner.environment == "github-hosted"`, `runner.os == "Linux"`, and
+`runner.arch == "X64"`. The reusable producer combines that predicate with the invocation checks in
+Section 3.3. The bootstrap is inline because no repository helper is trusted before checkout;
+structural tests freeze its step position, context bindings, and exact comparisons.
+
+The sole shared runner-eligibility helper accepts and validates only those three runner-context
+values. It does not accept or validate workflow, action, application, cache-generation, or provider
+identity. Composite metadata binds the values into private names for every public action's first
+executable step; they are not action inputs and caller `env` cannot replace the step-local bindings.
+The reusable producer calls the same helper immediately after its verified EdgeZero checkout and
+before app checkout, cache, artifact, or Docker work, as a checked-source consistency check in
+addition to its authoritative inline bootstrap. A missing, empty, differently cased, or otherwise
+different value fails closed. `runs-on`, Docker availability, uname output, and architecture alone
+are not proof of a GitHub-hosted runner. A job-level protected environment can be resolved before
+steps begin; the predicate does not claim to run before that GitHub control-plane event.
 
 ### 5.2 Working-copy topology
 
@@ -2103,6 +2131,10 @@ Caching remains off by default. Container execution and provenance validation ar
   required a context-derived GitHub-hosted Linux/X64 check in every public action and sensitive
   repository workflow job; retired the legacy direct-composite producer at candidate revision `H`;
   and corrected provenance packaging to accept either compile profile's output.
+- **v6.28:** separated the three-field public-action runner helper from producer workflow and cache
+  identity; added the checkout-independent producer bootstrap before credentialed checkout; and
+  fixed the v1 compatibility contract to literal standard GitHub-hosted `ubuntu-24.04` jobs while
+  retaining the context predicate as the self-hosted-runner security check.
 
 ## 13. Deferred implementation mechanics
 

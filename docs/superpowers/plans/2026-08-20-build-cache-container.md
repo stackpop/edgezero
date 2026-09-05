@@ -17,7 +17,7 @@ plans land on top. Their final passing action revision `P` contains the unchange
 record and the adoption documents for exact stable version `V`; consumers pin immutable release
 version `V`, which resolves to `P`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.27.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.28.
 
 **Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
 `shellcheck`, and `zizmor`.
@@ -41,9 +41,11 @@ version `V`, which resolves to `P`.
 - Every target command is launched through baked GNU `/usr/bin/env` with the design's exact two-argument
   `-S` placeholder protocol. Image and Docker-created variables are absent from target-command entry,
   and no Docker or runtime argv element is constructed from an environment value.
-- Every repository-owned workflow job introduced by this plan requires context-derived
-  `runner.environment:github-hosted`, `runner.os:Linux`, and `runner.arch:X64` before Docker,
-  credential, or mutation work. Runner labels and host command output are not substitutes.
+- Every repository-owned workflow job introduced by this plan declares literal
+  `runs-on: ubuntu-24.04`. Its first executable step is a fixed inline bootstrap requiring
+  context-derived `runner.environment:github-hosted`, `runner.os:Linux`, and `runner.arch:X64`
+  before checkout, Docker, credential, or mutation work. The label selects the supported host image;
+  runner labels and host command output are not substitutes for the context predicate.
 - Every committed non-local external action and reusable workflow ref is a canonical exact stable
   `v<major>.<minor>.<patch>` release tag. Major/minor tags, prereleases, branches, commit SHAs, and
   floating refs fail. Docker image refs use immutable `sha256` digests. Local `./...` actions remain
@@ -157,7 +159,7 @@ Modify:
 ## 4. Task 0: Enforce exact-version external references repository-wide
 
 The current pin gate permits major/minor tags, prereleases, and commit SHAs. That is broader than
-v6.27 and must be narrowed before adding the write-privileged publisher.
+v6.28 and must be narrowed before adding the write-privileged publisher.
 
 **Files:**
 
@@ -193,7 +195,9 @@ v6.27 and must be narrowed before adding the write-privileged publisher.
       algorithms fail unless a separately reviewed digest algorithm is added to the policy.
 - [ ] Update the four prepublication adoption documents to use literal
       `<EDGEZERO_ACTION_VERSION>` where the future consumer will substitute stable release `V`;
-      examples for third-party actions use real reviewed exact patch versions.
+      examples for third-party actions use real reviewed exact patch versions. Replace
+      `ubuntu-latest` and every other ordinary consumer runner label in those examples with literal
+      `runs-on: ubuntu-24.04`.
 - [ ] Add `check-doc-action-pins.sh` to parse fenced YAML in every tracked Markdown file and implement
       both documentation states from the design. In bootstrap state, absent
       `docs/.edgezero-action-release.json` permits the exact EdgeZero placeholder only in the four
@@ -202,9 +206,12 @@ v6.27 and must be narrowed before adding the write-privileged publisher.
       literal `V` in all EdgeZero refs. In released state, the base record cannot disappear; it is
       either byte-identical or replaced atomically with all documentation refs by a strictly greater
       stable version under the same hosted release/ref proof. Concrete third-party refs always use
-      exact stable patch versions; major/minor/prerelease/branch/SHA refs fail. Add positive/negative
-      state-transition, base/candidate, partial-update, downgrade/deletion, hidden-placeholder, and
-      mixed-version cases to `run.sh`.
+      exact stable patch versions; major/minor/prerelease/branch/SHA refs fail. Every ordinary fenced
+      consumer job invoking a public EdgeZero action must use literal `runs-on: ubuntu-24.04` in all
+      three documentation states; absent, dynamic, `ubuntu-latest`, other standard, larger, custom,
+      and self-hosted labels fail. Add positive/negative state-transition, base/candidate, partial-
+      update, downgrade/deletion, hidden-placeholder, mixed-version, and runner-label cases to
+      `run.sh`.
 - [ ] Add the hosted transition verifier to gate `G`. With only read permissions and fixed
       no-redirect versioned requests, it proves record `V` is a published `draft:false`,
       `prerelease:false`, `immutable:true` release whose API target and anonymous peeled remote ref
@@ -699,9 +706,11 @@ min:1, wait:0}` from the design. Every missing, extra, defaulted, or changed sem
       a `workflow_dispatch` body with `ref:"main"` while protected `main==G`, with a required
       candidate PR-number, head-repository, and full head-SHA input. Its exact candidate-bound
       `run-name` is API-visible. It uses
-      `environment: {name: build-container-release, deployment: false}`, checks out only exact `G`,
-      runs no candidate code, contains exactly one fixed `assert-exact-g-dispatch-context` step that
-      fetches the PR with the read-only token and compares all three inputs, and
+      `environment: {name: build-container-release, deployment: false}`, declares literal
+      `runs-on: ubuntu-24.04`, runs the fixed hosted/Linux/X64 bootstrap as its first executable step,
+      checks out only exact `G`, runs no candidate code, contains exactly one fixed
+      `assert-exact-g-dispatch-context` step that fetches the PR with the read-only token and compares
+      all three inputs, and
       uses the pinned App-token action only to prove the stored key can mint the exact repository-
       scoped token. The run API must later show event `workflow_dispatch`, exact path, `head_sha=G`,
       and that successful named assertion step.
@@ -744,23 +753,26 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       changes to the gate-owned publisher topology, permissions, concurrency group, action versions,
       gate checkout, helper paths, output set, token ordering, package deletion/admin scope, build secret
       exposure, missing/late release-state and rotation checks, predictable/hard-coded/pre-verification
-      challenge generation, missing or late hosted-Linux/X64 context assertions, or pin mutation
-      outside the trusted updater. Apply the same exact
+      challenge generation, any job without literal `runs-on: ubuntu-24.04`, missing or late
+      hosted-Linux/X64 bootstrap assertions, or pin mutation outside the trusted updater. Apply the same exact
       concurrency/group/queue checks to the gate-rotation workflow and reject any third workflow using
       that group or either approved workflow using a different one. Parse both workflows and require
-      the exact context-derived hosted/Linux/X64 assertion in every publisher and rotation job before
-      any step consumes environment data or credentials, creates an installation token, invokes
-      Docker, calls a mutation API, or mutates the repository; fixtures with a missing,
-      caller-derived, or late assertion fail. Do not claim that a step runs before GitHub resolves a
-      job-level protected environment.
+      literal runner label and context-derived hosted/Linux/X64 first-executable-step bootstrap in
+      every publisher and rotation job before checkout or any later step consumes protected
+      environment data or credentials, creates an installation token, invokes Docker, calls a mutation
+      API, or mutates the repository; fixtures with a missing, different, dynamic, caller-derived, or
+      late label or assertion fail. Do not claim that a step runs before GitHub resolves a job-level
+      protected environment.
 - [ ] Create gate-owned `publish-build-container.yml`. It triggers only protected
       `build-container-v*` tags and uses exact concurrency group
       `edgezero-build-container-publication` with `cancel-in-progress: false` and `queue: max`.
+      Every job declares literal `runs-on: ubuntu-24.04` and begins with the inline runner bootstrap.
       Document and test one running plus at most 100 pending runs; a run rejected at capacity publishes
       no pin and must be rerun. Run it through the exact structurally validated actionlint
       compatibility wrapper.
 - [ ] Create gate-owned `rotate-build-container-gate.yml`, dispatched only from protected main at old
-      `G`, with the same exact workflow-level concurrency contract. Its unprivileged acquire job runs
+      `G`, with the same exact workflow-level concurrency contract. Every job declares literal
+      `runs-on: ubuntu-24.04` and begins with the inline runner bootstrap. Its unprivileged acquire job runs
       after older publishers; its second job waits on secret-free
       `build-container-gate-rotation-lock` with `deployment:false`, parses the exact current-run
       rotation approval/evidence, and releases only after activated or rolled-back final state. Add a
@@ -1064,12 +1076,12 @@ a digest from the mutable tag.
 
 Before declaring this plan complete, run two independent reviews:
 
-1. **Contract review:** compare every file and test with design v6.27 Sections 2 through 10. Verify one
+1. **Contract review:** compare every file and test with design v6.28 Sections 2 through 10. Verify one
    expected/package/validate wire authority, protected gate and image source `G`, isolated release
    request `S`, staged gate-only Docker context, API-visible exact post-merge `S` proof, forward-only
    pin ancestry, no tag runtime pull, no placeholder image digest/checksum, no `/work/package`
-   convention, fixed GNU `env -S` closed-environment launch, hosted-Linux/X64 job assertions, and no
-   legacy `--stage` guidance.
+   convention, fixed GNU `env -S` closed-environment launch, literal `ubuntu-24.04` job selection,
+   first-step hosted-Linux/X64 assertions, and no legacy `--stage` guidance.
 2. **Release-adversary review:** test candidate workflow/helper substitution, forbidden
    major/minor/branch/SHA action refs, third-party exact-tag movement as recorded risk, immutable
    EdgeZero release enforcement, private

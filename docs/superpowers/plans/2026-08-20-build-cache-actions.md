@@ -8,7 +8,7 @@
 restore/compile/save primitive that later plans consume, without making cache availability part of
 build correctness or exposing credentials to compilation.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.27 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.28 Sections
 2 through 5 and 9.
 
 ## 1. Fixed decisions
@@ -85,12 +85,14 @@ build correctness or exposing credentials to compilation.
       call these helpers and must not reimplement them.
 - [ ] Emit shell-safe typed outputs and reject duplicate, missing, multiline, or malformed output.
       Tests independently recompute SHA-256 bytes; they do not call the implementation as oracle.
-- [ ] Implement the sole runner-eligibility helper and require context-derived
-      `runner.environment:github-hosted`, `runner.os:Linux`, and `runner.arch:X64`, exact workflow
-      repository/path/ref/SHA identity, full lowercase app ref, and canonical positive
-      `job.check_run_id` before any cache action runs. The values are not caller inputs; missing,
-      empty, differently cased, self-hosted, or architecture-only proofs fail. Plans 3 and 4 must call
-      this helper as every public action's first executable step.
+- [ ] Implement the sole shared runner-eligibility helper with exactly three values bound directly
+      from `runner.environment`, `runner.os`, and `runner.arch`. Require exact `github-hosted`, `Linux`,
+      and `X64`; missing, empty, differently cased, self-hosted, caller-input/env-derived, or
+      architecture-only proofs fail. The helper accepts and validates no workflow, action,
+      application, cache-generation, or provider identity. Plans 3 and 4 must call it as every public
+      action's first executable step. Plan 3 separately owns the checkout-independent reusable-
+      producer bootstrap that validates workflow identity, app ref, and `job.check_run_id` before
+      checkout or cache access.
 - [ ] Implement the sole canonical container-launch helper. It owns the closed operation enum,
       profile-to-environment mapping, sorted env-file serializer, placeholder split-string builder,
       exact `/usr/bin/env -S` argv, `docker create` array construction, env-file deletion before
