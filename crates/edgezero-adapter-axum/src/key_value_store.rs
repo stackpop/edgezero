@@ -223,10 +223,8 @@ impl KvStore for PersistentKvStore {
             .open_table(KV_TABLE)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open table: {err}")))?;
 
-        // End the `AccessGuard` borrow before the transaction is dropped: redb
-        // tracks live read references per page and asserts none outlive their
-        // transaction. Expiry is decided here, while the guard is alive, so an
-        // entry that is about to be deleted never has its bytes copied.
+        // redb asserts that no read reference outlives its transaction, so the
+        // `AccessGuard` borrow has to end before the drops below.
         let live_value = match table
             .get(key)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?

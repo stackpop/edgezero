@@ -36,10 +36,6 @@ async-compression = { version = "0.4", features = [
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = true }
-# `base16ct` (RustCrypto, same org as sha2) renders digests as lowercase
-# hex. sha2 0.11 returns `hybrid_array::Array`, which -- unlike 0.10's
-# `GenericArray` -- does not implement `LowerHex`, so `format!("{:x}", ..)`
-# no longer compiles. `no_std` + zero-dependency, so it stays WASM-safe.
 base16ct = { version = "1", features = ["alloc"] }
 brotli = "9"
 bytes = "1"
