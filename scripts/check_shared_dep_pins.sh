@@ -22,12 +22,16 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Extract validator's version from a file, accepting both the table form
+# Extract validator's version from a file. Accepts both the table form
 # (`validator = { version = "X", .. }`) and the bare form
-# (`validator = "X"`), so reformatting a pin does not blind this gate.
+# (`validator = "X"`) so reformatting a pin does not blind this gate, but
+# only where the assignment actually starts a line (optionally inside a
+# Rust string literal, which is how the scaffold seeds it) -- a commented
+# or prose mention must not shadow the real pin. Prints nothing when
+# there is no match; callers treat empty as "missing".
 pin_in() {
-  grep -hoE 'validator = (\{ version = )?"[^"]+"' "$1" 2>/dev/null |
-    head -1 | grep -oE '"[^"]+"' | tr -d '"'
+  grep -hoE '^[[:space:]]*(")?validator = (\\?\{ version = )?\\?"[^"\\]+' "$1" 2>/dev/null |
+    grep -oE '[0-9][^"\\]*$' || true
 }
 
 WANT="$(pin_in Cargo.toml)"

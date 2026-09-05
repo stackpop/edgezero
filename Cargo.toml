@@ -37,7 +37,12 @@ async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = true }
 base16ct = { version = "1", features = ["alloc"] }
-brotli = "9"
+# Held at 8 while `async-compression` still resolves brotli 8: taking 9
+# directly does not replace that copy, it adds a second complete
+# allocator/decompressor stack to every adapter graph (~40 KB of extra
+# wasm in the demo Spin build). We only use `Decompressor` and
+# `CompressorWriter`, unchanged across the two majors.
+brotli = "8"
 bytes = "1"
 chrono = "0.4"
 ctor = "1.0"
