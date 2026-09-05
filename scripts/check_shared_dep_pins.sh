@@ -56,11 +56,15 @@ done
 
 # The scaffold generator seeds the pin as a Rust string literal, and its
 # own unit test compares it against the root manifest; check it here too
-# so a mismatch is caught by the same gate as the rest.
+# so a mismatch is caught by the same gate as the rest. `pin_in` already
+# understands the quoted-literal spelling, so it is reused rather than
+# re-implemented -- a second parser here drifted from this one once.
 gen="crates/edgezero-cli/src/generator.rs"
-got="$(grep -hoE 'validator = \{ version = \\"[^\\]+\\"' "$gen" | head -1 |
-  sed -E 's/.*\\"([^\\]+)\\".*/\1/')"
-if [[ "$got" != "$WANT" ]]; then
+got="$(pin_in "$gen")"
+if [[ -z "$got" ]]; then
+  echo "$gen: violation: no validator seed found (expected $WANT)"
+  VIOLATIONS=$((VIOLATIONS + 1))
+elif [[ "$got" != "$WANT" ]]; then
   echo "$gen: violation: seeds validator $got, root Cargo.toml has $WANT"
   VIOLATIONS=$((VIOLATIONS + 1))
 fi
