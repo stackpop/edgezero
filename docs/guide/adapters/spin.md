@@ -7,7 +7,12 @@ component-scoped KV / variable stores.
 ## Prerequisites
 
 - Rust toolchain with `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
-- Spin CLI ([install](https://spinframework.dev/install))
+- Spin CLI **4.1 or newer** ([install](https://spinframework.dev/install)).
+  The workspace's `spin-sdk` imports `wasi:http/types@0.3.0`, which Spin
+  4.0.x does not provide — on an older runtime the component builds and
+  its tests pass, then `spin up` fails with `component imports instance
+'wasi:http/types@0.3.0', but a matching implementation was not found in
+the linker`.
 
 ## Project Setup
 
@@ -197,7 +202,7 @@ schema and `INSERT … ON CONFLICT DO UPDATE` statement vendored from
 spinframework/spin's `crates/key-value-spin/src/store.rs`. A contract
 test in `edgezero-adapter-spin/src/cli/push_sqlite.rs` asserts
 byte-equality against the upstream string, and the workspace's
-`spin-sdk = "~6.0"` pin blocks any Spin minor bump that would change
+`spin-sdk = "~7.0"` pin blocks any Spin minor bump that would change
 the schema until the operator opts in.
 
 ```bash
