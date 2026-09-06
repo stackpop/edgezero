@@ -139,6 +139,10 @@ impl SecretFieldsRecursionGuard {
     }
 }
 
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "`Drop::pin_drop` is unstable (`pin_ergonomics`) and conflicts with `drop`"
+)]
 impl Drop for SecretFieldsRecursionGuard {
     #[inline]
     fn drop(&mut self) {
@@ -300,9 +304,10 @@ impl EnvLookup {
 /// Returns `Err(ValidationErrors)` if any non-secret field fails its
 /// validator. Returns `Ok(())` if only secret-field validators fail.
 #[inline]
-pub fn validate_excluding_secrets<C: validator::Validate + AppConfigMeta>(
-    cfg: &C,
-) -> Result<(), validator::ValidationErrors> {
+pub fn validate_excluding_secrets<C>(cfg: &C) -> Result<(), validator::ValidationErrors>
+where
+    C: validator::Validate + AppConfigMeta,
+{
     let result = cfg.validate();
     let Err(mut errors) = result else {
         return Ok(());

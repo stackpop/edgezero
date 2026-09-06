@@ -68,7 +68,10 @@ impl ResolvedStoreId {
     /// equals the logical id (no env override applied).
     #[must_use]
     #[inline]
-    pub fn from_logical<S: Into<String>>(logical: S) -> Self {
+    pub fn from_logical<S>(logical: S) -> Self
+    where
+        S: Into<String>,
+    {
         let logical_str = logical.into();
         Self {
             platform: logical_str.clone(),
@@ -91,7 +94,11 @@ impl ResolvedStoreId {
     /// case + for the CLI's manual `resolve_kind` helper.
     #[must_use]
     #[inline]
-    pub fn new<L: Into<String>, P: Into<String>>(logical: L, platform: P) -> Self {
+    pub fn new<L, P>(logical: L, platform: P) -> Self
+    where
+        L: Into<String>,
+        P: Into<String>,
+    {
         Self {
             logical: logical.into(),
             platform: platform.into(),
@@ -207,11 +214,10 @@ impl<'entry> TypedSecretEntry<'entry> {
     /// Construct a new entry from its three components.
     #[must_use]
     #[inline]
-    pub fn new<Name: Into<String>>(
-        store_id: &'entry str,
-        field_name: Name,
-        key_value: &'entry str,
-    ) -> Self {
+    pub fn new<Name>(store_id: &'entry str, field_name: Name, key_value: &'entry str) -> Self
+    where
+        Name: Into<String>,
+    {
         Self {
             field_name: field_name.into(),
             key_value,

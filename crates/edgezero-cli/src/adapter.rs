@@ -339,7 +339,11 @@ fn run_shell(
 /// This is the "tee" half of [`run_shell_tee`]: the operator still sees
 /// the child's output as it happens, and the caller still gets the text
 /// to parse.
-fn tee_stream<R: Read, W: Write>(reader: R, mut writer: W) -> String {
+fn tee_stream<R, W>(reader: R, mut writer: W) -> String
+where
+    R: Read,
+    W: Write,
+{
     let mut buffered = BufReader::new(reader);
     let mut captured = String::new();
     let mut line = String::new();

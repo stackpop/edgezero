@@ -157,7 +157,10 @@ impl PersistentKvStore {
     /// # Errors
     /// Returns an error if the database file cannot be opened or initialised (corrupted file, locked by another process, or insufficient permissions).
     #[inline]
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, KvError> {
+    pub fn new<P>(path: P) -> Result<Self, KvError>
+    where
+        P: AsRef<Path>,
+    {
         let db_path = path.as_ref().display().to_string();
         let db = Database::create(path).map_err(|err| {
             KvError::Internal(anyhow::anyhow!(
@@ -220,49 +223,53 @@ impl KvStore for PersistentKvStore {
             .open_table(KV_TABLE)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open table: {err}")))?;
 
-        if let Some(entry) = table
+        // redb asserts that no read reference outlives its transaction, so the
+        // `AccessGuard` borrow has to end before the drops below.
+        let live_value = match table
             .get(key)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?
         {
-            let (value_bytes, expires_at) = entry.value();
-
-            // Check if expired
-            if Self::is_expired(expires_at) {
-                // Drop read transaction before write
-                drop(table);
-                drop(read_txn);
-
-                // Delete the expired key
-                let write_txn = self.begin_write()?;
-                {
-                    let mut write_table = Self::open_table(&write_txn)?;
-                    // Re-check expiry inside write txn to avoid TOCTOU race:
-                    // a concurrent put_bytes may have overwritten the key with
-                    // a fresh value between our read and this write.
-                    let still_expired = write_table
-                        .get(key)
-                        .map_err(|err| {
-                            KvError::Internal(anyhow::anyhow!("failed to get key: {err}"))
-                        })?
-                        .is_some_and(|fresh_entry| {
-                            let (_, exp) = fresh_entry.value();
-                            Self::is_expired(exp)
-                        });
-                    if still_expired {
-                        write_table.remove(key).map_err(|err| {
-                            KvError::Internal(anyhow::anyhow!("failed to remove: {err}"))
-                        })?;
-                    }
+            None => return Ok(None),
+            Some(entry) => {
+                let (value_bytes, expires_at) = entry.value();
+                if Self::is_expired(expires_at) {
+                    None
+                } else {
+                    Some(Bytes::copy_from_slice(value_bytes))
                 }
-                Self::commit(write_txn)?;
-
-                return Ok(None);
             }
+        };
 
-            Ok(Some(Bytes::copy_from_slice(value_bytes)))
-        } else {
-            Ok(None)
+        if let Some(value) = live_value {
+            return Ok(Some(value));
         }
+
+        // Expired: drop the read transaction before opening the write one.
+        drop(table);
+        drop(read_txn);
+
+        let write_txn = self.begin_write()?;
+        {
+            let mut write_table = Self::open_table(&write_txn)?;
+            // Re-check expiry inside write txn to avoid TOCTOU race:
+            // a concurrent put_bytes may have overwritten the key with
+            // a fresh value between our read and this write.
+            let still_expired = write_table
+                .get(key)
+                .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?
+                .is_some_and(|fresh_entry| {
+                    let (_, exp) = fresh_entry.value();
+                    Self::is_expired(exp)
+                });
+            if still_expired {
+                write_table
+                    .remove(key)
+                    .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to remove: {err}")))?;
+            }
+        }
+        Self::commit(write_txn)?;
+
+        Ok(None)
     }
 
     #[inline]
