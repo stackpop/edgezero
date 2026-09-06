@@ -1,5 +1,10 @@
 # EdgeZero Deploy GitHub Actions — Layered, Adapter-Independent Spec
 
+> Prepublication: these examples use `<EDGEZERO_ACTION_VERSION>` and are not runnable
+> until the caching release and adoption migration are complete. Public action and
+> workflow references require one exact stable `vMAJOR.MINOR.PATCH` version, never a
+> SHA, branch, major/minor tag, or prerelease. Third-party tag movement is accepted.
+
 **Status:** Revised design (supersedes the Fastly-only v0 spec)
 
 **Date:** 2026-07-08
@@ -95,16 +100,15 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
    `zizmor`). No `python3` heredocs and no `pip install`.
 9. **Pin third-party actions.** Every third-party `uses:` — in the repository's own
    _workflows_ and nested _inside a reusable action_ (`build-app-cli`,
-   `deploy-fastly`, …) — is pinned to a concrete, reviewable reference: a full commit
-   SHA or a released version tag, **including a movable major tag** (for example
-   `actions/checkout@v7` or `actions-rust-lang/setup-rust-toolchain@v1`). This is a
-   pinning policy, not an immutability guarantee: a version tag — a major tag such as
-   `@v4` especially — can be repointed by the action's publisher, so pin to a full
-   commit SHA where cryptographic immutability matters. A branch/floating ref
-   (`@main`, `@develop`, `@latest`) is rejected. `check-action-pins.sh` is the
+   `deploy-fastly`, …) — uses a canonical exact stable patch version (for example
+   `actions/checkout@v7.0.1` or `actions-rust-lang/setup-rust-toolchain@v1.17.0`).
+   Commit SHAs, major/minor tags, branches, prereleases, and build metadata are
+   rejected. Third-party tag movement is an accepted risk; EdgeZero releases use
+   immutable release versions. `check-action-pins.sh` is the
    repository-wide gate: it parses every workflow and action's YAML STRUCTURALLY
    (via `yq`, so a quoted, unicode-escaped, `!!str`-tagged, or multiline-scalar
-   `uses` cannot hide a floating ref) and accepts only a SHA or a version-tag shape.
+   `uses` cannot hide an invalid ref). Docker actions require lowercase SHA-256
+   digests; local action paths remain local.
    `.github/zizmor.yml` sets `unpinned-uses` to `ref-pin` as defense-in-depth over
    the deploy action surface (zizmor cannot distinguish a tag from a branch, so the
    tag-vs-branch decision is the pin script's).
@@ -424,37 +428,41 @@ versions via the API, not on application source. They need no Fastly CLI install
 A caller wires the trio; the actions carry no orchestration policy of their own:
 
 ```yaml
-- id: cli
-  uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-  with: { app-cli-package: my-app-cli }
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: cli
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with: { app-cli-package: my-app-cli }
 
-- id: stage
-  uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    deploy-to: staging
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: stage
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
-- id: check
-  uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    deploy-to: staging
-    domain: staging.example.com
-    fastly-version: ${{ steps.stage.outputs.fastly-version }}
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: check
+        uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs.fastly-version }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
-- if: >-
-    (failure() || cancelled()) && steps.stage.outputs.fastly-version != ''
-  uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    deploy-to: staging
-    fastly-version: ${{ steps.stage.outputs.fastly-version }}
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - if: >-
+          (failure() || cancelled()) && steps.stage.outputs.fastly-version != ''
+        uses: stackpop/edgezero/.github/actions/rollback-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          fastly-version: ${{ steps.stage.outputs.fastly-version }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
 The condition is `failure() || cancelled()` because `failure()` alone does not run
@@ -598,7 +606,8 @@ probe it, roll back on failure.
 
 ## 6. Execution flow (engine)
 
-1. Verify the runner is Linux x86-64 (`ubuntu-latest` is the tested environment).
+1. Verify the runner is Linux x86-64. The caching addendum requires standard
+   GitHub-hosted `ubuntu-24.04`, verified through the runner context.
    Self-hosted runners additionally require **Actions Runner 2.327.1+** — the
    wrappers use Node 24 actions (`download-artifact@v8`, `cache@v6`,
    `upload-artifact@v7`, `checkout@v7`), whose runtime ships only in that runner
@@ -928,10 +937,9 @@ can print credential material — so that file is created with `mktemp` at mode
 `600` and removed by an `EXIT` trap on normal exit, failure, and cancellation.
 This is best-effort, NOT a guarantee: a `SIGKILL`, runner shutdown, or hard
 job-timeout bypasses the trap (and the composite cleanup step), so on a persistent
-self-hosted runner a hard kill can leave the mode-`600` file behind. The supported
-runner model is therefore an **ephemeral** runner (GitHub-hosted, or self-hosted
-one-job-per-VM); on a persistent self-hosted runner, treat post-kill temp hygiene
-as your responsibility.
+self-hosted runner a hard kill can leave the mode-`600` file behind. The caching
+release supports only standard GitHub-hosted `ubuntu-24.04`; self-hosted runners,
+including one-job-per-VM runners, are outside the supported contract.
 
 Canonical lines are matched with a **fully anchored** pattern (`^<key>=[0-9]+$`).
 A prefix match reads `version=15.2.0` as `15` and `version=12abc` as `12` —
@@ -982,8 +990,9 @@ actions never construct error messages containing credentials.
 
 ## 14. Security requirements
 
-1. Recommend readable released tags for third-party actions and, for production,
-   full commit SHAs of the EdgeZero action ref where reproducibility matters.
+1. Require exact stable patch-version tags for third-party actions and one identical
+   immutable EdgeZero release version throughout each consumer workflow. Full SHAs
+   still identify application source and resolved execution, never external `uses:`.
 2. Compile the CLI package the application provides, from the application
    checkout and its lockfile; do not build the EdgeZero monorepo CLI or the
    action's own revision.

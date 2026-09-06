@@ -7,10 +7,18 @@ on:
       # the smokes) — including a brand-new action directory or an unrelated
       # workflow like test.yml that could introduce a floating ref.
       - .github/actions/**
+      - '**/action.yml'
+      - '**/action.yaml'
       - .github/workflows/**
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
+      - scripts/run-actionlint.sh
       - scripts/install-yq.sh
+      - docs/package.json
+      - docs/package-lock.json
+      - docs/.edgezero-action-release.json
+      - '**/*.[mM][dD]'
+      - '**/*.[mM][aA][rR][kK][dD][oO][wW][nN]'
       # The smoke fixture is a real Cargo app built against this workspace's crate
       # graph, so a change to the CLI/core/macro crates, the workspace manifest and
       # lockfile, or the pinned toolchain can change what the smoke compiles.
@@ -31,10 +39,18 @@ on:
       # the smokes) — including a brand-new action directory or an unrelated
       # workflow like test.yml that could introduce a floating ref.
       - .github/actions/**
+      - '**/action.yml'
+      - '**/action.yaml'
       - .github/workflows/**
       - .github/zizmor.yml
       - scripts/install-actionlint.sh
+      - scripts/run-actionlint.sh
       - scripts/install-yq.sh
+      - docs/package.json
+      - docs/package-lock.json
+      - docs/.edgezero-action-release.json
+      - '**/*.[mM][dD]'
+      - '**/*.[mM][aA][rR][kK][dD][oO][wW][nN]'
       # The smoke fixture is a real Cargo app built against this workspace's crate
       # graph, so a change to the CLI/core/macro crates, the workspace manifest and
       # lockfile, or the pinned toolchain can change what the smoke compiles.
@@ -53,7 +69,7 @@ permissions:
   contents: read
 
 env:
-  ACTIONLINT_VERSION: 1.7.7
+  ACTIONLINT_VERSION: 1.7.12
   ZIZMOR_VERSION: 1.16.3
   YQ_VERSION: 4.53.3
 
@@ -61,9 +77,10 @@ jobs:
   static-checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install pinned validation binaries under RUNNER_TEMP (checksum-verified)
         # Per the action's binary-isolation rule (§5.4/security principle 5),
@@ -96,21 +113,14 @@ jobs:
         # The `-shellcheck` integration runs shellcheck on each `run:` block at a
         # warning floor (info-level notes in unrelated workflows are not failures).
         run: |
-          "$RUNNER_TEMP/tools/bin/actionlint" -shellcheck='shellcheck -S warning'
+          bash scripts/run-actionlint.sh
 
       - name: Third-party actions pinned to a ref
         run: .github/actions/deploy-core/tests/check-action-pins.sh
 
       - name: Zizmor security scan
         run: |
-          "$RUNNER_TEMP/tools/bin/zizmor" --offline \
-            .github/workflows/deploy-action.yml \
-            .github/workflows/fastly-installer-check.yml \
-            .github/actions/build-app-cli/action.yml \
-            .github/actions/deploy-fastly/action.yml \
-            .github/actions/healthcheck-fastly/action.yml \
-            .github/actions/rollback-fastly/action.yml \
-            .github/actions/config-push-fastly/action.yml
+          "$RUNNER_TEMP/tools/bin/zizmor" --offline .github/workflows .github/actions
 
       - name: ShellCheck action scripts
         # -e SC1091: the `source "$SCRIPT_DIR/common.sh"` path is dynamic, so
@@ -121,15 +131,25 @@ jobs:
             .github/actions/*/scripts/*.sh \
             .github/actions/deploy-core/tests/*.sh \
             scripts/install-actionlint.sh \
+            scripts/run-actionlint.sh \
             scripts/install-yq.sh
 
-      - name: Bash contract tests
+      - name: Install documentation validator dependencies
+        # The documentation scanner loads its Markdown parser from this checked
+        # and locked tool tree, never from a separate candidate subject tree.
+        run: npm --prefix docs ci --ignore-scripts
+
+      - name: Action contract tests
         run: .github/actions/deploy-core/tests/run.sh
+
+      - name: Documentation references and release state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/actions/deploy-core/tests/check-doc-action-pins.sh
 
       - name: Validate docs
         run: |
           cd docs
-          npm ci
           npm run format
           npm run lint
           npm run build
@@ -145,7 +165,7 @@ jobs:
       FASTLY_ENDPOINT: https://inherited.invalid
       FASTLY_HOME: /nonexistent/inherited
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -216,7 +236,7 @@ jobs:
   handoff-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Create fixture app (app-owned CLI)
@@ -237,7 +257,7 @@ jobs:
       FASTLY_ENDPOINT: https://inherited.invalid
       FASTLY_HOME: /nonexistent/inherited
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       # The deploy job needs the app SOURCE (working-directory); the CLI binary comes
@@ -270,7 +290,7 @@ jobs:
   cache-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Create fixture app (app-owned CLI)
@@ -337,7 +357,7 @@ jobs:
     env:
       FAKE_LOSE_VERSION: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Create fixture app (app-owned CLI)
@@ -369,7 +389,7 @@ jobs:
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs['previous-version'] }}
         run: .github/actions/deploy-core/tests/assert-lost-version.sh
       - name: Download the CLI artifact for recovery
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v8.0.1
         with:
           name: edgezero-cli-recovery
           path: recover-cli
@@ -408,7 +428,7 @@ jobs:
       FASTLY_ENDPOINT: https://inherited.invalid
       FASTLY_HOME: /nonexistent/inherited
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -489,7 +509,7 @@ jobs:
       FASTLY_HOME: /nonexistent/inherited
       FASTLY_API_TOKEN: inherited-must-not-reach-production-probes
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 

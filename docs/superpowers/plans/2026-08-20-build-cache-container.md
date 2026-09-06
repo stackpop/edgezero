@@ -132,6 +132,9 @@ Create:
 - `.github/actions/deploy-core/tests/verify-gate-rotation-lock.test.sh`
 - `.github/actions/deploy-core/tests/build-container-workflows.test.sh`
 - `.github/actions/deploy-core/tests/check-doc-action-pins.sh`
+- `.github/actions/deploy-core/tests/check-doc-action-pins.mjs`
+- `.github/actions/deploy-core/tests/check-doc-action-pins.test.mjs`
+- `.github/actions/deploy-core/tests/install-actionlint.test.sh`
 - `.github/actions/deploy-core/tests/run-actionlint.test.sh`
 - `.github/workflows/build-container-ci.yml`
 - `.github/workflows/publish-build-container.yml`
@@ -157,6 +160,7 @@ Modify:
 - `.github/zizmor.yml`
 - `.github/workflows/deploy-action.yml`
 - `scripts/install-actionlint.sh`
+- `docs/{package.json,package-lock.json}` (the exact Markdown parser used by the documentation gate)
 - every existing `.github` workflow/composite containing a non-local external `uses:` ref
 - the four deploy/adoption documents containing consumer `uses:` examples
 
@@ -178,32 +182,32 @@ v6.29 and must be narrowed before adding the write-privileged publisher.
   `docs/specs/edgezero-deploy-action-implementation-plan.md`,
   `docs/specs/edgezero-deploy-adoption-guide.md`, and `docs/guide/deploy-github-actions.md`.
 
-- [ ] Write failing pin-gate tests proving `@v1`, `@v1.2`, branches, prereleases, build metadata,
+- [x] Write failing pin-gate tests proving `@v1`, `@v1.2`, branches, prereleases, build metadata,
       full/abbreviated SHAs, malformed/leading-zero versions, and empty refs fail; canonical stable
       `@v1.2.3` passes; local actions and digest-pinned Docker actions remain valid. Generate invalid
       YAML fixtures under the test's temporary directory; do not commit them into a surface scanned
       by the production gate.
-- [ ] Resolve each existing external ref to a reviewed upstream exact stable patch release. Record
+- [x] Resolve each existing external ref to a reviewed upstream exact stable patch release. Record
       the release URL and resolved commit in review evidence, prove the release tag exists and no
       same-named branch exists at review time, but write the version tag in YAML.
-- [ ] Change the structural YAML scanner to require canonical exact stable patch versions for every non-local external
+- [x] Change the structural YAML scanner to require canonical exact stable patch versions for every non-local external
       action and reusable workflow. Its default scan is exactly workflow `*.yml`/`*.yaml` files directly
       under `.github/workflows`, plus every repository-wide `action.yml`/`action.yaml`, pruning `.git`,
       `target`, and `node_modules`. Shell source and arbitrary YAML test data are not inputs. Do not add a
       low-privilege exception.
-- [ ] Reject empty and null `uses` scalars and count only parsed non-local external refs for the
+- [x] Reject empty and null `uses` scalars and count only parsed non-local external refs for the
       non-vacuity assertion. Encode each structurally extracted scalar so a multiline value cannot split
       into multiple shell records.
-- [ ] Require Docker action refs to match an immutable lowercase
+- [x] Require Docker action refs to match an immutable lowercase
       `docker://<name>@sha256:<64-lowercase-hex>` form; tags, uppercase hex, short digests, and other
       algorithms fail unless a separately reviewed digest algorithm is added to the policy.
-- [ ] Update the four prepublication adoption documents to use literal
+- [x] Update the four prepublication adoption documents to use literal
       `<EDGEZERO_ACTION_VERSION>` where the future consumer will substitute stable release `V`;
       examples for third-party actions use real reviewed exact patch versions. Replace
       `ubuntu-latest` and every other runner label on a step-based consumer job containing a
       `steps[*].uses` EdgeZero action reference with literal `runs-on: ubuntu-24.04`. A caller job with
       `jobs.<id>.uses` must omit both `steps` and `runs-on`; its called workflow selects the runner.
-- [ ] Add `check-doc-action-pins.sh` to parse fenced YAML in every tracked Markdown file and implement
+- [x] Add `check-doc-action-pins.sh` to parse fenced YAML in every tracked Markdown file and implement
       both documentation states from the design. In bootstrap state, absent
       `docs/.edgezero-action-release.json` permits the exact EdgeZero placeholder only in the four
       named prepublication documents. In transition state, a candidate adds the exact JCS `{V,P}`
@@ -224,12 +228,17 @@ v6.29 and must be narrowed before adding the write-privileged publisher.
       `prerelease:false`, `immutable:true` release whose API target and anonymous peeled remote ref
       both equal record `P`. Bootstrap and unchanged released-state checks remain offline. Candidate
       code cannot replace the verifier or release record parser.
-- [ ] Retain global zizmor `ref-pin` as defense in depth and document that the structural scanner is
+      Implementation uses Node's typed JSON and Git subprocess APIs plus exact `markdown-it@15.0.1`
+      for Markdown fence parsing and pinned yq for YAML. The Bash entrypoint and colocated module,
+      tests, and docs dependency manifests belong to `G`; install dependencies with
+      `npm --prefix <gate-root>/docs ci --ignore-scripts`. Never resolve parser modules or run npm
+      from the candidate subject checkout.
+- [x] Retain global zizmor `ref-pin` as defense in depth and document that the structural scanner is
       stricter. Rewrite `.github/zizmor.yml`'s existing comment so it no longer claims full commit
       SHAs pass repository policy: `ref-pin` accepts symbolic refs, while the structural gate permits
       only exact stable patch tags. Update contradictory prose in all four named documents, not only
       their fenced YAML examples.
-- [ ] Upgrade actionlint to exactly `1.7.12`. Pin these reviewed release archives in
+- [x] Upgrade actionlint to exactly `1.7.12`. Pin these reviewed release archives in
       `scripts/install-actionlint.sh`: linux/amd64
       `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`, linux/arm64
       `325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6`, darwin/amd64
@@ -237,22 +246,22 @@ v6.29 and must be narrowed before adding the write-privileged publisher.
       `aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f`. Test exact version,
       supported tuples, unknown tuple rejection, and checksum mismatch. Add an actionlint regression
       fixture containing `environment: {name: build-container-release, deployment: false}`.
-- [ ] Before the publisher exists, add failing tests for pinned actionlint's two known syntax gaps.
+- [x] Before the publisher exists, add failing tests for pinned actionlint's two known syntax gaps.
       `run-actionlint.sh` requires mikefarah yq 4.53.3 and structurally permits workflow-level
       `concurrency.queue: max` only in the publisher and gate-rotation workflows, each with exact group
       `edgezero-build-container-publication` and literal `cancel-in-progress:false`. It permits exactly
       the four `job.workflow_*` properties only in approved expressions/checkout ref locations of
       `.github/workflows/build-app-cli.yml`. Reject duplicate/aliased/misplaced/wrong values,
       misspellings, extra job properties, other workflows, and dynamic expressions.
-- [ ] After structural validation, make line-count-preserving temporary copies that blank only the two
+- [x] After structural validation, make line-count-preserving temporary copies that blank only the two
       approved queue lines and substitute same-type constants for only the approved job-context
       expressions. Run unfiltered actionlint 1.7.12 on those files and remap paths/lines; do not use
       `-ignore` or filter diagnostics. Raw canonical fixtures must emit exactly the reviewed unsupported
       queue/job-context diagnostic set, sanitized fixtures must pass, and every unrelated actionlint
       error must remain fatal.
-- [ ] Scan that exact default surface, including reusable-workflow job-level `uses`, and require at
+- [x] Scan that exact default surface, including reusable-workflow job-level `uses`, and require at
       least one parsed external ref so a broken parser cannot pass vacuously.
-- [ ] Run the pin suite, actionlint, and zizmor.
+- [x] Run the pin suite, actionlint, and zizmor.
 
 ```bash
 bash .github/actions/deploy-core/tests/run.sh

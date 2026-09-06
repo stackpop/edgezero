@@ -147,7 +147,7 @@ runs:
       run: exec "$GITHUB_ACTION_PATH/scripts/validate.sh"
 
     - name: Download CLI artifact
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@v8.0.1
       with:
         name: ${{ inputs['app-cli-artifact'] }}
         path: ${{ steps.ws.outputs.root }}/cli-download
@@ -235,7 +235,7 @@ runs:
       # skipped, so restoring would be a no-op; skip it too, matching the docs.
       if: ${{ inputs.cache == 'true' && steps.resolve.outputs['effective-build-mode'] == 'always' }}
       id: cache-restore
-      uses: actions/cache/restore@v6
+      uses: actions/cache/restore@v6.1.0
       with:
         key: ${{ steps.resolve.outputs['cache-key'] }}
         path: ${{ steps.resolve.outputs['cache-path'] }}
@@ -258,10 +258,10 @@ runs:
         FASTLY_HOME: ""
 
     - name: Install Rust toolchain
-      # Pinned to a released major version tag, per the repo's pin policy
-      # (check-action-pins.sh + .github/zizmor.yml accept a SHA or a version tag;
+      # Pinned to an exact stable patch version, per the repo's pin policy
+      # (check-action-pins.sh is stricter than zizmor's symbolic-ref check;
       # branch/floating refs are rejected).
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
       with:
         toolchain: ${{ steps.resolve.outputs['rust-toolchain'] }}
         target: wasm32-wasip1
@@ -358,7 +358,7 @@ runs:
     # saved.
     - name: Save application target cache
       if: ${{ inputs.cache == 'true' && steps.resolve.outputs['effective-build-mode'] == 'always' && steps.cache-restore.outputs['cache-hit'] != 'true' }}
-      uses: actions/cache/save@v6
+      uses: actions/cache/save@v6.1.0
       with:
         key: ${{ steps.resolve.outputs['cache-key'] }}
         path: ${{ steps.resolve.outputs['cache-path'] }}

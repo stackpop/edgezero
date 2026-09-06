@@ -1,5 +1,10 @@
 # Deploying from GitHub Actions
 
+> Prepublication: these examples use `<EDGEZERO_ACTION_VERSION>` and are not runnable
+> until the caching release and adoption migration are complete. Public action and
+> workflow references require one exact stable `vMAJOR.MINOR.PATCH` version, never a
+> SHA, branch, major/minor tag, or prerelease. Third-party tag movement is accepted.
+
 EdgeZero ships a set of reusable GitHub composite actions that deploy a
 checked-out EdgeZero application to Fastly Compute. They are **layered** so that
 adding another provider later does not rewrite the deploy engine, and the
@@ -23,12 +28,11 @@ this page is the practical how-to.
 Under the hood a private `deploy-core` engine (a set of shared scripts) holds all
 provider-neutral behavior; the wrappers above are thin.
 
-**Runner support:** Linux x86-64 only (`ubuntu-latest` is tested). On **self-hosted**
-runners you must run **Actions Runner 2.327.1 or newer**: these actions use
-Node 24 dependencies (`actions/download-artifact@v8`, `actions/cache@v6`,
-`actions/upload-artifact@v7`, `actions/checkout@v7`), and the Node 24 runtime they
-require ships only in runner 2.327.1+. Hosted runners already meet this; older
-self-hosted runners fail to launch the actions.
+**Runner support for the caching release:** standard GitHub-hosted `ubuntu-24.04`
+Linux x86-64. Every step-based job using a public action declares that literal
+label. A job-level reusable-workflow caller omits both `steps` and `runs-on`;
+the called workflow selects its runner. Self-hosted, larger, and custom-image
+runners are unsupported.
 
 ## What you provide
 
@@ -67,29 +71,29 @@ self-hosted runners fail to launch the actions.
 ```yaml
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       - id: cli
-        uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
         with:
           app-cli-package: my-app-cli # the CLI crate in your workspace
 
       - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
-        uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
         with:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
-Use a trusted `@<ref>` — a released tag, or a full commit SHA when you need a
-reproducible production deploy.
+The release migration replaces `<EDGEZERO_ACTION_VERSION>` with one published,
+immutable, exact stable patch version across every EdgeZero reference.
 
 ## Separate deployer and application repositories
 
@@ -106,48 +110,51 @@ The snippet below is a job fragment with placeholders you must fill in:
 - The application checkout's `token:` reads `steps.app-token.outputs.token`, which
   assumes an earlier `id: app-token` step that mints the token (shown below). Swap
   it for however you mint yours.
-- Replace every `@<ref>` in a `uses:` with a real ref — a released tag, or a full
-  commit SHA for a reproducible production deploy.
+- The release migration replaces every `<EDGEZERO_ACTION_VERSION>` with the same
+  exact stable EdgeZero release version.
 
 ```yaml
-steps:
-  - name: Checkout deployer
-    uses: actions/checkout@v4
-    with:
-      path: deployer
-      persist-credentials: false
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout deployer
+        uses: actions/checkout@v7.0.1
+        with:
+          path: deployer
+          persist-credentials: false
 
-  # Mint the app-scoped token consumed by the application checkout below. This
-  # example uses a GitHub App; a fine-grained PAT in a secret works too.
-  - id: app-token
-    uses: actions/create-github-app-token@<ref>
-    with:
-      app-id: ${{ vars.APP_ID }}
-      private-key: ${{ secrets.APP_PRIVATE_KEY }}
-      repositories: my-edgezero-app
+      # Mint the app-scoped token consumed by the application checkout below. This
+      # example uses a GitHub App; a fine-grained PAT in a secret works too.
+      - id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: my-edgezero-app
 
-  - name: Checkout application
-    uses: actions/checkout@v4
-    with:
-      repository: stackpop/my-edgezero-app
-      ref: ${{ inputs.ref }} # requires an `on:` input named `ref`, or use a literal
-      path: app
-      persist-credentials: false
-      token: ${{ steps.app-token.outputs.token }} # app-scoped token
+      - name: Checkout application
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/my-edgezero-app
+          ref: ${{ inputs.ref }} # requires an `on:` input named `ref`, or use a literal
+          path: app
+          persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }} # app-scoped token
 
-  - id: cli
-    uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-    with:
-      app-cli-package: my-app-cli
-      working-directory: app
+      - id: cli
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-package: my-app-cli
+          working-directory: app
 
-  - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
-    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-    with:
-      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-      working-directory: app
-      fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-      fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: app
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
 ## Monorepo application
@@ -158,25 +165,29 @@ workspace may be the subdirectory itself), so a monorepo caches the right
 `target/`.
 
 ```yaml
-- id: cli
-  uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-  with:
-    app-cli-package: api-cli
-    working-directory: apps/api
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: cli
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-package: api-cli
+          working-directory: apps/api
 
-- id: deploy # recovery/rollback below reads steps.deploy.outputs.*
-  uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    working-directory: apps/api
-    manifest: edgezero.toml
-    # `cache` only takes effect with `build-mode: always` — that credential-free
-    # build is what seeds the cache (the token-bearing deploy is never cached). With
-    # the Fastly default `build-mode: never`, `cache: true` is a no-op.
-    build-mode: always
-    cache: true
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: apps/api
+          manifest: edgezero.toml
+          # `cache` only takes effect with `build-mode: always` — that credential-free
+          # build is what seeds the cache (the token-bearing deploy is never cached). With
+          # the Fastly default `build-mode: never`, `cache: true` is a no-op.
+          build-mode: always
+          cache: true
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
 ## Keeping the credential out of the build phase
@@ -204,30 +215,30 @@ boundaries).
 ```yaml
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - id: cli
-        uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
         with:
           app-cli-package: my-app-cli
     # No provider secret is available anywhere in this job.
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - id: deploy # recovery/rollback below reads steps.deploy.outputs.*
-        uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
         with:
           app-cli-artifact: edgezero-cli # the build job's artifact name
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -308,11 +319,15 @@ The default `provider-env-clear` list repeats the shipped aliases so the dynamic
 layer is self-contained. Add your own provider's aliases if you have one:
 
 ```yaml
-- uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-  with:
-    app-cli-package: my-app-cli
-    # Defaults cover Fastly/Cloudflare/Spin; add your own provider's aliases.
-    provider-env-clear: '["FASTLY_API_TOKEN","ACME_DEPLOY_TOKEN"]'
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-package: my-app-cli
+          # Defaults cover Fastly/Cloudflare/Spin; add your own provider's aliases.
+          provider-env-clear: '["FASTLY_API_TOKEN","ACME_DEPLOY_TOKEN"]'
 ```
 
 The value must be a JSON array of non-empty variable names; anything else fails
@@ -392,67 +407,71 @@ the build ran in this job or a
 not cross job boundaries.
 
 ```yaml
-- name: Fetch the app CLI for recovery
-  # Runs on ANY non-success — NOT gated on mutation-attempted, whose absence is
-  # not proof of no mutation (a lost signal must not skip reconciliation). The
-  # active-version check below is idempotent: it only rolls back if the live
-  # version actually differs from the pre-deploy one.
-  if: ${{ failure() || cancelled() }}
-  uses: actions/download-artifact@<sha>
-  with:
-    name: edgezero-cli # the same app-cli-artifact name the deploy used
-    path: ${{ runner.temp }}/recover-cli
-- name: Read the currently-active version
-  id: recover
-  # Runs on ANY non-success — NOT gated on mutation-attempted, whose absence is
-  # not proof of no mutation (a lost signal must not skip reconciliation). The
-  # active-version check below is idempotent: it only rolls back if the live
-  # version actually differs from the pre-deploy one.
-  if: ${{ failure() || cancelled() }}
-  env:
-    FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }} # active-version calls the API
-    # Pass the service id through env, never interpolate `${{ vars.* }}` into the
-    # script — a value containing a quote could otherwise escape the argument.
-    SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
-  # Explicit `shell: bash` runs with `-eo pipefail`, so a failing `active-version`
-  # (in the `$(…)` below) aborts rather than silently yielding an empty version and
-  # skipping rollback.
-  shell: bash
-  run: |
-    case "$SERVICE_ID" in '' | *[!A-Za-z0-9_-]*)
-      echo "::error::FASTLY_SERVICE_ID is empty or malformed"; exit 1;; esac
-    dir="${{ runner.temp }}/recover-cli"
-    tar -C "$dir" -xf "$dir"/*.tar
-    bin="$dir/$(jq -r '."app-cli-bin"' "$dir/app-cli-meta.json")"
-    out=$("$bin" active-version --adapter fastly --service-id "$SERVICE_ID")
-    # Require EXACTLY ONE `version=` line (a malformed or repeated line is an
-    # error), and accept an EMPTY value: active-version emits `version=` when the
-    # service has no active version yet (a first-ever deploy) — that is "nothing to
-    # roll back", not a failure. The value is the digits, or empty.
-    #
-    # Use HERE-STRINGS, never `printf … | grep -q`: grep -q exits on the first
-    # match and SIGPIPEs the writer, which under pipefail returns 141 and would fail
-    # this step (skipping rollback) when active-version prints extra lines.
-    n=$(grep -cE '^version=' <<<"$out" || true)
-    [ "$n" = "1" ] || { echo "::error::expected exactly one 'version=' line, got $n"; exit 1; }
-    grep -qE '^version=[0-9]*$' <<<"$out" ||
-      { echo "::error::active-version emitted a malformed version line"; exit 1; }
-    v=$(sed -n 's/^version=//p' <<<"$out")
-    echo "version=$v" >>"$GITHUB_OUTPUT" # empty -> the rollback step's guard skips it
-- name: Roll back only if the deploy activated a NEW version over a known previous one
-  if: >-
-    (failure() || cancelled()) &&
-    steps.deploy.outputs['previous-version'] != '' &&
-    steps.recover.outputs.version != '' &&
-    steps.recover.outputs.version != steps.deploy.outputs['previous-version']
-  uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
-  with:
-    app-cli-artifact: edgezero-cli
-    deploy-to: production
-    fastly-version: ${{ steps.recover.outputs.version }} # current (bad) version
-    rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch the app CLI for recovery
+        # Runs on ANY non-success — NOT gated on mutation-attempted, whose absence is
+        # not proof of no mutation (a lost signal must not skip reconciliation). The
+        # active-version check below is idempotent: it only rolls back if the live
+        # version actually differs from the pre-deploy one.
+        if: ${{ failure() || cancelled() }}
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: edgezero-cli # the same app-cli-artifact name the deploy used
+          path: ${{ runner.temp }}/recover-cli
+      - name: Read the currently-active version
+        id: recover
+        # Runs on ANY non-success — NOT gated on mutation-attempted, whose absence is
+        # not proof of no mutation (a lost signal must not skip reconciliation). The
+        # active-version check below is idempotent: it only rolls back if the live
+        # version actually differs from the pre-deploy one.
+        if: ${{ failure() || cancelled() }}
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }} # active-version calls the API
+          # Pass the service id through env, never interpolate `${{ vars.* }}` into the
+          # script — a value containing a quote could otherwise escape the argument.
+          SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
+        # Explicit `shell: bash` runs with `-eo pipefail`, so a failing `active-version`
+        # (in the `$(…)` below) aborts rather than silently yielding an empty version and
+        # skipping rollback.
+        shell: bash
+        run: |
+          case "$SERVICE_ID" in '' | *[!A-Za-z0-9_-]*)
+            echo "::error::FASTLY_SERVICE_ID is empty or malformed"; exit 1;; esac
+          dir="${{ runner.temp }}/recover-cli"
+          tar -C "$dir" -xf "$dir"/*.tar
+          bin="$dir/$(jq -r '."app-cli-bin"' "$dir/app-cli-meta.json")"
+          out=$("$bin" active-version --adapter fastly --service-id "$SERVICE_ID")
+          # Require EXACTLY ONE `version=` line (a malformed or repeated line is an
+          # error), and accept an EMPTY value: active-version emits `version=` when the
+          # service has no active version yet (a first-ever deploy) — that is "nothing to
+          # roll back", not a failure. The value is the digits, or empty.
+          #
+          # Use HERE-STRINGS, never `printf … | grep -q`: grep -q exits on the first
+          # match and SIGPIPEs the writer, which under pipefail returns 141 and would fail
+          # this step (skipping rollback) when active-version prints extra lines.
+          n=$(grep -cE '^version=' <<<"$out" || true)
+          [ "$n" = "1" ] || { echo "::error::expected exactly one 'version=' line, got $n"; exit 1; }
+          grep -qE '^version=[0-9]*$' <<<"$out" ||
+            { echo "::error::active-version emitted a malformed version line"; exit 1; }
+          v=$(sed -n 's/^version=//p' <<<"$out")
+          echo "version=$v" >>"$GITHUB_OUTPUT" # empty -> the rollback step's guard skips it
+      - name: Roll back only if the deploy activated a NEW version over a known previous one
+        if: >-
+          (failure() || cancelled()) &&
+          steps.deploy.outputs['previous-version'] != '' &&
+          steps.recover.outputs.version != '' &&
+          steps.recover.outputs.version != steps.deploy.outputs['previous-version']
+        uses: stackpop/edgezero/.github/actions/rollback-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: edgezero-cli
+          deploy-to: production
+          fastly-version: ${{ steps.recover.outputs.version }} # current (bad) version
+          rollback-to: ${{ steps.deploy.outputs['previous-version'] }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
 **First-ever deploy** is the one case this cannot automate: if `previous-version`
@@ -553,17 +572,21 @@ the config store rather than assume it is unchanged.
 A production config push, using the same build artifact:
 
 ```yaml
-- id: cli
-  uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-  with:
-    app-cli-package: my-app-cli
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: cli
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-package: my-app-cli
 
-- uses: stackpop/edgezero/.github/actions/config-push-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    # deploy-to: staging  # writes the <store>_staging twin instead
-    # app-config-inline: ${{ vars.APP_CONFIG_TOML }}  # or push inline content
+      - uses: stackpop/edgezero/.github/actions/config-push-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          # deploy-to: staging  # writes the <store>_staging twin instead
+          # app-config-inline: ${{ vars.APP_CONFIG_TOML }}  # or push inline content
 ```
 
 **Staging config is the same store, a different key.** Fastly config stores are
@@ -624,37 +647,41 @@ your app CLI; the actions are thin wrappers. You wire the trio — the actions
 carry no orchestration policy of their own.
 
 ```yaml
-- id: cli
-  uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-  with: { app-cli-package: my-app-cli }
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: cli
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with: { app-cli-package: my-app-cli }
 
-- id: stage
-  uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    deploy-to: staging
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: stage
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
-- id: check
-  uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    deploy-to: staging
-    domain: staging.example.com
-    fastly-version: ${{ steps.stage.outputs.fastly-version }}
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: check
+        uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          domain: staging.example.com
+          fastly-version: ${{ steps.stage.outputs.fastly-version }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
-- if: >-
-    (failure() || cancelled()) && steps.stage.outputs.fastly-version != ''
-  uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
-  with:
-    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-    deploy-to: staging
-    fastly-version: ${{ steps.stage.outputs.fastly-version }}
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - if: >-
+          (failure() || cancelled()) && steps.stage.outputs.fastly-version != ''
+        uses: stackpop/edgezero/.github/actions/rollback-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          deploy-to: staging
+          fastly-version: ${{ steps.stage.outputs.fastly-version }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
 - `deploy-fastly` with `deploy-to: staging` clones the active version, uploads the built
@@ -671,27 +698,31 @@ in Fastly's version metadata — so a production rollback **cannot infer** what 
 re-activate. Capture the target at deploy time and thread it through:
 
 ```yaml
-- id: deploy
-  uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-  with:
-    # A literal artifact name works whether the build ran in this job or a
-    # separate one — steps.cli.* does not cross job boundaries.
-    app-cli-artifact: edgezero-cli
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: deploy
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          # A literal artifact name works whether the build ran in this job or a
+          # separate one — steps.cli.* does not cross job boundaries.
+          app-cli-artifact: edgezero-cli
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 
-# ... run your production health checks here ...
+      # ... run your production health checks here ...
 
-- if: >-
-    (failure() || cancelled()) && steps.deploy.outputs.fastly-version != '' &&
-    steps.deploy.outputs.previous-version != ''
-  uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
-  with:
-    app-cli-artifact: edgezero-cli
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-    fastly-version: ${{ steps.deploy.outputs.fastly-version }}
-    rollback-to: ${{ steps.deploy.outputs.previous-version }}
+      - if: >-
+          (failure() || cancelled()) && steps.deploy.outputs.fastly-version != '' &&
+          steps.deploy.outputs.previous-version != ''
+        uses: stackpop/edgezero/.github/actions/rollback-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: edgezero-cli
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+          fastly-version: ${{ steps.deploy.outputs.fastly-version }}
+          rollback-to: ${{ steps.deploy.outputs.previous-version }}
 ```
 
 The rollback needs **both** outputs, so it guards on both. `previous-version` is
@@ -751,12 +782,11 @@ mode-`600` temp file (it can contain credential material under debug flags) and
 remove it with a best-effort `EXIT` trap. A `SIGKILL`, runner shutdown, or hard
 `timeout-minutes` bypasses that trap, so on a **persistent self-hosted** runner a
 hard kill can leave that file — and any inline config — behind for another job to
-read. The supported model is an ephemeral runner (GitHub-hosted, or self-hosted
-one-job-per-VM); on a persistent runner, post-kill temp hygiene is on you.
+read. The caching release supports only standard GitHub-hosted `ubuntu-24.04`;
+self-hosted, custom, and larger runners are not supported.
 
 Add `timeout-minutes`, a protected GitHub Environment with required reviewers,
-and pin third-party actions to readable released tags (or full SHAs for
-production).
+and pin third-party actions to canonical exact stable patch-version tags.
 
 ## Non-goals
 

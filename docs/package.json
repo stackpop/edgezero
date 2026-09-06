@@ -16,6 +16,7 @@
   "devDependencies": {
     "@types/node": "^24.10",
     "eslint": "^10",
+    "markdown-it": "15.0.1",
     "@eslint/js": "^10",
     "typescript-eslint": "^8.58",
     "prettier": "^3.9.6",

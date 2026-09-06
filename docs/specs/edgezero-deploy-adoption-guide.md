@@ -1,5 +1,10 @@
 # EdgeZero Deploy Actions — Adoption Guide
 
+> Prepublication: these examples use `<EDGEZERO_ACTION_VERSION>` and are not runnable
+> until the caching release and adoption migration are complete. Public action and
+> workflow references require one exact stable `vMAJOR.MINOR.PATCH` version, never a
+> SHA, branch, major/minor tag, or prerelease. Third-party tag movement is accepted.
+
 **Status:** Adoption guide for any EdgeZero application repository
 
 **Spec:** `docs/specs/edgezero-deploy-github-action.md`
@@ -38,21 +43,21 @@ The app and its deploy workflow live in one repo.
 ```yaml
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       - id: cli
-        uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
         with:
           app-cli-package: my-app-cli # the CLI crate in your app's workspace
 
       - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
-        uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
         with:
           app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -72,43 +77,46 @@ and point both actions at it.
 > earlier `id: app-token` step produced `steps.app-token.outputs.token`.
 
 ```yaml
-steps:
-  - name: Checkout deployer
-    uses: actions/checkout@v4
-    with:
-      path: deployer
-      persist-credentials: false
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout deployer
+        uses: actions/checkout@v7.0.1
+        with:
+          path: deployer
+          persist-credentials: false
 
-  - name: Checkout application
-    uses: actions/checkout@v4
-    with:
-      repository: stackpop/my-edgezero-app
-      # MUST be a trusted, immutable ref (a full commit SHA, or a protected tag)
-      # — never an arbitrary branch. Fastly's default `build-mode: never` means
-      # `fastly compute deploy` COMPILES the application while the API token is
-      # in scope, so untrusted code would run with your credentials (spec §10.1).
-      ref: ${{ inputs.ref }}
-      path: app
-      persist-credentials: false
-      # A private app repo is NOT readable with the deployer's default
-      # GITHUB_TOKEN. Supply a token scoped to the app repo — a GitHub App
-      # installation token (preferred) or a fine-grained PAT with
-      # `contents: read` on the app repo:
-      token: ${{ steps.app-token.outputs.token }}
+      - name: Checkout application
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/my-edgezero-app
+          # MUST be a trusted, immutable ref (a full commit SHA, or a protected tag)
+          # — never an arbitrary branch. Fastly's default `build-mode: never` means
+          # `fastly compute deploy` COMPILES the application while the API token is
+          # in scope, so untrusted code would run with your credentials (spec §10.1).
+          ref: ${{ inputs.ref }}
+          path: app
+          persist-credentials: false
+          # A private app repo is NOT readable with the deployer's default
+          # GITHUB_TOKEN. Supply a token scoped to the app repo — a GitHub App
+          # installation token (preferred) or a fine-grained PAT with
+          # `contents: read` on the app repo:
+          token: ${{ steps.app-token.outputs.token }}
 
-  - id: cli
-    uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-    with:
-      app-cli-package: my-app-cli
-      working-directory: app
+      - id: cli
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-package: my-app-cli
+          working-directory: app
 
-  - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
-    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-    with:
-      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-      working-directory: app
-      fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-      fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: app
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
 ### 2.3 Monorepo application
@@ -119,29 +127,32 @@ subdirectory (which in a nested workspace may be the subdirectory itself, not th
 repo root), so a monorepo caches the right artifacts.
 
 ```yaml
-steps:
-  - uses: actions/checkout@v4
-    with:
-      persist-credentials: false
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
-  - id: cli
-    uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-    with:
-      app-cli-package: api-cli
-      working-directory: apps/api
+      - id: cli
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-package: api-cli
+          working-directory: apps/api
 
-  - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
-    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-    with:
-      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-      working-directory: apps/api
-      manifest: edgezero.toml
-      # `cache` only takes effect with `build-mode: always` (the credential-free
-      # build that seeds the cache); with the Fastly default `never` it is a no-op.
-      build-mode: always
-      cache: true
-      fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-      fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+      - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
+        uses: stackpop/edgezero/.github/actions/deploy-fastly@<EDGEZERO_ACTION_VERSION>
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: apps/api
+          manifest: edgezero.toml
+          # `cache` only takes effect with `build-mode: always` (the credential-free
+          # build that seeds the cache); with the Fastly default `never` it is a no-op.
+          build-mode: always
+          cache: true
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
 
 ## 3. Consumer requirements
@@ -187,15 +198,14 @@ steps:
   `app-cli-package` — in a nested-workspace monorepo this may be your app
   subdirectory, not the repo root). `build-app-cli` requires it, and caching keys on
   it.
-- Pin action references to readable released tags, or full SHAs for production
-  reproducibility.
+- Pin action references to canonical exact stable patch-version tags. Every
+  EdgeZero reference in a workflow uses the same immutable release version.
 - Use least-privilege permissions (`contents: read`), protected environments,
   `timeout-minutes`, and appropriate concurrency.
-- **Run on ephemeral runners** (GitHub-hosted, or self-hosted one-job-per-VM). The
-  lifecycle log and any inline config are removed by a best-effort `EXIT` trap; a
-  `SIGKILL`, runner shutdown, or hard timeout bypasses it, so on a persistent
-  self-hosted runner a hard kill can leave a mode-`600` credential-bearing file
-  behind. On such runners, post-kill temp hygiene is your responsibility.
+- **Use standard GitHub-hosted `ubuntu-24.04` runners.** The caching release does
+  not support self-hosted, custom, or larger runners. Lifecycle logs and inline
+  config have best-effort cleanup; hard termination can bypass it, so the
+  ephemeral hosted runner remains part of the credential boundary.
 
 ## 4. Fastly staging lifecycle
 
@@ -323,7 +333,7 @@ Workflow shape:
   `actions/checkout`.
 - Replace the legacy `fastly/*@v2` trio with `build-app-cli` + `deploy-fastly` +
   `healthcheck-fastly` + `rollback-fastly`.
-- Pin action references to readable released tags, or full SHAs for production.
+- Pin action references to canonical exact stable patch-version tags.
 - Read the version from `steps.<deploy>.outputs.fastly-version` (same concept as
   the legacy `fastly-version`).
 - Audit `TRUSTED_SERVER_CONFIG`; if still needed, keep config expansion in the
