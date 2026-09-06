@@ -7,7 +7,7 @@
 can reach a credentialed provider command, and preserve the parent deploy lifecycle without ambient
 host state or the legacy `--stage` spelling.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.28 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
 2, 5, 6.1, 6.6, 7.2, and 9. The parent deploy spec remains normative where the addendum does not
 expressly replace it.
 
@@ -165,10 +165,15 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       `runner.os`, and `runner.arch`. Require exact `github-hosted`, `Linux`, and `X64` before artifact
       download, source materialization, Docker, token handling, or mutation. Reject caller-input/env
       substitution, missing values, and self-hosted Linux/X64 fixtures. Contract tests require this to
-      remain the first executable internal action step. The helper receives no `job.workflow_*`,
-      `job.check_run_id`, app, action, cache, or provider identity. Support and hosted fixtures require
-      the caller's ordinary job to declare literal `runs-on: ubuntu-24.04`; the composite cannot
-      observe that label and never treats it as security evidence.
+      remain the first executable internal action step with no `if`, continuation, or failure masking;
+      every later protected operation requires guard success. An `if: always()` cleanup may remove
+      recorded private paths and named containers; required reconciliation additionally requires
+      exact guard-success and `mutation-attempted` conditions. Reject every other non-cleanup
+      always-run path, including an arbitrary step that copies those conditions. The helper receives no
+      `job.workflow_*`, `job.check_run_id`, app, action, cache, or provider identity. Support and hosted
+      fixtures require a caller's step-based job containing the action reference to declare literal
+      `runs-on: ubuntu-24.04`; the composite cannot observe that label and never treats it as security
+      evidence.
 - [ ] Make every public provider action accept the named artifact, trusted producer
       `action-version`, and complete `CallerExpectedIdentity`; require its own action repository/ref to
       equal that version, derive PlatformIdentity locally, independently download/validate/smoke the

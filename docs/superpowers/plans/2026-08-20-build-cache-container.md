@@ -17,7 +17,7 @@ plans land on top. Their final passing action revision `P` contains the unchange
 record and the adoption documents for exact stable version `V`; consumers pin immutable release
 version `V`, which resolves to `P`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.28.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29.
 
 **Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
 `shellcheck`, and `zizmor`.
@@ -41,11 +41,15 @@ version `V`, which resolves to `P`.
 - Every target command is launched through baked GNU `/usr/bin/env` with the design's exact two-argument
   `-S` placeholder protocol. Image and Docker-created variables are absent from target-command entry,
   and no Docker or runtime argv element is constructed from an environment value.
-- Every repository-owned workflow job introduced by this plan declares literal
+- Every step-based repository-owned workflow job introduced by this plan declares literal
   `runs-on: ubuntu-24.04`. Its first executable step is a fixed inline bootstrap requiring
   context-derived `runner.environment:github-hosted`, `runner.os:Linux`, and `runner.arch:X64`
   before checkout, Docker, credential, or mutation work. The label selects the supported host image;
-  runner labels and host command output are not substitutes for the context predicate.
+  runner labels and host command output are not substitutes for the context predicate. The bootstrap
+  has no `if` or `continue-on-error`, cannot mask command failure, and gates every later protected
+  operation. An `if: always()` cleanup needs no guard-success condition; any recovery path must
+  be a fixed protocol-required recovery/reconciliation step and conjunctively require guard success
+  and its protocol-specific transition marker. Every other non-cleanup always-run path fails.
 - Every committed non-local external action and reusable workflow ref is a canonical exact stable
   `v<major>.<minor>.<patch>` release tag. Major/minor tags, prereleases, branches, commit SHAs, and
   floating refs fail. Docker image refs use immutable `sha256` digests. Local `./...` actions remain
@@ -159,7 +163,7 @@ Modify:
 ## 4. Task 0: Enforce exact-version external references repository-wide
 
 The current pin gate permits major/minor tags, prereleases, and commit SHAs. That is broader than
-v6.28 and must be narrowed before adding the write-privileged publisher.
+v6.29 and must be narrowed before adding the write-privileged publisher.
 
 **Files:**
 
@@ -196,8 +200,9 @@ v6.28 and must be narrowed before adding the write-privileged publisher.
 - [ ] Update the four prepublication adoption documents to use literal
       `<EDGEZERO_ACTION_VERSION>` where the future consumer will substitute stable release `V`;
       examples for third-party actions use real reviewed exact patch versions. Replace
-      `ubuntu-latest` and every other ordinary consumer runner label in those examples with literal
-      `runs-on: ubuntu-24.04`.
+      `ubuntu-latest` and every other runner label on a step-based consumer job containing a
+      `steps[*].uses` EdgeZero action reference with literal `runs-on: ubuntu-24.04`. A caller job with
+      `jobs.<id>.uses` must omit both `steps` and `runs-on`; its called workflow selects the runner.
 - [ ] Add `check-doc-action-pins.sh` to parse fenced YAML in every tracked Markdown file and implement
       both documentation states from the design. In bootstrap state, absent
       `docs/.edgezero-action-release.json` permits the exact EdgeZero placeholder only in the four
@@ -206,12 +211,14 @@ v6.28 and must be narrowed before adding the write-privileged publisher.
       literal `V` in all EdgeZero refs. In released state, the base record cannot disappear; it is
       either byte-identical or replaced atomically with all documentation refs by a strictly greater
       stable version under the same hosted release/ref proof. Concrete third-party refs always use
-      exact stable patch versions; major/minor/prerelease/branch/SHA refs fail. Every ordinary fenced
-      consumer job invoking a public EdgeZero action must use literal `runs-on: ubuntu-24.04` in all
-      three documentation states; absent, dynamic, `ubuntu-latest`, other standard, larger, custom,
-      and self-hosted labels fail. Add positive/negative state-transition, base/candidate, partial-
-      update, downgrade/deletion, hidden-placeholder, mixed-version, and runner-label cases to
-      `run.sh`.
+      exact stable patch versions; major/minor/prerelease/branch/SHA refs fail. In all three
+      documentation states, classify each parsed job by AST shape: a step-based job containing a
+      `steps[*].uses` EdgeZero action reference requires literal `runs-on: ubuntu-24.04`; a job-level
+      EdgeZero reusable-workflow call with `jobs.<id>.uses` must have no `steps` and no `runs-on`.
+      Reject mixed shapes, absent or dynamic labels on step-based jobs, `ubuntu-latest`, other
+      standard, larger, custom, and self-hosted labels. Add positive/negative state-transition,
+      base/candidate, partial-update, downgrade/deletion, hidden-placeholder, mixed-version, job-
+      shape, and runner-label cases to `run.sh`.
 - [ ] Add the hosted transition verifier to gate `G`. With only read permissions and fixed
       no-redirect versioned requests, it proves record `V` is a published `draft:false`,
       `prerelease:false`, `immutable:true` release whose API target and anonymous peeled remote ref
@@ -617,15 +624,20 @@ release credential. Candidate code is always subject data. No image is published
       no secret/environment/mutation token in either required job; - repository variable `EDGEZERO_BUILD_CONTAINER_GATE_SHA` validated as a full SHA; - separate gate and subject checkouts with persisted credentials disabled; - all classifier, driver, completion, and verifier commands resolved under the gate checkout; - exact protected workflow repository/path parsing from `github.workflow_ref` and exact
       `github.workflow_sha` assertions for required runs; - explicit not-applicable execution and an unconditional terminal completion assertion; and - fixed steps `assert-exact-g-dispatch-context` and `assert-exact-main-push-context`; generic
       protected-main push assertions for event, ref, `event.after`, current head `Q`, workflow SHA,
-      active gate SHA, and both latest-attempt job conclusions; exact context-derived
-      `github-hosted`/`Linux`/`X64` assertions before Docker work in every job; plus separate release-request
-      identity when `Q=S`.
+      active gate SHA, and both latest-attempt job conclusions; literal `runs-on: ubuntu-24.04` and an
+      unconditional context-derived `github-hosted`/`Linux`/`X64` bootstrap as the first executable
+      step of every job before either checkout; no bootstrap `if`, `continue-on-error`, or masked
+      failure; success-gated later non-cleanup steps; and separate release-request identity when
+      `Q=S`. Negative fixtures cover absent/dynamic/wrong labels, missing/late/skipped/continued
+      guards, failure masking, arbitrary non-cleanup always-run steps, and required recovery/
+      reconciliation steps without exact guard-success and transition-marker conditions.
 - [ ] Implement `build-container-ci.yml`. For organization-required runs,
       `github.workflow_ref` must identify `stackpop/edgezero` and the exact path, and
       `github.workflow_sha` must equal repository variable `EDGEZERO_BUILD_CONTAINER_GATE_SHA`, whose
       value is `G`. Push runs use local workflow SHA equal to current protected head `Q` while still
-      executing gate code from that variable. Each stable push job invokes the trusted context helper
-      in exactly one named `assert-exact-main-push-context` step. Keep the existing path-filtered
+      executing gate code from that variable. Every job uses the literal runner label and fixed
+      first-step bootstrap above. Each stable push job invokes the trusted context helper in exactly
+      one named `assert-exact-main-push-context` step. Keep the existing path-filtered
       `deploy-action.yml` separate.
 - [ ] Wire all focused suites into `run.sh`. The protected gate runs its own tests; it never
       executes a candidate test script.
@@ -754,15 +766,18 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       gate checkout, helper paths, output set, token ordering, package deletion/admin scope, build secret
       exposure, missing/late release-state and rotation checks, predictable/hard-coded/pre-verification
       challenge generation, any job without literal `runs-on: ubuntu-24.04`, missing or late
-      hosted-Linux/X64 bootstrap assertions, or pin mutation outside the trusted updater. Apply the same exact
+      hosted-Linux/X64 bootstrap assertions, conditional or continued guards, masked failures,
+      unguarded non-cleanup always-run paths, or pin mutation outside the trusted updater. Apply the same exact
       concurrency/group/queue checks to the gate-rotation workflow and reject any third workflow using
       that group or either approved workflow using a different one. Parse both workflows and require
       literal runner label and context-derived hosted/Linux/X64 first-executable-step bootstrap in
       every publisher and rotation job before checkout or any later step consumes protected
       environment data or credentials, creates an installation token, invokes Docker, calls a mutation
       API, or mutates the repository; fixtures with a missing, different, dynamic, caller-derived, or
-      late label or assertion fail. Do not claim that a step runs before GitHub resolves a job-level
-      protected environment.
+      late label or assertion, guard `if`, `continue-on-error`, masked failure, arbitrary non-cleanup
+      always-run step, or required recovery/reconciliation step lacking exact guard-success and
+      transition-marker conditions fail. Do not claim that a step runs before GitHub resolves a
+      job-level protected environment.
 - [ ] Create gate-owned `publish-build-container.yml`. It triggers only protected
       `build-container-v*` tags and uses exact concurrency group
       `edgezero-build-container-publication` with `cancel-in-progress: false` and `queue: max`.
@@ -1076,7 +1091,7 @@ a digest from the mutable tag.
 
 Before declaring this plan complete, run two independent reviews:
 
-1. **Contract review:** compare every file and test with design v6.28 Sections 2 through 10. Verify one
+1. **Contract review:** compare every file and test with design v6.29 Sections 2 through 10. Verify one
    expected/package/validate wire authority, protected gate and image source `G`, isolated release
    request `S`, staged gate-only Docker context, API-visible exact post-merge `S` proof, forward-only
    pin ancestry, no tag runtime pull, no placeholder image digest/checksum, no `/work/package`

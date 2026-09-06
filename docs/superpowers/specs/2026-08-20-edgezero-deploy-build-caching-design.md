@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions - Build Caching Spec
 
-**Status:** Design (proposed) - v6.28
+**Status:** Design (proposed) - v6.29
 
 **Related:** `docs/specs/edgezero-deploy-github-action.md`,
 `docs/specs/edgezero-deploy-action-implementation-plan.md`,
@@ -38,13 +38,15 @@ contracts. It must not expose provider credentials to app CLI compilation or to 
   pass digest, ELF, and smoke checks.
   `cache: true` explicitly accepts this risk; v1 does not and cannot generally detect it.
 - v1 supports only the standard GitHub-hosted `ubuntu-24.04` `linux/amd64` runner label. Every
-  repository-owned job in this design and every published consumer job that invokes a public
-  EdgeZero action uses literal `runs-on: ubuntu-24.04`; larger, custom-image, and other hosted labels
-  are unsupported even when their runner context is Linux/X64. It fails closed on self-hosted runners
-  and does not target GitHub Enterprise Server. The GitHub Actions service and selected runner
-  runtime are trusted infrastructure. The in-job predicate prevents EdgeZero work after context
-  reports a self-hosted runner; it cannot prove the caller selected the supported label, retract a
-  secret a caller already supplied to that runner, or defend against a malicious runner
+  step-based repository-owned job in this design and every published step-based consumer job
+  containing a `steps[*].uses` reference to a public EdgeZero action uses literal
+  `runs-on: ubuntu-24.04`; larger, custom-image, and other hosted labels are unsupported even when
+  their runner context is Linux/X64. A caller job with `jobs.<id>.uses` is not step-based, must omit
+  `runs-on`, and delegates runner selection to the called workflow. v1 fails closed on self-hosted
+  runners and does not target GitHub Enterprise Server. The GitHub Actions service and selected
+  runner runtime are trusted infrastructure. The in-job predicate prevents EdgeZero work after
+  context reports a self-hosted runner; it cannot prove the caller selected the supported label,
+  retract a secret a caller already supplied to that runner, or defend against a malicious runner
   implementation.
 - Image publication trusts the digest-pinned official Rust base, Rustup's manifest/checksum chain,
   Debian's signed package archive, and checksum-pinned Fastly/sccache release assets. Candidate source
@@ -165,7 +167,9 @@ Section 5.1, all four workflow properties above, the canonical action version en
 `job.workflow_ref`, full lowercase `app-ref`, and a canonical positive `job.check_run_id`. It runs
 before any checkout, cache or artifact action, Docker command, source materialization, credential
 use, or other repository-supplied executable. It cannot call or source a repository helper because
-the trusted EdgeZero checkout does not yet exist.
+the trusted EdgeZero checkout does not yet exist. The step has no `if` or `continue-on-error`, does
+not mask command failure. All later protected operations require bootstrap success; the only
+post-failure exceptions are the bounded cleanup and marker-gated recovery paths in Section 5.1.
 
 These hosted-runner context properties identify the workflow that defines the current job. They are
 part of the hosted-only v1 floor.
@@ -178,16 +182,23 @@ image source. `H` is reserved for the final action candidate defined in Section 
 
 After that bootstrap passes, the reusable job uses `actions/checkout@v7.0.1` only to place repository
 `stackpop/edgezero` at `ref: job.workflow_sha` in a fixed private action-source directory with
-`persist-credentials:false`. The trusted Section 5.2 materializer fetches the application at
-`app-ref` into a distinct fixed private authority root without initially creating a worktree, proves
-the committed filter/submodule policy, and only then checks out materialized bytes. The EdgeZero
-checkout must have exact HEAD `job.workflow_sha`, repository id/name, clean state, and no submodule,
-LFS, sparse, or untracked content. Every local composite/helper invocation resolves beneath that
-verified EdgeZero root. No `./...` action or helper path may resolve against the application
-authority, and neither root may overlap, contain, or symlink into the other. The app token is removed
-from Git configuration and the credential channel before the workflow exports tracked files and
-supported submodules into non-hardlinked Copy A. The authority remains read-only and is verified
-before and after use; Copy A contains no `.git`, checkout credential, ignored file, or untracked file.
+`persist-credentials:false`. Its next executable step is a second fixed inline assertion that uses
+only workflow-literal commands and runner tools to inspect the fixed checkout path; it never executes
+or sources a file from that checkout. It proves the root is real and non-overlapping, repository
+identity is exact, HEAD is `job.workflow_sha`, the tree is clean with no submodule, LFS, sparse, or
+untracked content. Structural tests separately prove this verifier immediately follows checkout and
+that no earlier step executes, sources, or resolves a path from the checkout. Only then may the
+workflow invoke the checked-out shared runner helper or any other local action or helper.
+
+The trusted Section 5.2 materializer then fetches the application at `app-ref` into a distinct fixed
+private authority root without initially creating a worktree, proves the committed filter/submodule
+policy, and only then checks out materialized bytes. Every local composite/helper invocation resolves
+beneath the verified EdgeZero root. No `./...` action or helper path may resolve against the
+application authority, and neither root may overlap, contain, or symlink into the other. The app
+token is removed from Git configuration and the credential channel before the workflow exports
+tracked files and supported submodules into non-hardlinked Copy A. The authority remains read-only
+and is verified before and after use; Copy A contains no `.git`, checkout credential, ignored file,
+or untracked file.
 
 ## 4. Cache design
 
@@ -392,9 +403,11 @@ Runtime containers use a read-only root filesystem, uid/gid 1001, dropped capabi
 `no-new-privileges`, no GitHub file-command channels, explicit mounts, and operation-specific network,
 memory, pid, and timeout limits.
 
-Every repository-owned workflow job specified by this design declares literal
+Every step-based repository-owned workflow job specified by this design declares literal
 `runs-on: ubuntu-24.04`. Published consumer examples and tested adoption workflows declare the same
-literal label on every ordinary job that invokes a public EdgeZero composite action. A caller job
+literal label on every step-based job containing a `steps[*].uses` reference to a public EdgeZero
+composite action. A job-level reusable-workflow caller with `jobs.<id>.uses` has no `steps` and must
+omit `runs-on`; the called EdgeZero producer owns its literal runner label. A step-based caller job
 that uses a different standard, larger, or custom-image runner label is outside the v1 compatibility
 contract. The label selects the supported host image family; it is not security evidence and is not
 observable from inside a composite action.
@@ -405,7 +418,15 @@ repository-owned workflow job performs a fixed first-executable-step bootstrap t
 context-derived `runner.environment == "github-hosted"`, `runner.os == "Linux"`, and
 `runner.arch == "X64"`. The reusable producer combines that predicate with the invocation checks in
 Section 3.3. The bootstrap is inline because no repository helper is trusted before checkout;
-structural tests freeze its step position, context bindings, and exact comparisons.
+structural tests freeze its step position, context bindings, and exact comparisons. It is
+unconditional, has no `if` or `continue-on-error`, and cannot mask a failed command. No later
+protected operation may run unless the guard succeeded. Normal steps retain default success gating.
+An `if: always()` cleanup may only remove previously recorded action-private paths or named
+containers and revoke an already-created ephemeral credential; it may not interpret, execute,
+upload, save, or otherwise consume artifact/source/cache contents, start a container, create a
+credential, or perform provider mutation. A required recovery or post-mutation reconciliation path
+may run after an operational failure only when its condition conjunctively proves guard success and
+the protocol-specific mutation/transition marker; guard failure can reach cleanup only.
 
 The sole shared runner-eligibility helper accepts and validates only those three runner-context
 values. It does not accept or validate workflow, action, application, cache-generation, or provider
@@ -414,9 +435,11 @@ executable step; they are not action inputs and caller `env` cannot replace the 
 The reusable producer calls the same helper immediately after its verified EdgeZero checkout and
 before app checkout, cache, artifact, or Docker work, as a checked-source consistency check in
 addition to its authoritative inline bootstrap. A missing, empty, differently cased, or otherwise
-different value fails closed. `runs-on`, Docker availability, uname output, and architecture alone
-are not proof of a GitHub-hosted runner. A job-level protected environment can be resolved before
-steps begin; the predicate does not claim to run before that GitHub control-plane event.
+different value fails closed. Every public action's helper step is unconditional, has no `if` or
+`continue-on-error`, cannot mask helper failure, and gates all later protected internal operations
+under the same cleanup/recovery rules. `runs-on`, Docker availability, uname output, and architecture
+alone are not proof of a GitHub-hosted runner. A job-level protected environment can be resolved
+before steps begin; the predicate does not claim to run before that GitHub control-plane event.
 
 ### 5.2 Working-copy topology
 
@@ -2135,6 +2158,10 @@ Caching remains off by default. Container execution and provenance validation ar
   identity; added the checkout-independent producer bootstrap before credentialed checkout; and
   fixed the v1 compatibility contract to literal standard GitHub-hosted `ubuntu-24.04` jobs while
   retaining the context predicate as the self-hosted-runner security check.
+- **v6.29:** required fixed inline checkout verification before any checked-out helper executes;
+  made workflow and composite runner guards structurally non-bypassable; propagated the first-step
+  and literal-runner contract into the protected gate workflow tests; and replaced "ordinary job"
+  with exact step-based-job and reusable-workflow-caller AST rules.
 
 ## 13. Deferred implementation mechanics
 

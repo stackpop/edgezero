@@ -8,7 +8,7 @@
 restore/compile/save primitive that later plans consume, without making cache availability part of
 build correctness or exposing credentials to compilation.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.28 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
 2 through 5 and 9.
 
 ## 1. Fixed decisions
@@ -90,9 +90,10 @@ build correctness or exposing credentials to compilation.
       and `X64`; missing, empty, differently cased, self-hosted, caller-input/env-derived, or
       architecture-only proofs fail. The helper accepts and validates no workflow, action,
       application, cache-generation, or provider identity. Plans 3 and 4 must call it as every public
-      action's first executable step. Plan 3 separately owns the checkout-independent reusable-
-      producer bootstrap that validates workflow identity, app ref, and `job.check_run_id` before
-      checkout or cache access.
+      action's first executable step, with no conditional, continuation, or failure-masking wrapper;
+      helper failure must success-gate every later non-cleanup internal step. Plan 3 separately owns
+      the checkout-independent reusable-producer bootstrap that validates workflow identity, app ref,
+      and `job.check_run_id` before checkout or cache access.
 - [ ] Implement the sole canonical container-launch helper. It owns the closed operation enum,
       profile-to-environment mapping, sorted env-file serializer, placeholder split-string builder,
       exact `/usr/bin/env -S` argv, `docker create` array construction, env-file deletion before
@@ -178,8 +179,9 @@ build correctness or exposing credentials to compilation.
       contract suite. The build-only reusable workflow does not exist before plan 3, and the current
       direct-composite producer must not expose an intermediate cache/provenance contract. Its sole
       change in this plan is to call the shared runner-eligibility helper as its first executable step;
-      tests require rejection of missing/malformed/self-hosted context before existing producer work.
-      Do not otherwise change provider or public producer behavior in this plan.
+      tests require rejection of missing/malformed/self-hosted context and of a conditional,
+      continued, or failure-masked guard before existing producer work. Do not otherwise change
+      provider or public producer behavior in this plan.
 - [ ] Run cold, warm, corrupt-restore, concurrent-generation, stop-failure, write-error, audit-failure,
       save-denied, save-warning, and sccache response-loss fixtures. Assert the design's exact cold
       Rust miss/write counters, a new-job warm restore with at least one post-zero Rust cache hit and

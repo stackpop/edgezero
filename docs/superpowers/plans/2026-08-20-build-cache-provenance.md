@@ -7,7 +7,7 @@
 CLI artifact and make every consumer independently validate exact caller and platform identity before
 the binary can execute.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.28 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
 3, 5.1, 5.3, 5.4, 6, 7, and 9.
 
 ## 1. Fixed actions and boundaries
@@ -46,15 +46,20 @@ the binary can execute.
       producer bootstrap. Bind the three runner fields, four `job.workflow_*` fields,
       `job.check_run_id`, and `app-ref` directly from their exact contexts or declared input; validate
       the exact runner/workflow/version/SHA/generation contract before any checkout, cache restore/
-      save, artifact work, Docker, repository code, or credential use. Then
-      require the EdgeZero action-source checkout and plan 2's three-field runner helper immediately
-      after it and before app checkout or other work. Negative fixtures cover missing, reordered,
-      late, caller-env-derived, differently cased, malformed, and self-hosted values; a `runs-on`
-      label or host-command check never substitutes for the context predicate.
+      save, artifact work, Docker, repository code, or credential use. Then require the EdgeZero
+      action-source checkout, a second fixed inline checkout-verification step, and plan 2's three-
+      field runner helper in that exact order before app checkout or other work. The verifier uses
+      only inline commands and runner tools to inspect the checkout, executes or sources no file from
+      it, and proves its exact root/repository/HEAD/clean/content contract before any local action or
+      helper executes. Negative fixtures cover missing, reordered, late, skipped, continued, or
+      failure-masked assertions, caller-env-derived, differently cased, malformed, and self-hosted
+      values, local execution before verification, and non-cleanup always-run paths; a `runs-on` label
+      or host-command check never substitutes for the context predicate.
 - [ ] Add repository-wide structural tests that candidate revision `H` replaces
       `.github/actions/build-app-cli/action.yml` with the exact fail-closed retirement stub: its first
-      executable step calls the runner helper, its next step always fails with migration guidance, and
-      it has no producer input/output, build helper, cache, Docker, or artifact-upload path. Reject any
+      executable step calls the runner helper without `if`, continuation, or failure masking; its next
+      step always fails with migration guidance, and it has no producer input/output, build helper,
+      cache, Docker, or artifact-upload path. Reject any
       executable repository workflow or runnable documentation producer call to that composite at
       `H`. The four gated prepublication documents remain explicitly non-runnable until plan 5 removes
       their legacy guidance at `R`; immutable older exact versions remain historical behavior, not a
@@ -115,9 +120,8 @@ the binary can execute.
       lowercase `app-ref`, canonical positive `job.check_run_id`, exact context-derived
       `runner.environment:github-hosted`, `runner.os:Linux`, and `runner.arch:X64`, all four exact
       workflow identity properties, the canonical stable action version parsed from
-      `job.workflow_ref`, and its resolved workflow SHA. Run plan 2's three-field runner helper
-      immediately after the trusted EdgeZero action-source checkout and before app checkout, cache,
-      artifact, or Docker work; this checked-source call does not replace the bootstrap.
+      `job.workflow_ref`, and its resolved workflow SHA. The bootstrap has no `if` or
+      `continue-on-error`, cannot mask failure, and success-gates every later non-cleanup step.
 - [ ] Declare required string inputs for repository/ref/id/workspace/package/bin/artifact, optional
       string defaults for working directory/suffix/app env, boolean defaults for cache/disclosure, the
       required `rust-toolchain`, numeric timeout default, and the required checkout secret exactly as specified. Parse the
@@ -131,10 +135,13 @@ the binary can execute.
       the ref's resolved full SHA and require canonical positive `job.check_run_id`. Only after that
       step passes, use exact `actions/checkout@v7.0.1` with persisted credentials disabled to check
       out only `stackpop/edgezero` at ref `job.workflow_sha` into a fixed private action-source root.
-      Use plan 2's prevalidated object-first materializer for the app at full `app-ref` in a distinct
-      authority root. Verify EdgeZero repository identity/HEAD/clean tree, authority and Copy A export
-      contracts, root separation, and that every local composite/helper path resolves beneath the
-      EdgeZero root rather than app data.
+      As the next executable step, use only fixed inline workflow commands and runner tools to verify
+      the real fixed root, exact repository identity and HEAD, clean tree, and absence of submodule,
+      LFS, sparse, and untracked content. Execute no checked-out path before that verification. Then
+      run plan 2's three-field runner helper and only afterward use plan 2's prevalidated object-first
+      materializer for the app at full `app-ref` in a distinct authority root. Verify authority and
+      Copy A export contracts, root separation, and that every local composite/helper path resolves
+      beneath the verified EdgeZero root rather than app data.
 - [ ] Wire plan 2's already gated cache primitive and exact restore/save action versions into this
       workflow. Add the first public cache-off, cold, warm, corrupt-restore, save-denied, and
       warning-only save hosted runs; preserve evidence for exactly one Cargo compile/build invocation
@@ -143,6 +150,9 @@ the binary can execute.
       migrate `.github/workflows/deploy-action.yml` plus its producer fixtures away from local
       composite calls. Exercise reusable-workflow behavior through the trusted non-public harness until
       plan 5 can run literal candidate `C`; no repository workflow may retain an alternate producer.
+      Structural tests require literal `runs-on: ubuntu-24.04` on every step-based job containing a
+      public EdgeZero action reference and no `runs-on` or `steps` on its job-level reusable-workflow
+      caller.
 - [ ] Expose only `artifact-name`, trusted `action-version`, resolved `action-revision`, and
       CallerExpectedIdentity fields. Never expose the host artifact
       path, container ref, platform digest/protocol, checkout token, cache path, or provider state.
@@ -163,9 +173,10 @@ the binary can execute.
       materialization, artifact download, or Docker execution; caller inputs and caller `env` cannot
       substitute these bindings. The helper receives no `job.workflow_*`, `job.check_run_id`, app,
       action, cache, or provider identity. Contract tests require this to remain the first executable
-      internal action step. Support and hosted fixtures require the caller's ordinary job to declare
-      literal `runs-on: ubuntu-24.04`; the composite cannot observe that label and never treats it as
-      security evidence.
+      internal action step with no `if`, continuation, or failure masking; every later non-cleanup
+      internal step remains success-gated. Support and hosted fixtures require a caller's step-based
+      job containing the action reference to declare literal `runs-on: ubuntu-24.04`; the composite
+      cannot observe that label and never treats it as security evidence.
 - [ ] Give `compute-app-cli-identity` exactly the required string inputs `action-version`,
       `app-repository`, `app-ref`, `app-repo-id`, `workspace-root`, `app-cli-package`, `app-cli-bin`,
       and `rust-toolchain`, optional string `working-directory` default `.`, and required sensitive

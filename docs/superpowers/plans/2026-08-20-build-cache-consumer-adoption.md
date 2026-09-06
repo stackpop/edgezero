@@ -9,7 +9,7 @@
 full-SHA app identity and explicit inputs, publish exact stable action version `V`, then activate
 synchronized runnable documentation at revision `R` without ever merging an unpublished version ref.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.28 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
 3.3, 5.1, 5.2, 5.4, 7, 9, and 10, plus the parent deploy lifecycle contract.
 
 ## 1. Release structure
@@ -43,11 +43,16 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       reusable-workflow/action refs, unique artifact names, caller and action identity forwarding,
       public identity-action use, action-local source materialization with no authority-path handoff,
       no aggregate matrix identity, minimal permissions, secret confinement, and absence of
-      direct-composite producer use. Require literal `runs-on: ubuntu-24.04` in the reusable producer
-      and every ordinary consumer job that invokes a public EdgeZero action; reject absent, dynamic,
-      `ubuntu-latest`, other standard, larger, custom-image, and self-hosted labels. Require the legacy
-      path at candidate `H` to be only the exact non-producing retirement stub, and reject any
-      workflow or documentation that invokes it as a producer.
+      direct-composite producer use. Classify jobs by parsed AST shape. Require literal
+      `runs-on: ubuntu-24.04` in the reusable producer and every step-based consumer job containing a
+      `steps[*].uses` public EdgeZero action reference. Require a job-level EdgeZero reusable-workflow
+      caller with `jobs.<id>.uses` to have neither `steps` nor `runs-on`. Reject mixed shapes, absent or
+      dynamic step-based labels, `ubuntu-latest`, other standard, larger, custom-image, and self-hosted
+      labels. Require the producer bootstrap, inline checkout verification, and shared runner helper
+      in exact order without conditional, continuation, failure masking, pre-verification local
+      execution, or non-cleanup always-run paths. Require the legacy path at candidate `H` to be only
+      the exact non-producing retirement stub, and reject any workflow or documentation that invokes
+      it as a producer.
 - [ ] Add public/private app repository fixtures, root/nested workspace fixtures, public Git and
       sibling path dependencies, submodules, no-filter and pinned-LFS cases, app-env migration,
       generated outputs, production/staging provider paths, and cache enabled/disabled cases.
@@ -87,10 +92,11 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       `compute-app-cli-identity` at the same action version with the exact
       repository/ref/id/workspace/cwd/package/bin/toolchain inputs and `app-checkout-token`. Compare
       all five typed outputs with the producer and only then invoke provider actions with the named
-      artifact. Every ordinary consumer job declares literal `runs-on: ubuntu-24.04`; the caller job
-      that directly `uses` the reusable workflow has no `runs-on`, and the called workflow owns its
-      literal label. The identity action destroys its action-private authority before returning and
-      exposes no host path or handle.
+      artifact. Every step-based consumer job containing a public EdgeZero action reference declares
+      literal `runs-on: ubuntu-24.04`; the caller job with `jobs.<id>.uses` that directly invokes the
+      reusable workflow has neither `steps` nor `runs-on`, and the called workflow owns its literal
+      label. The identity action destroys its action-private authority before returning and exposes no
+      host path or handle.
 - [ ] Pin every EdgeZero reusable workflow and action within a published consumer workflow to one
       identical literal stable `V`. Generated candidate-release tests substitute one identical literal
       `C`. Reject mixed versions, major/minor tags, prereleases in published examples, SHAs, and
@@ -138,11 +144,13 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] State that the caller repository's effective Actions policy must permit version-tag action and
       reusable-workflow refs; an organization/enterprise full-SHA mandate is incompatible with this
       release policy and must fail adoption preflight rather than trigger an undocumented SHA fallback.
-- [ ] State that v1 supports only ordinary consumer jobs with literal `runs-on: ubuntu-24.04` and the
-      reusable producer's internally selected identical label. Other standard Ubuntu labels,
-      `ubuntu-latest`, larger runners, custom GitHub-hosted images, and self-hosted runners are outside
-      the compatibility contract; the action's runner-context predicate is still required because the
-      label is not security evidence and is not observable from a composite action.
+- [ ] State that v1 supports only step-based consumer jobs containing public EdgeZero action
+      references with literal `runs-on: ubuntu-24.04`, plus job-level reusable-workflow callers that
+      omit `steps` and `runs-on` and delegate to the producer's identical internal label. Other
+      standard Ubuntu labels, `ubuntu-latest`, larger runners, custom GitHub-hosted images, and
+      self-hosted runners are outside the compatibility contract; the action's runner-context
+      predicate is still required because the label is not security evidence and is not observable
+      from a composite action.
 - [ ] Explain that protocol 1 rejects custom Git filters, supports only no filter or the action's
       pinned Git LFS materialization path, rejects repository/enclosing Cargo config and credentials,
       requires the image toolchain, permits only public dependency fetching, and preserves the
@@ -184,18 +192,19 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Reconcile the parent spec, original implementation plan, adoption guide, and public guide
       against shipped metadata: two-job topology, authority materialization, action/caller identity,
       exact app inputs, `app-env`, generated outputs, cache defaults, provider lifecycle, and literal
-      `runs-on: ubuntu-24.04` on every ordinary consumer job. Keep the exact
-      `<EDGEZERO_ACTION_VERSION>` bootstrap placeholder in these four prepublication documents; do not
-      introduce a guessed or unpublished stable version.
+      `runs-on: ubuntu-24.04` on every step-based consumer job containing a public EdgeZero action
+      reference, with no `runs-on` or `steps` on a job-level reusable-workflow caller. Keep the exact
+      `<EDGEZERO_ACTION_VERSION>` bootstrap placeholder in these four prepublication documents; do
+      not introduce a guessed or unpublished stable version.
 - [ ] Run plan 1's permanent documentation scanner in bootstrap mode over every tracked Markdown
       file. Prove `docs/.edgezero-action-release.json` is absent, the placeholder appears only in the
       four named surfaces, no other action-ref placeholder exists, and every third-party ref is an
-      exact stable patch version. Require literal `ubuntu-24.04` for every ordinary fenced consumer
-      job that invokes a public EdgeZero action. Do not modify the gate-owned scanner in this plan.
+      exact stable patch version. Require the exact step-based/reusable-caller AST and runner-label
+      rules for every fenced consumer workflow. Do not modify the gate-owned scanner in this plan.
 - [ ] Run every protocol, cache, image, launcher, source-freeze, provider, workflow, fixture, docs/pin,
       actionlint, zizmor, shellcheck, Rust, and local integration suite at one clean candidate descended
       from `B`. Confirm `image.json` remains reviewed `{D,S,protocol}`.
-- [ ] Run independent contract and release-adversary reviews against design v6.28, including exact-tag
+- [ ] Run independent contract and release-adversary reviews against design v6.29, including exact-tag
       policy, third-party tag movement risk, EdgeZero immutable releases, action-version mixing,
       substitution, identity replay, malformed artifacts, host/container races, source mutation,
       generated-output escape, credential flow, cache disclosure, rollback, and cancellation.
@@ -253,10 +262,10 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       using the closed event-to-range table. The selected base is the then-current protected-main
       commit, which may be newer than `P`; the synthetic candidate is not named `R`. Require the
       one-way bootstrap-to-released transition, exact record schema/JCS, no placeholder in any fenced
-      YAML, one identical EdgeZero `V` per workflow, literal `ubuntu-24.04` ordinary consumer jobs,
-      and exact third-party patch versions. The hosted transition verifier must prove public release
-      `V` is `draft:false`, `prerelease:false`, `immutable:true` and its API target and anonymously
-      peeled ref both equal record `P`.
+      YAML, one identical EdgeZero `V` per workflow, exact step-based/reusable-caller job shapes and
+      runner labels, and exact third-party patch versions. The hosted transition verifier must prove
+      public release `V` is `draft:false`, `prerelease:false`, `immutable:true` and its API target and
+      anonymously peeled ref both equal record `P`.
 - [ ] Parse every fenced YAML example, validate it against action/workflow metadata, and prove examples
       are runnable after only repository/application-value substitution. Run the complete docs build,
       pin scanner, actionlint, and required repository checks; merge through the one-entry queue and
