@@ -6,9 +6,9 @@
 //!
 //! ## Storage Location
 //!
-//! By default, the development server stores data at `.edgezero/kv.redb`
-//! in your project directory. Custom store names get their own derived
-//! database file under `.edgezero/`. Add this path to your `.gitignore`:
+//! The development server stores each declared KV id in its own file,
+//! `.edgezero/kv-<slug>-<hash>.redb`, derived from the resolved store name
+//! (see `kv_store_path` in `dev_server.rs`). Add this path to your `.gitignore`:
 //!
 //! ```gitignore
 //! .edgezero/
