@@ -173,9 +173,10 @@ Axum-style `:name` parameters are **not supported**. Use `{name}` instead.
 
 ## Route Priority
 
-Routes are matched by specificity (static segments first, then parameters, then catch-alls). If two
-routes have the same specificity, the first registered wins. Avoid ambiguous patterns that share
-the same shape (for example, two routes that both look like `/users/{id}`).
+Routes are matched by specificity (static segments first, then parameters, then catch-alls).
+Registering two routes that conflict for the same method (for example, two routes that both look
+like `/users/{id}`) panics when the router is built with `duplicate route definition for <path>`,
+so the conflict surfaces at startup rather than at request time.
 
 ## Next Steps
 

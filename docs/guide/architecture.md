@@ -12,6 +12,7 @@ edgezero/
 │   ├── edgezero-adapter/        # Shared adapter traits and registry
 │   ├── edgezero-adapter-fastly/ # Fastly Compute@Edge bridge
 │   ├── edgezero-adapter-cloudflare/ # Cloudflare Workers bridge
+│   ├── edgezero-adapter-spin/   # Fermyon Spin bridge
 │   ├── edgezero-adapter-axum/   # Native Axum/Tokio bridge
 │   └── edgezero-cli/            # CLI for scaffolding and dev server
 └── examples/
@@ -66,6 +67,12 @@ Adapters translate between provider-specific types and the portable core model:
 - Provides `CloudflareRequestContext` for Workers APIs
 - Implements `CloudflareProxyClient` for fetch operations
 
+### edgezero-adapter-spin
+
+- Converts `spin_sdk::http::Request` to core request and back
+- Provides `SpinRequestContext` for Spin-specific APIs
+- Implements `SpinProxyClient` for outbound requests
+
 ### edgezero-adapter-axum
 
 - Wraps `RouterService` in Axum/Tokio services
@@ -94,7 +101,7 @@ Adapters translate between provider-specific types and the portable core model:
 │                        Adapter                               │
 │  - into_core_request(): Provider Request → Core Request     │
 │  - from_core_response(): Core Response → Provider Response  │
-│  - run_app()/dispatch_with_config(): Canonical lifecycle    │
+│  - run_app(): Canonical lifecycle                           │
 │  - dispatch(): Low-level manual lifecycle                   │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -123,6 +130,7 @@ Adapter crates use feature flags to gate provider SDKs and CLI integration:
 | -------------- | --------------------------- | -------------------------------------- |
 | `fastly`       | edgezero-adapter-fastly     | Fastly SDK integration                 |
 | `cloudflare`   | edgezero-adapter-cloudflare | Workers SDK integration                |
+| `spin`         | edgezero-adapter-spin       | Spin SDK integration                   |
 | `cli`          | adapter crates              | Register adapters and scaffolding data |
 | `demo-example` | edgezero-cli                | Bundled demo app for development       |
 

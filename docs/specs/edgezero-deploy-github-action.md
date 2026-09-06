@@ -606,8 +606,8 @@ probe it, roll back on failure.
 
 1. Verify the runner is Linux x86-64 (`ubuntu-latest` is the tested environment).
    Self-hosted runners additionally require **Actions Runner 2.327.1+** — the
-   wrappers use Node 24 actions (`download-artifact@v8`, `cache@v6`,
-   `upload-artifact@v7`, `checkout@v7`), whose runtime ships only in that runner
+   wrappers use Node 24 actions (`download-artifact@v8`, `cache/restore@v6`,
+   `cache/save@v6`, `upload-artifact@v7`), whose runtime ships only in that runner
    release. This is a runner prerequisite, not something the engine enforces.
 2. Validate that `adapter` is a well-formed, non-empty token. The engine does
    **not** enumerate the CLI's compiled adapters (there is no introspection

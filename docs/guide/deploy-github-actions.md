@@ -25,8 +25,8 @@ provider-neutral behavior; the wrappers above are thin.
 
 **Runner support:** Linux x86-64 only (`ubuntu-latest` is tested). On **self-hosted**
 runners you must run **Actions Runner 2.327.1 or newer**: these actions use
-Node 24 dependencies (`actions/download-artifact@v8`, `actions/cache@v6`,
-`actions/upload-artifact@v7`, `actions/checkout@v7`), and the Node 24 runtime they
+Node 24 dependencies (`actions/download-artifact@v8`, `actions/cache/restore@v6`,
+`actions/cache/save@v6`, `actions/upload-artifact@v7`), and the Node 24 runtime they
 require ships only in runner 2.327.1+. Hosted runners already meet this; older
 self-hosted runners fail to launch the actions.
 
@@ -254,6 +254,10 @@ the source — which is why "trust the app you deploy" remains the real boundary
 
 Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`.
 
+The uploaded artifact deliberately sets no `retention-days`, so the repository or
+organisation default applies. A forced one-day retention would expire the CLI
+before a deploy job held behind an Environment-approval gate gets to download it.
+
 **Keeping provider secrets out of your build.** This step compiles _your_ code and
 runs your CLI's `--help`, so it keeps provider credentials out of the environment
 in two layers:
@@ -347,6 +351,10 @@ conservative false positive); if the action fails, read it via `if: always()` to
 know a deploy may have occurred and reconcile rather than assume nothing happened.
 Thread `previous-version` into `rollback-fastly`'s `rollback-to` so a later
 rollback has a real target (Fastly cannot infer one — see `rollback-fastly`).
+
+The action always writes a GitHub job summary, including on failure: adapter,
+working directory, source revision, manifest, toolchain, target, CLI version,
+effective build mode, cache status, and result.
 
 **If a _production_ deploy fails with `mutation-attempted=true` but no
 `fastly-version`** (the CLI almost certainly ran and may have activated a version,
@@ -716,8 +724,9 @@ credential-free validation build first; the deploy may still recompile.
 
 Caching is opt-in (`cache: false` by default) and, when enabled, caches only the
 Cargo workspace root `target/` under an exact key (runner OS/arch, toolchain,
-target, CLI version, source revision, and `Cargo.lock` hash). Enable it only for
-trusted, immutable refs.
+target, CLI version, Cargo workspace path, `build-args` hash, source revision, and
+`Cargo.lock` hash), so two workspaces in one repo never share a cache and a
+`--features` change invalidates it. Enable it only for trusted, immutable refs.
 
 ## Recommended job hardening
 

@@ -92,6 +92,9 @@ back to their listed defaults.
 | `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                                                       | `127.0.0.1`     |
 | `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                                                       | `8787`          |
 | `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                                              | adapter default |
+| `EDGEZERO__LOGGING__ENDPOINT`              | named log endpoint the platform logger attaches to (Fastly only); unset means no platform logger is initialised        | none            |
+| `EDGEZERO__LOGGING__USE_FASTLY_LOGGER`     | whether to initialise the Fastly logger (Fastly only); derived from `ENDPOINT` on the runtime-env path                 | `true`          |
+| `EDGEZERO__LOGGING__ECHO_STDOUT`           | also echo log lines to stdout (Fastly only)                                                                            | `true`          |
 
 `<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-case logical
 id. The literal `__KEY` selector is config-only — it swaps which blob
@@ -136,10 +139,10 @@ last one returns a `BoundSecretStore` whose `get_bytes(key)` is
 single-arg — the platform store name is bound by the
 dispatcher, not passed at the call site).
 
-Adapter setup code still has `with_*_handle` /
-`dispatch_with_*_handle` convenience constructors that take a
-single bare handle. Internally each dispatcher synthesises a
-one-id `KvRegistry` / `ConfigRegistry` / `SecretRegistry`
+Adapter setup code still has `with_*_handle` convenience
+constructors that take a single bare handle, and the public
+dispatch entry point is `dispatch_with_registries`.
+Internally each dispatcher synthesises a one-id `KvRegistry` / `ConfigRegistry` / `SecretRegistry`
 under the conventional `"default"` id from that handle before
 the request reaches the router — so the registry-aware
 accessors and the `Kv` / `Config` / `Secrets` extractors
