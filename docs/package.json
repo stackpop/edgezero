@@ -17,7 +17,7 @@
     "@types/node": "^24.10",
     "eslint": "^10",
     "@eslint/js": "^10",
-    "typescript-eslint": "^8.68",
+    "typescript-eslint": "^8.69",
     "prettier": "^3.9.6",
     "vitepress": "^1.5.0"
   }
