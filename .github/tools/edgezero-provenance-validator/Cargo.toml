@@ -1,0 +1,16 @@
+[package]
+name = "edgezero-provenance-validator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+
+[dev-dependencies]
+jsonschema = { version = "=0.54.0", default-features = false }

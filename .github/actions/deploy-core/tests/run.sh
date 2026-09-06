@@ -1909,22 +1909,43 @@ test_action_pin_gate() {
   # jobs/steps scaffolding so the tests exercise the same paths the gate selects.
   wrap() { printf 'jobs:\n  a:\n    steps:\n%s\n' "$1" >"$2"; }
 
-  # Valid pins in block, quoted, and flow forms — a version tag and a full SHA —
-  # plus a commented-out branch ref that must be IGNORED (not a real `uses`). A bare
-  # major tag (`@v4`) is a deliberately-accepted VERSION TAG under the repo's policy:
-  # the gate enforces a concrete, reviewable ref, NOT immutability (a publisher can
-  # repoint `@v4`). See check-action-pins.sh's header.
+  # Only canonical exact stable patch tags are public action refs.
   wrap '      - uses: actions/checkout@v4.3.0
-      - "uses": actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-      - { uses: actions/setup-node@v4 }
+      - "uses": actions/cache@v5.1.0
+      - { uses: actions/setup-node@v6.0.0 }
       # uses: actions/checkout@main' "$dir/ok.yml"
-  assert_succeeds "valid pins (block/quoted/flow, tag+SHA, major tag) pass; a commented branch is ignored" \
+  assert_succeeds "exact versions in block/quoted/flow forms pass; comments are ignored" \
     bash "$checker" "$dir/ok.yml"
 
-  # A full semver tag with BOTH a prerelease and build-metadata suffix is valid.
-  wrap '      - uses: some/action@v1.2.3-rc.1+build.5' "$dir/semver.yml"
-  assert_succeeds "a prerelease+build semver tag (@v1.2.3-rc.1+build.5) is accepted" \
-    bash "$checker" "$dir/semver.yml"
+  local invalid
+  for invalid in v1 v1.2 v1.2.3-rc.1 v1.2.3+build.5 v1.2.3-rc.1+build.5 \
+    1.2.3 v01.2.3 v1.02.3 v1.2.03 v1.2.3.4 \
+    0057852bfaa89a56745cba8c7296529d2fc39830 0057852 '' main latest; do
+    wrap "      - uses: some/action@$invalid" "$dir/invalid.yml"
+    assert_fails "noncanonical external ref @$invalid is rejected" bash "$checker" "$dir/invalid.yml"
+  done
+  for invalid in 'null' '~' '""' 'true' '123' '[actions/checkout@v4.3.0]' '{ref: actions/checkout@v4.3.0}'; do
+    wrap "      - uses: $invalid" "$dir/invalid.yml"
+    assert_fails "empty or non-string uses $invalid is rejected" bash "$checker" "$dir/invalid.yml"
+  done
+  wrap '      - uses:' "$dir/empty.yml"
+  assert_fails "an empty uses is rejected" bash "$checker" "$dir/empty.yml"
+  wrap '      - uses: |-
+          actions/checkout@v4.3.0
+          actions/cache@v5.1.0' "$dir/multiple-lines.yml"
+  assert_fails "one multiline value cannot become two valid refs" bash "$checker" "$dir/multiple-lines.yml"
+  wrap '      - uses: |
+          actions/checkout@v4.3.0' "$dir/trailing-newline.yml"
+  assert_fails "a ref with a trailing newline is rejected" bash "$checker" "$dir/trailing-newline.yml"
+  printf 'jobs:\n  build:\n    uses: owner/repo/.github/workflows/build.yml@v1.2.3\n' >"$dir/reusable.yml"
+  assert_succeeds "job-level exact reusable workflow ref is accepted" bash "$checker" "$dir/reusable.yml"
+  printf 'jobs:\n  build:\n    uses: owner/repo/.github/workflows/build.yml@v1\n' >"$dir/reusable.yml"
+  assert_fails "job-level major reusable workflow ref is rejected" bash "$checker" "$dir/reusable.yml"
+  printf 'runs:\n  using: composite\n  steps:\n    - uses: owner/repo@v1\n' >"$dir/action.yml"
+  assert_fails "composite step major ref is rejected" bash "$checker" "$dir/action.yml"
+  wrap '      - uses: ./tools/local-action' "$dir/local.yml"
+  assert_succeeds "local actions remain accepted" bash "$checker" "$dir/local.yml"
+  assert_fails "a missing explicit input is rejected" bash "$checker" "$dir/absent.yml"
 
   # Every mutable-ref form must be REJECTED — including the ones NO text regex can
   # catch: a unicode-ESCAPED key, a `!!str`-TAGGED value, and a MULTILINE folded
@@ -1955,8 +1976,7 @@ test_action_pin_gate() {
   wrap '      - uses: actions/checkout' "$dir/unpinned.yml"
   assert_fails "an unpinned ref (no @) is rejected" bash "$checker" "$dir/unpinned.yml"
 
-  # A docker ref must itself be pinned: a floating `:latest` or a bare image is
-  # rejected, while an @<algo>:<digest> or a version tag passes.
+  # Docker actions require an exact lowercase sha256 digest.
   wrap '      - uses: docker://ghcr.io/x/y:latest' "$dir/docker-latest.yml"
   assert_fails "a floating docker ':latest' is rejected" bash "$checker" "$dir/docker-latest.yml"
 
@@ -1967,7 +1987,11 @@ test_action_pin_gate() {
   assert_succeeds "a docker @sha256 digest is accepted" bash "$checker" "$dir/docker-digest.yml"
 
   wrap '      - uses: docker://alpine:3.18.4' "$dir/docker-tag.yml"
-  assert_succeeds "a docker version tag is accepted" bash "$checker" "$dir/docker-tag.yml"
+  assert_fails "a docker version tag is rejected" bash "$checker" "$dir/docker-tag.yml"
+  for invalid in sha256:abc sha512:0123456789abcdef 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF'; do
+    wrap "      - uses: docker://alpine@$invalid" "$dir/docker-invalid.yml"
+    assert_fails "invalid docker digest $invalid is rejected" bash "$checker" "$dir/docker-invalid.yml"
+  done
 
   # A non-action `uses` field (here an env var literally named `uses`) is NOT an
   # action reference and must NOT be flagged — only job/step/composite `uses` count.
@@ -1988,6 +2012,38 @@ YML
     >"$dir/malformed.yml"
   assert_fails "malformed YAML is rejected (fail-closed, not passed unchecked)" \
     bash "$checker" "$dir/malformed.yml"
+
+  wrap '      - uses: >-
+          actions/checkout@v4.3.0' "$dir/folded-valid.yml"
+  assert_succeeds "a folded scalar resolving to one exact ref passes" bash "$checker" "$dir/folded-valid.yml"
+  local sandbox="$dir/repository" sandbox_checker pruned
+  mkdir -p "$sandbox/.github/actions/deploy-core/tests" "$sandbox/.github/workflows" "$sandbox/tools/local"
+  sandbox_checker="$sandbox/.github/actions/deploy-core/tests/check-action-pins.sh"
+  cp "$checker" "$sandbox_checker"
+  assert_fails "an empty default scan fails" bash "$sandbox_checker"
+  cp "$dir/local.yml" "$sandbox/.github/workflows/local.yaml"
+  assert_fails "a local-only default scan fails" bash "$sandbox_checker"
+  cp "$dir/env-uses.yml" "$sandbox/.github/workflows/valid.yml"
+  assert_equals "only external refs count in a default scan" \
+    'action reference policy passed (1 external references)' "$(bash "$sandbox_checker")"
+  cp "$dir/action.yml" "$sandbox/tools/local/action.yaml"
+  assert_fails "default scan includes action metadata outside .github" bash "$sandbox_checker"
+  printf 'runs:\n  using: composite\n  steps:\n    - uses: owner/repo@v1.2.3\n' >"$sandbox/tools/local/action.yaml"
+  assert_succeeds "default scan accepts an exact composite ref" bash "$sandbox_checker"
+  mkdir -p "$sandbox/.github/workflows/nested"
+  cp "$dir/block.yml" "$sandbox/.github/workflows/nested/ignored.yml"
+  for pruned in .git target node_modules; do
+    mkdir -p "$sandbox/$pruned"
+    cp "$dir/action.yml" "$sandbox/$pruned/action.yml"
+  done
+  cp "$dir/block.yml" "$sandbox/fixture.yml"
+  assert_succeeds "default scan prunes Git/build/dependencies and ignores non-workflow YAML" bash "$sandbox_checker"
+  mkdir -p "$dir/parser-bin"
+  # The fake parser expands its own argument, not this test shell's.
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\ncase "$1" in --version) echo "yq (https://github.com/mikefarah/yq/) version v4.53.3";; esac\n' >"$dir/parser-bin/yq"
+  chmod +x "$dir/parser-bin/yq"
+  assert_fails "a broken parser emitting no records cannot pass" env PATH="$dir/parser-bin:$PATH" bash "$sandbox_checker"
 }
 
 # ---------------------------------------------------------------------------
@@ -2486,6 +2542,15 @@ main() {
   test_action_output_contracts
   test_action_public_surface
   test_action_pin_gate
+  assert_succeeds "actionlint installer contract" bash "$ACTIONS_DIR/deploy-core/tests/install-actionlint.test.sh"
+  assert_succeeds "documentation reference and release-state contracts" node --test "$ACTIONS_DIR/deploy-core/tests/check-doc-action-pins.test.mjs"
+  if command -v actionlint >/dev/null 2>&1 && [[ "$(actionlint -version | sed -n '1p')" == 1.7.12 ]]; then
+    assert_succeeds "actionlint compatibility contract" bash "$ACTIONS_DIR/deploy-core/tests/run-actionlint.test.sh"
+  elif [[ "${CI:-}" == true ]]; then
+    fail "actionlint 1.7.12 is required in CI"
+  else
+    skip "actionlint compatibility contract (requires actionlint 1.7.12)"
+  fi
 
   printf '\nPassed: %d  Failed: %d  Skipped: %d\n' "$tests_passed" "$tests_failed" "$tests_skipped"
   [[ "$tests_failed" -eq 0 ]]

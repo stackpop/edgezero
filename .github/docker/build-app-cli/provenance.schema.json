@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EdgeZero protocol-1 provenance",
+  "$comment": "JCS bytes, duplicate keys, UTF-8 byte limits, decimal u64 range, derivation, ABI ordering, and identity equality are enforced by the protocol validator.",
+  "oneOf": [{ "$ref": "#/$defs/expected" }, { "$ref": "#/$defs/metadata" }],
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "not": { "pattern": "[\\u0000-\\u001f\\u007f-\\u009f/\\\\]" }
+    },
+    "digest": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "caller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app-cli-bin",
+        "app-cli-package",
+        "app-repo-id",
+        "source-revision",
+        "workspace-id"
+      ],
+      "properties": {
+        "app-cli-bin": { "$ref": "#/$defs/name" },
+        "app-cli-package": { "$ref": "#/$defs/name" },
+        "app-repo-id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "source-revision": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[0-9a-f]{40}$",
+          "not": { "const": "0000000000000000000000000000000000000000" }
+        },
+        "workspace-id": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["container-ref", "platform-id", "provenance-protocol"],
+      "properties": {
+        "container-ref": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/stackpop/edgezero-build-app-cli@sha256:[0-9a-f]{64}$"
+        },
+        "platform-id": { "$ref": "#/$defs/digest" },
+        "provenance-protocol": { "type": "integer", "const": 1 }
+      }
+    },
+    "abi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interpreter", "machine", "needed"],
+      "properties": {
+        "interpreter": { "enum": [null, "/lib64/ld-linux-x86-64.so.2"] },
+        "machine": { "type": "string", "const": "x86_64" },
+        "needed": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/name" },
+              { "not": { "pattern": "\\$" } }
+            ]
+          }
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caller", "platform", "schema-version"],
+      "properties": {
+        "caller": { "$ref": "#/$defs/caller" },
+        "platform": { "$ref": "#/$defs/platform" },
+        "schema-version": { "type": "integer", "const": 1 }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi",
+        "app-cli-version",
+        "binary-sha256",
+        "binary-size",
+        "caller",
+        "platform",
+        "schema-version"
+      ],
+      "properties": {
+        "abi": { "$ref": "#/$defs/abi" },
+        "app-cli-version": { "$ref": "#/$defs/name" },
+        "binary-sha256": { "$ref": "#/$defs/digest" },
+        "binary-size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912
+        },
+        "caller": { "$ref": "#/$defs/caller" },
+        "platform": { "$ref": "#/$defs/platform" },
+        "schema-version": { "type": "integer", "const": 1 }
+      }
+    }
+  }
+}
