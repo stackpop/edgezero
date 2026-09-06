@@ -12,6 +12,9 @@ The full command surface in your generated `myapp-cli`:
 myapp-cli build       # cargo build for a target adapter
 myapp-cli deploy      # push to production (per-adapter)
 myapp-cli serve       # local dev server (per-adapter)
+myapp-cli active-version   # print the active service version (Fastly)
+myapp-cli healthcheck      # probe a deployed version (Fastly)
+myapp-cli rollback         # reactivate a previous version / drop a staged one (Fastly)
 myapp-cli new         # scaffold another project
 myapp-cli auth        # sign in / out / status against the platform CLI
 myapp-cli provision   # create the platform resources backing your stores

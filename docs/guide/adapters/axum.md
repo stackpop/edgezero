@@ -27,10 +27,11 @@ crates/my-app-adapter-axum/
 The Axum entrypoint wires the adapter:
 
 ```rust
+use edgezero_adapter_axum::dev_server::run_app;
 use my_app_core::App;
 
 fn main() -> anyhow::Result<()> {
-    edgezero_adapter_axum::run_app::<App>()
+    run_app::<App>()
 }
 ```
 
@@ -82,20 +83,26 @@ The binary is placed in `target/release/my-app-adapter-axum`.
 The Axum adapter provides a native HTTP client for proxying:
 
 ```rust
-use edgezero_adapter_axum::AxumProxyClient;
+use edgezero_adapter_axum::proxy::AxumProxyClient;
 use edgezero_core::proxy::ProxyService;
 
-let client = AxumProxyClient::default();
+let client = AxumProxyClient::try_new()?;
 let response = ProxyService::new(client).forward(request).await?;
 ```
 
-This uses `reqwest` under the hood for outbound HTTP requests.
+This uses `reqwest` under the hood for outbound HTTP requests. `try_new` is
+fallible because it builds a `reqwest::Client`; it returns a `reqwest::Error` if
+the TLS backend cannot be initialised on the host.
 
 ## Logging
 
-The Axum adapter's `run_app` helper installs `simple_logger` and reads logging configuration
-from `edgezero.toml` (level and `echo_stdout`). If you want a different logger, wire your own
-entrypoint using `App::build_app()` and `AxumDevServer`.
+The Axum adapter's `run_app` helper installs `simple_logger` at the level read from
+`EDGEZERO__LOGGING__LEVEL`, falling back to `info` when the variable is unset or
+unparseable. It does not read `edgezero.toml`, and `echo_stdout` has no effect on
+the runtime. To install a different logger, set `owns_logging = true` on your `app!`
+declaration so `run_app` skips its own logger, then install yours in `main`. Wiring
+`App::build_app()` and `AxumDevServer` by hand remains the fallback if you also need
+to control the bind address or store setup.
 
 ::: tip Logging status
 `run_app` wires logging automatically; custom entrypoints should install a logger explicitly.
@@ -134,6 +141,31 @@ Run tests:
 ```bash
 cargo test -p my-app-core
 cargo test -p my-app-adapter-axum
+```
+
+## KV Storage
+
+Each declared `[stores.kv]` id resolves to a `redb`-backed store on disk under
+`.edgezero/`, so values persist across dev-server restarts. The file name is
+derived from the platform store name, which comes from
+`EDGEZERO__STORES__KV__<ID>__NAME` or defaults to the logical id:
+
+```
+.edgezero/kv-<slug>-<hash>.redb
+```
+
+The database file grows over time and does not shrink after deletions. To reclaim
+space, delete the file in `.edgezero/`; the data is lost. See [KV Storage](/guide/kv)
+for the portable API.
+
+## Secret Store
+
+A declared `[stores.secrets]` id resolves to an `EnvSecretStore`, which looks up each
+secret name verbatim in the process environment. Axum lists `secrets` in its
+`single_store_kinds`, so only one secrets id may be declared:
+
+```bash
+API_KEY=mysecret edgezero serve --adapter axum
 ```
 
 ## Config Store
@@ -205,8 +237,14 @@ CMD ["my-app-adapter-axum"]
 Configure the Axum adapter in `edgezero.toml`. See [Configuration](/guide/configuration) for the full
 manifest reference.
 
-The `axum.toml` file is used by the Axum CLI helper to locate the crate and display the port.
-The runtime currently binds to `127.0.0.1:8787` regardless of the `axum.toml` port value.
+The `axum.toml` file is used by the Axum CLI helper to locate the crate and carry a
+default port. `edgezero serve --adapter axum` resolves the bind address with this
+precedence, highest first: the `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`
+environment variables, then `[adapters.axum.adapter]` in `edgezero.toml`, then
+`axum.toml`, then `127.0.0.1:8787`. The CLI passes the resolved address to the child
+process as `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`. Running the binary
+directly bypasses that resolution: it reads only those two environment variables and
+otherwise falls back to `127.0.0.1:8787`.
 
 ## Development Workflow
 
@@ -231,7 +269,7 @@ A typical development workflow:
 | Concurrency | Multi-threaded | Single-threaded   |
 
 ::: tip Development Parity
-While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Some edge-specific features (KV stores, geolocation) aren't available in the Axum adapter.
+While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Some edge-specific features (geolocation) aren't available in the Axum adapter.
 :::
 
 ## Next Steps

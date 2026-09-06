@@ -28,10 +28,10 @@ The Wrangler manifest configures your Worker:
 ```toml
 name = "my-app"
 main = "build/worker/shim.mjs"
-compatibility_date = "2024-01-01"
+compatibility_date = "2023-05-01"
 
 [build]
-command = "edgezero build --adapter cloudflare"
+command = "worker-build --release"
 ```
 
 ### Entrypoint
@@ -56,10 +56,14 @@ derived from the baked store ids and queried individually). Per-id
 request extensions automatically. No `edgezero.toml` is loaded by
 the runtime — see [the migration guide](../manifest-store-migration.md).
 
-The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
-`dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
-`ConfigStoreHandle`.
+For fully manual wiring, `CloudflareService::new(&app)` builds a dispatcher one
+store at a time: `.with_config(binding)` (a KV binding name),
+`.with_config_handle(handle)`, `.with_kv(binding)`, `.with_secrets()`, the
+matching `.require_kv()` / `.require_secrets()` flags, and finally
+`.dispatch(req)`. This path takes bindings verbatim and does not resolve
+`EDGEZERO__STORES__*` selectors, so prefer `run_app` unless you are mocking a
+backend. `dispatch_with_registries` is the registry-based dispatcher `run_app`
+itself calls.
 
 ## Building
 
@@ -98,7 +102,7 @@ wrangler deploy --cwd crates/my-app-adapter-cloudflare
 Cloudflare Workers use the global `fetch` API for outbound requests:
 
 ```rust
-use edgezero_adapter_cloudflare::CloudflareProxyClient;
+use edgezero_adapter_cloudflare::proxy::CloudflareProxyClient;
 use edgezero_core::proxy::ProxyService;
 
 let client = CloudflareProxyClient;
@@ -124,7 +128,7 @@ Access Cloudflare-specific APIs via the request context extensions:
 
 ```rust
 use edgezero_core::context::RequestContext;
-use edgezero_adapter_cloudflare::CloudflareRequestContext;
+use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
 
 async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
     if let Some(cf_ctx) = CloudflareRequestContext::get(ctx.request()) {
@@ -174,10 +178,36 @@ id      = "abc123…"
 
 The binding name comes from `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`
 (defaulting to the logical id `app_config` when unset). Populate the
-namespace via `wrangler kv:key put`. Missing bindings log a one-time
+namespace via `wrangler kv key put`. Missing bindings log a one-time
 warning and the id is dropped from the registry. See
 [the migration guide](../manifest-store-migration.md) if you are coming
 from the pre-rewrite `[vars]`-backed JSON-string form.
+
+KV and config share the same `[[kv_namespaces]]` binding space on Cloudflare,
+so the same logical id must not appear under both `[stores.kv]` and
+`[stores.config]`; both would resolve to a single underlying namespace at
+runtime. `edgezero config validate` rejects the collision.
+
+## Secret Store
+
+Worker Secrets is a single flat bag with no namespace concept, so exactly one
+`[stores.secrets]` id is permitted; `edgezero config validate --strict` rejects
+more than one. Handlers read values through the `Secrets` extractor or
+`ctx.secret_store(id)`, and a secret with no matching binding resolves to `None`
+rather than erroring.
+
+```toml
+# edgezero.toml
+[stores.secrets]
+ids = ["default"]
+```
+
+Populate secrets with the Wrangler CLI; there is no binding flag, since the
+secret name is the binding:
+
+```bash
+wrangler secret put API_KEY
+```
 
 ## KV Storage
 
