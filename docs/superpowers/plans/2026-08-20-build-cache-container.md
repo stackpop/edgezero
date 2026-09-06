@@ -294,18 +294,18 @@ protected gate baseline `G` before source revision `S` is proposed.
 
 ### 5.1 JSON/schema tranche
 
-- [ ] Add one Draft 2020-12 schema and exact valid/invalid fixtures for both `expected.json` and
+- [x] Add one Draft 2020-12 schema and exact valid/invalid fixtures for both `expected.json` and
       `app-cli-meta.json` from design Section 6.2. Write colocated failing tests for RFC 8785 bytes,
       recursive duplicate-key rejection before object construction, every exact field/type/bound,
       unknown and missing fields, noncanonical decimal/hash/name values, schema/protocol mismatch,
       `container-ref` derivation, `workspace-id` rendering, and complete caller/platform identity
       mismatch. Workspace/suffix hash computation vectors belong to the cache-actions follow-on plan,
       not this protocol crate.
-- [ ] Test a closed typed canonical encoder. Protocol 1 contains only bounded strings, positive
+- [x] Test a closed typed canonical encoder. Protocol 1 contains only bounded strings, positive
       integers, null, fixed objects, and the `needed` array; no generic floating-point value is accepted.
-- [ ] Run `cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml json_contract::tests`; expected: non-zero for
+- [x] Run `cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml json_contract::tests`; expected: non-zero for
       unimplemented behavior.
-- [ ] Implement only `json_contract.rs`; rerun the focused and full crate tests; expected: pass.
+- [x] Implement only `json_contract.rs`; rerun the focused and full crate tests; expected: pass.
       Commit the green JSON/schema tranche.
 
 ### 5.2 Archive/extraction tranche

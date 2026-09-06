@@ -261,8 +261,9 @@ test("event ranges are selected from exact hosted context", () => {
   assert.throws(() =>
     selectRange({ ...env, GITHUB_REF: "refs/heads/main" }, event, git),
   );
-  assert.throws(() =>
-    selectRange(env, event, { ...git, parents: () => [app, base] }),
+  assert.throws(
+    () => selectRange(env, event, { ...git, parents: () => [app, base] }),
+    /synthetic merge parents differ: expected .*; observed /,
   );
   assert.throws(() =>
     selectRange({ ...env, GITHUB_EVENT_NAME: "workflow_dispatch" }, event, git),

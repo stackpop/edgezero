@@ -7,6 +7,8 @@ on:
       # the smokes) — including a brand-new action directory or an unrelated
       # workflow like test.yml that could introduce a floating ref.
       - .github/actions/**
+      - .github/tools/edgezero-provenance-validator/**
+      - .github/docker/build-app-cli/**
       - '**/action.yml'
       - '**/action.yaml'
       - .github/workflows/**
@@ -39,6 +41,8 @@ on:
       # the smokes) — including a brand-new action directory or an unrelated
       # workflow like test.yml that could introduce a floating ref.
       - .github/actions/**
+      - .github/tools/edgezero-provenance-validator/**
+      - .github/docker/build-app-cli/**
       - '**/action.yml'
       - '**/action.yaml'
       - .github/workflows/**
@@ -141,6 +145,15 @@ jobs:
 
       - name: Action contract tests
         run: .github/actions/deploy-core/tests/run.sh
+
+      - name: Protocol validator tests and lints
+        run: |
+          rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)
+          rustup toolchain install "$rust" --profile minimal --component rustfmt --component clippy
+          manifest=.github/tools/edgezero-provenance-validator/Cargo.toml
+          cargo "+$rust" fmt --manifest-path "$manifest" --all -- --check
+          cargo "+$rust" clippy --locked --manifest-path "$manifest" --workspace --all-targets --all-features -- -D warnings
+          cargo "+$rust" test --locked --manifest-path "$manifest" --workspace --all-targets
 
       - name: Documentation references and release state
         env:

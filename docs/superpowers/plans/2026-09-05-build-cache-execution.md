@@ -73,3 +73,43 @@ Verification on 2026-09-05:
 
 No hosted GitHub workflow result or Linux-only local test is claimed by this
 record. The standalone protocol crate is a separate Task 1 tranche.
+
+## JSON Protocol Tranche
+
+Task 1 Section 5.1 now has the standalone crate, closed expected/metadata types,
+typed constructors, exact canonical encoders, a Draft 2020-12 schema, and valid
+and invalid wire fixtures. The root Cargo workspace and dependency graph are
+unchanged. Production dependencies are exact serde 1.0.228 and serde_json 1.0.150;
+schema conformance uses dev-only
+[jsonschema 0.54.0](https://docs.rs/jsonschema/0.54.0/jsonschema/) with default
+features disabled, including external HTTP/file resolution.
+
+Fifteen colocated tests cover duplicate/escaped keys, unknown and missing fields,
+required null, alternate byte encodings, malformed surrogates, field types and
+bounds, schema constraints, container derivation, complete identity equality,
+UTF-8 ordering, duplicate preservation, exact 64-KiB acceptance, and overflow.
+Failing skeleton tests were observed before implementation. Full standalone tests,
+fmt, and strict Clippy passed; both read-only reviewers reported no remaining
+blocker for this tranche. CI now explicitly tests the standalone manifest with
+the repository's Rust version.
+
+Archive/extraction, ELF/loadability, the CLI/capability corpus, container gate and
+publisher, image release/pin, and plans 2 through 5 are not implemented by this
+tranche. No runnable or published caching release is claimed.
+
+## Hosted Identity Blocker
+
+Task 0 was pushed as `b3589741814a76d5598ff17aab42f2cff0f67811` to
+[PR 347](https://github.com/stackpop/edgezero/pull/347).
+Its [static-checks job](https://github.com/stackpop/edgezero/actions/runs/34013647236/job/101433619629)
+failed at the strict synthetic-merge parent assertion. GitHub's PR and run APIs
+reported base `37f1a137bc856358bb4d69c499b61129d29c192e`, while the current main ref
+and synthetic merge `fd99c1e1a73d211be84d4077decbbb80441a5e59` use first parent
+`593fc9282a1c56e12bae15f91eef2162f4b6a1b7`; its second parent is the exact pushed
+head. The scanner now reports expected and observed parent identities on failure.
+It still enforces design Section 8's literal event-base contract. No branch merge,
+rebase, gate bypass, or event-selection design amendment has been performed.
+
+The user has been asked to choose a branch refresh or a reviewed event-selection
+amendment, and to identify the maintainer who will provision release prerequisites
+and independent approvals. These hosted checkpoints remain open.

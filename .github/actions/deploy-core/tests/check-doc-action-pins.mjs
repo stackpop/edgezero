@@ -239,10 +239,11 @@ export function selectRange(env, event, git) {
         isSha(base) && isSha(pr?.head?.sha),
         "invalid pull request source SHA",
       );
+      const observedParents = git.parents(candidate);
+      const expectedParents = [base, pr.head.sha];
       requireThat(
-        JSON.stringify(git.parents(candidate)) ===
-          JSON.stringify([base, pr.head.sha]),
-        "synthetic merge parents differ",
+        JSON.stringify(observedParents) === JSON.stringify(expectedParents),
+        `synthetic merge parents differ: expected ${JSON.stringify(expectedParents)}; observed ${JSON.stringify(observedParents)}`,
       );
       break;
     }
