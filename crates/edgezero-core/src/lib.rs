@@ -42,5 +42,6 @@ pub mod store_registry;
 /// module docs. Enable via the `test-utils` feature in `[dev-dependencies]`.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_env;
+pub mod time;
 
 pub use edgezero_macros::{AppConfig, action, app};
