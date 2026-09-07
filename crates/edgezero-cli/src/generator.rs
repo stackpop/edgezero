@@ -667,9 +667,14 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
     lines.dedup();
     let mut body = lines.join("\n");
     if has("spin") {
-        body.push_str(
-            "\n\n# Spin is not asdf-managed in this scaffold; install via\n# https://spinframework.dev/install\n",
-        );
+        body.push_str(concat!(
+            "\n\n# Spin is not asdf-managed in this scaffold; install via\n",
+            "# https://spinframework.dev/install\n",
+            "# Requires Spin 4.1 or newer: spin-sdk 7 imports\n",
+            "# wasi:http/types@0.3.0, which Spin 4.0.x does not provide.\n",
+            "# On an older runtime the component builds and its tests\n",
+            "# pass, then the wasm linker rejects it at startup.\n",
+        ));
     } else {
         body.push('\n');
     }
