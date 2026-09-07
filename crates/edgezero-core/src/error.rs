@@ -12,10 +12,36 @@ use crate::http::{
 };
 use crate::response::{IntoResponse, response_with_body};
 
+/// Stable classification for upstream failures that map to HTTP 502.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BadGatewayReason {
+    Decode,
+    Protocol,
+    Transport,
+    Unspecified,
+}
+
+/// Configured budget input that selected an effective deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BudgetSource {
+    BatchDeadline,
+    Default,
+    PerCallTimeout,
+    Unspecified,
+}
+
 /// Application-level error that carries an HTTP status code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EdgeError {
+    /// Upstream or transport failure. HTTP 502.
+    #[error("{message}")]
+    BadGateway {
+        message: String,
+        reason: BadGatewayReason,
+    },
     #[error("{message}")]
     BadRequest { message: String },
     /// The blob's `data` shape disagrees with the deployed `C`
@@ -24,6 +50,12 @@ pub enum EdgeError {
     /// `"config_out_of_date"`, carries `Retry-After: 60`.
     #[error("config out of date: {message}")]
     ConfigOutOfDate { message: String, field_path: String },
+    /// A wall-clock deadline or per-request timeout fired. HTTP 504.
+    #[error("{message}")]
+    GatewayTimeout {
+        message: String,
+        cause: BudgetSource,
+    },
     #[error("internal error: {source}")]
     Internal {
         #[from]
@@ -42,6 +74,22 @@ pub enum EdgeError {
 }
 
 impl EdgeError {
+    #[inline]
+    pub fn bad_gateway<S: Into<String>>(message: S) -> Self {
+        EdgeError::BadGateway {
+            message: message.into(),
+            reason: BadGatewayReason::Unspecified,
+        }
+    }
+
+    #[inline]
+    pub fn bad_gateway_with_reason<S: Into<String>>(message: S, reason: BadGatewayReason) -> Self {
+        EdgeError::BadGateway {
+            message: message.into(),
+            reason,
+        }
+    }
+
     #[inline]
     pub fn bad_request<S: Into<String>>(message: S) -> Self {
         EdgeError::BadRequest {
@@ -96,6 +144,22 @@ impl EdgeError {
         }
     }
 
+    #[inline]
+    pub fn gateway_timeout<S: Into<String>>(message: S) -> Self {
+        EdgeError::GatewayTimeout {
+            message: message.into(),
+            cause: BudgetSource::Unspecified,
+        }
+    }
+
+    #[inline]
+    pub fn gateway_timeout_caused<S: Into<String>>(message: S, cause: BudgetSource) -> Self {
+        EdgeError::GatewayTimeout {
+            message: message.into(),
+            cause,
+        }
+    }
+
     /// Typed access to the wrapped [`AnyError`] for `EdgeError::Internal`.
     ///
     /// Renamed away from `source` to avoid shadowing
@@ -107,8 +171,10 @@ impl EdgeError {
     pub fn inner(&self) -> Option<&AnyError> {
         match self {
             EdgeError::Internal { source } => Some(source),
-            EdgeError::BadRequest { .. }
+            EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
             | EdgeError::ConfigOutOfDate { .. }
+            | EdgeError::GatewayTimeout { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
             | EdgeError::MethodNotAllowed { .. }
@@ -129,8 +195,10 @@ impl EdgeError {
 
     fn kind_str(&self) -> &'static str {
         match self {
+            EdgeError::BadGateway { .. } => "bad_gateway",
             EdgeError::BadRequest { .. } => "bad_request",
             EdgeError::ConfigOutOfDate { .. } => "config_out_of_date",
+            EdgeError::GatewayTimeout { .. } => "gateway_timeout",
             EdgeError::Internal { .. } => "internal",
             EdgeError::MethodNotAllowed { .. } => "method_not_allowed",
             EdgeError::NotFound { .. } => "not_found",
@@ -144,8 +212,10 @@ impl EdgeError {
     #[inline]
     pub fn message(&self) -> String {
         match self {
-            EdgeError::BadRequest { message }
+            EdgeError::BadGateway { message, .. }
+            | EdgeError::BadRequest { message }
             | EdgeError::ConfigOutOfDate { message, .. }
+            | EdgeError::GatewayTimeout { message, .. }
             | EdgeError::Validation { message }
             | EdgeError::NotImplemented { message }
             | EdgeError::ServiceUnavailable { message } => message.clone(),
@@ -199,10 +269,12 @@ impl EdgeError {
     #[inline]
     pub fn status(&self) -> StatusCode {
         match self {
+            EdgeError::BadGateway { .. } => StatusCode::BAD_GATEWAY,
             EdgeError::BadRequest { .. } => StatusCode::BAD_REQUEST,
             EdgeError::ConfigOutOfDate { .. } | EdgeError::ServiceUnavailable { .. } => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            EdgeError::GatewayTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             EdgeError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
             EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
@@ -242,8 +314,10 @@ impl IntoResponse for EdgeError {
             EdgeError::ConfigOutOfDate { field_path, .. } if !field_path.is_empty() => {
                 Some(field_path.as_str())
             }
-            EdgeError::BadRequest { .. }
+            EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
             | EdgeError::ConfigOutOfDate { .. }
+            | EdgeError::GatewayTimeout { .. }
             | EdgeError::Internal { .. }
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
@@ -332,10 +406,138 @@ mod tests {
     use std::str;
 
     #[test]
+    fn bad_gateway_and_gateway_timeout_surface() {
+        for (err, code, msg) in [
+            (
+                EdgeError::bad_gateway("upstream refused"),
+                StatusCode::BAD_GATEWAY,
+                "upstream refused",
+            ),
+            (
+                EdgeError::gateway_timeout("deadline expired"),
+                StatusCode::GATEWAY_TIMEOUT,
+                "deadline expired",
+            ),
+        ] {
+            assert_eq!(err.status(), code);
+            assert_eq!(err.message(), msg);
+            assert!(err.inner().is_none());
+            assert!(err.to_string().contains(msg));
+        }
+    }
+
+    #[test]
+    fn bad_gateway_and_gateway_timeout_json_shape() {
+        for (err, code, kind, msg) in [
+            (
+                EdgeError::bad_gateway("nope"),
+                502_u16,
+                "bad_gateway",
+                "nope",
+            ),
+            (
+                EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Decode),
+                502_u16,
+                "bad_gateway",
+                "nope",
+            ),
+            (
+                EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Protocol),
+                502_u16,
+                "bad_gateway",
+                "nope",
+            ),
+            (
+                EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Transport),
+                502_u16,
+                "bad_gateway",
+                "nope",
+            ),
+            (
+                EdgeError::gateway_timeout("late"),
+                504_u16,
+                "gateway_timeout",
+                "late",
+            ),
+            (
+                EdgeError::gateway_timeout_caused("late", BudgetSource::PerCallTimeout),
+                504_u16,
+                "gateway_timeout",
+                "late",
+            ),
+            (
+                EdgeError::gateway_timeout_caused("late", BudgetSource::BatchDeadline),
+                504_u16,
+                "gateway_timeout",
+                "late",
+            ),
+            (
+                EdgeError::gateway_timeout_caused("late", BudgetSource::Default),
+                504_u16,
+                "gateway_timeout",
+                "late",
+            ),
+        ] {
+            let response = err.into_response().expect("response");
+            assert_eq!(response.status().as_u16(), code);
+            let body_json = parse_body(response);
+            assert_eq!(body_json["error"]["status"], code);
+            assert_eq!(body_json["error"]["kind"], serde_json::Value::from(kind));
+            assert_eq!(body_json["error"]["message"], serde_json::Value::from(msg));
+            assert!(
+                body_json["error"].get("field_path").is_none(),
+                "502/504 carry no field_path"
+            );
+            assert!(
+                body_json["error"].get("reason").is_none(),
+                "reason is not part of the wire shape"
+            );
+            assert!(
+                body_json["error"].get("cause").is_none(),
+                "cause is not part of the wire shape"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_gateway_reason_is_typed() {
+        let EdgeError::BadGateway {
+            reason: default_reason,
+            ..
+        } = EdgeError::bad_gateway("x")
+        else {
+            panic!("expected BadGateway");
+        };
+        assert_eq!(default_reason, BadGatewayReason::Unspecified);
+
+        for expected in [
+            BadGatewayReason::Decode,
+            BadGatewayReason::Protocol,
+            BadGatewayReason::Transport,
+            BadGatewayReason::Unspecified,
+        ] {
+            let EdgeError::BadGateway { reason, .. } =
+                EdgeError::bad_gateway_with_reason("x", expected)
+            else {
+                panic!("expected BadGateway");
+            };
+            assert_eq!(reason, expected);
+        }
+    }
+
+    #[test]
     fn bad_request_sets_status_and_message() {
         let err = EdgeError::bad_request("oops");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(err.message(), "oops");
+    }
+
+    #[test]
+    fn bare_gateway_timeout_is_unspecified() {
+        let EdgeError::GatewayTimeout { cause, .. } = EdgeError::gateway_timeout("x") else {
+            panic!("expected GatewayTimeout");
+        };
+        assert_eq!(cause, BudgetSource::Unspecified);
     }
 
     #[test]
@@ -349,7 +551,9 @@ mod tests {
                 assert_eq!(message, "missing field");
                 assert_eq!(field_path, "feature.new_checkout");
             }
-            EdgeError::BadRequest { .. }
+            EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
+            | EdgeError::GatewayTimeout { .. }
             | EdgeError::Internal { .. }
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
@@ -399,7 +603,9 @@ mod tests {
                 // String segments redacted, structure preserved.
                 assert_eq!(field_path, "<redacted>.<redacted>");
             }
-            EdgeError::BadRequest { .. }
+            EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
+            | EdgeError::GatewayTimeout { .. }
             | EdgeError::Internal { .. }
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
@@ -453,7 +659,9 @@ mod tests {
                 // Structure is preserved (items.<key>.port -> redacted, dotted).
                 assert_eq!(field_path, "<redacted>.<redacted>.<redacted>");
             }
-            EdgeError::BadRequest { .. }
+            EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
+            | EdgeError::GatewayTimeout { .. }
             | EdgeError::Internal { .. }
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
@@ -492,7 +700,9 @@ mod tests {
                     "field_path should match serde_path_to_error sentinel"
                 );
             }
-            EdgeError::BadRequest { .. }
+            EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
+            | EdgeError::GatewayTimeout { .. }
             | EdgeError::Internal { .. }
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
@@ -521,6 +731,23 @@ mod tests {
         let err = EdgeError::from(ConfigStoreError::unavailable("backend offline"));
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.message(), "backend offline");
+    }
+
+    #[test]
+    fn gateway_timeout_caused_preserves_cause() {
+        for expected in [
+            BudgetSource::BatchDeadline,
+            BudgetSource::Default,
+            BudgetSource::PerCallTimeout,
+            BudgetSource::Unspecified,
+        ] {
+            let EdgeError::GatewayTimeout { cause, .. } =
+                EdgeError::gateway_timeout_caused("x", expected)
+            else {
+                panic!("expected GatewayTimeout");
+            };
+            assert_eq!(cause, expected);
+        }
     }
 
     #[test]
@@ -636,6 +863,7 @@ mod tests {
             }};
         }
 
+        assert_kind!(EdgeError::bad_gateway("x"), "bad_gateway", 502_u16);
         assert_kind!(EdgeError::bad_request("x"), "bad_request", 400_u16);
         assert_kind!(
             EdgeError::config_out_of_date("x", "f"),
@@ -654,6 +882,7 @@ mod tests {
         );
         assert_kind!(EdgeError::not_found("/x"), "not_found", 404_u16);
         assert_kind!(EdgeError::not_implemented("x"), "not_implemented", 501_u16);
+        assert_kind!(EdgeError::gateway_timeout("x"), "gateway_timeout", 504_u16);
         assert_kind!(
             EdgeError::service_unavailable("x"),
             "service_unavailable",
@@ -676,7 +905,9 @@ mod tests {
             }};
         }
 
+        assert_retry_after!(EdgeError::bad_gateway("x"), false);
         assert_retry_after!(EdgeError::bad_request("x"), false);
+        assert_retry_after!(EdgeError::gateway_timeout("x"), false);
         assert_retry_after!(EdgeError::internal(anyhow::anyhow!("x")), false);
         // ServiceUnavailable is also 503 but must NOT carry Retry-After
         assert_retry_after!(EdgeError::service_unavailable("x"), false);
@@ -685,6 +916,14 @@ mod tests {
 
     #[test]
     fn field_path_only_on_config_out_of_date() {
+        for err in [EdgeError::bad_gateway("x"), EdgeError::gateway_timeout("x")] {
+            let body = parse_body(err.into_response().expect("response"));
+            assert!(
+                body["error"].get("field_path").is_none(),
+                "field_path should be absent for gateway errors"
+            );
+        }
+
         let bad_req_err = EdgeError::bad_request("x");
         let bad_req_body = parse_body(bad_req_err.into_response().expect("response"));
         assert!(
