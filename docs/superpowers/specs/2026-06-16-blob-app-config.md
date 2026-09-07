@@ -4125,6 +4125,29 @@ key)`.
 
 ### 6.3 Errors
 
+> **Typed-classification gate (must resolve before implementing this extractor).** The
+> status/kind mapping below is necessary but not sufficient: callers must not infer an
+> extraction failure's origin by parsing `message`. Before the next `EdgeError` surface is
+> frozen, choose and document a Rust-inspectable, `#[non_exhaustive]`
+> `StoreExtractionReason` carrier covering at least `BackendUnavailable`,
+> `IntegrityMismatch`, `InvalidEnvelope`, `InvalidKey`, `MissingBlob`, `MissingRegistry`,
+> `MissingSecret`, `SchemaMismatch`, `SecretBackendUnavailable`, and `UnknownStore`.
+> The carrier may be a field on the affected variants, a dedicated `EdgeError` variant
+> whose status/kind delegates by reason, or a typed source retained by `EdgeError`; it must
+> survive every `AppConfig<C>`/`from_store`/secret-walk mapping and remain inspectable from
+> the returned error without downcasting a formatted string. It is Rust-side diagnostic
+> metadata and is not serialized unless a later wire contract explicitly opts in.
+>
+> The chosen representation must preserve the externally documented outcomes below:
+> missing/deployment-drift/schema reasons remain `config_out_of_date` with 503 and
+> `Retry-After`; transient backend reasons remain `service_unavailable` with 503 and no
+> current `Retry-After`; caller key-shape errors remain `bad_request` with 400; integrity,
+> envelope, registry/wiring, and secret-invariant failures remain `internal` with 500.
+> Tests must enumerate every known reason, assert its status/kind/header/field-path policy,
+> and prove the JSON envelope omits the typed reason. Do not land the message-only extractor
+> mapping and defer this decision: adding fields after downstream exhaustive matches exist
+> would turn an avoidable design choice into a breaking migration.
+
 The extractor surfaces:
 
 - `EdgeError::ServiceUnavailable` — store unreachable, network
