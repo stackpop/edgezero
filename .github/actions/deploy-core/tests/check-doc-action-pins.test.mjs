@@ -72,6 +72,29 @@ test("fences use the Markdown AST including list and quote nesting", () => {
   assert.equal(scanDocument(path, fence(example("v1.2.3")), record), 1);
 });
 
+test("bootstrap adoption documents use their existing superpowers locations", () => {
+  for (const document of [
+    "docs/superpowers/specs/edgezero-deploy-github-action.md",
+    "docs/superpowers/plans/edgezero-deploy-action-implementation-plan.md",
+    "docs/superpowers/specs/edgezero-deploy-adoption-guide.md",
+    path,
+  ]) {
+    assert.equal(scanDocument(document, fence(example()), null), 1);
+  }
+  for (const name of [
+    "edgezero-deploy-github-action",
+    "edgezero-deploy-action-implementation-plan",
+    "edgezero-deploy-adoption-guide",
+  ]) {
+    assert.throws(() =>
+      scanDocument(`docs/specs/${name}.md`, fence(example()), null),
+    );
+  }
+  assert.throws(() =>
+    scanDocument("docs/superpowers/specs/unreviewed.md", fence(example()), null),
+  );
+});
+
 test("job-level reusable callers omit steps and runner selection", () => {
   const call =
     "jobs:\n  build:\n    uses: stackpop/edgezero/.github/workflows/build-app-cli.yml@v1.2.3\n";
@@ -181,6 +204,7 @@ test("workflow filters include every structural gate input family", () => {
       "**/action.yml",
       "**/action.yaml",
       "docs/.edgezero-action-release.json",
+      "docs/superpowers/**",
       "**/*.[mM][dD]",
       "**/*.[mM][aA][rR][kK][dD][oO][wW][nN]",
     ]) {

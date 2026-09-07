@@ -8,7 +8,7 @@
 restore/compile/save primitive that later plans consume, without making cache availability part of
 build correctness or exposing credentials to compilation.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
 2 through 5 and 9.
 
 ## 1. Fixed decisions
@@ -55,6 +55,9 @@ build correctness or exposing credentials to compilation.
       complete the full rotation/recovery checklist. Record it as this plan's active gate. Do not mix
       public action wiring/metadata into the gate PR; the reviewed materializer/exporter helper itself
       is gate code and lands here. Do not publish a new image because image-context bytes are unchanged.
+- [ ] Exercise this handoff with protected main already beyond `B`: dispatch at protected head `Q`,
+      prove active `G` ancestry and manifested-byte equality, then activate the new gate through the
+      plan-1 lock protocol. Do not require the entire main commit to equal the old gate commit.
 
 ## 3. Shared build preflight, identity, and keys
 
@@ -187,8 +190,9 @@ build correctness or exposing credentials to compilation.
       Rust miss/write counters, a new-job warm restore with at least one post-zero Rust cache hit and
       equal binary digest, and complete default-off absence; elapsed time is never evidence.
 - [ ] Run shellcheck, the protected contract/container harness, `scripts/run-actionlint.sh`, zizmor,
-      and all Rust checks. Defer real reusable-workflow cold/warm evidence to plan 3 after the workflow
-      exists. Confirm all non-local actions remain exact-version pinned.
+      and all Rust checks. Defer non-public workflow harness integration to plan 3 after the workflow
+      exists and actual literal-`C` public cold/warm qualification to plan 5. Confirm all non-local
+      actions remain exact-version pinned.
 - [ ] Merge through the one-entry queue. Record the resulting commit and active gate revision for plan
       3; do not designate final `P` yet.
 

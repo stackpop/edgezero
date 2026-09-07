@@ -7,7 +7,7 @@
 CLI artifact and make every consumer independently validate exact caller and platform identity before
 the binary can execute.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
 3, 5.1, 5.3, 5.4, 6, 7, and 9.
 
 ## 1. Fixed actions and boundaries
@@ -42,6 +42,12 @@ the binary can execute.
       literal `runs-on: ubuntu-24.04`, checkout credential removal, artifact-name uniqueness, no
       platform output, typed identity output, exact EdgeZero/app checkout separation, no app-relative
       local action resolution, exact mount split, cleanup on every exit, and no provider input or secret.
+- [ ] Add the complete token/App authentication truth table and structural checks for the exact
+      producer-side token action after bootstrap/source verification and before source fetching.
+      Reject absent, partial, or mixed credentials; arbitrary API/owner/repository lists; a mint step
+      in a job-level caller; cross-job token forwarding; private-key/container leakage; and fallback
+      or scope broadening. Test single-repository contents-read minting, identity failure, expired
+      tokens, failed materialization, and mandatory post-step revocation.
 - [ ] Parse the reusable workflow and require its first executable step to be the fixed inline
       producer bootstrap. Bind the three runner fields, four `job.workflow_*` fields,
       `job.check_run_id`, and `app-ref` directly from their exact contexts or declared input; validate
@@ -69,7 +75,9 @@ the binary can execute.
       writable parser input, and a second downloaded artifact must all fail.
 - [ ] Land and activate this gate update using the plan-1 rotation and rollback procedure before
       modifying producer or consumer actions. Prove its changed paths are outside
-      `image-context-paths.txt`; otherwise stop for a new image release.
+      `image-context-paths.txt`; otherwise stop for a new image release. Dispatch at post-`B` snapshot
+      `Q_d`, prove active `G` ancestry and manifested-byte equality, retain old-`G` lock helpers across
+      activation, and record `Q_f` separately. Preserve the historical image-release gate identity.
 
 ## 3. Caller identity and authority export
 
@@ -86,7 +94,7 @@ the binary can execute.
       checkout and materialize only through the absolute verified Git LFS binary. Remove credentials
       and their host channel before Copy A or any container exists. Produce tracked/submodule-only,
       `.git`-free, non-hardlinked Copy A. Prove forbidden filters/hooks/origins are never reached and
-      the token never appears in Copy A, argv, environment, mounted data, logs, artifacts, or cache;
+      the token never appears in Copy A, argv, container environment, mounted data, logs, artifacts, or cache;
       reverify the read-only authority after compilation.
 
 ## 4. Expected identity and package
@@ -109,8 +117,11 @@ the binary can execute.
       closure, and no extra filesystem entry.
 - [ ] Validate `app-cli-artifact` as 1..128 ASCII bytes matching the design regex and unique in the
       run. Upload exactly the literal file path with `archive:true`, `compression-level:0`,
-      `include-hidden-files:false`, `if-no-files-found:error`, `overwrite:false`, and
-      `retention-days:1`; require nonempty artifact id/digest outputs and no wildcard/multiple path.
+      `include-hidden-files:false`, `if-no-files-found:error`, and `overwrite:false`; omit
+      `retention-days` to preserve the repository/organization default. Require nonempty artifact
+      id/digest outputs and no wildcard/multiple path. Add a structural regression rejecting forced
+      one-day retention and a delayed-consumer fixture beyond 24 hours, with an adequate effective
+      retention policy. Expired artifacts fail explicitly; do not rebuild silently during deployment.
 
 ## 5. Reusable workflow interface
 
@@ -124,7 +135,8 @@ the binary can execute.
       `continue-on-error`, cannot mask failure, and success-gates every later non-cleanup step.
 - [ ] Declare required string inputs for repository/ref/id/workspace/package/bin/artifact, optional
       string defaults for working directory/suffix/app env, boolean defaults for cache/disclosure, the
-      required `rust-toolchain`, numeric timeout default, and the required checkout secret exactly as specified. Parse the
+      required `rust-toolchain`, numeric timeout default, optional empty `app-checkout-client-id`, and
+      optional secrets `app-checkout-token`/`app-checkout-private-key` exactly as specified. Parse the
       received numeric timeout as an integer in 1..120 and reject every undeclared compatibility,
       platform, provider, ambient-environment, Cargo, and arbitrary-argument surface.
 - [ ] In the checkout-independent bootstrap, require `job.workflow_repository` and
@@ -138,14 +150,18 @@ the binary can execute.
       As the next executable step, use only fixed inline workflow commands and runner tools to verify
       the real fixed root, exact repository identity and HEAD, clean tree, and absence of submodule,
       LFS, sparse, and untracked content. Execute no checked-out path before that verification. Then
-      run plan 2's three-field runner helper and only afterward use plan 2's prevalidated object-first
+      run plan 2's three-field runner helper, validate Section 7.1's exclusive authentication mode,
+      and, only in App mode, mint with `actions/create-github-app-token@v3.2.0`, `client-id`, the single
+      parsed owner/repository, contents-read permission, literal GitHub API origin, and mandatory
+      revocation. Pass only the masked token to plan 2's prevalidated object-first
       materializer for the app at full `app-ref` in a distinct authority root. Verify authority and
       Copy A export contracts, root separation, and that every local composite/helper path resolves
       beneath the verified EdgeZero root rather than app data.
 - [ ] Wire plan 2's already gated cache primitive and exact restore/save action versions into this
-      workflow. Add the first public cache-off, cold, warm, corrupt-restore, save-denied, and
-      warning-only save hosted runs; preserve evidence for exactly one Cargo compile/build invocation
-      after metadata preflight and for token absence.
+      workflow. Exercise cache-off, cold, warm, corrupt-restore, save-denied, and warning-only save
+      through the non-public hosted harness; preserve evidence for exactly one Cargo compile/build
+      invocation after metadata preflight and for token absence. Actual tagged public workflow
+      qualification is a separate plan-5 checkpoint after `C` exists; harness results cannot satisfy it.
 - [ ] Replace the legacy `.github/actions/build-app-cli` producer with the gated retirement stub and
       migrate `.github/workflows/deploy-action.yml` plus its producer fixtures away from local
       composite calls. Exercise reusable-workflow behavior through the trusted non-public harness until
@@ -180,7 +196,8 @@ the binary can execute.
 - [ ] Give `compute-app-cli-identity` exactly the required string inputs `action-version`,
       `app-repository`, `app-ref`, `app-repo-id`, `workspace-root`, `app-cli-package`, `app-cli-bin`,
       and `rust-toolchain`, optional string `working-directory` default `.`, and required sensitive
-      string input `app-checkout-token`, supplied by the caller from a GitHub secret and masked before
+      string input `app-checkout-token`, supplied from a GitHub secret or masked same-job App-token
+      output and masked before
       use. Require its runner action repository/ref to equal the supplied exact version. Materialize
       one action-private authority with plan 2's gated object-first helper, remove the credential
       channel, recompute identity, and clean the authority on every exit. Output exactly
@@ -199,7 +216,8 @@ the binary can execute.
       operation variants and profile data; do not duplicate env-file serialization, placeholder argv,
       Docker create/start/attach, timeout, or cleanup logic.
 - [ ] In the consumer job, invoke `compute-app-cli-identity` once with the exact source inputs and
-      checkout-token secret, then compare every typed output with the reusable-workflow outputs before
+      checkout token from a secret or masked same-job App-token output, then compare every typed
+      output with the reusable-workflow outputs before
       invoking any provider action. Pass those verified caller fields to later actions; do not retain
       or pass an authority path because the identity action destroys its authority before returning.
       Source-free actions do not materialize source or mount Copy B; each compares artifact metadata

@@ -17,7 +17,7 @@ plans land on top. Their final passing action revision `P` contains the unchange
 record and the adoption documents for exact stable version `V`; consumers pin immutable release
 version `V`, which resolves to `P`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30.
 
 **Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
 `shellcheck`, and `zizmor`.
@@ -167,7 +167,7 @@ Modify:
 ## 4. Task 0: Enforce exact-version external references repository-wide
 
 The current pin gate permits major/minor tags, prereleases, and commit SHAs. That is broader than
-v6.29 and must be narrowed before adding the write-privileged publisher.
+v6.30 and must be narrowed before adding the write-privileged publisher.
 
 **Files:**
 
@@ -178,9 +178,9 @@ v6.29 and must be narrowed before adding the write-privileged publisher.
 - Create `scripts/run-actionlint.sh` and its focused compatibility test.
 - Modify external refs in `.github/workflows/{codeql,deploy-action,deploy-docs,fastly-installer-check,format,test}.yml`.
 - Modify external refs in `.github/actions/{build-app-cli,config-push-fastly,deploy-fastly,healthcheck-fastly,rollback-fastly}/action.yml`.
-- Modify examples in `docs/specs/edgezero-deploy-github-action.md`,
-  `docs/specs/edgezero-deploy-action-implementation-plan.md`,
-  `docs/specs/edgezero-deploy-adoption-guide.md`, and `docs/guide/deploy-github-actions.md`.
+- Modify examples in `docs/superpowers/specs/edgezero-deploy-github-action.md`,
+  `docs/superpowers/plans/edgezero-deploy-action-implementation-plan.md`,
+  `docs/superpowers/specs/edgezero-deploy-adoption-guide.md`, and `docs/guide/deploy-github-actions.md`.
 
 - [x] Write failing pin-gate tests proving `@v1`, `@v1.2`, branches, prereleases, build metadata,
       full/abbreviated SHAs, malformed/leading-zero versions, and empty refs fail; canonical stable
@@ -223,6 +223,14 @@ v6.29 and must be narrowed before adding the write-privileged publisher.
       standard, larger, custom, and self-hosted labels. Add positive/negative state-transition,
       base/candidate, partial-update, downgrade/deletion, hidden-placeholder, mixed-version, job-
       shape, and runner-label cases to `run.sh`.
+- [ ] Reconcile the implemented v6.29 selector with v6.30 before freezing `G`. Add the reproduced
+      hosted case where payload base `37f1a137...` precedes synthetic first parent `593fc928...`, and
+      head `8f68476d...` is the second parent. Authenticate the context-selected synthetic commit;
+      require exactly `[F,J]` and `A` ancestor-or-equal to `F`; compare `F..M`, not `A..M` or latest
+      main. Reject wrong/missing/reordered/extra parents, unavailable/shallow objects, replace/graft
+      history, wrong repository/ref, and reversed/incomparable ancestry. Test a release record added
+      upstream at `F`, intervening upstream executable changes, candidate-only mixed changes, and
+      later main movement. Keep these tasks unchecked until code, fixtures, and hosted CI agree.
 - [ ] Add the hosted transition verifier to gate `G`. With only read permissions and fixed
       no-redirect versioned requests, it proves record `V` is a published `draft:false`,
       `prerelease:false`, `immutable:true` release whose API target and anonymous peeled remote ref
@@ -328,10 +336,15 @@ protected gate baseline `G` before source revision `S` is proposed.
 - [ ] Add controlled static/dynamic valid, wrong class/endian/type/architecture/interpreter,
       wrong `EI_VERSION`/`e_version`/`EI_OSABI`/`EI_ABIVERSION`/`EI_PAD`/`e_flags`/`e_ehsize`/
       `e_phentsize`, zero `e_phnum`, `PN_XNUM`,
-      malformed/duplicate `PT_DYNAMIC`, missing/nonzero-after `DT_NULL`, conflicting string-table tags,
+      malformed/duplicate `PT_DYNAMIC`, unequal file/memory sizes, contradictory file-offset versus
+      virtual-address dynamic tables, nonunique/nonreadable/non-file-backed mappings,
+      missing/nonzero-after `DT_NULL`, conflicting string-table tags,
       unmapped/overlapping string ranges, malformed string/interpreter termination, RPATH/RUNPATH,
-      AUDIT/DEPAUDIT/CONFIG/AUXILIARY/FILTER/POSFLAG rejection, valid bounded SONAME, empty/oversized/
-      slash-containing/duplicate SONAME rejection, NODEFLIB/LOADFLTR and unknown-flag rejection, every
+      AUDIT/DEPAUDIT/CONFIG/AUXILIARY/FILTER/POSFLAG rejection, System-V/GNU OSABI acceptance and every
+      other OSABI rejection, libc-style dependency `PT_INTERP` acceptance only for the exact fixed
+      interpreter, primary SONAME rejection, optional library SONAME equal to its filename, reserved
+      primary/interpreter filenames, cross-object alias collisions, empty/oversized/slash/backslash/
+      dollar-containing/duplicate SONAME rejection, NODEFLIB/LOADFLTR and unknown-flag rejection, every
       in-range and just-outside case for the closed numeric tag allowlist, exact
       `DT_FLAGS=0x0000001e` and `DT_FLAGS_1=0x5eff976f` mask boundaries, unknown standard/GNU/OS/processor
       tag rejection, duplicate rejection for every singleton tag, slash/backslash/dollar-containing
@@ -341,7 +354,8 @@ protected gate baseline `G` before source revision `S` is proposed.
       controlled loader profile in design Section 6.4.
 - [ ] Write failing tests for machine, interpreter/null, byte-sorted duplicate-preserving direct
       `DT_NEEDED`, digest, size, exact `/opt/edgezero/runtime-lib` lookup, symlink/hardlink/subdirectory
-      rejection, duplicate basename, interpreter parsing, and recursive dependency resolution against
+      rejection, duplicate basename, interpreter parsing, the one `ld-linux-x86-64.so.2` alias resolving
+      to the already-validated interpreter rather than a flat copy, and recursive dependency resolution against
       a synthetic image root. Add preload presence, cache-only/default-directory/hardware-capability
       substitution, direct-loader argv, and explicit `dlopen` non-claim fixtures.
 - [ ] Run `cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml elf::tests`; expected: non-zero for
@@ -541,11 +555,20 @@ release credential. Candidate code is always subject data. No image is published
       instruction may replace an installed tool, validator, schema, fixture, interpreter, or closure
       member. Static contract tests bind the instruction sequence and destinations.
 - [ ] Populate flat `/opt/edgezero/runtime-lib` with the complete reviewed x86-64 startup closure,
-      require exact dynamic interpreter `/lib64/ld-linux-x86-64.so.2`, and remove
+      excluding the interpreter. Require exact dynamic interpreter `/lib64/ld-linux-x86-64.so.2`,
+      validate every library's role and filename/SONAME aliases, reserve `app-cli` and
+      `ld-linux-x86-64.so.2` against flat-directory copies, and remove
       `/etc/ld.so.preload`. Dynamic app-binary launches use the container runtime's argv API with exact
       interpreter options `--inhibit-cache --glibc-hwcaps-mask '' --library-path
 /opt/edgezero/runtime-lib`; static binaries run directly. Test that no shell, cache, default
       directory, hardware-capability directory, or preload can substitute a startup object.
+- [ ] Before freezing `G`, compile a real GNU-target Rust CLI using the selected image toolchain.
+      Run package, validate, and controlled-loader smoke through their exact isolated profiles against
+      the image's actual Bookworm libc/interpreter closure. Record the measured libc/loader digests
+      and accepted headers; do not substitute synthetic ELF fixtures or a distro-package inspection
+      for this image acceptance test. In a separate isolated loader-comparison harness, prove primary
+      and dependency SONAME-collision fixtures are rejected and the interpreter alias resolves to the
+      same object the parser predicts. No application execution occurs in the parser profile.
 - [ ] Write failing command-fixture tests for `verify-toolchain.sh`. Cover exact, prerelease,
       extra-text, missing, and malformed Rust/Fastly/sccache version output; absent
       `wasm32-wasip1`; failed minimal compile; invalid wasm magic; validator self-test failure;
@@ -607,12 +630,16 @@ release credential. Candidate code is always subject data. No image is published
       `relevant=true|false`; both gate modes require true. Any invalid range, missing object, gitlink,
       path ambiguity, mixed
       gate/non-gate change, or unmanifested repository image-context input fails. Gate-update mode requires the
-      base tree to equal old `G`, validates candidate manifest and CODEOWNERS as inert data, and permits
+      base's manifested tree to equal old `G`, validates candidate manifest and CODEOWNERS as inert data, and permits
       changed paths only in the union of old and candidate manifests. Gate-rollback requires disabled
       release, both pointers at old `G`, a base valid as failed `G'`, a head tree byte-equal to old
       `G`, the two-manifest union, and no non-gate/release/pin change.
 - [ ] Derive those classifier SHAs only through the trusted workflow's closed event selector. For
-      `pull_request`, require exact base repository/ref and synthetic merge-parent agreement. For
+      `pull_request`, require exact base repository/ref and authenticate `M=github.sha`; read exactly
+      ordered parents `[F,J]` with second parent equal to event head, require event base `A`
+      ancestor-or-equal to `F`, and select `F..M`. Both scanner and classifier use that pair for state,
+      changed paths, and base-manifest reads, with `{A,F,J,M}` diagnostics; no moving API/main,
+      merge-base, PR-head-only, or three-dot substitute is allowed. For
       `merge_group:checks_requested`, require payload base/head SHAs, exact base/head refs,
       `head_sha==github.sha`, the `gh-readonly-queue/main/` head prefix, and base ancestry. For
       protected-main `push`, require nonzero `before`, `after==github.sha==github.workflow_sha`, exact
@@ -711,9 +738,19 @@ min:1, wait:0}` from the design. Every missing, extra, defaulted, or changed sem
       fail. Matching check names from candidate workflow code are not evidence.
 - [ ] Verify protected-environment App/installation/team variables and private-key secret metadata.
       Use the local App key to authenticate the exact dedicated App and selected-repository installation
-      with only contents/write, pull-requests/write, and implicit metadata/read. The only non-GET calls
-      are creation of a repository-id-bounded test token and its guaranteed revocation. Reject extra
-      repository or permission scope.
+      with only contents/write, pull-requests/write, and implicit metadata/read. First mint
+      `InstallationMetadataAudit` with exact body `{"permissions":{"metadata":"read"}}`, omitting
+      both repository selectors. Require only metadata-read returned permission and complete,
+      duplicate-free repository enumeration with `total_count:1` and only the verified EdgeZero
+      id/full name. Its wrapper allows only repository enumeration and revocation. Revoke it
+      successfully, then mint distinct `EdgeZeroPublisherProbe` with exact body
+      `{"repository_ids":[E],"permissions":{"contents":"write","pull_requests":"write"}}`.
+      The probe's wrapper allows only the specified enumeration, EdgeZero GET, and revocation.
+      Neither token can cross wrappers or be stored in Actions. Reject broadened permissions,
+      narrowed audit bodies, omitted permission bodies, extra repositories, duplicate/truncated/count-
+      mismatched pages, and revocation failure. Include a two-repository installation whose bounded
+      probe sees only EdgeZero: the installation audit must still reject it. Only these two local
+      token creations/revocations are non-GET operations; persistent mutations remain forbidden.
 - [ ] Resolve `EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_LOGIN` through the exact public user endpoint
       and require the response login, numeric id, and `type:"Bot"` to equal the independently reviewed
       repository variables. Reject a user/login collision before trusting pin-PR authorship.
@@ -724,28 +761,50 @@ min:1, wait:0}` from the design. Every missing, extra, defaulted, or changed sem
       package state, manual-evidence digest, and timestamp, but no credential. A separately authenticated
       operator posts it and the byte-identical PNG to the candidate PR. Test evidence-post failure.
 - [ ] Add `build-container-release-preflight` to the gate-owned CI workflow only for
-      a `workflow_dispatch` body with `ref:"main"` while protected `main==G`, with a required
+      a `workflow_dispatch` body with `ref:"main"` at protected snapshot `Q`, with a required
       candidate PR-number, head-repository, and full head-SHA input. Its exact candidate-bound
       `run-name` is API-visible. It uses
       `environment: {name: build-container-release, deployment: false}`, declares literal
       `runs-on: ubuntu-24.04`, runs the fixed hosted/Linux/X64 bootstrap as its first executable step,
       checks out only exact `G`, runs no candidate code, contains exactly one fixed
       `assert-exact-g-dispatch-context` step that fetches the PR with the read-only token and compares
-      all three inputs, and
+      all three inputs, exact workflow/ref identity, boolean ref protection,
+      `github.sha==github.workflow_sha==Q`, active `G` pointers, `G` ancestry, and gate/context
+      presence/mode/byte equality at `Q`, and
       uses the pinned App-token action only to prove the stored key can mint the exact repository-
-      scoped token. The run API must later show event `workflow_dispatch`, exact path, `head_sha=G`,
-      and that successful named assertion step.
+      scoped token. The run API must later show event `workflow_dispatch`, exact path, `head_sha=Q`,
+      and that successful named assertion step. Record `{G,Q}` separately; do not require whole-
+      commit equality or recompute `Q` from moving main. The operator checks the dispatch contract
+      before dispatch and the independent reviewer checks the actual run snapshot before approval.
 - [ ] Fixture-test the bounded credential smoke: temporarily add literal deployment branch policy
-      `main`, dispatch the workflow with body `ref:"main"` while `main==G`, approve and complete the smoke, remove
+      `main`, dispatch with body `ref:"main"` under that `{G,Q}` contract, approve and complete the smoke, remove
       only `main`, and restore the sole tag policy. Any wildcard, caller branch, candidate
-      commit, credential update, or workflow SHA other than `G` invalidates the smoke. Capture
+      commit, changed active gate, manifested-byte mismatch, or invalid dispatch identity invalidates
+      the smoke. Test bootstrap `Q=G` and later `Q>G` with non-gate changes; captured snapshots do not
+      change when main advances. Capture
       the pre-`S` administrator-bypass PNG only after final tag-only policy is restored.
+- [ ] Before dispatch, snapshot variables as `{name,value,created_at,updated_at}` and secret metadata
+      as `{name,created_at,updated_at}` using the local policy auditor, never the key value. Require
+      every `updated_at` strictly earlier than the smoke run's `created_at` and each record's creation
+      no later than its update. Recompare all four records after smoke/policy restoration and at final
+      audit. Bind candidate, `{G,Q}`, run/attempt/job ids, cutoff, and snapshots in evidence. Test equal
+      cutoff, malformed times, key replacement after job start but before completion, post-smoke
+      replacement, delete/recreate, changed variable value, and stale-attempt substitution. Changes
+      require a fresh dispatch. Record job `completed_at`, never treat run `updated_at` as completion.
 - [ ] Write `release-approval-gate.test.sh`. Cover canonical valid comment; missing, duplicate,
       rejected, and bypassed reviews; wrong environment/reviewer/run id/run attempt/source/tag/PNG digest;
       wrong/missing/duplicate challenge and image digest; attempted future-attempt predeclaration;
       malformed/extra/reordered JSON; invalid calendar, fractional, offset, stale, or future time;
       API/non-200/malformed response; reused earlier-attempt
       evidence; and proof that token creation and every mutation have not run on failure.
+- [ ] Add partial-rerun fixtures: inherited `build-attempt:"1"` with current/API/comment attempt 2
+      fails before minting; missing/zero/leading-zero/overflow attempts also fail. A rebuilt attempt 2
+      with a new challenge and approval passes. Use real API JSON integer fields: positive u64 `id`
+      and positive u32 `run_attempt`, canonically rendered without lossy conversion for comparison
+      with string context/output/comment values. Reject API strings, fractions, zero, and overflow.
+      Structural tests require the build step to capture
+      its own context and the approval helper to compare it unconditionally before credential minting;
+      an updater-derived attempt, late check, continuation, or failure masking is rejected.
 - [ ] Implement the gate with only `actions:read` and `contents:read` available. It
       performs only the exact two no-redirect GETs for the current run and its non-paginated approval
       history, requires complete valid 200 responses, and requires exactly:
@@ -754,7 +813,10 @@ min:1, wait:0}` from the design. Every missing, extra, defaulted, or changed sem
 edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<D>","png-sha256":"sha256:<64-lowercase-hex>","release-tag":"<tag>","reviewed-at":"<RFC3339-UTC>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","source-revision":"<S>"}
 ```
 
-      Run it from the verified `G` checkout; it must pass before App-token creation. Require exactly one
+      Run it from the verified `G` checkout; it must pass before App-token creation. First require
+      context-derived build output `build-attempt` to equal current `github.run_attempt` and the
+      canonical decimal rendering of API integer `run_attempt`; output/context/comment attempts
+      are canonical positive-u32 strings, not the API field's JSON type. Require exactly one
       protocol-prefixed record claiming the current run id/attempt, exact current challenge and `D`, and
       approved state; any second or mismatched current-attempt record fails. The API reviewer login is
       the evidence approver. Earlier attempts never satisfy the current `github.run_attempt`.
@@ -794,26 +856,67 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       Document and test one running plus at most 100 pending runs; a run rejected at capacity publishes
       no pin and must be rerun. Run it through the exact structurally validated actionlint
       compatibility wrapper.
-- [ ] Create gate-owned `rotate-build-container-gate.yml`, dispatched only from protected main at old
-      `G`, with the same exact workflow-level concurrency contract. Every job declares literal
+- [ ] Create gate-owned `rotate-build-container-gate.yml`, dispatched only from protected main at
+      snapshot `Q_d` while both pointers identify old `G`. Prove the design's protected dispatch
+      identity, `G` ancestry, and complete gate/context presence/mode/byte equality; non-gate main
+      changes are allowed. Both jobs retain captured `{G,Q_d}` and execute only captured old-`G`
+      helpers, even after activation changes the gate variable. Use the same workflow-level concurrency
+      contract. Every job declares literal
       `runs-on: ubuntu-24.04` and begins with the inline runner bootstrap. Its unprivileged acquire job runs
       after older publishers; its second job waits on secret-free
       `build-container-gate-rotation-lock` with `deployment:false`, parses the exact current-run
-      rotation approval/evidence, and releases only after activated or rolled-back final state. Add a
+      rotation approval/evidence, and releases only after activated or rolled-back final state at
+      `Q_f`, with `Q_d` ancestry and exact final manifested bytes/pointers. Implement the spec's
+      exact two-line rotation approval, canonical receipt schema, and digest bytes. The local-only
+      policy auditor repeats private variable/ruleset/environment reads after final restoration;
+      its receipt binds current lock run/attempt, dispatch/final heads, observed gate/descriptor
+      SHAs, enabled state, audit time, and full policy-evidence digest. The independent reviewer
+      verifies the attached full audit and supplies the receipt through the authenticated approval
+      comment. The waiting helper trusts that review for private-policy observations and uses only
+      `actions:read`/`contents:read` GETs for current run, approvals, and exact main ref; it never
+      calls private-policy endpoints or receives an audit PAT. Verify API reviewer/actor separation,
+      current numeric API attempt, both receipt/head bindings, final Git tree, digest, ordered
+      timestamps, and 15-minute freshness. Add valid activation/rollback fixtures and reject changed
+      receipts, stale audits, duplicate/rejected reviews, head/attempt mismatch, variable API calls,
+      and ambient `vars` substituted for the fresh local audit. A superseded protocol review
+      requires a fresh lock dispatch. Name the single unconditional success-gating verification step
+      exactly `assert-exact-rotation-context`; test continuation, skipped guards, and masked failures.
+      The waiting-run policy receipt is not final publisher prerequisite evidence: do not require its
+      own completion during receipt generation. Refresh the publisher's `rotation-history` record
+      only after successful lock completion; test this ordering without a circular prerequisite.
+      The comment binds `Q_f`; it never requires final main to
+      equal old `G` or `Q_d`. Add a
       live prerequisite fixture proving a publisher queued behind the waiting lock starts no build or
       push. A canceled/expired lock may release concurrency only after the release-state variable and
       absent tag policy keep later publishers fail-closed.
 - [ ] Split the publisher into `build-and-verify` and `update-pin`.
-      `build-and-verify` has no environment, permissions only contents/read and packages/write,
+      `build-and-verify` has no environment, permissions only contents/read, actions/read, and packages/write,
       no App key, and after anonymous verification generates 32 OS-CSPRNG bytes, exposes the 64-lowercase-
       hex `approval-challenge`, and writes exact `{challenge,S,D,tag,run-id,run-attempt}` to its job
-      summary. Its outputs are only `{S,D,protocol,tag,approval-challenge}`. `update-pin` has the protected environment, no image build, initial
+      summary. Capture that build step's context-derived attempt as canonical positive-u32 string
+      `build-attempt`; outputs are only `{S,D,protocol,tag,approval-challenge,build-attempt}`.
+      `update-pin` has the protected environment, no image build, initial
       actions/read and contents/read, and executes approval/updater helpers only from a separate checkout
       of repository variable `EDGEZERO_BUILD_CONTAINER_GATE_SHA`, whose value is `G`.
       `build-and-verify` separately checks out `S` only to validate the isolated release request and
       manifested-byte equality, then uses `stage-build-context.sh` to build solely from copied `G`
       inputs. After acquiring shared concurrency and before registry login/build, require release state
-      exact `enabled`, active gate consistency, and no active rotation-lock run. A candidate Dockerfile
+      exact `enabled`, active gate consistency, and the design's latest successful rotation check.
+      Enumerate complete unfiltered rotation history, select greatest numeric run id and its current
+      API attempt, and bind the exact `rotation-history` prerequisite record. Require completed/success,
+      its exact-attempt successful `assert-exact-rotation-context` step, matching approved receipt,
+      final active gate/descriptor, and final-head ancestry/tree equality. Check receipt freshness at
+      original verification-step completion, not publication time. Only reviewed bootstrap evidence
+      plus empty history allows no rotation. Test failed/canceled/timed-out/skipped/waiting rotations
+      with state still enabled, a newer failure after older success, successful prior attempt followed
+      by failed rerun, changed/deleted history, truncated pages, queued new rotation, and valid later
+      publication. The actions/read wrapper allows only the design's exact history/run/approval/
+      attempt-jobs/main-ref GET routes; add these fixed routes and fixtures to the local policy auditor
+      and record producer as well, including the exact `/repos/stackpop/edgezero/git/ref/heads/main`
+      positive fixture and the policy PAT's `Contents:read` grant. No registry login, Docker build,
+      or mutation can precede this guard;
+      structural tests reject missing actions/read, extra grants, conditional/late guards, and masks.
+      A candidate Dockerfile
       or unmanifested path is never in the Docker context. Each job invokes exactly one fixed
       `assert-exact-publisher-context` step from `G` before sensitive work and verifies tag event/ref,
       `github.sha==github.workflow_sha==S`, run id/attempt/tag, active gate, and enabled release state.
@@ -877,18 +980,23 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
 ### 6.6 Prove gate rotation and recovery before release
 
 - [ ] Add fixture/integration tests for a gate-update PR. Old `G` must require the protected base tree
-      to equal old `G`, classify exactly `mode=gate-update`, accept changes only in the union of old and
+      to match old `G` only on manifested paths, classify exactly `mode=gate-update`, accept changes only in the union of old and
       candidate manifests, validate canonical candidate manifest and CODEOWNERS coverage as inert data,
       reject mixed release-request/pin/non-gate changes, and never execute a candidate helper.
-- [ ] Exercise the activation state machine with fake configuration APIs: quiesce publication, remove
-      by dispatching the old-`G` rotation workflow and waiting until it holds publication concurrency;
+- [ ] Exercise the activation state machine with fake configuration APIs: quiesce publication
+      by dispatching at protected `Q_d` using old-`G` code and waiting until it holds publication concurrency;
       set release state `disabled:<lock-run-id>:<old-G>`, remove the sole tag deployment policy, merge
       through the one-entry queue, record `G'`, run the clean
       detached `G'` suite and exact post-merge assertion, update the repository variable and
       organization descriptor after updating the marker with `G'`, verify both plus the base manifested
-      tree, restore the tag policy, produce fresh evidence, set state enabled, and approve the lock with
-      the exact evidence-bound comment. Every intermediate pointer mismatch, publisher that starts
+      tree, restore and locally verify tag policy, set state enabled, emit a fresh policy receipt,
+      and approve the lock with the exact evidence-bound comment. Only after successful lock
+      verification refresh the publisher prerequisite record. Every intermediate pointer mismatch, publisher that starts
       behind the lock, or malformed state/comment fails closed.
+- [ ] Repeat the full sequence after `G -> S -> B` and after later non-gate commits, including
+      credential-smoke refresh at `Q != G`, activation to `G'`, final `Q_f != Q_d`, and rollback to a
+      new main commit rather than back to old `G`. Reject changed gate bytes, pointer disagreement,
+      wrong dispatch context, and helper reselection after the gate variable changes.
 - [ ] Exercise rollback at every activation step. Release stays disabled; both pointers restore to old
       `G`; ordinary work remains blocked while base contains `G'`; and a separately reviewed old-`G`
       `mode=gate-rollback` must restore the manifested tree before release policy returns. Require
@@ -897,7 +1005,8 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       `G`, release disabled, queue merge, and generic exact-head push evidence. If old `G` cannot
       validate either side, require a new manual trust-root review with release disabled. Add fixtures
       for every interrupted pointer/policy state. No bypass or mixed-pointer operating mode is
-      permitted.
+      permitted. Restore presence, Git mode, and bytes across the old/new manifest union, including
+      required absence of newly introduced paths; preserve unrelated release, pin, and app files.
 
 **Gate:** do not tag or publish from `G`. The next task cannot alter a gate-owned path.
 
@@ -944,14 +1053,16 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       design Section 5 with fixed `/usr/bin/env`, exact sorted placeholder argv, and only each profile's
       post-`env -i` target environment. No shell or `jq` may produce expected identity. No
       `/work/package` mount may appear.
-- [ ] Execute the bounded credential smoke while protected main is still `G`: temporarily add literal
+- [ ] Take the exact pre-dispatch credential metadata snapshots and verify protected `{G,Q}` dispatch
+      identity/ancestry/manifest equality. Execute the bounded credential smoke: temporarily add literal
       `main` as the sole extra environment deployment policy, dispatch with body `ref:"main"` and the
       candidate PR number, exact head repository, and current full head SHA, approve and complete the
       smoke, then remove `main`. Require the exact candidate-bound `run-name`, run event
-      `workflow_dispatch`, path, `head_sha=G`, and exactly one successful
+      `workflow_dispatch`, path, `head_sha=Q`, and exactly one successful
       `assert-exact-g-dispatch-context` step that resolves the PR API and compares all three inputs;
-      then require final tag-only policy and unchanged credential metadata. A new candidate commit
-      makes this evidence stale.
+      then require final tag-only policy, exact snapshot equality, and credential updates strictly
+      before run `created_at`. Record `{G,Q}` and exact run/attempt/job evidence. A new candidate
+      commit, changed active gate, or credential change makes this evidence stale.
 
 ### 7.2 Qualify and merge `S`
 
@@ -995,14 +1106,15 @@ preflight review pass.
 - [ ] On first publication, stop at the expected private-package failure. An operator makes the GHCR
       package public, then reruns the exact `G` prerequisite verifier in package-present mode and
       attaches its public-visibility/repository-link evidence before rerunning the same tag. Evidence
-      from the failed run attempt does not carry forward.
+      from the failed run attempt does not carry forward. Rerun the build and downstream job, not
+      only the failed pin job; every qualifying attempt produces a fresh challenge.
 
 **Release checkpoint 2:** after the image is public and anonymously verified, the environment approver
 captures a fresh PNG and enters the exact design comment for the current
 `{challenge,D,run-id,run-attempt,S,tag,png-sha256,reviewed-at}` before approving `update-pin`.
 
 - [ ] Check out exact `G` without persisted credentials, then require `release-approval-gate.sh` to
-      pass before App-token minting.
+      pass before App-token minting, including build-output/current/API/comment attempt equality.
       Then mint the exact repository-scoped App token, verify installation id, and invoke only
       `G/update-image-pin-pr.sh`.
 - [ ] Generate the exact five-field image record plus canonical JCS release-evidence record through
@@ -1067,7 +1179,12 @@ a digest from the mutable tag.
       `queue: max`; a run rejected at capacity publishes no pin and must be rerun.
 - [ ] For every `update-pin` attempt, record run id, run attempt, exact approval comment, API
       reviewer login, challenge, image digest, source, tag, review time, PNG basename/digest, and final evidence attachment.
-      Earlier-attempt or pre-`S` evidence is invalid.
+      Earlier-attempt or pre-`S` evidence is invalid. Require producer-derived `build-attempt` equality
+      before minting; partial reruns that inherit an older build fail and require a full build rerun.
+- [ ] Record each rotation's `{old-G,Q_d,new-G,Q_f}` and preserve image-release gate history
+      separately. Credential-smoke evidence records `{G,Q}`, exact pre-dispatch metadata snapshots,
+      run creation cutoff, and final unchanged metadata; neither current main nor completion time
+      substitutes for these bindings.
 - [ ] Document that GHCR has no enforceable per-version retention lock and repository automation has no
       package-deletion credential or endpoint. Manual administrator deletion is accepted operational
       risk; recovery is a new source/image verification/pin release.
@@ -1100,7 +1217,7 @@ a digest from the mutable tag.
 
 Before declaring this plan complete, run two independent reviews:
 
-1. **Contract review:** compare every file and test with design v6.29 Sections 2 through 10. Verify one
+1. **Contract review:** compare every file and test with design v6.30 Sections 2 through 10. Verify one
    expected/package/validate wire authority, protected gate and image source `G`, isolated release
    request `S`, staged gate-only Docker context, API-visible exact post-merge `S` proof, forward-only
    pin ancestry, no tag runtime pull, no placeholder image digest/checksum, no `/work/package`

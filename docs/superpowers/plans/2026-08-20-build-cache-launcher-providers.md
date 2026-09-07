@@ -7,7 +7,7 @@
 can reach a credentialed provider command, and preserve the parent deploy lifecycle without ambient
 host state or the legacy `--stage` spelling.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
 2, 5, 6.1, 6.6, 7.2, and 9. The parent deploy spec remains normative where the addendum does not
 expressly replace it.
 
@@ -37,7 +37,9 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       rollback, stale rollback refusal, lost version, cancellation, config push, and mutation output.
 - [ ] Prove candidate changes cannot weaken the profile tables, source-freeze checks, binary recheck,
       token boundary, or exclusive `--staging` spelling, then land and activate the new gate revision
-      using plan 1's rotation procedure.
+      using plan 1's post-`B` rotation procedure. Bind dispatch `{G,Q_d}` by ancestry and manifested-byte
+      equality, keep the lock jobs on captured old-`G` helpers, and record final `Q_f` separately from
+      the historical image-release gate identity.
 
 ## 3. Closed input and environment construction
 
@@ -97,7 +99,8 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
 
 - [ ] Define `deploy-fastly` and `config-push-fastly` as the only source-bearing public actions. Give
       each the design's exact repository/ref/id/workspace/cwd/package/bin/toolchain inputs plus required
-      sensitive string `app-checkout-token`, supplied from a GitHub secret and masked before use. At
+      sensitive string `app-checkout-token`, supplied from a GitHub secret or masked same-job
+      App-token output and masked before use. App private keys are not consumer-action inputs. At
       action start, independently materialize one action-private authority with plan 2's trusted
       object-first helper, verify all five supplied
       `CallerExpectedIdentity` fields, and remove the checkout credential channel before application

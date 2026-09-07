@@ -21,9 +21,9 @@ const markdown = new MarkdownIt("commonmark");
 const recordPath = "docs/.edgezero-action-release.json";
 const placeholder = "<EDGEZERO_ACTION_VERSION>";
 const adoption = new Set([
-  "docs/specs/edgezero-deploy-github-action.md",
-  "docs/specs/edgezero-deploy-action-implementation-plan.md",
-  "docs/specs/edgezero-deploy-adoption-guide.md",
+  "docs/superpowers/specs/edgezero-deploy-github-action.md",
+  "docs/superpowers/plans/edgezero-deploy-action-implementation-plan.md",
+  "docs/superpowers/specs/edgezero-deploy-adoption-guide.md",
   "docs/guide/deploy-github-actions.md",
 ]);
 const versionPattern = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;

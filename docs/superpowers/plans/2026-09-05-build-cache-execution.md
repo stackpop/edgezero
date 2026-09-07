@@ -1,7 +1,8 @@
 # Build Cache Implementation Evidence
 
 Implementation branch: `feature/build-app-cli-cache` in the existing
-`edgezero-actions-improve` worktree. The reviewed contract is design v6.29.
+`edgezero-actions-improve` worktree. The implementation recorded below follows design v6.29;
+the subsequent v6.30 design reconciliation is recorded separately at the end.
 
 ## Version Reference Review
 
@@ -113,3 +114,34 @@ rebase, gate bypass, or event-selection design amendment has been performed.
 The user has been asked to choose a branch refresh or a reviewed event-selection
 amendment, and to identify the maintainer who will provision release prerequisites
 and independent approvals. These hosted checkpoints remain open.
+
+## v6.30 Design Reconciliation
+
+The reviewed amendment selects the authenticated synthetic first parent for PR comparisons, retaining
+payload-base ancestry and exact event/head identity checks. Plan 1 explicitly schedules the existing
+scanner's implementation and hosted regression follow-up before `G` is frozen. The executable
+selector has not been changed by this documentation correction, so the known hosted failure is not
+claimed fixed.
+
+The existing caching design and all five existing plans have been reconciled for Bookworm ELF and
+loader aliases, post-`B` gate rotation, credential scope/freshness, publisher attempt binding, artifact
+retention, and App-authenticated migration. The original deployment spec/adoption companion now live
+under `docs/superpowers/specs/`; the original deployment plan is under `docs/superpowers/plans/`.
+References and the scanner's four-document bootstrap allowlist follow those moves without widening
+the placeholder exception to other internal documents. No new image, gate activation, source tag,
+action release, or completed caching implementation is asserted by these edits.
+
+Follow-up review also made rotation policy observations explicitly local-auditor/reviewer evidence,
+normalized numeric REST attempt fields before string comparisons, and required publishers to verify
+the latest evidence-bound rotation attempt succeeded. The rotation receipt precedes lock completion;
+the final publisher prerequisite record follows it, avoiding a circular approval prerequisite.
+
+Local verification for the documentation correction and relocation:
+
+- Documentation scanner: 39 external references, bootstrap state; 13 scanner tests passed.
+- Action contract suite: 301 passed, zero failed, four Linux-only checks skipped on macOS.
+- Docs formatting, ESLint, VitePress build, and the pinned actionlint workflow check passed.
+- Workspace tests, formatting, all-feature Clippy, the combined Fastly/Cloudflare/Spin check, and
+  the Spin `wasm32-wasip2` check passed. The network-fetching generated-workspace test stays ignored.
+
+These are local regression checks, not hosted rotation, credential, image, or release evidence.

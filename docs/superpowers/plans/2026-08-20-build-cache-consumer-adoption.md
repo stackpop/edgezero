@@ -9,7 +9,7 @@
 full-SHA app identity and explicit inputs, publish exact stable action version `V`, then activate
 synchronized runnable documentation at revision `R` without ever merging an unpublished version ref.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.29 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
 3.3, 5.1, 5.2, 5.4, 7, 9, and 10, plus the parent deploy lifecycle contract.
 
 ## 1. Release structure
@@ -56,21 +56,33 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Add public/private app repository fixtures, root/nested workspace fixtures, public Git and
       sibling path dependencies, submodules, no-filter and pinned-LFS cases, app-env migration,
       generated outputs, production/staging provider paths, and cache enabled/disabled cases.
+- [ ] Include a private-app adoption fixture whose only stored checkout credentials are an App client
+      id and private key, plus token-mode and mixed/partial/absent-mode rejection fixtures. Cover a
+      consumer approval after 24 hours, token minting only after that approval, token expiry before a
+      later source-bearing step, and missing/expired artifacts under inadequate retention. Never use
+      a masked job output or an artifact to transfer checkout credentials between jobs.
 - [ ] Add negative fixtures for major/minor/prerelease/SHA/branch refs in published workflows, mixed
       EdgeZero versions, producer provider inputs, missing authority/Copy B identity check, authority
       path/descriptor/handle passed between actions, checkout token passed to a source-free action,
       artifact-name reuse, caller-supplied platform/expected identity, ambient env reliance, custom
       Git filters, and legacy `--stage`.
 - [ ] Land and activate this gate update before changing reusable workflow/action interfaces. The gate
-      validates version grammar and equality, not a not-yet-created value for `V`.
+      validates version grammar and equality, not a not-yet-created value for `V`. Use protected
+      dispatch head `Q` with active-`G` ancestry/manifest equality; this is a post-`B` rotation, not a
+      new bootstrap requiring main to equal `G`.
 
 ## 3. Final reusable producer workflow
 
 - [ ] Freeze `.github/workflows/build-app-cli.yml` as a build-only `workflow_call` interface with the
-      exact design inputs, required `rust-toolchain`, `app-checkout-token` secret, hosted-only workflow
+      exact design inputs, required `rust-toolchain`, exclusive token/App authentication with optional
+      `app-checkout-client-id` and the two optional checkout secrets, hosted-only workflow
       version/resolved-SHA identity checks, literal `runs-on: ubuntu-24.04`, the first-step inline
       producer bootstrap, bounded timeout, cache default `false`, and no provider credential or
       mutation surface.
+- [ ] Preserve plan 3's host-only App minting inside the called workflow, after verified action-source
+      bootstrap and before app fetching. Scope it to the single app repository with contents-read
+      permission, forbid token/private-key outputs and runtime-container exposure, and require
+      post-step revocation. Token mode does not mint or revoke a caller-owned token.
 - [ ] Materialize EdgeZero source separately at exact `job.workflow_sha`. Checkout the app into a
       recursive non-sparse authority root at full lowercase `app-ref`, verify authenticated repository
       id and CallerExpectedIdentity, remove credentials, enforce the no-filter-or-pinned-LFS contract,
@@ -118,7 +130,14 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       `deploy-fastly` and `config-push-fastly`; each independently materializes its authority and
       removes its checkout credential channel before app code or provider-token creation/injection.
       Source-free actions receive neither source-materialization inputs nor the token. Define explicit
-      job permissions and prove artifacts, caches, summaries, logs, and outputs contain neither token.
+      job permissions and prove artifacts, caches, summaries, logs, public EdgeZero outputs, and
+      job/workflow outputs contain neither token. The token action's masked same-job output is the
+      sole output-channel exception.
+- [ ] In App-authenticated consumer jobs, mint a fresh repository-scoped contents-read token after
+      environment approval using exact `actions/create-github-app-token@v3.2.0`. Supply its masked
+      same-job output to identity/source-bearing actions, mint again before a later invocation when
+      the previous token could have expired, and retain mandatory revocation. Never pass a private
+      key into an EdgeZero composite or a token through `needs`.
 - [ ] Exercise `validate-app-cli-provenance`, `active-version-fastly`, `deploy-fastly`,
       `healthcheck-fastly`, `rollback-fastly`, and `config-push-fastly` as independent consumers. Each
       action downloads its own artifact, derives PlatformIdentity locally, writes a fresh expected file
@@ -128,6 +147,16 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 
 ## 5. App-repository migration behavior
 
+- [ ] Document both producer authentication modes, their exact fields, and exclusive validation.
+      App-only adopters pass the client id and private-key secret to the reusable producer, then mint
+      separate tokens in approved consumer jobs. Explain the single-app-repository App-token scope;
+      private external submodules require a pre-provisioned token covering the source graph, with no
+      implicit token widening. Same-repository callers may explicitly pass `GITHUB_TOKEN` in token mode.
+- [ ] Preserve repository-default artifact retention and require it to cover the documented maximum
+      approval/retry/recovery window. Do not impose one day, transport secrets in artifacts, silently
+      rebuild after expiry, or imply that caching controls artifact availability or readership.
+      Artifacts inherit the caller repository's readership even with caching off; private-app/public-
+      deployer adoption must explicitly acknowledge that exposure in its reviewed workflow policy.
 - [ ] Replace ambient workflow `env` examples with the explicit duplicate-safe `app-env` JSON object.
       Document the exact deny rules and state that otherwise allowed values are caller-classified as
       non-secret and may affect cross-repository compilation cache contents.
@@ -204,7 +233,7 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Run every protocol, cache, image, launcher, source-freeze, provider, workflow, fixture, docs/pin,
       actionlint, zizmor, shellcheck, Rust, and local integration suite at one clean candidate descended
       from `B`. Confirm `image.json` remains reviewed `{D,S,protocol}`.
-- [ ] Run independent contract and release-adversary reviews against design v6.29, including exact-tag
+- [ ] Run independent contract and release-adversary reviews against design v6.30, including exact-tag
       policy, third-party tag movement risk, EdgeZero immutable releases, action-version mixing,
       substitution, identity replay, malformed artifacts, host/container races, source mutation,
       generated-output escape, credential flow, cache disclosure, rollback, and cancellation.
@@ -259,8 +288,10 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       tracked Markdown plus that record; do not touch action/workflow code, metadata, gate-owned paths,
       or implementation fixtures.
 - [ ] Run the plan-1 dual-state scanner on the documentation PR and its final merge-group candidate
-      using the closed event-to-range table. The selected base is the then-current protected-main
-      commit, which may be newer than `P`; the synthetic candidate is not named `R`. Require the
+      using the closed event-to-range table. For PRs select authenticated synthetic first parent `F`,
+      not the possibly older payload base `A`; for merge groups use the event's exact base SHA. The
+      event-bound base may be newer than `P`; later main movement does not change it, and the
+      synthetic candidate is not named `R`. Require the
       one-way bootstrap-to-released transition, exact record schema/JCS, no placeholder in any fenced
       YAML, one identical EdgeZero `V` per workflow, exact step-based/reusable-caller job shapes and
       runner labels, and exact third-party patch versions. The hosted transition verifier must prove
@@ -285,7 +316,7 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       fail documentation release.
 - [ ] Verify public anonymous image pull by digest and an end-to-end fresh app adoption from the
       published guide using literal `V`. Record image-release gate `G`, the ordered gate-rotation
-      lineage and final active gate, `{S,D,B,P,C,V,R,protocol}`, action-version resolved commits,
+      lineage with each `{old-G,Q_d,new-G,Q_f}` and final active gate, `{S,D,B,P,C,V,R,protocol}`, action-version resolved commits,
       release attestations, hosted run ids/attempts, and documentation-check results. Do not collapse
       the post-`B` gate revisions into the image-release `G` label.
 

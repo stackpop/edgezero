@@ -7,7 +7,7 @@
 
 **Status:** Adoption guide for any EdgeZero application repository
 
-**Spec:** `docs/specs/edgezero-deploy-github-action.md`
+**Spec:** `docs/superpowers/specs/edgezero-deploy-github-action.md`
 
 The layered deploy actions are for **any** EdgeZero application repository, not a
 single deployer. This guide describes the general adoption shape and then walks

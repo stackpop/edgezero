@@ -12,7 +12,7 @@ adding another provider later does not rewrite the deploy engine, and the
 deploy logic in YAML; they compile your CLI, scope credentials, and invoke it.
 
 The design reference lives in
-[`docs/specs/edgezero-deploy-github-action.md`](https://github.com/stackpop/edgezero/blob/main/docs/specs/edgezero-deploy-github-action.md);
+[`docs/superpowers/specs/edgezero-deploy-github-action.md`](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/edgezero-deploy-github-action.md);
 this page is the practical how-to.
 
 ## The three layers
