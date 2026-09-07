@@ -95,11 +95,10 @@ fn env_config_from_worker(env: &Env, stores: StoresMetadata) -> EnvConfig {
 /// store binding cannot be opened.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[inline]
-pub async fn run_app<A: Hooks>(
-    req: Request,
-    env: Env,
-    ctx: Context,
-) -> Result<Response, WorkerError> {
+pub async fn run_app<A>(req: Request, env: Env, ctx: Context) -> Result<Response, WorkerError>
+where
+    A: Hooks,
+{
     // Best-effort: if a logger is already installed, ignore the error rather
     // than panicking — every Worker request re-enters this function. Skipped
     // entirely when the app owns logging.

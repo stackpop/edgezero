@@ -52,7 +52,7 @@ edgezero-cli = { path = "../../../crates/edgezero-cli", default-features = false
 clap = { version = "4", features = ["derive"] }
 edgezero-core = { path = "../../../crates/edgezero-core" }
 serde = { version = "1", features = ["derive"] }
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 TOML
 
   cat >crates/fixture-app-cli/src/main.rs <<'RS'

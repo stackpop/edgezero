@@ -180,7 +180,10 @@ impl<'app> CloudflareService<'app> {
     /// without it.
     #[must_use]
     #[inline]
-    pub fn with_config<S: Into<String>>(mut self, binding: S) -> Self {
+    pub fn with_config<S>(mut self, binding: S) -> Self
+    where
+        S: Into<String>,
+    {
         self.config = ConfigSource::Binding(binding.into());
         self
     }
@@ -201,7 +204,10 @@ impl<'app> CloudflareService<'app> {
     /// the manifest declares `[stores.kv]`.
     #[must_use]
     #[inline]
-    pub fn with_kv<S: Into<String>>(mut self, binding: S) -> Self {
+    pub fn with_kv<S>(mut self, binding: S) -> Self
+    where
+        S: Into<String>,
+    {
         self.kv = Some(KvSource {
             binding: binding.into(),
             required: false,

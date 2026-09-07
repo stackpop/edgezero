@@ -330,7 +330,10 @@ async fn serve_with_stores(
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 #[inline]
-pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
+pub fn run_app<A>() -> anyhow::Result<()>
+where
+    A: Hooks,
+{
     let env = EnvConfig::from_env();
     let stores = A::stores();
     let kv_init_requirement = kv_init_requirement(stores);

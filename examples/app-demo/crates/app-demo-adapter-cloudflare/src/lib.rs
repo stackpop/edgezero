@@ -3,7 +3,7 @@
 #[cfg(target_arch = "wasm32")]
 use app_demo_core::App;
 #[cfg(target_arch = "wasm32")]
-use worker::{event, Context, Env, Request, Response, Result};
+use worker::{Context, Env, Request, Response, Result, event};
 
 /// Entrypoint invoked by Cloudflare Workers.
 ///

@@ -194,7 +194,7 @@ fn config_typed_handler_deserialises_blob_envelope_to_greeting() {
     use edgezero_core::body::Body;
     use edgezero_core::config_store::ConfigStoreHandle;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::http::{request_builder, Method, StatusCode};
+    use edgezero_core::http::{Method, StatusCode, request_builder};
     use edgezero_core::params::PathParams;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
     use edgezero_core::store_registry::{

@@ -15,6 +15,7 @@
 //! - UTF-8 bytes of the resulting string feed into `Sha256`; hex
 //!   output is lowercase, no `0x` prefix.
 
+use base16ct::lower::encode_string;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -29,7 +30,7 @@ pub fn canonical_data_sha256(data: &Value) -> String {
     write_canonical(&mut buf, data);
     let mut hasher = Sha256::new();
     hasher.update(buf.as_bytes());
-    format!("{:x}", hasher.finalize())
+    encode_string(&hasher.finalize())
 }
 
 #[cfg(test)]

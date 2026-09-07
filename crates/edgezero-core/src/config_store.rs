@@ -42,7 +42,7 @@ macro_rules! config_store_contract_tests {
             use super::*;
             use $crate::config_store::ConfigStore;
 
-            fn run<Fut: ::std::future::Future>(future: Fut) -> Fut::Output {
+            fn run<Fut>(future: Fut) -> Fut::Output where Fut: ::std::future::Future {
                 ::futures::executor::block_on(future)
             }
 
@@ -188,7 +188,10 @@ impl ConfigStoreError {
 
     /// Create an error for malformed or backend-invalid keys.
     #[inline]
-    pub fn invalid_key<S: Into<String>>(message: S) -> Self {
+    pub fn invalid_key<S>(message: S) -> Self
+    where
+        S: Into<String>,
+    {
         Self::InvalidKey {
             message: message.into(),
         }
@@ -196,7 +199,10 @@ impl ConfigStoreError {
 
     /// Create an error for temporarily unavailable backends.
     #[inline]
-    pub fn unavailable<S: Into<String>>(message: S) -> Self {
+    pub fn unavailable<S>(message: S) -> Self
+    where
+        S: Into<String>,
+    {
         Self::Unavailable {
             message: message.into(),
         }

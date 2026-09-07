@@ -36,6 +36,12 @@ async-compression = { version = "0.4", features = [
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = true }
+base16ct = { version = "1", features = ["alloc"] }
+# Held at 8 while `async-compression` still resolves brotli 8: taking 9
+# directly does not replace that copy, it adds a second complete
+# allocator/decompressor stack to every adapter graph (~40 KB of extra
+# wasm in the demo Spin build). We only use `Decompressor` and
+# `CompressorWriter`, unchanged across the two majors.
 brotli = "8"
 bytes = "1"
 chrono = "0.4"
@@ -47,7 +53,7 @@ edgezero-adapter-fastly = { path = "crates/edgezero-adapter-fastly", default-fea
 edgezero-adapter-spin = { path = "crates/edgezero-adapter-spin", default-features = false }
 edgezero-core = { path = "crates/edgezero-core", default-features = false }
 edgezero-cli = { path = "crates/edgezero-cli", default-features = false }
-fastly = "0.12"
+fastly = "0.13"
 fern = "0.7"
 flate2 = { version = "1", features = ["rust_backend"] }
 futures = { version = "0.3", features = ["std", "executor"] }
@@ -57,34 +63,40 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 log = "0.4"
-log-fastly = "0.12"
+log-fastly = "0.13"
 matchit = "0.9"
 once_cell = "1"
-redb = "4.1.0"
+# 4.2 asserts that no read reference outlives its transaction. That check
+# is what caught the `AccessGuard` bug in the axum KV store, so the
+# floor stays at 4.2 rather than 4.1 -- resolving an older patch would
+# silently drop the guard against reintroducing it.
+redb = "4.2.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
 # `bundled` ships SQLite source so operators don't need a system
 # `libsqlite3-sys` install. Used by `edgezero-adapter-spin`'s CLI-only
 # `config push --adapter spin` writer to write into Spin's local KV
 # file (`<spin.toml dir>/.spin/sqlite_key_value.db`) using the schema
 # vendored from spinframework/spin's `crates/key-value-spin/src/store.rs`.
-rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 ryu = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
 serde_urlencoded = "0.7"
-sha2 = "0.10"
-similar = "2"
+sha2 = "0.11"
+similar = "3"
 simple_logger = "5"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 syn = { version = "3", features = ["full", "extra-traits", "visit"] }
 subtle = "2"
-# Pinned to the `~6.0` range (allows 6.0.x, blocks 6.1+) so a minor
+# Pinned to the `~7.0` range (allows 7.0.x, blocks 7.1+) so a minor
 # bump that touches `key_value::Store::open`'s async signature or the
 # wasi-http import surface fails at build time rather than at `spin
 # up` (where a runtime mismatch surfaces as opaque WIT linker errors).
-spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
+# 7.0 imports `wasi:http/types@0.3.0`, which Spin 4.1+ provides and
+# Spin 4.0.x does not -- see the spin entry in `.tool-versions`.
+spin-sdk = { version = "~7.0", default-features = false, features = ["http", "key-value", "variables"] }
 tempfile = "3"
 toml_edit = "0.25"
 thiserror = "2"
@@ -95,7 +107,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 walkdir = { version = "2" }
 web-time = "1"
 worker = { version = "0.8", features = ["http"] }
@@ -120,7 +132,7 @@ single_call_fn = "allow"
 separated_literal_suffix = "allow"
 # `pub_with_shorthand` flags the shorthand `pub(crate)` form and wants the
 # longhand `pub(in crate)` form. Verified by removing this allow on
-# clippy 1.95: 6 errors of the form
+# clippy 1.98: 44 errors of the form
 #
 #   error: usage of `pub` without `in`
 #     |  pub(crate) fn decompress_body(...)
@@ -130,9 +142,9 @@ separated_literal_suffix = "allow"
 # So the lint flags `pub(crate)` and suggests `pub(in crate)`. We use
 # `pub(crate)` because rustfmt unconditionally rewrites `pub(in crate)`
 # → `pub(crate)` on save; no spelling satisfies both clippy and rustfmt.
-# Six legitimate cross-file `pub(crate)` items currently fire:
-# dispatch_raw, dispatch_with_store_names, parse_uri, parse_client_addr,
-# decompress_body, and one extra in fastly/request.rs.
+# 44 legitimate cross-file `pub(crate)` items currently fire, spread
+# across core and the adapter crates (dispatch_raw, parse_uri,
+# decompress_body, and the rest).
 pub_with_shorthand = "allow"
 # `module_name_repetitions` was attempted: 39 sites in edgezero-core,
 # centred on three concrete blockers that surfaced during the rename:
@@ -153,6 +165,13 @@ pub_with_shorthand = "allow"
 # real, but it conflicts with our flat re-export surface and several
 # names cannot be deprefixed without losing meaning.
 module_name_repetitions = "allow"
+
+# `inline_modules` (new in clippy 1.98) flags every `#[cfg(test)] mod tests
+# { .. }` block -- 77 of them workspace-wide. CLAUDE.md mandates the
+# opposite ("Colocate tests with implementation modules"), and splitting
+# each into a sibling `tests.rs` would separate every test from the code
+# it covers for no readability gain. Colocation wins.
+inline_modules = "allow"
 
 # `pattern_type_mismatch` and `ref_patterns` are mutually exclusive in modern
 # Rust — every `if let Some(x) = &foo` flags the first, every

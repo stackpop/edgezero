@@ -55,6 +55,13 @@ jobs:
       - name: No legacy typed reads
         run: ./scripts/check_no_legacy_typed_reads.sh
 
+      # `validator` is pinned in four places cargo cannot reconcile (this
+      # workspace, the excluded demo workspace, the scaffold seeds, and the
+      # deploy fixture). A mismatch only surfaces as a confusing
+      # "trait bound not satisfied" in a deploy smoke job, so gate it here.
+      - name: Shared dependency pins agree
+        run: ./scripts/check_shared_dep_pins.sh
+
       - name: Nested AppConfig audit
         run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
 

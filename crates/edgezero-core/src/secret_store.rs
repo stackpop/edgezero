@@ -47,7 +47,10 @@ macro_rules! secret_store_contract_tests {
             use bytes::Bytes;
             use $crate::secret_store::SecretStore;
 
-            fn run<Fut: std::future::Future>(future: Fut) -> Fut::Output {
+            fn run<Fut>(future: Fut) -> Fut::Output
+            where
+                Fut: std::future::Future,
+            {
                 futures::executor::block_on(future)
             }
 
