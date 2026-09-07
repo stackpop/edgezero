@@ -57,19 +57,28 @@
 
 | Phase | Scope | Plan status |
 | --- | --- | --- |
-| 1a | Add `BadGatewayReason`, `BudgetSource`, typed `BadGateway`, attributed `GatewayTimeout`, `Deadline`, and the three deadline constants | Executable: [`2026-07-10-outbound-http-phase1a-error-time.md`](2026-07-10-outbound-http-phase1a-error-time.md) |
-| 1b | Add the pinned direct `url` dependency, outbound request/response types, one-time canonical URI construction, resource-limit builders, `DispatchBudget`, and `dispatch_budget` in a buildable dependency order | Not yet authored |
-| 2 | Typed body errors, typed response-limit errors, encoded/header/Brotli/chunk controls, bounded/deadline-aware drains, normalization, and shared decoder primitives | Not yet authored |
-| 3 | Manifest capability declarations, adapter metadata, paired target/contract resolver, CLI gates, and selected-component Spin host-drift validation | Not yet authored |
-| 4 | Axum and Cloudflare outbound implementations, response-converter scheduling, host-event fairness, and contract tests | Not yet authored |
-| 5 | Spin hand-built WASI HTTP request/response state machines, completion-error mapping, and cooperative raw/decoded-input fairness | Not yet authored |
-| 6 | Fastly dispatch/harvest engine, dynamic backends, timers, and test seams | Not yet authored |
-| 7 | Templates, `app-demo`, public docs, generated-project checks, and remaining live-host characterization | Not yet authored |
+| 1a | Add `BadGatewayReason`, `BudgetSource`, typed `BadGateway`, attributed `GatewayTimeout`, `Deadline`, and the three deadline constants | Implemented; plan: [`2026-07-10-outbound-http-phase1a-error-time.md`](2026-07-10-outbound-http-phase1a-error-time.md) |
+| 1b | Add the pinned direct `url` dependency, outbound request/response types, one-time canonical URI construction, resource-limit builders, `DispatchBudget`, and `dispatch_budget` in a buildable dependency order | Executable: [`2026-09-06-outbound-http-phase1b-core-types-budget.md`](2026-09-06-outbound-http-phase1b-core-types-budget.md) |
+| 2 | Typed body errors, typed response-limit errors, encoded/header/Brotli/chunk controls, bounded/deadline-aware drains, normalization, and shared decoder primitives | Executable: [`2026-09-06-outbound-http-phase2-body-response-limits.md`](2026-09-06-outbound-http-phase2-body-response-limits.md) |
+| 3 | Manifest capability declarations, fail-closed adapter metadata contract, paired target/contract resolver, CLI gates, and selected-component Spin host-drift validation | Executable: [`2026-09-06-outbound-http-phase3-capabilities-cli.md`](2026-09-06-outbound-http-phase3-capabilities-cli.md) |
+| 4 | Axum and Cloudflare outbound implementations, response-converter scheduling, host-event fairness, and contract tests | Executable: [`2026-09-06-outbound-http-phase4-axum-cloudflare.md`](2026-09-06-outbound-http-phase4-axum-cloudflare.md) |
+| 5 | Spin hand-built WASI HTTP request/response state machines, completion-error mapping, and cooperative raw/decoded-input fairness | Executable with STOP gate: [`2026-09-06-outbound-http-phase5-spin.md`](2026-09-06-outbound-http-phase5-spin.md) |
+| 6 | Fastly dispatch/harvest engine, dynamic backends, timers, and test seams | Executable: [`2026-09-06-outbound-http-phase6-fastly.md`](2026-09-06-outbound-http-phase6-fastly.md) |
+| 7 | Templates, `app-demo`, public docs, generated-project checks, hard legacy-API removal, and remaining live-host characterization | Executable: [`2026-09-06-outbound-http-phase7-migration-docs.md`](2026-09-06-outbound-http-phase7-migration-docs.md) |
 
 The phase numbers after 1a are organizational guidance, not permission to split an
-invariant across unbuildable commits. A phase plan may adjust boundaries when current code
-requires it, but it must preserve the dependency order and acceptance contracts in the
-specification.
+invariant across unbuildable commits. Phases 1b and 2 stage the new core module alongside
+the old one; Phases 4-6 migrate adapters; Phase 7 migrates external consumers and deletes
+the old module. That temporary dual surface is branch-only scaffolding: no intermediate
+state is releasable, there are no aliases between old and new names, and the series is not
+mergeable until Phase 7's scoped legacy-symbol gate passes. Each task still leaves its
+current repository/worktree buildable.
+
+Phase 3 leaves each in-tree adapter on the registry method's `Unsupported` default. The
+exact Axum/Cloudflare, Spin, and Fastly matrix rows are published only in Phases 4, 5, and
+6 respectively, in the same commit series as their passing behavior contracts and any
+required host evidence. This prevents the CLI from accepting a capability before the
+runtime implements it.
 
 Phases 4-6 include each adapter's direct dependencies, independent `test-utils` feature,
 native contract tests, and explicit native/WASM CI activation from spec §5.5. These gates
@@ -115,5 +124,7 @@ Before writing any later phase plan:
 
 ## Readiness
 
-Phase 1a is ready to execute independently. Later phases require their own reviewed plans;
-this index must not be expanded into a second copy of the master design.
+Phase 1a is implemented. Plans 1b-7 are executable in sequence; Phase 5 begins with a
+mandatory real WASI HTTP SDK-resource runner proof and stops if that proof fails. The
+master design remains the normative behavior contract; these plans define implementation
+order, red/green tests, commits, and verification commands without replacing it.

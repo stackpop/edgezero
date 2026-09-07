@@ -1,6 +1,6 @@
 # EdgeZero Outbound HTTP — Design Spec
 
-> **Status:** Draft, revised through review round 59 (round 59 = typed gateway/resource reasons, response limits, ingress/egress ownership boundaries, adapter fairness/completion, and target-bound CLI discovery) · **Date:** 2026-09-06
+> **Status:** Implementation-ready, revised through review round 61 (round 61 = finalized phase ownership and red/green filters, complete Tier 2 adapter cases, a compile-driven typed-stream boundary audit, and green Fastly seam sequencing) · **Date:** 2026-09-07
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). Relevant baseline changes are the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, expanded runtime `AdapterAction` variants, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the app-demo integration crate. Non-outbound store/config lifecycle changes remain outside this design.
@@ -87,8 +87,8 @@ Applications today proxy a single outbound request through the current
 | Handle | `ProxyHandle` (`Arc<dyn ProxyClient>`), `RequestContext::proxy_handle()` | `proxy.rs:21`, `context.rs:97` |
 | Request type | `ProxyRequest::new(method, uri)`; `ProxyRequest::from_request` (streaming) | `proxy.rs:138`, `proxy.rs:100` |
 | Body | `Body { Once(Bytes), Stream(..) }`; `Body::into_bytes_bounded(max)` exists | `body.rs:14`, `body.rs:76` |
-| Errors | `EdgeError`: 400/422/404/405/503/500. No 502/504. `#[non_exhaustive]` | `crates/edgezero-core/src/error.rs` |
-| Deadlines | No outbound deadline type or dispatch budget; `web_time::Instant` already exists elsewhere in core | `middleware.rs`, `key_value_store.rs` |
+| Errors | Phase 1a has typed 502/504 errors; response-limit 502 remains Phase 2. `EdgeError` is `#[non_exhaustive]` | `crates/edgezero-core/src/error.rs` |
+| Deadlines | Phase 1a has `Deadline` and constants; `DispatchBudget` / `dispatch_budget` remain Phase 1b | `crates/edgezero-core/src/time.rs` |
 | Fastly send | `send_async_streaming()` then `pending_request.wait()` — serializes | `crates/edgezero-adapter-fastly/src/proxy.rs:30` |
 | Fastly backend name | host with only `.`/`:` sanitized | `crates/edgezero-adapter-fastly/src/proxy.rs:110` |
 | Manifest | no capability declaration or outbound host plumbing | `crates/edgezero-core/src/manifest.rs` |
@@ -296,11 +296,12 @@ Obtained from the context:
 
 ```rust
 // crates/edgezero-core/src/context.rs — replaces proxy_handle
-// The accessor is valid both before and after the inbound-body restructuring: it uses
-// RequestContext's public extensions accessor rather than reaching into a private field.
+// The accessor is valid both before and after the inbound-body restructuring: as an
+// inherent method it reads `self.request.extensions()` directly and does not require a
+// new public `RequestContext::extensions()` API.
 impl RequestContext {
     pub fn http_client(&self) -> Option<HttpClient> {
-        self.extensions().get::<HttpClient>().cloned()
+        self.request.extensions().get::<HttpClient>().cloned()
     }
 }
 ```
@@ -532,7 +533,7 @@ impl OutboundRequest {
 
  // ---- Canonicalized URI accessors (adapter-facing, non-consuming) ----
  //
- // These four accessors are the **single canonical source** of the
+ // These five accessors are the **single canonical source** of the
  // host/port/SNI/cert-host split that every adapter needs. They are
  // derived from `self.uri` after the canonicalization rules
  // have rejected **userinfo and fragments**, validated the port, and applied the pinned
@@ -543,7 +544,7 @@ impl OutboundRequest {
  // re-deriving from `uri`** for the host/port/SNI/cert split — both to
  // share the canonicalization logic and so the Fastly identity hash
  // sees a single canonical form. They are also the values
- // tested by the Tier 1 half of the four-value row.
+ // tested by the Tier 1 half of the five-value row.
  //
  // **Manifest `[capabilities.outbound].hosts` entries are a separate
  // grammar** — those entries are host-authority-only
@@ -571,6 +572,12 @@ impl OutboundRequest {
  /// outbound `Request::set_header("host"..)` consume; Axum / Spin pick
  /// it up the same way.
     pub fn host_authority(&self) -> String;
+
+ /// Canonical host only, with no port and no IPv6 brackets. Unlike
+ /// `sni_hostname`, this returns IP literals too. Fastly uses this value in
+ /// `BackendIdentity`; adapters MUST NOT recover it by reparsing `uri` or
+ /// splitting `backend_target`.
+    pub fn host_name(&self) -> &str;
 
  /// SNI hostname — what an HTTPS adapter passes to its TLS stack's
  /// SNI setter (Fastly's `.sni_hostname(..)`, Spin/CF's underlying
@@ -1502,7 +1509,6 @@ pub enum BudgetSource {
 // pub(crate) struct BudgetInputs {
 // pub timeout: Option<Duration>,
 // pub deadline: Option<Deadline>,
-// pub max_response_bytes: u64,
 // }
 // impl OutboundRequest {
 // pub(crate) fn budget_inputs(&self) -> BudgetInputs;
@@ -1794,7 +1800,7 @@ let budget = dispatch_budget(req, now)?;
 // crates/edgezero-adapter-fastly/src/proxy.rs:120). HTTP targets opt out via
 // .disable_ssl().
 //
-// Four canonicalized values come from the OutboundRequest accessors ( —
+// Five canonicalized values come from the OutboundRequest accessors —
 // adapters MUST consume these, never re-derive from `req.uri`):
 // - `req.backend_target` — connection target `"host:port"` with the
 // resolved port; passed as the
@@ -1806,6 +1812,8 @@ let budget = dispatch_budget(req, now)?;
 // (carries the explicit port only when
 // non-default; preserves Host
 // semantics).
+// - `req.host_name` — canonical host only, with no port or IPv6 brackets;
+// used in `BackendIdentity`.
 // - `req.sni_hostname` — `Option<&str>`. `Some(host)` for DNS-name HTTPS
 // targets; `None` for IP-literal HTTPS (RFC 6066
 // forbids SNI for IP literals). When `None`, the
@@ -1838,6 +1846,7 @@ let (connect_ms, first_byte_ms) = if total_ms < 4 {
 let between_ms = total_ms;
 let mut builder = Backend::builder(&backend_name, &req.backend_target())
     .connect_timeout(Duration::from_millis(connect_ms))
+    .enable_pooling(false) // SDK default is cross-session pooling; keep budget isolation local
     .first_byte_timeout(Duration::from_millis(first_byte_ms))
     .between_bytes_timeout(Duration::from_millis(between_ms))
     .override_host(req.host_authority());
@@ -2311,7 +2320,7 @@ concatenated members within one content-coding layer
 must preserve all decoded payload and observe late source errors before reporting success:
 
 - **Gzip:** enable `GzipDecoder::multiple_members(true)` in pinned
-  `async-compression` 0.4.43. Decode every member in order under the same absolute
+  lockfile-pinned `async-compression` 0.4.43. Decode every member in order under the same absolute
   deadline, including empty members. Any configured decoded-byte cap counts cumulatively
   across members at its existing consumer-owned boundary; no new cap enters the decoder.
   Member boundaries reset neither budget. A truncated/corrupt later member or trailing bytes
@@ -2543,14 +2552,19 @@ These are per-response controls, not aggregate batch limits.
 1. At the earliest adapter boundary where headers are guest-visible, count entries and
    `name.as_bytes().len() + value.as_bytes().len()` for every visible pair before
    normalization, duplicate coalescing by EdgeZero, or additional collected header state.
-   Reject on the first exceeded configured limit; never truncate. Cloudflare can measure
+   Increment and check the entry count before adding/checking bytes for that entry, so if
+   the same field crosses both configured limits, `HeaderCount` wins. Reject on the first
+   exceeded configured limit; never truncate. Cloudflare can measure
    only workerd's already-materialized strings and merged non-`set-cookie` entries. No
    adapter claims these limits prevent provider/SDK allocation or a host-side rejection
    that occurs before metadata reaches the guest.
 2. Apply bodyless/205 disposition. Framing-bodyless responses do not consume a body or
    invoke body/window limits. A visible normalized `Content-Length` greater than a configured
    encoded cap rejects a payload-bearing response before reading, including compressed
-   responses; identity responses may independently reject against the decoded cap.
+   responses; identity responses may independently reject against the decoded cap. For a
+   payload-bearing response or 205, malformed, comma-list, or conflicting repeated visible
+   `Content-Length` is `bad_gateway` reason `Protocol` before body reads. HEAD/304 preserve
+   representation metadata without interpreting it as a body promise.
 3. Count every guest-visible raw body item before handing it to the content decoder or
    passthrough stream. The encoded total is cumulative across gzip members and native
    completion reads. Check before forwarding/appending. On raw overflow, abort/drop the
@@ -2943,6 +2957,12 @@ pub trait Adapter: Sync + Send {
 
 This reference is intentionally partial. Existing non-outbound trait methods retain
 their current ownership and behavior.
+
+**Publication order:** adding the trait/default does not immediately advertise the matrix.
+Each in-tree adapter inherits `Unsupported` until its outbound implementation, deterministic
+contracts, and any required host evidence land. That adapter's exact override is committed
+in the same phase. The completed repository has the matrix below; no intermediate branch
+state may claim support for behavior that has not landed.
 
 Capability matrix (all four adapters):
 
@@ -4310,9 +4330,9 @@ async fn send_all(
   documented recovery (`Backend::from_str(name)`) returns a handle without
   exposing the registered properties. EdgeZero therefore owns the entire
   uniqueness story **at the guest layer**: a **session-scoped** adapter-local cache
-  (a per-session `Mutex<HashMap<String, (BackendIdentity, Backend)>>` **field on the
-  per-request `FastlyOutboundClient`** — `Mutex` not `RefCell`, because the trait is `Send + Sync` — fresh each request/session; see *Cache
-  ownership* below for why a per-request field is correct and a cross-request cache is wrong) holds the identity →
+  (a `Mutex<HashMap<String, (BackendIdentity, Backend)>>` field on the
+  request-context `FastlyOutboundClient` — `Mutex` not `RefCell`, because the trait is
+  `Send + Sync`; see *Cache ownership* below) holds the identity →
   backend mapping, and a hit
   reuses the cached `Backend` while a miss calls `Backend::builder(..).finish()`
   exactly once. Because EdgeZero hashes every relevant property into the
@@ -4334,9 +4354,10 @@ async fn send_all(
     `((duration.as_nanos() + 999_999) / 1_000_000).max(1)`, lint-clean form in the
     `fastly_timeout_ms` helper. **No bucketing.** The cache is **per-session** (below),
     so it cannot grow unbounded across requests — earlier drafts bucketed the budget to
-    bound a *cross-request* thread-local cache, but that cache model was wrong (Fastly
-    backend names are **session-scoped**, verified against `BackendBuilder` docs — a new
-    request is a new session with a fresh namespace). Within one session a `send_all`
+    bound a *cross-request* thread-local cache, but that cache model was wrong. Dynamic
+    backend registration names are session-scoped. Connection pooling is a separate SDK
+    feature and EdgeZero explicitly calls `.enable_pooling(false)` so a prior session's
+    connection cannot weaken this request's budget isolation. Within one session a `send_all`
     shares a single `batch_now`, so same-budget slots to the same host compute the
     **same** `budget_ms` → one backend; distinct budgets → distinct backends. The cache
     is therefore bounded by the number of distinct `(host, budget)` pairs in the
@@ -4521,19 +4542,17 @@ async fn send_all(
   finite host-teardown bound. **Collision detection** is
   belt-and-suspenders.
 
-  **Cache ownership — a PER-SESSION map (a `Mutex` field on the per-request client).**
+  **Cache ownership — a request-context/session map (a `Mutex` field on the client).**
   This is the single authoritative statement; it governs the protocol below and the
   §4.3 *Dynamic backends* discussion. **Fastly dynamic-backend names are
   session-scoped, NOT global across requests** (verified against the `BackendBuilder`
   docs: dynamic-backend *registration* is per-session — each session registers into its
-  **own** namespace, so a `NameInUse` only fires within the current session; same-name
-  backends do **not** pool or carry over across sessions). Every inbound request is a
-  **new session**: `FastlyOutboundClient`
-  is constructed per request (`crates/edgezero-adapter-fastly/src/request.rs`), it gets
-  a **fresh** cache, and the session's backend namespace is **also fresh** — so request
-  #2 re-registering `ez_abc` does **not** collide with request #1's registration (that
-  was a different session). The cache is therefore correctly a **field on the per-request
-  client**, and its lifetime matches the session by construction:
+  own namespace, so a `NameInUse` applies to the active session). The SDK separately
+  enables same-name/same-settings connection pooling across sessions by default; EdgeZero
+  disables that with `.enable_pooling(false)`. `FastlyOutboundClient` is constructed for
+  each EdgeZero request context (`crates/edgezero-adapter-fastly/src/request.rs`), receives
+  a fresh cache, and must not be retained beyond that context. The cache is therefore a
+  field on the client whose intended lifetime is the active request/session:
 
   ```rust
   struct FastlyOutboundClient {
@@ -4547,13 +4566,14 @@ async fn send_all(
   ```
 
   **This reverses two earlier drafts wrong for the same root reason** — the
-  belief that names persist across requests. One made the cache a cross-request
+  belief that registration names persist across requests. One made the cache a cross-request
   `thread_local!` (which would carry **stale** entries into a reused instance's next
   session, where those names are unregistered); another bucketed the budget to bound
   that non-existent cross-request growth. Neither is needed: the map exists only to
   **dedup within a single session's fan-out** (multiple `send_all` slots / multiple
   `send`s in one handler to the same host+budget reuse one registration), so its size
-  is bounded by the fan-out, and it is discarded when the request ends. The **test seam**
+  is bounded by the fan-out, and it is discarded when the request context ends. Disabling
+  SDK connection pooling is distinct from discarding this registration cache. The **test seam**
   (§5.5) exposes this client field.
 
   The protocol below takes the map's **uncontended `Mutex`**. To state the one model
@@ -4824,24 +4844,24 @@ async fn send_all(
     identity, reuse; if it maps to a *different* identity, fail closed with
     `EdgeError::internal("dynamic backend name collision — refusing to reuse")`.
   - **Single `send`** — same lookup path; same fail-closed behaviour.
-  - **Across calls within ONE request — a per-session `Mutex<HashMap<..>>` field.**
-    Fastly dynamic-backend names are **session-scoped**: a new inbound request is a new
-    session with a **fresh** namespace, so request #2 re-registering `ez_abc` does NOT
-    collide with request #1 (same-name backends do **not** pool or carry over across
-    sessions — registration is per-session). The cache is
-    therefore a **field on the per-request `FastlyOutboundClient`**, fresh each request —
+  - **Across calls within ONE request context — a session-scoped
+    `Mutex<HashMap<..>>` field.** Fastly dynamic-backend registration names are
+    session-scoped. The cache is therefore a field on the request-context
+    `FastlyOutboundClient`, fresh with that client —
     it exists to dedup **within** a single session's fan-out (multiple `send_all` slots /
     multiple `send`s in one handler to the same host+budget reuse one registration), and
-    is discarded when the request ends. **It MUST be a `Mutex<HashMap<..>>`, NOT a
+    is discarded when the request context ends. **It MUST be a `Mutex<HashMap<..>>`, NOT a
     `RefCell`:** `OutboundHttpClient: Send + Sync` (the handle stores `Arc<dyn
     OutboundHttpClient>` in `http::Extensions`, which require `Sync`), and `RefCell` is
     `!Sync` — a `RefCell` field would fail to compile. The `Mutex` is **uncontended** on
     the single-threaded WASM guest (it exists to satisfy `Sync`, not to serialize), and
     the lock is never held across a host call. A SHA-256-128 collision against an earlier
     registration in this session is still caught. *(Two earlier drafts got this wrong for
-    the same root cause — the false belief that names persist across requests: one made
+    the same root cause — the false belief that registration names persist across requests: one made
     the cache a cross-request `thread_local!`, another used a non-`Sync` `RefCell`. Both
-    are superseded by this per-request `Mutex` field.)*
+    are superseded by this request-context `Mutex` field. The backend builder also calls
+    `.enable_pooling(false)` because SDK connection pooling is cross-session and separate
+    from registration-name/cache lifetime.)*
   - **`Backend::builder` returns `NameInUse`** — the adapter cannot fully verify
     the registered identity. Fastly's `Backend::from_name` returns a handle to the
     existing backend but its public getters do not round-trip every builder field
@@ -5557,7 +5577,8 @@ Required coverage:
   invalid method/URI combinations before any adapter work. WHATWG canonicalization covers
   dot segments, percent-encoded delimiters, numeric IPv4 aliases, IDNA, empty paths, and
   query characters in addition to DNS names, default/non-default ports, bracketed IPv6,
-  and Host/SNI/certificate values. App-visible and adapter-visible serializations are equal.
+  and backend-target/Host/host-only/SNI/certificate values. App-visible and
+  adapter-visible serializations are equal.
 - Request normalization strips standard hop-by-hop fields plus every field nominated by
   each visible `Connection` value, case-insensitively and across repeated field lines.
   Empty or invalid nomination tokens fail the whole request as 400; valid prefixes are not
