@@ -1,12 +1,14 @@
-# Outbound HTTP — Phase 1a: `EdgeError` 502/504 + `time.rs` primitives
+# Outbound HTTP — Phase 1a: typed `EdgeError` 502/504 + `time.rs` primitives
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Land the **additive, no-new-dependency on the current baseline** core primitives from the outbound-HTTP spec ([`2026-05-21-outbound-http-design.md`](../specs/2026-05-21-outbound-http-design.md)): the `EdgeError::BadGateway`/`GatewayTimeout` variants (§7 error.rs) — **`GatewayTimeout` carries a typed `cause: BudgetSource`**, so the `BudgetSource` enum lands **in `error.rs`, Task 1** (NOT `time.rs` — Task 1 builds first and names it) — and the `edgezero-core::time` module's `Deadline` + budget constants. (Constant ownership spans sections, not just §3.3.1: `DEFAULT_NO_DEADLINE_BUDGET` / `DEADLINE_FAR_FUTURE` are §3.3.1, `BATCH_DISPATCH_SLACK_MAX` is §3.3.4/§4.3; `BudgetSource` is §3.3.2/§3.4.3 but lives in `error.rs`. Phase 1a lands the *types + constants*; their producer `dispatch_budget` is Phase 1b.) Neither touches the `proxy → outbound` rename or `Body`, so each task keeps `cargo test --workspace` green. **Scope caveat:** the per-task verification is a deliberate **local subset** (see Task 3 Scope) — it does not run the generated-project build, `app-demo`, or the per-adapter WASM matrices, so a green task is not a claim of full-CI readiness.
+**Goal:** Land the **additive, no-new-dependency on the current baseline** core primitives from the outbound-HTTP spec ([`2026-05-21-outbound-http-design.md`](../specs/2026-05-21-outbound-http-design.md)): `EdgeError::BadGateway { reason: BadGatewayReason }`, `GatewayTimeout { cause: BudgetSource }`, and the `edgezero-core::time` module's `Deadline` + budget constants. `BadGatewayReason` and `BudgetSource` land in `error.rs`, Task 1, because the variants name them; `dispatch_budget` remains Phase 1b. Neither task touches the `proxy → outbound` rename or `Body`, so each task keeps `cargo test --workspace` green. **Scope caveat:** per-task verification is a deliberate local subset (Task 3); generated projects, `app-demo`, and expanded adapter-specific WASM matrices remain CI backstops.
 
-**Architecture:** `edgezero-core` only. Additive: new `EdgeError` variants (the enum is `#[non_exhaustive]`, but that does **not** relax exhaustiveness *inside the defining crate* — every exhaustive `match`, including the ones in the test module, must gain the two arms) and a brand-new `time` module. No adapter, CLI, or app-demo change. **`DispatchBudget` and `dispatch_budget` are BOTH deferred to Phase 1b** — the spec (§3.3.2) treats the carrier struct and its authoritative producer as one contract, and shipping a freely-constructible `DispatchBudget` without its producer invites misuse. Phase 1a lands `Deadline` + constants only.
+**Architecture:** `edgezero-core` only. Additive: two new `EdgeError` variants, their two non-exhaustive reason/provenance enums, and a new `time` module. The `EdgeError` enum is `#[non_exhaustive]`, but matches inside its defining crate remain exhaustive and must gain both arms. `BadGatewayReason` is intentionally coarse (`Decode`, `Protocol`, `Transport`, `Unspecified`) so every adapter can report a stable category without exposing provider enums. No reason/cause field is serialized. No adapter, CLI, or app-demo change. **`DispatchBudget` and `dispatch_budget` are both deferred to Phase 1b**; Phase 1a lands `Deadline` + constants only.
 
-**Round-55 scope alignment:** the master spec's corrected `Body::Stream` constructors,
+**Round-59 scope alignment:** the master spec's response resource limits, canonical URL
+parser, adapter scheduling/completion rules, ingress ownership, and response-egress gate are
+later work. The corrected `Body::Stream` constructors,
 Fastly buffered-upload caveat, Axum/Cloudflare upload-pull boundary checks, and Spin
 exchange state machine are later outbound/adapter work. They do not alter any Phase 1a
 task, file, API, or verification command. In particular, this plan must not opportunistically
@@ -20,7 +22,7 @@ change `Body`, `proxy`, or an adapter while landing the error/time primitives.
 - **Colocated tests** (`#[cfg(test)]` same file); async tests use `futures::executor::block_on`.
 - **Verbatim constants:** `DEFAULT_NO_DEADLINE_BUDGET = 30 s`, `DEADLINE_FAR_FUTURE = 7 days`, `BATCH_DISPATCH_SLACK_MAX = 25 ms`.
 - **CI gates must stay green:** `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets`; `cargo check --workspace --all-targets --features "fastly cloudflare spin"`; `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`.
-- **Verified against `crates/edgezero-core/src/error.rs` on `main`** (re-confirm with the compiler-driven Step 6 rather than trusting line numbers, which drift): `EdgeError` today has variants `BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`. The new arms below must be added to **nine** exhaustive matches — **five in `impl`**: `inner()`, `kind_str()`, `message()`, `status()`, `IntoResponse`'s `field_path_opt` — **and four in the test module**: the explicit `ConfigOutOfDate` matches in `config_out_of_date_constructor_round_trips`, `config_out_of_date_from_serde_extracts_path_and_message`, `config_out_of_date_from_serde_redacts_map_key_from_path_and_message`, and `config_out_of_date_from_serde_root_error_passes_through_sentinel`. Each has no `_` wildcard. The compiler-driven Step 6 remains the source of truth. Also **three** per-variant tests must gain rows for both new variants: `kind_strings_per_variant`, `retry_after_only_on_config_out_of_date`, and `field_path_only_on_config_out_of_date`. `web-time` presence is confirmed in Task 0.
+- **Verified against the current worktree's `crates/edgezero-core/src/error.rs`** (re-confirm with the compiler-driven Step 6 rather than trusting line numbers): `EdgeError` today has variants `BadRequest, ConfigOutOfDate, Internal, MethodNotAllowed, NotFound, NotImplemented, ServiceUnavailable, Validation`. The two new arms must be added to **nine** exhaustive matches: five implementation matches (`inner`, `kind_str`, `message`, `status`, and `IntoResponse`'s `field_path_opt`) plus four explicit `ConfigOutOfDate` test matches. The compiler remains the source of truth. Three per-variant tests gain rows for both variants. Reason/provenance tests additionally cover every known enum value and wire-shape isolation. `web-time` presence is confirmed in Task 0.
 - **`cargo test` accepts only ONE positional filter** — `cargo test -p X a b` fails with `unexpected argument 'b'` (verified). Use a single common substring or two separate commands.
 - **The Clippy gate is STRICT — read this before writing any code.** The root `Cargo.toml` sets `restriction = { level = "deny", priority = -1 }`, and the following are **not** allow-listed, so they are hard errors in **production** code:
   - `missing_inline_in_public_items` → **every public fn needs `#[inline]`** (error.rs already carries 14).
@@ -55,16 +57,23 @@ implementation.
 
 ---
 
-### Task 1: `EdgeError::BadGateway` (502) + `GatewayTimeout` (504)
+### Task 1: typed `EdgeError::BadGateway` (502) + `GatewayTimeout` (504)
 
 **Files:**
 - Modify: `crates/edgezero-core/src/error.rs` (enum + constructors + **9 exhaustive matches: 5 impl + 4 test panic-arms**)
 - Test: `crates/edgezero-core/src/error.rs` (colocated `#[cfg(test)]`)
 
 **Interfaces:**
-- Produces: `EdgeError::bad_gateway<S: Into<String>>(msg) -> Self` (502, kind `"bad_gateway"`), `EdgeError::gateway_timeout<S: Into<String>>(msg) -> Self` (504, kind `"gateway_timeout"`, `cause: BudgetSource::Unspecified`), and `gateway_timeout_caused(msg, cause)`. The `GatewayTimeout` variant carries a typed `cause: BudgetSource` (consumer reads it by matching the variant; it is a Rust-side field, **not** serialized — the JSON shape is unchanged). JSON via existing `IntoResponse`: `{ "error": { "status", "kind", "message" } }` (no `field_path`, no `cause` in JSON, for these two).
+- Produces `bad_gateway(msg)` with `reason: BadGatewayReason::Unspecified`,
+  `bad_gateway_with_reason(msg, reason)`, `gateway_timeout(msg)` with
+  `cause: BudgetSource::Unspecified`, and `gateway_timeout_caused(msg, cause)`.
+  `BadGatewayReason::{Decode, Protocol, Transport, Unspecified}` and
+  `BudgetSource::{BatchDeadline, Default, PerCallTimeout, Unspecified}` are
+  `#[non_exhaustive]`, `Clone + Copy + Debug + Eq`. Consumers inspect fields by matching the
+  variant. The JSON envelope remains `{ "error": { "status", "kind", "message" } }` with
+  no `field_path`, `reason`, or `cause`.
 
-- [ ] **Step 1: Write the failing tests (table-driven, BOTH variants)**
+- [ ] **Step 1: Write the failing tests (surface, typed fields, and wire isolation)**
 
 The existing `#[cfg(test)] mod tests` already imports `StatusCode`, `CONTENT_TYPE`, `HeaderValue`, `str` and does `use super::*;`, and has a `parse_body(response) -> serde_json::Value` helper (`tests::parse_body`). Add — **no new imports** (re-importing under `-D warnings` fails):
 
@@ -100,6 +109,24 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
     for (err, code, kind, msg) in [
         (
             EdgeError::bad_gateway("nope"),
+            502_u16,
+            "bad_gateway",
+            "nope",
+        ),
+        (
+            EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Decode),
+            502_u16,
+            "bad_gateway",
+            "nope",
+        ),
+        (
+            EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Protocol),
+            502_u16,
+            "bad_gateway",
+            "nope",
+        ),
+        (
+            EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Transport),
             502_u16,
             "bad_gateway",
             "nope",
@@ -142,11 +169,37 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
             body_json["error"].get("field_path").is_none(),
             "502/504 carry no field_path"
         );
-        // The typed `cause` is a Rust-side field, NOT serialized — the JSON must NOT leak it.
+        // Typed classification is Rust-side only; the JSON must not leak either field.
+        assert!(
+            body_json["error"].get("reason").is_none(),
+            "reason is not part of the wire shape"
+        );
         assert!(
             body_json["error"].get("cause").is_none(),
             "cause is not part of the wire shape"
         );
+    }
+}
+
+#[test]
+fn bad_gateway_reason_is_typed() {
+    let EdgeError::BadGateway { reason, .. } = EdgeError::bad_gateway("x") else {
+        panic!("expected BadGateway");
+    };
+    assert_eq!(reason, BadGatewayReason::Unspecified);
+
+    for expected in [
+        BadGatewayReason::Decode,
+        BadGatewayReason::Protocol,
+        BadGatewayReason::Transport,
+        BadGatewayReason::Unspecified,
+    ] {
+        let EdgeError::BadGateway { reason, .. } =
+            EdgeError::bad_gateway_with_reason("x", expected)
+        else {
+            panic!("expected BadGateway");
+        };
+        assert_eq!(reason, expected);
     }
 }
 
@@ -218,7 +271,13 @@ Only `kind_strings_per_variant` is exhaustive today; the other two are subset ch
 the rows to all three anyway so 502/504 are pinned for kind/status, absence of
 `Retry-After`, and absence of `field_path` from the first red run onward.
 
-- [ ] **Step 2: Run to verify it fails** — Run: `cargo test -p edgezero-core gateway_timeout` (single filter — **substring `gateway_timeout` matches ALL FOUR** new fns: `bad_gateway_and_gateway_timeout_surface`, `bad_gateway_and_gateway_timeout_json_shape`, `bare_gateway_timeout_is_unspecified`, `gateway_timeout_caused_preserves_cause`, so the red/green loop actually exercises the attribution tests, not just the surface ones) — Expected: FAIL to compile (`no variant or associated item named bad_gateway`/`gateway_timeout`).
+- [ ] **Step 2: Run to verify it fails** — Run both focused commands:
+  `cargo test -p edgezero-core bad_gateway` (matches the two shared surface/wire tests plus
+  `bad_gateway_reason_is_typed`) and `cargo test -p edgezero-core gateway_timeout` (matches
+  the two shared tests plus both timeout-attribution tests). Expected: FAIL to compile
+  (`no variant or associated item named bad_gateway`/`gateway_timeout`). A single
+  `gateway_timeout` filter does **not** match `bad_gateway_reason_is_typed` and therefore
+  cannot prove the new 502 classification went red.
 
 - [ ] **Step 3: Add the two variants** in `pub enum EdgeError` — **ALPHABETICALLY, not appended.**
 
@@ -232,7 +291,10 @@ Resulting order: `BadGateway, BadRequest, ConfigOutOfDate, GatewayTimeout, Inter
     /// Upstream or transport failure (DNS, TLS, connect, unreachable, or a
     /// non-timeout send failure). HTTP 502.
     #[error("{message}")]
-    BadGateway { message: String },
+    BadGateway {
+        message: String,
+        reason: BadGatewayReason,
+    },
     /// A wall-clock deadline or per-request timeout fired. HTTP 504.
     /// Carries typed provenance naming which configured budget input selected the
     /// effective deadline. This is not the physical timer phase, proof that the named
@@ -241,21 +303,30 @@ Resulting order: `BadGateway, BadRequest, ConfigOutOfDate, GatewayTimeout, Inter
     GatewayTimeout { message: String, cause: BudgetSource },
 ```
 
-`BudgetSource` is defined **in `error.rs` in THIS task (Task 1)**, NOT in `time.rs` (Task 2).
-That ordering is load-bearing: Task 1 lands/commits/builds **before** Task 2, and Task 1's
-`GatewayTimeout` names `BudgetSource`, so a `time`-module home would make the standalone
-Task-1 commit fail to compile. Define it immediately **before `EdgeError`** in `error.rs`
-so the denied item-order lint also sees `BudgetSource` (B) before `EdgeError` (E);
+`BadGatewayReason` and `BudgetSource` are defined **in `error.rs` in THIS task (Task 1)**,
+NOT in `time.rs` (Task 2). That ordering is load-bearing: Task 1 lands/commits/builds
+**before** Task 2, and the two variants name these enums, so a `time`-module home would
+make the standalone Task-1 commit fail to compile. Define both immediately **before
+`EdgeError`** in alphabetical item order (`BadGatewayReason`, `BudgetSource`, `EdgeError`);
 `time.rs` (Task 2) and `dispatch_budget` (Phase 1b) later
 `use crate::error::BudgetSource;`.
 
 The **derives and variant order are compile-verified** (a throwaway crate under the repo's
 `arbitrary_source_item_ordering` deny + `cargo check`):
 ```rust
-// Debug: EdgeError derives Debug and contains `cause`.
-// Clone + Copy: budget/error carriers pass provenance by value.
-// PartialEq + Eq: the contract tests below assert `cause == BudgetSource::Unspecified` etc.
+// Debug: EdgeError derives Debug and contains both reason enums.
+// Clone + Copy: error carriers pass classification/provenance by value.
+// PartialEq + Eq: contract tests assert exact values.
 // Variants ALPHABETICAL: `arbitrary_source_item_ordering` (denied) rejects any other order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BadGatewayReason {
+    Decode,
+    Protocol,
+    Transport,
+    Unspecified,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // non_exhaustive: public enum that must be able to gain a future budget-input source
 // without a breaking change. Verified: intra-crate exhaustive matches
@@ -276,6 +347,17 @@ pub enum BudgetSource {
     pub fn bad_gateway<S: Into<String>>(message: S) -> Self {
         EdgeError::BadGateway {
             message: message.into(),
+            reason: BadGatewayReason::Unspecified,
+        }
+    }
+    #[inline]
+    pub fn bad_gateway_with_reason<S: Into<String>>(
+        message: S,
+        reason: BadGatewayReason,
+    ) -> Self {
+        EdgeError::BadGateway {
+            message: message.into(),
+            reason,
         }
     }
     #[inline]
@@ -294,18 +376,17 @@ pub enum BudgetSource {
     }
 ```
 
-(All three literals are shown in rustfmt's canonical **split** form — verified with
-`rustfmt --edition 2024`. **Even the single-field `BadGateway`** wraps: rustfmt expands a
-struct literal in a function-body tail position across lines regardless of field count, so a
-one-liner `BadGateway { message: message.into() }` would fail the `cargo fmt --check` gate.
-An earlier note wrongly claimed the single-field form stays inline — it does not.)
+(All four literals are shown in rustfmt's canonical split form, verified with
+`rustfmt --edition 2024`.)
 
 - [ ] **Step 5: Update ALL nine exhaustive matches (crate won't compile until every one is done)**
 
 `impl` sites:
 - `kind_str()` — add `EdgeError::BadGateway { .. } => "bad_gateway",` and `EdgeError::GatewayTimeout { .. } => "gateway_timeout",`
 - `status()` — add `EdgeError::BadGateway { .. } => StatusCode::BAD_GATEWAY,` and `EdgeError::GatewayTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,`
-- `message()` — add `EdgeError::BadGateway { message }` and **`EdgeError::GatewayTimeout { message, .. }`** (the `..` ignores the `cause` field — a bare `{ message }` pattern won't compile now that the variant has a second field) to the "clone the `message`" arm.
+- `message()` — add **`EdgeError::BadGateway { message, .. }`** and
+  **`EdgeError::GatewayTimeout { message, .. }`** to the "clone the `message`" arm. The
+  `..` is required because both variants carry a second typed field.
 - `inner()` — add both variants to the `=> None` arm list.
 - `IntoResponse::into_response`'s `field_path_opt` match — add both variants to the `=> None` arm list.
 
@@ -318,7 +399,11 @@ If it reports `E0004 non-exhaustive patterns` anywhere, add the two arms at that
 
 - [ ] **Step 7: Run the new + matrix tests to verify they pass**
 
-Run: `cargo test -p edgezero-core gateway_timeout` (the **same filter as the red Step 2** — matches all four surface + attribution fns, so the green step exercises the SAME set that went red, including `bare_gateway_timeout_is_unspecified` and `gateway_timeout_caused_preserves_cause`; a `bad_gateway` filter would silently skip the two cause tests), then `cargo test -p edgezero-core kind_strings_per_variant`, then `cargo test -p edgezero-core only_on_config_out_of_date` (one filter matches both the retry_after_* and field_path_* matrices).
+Run: `cargo test -p edgezero-core bad_gateway`, then
+`cargo test -p edgezero-core gateway_timeout` (the **same two filters as red Step 2**), then
+`cargo test -p edgezero-core kind_strings_per_variant`, then
+`cargo test -p edgezero-core only_on_config_out_of_date` (one filter matches both the
+retry_after_* and field_path_* matrices).
 Expected: PASS.
 
 - [ ] **Step 8: Format, lint, full-crate test**
@@ -330,7 +415,7 @@ Expected: clean, all green.
 
 ```bash
 git add crates/edgezero-core/src/error.rs
-git commit -m "feat(core): add EdgeError::BadGateway (502) + GatewayTimeout (504)"
+git commit -m "feat(core): add typed gateway errors"
 ```
 
 ---
@@ -592,7 +677,23 @@ git commit -m "feat(core): add time module (Deadline + budget constants)"
 
 **Files:** none (verification only). Run from the repo root.
 
-**Scope:** Phase 1a is **additive, core-only** (new `EdgeError` variants + a new `time` module; no adapter, CLI, template, or `app-demo` change), so this task runs the **five CLAUDE.md gates** over the workspace **plus one core-only wasm32-unknown-unknown check** (Step 5). It deliberately does **not** run the generated-project build, the `examples/app-demo` build, or the per-adapter WASM test/check/clippy matrices. **This is a risk-reduced local subset, NOT a proof those are unaffected:** every one of them compiles `edgezero-core`, so a core change *could* in principle break them (an unexpected new export collision, a feature-gate interaction). The judgement is that a purely additive `EdgeError`-variant + new-`time`-module change is very unlikely to, and **full CI runs all of them on the PR regardless** — so Task 3 is a fast local gate, and CI is the actual backstop. If you want local certainty, run the full workspace + `examples/app-demo` builds too; otherwise rely on CI. Phases that touch adapters/templates/app-demo DO add those locally. The one WASM target that is *not* redundant here is `wasm32-unknown-unknown`: `web-time::Instant` resolves to its JS `Date`/`performance.now()` path there, whereas the Spin `wasm32-wasip2` gate uses the WASI clock — so the new `time` module's `web-time` dependency must be compiled on that target too.
+**Scope:** Phase 1a is **additive, core-only** (new `EdgeError` variants and typed
+reason/provenance enums plus a new `time` module; no adapter, CLI, template, or `app-demo`
+change), so this task runs the **five CLAUDE.md gates** over the workspace **plus one
+core-only wasm32-unknown-unknown check** (Step 5). It deliberately does **not** run the
+generated-project build, the `examples/app-demo` build, or expanded per-adapter WASM
+test/clippy matrices beyond the required Spin check. **This is a risk-reduced local subset, NOT a proof those are
+unaffected:** every one of them compiles `edgezero-core`, so a core change *could* in
+principle break them (an unexpected new export collision, a feature-gate interaction). The
+judgement is that this purely additive core surface is very unlikely to, and **full CI runs
+all of them on the PR regardless** — so Task 3 is a fast local gate, and CI is the actual
+backstop. If local certainty is required, run the full workspace + `examples/app-demo`
+builds too; otherwise rely on CI. Phases that touch adapters/templates/app-demo add those
+locally. The one WASM target that is *not* redundant here is
+`wasm32-unknown-unknown`: `web-time::Instant` resolves to its JS
+`Date`/`performance.now()` path there, whereas the Spin `wasm32-wasip2` gate uses the WASI
+clock — so the new `time` module's `web-time` dependency must be compiled on that target
+too.
 
 - [ ] **Step 1: Format check + workspace test**
 
@@ -625,7 +726,11 @@ Expected: `Finished`. (Compiles the new `time` module against `web-time`'s brows
 
 ## Self-Review
 
-- **Spec coverage:** Task 1 = §7 error.rs (both variants, full surface, JSON shape for **both**, matrix test); Task 2 = §§3.3.1/3.3.4 (Deadline and all three constants). `DispatchBudget` + `dispatch_budget()` (§3.3.2) are deferred **together** to Phase 1b — a stated sequencing boundary, not a gap.
+- **Spec coverage:** Task 1 = §3.4.3/§7 `error.rs` (both variants, both typed enums,
+  constructors, full match surface, Rust-side classification, and JSON isolation); Task 2 =
+  §§3.3.1/3.3.4 (`Deadline` and all three constants). `DispatchBudget` +
+  `dispatch_budget()` (§3.3.2) are deferred **together** to Phase 1b — a stated sequencing
+  boundary, not a gap.
 - **Compile-safety (the class of bug a prior review caught):** the nine exhaustive matches (5 impl + 4 test panic-arms) are enumerated *and* backed by a compiler-driven catch step; focused tests and all six matrix rows enter the same compile-red edit; the `cargo test` single-filter rule is applied; `is_expired_at` treats a **zero** remaining as expired (`remaining_at` filters out a zero `Duration`), so a deadline exactly at now reads as expired.
 - **No placeholders / no flaky tests:** every step has exact code, paths, single-filter commands, expected output; timing tests are bounded by explicit `at_instant` instants (no `now() - 1s` underflow, no wide tolerance windows), and the clamp test proves the 7-day bound.
 
@@ -633,9 +738,11 @@ Expected: `Finished`. (Compiles the new `time` module against `web-time`'s brows
 
 Phase 1b must respect the producer's type dependency: `dispatch_budget(&OutboundRequest, ..)`
 cannot land before `OutboundRequest` and its private `budget_inputs()` accessor exist. The
-next plan must either (1) land `OutboundRequest`/`ResponseMode`, canonical URI accessors,
-`validate_for_dispatch`, `BudgetInputs`, `DispatchBudget`, and `dispatch_budget` in one
-buildable slice, or (2) land the request type/accessor in an earlier buildable slice and the
-budget carrier/producer immediately after it. `OutboundResponse`, the `Body::Stream` error
-change, and the `proxy → outbound` rename can then be sequenced around the four-adapter
-atomic migration, but no slice may name a type that does not yet exist.
+next plan must add the pinned direct workspace/`edgezero-core` `url` dependency and either
+(1) land `OutboundRequest`/`ResponseMode`, one-time canonical URI construction,
+resource-limit builders, `validate_for_dispatch`, `BudgetInputs`, `DispatchBudget`, and
+`dispatch_budget` in one buildable slice, or (2) land the request type/accessor in an
+earlier buildable slice and the budget carrier/producer immediately after it.
+`OutboundResponse`, the typed `ResponseLimitReason` work, the `Body::Stream` error change,
+and the `proxy → outbound` rename can then be sequenced around the four-adapter atomic
+migration, but no slice may name a type that does not yet exist.
