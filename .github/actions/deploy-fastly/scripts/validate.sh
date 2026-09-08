@@ -28,7 +28,7 @@ main() {
   # run, so the CLI we then execute with credentials would be arbitrary.
   require_present app-cli-artifact "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT:-}"
   require_present fastly-api-token "${EDGEZERO__FASTLY__API_TOKEN_PRESENT:-}"
-  require_input_matching fastly-service-id "${EDGEZERO__FASTLY__SERVICE_ID:-}" '^[A-Za-z0-9_-]+$'
+  require_input_matching fastly-service-id "${EDGEZERO__FASTLY__SERVICE_ID:-}" '^[A-Za-z0-9]+$'
 
   # Provider-neutral validation (adapter, booleans, JSON-array args, the
   # allowlist). It also rejects a 'deploy-to' that is neither production nor

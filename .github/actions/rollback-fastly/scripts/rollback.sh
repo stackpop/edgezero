@@ -25,7 +25,7 @@ source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
 
 validate_inputs() {
   require_linux_x86_64
-  require_input_matching fastly-service-id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}" '^[A-Za-z0-9_-]+$'
+  require_input_matching fastly-service-id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}" '^[A-Za-z0-9]+$'
   require_input_matching fastly-version "${EDGEZERO__LIFECYCLE__VERSION:-}" '^[0-9]+$'
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   # A typo in deploy-to must never silently roll back production.

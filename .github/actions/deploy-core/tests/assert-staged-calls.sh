@@ -45,16 +45,16 @@ assert_comment_precedes_stage() {
     fail "the comment was applied after staging; it must precede it"
 }
 
-# The staging twin must MIRROR production's runtime overrides: the non-config
-# override (LOG_LEVEL) is copied verbatim and the config selector is redirected
-# to `<logical>_staging`, both written into the twin (STAGESEL1) before the
-# relink. Without the mirror the staged version would lose production's adapter /
-# logging overrides.
+# The staging twin must MIRROR this service's production runtime overrides: the
+# scoped logging level is copied verbatim and the scoped config selector is
+# redirected to `<logical>_staging`, both written into the twin (STAGESEL1)
+# before the relink. Without the mirror the staged version would lose its
+# production logging override.
 assert_twin_mirrors_production() {
   local log="$1"
-  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__ADAPTER__FASTLY__LOG_LEVEL' "$log" ||
+  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__SERVICES__dummyservice__LOGGING__LEVEL' "$log" ||
     fail "production's non-config override was not mirrored into the staging twin"
-  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY' "$log" ||
+  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__SERVICES__dummyservice__STORES__CONFIG__APP_CONFIG__KEY' "$log" ||
     fail "the config selector was not written into the staging twin"
 
   # The mirror must land before the relink points the draft at the twin.
