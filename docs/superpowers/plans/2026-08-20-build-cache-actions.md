@@ -8,7 +8,7 @@
 restore/compile/save primitive that later plans consume, without making cache availability part of
 build correctness or exposing credentials to compilation.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31 Sections
 2 through 5 and 9.
 
 ## 1. Fixed decisions
@@ -35,7 +35,7 @@ build correctness or exposing credentials to compilation.
       authority/export boundaries, shared identity/environment/toolchain policy, stable host/path
       literals, key grammar, separate lookup/save predicates, no credential mount/environment, exact
       ordering, warning-only restore/save behavior, and one Cargo compile/build invocation after the
-      metadata preflight.
+      closed container-only metadata preflight. Reject any host `cargo metadata` invocation.
 - [ ] Add shell fixtures for sccache 0.10.0 layout/stats, including corrupt records, unexpected paths,
       write errors, stop failure, sparse files, hardlinks, special files, owner mismatch, path limits,
       entry-count limit, and checked-byte overflow.
@@ -64,10 +64,18 @@ build correctness or exposing credentials to compilation.
 - [ ] Write failing tests for the length-framed `workspace-id` and suffix hash. Commit vectors for root
       `.`, nested workspace, repository IDs of different decimal lengths, empty/255-byte suffixes,
       overlong/control suffixes, malformed UTF-8 paths, and byte-distinct NFC/NFD names.
-- [ ] Implement identity calculation in one shared host helper, which remains the sole owner in later
-      plans. Validate the authority checkout, canonical `git-root`, workspace and working-directory
-      containment, tracked regular `Cargo.lock`, and credential-free `cargo metadata --locked`
-      agreement before constructing either hash.
+- [ ] Implement identity calculation in one shared host orchestrator, which remains the sole owner in
+      later plans. Validate the authority checkout, canonical `git-root`, workspace and working-directory
+      containment, and tracked regular `Cargo.lock`; then invoke the canonical launcher's closed
+      `metadata-preflight` profile against read-only Copy A in the producer, Copy B in a source-bearing
+      deploy action, or the action-local identity-only Copy I owned by plan 3/4 when neither build copy
+      exists. It runs exact
+      `cargo metadata --locked --format-version 1` with bridge network, 1 GiB/no extra swap, 128 pids,
+      ten-minute timeout, fresh Cargo home/tmpfs, exact Rustup toolchain, and no target/sccache/app-env/
+      token/Git credential/configuration, authority, or other host mount. Duplicate-reject and parse one bounded
+      stdout JSON document, require exact workspace/package/bin/path-dependency agreement, and construct
+      identity only afterward. Tests replace host `cargo` with a fatal sentinel and cover malformed/
+      oversized/trailing metadata, stderr diagnostics, public dependency fetch, and container failure.
 - [ ] Consume, without modifying, the active gate's shared authority materializer and trusted
       exporter. Wire validated repository/ref/token inputs to those immutable helper bytes. They
       install the exact verified Git LFS binary; fetch exact commits with system/global config,
@@ -94,10 +102,14 @@ build correctness or exposing credentials to compilation.
       architecture-only proofs fail. The helper accepts and validates no workflow, action,
       application, cache-generation, or provider identity. Plans 3 and 4 must call it as every public
       action's first executable step, with no conditional, continuation, or failure-masking wrapper;
+      each shell-backed caller declares step-local empty `BASH_ENV` and `ENV` in metadata so no caller
+      startup file executes before the helper body. Structural fixtures reject missing, inherited, or
+      nonempty bindings;
       helper failure must success-gate every later non-cleanup internal step. Plan 3 separately owns
       the checkout-independent reusable-producer bootstrap that validates workflow identity, app ref,
       and `job.check_run_id` before checkout or cache access.
-- [ ] Implement the sole canonical container-launch helper. It owns the closed operation enum,
+- [ ] Implement the sole canonical container-launch helper, including `metadata-preflight` before any
+      compile operation. It owns the closed operation enum,
       profile-to-environment mapping, sorted env-file serializer, placeholder split-string builder,
       exact `/usr/bin/env -S` argv, `docker create` array construction, env-file deletion before
       start, attach, timeout, named-container removal, and cleanup verification. Its tests require
@@ -183,12 +195,16 @@ build correctness or exposing credentials to compilation.
       direct-composite producer must not expose an intermediate cache/provenance contract. Its sole
       change in this plan is to call the shared runner-eligibility helper as its first executable step;
       tests require rejection of missing/malformed/self-hosted context and of a conditional,
-      continued, or failure-masked guard before existing producer work. Do not otherwise change
+      continued, failure-masked, or nonempty/inherited `BASH_ENV`/`ENV` guard before existing producer work. Do not otherwise change
       provider or public producer behavior in this plan.
 - [ ] Run cold, warm, corrupt-restore, concurrent-generation, stop-failure, write-error, audit-failure,
       save-denied, save-warning, and sccache response-loss fixtures. Assert the design's exact cold
       Rust miss/write counters, a new-job warm restore with at least one post-zero Rust cache hit and
-      equal binary digest, and complete default-off absence; elapsed time is never evidence.
+      equal binary digest, and complete default-off absence; elapsed time is never evidence. Model
+      seven-day eviction as an earlier warm generation becoming absent and require an ordinary cold
+      success with no retry or deletion claim. Place arbitrary app-written bytes in an otherwise valid
+      regular sccache entry, prove the shape/size audit accepts opaque content only after the applicable
+      disclosure acknowledgement, and prove cross-repository lookup rejects it without acknowledgement.
 - [ ] Run shellcheck, the protected contract/container harness, `scripts/run-actionlint.sh`, zizmor,
       and all Rust checks. Defer non-public workflow harness integration to plan 3 after the workflow
       exists and actual literal-`C` public cold/warm qualification to plan 5. Confirm all non-local

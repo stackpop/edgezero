@@ -9,7 +9,7 @@
 full-SHA app identity and explicit inputs, publish exact stable action version `V`, then activate
 synchronized runnable documentation at revision `R` without ever merging an unpublished version ref.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31 Sections
 3.3, 5.1, 5.2, 5.4, 7, 9, and 10, plus the parent deploy lifecycle contract.
 
 ## 1. Release structure
@@ -50,7 +50,8 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       dynamic step-based labels, `ubuntu-latest`, other standard, larger, custom-image, and self-hosted
       labels. Require the producer bootstrap, inline checkout verification, and shared runner helper
       in exact order without conditional, continuation, failure masking, pre-verification local
-      execution, or non-cleanup always-run paths. Require the legacy path at candidate `H` to be only
+      execution, inherited/nonempty `BASH_ENV` or `ENV`, or non-cleanup always-run paths. Every
+      shell-backed first guard has step-local empty values. Require the legacy path at candidate `H` to be only
       the exact non-producing retirement stub, and reject any workflow or documentation that invokes
       it as a producer.
 - [ ] Add public/private app repository fixtures, root/nested workspace fixtures, public Git and
@@ -58,7 +59,9 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
       generated outputs, production/staging provider paths, and cache enabled/disabled cases.
 - [ ] Include a private-app adoption fixture whose only stored checkout credentials are an App client
       id and private key, plus token-mode and mixed/partial/absent-mode rejection fixtures. Cover a
-      consumer approval after 24 hours, token minting only after that approval, token expiry before a
+      two-phase hosted run whose protected consumer remains unapproved without a runner for more than
+      24 validated hours, then downloads the original artifact under adequate default retention; cover
+      token minting only after that approval, token expiry before a
       later source-bearing step, and missing/expired artifacts under inadequate retention. Never use
       a masked job output or an artifact to transfer checkout credentials between jobs.
 - [ ] Add negative fixtures for major/minor/prerelease/SHA/branch refs in published workflows, mixed
@@ -233,7 +236,7 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Run every protocol, cache, image, launcher, source-freeze, provider, workflow, fixture, docs/pin,
       actionlint, zizmor, shellcheck, Rust, and local integration suite at one clean candidate descended
       from `B`. Confirm `image.json` remains reviewed `{D,S,protocol}`.
-- [ ] Run independent contract and release-adversary reviews against design v6.30, including exact-tag
+- [ ] Run independent contract and release-adversary reviews against design v6.31, including exact-tag
       policy, third-party tag movement risk, EdgeZero immutable releases, action-version mixing,
       substitution, identity replay, malformed artifacts, host/container races, source mutation,
       generated-output escape, credential flow, cache disclosure, rollback, and cancellation.
@@ -267,7 +270,8 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Run the complete hosted cross-repository suite with every EdgeZero workflow/action ref equal to
       literal `C`: cold/warm/default-off caches; public/private and LFS source; two matrix identities;
       artifact/identity/expected handoff; all provider lifecycles; all negative pre-mutation cases; and
-      cancellation reconciliation. Verify exact run attempts and `action-revision==H`.
+      cancellation reconciliation. Include the recorded beyond-24-hour retained-artifact qualification
+      run. Verify exact run attempts and `action-revision==H`.
 - [ ] If either exact-`H` suite fails, fix on a new commit, choose a new unused `C`, and repeat Sections
       7-8; no stable `V` has been selected. After both pass, designate `H` as final action revision `P`.
 - [ ] Query current releases and remote refs, then select a distinct unused canonical stable patch

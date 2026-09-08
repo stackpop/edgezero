@@ -17,7 +17,7 @@ plans land on top. Their final passing action revision `P` contains the unchange
 record and the adoption documents for exact stable version `V`; consumers pin immutable release
 version `V`, which resolves to `P`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31.
 
 **Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
 `shellcheck`, and `zizmor`.
@@ -50,6 +50,9 @@ version `V`, which resolves to `P`.
   operation. An `if: always()` cleanup needs no guard-success condition; any recovery path must
   be a fixed protocol-required recovery/reconciliation step and conjunctively require guard success
   and its protocol-specific transition marker. Every other non-cleanup always-run path fails.
+- Every shell-backed first bootstrap/runner guard declares step-local `BASH_ENV: ""` and `ENV: ""`
+  in workflow or composite metadata. Clearing either variable in the script body is too late because
+  Bash may source the caller-selected file before executing that body.
 - Every committed non-local external action and reusable workflow ref is a canonical exact stable
   `v<major>.<minor>.<patch>` release tag. Major/minor tags, prereleases, branches, commit SHAs, and
   floating refs fail. Docker image refs use immutable `sha256` digests. Local `./...` actions remain
@@ -73,6 +76,11 @@ version `V`, which resolves to `P`.
 ## 2. Dependency order
 
 Although this is plan 1 of five, image publication cannot run first. Execute these gates:
+
+The already committed Section 5.1 JSON tranche is retained as reviewed preparatory work. Do not begin
+Section 5.2 or claim Task 1 complete until the remaining Task 0 selector, placeholder, hosted-verifier,
+and hosted-CI checks are green. This exception records branch history; it does not relax the landing
+order below.
 
 1. Complete the repository-wide exact-version pin-gate migration and actionlint upgrade (Task 0).
 2. Complete the protocol-owner validator, schema, fixtures, pin validator, image verifier, exact image
@@ -111,6 +119,7 @@ Create:
 - `.github/docker/build-app-cli/stage-build-context.sh`
 - `.github/docker/build-app-cli/assert-build-container-context.sh`
 - `.github/docker/build-app-cli/verify-release-prerequisites.sh`
+- `.github/docker/build-app-cli/write-publisher-prerequisite.sh`
 - `.github/docker/build-app-cli/release-approval-gate.sh`
 - `.github/docker/build-app-cli/write-image-release-record.sh`
 - `.github/docker/build-app-cli/update-image-pin-pr.sh`
@@ -123,6 +132,7 @@ Create:
 - `.github/actions/deploy-core/tests/stage-build-context.test.sh`
 - `.github/actions/deploy-core/tests/assert-build-container-context.test.sh`
 - `.github/actions/deploy-core/tests/verify-release-prerequisites.test.sh`
+- `.github/actions/deploy-core/tests/write-publisher-prerequisite.test.sh`
 - `.github/actions/deploy-core/tests/release-approval-gate.test.sh`
 - `.github/actions/deploy-core/tests/write-image-release-record.test.sh`
 - `.github/actions/deploy-core/tests/update-image-pin-pr.test.sh`
@@ -167,7 +177,7 @@ Modify:
 ## 4. Task 0: Enforce exact-version external references repository-wide
 
 The current pin gate permits major/minor tags, prereleases, and commit SHAs. That is broader than
-v6.30 and must be narrowed before adding the write-privileged publisher.
+v6.31 and must be narrowed before adding the write-privileged publisher.
 
 **Files:**
 
@@ -222,15 +232,20 @@ v6.30 and must be narrowed before adding the write-privileged publisher.
       Reject mixed shapes, absent or dynamic labels on step-based jobs, `ubuntu-latest`, other
       standard, larger, custom, and self-hosted labels. Add positive/negative state-transition,
       base/candidate, partial-update, downgrade/deletion, hidden-placeholder, mixed-version, job-
-      shape, and runner-label cases to `run.sh`.
-- [ ] Reconcile the implemented v6.29 selector with v6.30 before freezing `G`. Add the reproduced
+      shape, and runner-label cases to `run.sh`. In transition and released states, reject the literal
+      placeholder anywhere in every tracked Markdown document, including prose and non-YAML fences;
+      YAML parsing remains the authority for reference and job-shape checks.
+- [ ] Reconcile the implemented v6.29 selector with v6.31 before freezing `G`. Add the reproduced
       hosted case where payload base `37f1a137...` precedes synthetic first parent `593fc928...`, and
       head `8f68476d...` is the second parent. Authenticate the context-selected synthetic commit;
       require exactly `[F,J]` and `A` ancestor-or-equal to `F`; compare `F..M`, not `A..M` or latest
       main. Reject wrong/missing/reordered/extra parents, unavailable/shallow objects, replace/graft
       history, wrong repository/ref, and reversed/incomparable ancestry. Test a release record added
       upstream at `F`, intervening upstream executable changes, candidate-only mixed changes, and
-      later main movement. Keep these tasks unchecked until code, fixtures, and hosted CI agree.
+      later main movement. Run every subject Git command with `--no-replace-objects` and the design's
+      exact minimal child environment; inject and reject repository/worktree/common-dir, namespace,
+      index, object/alternate, shallow-file, inline-config, replacement-base, XDG, and arbitrary
+      ambient state. Keep these tasks unchecked until code, fixtures, and hosted CI agree.
 - [ ] Add the hosted transition verifier to gate `G`. With only read permissions and fixed
       no-redirect versioned requests, it proves record `V` is a published `draft:false`,
       `prerelease:false`, `immutable:true` release whose API target and anonymous peeled remote ref
@@ -240,7 +255,12 @@ v6.30 and must be narrowed before adding the write-privileged publisher.
       for Markdown fence parsing and pinned yq for YAML. The Bash entrypoint and colocated module,
       tests, and docs dependency manifests belong to `G`; install dependencies with
       `npm --prefix <gate-root>/docs ci --ignore-scripts`. Never resolve parser modules or run npm
-      from the candidate subject checkout.
+      from the candidate subject checkout. Its release GET uses API version `2026-03-10`, exact gate
+      user agent and media headers, and verifies the selected-version/content-type response headers;
+      the earlier `2022-11-28` request is not compliant transition evidence. Pass authorization only
+      through curl config stdin and give curl only runner `PATH` plus `LC_ALL=C`; fixtures reject
+      inherited token/proxy/CA/home/XDG/curl-home/arbitrary values. Give anonymous release-ref Git only
+      its existing closed temporary-home/config environment plus replacement-object hardening.
 - [x] Retain global zizmor `ref-pin` as defense in depth and document that the structural scanner is
       stricter. Rewrite `.github/zizmor.yml`'s existing comment so it no longer claims full commit
       SHAs pass repository policy: `ref-pin` accepts symbolic refs, while the structural gate permits
@@ -614,7 +634,9 @@ release credential. Candidate code is always subject data. No image is published
       all classifier/verifier/policy/approval/updater/publisher-checker helpers,
       context manifest/Dockerfile/`.dockerignore`, their focused tests and `run.sh` wiring,
       `scripts/{install-actionlint,run-actionlint}.sh`, `.github/CODEOWNERS`, `.github/zizmor.yml`, and
-      both container workflows. The manifest contains itself. `image-context-paths.txt` is a strict
+      all three container workflows (`build-container-ci.yml`, `publish-build-container.yml`, and
+      `rotate-build-container-gate.yml`). Include exact `docs/package.json` and
+      `docs/package-lock.json`. The manifest contains itself. `image-context-paths.txt` is a strict
       subset, is also canonical/sorted, and closes over every Docker build input and local Cargo
       dependency.
 - [ ] Write failing classifier tests for the design's closed pull-request, merge-group, and protected-
@@ -759,7 +781,25 @@ min:1, wait:0}` from the design. Every missing, extra, defaulted, or changed sem
       authorization failure is never absence.
 - [ ] Emit canonical evidence with every identity, rule id/URL, workflow/run/attempt/job URL, permission,
       package state, manual-evidence digest, and timestamp, but no credential. A separately authenticated
-      operator posts it and the byte-identical PNG to the candidate PR. Test evidence-post failure.
+      operator posts it and the byte-identical PNG to the candidate PR. In post-merge mode also emit the
+      exact v6.31 publisher-prerequisite JCS value bound to `{S,G,required-workflow-sha,
+      rotation-history,evidence-sha256}` as a separate derived output; the hashed evidence file never
+      contains that record or digest. Test evidence-post failure and reject an `S`-bound value before
+      exact-`S` push evidence exists.
+- [ ] Write `write-publisher-prerequisite.test.sh` before its helper. Cover exact inert/bootstrap,
+      inert/post-rotation, first-`S`, same-`S` package-recovery, and later-`S` transitions; malformed JCS,
+      unknown/reordered/duplicate fields, source carried across gate rotation, stale/failed/ambiguous
+      rotation, mismatched evidence digests, unexpected prior value, wrong actor/grants, redirect/header/
+      status failure, and failed post-write readback. The helper runs only from clean detached active `G`,
+      reads `EDGEZERO_PUBLISHER_PREREQUISITE_WRITE_TOKEN` only from its environment, authenticates the
+      expected active organization member, and accepts only a short-lived fine-grained PAT selected for
+      `stackpop/edgezero` with repository Variables/write, implicit Metadata/read, organization Members/read,
+      and no other displayed grant. Its credential wrapper permits only exact API-version/header GETs for
+      `/user`, membership, and the existing named variable plus PATCH of that same variable with exact
+      `{name,value}` body. It cannot create/delete a variable or mutate any other endpoint. Require an
+      independent final reviewer to control the invocation and verify the attached evidence first,
+      always recomputing the outer digest and recomputing a nested receipt digest only for verified
+      nonempty rotation history.
 - [ ] Add `build-container-release-preflight` to the gate-owned CI workflow only for
       a `workflow_dispatch` body with `ref:"main"` at protected snapshot `Q`, with a required
       candidate PR-number, head-repository, and full head-SHA input. Its exact candidate-bound
@@ -844,7 +884,8 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       literal runner label and context-derived hosted/Linux/X64 first-executable-step bootstrap in
       every publisher and rotation job before checkout or any later step consumes protected
       environment data or credentials, creates an installation token, invokes Docker, calls a mutation
-      API, or mutates the repository; fixtures with a missing, different, dynamic, caller-derived, or
+      API, or mutates the repository. Require those shell-backed first guards to bind step-local empty
+      `BASH_ENV` and `ENV`; fixtures with a missing, inherited, nonempty, different, dynamic, caller-derived, or
       late label or assertion, guard `if`, `continue-on-error`, masked failure, arbitrary non-cleanup
       always-run step, or required recovery/reconciliation step lacking exact guard-success and
       transition-marker conditions fail. Do not claim that a step runs before GitHub resolves a
@@ -882,8 +923,11 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       requires a fresh lock dispatch. Name the single unconditional success-gating verification step
       exactly `assert-exact-rotation-context`; test continuation, skipped guards, and masked failures.
       The waiting-run policy receipt is not final publisher prerequisite evidence: do not require its
-      own completion during receipt generation. Refresh the publisher's `rotation-history` record
-      only after successful lock completion; test this ordering without a circular prerequisite.
+      own completion during receipt generation. Only after successful lock completion may the local
+      auditor emit final evidence and the independent reviewer write an inert
+      `EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE` value with `source-revision:null`, the final
+      gate/descriptor, and exact completed `rotation-history`. Test this ordering without a circular
+      prerequisite and reject carrying any earlier `S` across rotation.
       The comment binds `Q_f`; it never requires final main to
       equal old `G` or `Q_d`. Add a
       live prerequisite fixture proving a publisher queued behind the waiting lock starts no build or
@@ -901,14 +945,22 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       `build-and-verify` separately checks out `S` only to validate the isolated release request and
       manifested-byte equality, then uses `stage-build-context.sh` to build solely from copied `G`
       inputs. After acquiring shared concurrency and before registry login/build, require release state
-      exact `enabled`, active gate consistency, and the design's latest successful rotation check.
-      Enumerate complete unfiltered rotation history, select greatest numeric run id and its current
-      API attempt, and bind the exact `rotation-history` prerequisite record. Require completed/success,
+      exact `enabled`; parse the step-local canonical
+      `vars.EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE`; and require its non-null source to equal
+      `S` and its gate/descriptor to equal active `G`. The single-variable writer, not the publisher,
+      recomputes the outer evidence digest; the publisher never follows an attachment or caller URL.
+      Add a live fixture that queues a publisher behind rotation, changes all three
+      variables while it waits, and proves it observes post-concurrency values or fails before build.
+      Enumerate complete unfiltered rotation history, parse every `created_at`, select the unique
+      greatest RFC 3339 instant, and use run id only as identity. Equal latest instants, future/invalid
+      times, duplicate ids, or incomplete pages fail. Bind its current API attempt and the exact
+      `rotation-history` prerequisite record. Require completed/success,
       its exact-attempt successful `assert-exact-rotation-context` step, matching approved receipt,
       final active gate/descriptor, and final-head ancestry/tree equality. Check receipt freshness at
       original verification-step completion, not publication time. Only reviewed bootstrap evidence
       plus empty history allows no rotation. Test failed/canceled/timed-out/skipped/waiting rotations
-      with state still enabled, a newer failure after older success, successful prior attempt followed
+      with state still enabled, a later-created failure after older success, equal-time ambiguity,
+      numeric-id/creation-time disagreement, successful prior attempt followed
       by failed rerun, changed/deleted history, truncated pages, queued new rotation, and valid later
       publication. The actions/read wrapper allows only the design's exact history/run/approval/
       attempt-jobs/main-ref GET routes; add these fixed routes and fixtures to the local policy auditor
@@ -951,7 +1003,10 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
       `EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_ID`, and
       `EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_LOGIN` to the independently verified dedicated App and
       bot identity; require the App id to equal the protected-environment App id and pin-branch
-      ruleset Integration actor.
+      ruleset Integration actor. Require publisher-prerequisite variable absence before bootstrap,
+      then create it once as the independently reviewed canonical inert record with `gate-sha==G`,
+      `required-workflow-sha==G`, empty-history bootstrap state, and `source-revision:null`. Later
+      changes use only the local single-variable writer; its PAT is never stored in Actions.
       Configure active organization ruleset `edgezero-build-container-required-workflow` with target
       `branch`, no bypass actors, repository-id condition exactly `[<edgezero-id>]`, ref-name include
       exactly `["refs/heads/main"]`, no ref excludes, and exactly one `workflows` rule containing
@@ -1079,7 +1134,8 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
 - [ ] From a clean detached checkout at `G`, run the full release-prerequisite verifier after merge using the candidate PR number and exact
       `G`/`S`. Attach canonical evidence and the byte-identical PNG to the merged PR.
       A maintainer other than the verifier and screenshot reviewer recomputes the digest, reviews all
-      API evidence, and authorizes tag creation.
+      API evidence, writes the exact `S`-bound publisher-prerequisite variable through the local
+      single-variable writer, verifies readback, and only then authorizes tag creation.
 
 **Release checkpoint 1:** no tag exists until exact-`S` push evidence and the three-person
 preflight review pass.
@@ -1105,7 +1161,8 @@ preflight review pass.
       issue a registry request. A private package fails before `update-pin`.
 - [ ] On first publication, stop at the expected private-package failure. An operator makes the GHCR
       package public, then reruns the exact `G` prerequisite verifier in package-present mode and
-      attaches its public-visibility/repository-link evidence before rerunning the same tag. Evidence
+      attaches its public-visibility/repository-link evidence. The independent reviewer replaces and
+      reads back the same-`S` publisher-prerequisite variable before rerunning the same tag. Evidence
       from the failed run attempt does not carry forward. Rerun the build and downstream job, not
       only the failed pin job; every qualifying attempt produces a fresh challenge.
 
@@ -1202,7 +1259,9 @@ a digest from the mutable tag.
 - [ ] Each follow-on plan must assign the design's deferred fixtures and tests before final action
       revision `P`: workspace/suffix vectors, format-independent cache tree bounds and entry count,
       exact cache action versions, cache lookup/save truth tables, sccache response-loss semantics,
-      mount/environment matrices, empty Cargo-config policy, path confinement, implicit nested
+      seven-day expiry as documented behavior, arbitrary app-written regular cache data under the
+      disclosure acknowledgement, both fixed host cache paths and overlap cleanup, container-only
+      metadata preflight, mount/environment matrices, empty Cargo-config policy, path confinement, implicit nested
       `bin`/`pkg` ownership and cleanup, exact app-env allow/deny boundaries, controlled-loader argv,
       artifact identity, and consumer recomputation.
 - [ ] In the consumer plan, keep the four prepublication documents at the gated placeholder while
@@ -1217,7 +1276,7 @@ a digest from the mutable tag.
 
 Before declaring this plan complete, run two independent reviews:
 
-1. **Contract review:** compare every file and test with design v6.30 Sections 2 through 10. Verify one
+1. **Contract review:** compare every file and test with design v6.31 Sections 2 through 10. Verify one
    expected/package/validate wire authority, protected gate and image source `G`, isolated release
    request `S`, staged gate-only Docker context, API-visible exact post-merge `S` proof, forward-only
    pin ancestry, no tag runtime pull, no placeholder image digest/checksum, no `/work/package`

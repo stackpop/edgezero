@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions - Build Caching Spec
 
-**Status:** Design (proposed) - v6.30
+**Status:** Design (proposed) - v6.31
 
 **Related:** `docs/superpowers/specs/edgezero-deploy-github-action.md`,
 `docs/superpowers/plans/edgezero-deploy-action-implementation-plan.md`,
@@ -35,6 +35,10 @@ contracts. It must not expose provider credentials to app CLI compilation or to 
 - Artifact provenance is a consistency and loadability check. It is not producer authentication or
   an attestation. A malicious producer can create a self-consistent archive. Attestation remains out
   of scope.
+- Repository administrators can mutate Actions variables and remain trusted administrative actors.
+  Publication nevertheless consumes `EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE` only through
+  the closed, independently reviewed record and update protocol in Section 8. A malformed, stale,
+  unreviewed, or cross-release value fails before registry authentication or image build.
 - Caching has an accepted correctness risk: sccache can miss undeclared filesystem or environment
   inputs, including changed `app-env` values, read by `build.rs` or proc macros. A stale object can
   pass digest, ELF, and smoke checks.
@@ -101,6 +105,9 @@ no Unicode normalization; non-UTF-8 paths fail closed.
 `workspace-root`; and credential-free `cargo metadata --locked` from `working-directory` must report
 that exact workspace root. Its `Cargo.lock` must be a tracked regular file. A caller-provided root is
 never trusted without those checks.
+The metadata command runs only through the closed `metadata-preflight` container profile in Section
+5.3 after checkout credential removal. No host Cargo process or ambient Cargo/Git
+credential/configuration participates in this agreement.
 
 - `workspace-id` is SHA-256 over the concatenation
   `<repo-id-byte-length>:<canonical-repo-id><root-byte-length>:<canonical-root>` with no separator or
@@ -216,10 +223,18 @@ consumer may restore and save that exact-key Cargo target cache only around the 
 `app-build` profile below, before any provider token is introduced. `build-mode: never` receives no
 target-cache restore or save.
 
-The host cache path is the fixed `${RUNNER_TEMP}/edgezero-sccache-v1`, emptied before restore. It is
-mounted at the constant `/work/sccache`. The fixed host path is required because `actions/cache`
-includes the archived path in its cache version. The fixed in-container path and `/work/repo` cwd
-also avoid path-only misses in sccache keys.
+The sccache host path is the fixed `${RUNNER_TEMP}/edgezero-sccache-v1`, emptied before restore and
+mounted at constant `/work/sccache`. When and only when the parent `deploy-fastly.cache` is enabled,
+its target-cache host path is independently fixed at
+`${RUNNER_TEMP}/edgezero-deploy-fastly-target-v1`, emptied before restore and mounted at constant
+`/work/target`. With that cache disabled, `app-build` instead creates a fresh target directory beneath
+the invocation-private action workspace, mounts it at `/work/target`, performs no restore/save, and
+removes it on every exit; it neither creates nor adopts the fixed target-cache root. `actions/cache`
+includes the archived host path in its cache version, so neither fixed path may contain an invocation
+id, checkout path, or random suffix. A second overlapping invocation in the same job fails the absent-
+root check rather than sharing either fixed directory. Sequential invocations may reuse a fixed path
+only after the prior invocation's verified cleanup. The fixed in-container paths and `/work/repo` cwd
+also avoid path-only misses in compiler and Cargo cache keys.
 
 The cache contains compiled outputs, indexes, and replayable compiler stdout/stderr. Diagnostics can
 contain paths, source excerpts, warnings, and compile-time values. Dependency sources, Cargo registry
@@ -383,11 +398,12 @@ action-derived protected-event save predicate as the sccache family. A denied pa
 restore-only only when lookup was eligible. Its existing key/content/audit contract remains owned by
 the parent deploy spec.
 
-At invocation start, the fixed host cache root must be absent beneath a real, non-symlinked
-`${RUNNER_TEMP}`; the action creates it, records it, and never adopts a preexisting path. After the
-single save attempt or any earlier terminal path, descriptor-relative no-follow cleanup removes that
-recorded tree and verifies absence. Cleanup failure fails the action even when restore/save failure
-itself was warning-only, because a dirty fixed root could contaminate another invocation in the job.
+At invocation start, each selected fixed host cache root must be absent beneath a real, non-symlinked
+`${RUNNER_TEMP}`; the action creates it, records its device/inode/owner/mode, and never adopts a
+preexisting path. Restore and pre-use audits remain confined to the recorded root. After the single
+save attempt or any earlier terminal path, descriptor-relative no-follow cleanup removes that recorded
+tree and verifies absence. Cleanup failure fails the action even when restore/save failure itself was
+warning-only, because a dirty fixed root could contaminate another invocation in the job.
 
 ## 5. Container execution
 
@@ -423,6 +439,11 @@ Section 3.3. The bootstrap is inline because no repository helper is trusted bef
 structural tests freeze its step position, context bindings, and exact comparisons. It is
 unconditional, has no `if` or `continue-on-error`, and cannot mask a failed command. No later
 protected operation may run unless the guard succeeded. Normal steps retain default success gating.
+Every shell-backed bootstrap and public-action runner-eligibility step sets step-local `BASH_ENV` and
+`ENV` to the empty string in workflow/composite metadata. This metadata binding occurs before Bash
+startup; unsetting either name inside the script body is too late. Structural and hosted fixtures
+prove caller workflow/job/action environment values cannot execute a startup file before the guard or
+replace its three context-derived values.
 An `if: always()` cleanup may only remove previously recorded action-private paths or named
 containers and revoke an already-created ephemeral credential; it may not interpret, execute,
 upload, save, or otherwise consume artifact/source/cache contents, start a container, create a
@@ -445,7 +466,7 @@ before steps begin; the predicate does not claim to run before that GitHub contr
 
 ### 5.2 Working-copy topology
 
-There are two independent exported-copy roles because GitHub jobs do not share filesystems. The
+There are three independent exported-copy roles because GitHub jobs do not share filesystems. The
 producer workflow and every consumer-side public action that needs repository source independently
 create a private **authority checkout** at the exact app SHA through the object-first trusted
 materializer defined below. The public identity action also creates its own short-lived authority for
@@ -455,18 +476,24 @@ validation. No authority directory, descriptor, path, or opaque handle is accept
 to another public action. After credential removal and source validation, a trusted exporter creates
 the applicable action-local copy from that authority checkout:
 
-- **Copy A, producer build job:** a private faithful copy used only for cached native CLI
-  compilation. It is mounted read-only; Cargo target, Cargo home, sccache, home, and temporary output
-  live in separate action-owned paths. The reusable workflow uploads its CLI artifact; Copy A is then
-  discarded.
+- **Copy A, producer build job:** a private faithful copy used only for producer metadata preflight and
+  cached or uncached native CLI compilation. It is mounted read-only; Cargo target, Cargo home,
+  sccache, home, and temporary output live in separate action-owned paths. The reusable workflow
+  uploads its CLI artifact; Copy A is then discarded.
 - **Copy B, source-bearing consumer action:** a fresh private faithful copy exported from that
   action's independently materialized authority. Its repository view is mounted read-only except for
   the action-created nested output-root mounts, so generated files can flow from app build to
   `fastly compute deploy` without granting general source write access. `deploy-fastly` creates one
-  Copy B at invocation start and may reuse it only between its internal app-build and deploy
-  operations; its active-version operation does not mount the copy. No authority, Copy B, or generated
-  root is shared across public action invocations. Source-free actions create no authority or Copy B.
-  Copy A never crosses into the consumer job.
+  Copy B at invocation start and may reuse it only for metadata preflight and its internal app-build
+  and deploy operations; its active-version operation does not mount the copy. No authority, Copy B,
+  or generated root is shared across public action invocations. Source-free actions create no
+  authority or Copy B. Copy A never crosses into the consumer job.
+- **Copy I, identity-only consumer action:** a short-lived private faithful copy used only where an
+  action has no Copy A or Copy B when it computes identity. `compute-app-cli-identity` and
+  `config-push-fastly` each export their own Copy I after credential removal, mount it read-only only
+  for `metadata-preflight`, and destroy it before returning or entering the config-push profile. It is
+  never an artifact, output, authority substitute, build input, provider input, or cross-action
+  handoff. A source-bearing deploy action uses its own Copy B for metadata instead of creating Copy I.
 
 `config-push-fastly` is the sole source-bearing Copy-B exception: it executes no application code and
 creates no Copy B. It independently materializes its own credential-free frozen authority and mounts
@@ -533,27 +560,36 @@ corrupt objects, pointer residue, nested submodules, credential cleanup, and con
 `run-app-cli-in-container` has a maximum allowlist and a closed profile for each operation. It never
 mounts all of `RUNNER_TEMP`.
 
-| In-container path           | Mode            | Allowed operations                                           | Source                                          |
-| --------------------------- | --------------- | ------------------------------------------------------------ | ----------------------------------------------- |
-| `/work/repo`                | read-only       | cached-compile, uncached-compile, app-build, provider-deploy | Copy A or Copy B                                |
-| `/work/repo`                | read-only       | config-push                                                  | credential-free frozen authority; no Copy B     |
-| `/work/repo/<output-root>`  | writable        | app-build, provider-deploy                                   | action-created declared/implicit directory      |
-| `/work/target`              | writable        | cached-compile, uncached-compile, app-build, provider-deploy | fresh or parent target cache as specified below |
-| `/work/cargo-home`          | writable, fresh | cached-compile, uncached-compile, app-build, provider-deploy | operation-specific directory                    |
-| `/work/sccache`             | writable        | cached-compile only                                          | stable host cache directory                     |
-| `/work/input/app-cli`       | read-only       | provenance-package only                                      | exact binary produced by the selected cached-compile or uncached-compile profile |
-| `/work/input/artifact.tar`  | read-only       | provenance-validate only                                     | downloaded artifact                             |
-| `/work/expected`            | writable, fresh | expected-write                                               | empty host expected-identity output directory   |
-| `/work/release`             | writable, fresh | release-request-write                                        | empty host release-request output directory     |
-| `/work/input/expected.json` | read-only       | provenance-package, provenance-validate                      | validator-generated expected identity           |
-| `/work/packaged`            | writable, fresh | provenance-package only                                      | empty host archive-output directory             |
-| `/work/validated`           | writable, fresh | provenance-validate only                                     | empty host output directory                     |
-| `/work/bin/app-cli`         | read-only       | binary-smoke and provider operations                         | validated binary                                |
-| `/work/config/inline.toml`  | read-only       | config-push only                                             | optional action-owned inline config file        |
-| `/work/home`, `/work/tmp`   | writable tmpfs  | all operations                                               | operation-local tmpfs                           |
+| In-container path           | Mode            | Allowed operations                                                               | Source                                                                           |
+| --------------------------- | --------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `/work/repo`                | read-only       | metadata-preflight, cached-compile, uncached-compile, app-build, provider-deploy | Copy A, Copy B, or identity-only Copy I as constrained below                     |
+| `/work/repo`                | read-only       | config-push                                                                      | credential-free frozen authority; no Copy B                                      |
+| `/work/repo/<output-root>`  | writable        | app-build, provider-deploy                                                       | action-created declared/implicit directory                                       |
+| `/work/target`              | writable        | cached-compile, uncached-compile, app-build, provider-deploy                     | fresh or parent target cache as specified below                                  |
+| `/work/cargo-home`          | writable, fresh | metadata-preflight, cached-compile, uncached-compile, app-build, provider-deploy | operation-specific directory                                                     |
+| `/work/sccache`             | writable        | cached-compile only                                                              | stable host cache directory                                                      |
+| `/work/input/app-cli`       | read-only       | provenance-package only                                                          | exact binary produced by the selected cached-compile or uncached-compile profile |
+| `/work/input/artifact.tar`  | read-only       | provenance-validate only                                                         | downloaded artifact                                                              |
+| `/work/expected`            | writable, fresh | expected-write                                                                   | empty host expected-identity output directory                                    |
+| `/work/release`             | writable, fresh | release-request-write                                                            | empty host release-request output directory                                      |
+| `/work/input/expected.json` | read-only       | provenance-package, provenance-validate                                          | validator-generated expected identity                                            |
+| `/work/packaged`            | writable, fresh | provenance-package only                                                          | empty host archive-output directory                                              |
+| `/work/validated`           | writable, fresh | provenance-validate only                                                         | empty host output directory                                                      |
+| `/work/bin/app-cli`         | read-only       | binary-smoke and provider operations                                             | validated binary                                                                 |
+| `/work/config/inline.toml`  | read-only       | config-push only                                                                 | optional action-owned inline config file                                         |
+| `/work/home`, `/work/tmp`   | writable tmpfs  | all operations                                                                   | operation-local tmpfs                                                            |
 
 Profiles:
 
+- `metadata-preflight`: Copy A in the producer, Copy B in `deploy-fastly`, or Copy I
+  only in `compute-app-cli-identity` and `config-push-fastly`, mounted read-only with fresh Cargo home
+  and tmpfs; no authority, target, sccache, provider token, checkout token, Git
+  credential/configuration, writable repository, or other host mount. It
+  invokes exact `cargo metadata --locked --format-version 1` from validated `working-directory`, with
+  bridge network only for anonymously readable crates.io and public Git dependencies. The launcher
+  captures one bounded JSON document on stdout; stderr is diagnostic only. The trusted host helper
+  duplicate-rejects and parses that document, validates the selected package/bin/workspace/path-
+  dependency contract, and never invokes host Cargo.
 - `cached-compile`: Copy A, fresh target and Cargo home, sccache, tmpfs; no token.
 - `uncached-compile`: Copy A, fresh target and Cargo home, and tmpfs; no token, sccache mount,
   wrapper, socket, or sccache process.
@@ -605,6 +641,7 @@ no operation receives additional swap:
 
 | Operations                                         | Network | Memory  | Pids | Hard wall timeout |
 | -------------------------------------------------- | ------- | ------- | ---- | ----------------- |
+| metadata-preflight                                 | bridge  | 1 GiB   | 128  | 10 minutes        |
 | cached-compile, uncached-compile                   | bridge  | 6 GiB   | 512  | `timeout-minutes` |
 | app-build, provider-deploy                         | bridge  | 6 GiB   | 512  | 60 minutes        |
 | expected-write, release-request-write              | none    | 256 MiB | 32   | 60 seconds        |
@@ -645,6 +682,9 @@ image variables such as `RUST_VERSION` or Docker-created variables such as `HOST
 publisher verifier treat `/usr/bin/env` with these exact `-S` expansion-before-clear semantics as a
 required runtime capability.
 
+- metadata preflight: `PATH`, `RUSTUP_HOME=/usr/local/rustup`, exact `RUSTUP_TOOLCHAIN`, fresh
+  `CARGO_HOME`, `HOME`, and `TMPDIR`; no `CARGO_TARGET_DIR`, application environment, token, Git
+  credential/configuration, compiler wrapper, flags, or `SCCACHE_*` value.
 - cached compile: `PATH`, `RUSTUP_HOME=/usr/local/rustup`, `RUSTUP_TOOLCHAIN`, fresh `CARGO_HOME`,
   fresh `CARGO_TARGET_DIR`, `RUSTC_WRAPPER=/usr/local/bin/sccache`, `SCCACHE_DIR`,
   `SCCACHE_CACHE_SIZE=2G`, `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, `CARGO_INCREMENTAL=0`, empty
@@ -1202,7 +1242,8 @@ defaulting to `.`, and `app-checkout-token` is a required sensitive string input
 caller from a GitHub secret or a masked same-job App-token output and masked before use. The action requires
 `github.action_repository==stackpop/edgezero` and `github.action_ref==action-version`, independently
 materializes and validates a short-lived authority through Section 5.2, removes the credential
-channel, computes identity, and cleans the authority on every exit. It outputs exactly the five
+channel, exports a private Copy I, computes identity through the closed `metadata-preflight`, and
+cleans both paths on every exit. It outputs exactly the five
 `CallerExpectedIdentity` fields and no authority path, descriptor, opaque handle, credential,
 platform field, or other host state. The job compares every output with the reusable-workflow output
 before invoking another EdgeZero action.
@@ -1491,15 +1532,20 @@ anonymous public API data, and the waiting job must not treat its `vars` context
 After final restoration, the local auditor repeats every policy/pointer check, binds the full audit
 to `{Q_d,Q_f,old-G,new-G,result,lock-run-id,lock-run-attempt}`, and emits the receipt only on success.
 This rotation audit deliberately does not require completion of its own still-waiting lock run; it
-is not yet the publisher's prerequisite record. Only after successful lock completion can the local
-auditor emit refreshed publisher prerequisite evidence with the completed `rotation-history` below.
-Its `gate-sha` is the observed repository gate variable; `required-workflow-sha` is the observed
-descriptor SHA; both equal `G'` for activation or old `G` for rollback. The independent reviewer
-verifies the full attached audit, recomputes both digests, verifies restored tag policy and enabled
-state, and supplies the two-line receipt through GitHub's authenticated environment-approval
-comment, not through a caller input, artifact, or arbitrary URL. The reviewer differs from the
-operator and lock-run actor. Private-policy observations are authenticated reviewer evidence, not
-live API observations made by the waiting helper; this does not claim an administrative policy lock.
+is not yet the publisher's prerequisite record. The independent reviewer verifies the attached audit,
+recomputes both digests, verifies restored tag policy and enabled state, and supplies the two-line
+receipt through GitHub's authenticated environment-approval comment, not through a caller input,
+artifact, or arbitrary URL. The reviewer differs from the operator and lock-run actor. Private-policy
+observations are authenticated reviewer evidence, not live API observations made by the waiting
+helper; this does not claim an administrative policy lock.
+
+Only after the waiting helper succeeds and the rotation run reaches completed/success can the local
+auditor fetch that exact run/attempt and emit refreshed publisher prerequisite evidence. Its
+`gate-sha` is the observed repository gate variable; `required-workflow-sha` is the observed descriptor
+SHA; both equal `G'` for activation or old `G` for rollback. A final independent review verifies the
+completed-lock evidence and then writes the inert record with `source-revision:null` through the
+single-variable local writer defined below. The waiting-run receipt is never used as its own
+completion proof.
 
 The waiting helper has only `actions:read` and `contents:read`; its credential wrapper permits only
 the exact no-redirect GETs for its current run, that run's complete non-paginated approval history,
@@ -1850,7 +1896,8 @@ media-type requirement.
 `EDGEZERO_BUILD_CONTAINER_RELEASE_TEAM_ID`.
 `{approved-repository-variable-name}` is exactly one of
 `EDGEZERO_BUILD_CONTAINER_RELEASE_STATE`, `EDGEZERO_BUILD_CONTAINER_PUBLISHER_APP_ID`,
-`EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_ID`, or `EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_LOGIN`.
+`EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_ID`, `EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_LOGIN`, or
+`EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE`.
 Release state obeys the exact state grammar above, App/Bot IDs are canonical positive decimals, and
 the bot login equals the independently verified dedicated App bot account. The user lookup must
 return that exact login, numeric id equal to `EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_ID`, and
@@ -1914,7 +1961,9 @@ separately authenticated operator to attach to the candidate PR:
   gate identity. Its workflow SHA is separately recorded as dispatch `Q`, with verified `G` ancestry
   and gate-owned byte equality. Repository release state equals `enabled`; publisher App id equals
   the environment App id and pin-branch bypass actor; and publisher bot id/login identify the verified
-  App bot account used for pin PRs;
+  App bot account used for pin PRs. The auditor parses and records the current canonical publisher-
+  prerequisite value as the expected prior state for the separately reviewed writer; malformed,
+  missing, wrong-gate, or impossible lifecycle state blocks evidence production;
 - an App JWT made from that key identifies the expected dedicated App; the expected installation is
   active on account `stackpop`, uses selected repositories, grants exactly `contents:write`,
   `pull_requests:write`, and implicit `metadata:read`, and its repository list is exactly
@@ -1964,8 +2013,53 @@ permissions, repository identities, and successful revocation separately, never 
 cannot be exchanged between wrappers, stored in Actions, or reused by the publisher. Every exit
 attempts revocation of any minted token; verification or revocation failure blocks progression.
 The installation-wide metadata audit is the sole exception to repository-bounded local token minting,
-not permission to broaden the publisher's mutation token. No credential may call a persistent
-repository, organization, package, pull-request, comment, or ruleset mutation endpoint.
+not permission to broaden the publisher's mutation token. No audit or probe credential in the
+preceding paragraph may call a persistent repository, organization, package, pull-request, comment,
+or ruleset mutation endpoint. The separately reviewed prerequisite-record writer below is the sole
+exception and can mutate only its one named repository variable.
+
+The publisher's authenticated ingress is repository variable
+`EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE`. Its value is UTF-8 RFC 8785 JCS with no BOM,
+surrounding whitespace, or trailing newline and has exactly this closed shape:
+
+```text
+{"evidence-sha256":"sha256:<64-lowercase-hex>","gate-sha":"<40-lowercase-hex>","required-workflow-sha":"<40-lowercase-hex>","rotation-history":{"state":"bootstrap-no-rotation"},"schema-version":1,"source-revision":"<40-lowercase-hex>"}
+```
+
+`source-revision` may instead be JSON null only for an inert record that cannot authorize a tag.
+When rotation history is nonempty, `rotation-history` is exactly
+`{"created-at":"<RFC3339-UTC>","evidence-sha256":"sha256:<64-lowercase-hex>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","state":"verified"}`.
+Unknown, duplicate, missing, reordered, mistyped, noncanonical, zero, or out-of-range values fail.
+The outer evidence digest covers the complete canonical prerequisite-evidence file reviewed for that
+record. That file does not contain the derived publisher-prerequisite record or its digest, avoiding a
+self-reference. A release-bound record's byte-identical evidence file is attached to the source PR,
+while an inert post-rotation record covers the completed-lock audit. The nested digest covers the
+approved rotation receipt. The gate and required-workflow SHAs must be equal. A non-null source
+revision must equal the exact isolated release source `S` whose post-merge push and prerequisite audit
+the outer evidence records.
+
+The variable is provisioned before release in inert form. A successful gate rotation leaves the old
+value stale while the lock runs; after the lock completes successfully, the local auditor emits a
+reviewed replacement with the new active gate, exact latest rotation, and null source revision. It
+never carries an old `S` across a gate change. A later successful post-merge release audit emits a
+replacement bound to its exact `S`. First-package visibility recovery repeats the audit and replaces
+the same-`S` record with the new evidence digest before the tag run is retried. Failed, canceled,
+waiting, or unreviewed audits never update the variable.
+
+A separate local writer runs from clean detached active `G` and receives
+`EDGEZERO_PUBLISHER_PREREQUISITE_WRITE_TOKEN` only through its process environment. The token is a
+short-lived fine-grained PAT selected only for `stackpop/edgezero`, with repository
+`Variables:write`, implicit `Metadata:read`, organization `Members:read`, and no other grant. A second
+operator records its selection, displayed grants, expiration, and screenshot digest. The writer
+authenticates the expected active organization-member login, validates the canonical evidence and
+record locally, GETs the existing exact variable, and permits only PATCH of
+`/repos/stackpop/edgezero/actions/variables/EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE` with a
+body containing that exact name and JCS value. It cannot create/delete a variable, write another
+name, or call a repository, workflow, ref, release, package, pull-request, comment, ruleset, or
+environment mutation endpoint. The independent final reviewer, distinct from the verifier, controls
+the writer invocation after recomputing the outer evidence digest and, only for verified nonempty
+rotation history, the nested receipt digest. Missing review, token/grant mismatch,
+unexpected prior state, API failure, or post-write readback mismatch blocks tagging or rerun.
 
 API failure, pagination truncation, ambiguity, extra bypass actor, extra repository or write
 permission, credential failure, or evidence-post failure blocks release designation or publication.
@@ -2002,20 +2096,32 @@ additional use to fail before sanitization. Remove each compatibility rewrite in
 reviewed actionlint release natively supports that syntax.
 
 After acquiring that group, every publisher requires
-`EDGEZERO_BUILD_CONTAINER_RELEASE_STATE==enabled`, verifies the active gate variable and organization
-descriptor agree through the already reviewed prerequisite evidence, and proves no rotation lock is
-active before image build or registry authentication. The same unconditional guard also verifies
-successful completion of the latest rotation, not merely absence of an active run. With
+`EDGEZERO_BUILD_CONTAINER_RELEASE_STATE==enabled` and parses the exact step-local
+`vars.EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE` value only after the pending workflow has
+acquired concurrency and its job is sent to a runner. The record's non-null source revision must equal
+tag source `S`; its gate SHA must equal both the active gate variable and recorded organization
+descriptor SHA. A required hosted fixture queues a publisher behind a rotation, changes all three
+variables while it waits, and proves the publisher receives the post-rotation values or fails before
+build. If GitHub does not preserve that evaluated-after-concurrency behavior, release is blocked and
+the variable channel must be redesigned; a queued-run snapshot is not accepted.
+
+The same unconditional guard proves no rotation lock is active before image build or registry
+authentication and verifies successful completion of the latest rotation, not merely absence of an
+active run. With
 `actions:read`, enumerate the rotation workflow's complete run history using only `per_page=100`
-and positive `page`, without status/conclusion filters, and select its greatest integer run id.
-Incomplete pagination, ambiguous identity, or malformed responses fail; historical reruns are
-checked through the selected run's current API attempt, not a cached successful older attempt.
-The reviewed prerequisite evidence records `rotation-history` as exactly
+and positive `page`, without status/conclusion filters. Parse every run's `created_at` as an RFC 3339
+instant and select the unique run at the greatest instant; two distinct runs at that instant are
+ambiguous and fail closed. Run id is identity only and is never treated as a chronological ordering
+contract. Incomplete pagination, duplicate run ids, invalid/future timestamps, ambiguous identity, or
+malformed responses fail; historical reruns are checked through the selected run's current API
+attempt, not a cached successful older attempt. The prerequisite variable records `rotation-history`
+as exactly
 `{"state":"bootstrap-no-rotation"}` when the history is empty, or
-`{"evidence-sha256":"sha256:<64-lowercase-hex>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","state":"verified"}`
+`{"created-at":"<RFC3339-UTC>","evidence-sha256":"sha256:<64-lowercase-hex>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","state":"verified"}`
 for the selected rotation. Empty current history is accepted only with the independently reviewed
 bootstrap record; any existing rotation requires the verified form and exact matching current
-run/attempt/receipt digest. A deleted or changed previously recorded run is not bootstrap.
+creation instant/run/attempt/receipt digest. A deleted or changed previously recorded run is not
+bootstrap.
 
 Require the selected rotation run to be the exact protected-main rotation workflow at its receipt's
 `Q_d`, status `completed`, conclusion `success`, with exactly one successful
@@ -2181,6 +2287,13 @@ the candidate's documentation state. Later main movement cannot change this even
 The selected `merge_group` and push pairs retain their existing contracts; neither is forced into
 the PR's two-parent shape.
 
+Every subject-history Git subprocess receives only runner `PATH`, `LC_ALL=C`, `HOME=/dev/null`,
+`TMPDIR=/tmp`, a ceiling at the subject's parent, `GIT_NO_REPLACE_OBJECTS=1`,
+`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, and `GIT_TERMINAL_PROMPT=0`, and every command
+also uses `--no-replace-objects`. Repository/worktree/common-dir, namespace, index, object/alternate,
+shallow-file, inline-config, replacement-ref-base, XDG, and arbitrary caller environment values are
+absent from the child.
+
 The scanner compares the selected base and candidate states as follows:
 
 - **bootstrap:** `docs/.edgezero-action-release.json` is absent from both base and candidate. Only the
@@ -2197,6 +2310,14 @@ The scanner compares the selected base and candidate states as follows:
   fenced workflow equals the candidate record's `V`; downgrade, partial update, or non-document
   change fails closed.
 
+The hosted release verifier reads its optional API token in the trusted parent and passes it only
+through curl config stdin. The curl child environment is exactly runner `PATH` and `LC_ALL=C`; ambient
+token, proxy, CA-bundle, home/XDG, curl-home, and arbitrary variables are absent. Its anonymous
+release-ref Git child runs in a fresh temporary working directory/home with only `PATH`, that home and
+ceiling, disabled system/global configuration, disabled terminal prompting, and replacement objects
+disabled in both argv and environment. Fixtures inject each prohibited environment family and fail if
+a child observes one.
+
 The first transition therefore happens only in `R`, after `V` exists. Candidate `H` never puts an
 unpublished or retired version into protected-main documentation, no later PR can return to
 bootstrap mode, and later action releases repeat the same post-release atomic record/documentation
@@ -2210,8 +2331,10 @@ Required automated coverage includes:
 - cold, warm, uncached, corrupt-restore, stop-failure, write-error, audit-failure, and save-warning
   cache paths, plus separate complete lookup-eligibility and protected-event save-authorization truth
   tables for both cache families;
-- fixed host path restoration, cross-host-checkout-path hits, nested workspace and sibling path deps,
-  public Git dependencies, concurrent generations, seven-day expiry as documented behavior, exactly
+- both fixed host cache paths, absent-root/overlapping-invocation rejection, verified cleanup,
+  cache-disabled absence of the fixed parent target root and cleanup of its invocation-private target,
+  cross-host-checkout-path hits, nested workspace and sibling path deps, public Git dependencies,
+  concurrent generations, seven-day expiry as documented behavior, exactly
   one Cargo compile/build invocation after metadata preflight, no action-level retry, and pinned
   sccache response-loss fallback behavior;
 - cache audit type/owner/path/layout/logical-byte/non-sparse/path-length/entry-count checks and
@@ -2221,14 +2344,17 @@ Required automated coverage includes:
   precreation, special-file/hardlink rejection, descriptor-relative cleanup, caller-declared generated
   output, undeclared output rejection, source-free lifecycle bypass of Copy B checks, and unchanged
   original checkout;
-- every environment and mount profile, including token absence, production healthcheck tokenlessness,
+- every environment and mount profile, including Copy A/Copy B/Copy I metadata source selection,
+  Copy I's identity-only lifetime and cleanup, the container-only credential-free metadata preflight,
+  rejection of authority or host Cargo/config/credential influence, token absence, production healthcheck tokenlessness,
   staging token presence, credential-free `app-build`, every exact `app-env` name/value/count/size
   boundary, sorted placeholder-only `env -S` argv, expansion-before-clear edge values, inherited/image/
   Docker variable removal, empty Cargo-config policy, config-push repo/config confinement, and
   deploy-without-sccache;
 - strict caller identity, full-SHA app refs, exact-version workflow/action refs, resolved workflow
   SHA, exact GitHub-hosted Linux/X64 context checks in every public action and sensitive repository
-  job, immutable EdgeZero release enforcement, locally derived platform identity, matrix artifacts,
+  job, step-local empty `BASH_ENV`/`ENV` before every shell-backed first guard, immutable EdgeZero
+  release enforcement, locally derived platform identity, matrix artifacts,
   and consumer recomputation for private repositories;
 - exact canonical metadata and expected JSON, typed `write-expected`, schema versions, duplicate keys,
   byte-exact ustar
@@ -2253,7 +2379,10 @@ Required automated coverage includes:
   merge-queue payload and single-entry behavior, API-visible exact-`S` push assertion-step evidence,
   image-pin deletion and source-ancestry ordering, environment
   reviewer/self-review/deployment-policy checks, per-attempt approval comment and token-ordering checks,
-  policy-API method/path/header/version allowlisting, App installation/repository/permission/token-
+  policy-API method/path/header/version allowlisting, canonical publisher-prerequisite record parsing,
+  writer credential/method/path/body confinement, inert/`S`-bound transition truth tables, post-write
+  readback, queued publisher observing post-concurrency variable values, unique latest-`created_at`
+  rotation selection and equal-time ambiguity, App installation/repository/permission/token-
   scope checks, actionlint queue-compatibility isolation, publication concurrency and queue-overflow
   cancellation, gate-rotation failure recovery, and release rerun/idempotency;
 - post-`B` dispatch/activation/rollback using distinct gate, dispatch, and final-head identities;
@@ -2408,6 +2537,14 @@ Caching remains off by default. Container execution and provenance validation ar
   since a failing lock workflow alone cannot preserve GitHub concurrency.
   The five existing plans carry the corresponding fixtures and hosted checkpoints;
   this design revision does not claim those implementation changes are complete.
+- **v6.31:** defined the publisher's authenticated prerequisite ingress as one canonical repository
+  variable with a separately reviewed local single-variable writer, inert post-rotation state, exact
+  release-source binding, and post-concurrency freshness fixture; replaced undocumented numeric run-id
+  ordering with unique latest RFC 3339 creation time; closed first-shell `BASH_ENV`/`ENV`, parent target-
+  cache path/lifecycle, and credential-free metadata execution profiles, including the identity-only
+  consumer copy required when Copy A/Copy B is unavailable; and assigned the corresponding
+  ownership and adversarial tests across the five plans. Exact stable patch-version `uses:` refs and
+  their accepted third-party tag-movement risk are unchanged.
 
 ## 13. Deferred implementation mechanics
 

@@ -7,7 +7,7 @@
 CLI artifact and make every consumer independently validate exact caller and platform identity before
 the binary can execute.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31 Sections
 3, 5.1, 5.3, 5.4, 6, 7, and 9.
 
 ## 1. Fixed actions and boundaries
@@ -49,7 +49,7 @@ the binary can execute.
       or scope broadening. Test single-repository contents-read minting, identity failure, expired
       tokens, failed materialization, and mandatory post-step revocation.
 - [ ] Parse the reusable workflow and require its first executable step to be the fixed inline
-      producer bootstrap. Bind the three runner fields, four `job.workflow_*` fields,
+      producer bootstrap with step-local `BASH_ENV: ""` and `ENV: ""`. Bind the three runner fields, four `job.workflow_*` fields,
       `job.check_run_id`, and `app-ref` directly from their exact contexts or declared input; validate
       the exact runner/workflow/version/SHA/generation contract before any checkout, cache restore/
       save, artifact work, Docker, repository code, or credential use. Then require the EdgeZero
@@ -59,7 +59,8 @@ the binary can execute.
       it, and proves its exact root/repository/HEAD/clean/content contract before any local action or
       helper executes. Negative fixtures cover missing, reordered, late, skipped, continued, or
       failure-masked assertions, caller-env-derived, differently cased, malformed, and self-hosted
-      values, local execution before verification, and non-cleanup always-run paths; a `runs-on` label
+      values, missing/inherited/nonempty step-local `BASH_ENV` or `ENV`, local execution before
+      verification, and non-cleanup always-run paths; a `runs-on` label
       or host-command check never substitutes for the context predicate.
 - [ ] Add repository-wide structural tests that candidate revision `H` replaces
       `.github/actions/build-app-cli/action.yml` with the exact fail-closed retirement stub: its first
@@ -67,9 +68,10 @@ the binary can execute.
       step always fails with migration guidance, and it has no producer input/output, build helper,
       cache, Docker, or artifact-upload path. Reject any
       executable repository workflow or runnable documentation producer call to that composite at
-      `H`. The four gated prepublication documents remain explicitly non-runnable until plan 5 removes
-      their legacy guidance at `R`; immutable older exact versions remain historical behavior, not a
-      supported compatibility path in `H` or `V`.
+      `H`. Plan 5 replaces their legacy topology while constructing `H`, but leaves the exact gated
+      version placeholder so the revised examples remain explicitly non-runnable. Revision `R` only
+      adds the published `{V,P}` record and substitutes literal `V`; immutable older exact versions
+      remain historical behavior, not a supported compatibility path in `H` or `V`.
 - [ ] Add substitution fixtures: caller-supplied expected JSON, alternate schema/fixtures, candidate
       validator, shell-generated JSON, tar implementation, binary execution in parser container,
       writable parser input, and a second downloaded artifact must all fail.
@@ -84,7 +86,8 @@ the binary can execute.
 - [ ] Consume plan 2's sole identity-calculation helper over a validated authority
       checkout; do not add another identity implementation. Require exact
       repository ID from authenticated GitHub API, full lowercase source SHA, workspace/cwd
-      containment, tracked regular lockfile, and credential-free locked Cargo metadata agreement.
+      containment, tracked regular lockfile, and credential-free locked Cargo metadata agreement from
+      plan 2's container-only `metadata-preflight`; reject host Cargo or an alternate profile.
       Derive the package version from that same metadata result; no caller input may override it.
 - [ ] Produce exact bounded package/bin names and the design's length-framed workspace hash. Reject
       non-UTF-8/escaping paths, symlink roots, malformed repository ID/SHA, duplicate outputs, and
@@ -120,8 +123,12 @@ the binary can execute.
       `include-hidden-files:false`, `if-no-files-found:error`, and `overwrite:false`; omit
       `retention-days` to preserve the repository/organization default. Require nonempty artifact
       id/digest outputs and no wildcard/multiple path. Add a structural regression rejecting forced
-      one-day retention and a delayed-consumer fixture beyond 24 hours, with an adequate effective
-      retention policy. Expired artifacts fail explicitly; do not rebuild silently during deployment.
+      one-day retention. Add a two-phase hosted qualification fixture: the producer uploads and records
+      its exact run/artifact identity, a protected consumer job remains unapproved without occupying a
+      runner, and an independent reviewer releases it only after validated elapsed time exceeds 24
+      hours while the effective repository retention still covers the artifact. The resumed job must
+      download and validate that original artifact. Expired artifacts fail explicitly; do not rebuild
+      silently during deployment.
 
 ## 5. Reusable workflow interface
 
@@ -189,7 +196,8 @@ the binary can execute.
       materialization, artifact download, or Docker execution; caller inputs and caller `env` cannot
       substitute these bindings. The helper receives no `job.workflow_*`, `job.check_run_id`, app,
       action, cache, or provider identity. Contract tests require this to remain the first executable
-      internal action step with no `if`, continuation, or failure masking; every later non-cleanup
+      internal action step with no `if`, continuation, or failure masking and with step-local empty
+      `BASH_ENV` and `ENV`; every later non-cleanup
       internal step remains success-gated. Support and hosted fixtures require a caller's step-based
       job containing the action reference to declare literal `runs-on: ubuntu-24.04`; the composite
       cannot observe that label and never treats it as security evidence.
@@ -200,7 +208,9 @@ the binary can execute.
       output and masked before
       use. Require its runner action repository/ref to equal the supplied exact version. Materialize
       one action-private authority with plan 2's gated object-first helper, remove the credential
-      channel, recompute identity, and clean the authority on every exit. Output exactly
+      channel, export a private faithful `.git`-free/non-hardlinked Copy I, recompute identity through
+      plan 2's closed metadata profile with only that copy mounted read-only, and clean both authority
+      and Copy I on every exit. Never expose Copy I to another profile or action. Output exactly
       `app-repo-id`, `source-revision`, `app-cli-package`, `app-cli-bin`, and `workspace-id`; never
       output a path, descriptor, opaque authority handle, token, or platform field.
 - [ ] In each consuming action, create a private action workspace, derive local PlatformIdentity,

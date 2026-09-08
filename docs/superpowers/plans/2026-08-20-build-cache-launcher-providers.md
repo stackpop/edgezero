@@ -7,7 +7,7 @@
 can reach a credentialed provider command, and preserve the parent deploy lifecycle without ambient
 host state or the legacy `--stage` spelling.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.30 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31 Sections
 2, 5, 6.1, 6.6, 7.2, and 9. The parent deploy spec remains normative where the addendum does not
 expressly replace it.
 
@@ -102,11 +102,12 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       sensitive string `app-checkout-token`, supplied from a GitHub secret or masked same-job
       App-token output and masked before use. App private keys are not consumer-action inputs. At
       action start, independently materialize one action-private authority with plan 2's trusted
-      object-first helper, verify all five supplied
-      `CallerExpectedIdentity` fields, and remove the checkout credential channel before application
-      code, provider-token creation, or provider-token injection. Never accept or output an authority
-      path, descriptor, or opaque handle from another action. Source-free actions accept none of these
-      materialization inputs and no checkout token.
+      object-first helper and remove the checkout credential channel. Export Copy B for
+      `deploy-fastly` or the short-lived Copy I described below for `config-push-fastly`, then verify
+      all five supplied `CallerExpectedIdentity` fields through the closed metadata profile before
+      application code, provider-token creation, or provider-token injection. Never accept or output
+      an authority path, descriptor, copy path, or opaque handle from another action. Source-free
+      actions accept none of these materialization inputs and no checkout token.
 - [ ] For `deploy-fastly`, build Copy B with plan 2's trusted exporter from that action-local,
       credential-free authority. It is a faithful, private, `.git`-free, non-hardlinked, recursive,
       non-sparse copy containing only tracked files and initialized submodules. Keep the authority
@@ -116,12 +117,19 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       `deploy-fastly` invocation's internal operations, and never share it or its output roots with
       another action.
 - [ ] Make `config-push-fastly` the explicit no-Copy-B exception. It executes no app code and mounts
-      only its independently materialized credential-free frozen authority read-only. Record and
+      only its independently materialized credential-free frozen authority read-only for config push.
+      Before identity calculation it separately exports a private Copy I, runs only plan 2's closed
+      metadata profile against that read-only copy, and destroys Copy I before provider-token creation;
+      it never mounts the authority in metadata preflight. Record and
       verify authority HEAD, index/worktree state, full inventory, and selected tracked
       manifest/file-config identity before token creation, immediately before container start, and
       after the command; apply equivalent identity checks to an action-owned inline config. Add
       substitution/race fixtures at every boundary and fail on any authority, manifest, or config
       change.
+- [ ] Run `deploy-fastly` identity metadata against its own read-only Copy B before app execution, and
+      run `config-push-fastly` identity metadata against only its short-lived Copy I. Add negative
+      fixtures proving neither path mounts the authority, that Copy I cannot enter config push or any
+      provider/build profile, and that both copies are action-local and cleaned on every exit.
 - [ ] Parse `generated-output-paths` as the exact bounded canonical JSON array. Reject raw input over
       65,536 bytes, duplicates, overlap, root/dot/git paths, tracked path ancestors, existing roots,
       non-UTF-8 or noncanonical
@@ -146,15 +154,25 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
 ## 6. Credential-free app build and parent target cache
 
 - [ ] Under `build-mode: always`, run exactly one credential-free app-build profile before provider
-      deploy. It receives the validated binary, Copy B, fresh Cargo home, action-owned target path,
-      validated app environment, and declared/implicit output roots, but no provider token or sccache.
+      deploy. It receives the validated binary, Copy B, fresh Cargo home, validated app environment,
+      declared/implicit output roots, and one target directory mounted at `/work/target`, but no
+      provider token or sccache. With parent `deploy-fastly.cache:true`, that directory is the fixed host
+      path `${RUNNER_TEMP}/edgezero-deploy-fastly-target-v1`; with cache disabled, it is a fresh directory
+      beneath the invocation-private workspace and is never the fixed cache root.
 - [ ] If the parent `deploy-fastly.cache` option is enabled, restore its exact-key Cargo target cache
       only after plan 2's lookup-eligibility predicate passes, audit it under the parent's contract,
       and save it after successful credential-free app-build and source/output audit only when plan
       2's full protected-event save predicate passes. Cross-repository use without disclosure
       acknowledgement fails before restore. Save must finish before token minting or injection and is
       never retried or attempted after any token-bearing command. Commit independent lookup/save
-      truth-table integration tests for this cache family.
+      truth-table integration tests for this cache family. Require real non-symlinked `RUNNER_TEMP`,
+      target-root absence before mode-0700 creation, recorded device/inode/uid/gid, no adoption or
+      nested mount, descriptor-relative no-follow audit/cleanup, and verified absence on every exit.
+      A concurrent same-job invocation fails on the existing root; a sequential invocation starts only
+      after prior verified cleanup. The host path never includes a checkout or invocation identifier.
+- [ ] Add a cache-disabled target fixture that proves no lookup/save occurs, the fixed parent target
+      root is neither created nor adopted, only the fresh invocation-private target is mounted at
+      `/work/target`, and that private target is removed on success and every failure path.
 - [ ] Under `build-mode: never`, perform no target-cache restore/save and no credential-free build.
       Provider deploy may still compile with the token for either mode; never claim app-build prevents
       that compile and never expose its token-bearing outputs to a cache.
@@ -168,7 +186,8 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       `runner.os`, and `runner.arch`. Require exact `github-hosted`, `Linux`, and `X64` before artifact
       download, source materialization, Docker, token handling, or mutation. Reject caller-input/env
       substitution, missing values, and self-hosted Linux/X64 fixtures. Contract tests require this to
-      remain the first executable internal action step with no `if`, continuation, or failure masking;
+      remain the first executable internal action step with no `if`, continuation, or failure masking
+      and with step-local empty `BASH_ENV` and `ENV`; reject inherited/nonempty startup bindings;
       every later protected operation requires guard success. An `if: always()` cleanup may remove
       recorded private paths and named containers; required reconciliation additionally requires
       exact guard-success and `mutation-attempted` conditions. Reject every other non-cleanup
