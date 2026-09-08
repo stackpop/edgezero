@@ -355,7 +355,7 @@ fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
 /// would have swallowed any stderr containing the word
 /// "conflict" and let provision march on to writeback against a
 /// nonexistent store, surfacing as a confusing deploy-time error.
-fn looks_like_already_exists(stderr: &str, kind: &str) -> bool {
+pub(super) fn looks_like_already_exists(stderr: &str, kind: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     let conflict_signal = lower.contains("already exists")
         || (lower.contains("duplicate") && lower.contains("name"))

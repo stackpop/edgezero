@@ -504,7 +504,7 @@ fn write_value_to_fastly_stdin(mut stdin: ChildStdin, value: &str) -> Result<(),
 /// both a bare array (`[ {"id": "...", "name": "..."}, ... ]`)
 /// and an `{"items": [...]}` envelope so this stays compatible
 /// across fastly CLI versions.
-fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
+pub(super) fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
     let parsed: serde_json::Value = match serde_json::from_str(stdout) {
         Ok(value) => value,
         Err(err) => {

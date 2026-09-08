@@ -122,7 +122,7 @@ pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), 
     Ok(())
 }
 
-fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
+pub(super) fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
     if let Some(found) = find_manifest_upwards(start, "fastly.toml") {
         return Ok(found);
     }

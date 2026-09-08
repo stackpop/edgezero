@@ -178,6 +178,13 @@ impl Adapter for CloudflareCliAdapter {
             }),
             AdapterAction::Deploy => run::deploy(args, ctx),
             AdapterAction::Serve => run::serve(args, ctx),
+            // The Fastly staging lifecycle is Fastly-only.
+            AdapterAction::DeployStaged
+            | AdapterAction::EmitVersion
+            | AdapterAction::Healthcheck
+            | AdapterAction::Rollback => Err(format!(
+                "cloudflare adapter does not support the Fastly staging lifecycle action {action:?}"
+            )),
             other => Err(format!("cloudflare adapter does not support {other:?}")),
         }
     }

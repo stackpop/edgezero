@@ -28,6 +28,7 @@ mod provision_local;
 mod push_cloud;
 mod push_local;
 mod run;
+mod staging;
 #[cfg(test)]
 mod test_support;
 
@@ -250,6 +251,10 @@ impl Adapter for FastlyCliAdapter {
             }
             AdapterAction::Deploy => run::deploy(args, ctx),
             AdapterAction::Serve => run::serve(args, ctx),
+            AdapterAction::DeployStaged => staging::deploy_staged(args),
+            AdapterAction::EmitVersion => staging::emit_active_version(args),
+            AdapterAction::Healthcheck => staging::healthcheck(args),
+            AdapterAction::Rollback => staging::rollback(args),
             other => Err(format!("fastly adapter does not support {other:?}")),
         }
     }
