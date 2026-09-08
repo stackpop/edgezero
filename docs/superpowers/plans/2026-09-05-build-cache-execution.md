@@ -184,3 +184,47 @@ Local v6.31 reconciliation verification on 2026-09-07:
   reproduced advanced-base selector fixture and release-verifier adversarial fixtures. Task 0 is
   complete. The real hosted release API/ref proof remains required at documentation revision `R`; it
   cannot run in bootstrap because the design requires the release record to remain absent through `P`.
+
+## Archive/Extraction Protocol Tranche
+
+Task 1 Section 5.2 now has the sole protocol-1 archive encoder/parser and atomic binary extractor.
+The encoder emits the exact two-member deterministic ustar form from design Section 6.3. The parser
+rejects noncanonical headers, alternate numeric encodings, extensions and non-regular members,
+renamed/duplicate/extra/out-of-order members, malformed sizes and checksums, nonzero padding,
+incorrect end blocks, trailing bytes, and checked-arithmetic or seek failures. Metadata allocation is
+bounded to 64 KiB; binary payloads are skipped and extracted through bounded 8-KiB I/O rather than
+loaded into memory.
+
+The committed archive corpus includes one byte-exact golden archive and malformed category fixtures.
+Review corrected the embedded-NUL vector so it preserves the canonical member name before post-NUL
+garbage. Because the eleven-octal-digit protocol field cannot encode a `u64` overflow, the former
+misnamed overflow tar is now the maximum-size vector and a synthetic `Read + Seek` fixture exercises
+near-`u64::MAX` offset overflow directly. Separate bounded readers prove zero/oversized metadata and
+aggregate-size failures occur before payload I/O.
+
+The extractor requires a fresh canonical empty output parent, writes one create-new temporary sibling,
+flushes and verifies it, and publishes with no replacement. Linux uses the required
+`renameat2(RENAME_NOREPLACE)` path; the macOS test path uses an atomic no-replace hard-link publication
+followed by source removal. Checked cleanup covers pre- and post-publication handled failures, reports
+cleanup failure without hiding the primary failure, and preserves independently created collision
+sentinels. Success requires one regular mode-0755, link-count-one `app-cli`. The output parent remains
+the invocation-private trusted directory from design Sections 6.5 and 6.6; no stronger concurrent
+same-uid adversary is claimed.
+
+TDD evidence was recorded before implementation and during review hardening: the initial focused suite
+failed on the unimplemented encoder/parser/extractor; bounded-I/O, temporary-ownership, fixture
+semantics, canonical-path, and exact-seek tests each failed for their intended missing behavior before
+the corresponding production or fixture correction. Final local verification on 2026-09-08:
+
+- Focused archive/extraction tests: 23 passed, zero failed.
+- Complete standalone validator tests: 38 passed, zero failed; formatting and all-target/all-feature
+  Clippy with warnings denied passed.
+- The standalone validator compiled for `x86_64-unknown-linux-gnu`; repository workspace tests,
+  formatting, all-target/all-feature Clippy, and the combined Fastly/Cloudflare check passed.
+- Two-stage read-only review approved Section 5.2 specification compliance and code quality after
+  checked cleanup, no-replace collision, inclusive-boundary, canonical-parent, and adversarial seek
+  coverage was added.
+
+The Linux publication branch is compile-checked locally and is exercised by hosted Linux tests after
+this tranche is pushed; this local record does not claim a macOS runtime executed `renameat2`.
+ELF/loadability, CLI/capability integration, image publication, and the later plans remain open.

@@ -344,15 +344,15 @@ protected gate baseline `G` before source revision `S` is proposed.
 
 ### 5.2 Archive/extraction tranche
 
-- [ ] Add a byte-for-byte golden archive from design Section 6.3 plus malformed base-256/octal,
+- [x] Add a byte-for-byte golden archive from design Section 6.3 plus malformed base-256/octal,
       checksum, embedded-NUL, PAX/GNU, sparse, duplicate, extra, traversal, link, special-file, header,
       order, size, padding, end-block, overflow, and trailing-data fixtures.
-- [ ] Write failing encoder, parser, and extraction tests. Assert two repeated encodes are identical,
+- [x] Write failing encoder, parser, and extraction tests. Assert two repeated encodes are identical,
       all payload padding is zero, exactly two end blocks precede EOF, and failure leaves the fresh output
       parent empty.
-- [ ] Run `cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml archive::tests`; expected: non-zero for
+- [x] Run `cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml archive::tests`; expected: non-zero for
       unimplemented protocol behavior.
-- [ ] Implement `archive.rs` and `extract.rs` directly over bounded `Read + Seek`/`Write`; do not
+- [x] Implement `archive.rs` and `extract.rs` directly over bounded `Read + Seek`/`Write`; do not
       invoke system `tar`, add a tar crate, or load the allowed 512 MiB binary wholesale. Create outputs
       atomically and require the final regular file to have mode 0755 and link count one. Rerun focused
       and full crate tests; expected: pass. Commit the green archive/extraction tranche.
