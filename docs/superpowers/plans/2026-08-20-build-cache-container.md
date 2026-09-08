@@ -618,20 +618,20 @@ release credential. Candidate code is always subject data. No image is published
       placeholders, and any argv element constructed by inserting a value.
 - [ ] Implement exact semantic-version parsing, installed-target inspection, and compilation of the
       committed `wasm-smoke.rs` library into tmpfs. Substring version matching is forbidden.
-- [ ] Write failing fixture tests for `verify-published-image.sh`. Cover accepted leaf Docker and
+- [x] Write failing fixture tests for `verify-published-image.sh`. Cover accepted leaf Docker and
       OCI manifests; rejected one-entry/multi-entry indexes; missing config/layers; malformed BuildKit
       metadata; wrong OS/architecture; wrong source/revision/protocol labels; mutable-tag lookup; private
       registry response; and every toolchain/validator failure.
-- [ ] Implement the verifier over a supplied `repository@digest`, source SHA, and protocol. Use
+- [x] Implement the verifier over a supplied `repository@digest`, source SHA, and protocol. Use
       `docker buildx imagetools inspect "$REF" --raw` for media type and
       `--format '{{json .Image}}'` for image OS/architecture. Never inspect a tag to discover
       identity.
-- [ ] Exercise the baked validator's `write-expected` profile with only a fresh writable
+- [x] Exercise the baked validator's `write-expected` profile with only a fresh writable
       `/work/expected`, tmpfs home/temp, no repository/binary/target/Cargo/cache/token mount, and
       `--network=none`. Then run deterministic package twice and validate every golden/malformed
       archive with each operation's exact mount profile. Assert no `/work/package` convention
       exists.
-- [ ] Run both focused tests and shellcheck before implementing, then rerun them green.
+- [x] Run both focused tests and shellcheck before implementing, then rerun them green.
 
 ### 6.3 Protected classifier and required workflow
 

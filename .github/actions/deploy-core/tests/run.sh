@@ -2547,6 +2547,7 @@ main() {
   assert_succeeds "build-container staged context contract" bash "$ACTIONS_DIR/deploy-core/tests/stage-build-context.test.sh"
   assert_succeeds "build-container input contract" bash "$ACTIONS_DIR/deploy-core/tests/assert-build-container-context.test.sh"
   assert_succeeds "build-container toolchain contract" bash "$ACTIONS_DIR/deploy-core/tests/verify-toolchain.test.sh"
+  assert_succeeds "published build-container verification contract" bash "$ACTIONS_DIR/deploy-core/tests/verify-published-image.test.sh"
   assert_succeeds "actionlint installer contract" bash "$ACTIONS_DIR/deploy-core/tests/install-actionlint.test.sh"
   assert_succeeds "documentation reference and release-state contracts" node --test "$ACTIONS_DIR/deploy-core/tests/check-doc-action-pins.test.mjs"
   if command -v actionlint >/dev/null 2>&1 && [[ "$(actionlint -version | sed -n '1p')" == 1.7.12 ]]; then
