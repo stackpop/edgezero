@@ -43,8 +43,14 @@ chunks progressively depends on the adapter:
    provider response (Spin rejects streamed bodies over 16 MiB), so the client
    receives the whole body at once
 
-Use streaming for its memory and composability benefits everywhere, but only rely
-on progressive delivery (SSE, long-lived chunked responses) on Cloudflare today.
+On Cloudflare, streaming also keeps memory flat, because each chunk is forwarded as
+it is produced. On the buffering adapters a streamed body is collected in full
+before the response goes out: Axum into an unbounded buffer, Spin into a buffer
+capped at 16 MiB (larger bodies fail), and Fastly into a host-side body that is
+only sent once complete. There `Body::stream` is an API-composability convenience,
+not a memory saving, and a very large streamed response can exhaust memory or be
+rejected. Only rely on progressive delivery (SSE, long-lived chunked responses) on
+Cloudflare today.
 
 ## Server-Sent Events
 

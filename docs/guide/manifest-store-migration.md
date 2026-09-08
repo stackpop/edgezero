@@ -84,17 +84,17 @@ the spec, §6.6):
 `__` (double underscore) separates segments. Absent variables fall
 back to their listed defaults.
 
-| Variable                                   | Role                                                                                                                   | Default         |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | --------------- |
-| `EDGEZERO__STORES__<KIND>__<ID>__NAME`     | platform name for logical store `<id>`                                                                                 | the logical id  |
-| `EDGEZERO__STORES__CONFIG__<ID>__KEY`      | config-store **key** the runtime reads the blob from — the staging/canary selector that pairs with `config push --key` | the logical id  |
-| `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                                             | —               |
-| `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                                                       | `127.0.0.1`     |
-| `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                                                       | `8787`          |
-| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                                              | adapter default |
-| `EDGEZERO__LOGGING__ENDPOINT`              | named log endpoint the platform logger attaches to (Fastly only); unset means no platform logger is initialised        | none            |
-| `EDGEZERO__LOGGING__USE_FASTLY_LOGGER`     | whether to initialise the Fastly logger (Fastly only); derived from `ENDPOINT` on the runtime-env path                 | `true`          |
-| `EDGEZERO__LOGGING__ECHO_STDOUT`           | also echo log lines to stdout (Fastly only)                                                                            | `true`          |
+| Variable                                   | Role                                                                                                                          | Default         |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| `EDGEZERO__STORES__<KIND>__<ID>__NAME`     | platform name for logical store `<id>`                                                                                        | the logical id  |
+| `EDGEZERO__STORES__CONFIG__<ID>__KEY`      | config-store **key** the runtime reads the blob from — the staging/canary selector that pairs with `config push --key`        | the logical id  |
+| `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                                                    | —               |
+| `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                                                              | `127.0.0.1`     |
+| `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                                                              | `8787`          |
+| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                                                     | adapter default |
+| `EDGEZERO__LOGGING__ENDPOINT`              | named log endpoint (Fastly only); setting it is what enables the Fastly logger, unset means no platform logger is initialised | none            |
+| `EDGEZERO__LOGGING__USE_FASTLY_LOGGER`     | resolved into `EnvConfig` but not applied on the Fastly runtime-env path: logger use is derived from `ENDPOINT` alone         | —               |
+| `EDGEZERO__LOGGING__ECHO_STDOUT`           | resolved into `EnvConfig` but not applied on the Fastly runtime-env path: stdout echo is always on there                      | —               |
 
 `<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-case logical
 id. The literal `__KEY` selector is config-only — it swaps which blob

@@ -604,17 +604,17 @@ not from a remote auth provider.
 
 The CLI respects these environment variables:
 
-| Variable            | Description                                                                                                                                                         |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`). Honoured by `build`, `deploy`, and `serve`; `provision` and the `config` subcommands take `--manifest` instead.        |
-| `FASTLY_API_TOKEN`  | Fastly API token. Required by the Fastly lifecycle commands (`deploy`, `active-version`, `rollback`, and a **staging** `healthcheck`); they fail closed without it. |
-| `FASTLY_SERVICE_ID` | Default Fastly service id, used when `--service-id` is not passed. The lifecycle commands need a service id from one source or the other.                           |
+| Variable            | Description                                                                                                                                                                                                                                  |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`). Honoured by `build`, `deploy`, `serve`, and `auth` (which has no `--manifest` flag, so this is its only manifest selector); `provision` and the `config` subcommands take `--manifest` instead. |
+| `FASTLY_API_TOKEN`  | Fastly API token. Required by the Fastly lifecycle commands (`deploy`, `active-version`, `rollback`, and a **staging** `healthcheck`); they fail closed without it.                                                                          |
+| `FASTLY_SERVICE_ID` | Default Fastly service id, used when `--service-id` is not passed. The lifecycle commands need a service id from one source or the other.                                                                                                    |
 
 ## Working Directory
 
 All commands expect to run from the project root where `edgezero.toml` is located. If the file is
-missing, `build`, `deploy`, and `serve` fall back to built-in adapters (when compiled in) instead of
-manifest-driven commands; `provision` and the `config` subcommands error instead.
+missing, `build`, `deploy`, `serve`, and `auth` fall back to built-in adapters (when compiled in)
+instead of manifest-driven commands; `provision` and the `config` subcommands error instead.
 
 ## Adapter Discovery
 

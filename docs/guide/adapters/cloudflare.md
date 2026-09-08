@@ -60,10 +60,30 @@ For fully manual wiring, `CloudflareService::new(&app)` builds a dispatcher one
 store at a time: `.with_config(binding)` (a KV binding name),
 `.with_config_handle(handle)`, `.with_kv(binding)`, `.with_secrets()`, the
 matching `.require_kv()` / `.require_secrets()` flags, and finally
-`.dispatch(req)`. This path takes bindings verbatim and does not resolve
-`EDGEZERO__STORES__*` selectors, so prefer `run_app` unless you are mocking a
-backend. `dispatch_with_registries` is the registry-based dispatcher `run_app`
-itself calls.
+`.dispatch(req, env, ctx).await`, which needs the worker `Env` and `Context`
+to open bindings:
+
+```rust
+use edgezero_adapter_cloudflare::request::CloudflareService;
+use edgezero_core::app::Hooks as _;
+use my_app_core::App;
+use worker::*;
+
+#[event(fetch)]
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let app = App::build_app();
+    CloudflareService::new(&app)
+        .with_config("APP_CONFIG")
+        .with_kv("APP_KV")
+        .dispatch(req, env, ctx)
+        .await
+}
+```
+
+This path takes bindings verbatim and does not resolve `EDGEZERO__STORES__*`
+selectors, so prefer `run_app` unless you are mocking a backend.
+`dispatch_with_registries` is the registry-based dispatcher `run_app` itself
+calls.
 
 ## Building
 
