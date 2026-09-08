@@ -12,10 +12,10 @@ organization-required workflow. Source revision `S` is an isolated canonical rel
 repository image-context bytes remain identical to `G`. The publisher stages a fresh context solely from the
 verified `G` checkout, captures and verifies immutable digest `D`, proves anonymous access, and opens
 an idempotent, forward-only App-authored PR adding the image and release-evidence records. That pin
-forms baseline `B`. Four remaining feature
-plans land on top. Their final passing action revision `P` contains the unchanged `{D, S, protocol}`
-record and the adoption documents for exact stable version `V`; consumers pin immutable release
-version `V`, which resolves to `P`.
+forms baseline `B`. Four remaining feature plans land on top. Their final passing action revision `P`
+contains the unchanged `{D, S, protocol}` record and prepublication adoption documents with the gated
+placeholder. After `P` qualifies, immutable stable release `V` is published at `P`; documentation
+revision `R` replaces the placeholders, and consumers pin `V`.
 
 **Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31.
 
@@ -78,9 +78,12 @@ version `V`, which resolves to `P`.
 Although this is plan 1 of five, image publication cannot run first. Execute these gates:
 
 The already committed Section 5.1 JSON tranche is retained as reviewed preparatory work. Do not begin
-Section 5.2 or claim Task 1 complete until the remaining Task 0 selector, placeholder, hosted-verifier,
-and hosted-CI checks are green. This exception records branch history; it does not relax the landing
-order below.
+Section 5.2 or claim Task 1 complete until the Task 0 selector, placeholder, hosted-verifier
+implementation, and bootstrap hosted-CI checks are green. The live transition proof is not a Task 0
+prerequisite: the design keeps `docs/.edgezero-action-release.json` absent through `P`, creates stable
+release `V` only after `P` qualifies, and exercises the real API/ref proof in the documentation-only
+revision `R` under consumer plan Section 9. This exception records branch history; it does not relax
+the landing order below.
 
 1. Complete the repository-wide exact-version pin-gate migration and actionlint upgrade (Task 0).
 2. Complete the protocol-owner validator, schema, fixtures, pin validator, image verifier, exact image
@@ -246,7 +249,7 @@ v6.31 and must be narrowed before adding the write-privileged publisher.
       exact minimal child environment; inject and reject repository/worktree/common-dir, namespace,
       index, object/alternate, shallow-file, inline-config, replacement-base, XDG, and arbitrary
       ambient state. Keep these tasks unchecked until code, fixtures, and hosted CI agree.
-- [ ] Add the hosted transition verifier to gate `G`. With only read permissions and fixed
+- [x] Add the hosted transition verifier to gate `G`. With only read permissions and fixed
       no-redirect versioned requests, it proves record `V` is a published `draft:false`,
       `prerelease:false`, `immutable:true` release whose API target and anonymous peeled remote ref
       both equal record `P`. Bootstrap and unchanged released-state checks remain offline. Candidate
@@ -260,7 +263,10 @@ v6.31 and must be narrowed before adding the write-privileged publisher.
       the earlier `2022-11-28` request is not compliant transition evidence. Pass authorization only
       through curl config stdin and give curl only runner `PATH` plus `LC_ALL=C`; fixtures reject
       inherited token/proxy/CA/home/XDG/curl-home/arbitrary values. Give anonymous release-ref Git only
-      its existing closed temporary-home/config environment plus replacement-object hardening.
+      its existing closed temporary-home/config environment plus replacement-object hardening. Task 0
+      qualifies the implementation with adversarial fixtures and a hosted bootstrap run; consumer plan
+      Section 9 supplies the real immutable `V` transition proof when revision `R` can legally add the
+      release record.
 - [x] Retain global zizmor `ref-pin` as defense in depth and document that the structural scanner is
       stricter. Rewrite `.github/zizmor.yml`'s existing comment so it no longer claims full commit
       SHAs pass repository policy: `ref-pin` accepts symbolic refs, while the structural gate permits

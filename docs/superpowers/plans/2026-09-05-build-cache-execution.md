@@ -162,8 +162,9 @@ This record does not claim those future publisher, rotation, cache, metadata, or
 tasks are implemented. Task 0 selector, whole-document placeholder, and hosted API-contract fixes are
 tracked separately. Their scanner implementation confines subject Git and hosted release-verifier
 subprocesses to the v6.31 allowlisted environments. The selector and placeholder paths pass local and
-hosted contract suites; live hosted release-transition agreement remains a separate checkpoint before
-the archive/extraction tranche begins.
+hosted contract suites; the transition verifier passes its adversarial fixtures in hosted CI. The real
+immutable-release transition remains a separate consumer-plan Section 9 checkpoint at documentation
+revision `R`, after stable release `V` exists.
 
 Local v6.31 reconciliation verification on 2026-09-07:
 
@@ -180,5 +181,6 @@ Local v6.31 reconciliation verification on 2026-09-07:
   strict Clippy.
 - Independent design/plan, implementation-compliance, and code-quality reviews reported no remaining
   local issue. PR 347's hosted `static-checks` job passed 319 action-contract tests, including the
-  reproduced advanced-base selector fixture. The hosted release API/ref proof remains required before
-  its Task 0 checkbox or the archive/extraction tranche can advance.
+  reproduced advanced-base selector fixture and release-verifier adversarial fixtures. Task 0 is
+  complete. The real hosted release API/ref proof remains required at documentation revision `R`; it
+  cannot run in bootstrap because the design requires the release record to remain absent through `P`.
