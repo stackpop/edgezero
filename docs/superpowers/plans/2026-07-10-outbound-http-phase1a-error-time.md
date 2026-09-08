@@ -72,6 +72,14 @@ implementation.
   `#[non_exhaustive]`, `Clone + Copy + Debug + Eq`. Consumers inspect fields by matching the
   variant. The JSON envelope remains `{ "error": { "status", "kind", "message" } }` with
   no `field_path`, `reason`, or `cause`.
+- `BudgetSource::Unspecified` means no EdgeZero budget source was proven. It covers both
+  timeout APIs outside a dispatch budget and an independently controlled provider timeout
+  observed before the selected absolute dispatch deadline expired. A provider phase timer
+  explicitly configured from the selected budget may retain that budget's source even when
+  it intentionally fires before the total deadline; an unconfigured DNS/write/host timeout
+  may not. Adapters must not stamp a configured source onto an early provider event merely
+  because its SDK error name contains `Timeout`; the outbound adapter phases own the exact
+  per-variant classification rule.
 
 - [ ] **Step 1: Write the failing tests (surface, typed fields, and wire isolation)**
 
