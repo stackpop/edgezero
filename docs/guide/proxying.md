@@ -56,7 +56,7 @@ async fn proxy_with_auth(RequestContext(ctx): RequestContext) -> Result<Response
 - Fastly and Cloudflare preserve streaming bodies; Axum buffers outbound bodies before sending.
 - Fastly and Cloudflare automatically decode `gzip`/`br` responses for you.
 - If you need a direct client (for tests or custom wiring), use the adapter clients
-  (`FastlyProxyClient`, `CloudflareProxyClient`, `AxumProxyClient::default()`).
+  (`FastlyProxyClient`, `CloudflareProxyClient`, `SpinProxyClient`, `AxumProxyClient::try_new()?`).
 
 ## Next Steps
 

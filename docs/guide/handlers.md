@@ -214,6 +214,30 @@ async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
 | `into_request()` | `Request` - consume context, take request  |
 | `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
 
+### Store Extractors
+
+Registries for the stores declared in `edgezero.toml` are injected by the adapter
+and extracted by id:
+
+| Extractor      | Gives you                                                                                                                          |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `Kv`           | `.default()` / `.named(id)` → a KV handle. See [KV](/guide/kv).                                                                    |
+| `Config`       | `.default()` / `.named(id)` → a config-store handle (`get(key)`).                                                                  |
+| `Secrets`      | `.default()` / `.named(id)` → a secret-store handle (`require_str(name)`).                                                         |
+| `AppConfig<C>` | Your typed app config, deserialised from the blob and with `#[secret]` fields resolved. See [Configuration](/guide/configuration). |
+
+```rust
+#[action]
+async fn handler(
+    AppConfig(cfg): AppConfig<MyAppConfig>,
+    kv: Kv,
+) -> Result<Response, EdgeError> {
+    let store = kv.default().ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no kv")))?;
+    let hits: u64 = store.get_or("hits", 0).await?;
+    Ok(text(format!("{} {hits}", cfg.greeting)))
+}
+```
+
 ## Sharing app state
 
 Request-derived extractors (`Json`, `Query`, `Path`, …) cover per-request data.
