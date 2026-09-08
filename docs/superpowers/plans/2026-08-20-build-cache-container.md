@@ -359,7 +359,7 @@ protected gate baseline `G` before source revision `S` is proposed.
 
 ### 5.3 ELF/loadability tranche
 
-- [ ] Add controlled static/dynamic valid, wrong class/endian/type/architecture/interpreter,
+- [x] Add controlled static/dynamic valid, wrong class/endian/type/architecture/interpreter,
       wrong `EI_VERSION`/`e_version`/`EI_OSABI`/`EI_ABIVERSION`/`EI_PAD`/`e_flags`/`e_ehsize`/
       `e_phentsize`, zero `e_phnum`, `PN_XNUM`,
       malformed/duplicate `PT_DYNAMIC`, unequal file/memory sizes, contradictory file-offset versus
@@ -378,15 +378,15 @@ protected gate baseline `G` before source revision `S` is proposed.
       direct/transitive flat-closure library, duplicate basename, dangling or escaping candidate,
       mixed architecture, duplicate-needed, interpreter dependency, and cycle fixtures for the
       controlled loader profile in design Section 6.4.
-- [ ] Write failing tests for machine, interpreter/null, byte-sorted duplicate-preserving direct
+- [x] Write failing tests for machine, interpreter/null, byte-sorted duplicate-preserving direct
       `DT_NEEDED`, digest, size, exact `/opt/edgezero/runtime-lib` lookup, symlink/hardlink/subdirectory
       rejection, duplicate basename, interpreter parsing, the one `ld-linux-x86-64.so.2` alias resolving
       to the already-validated interpreter rather than a flat copy, and recursive dependency resolution against
       a synthetic image root. Add preload presence, cache-only/default-directory/hardware-capability
       substitution, direct-loader argv, and explicit `dlopen` non-claim fixtures.
-- [ ] Run `cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml elf::tests`; expected: non-zero for
+- [x] Run `cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml elf::tests`; expected: non-zero for
       unimplemented inspection/loadability behavior.
-- [ ] Implement `elf.rs` with bounded ranged reads and checked offsets. Do not invoke `ldd`, the
+- [x] Implement `elf.rs` with bounded ranged reads and checked offsets. Do not invoke `ldd`, the
       loader, or the artifact. Rerun focused and full crate tests; expected: pass. Commit the green ELF
       tranche.
 

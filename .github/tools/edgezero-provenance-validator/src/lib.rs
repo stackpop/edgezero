@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod elf;
 pub mod extract;
 pub mod json_contract;
 

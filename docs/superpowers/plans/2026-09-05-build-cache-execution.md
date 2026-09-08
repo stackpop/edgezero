@@ -228,3 +228,38 @@ the corresponding production or fixture correction. Final local verification on 
 The Linux publication branch is compile-checked locally and is exercised by hosted Linux tests after
 this tranche is pushed; this local record does not claim a macOS runtime executed `renameat2`.
 ELF/loadability, CLI/capability integration, image publication, and the later plans remain open.
+
+## ELF/Loadability Protocol Tranche
+
+Task 1 Section 5.3 now implements the protocol-1 ELF parser and recursive startup-closure resolver.
+It accepts only ELF64 little-endian x86-64 objects with the exact header, program-header, object-role,
+interpreter, dynamic-table, string-table, tag, flag, SONAME, and dependency-name profile in design
+Section 6.4. Program-header ranges and virtual-to-file mappings use checked arithmetic and bounded
+8-KiB reads. Ambiguous, partial, unreadable, non-file-backed, or contradictory mappings fail closed.
+
+Dynamic dependency resolution is confined to `/opt/edgezero/runtime-lib`, except that the fixed loader
+basename resolves to the already validated `/lib64/ld-linux-x86-64.so.2`. The resolver validates every
+flat-directory object and alias, rejects symlinks, hard links, subdirectories, reserved names, missing
+closure members, mixed architectures, and `/etc/ld.so.preload`, and terminates cycles by device/inode.
+Direct `DT_NEEDED` values remain duplicate-preserving and are byte-sorted only for metadata. SHA-256
+and size are measured from the opened primary file. The structural launch contract fixes the dynamic
+loader options and records that the claim covers startup only, not later `dlopen` or child processes.
+
+TDD evidence was recorded before implementation and during review hardening. The initial focused
+suite failed because the ELF API and SHA-256 dependency did not exist. Subsequent focused failures
+proved missing preload rejection, malformed `PT_LOAD` memory bounds, partial mapping ambiguity, and
+unbounded repeatable `DT_NEEDED` retention before those behaviors were implemented. A metadata-
+impossible dependency count now fails after at most 21,846 entries, and dynamic entries are scanned in
+bounded chunks rather than with one seek per entry. Characterization tests cover existing rejection
+paths that required no production change. Final local verification on 2026-09-08:
+
+- Focused ELF/loadability tests: 32 passed, zero failed.
+- Complete standalone validator tests: 70 passed, zero failed; formatting and all-target/all-feature
+  Clippy with warnings denied passed.
+- Repository workspace tests passed after the production changes; `git diff --check` passed.
+- Independent specification-compliance and code-quality reviews approved the tranche after preload,
+  mapping-overlap, closed-tag boundary, empty-dynamic-table, and denial-of-service coverage was added.
+
+The real GNU-target CLI, pinned Bookworm loader/libc closure, and application-directed `dlopen` runtime
+fixture remain the explicit Task 2 image-verification gate. Section 5.3 does not invoke `ldd`, a loader,
+or an inspected artifact. CLI/capability integration, image publication, and the later plans remain open.
