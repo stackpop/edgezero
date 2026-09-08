@@ -308,3 +308,43 @@ The Linux no-replace branch is compile-checked but still requires hosted executi
 pinned Bookworm startup closure, controlled loader execution, and abnormal host cleanup remain Task
 2 container/image-verification obligations. This tranche does not claim an image publication,
 release, or cache-enabled deployment.
+
+## Pin and Release-Evidence Record Tranche
+
+Task 2 Section 6.1 now has the five-field image-record validator, exact ten-field canonical
+release-evidence validator, and sole typed pair writer. The validator performs a bounded regular-file
+check and consumes `jq --stream` events before ordinary object construction, so duplicate and escaped
+duplicate top-level keys cannot be hidden by last-value-wins parsing. It enforces exact fields and
+types, the fixed GHCR repository, nonzero lowercase image digest and source revision, informational
+release-tag grammar, protocol `1`, canonical positive u32/u64 run strings, GitHub login grammar,
+calendar-valid fresh UTC review time, exact no-newline JCS evidence bytes, and all cross-record
+identities.
+
+Only typed `runtime-ref`, `source-revision`, and `provenance-protocol` modes expose record data. The
+runtime reference is always `repository@digest`; there is no tag accessor or tag-based pull output.
+The pair writer accepts individual trusted scalar flags, fixes schema version internally, emits both
+records through create-new hard-link publication in one physical parent, and rolls back a one-sided
+publication only when it still owns that inode. It rejects raw JSON, duplicate/unknown/missing flags,
+split parents, normalized protocol spellings, and either pre-existing destination. No placeholder
+`image.json` or `image-release-evidence.json` was created.
+
+TDD evidence was observed before implementation. The corrected initial image-contract run had 23
+failures for missing fields, duplicate/unknown acceptance, absent typed modes, invalid digest/source/
+protocol/tag acceptance, and absent pair validation. The writer suite failed because the typed writer
+did not exist. Subsequent review-driven tests exposed the portable `wc -c` whitespace assumption and
+then passed after normalization. Final local verification on 2026-09-08:
+
+- Image record and typed-output contract: 44 passed, zero failed.
+- Release-evidence, pair, and writer contract: 66 passed, zero failed.
+- Bash syntax and ShellCheck at warning severity passed for both production scripts and both focused
+  tests.
+- The complete deploy-core action suite passed 304 tests with zero failures and five expected macOS
+  skips. Action-reference, documentation-reference, and placeholder-pin scanners passed.
+- Hosted CI for the preceding CLI/capability commit `525a18d1` passed every reported job, including
+  Rust CodeQL, all four wasm Clippy/test legs, static checks, smoke tests, formatting, and workspace
+  tests.
+
+The paired validator requires both current records and the writer cannot partially add or replace a
+pair. Git range-level atomic add/change/delete classification remains the explicit Section 6.5
+classifier obligation. Image creation, toolchain/runtime verification, publication, protected gate
+activation, and caching integration remain open.

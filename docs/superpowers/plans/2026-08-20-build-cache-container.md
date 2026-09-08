@@ -520,15 +520,15 @@ release credential. Candidate code is always subject data. No image is published
 
 ### 6.1 Pin-record validator
 
-- [ ] Extend `check-image-pin.test.sh` first. Cover the valid five-field record; malformed,
+- [x] Extend `check-image-pin.test.sh` first. Cover the valid five-field record; malformed,
       duplicate, extra, and missing fields; wrong JSON types; foreign or empty repository; mutable,
       zero, uppercase, or malformed digest/source; non-integer or non-`1` protocol; malformed tag;
       and any use of the tag as a runtime pull reference.
-- [ ] Add independent canonical bytes and malformed cases for the exact ten-field
+- [x] Add independent canonical bytes and malformed cases for the exact ten-field
       `image-release-evidence.json`: duplicate/extra/missing/reordered keys, non-JCS bytes, wrong
       strings/integer, run id/attempt precision, stale/invalid UTC time, login/challenge/digest/tag/S
       grammar, and every cross-file mismatch. Pair add/change/delete must be atomic.
-- [ ] Implement `check-image-pin.sh <path>` with Bash and `jq`. Detect duplicate top-level
+- [x] Implement `check-image-pin.sh <path>` with Bash and `jq`. Detect duplicate top-level
       keys from streaming parse events before ordinary object construction. Accept exactly:
 
 ```json
@@ -545,9 +545,9 @@ release credential. Candidate code is always subject data. No image is published
       digest-qualified runtime ref, source SHA, and protocol through typed subcommands or shell-safe
       output fields.
 
-- [ ] Run the focused test and `shellcheck -S warning`. Do not create placeholder
+- [x] Run the focused test and `shellcheck -S warning`. Do not create placeholder
       `image.json` or evidence record.
-- [ ] Implement the gate-owned typed release-record writer and paired validator. The writer consumes
+- [x] Implement the gate-owned typed release-record writer and paired validator. The writer consumes
       only trusted current publisher/approval scalars, emits exact JCS create-new bytes, and never
       accepts raw JSON. Runtime actions continue to parse only `image.json`.
 

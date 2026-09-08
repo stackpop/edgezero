@@ -2542,6 +2542,8 @@ main() {
   test_action_output_contracts
   test_action_public_surface
   test_action_pin_gate
+  assert_succeeds "build-container image pin contract" bash "$ACTIONS_DIR/deploy-core/tests/check-image-pin.test.sh"
+  assert_succeeds "build-container release record contract" bash "$ACTIONS_DIR/deploy-core/tests/write-image-release-record.test.sh"
   assert_succeeds "actionlint installer contract" bash "$ACTIONS_DIR/deploy-core/tests/install-actionlint.test.sh"
   assert_succeeds "documentation reference and release-state contracts" node --test "$ACTIONS_DIR/deploy-core/tests/check-doc-action-pins.test.mjs"
   if command -v actionlint >/dev/null 2>&1 && [[ "$(actionlint -version | sed -n '1p')" == 1.7.12 ]]; then
