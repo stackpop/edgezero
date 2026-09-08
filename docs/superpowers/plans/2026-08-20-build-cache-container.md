@@ -235,7 +235,7 @@ v6.31 and must be narrowed before adding the write-privileged publisher.
       shape, and runner-label cases to `run.sh`. In transition and released states, reject the literal
       placeholder anywhere in every tracked Markdown document, including prose and non-YAML fences;
       YAML parsing remains the authority for reference and job-shape checks.
-- [ ] Reconcile the implemented v6.29 selector with v6.31 before freezing `G`. Add the reproduced
+- [x] Reconcile the implemented v6.29 selector with v6.31 before freezing `G`. Add the reproduced
       hosted case where payload base `37f1a137...` precedes synthetic first parent `593fc928...`, and
       head `8f68476d...` is the second parent. Authenticate the context-selected synthetic commit;
       require exactly `[F,J]` and `A` ancestor-or-equal to `F`; compare `F..M`, not `A..M` or latest

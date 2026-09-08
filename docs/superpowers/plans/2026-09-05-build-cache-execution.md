@@ -160,9 +160,10 @@ builds; cache-disabled builds use and clean a fresh invocation-private target. T
 
 This record does not claim those future publisher, rotation, cache, metadata, or hosted qualification
 tasks are implemented. Task 0 selector, whole-document placeholder, and hosted API-contract fixes are
-tracked separately and must pass before the archive/extraction tranche begins. Their local scanner
-implementation also confines subject Git and hosted release-verifier subprocesses to the v6.31
-allowlisted environments; hosted agreement remains a separate checkpoint.
+tracked separately. Their scanner implementation confines subject Git and hosted release-verifier
+subprocesses to the v6.31 allowlisted environments. The selector and placeholder paths pass local and
+hosted contract suites; live hosted release-transition agreement remains a separate checkpoint before
+the archive/extraction tranche begins.
 
 Local v6.31 reconciliation verification on 2026-09-07:
 
@@ -178,5 +179,6 @@ Local v6.31 reconciliation verification on 2026-09-07:
   `wasm32-wasip2` check passed. The standalone provenance validator passed 15 tests, formatting, and
   strict Clippy.
 - Independent design/plan, implementation-compliance, and code-quality reviews reported no remaining
-  local issue. The hosted synthetic-merge selector run and hosted release API/ref proof remain required
-  before their Task 0 checkboxes or the archive/extraction tranche can advance.
+  local issue. PR 347's hosted `static-checks` job passed 319 action-contract tests, including the
+  reproduced advanced-base selector fixture. The hosted release API/ref proof remains required before
+  its Task 0 checkbox or the archive/extraction tranche can advance.
