@@ -253,6 +253,14 @@ impl Metadata {
         )
     }
 
+    pub(crate) fn matches_observation(&self, abi: &Abi, hash: &str, size: u64) -> Result<()> {
+        self.validate()?;
+        require(
+            self.abi == *abi && self.binary_sha256 == hash && self.binary_size == size,
+            "binary metadata mismatch",
+        )
+    }
+
     fn validate(&self) -> Result<()> {
         require(self.schema_version == 1, "unsupported schema version")?;
         self.caller.validate()?;
@@ -790,8 +798,9 @@ mod tests {
             DYNAMIC
         );
         let static_abi = Abi::new(Interpreter::Static, vec![]).unwrap();
+        let static_hash = "sha256:6b25433eed518a44b19e8c821749f4dd07156d0962727ed27c15f8816c3c1c96";
         assert_eq!(
-            Metadata::new(&expected, static_abi, "0.1.0", &hash, 123)
+            Metadata::new(&expected, static_abi, "0.1.0", static_hash, 2048)
                 .unwrap()
                 .canonical_bytes()
                 .unwrap(),

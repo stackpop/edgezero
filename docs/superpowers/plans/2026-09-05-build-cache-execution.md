@@ -263,3 +263,48 @@ paths that required no production change. Final local verification on 2026-09-08
 The real GNU-target CLI, pinned Bookworm loader/libc closure, and application-directed `dlopen` runtime
 fixture remain the explicit Task 2 image-verification gate. Section 5.3 does not invoke `ldd`, a loader,
 or an inspected artifact. CLI/capability integration, image publication, and the later plans remain open.
+
+## CLI/Capability Protocol Tranche
+
+Task 1 Section 5.4 now provides the synchronous provenance-validator executable with
+`write-expected`, `write-release-request`, `package`, `validate`, and `self-test` commands. Typed
+arguments enforce protocol `1`, the canonical release tag, fixed release-request path, work-root
+confinement, and create-new/no-replace publication. The package and validation paths compose the
+reviewed JSON, archive, and ELF protocols; validation publishes mode-0755 output without executing
+the application binary.
+
+The self-test uses a compiled, bounded manifest of exact fixture paths, SHA-256 values, and expected
+outcomes. Its valid golden archive is a coherent package containing a static x86-64 ELF and canonical
+metadata, not merely a syntactically valid tar. The fixture identities are:
+
+- `app-cli`: 2,048 bytes,
+  `6b25433eed518a44b19e8c821749f4dd07156d0962727ed27c15f8816c3c1c96`.
+- `static-meta.json`: 710 bytes,
+  `8ad2590f982dacf2272e8afb1f88b9e910349f43aab38675bac9cd43eb2e47d2`.
+- `archive.tar`: 5,120 bytes,
+  `bb041c59d4c24ecc41f3f329040aef224a8afd5477ee515b59c6ae94d5c258f1`.
+
+TDD evidence was observed before implementation and during review hardening. The initial process
+suite failed because the binary and command API did not exist. Later focused failures demonstrated
+missing canonical-root and traversal checks, publication-identity checks, staged-archive rehashing,
+integrated archive tamper rejection, coherent golden-fixture equality, and bounded collision-watcher
+shutdown before those behaviors were added. Final local verification on 2026-09-08:
+
+- Complete standalone validator tests: 76 unit and 21 process/integration tests passed; standalone
+  formatting and all-target/all-feature Clippy with warnings denied passed.
+- Repository formatting, all-target/all-feature Clippy, workspace tests, the combined
+  Fastly/Cloudflare/Spin check, and the Spin `wasm32-wasip2` check passed.
+- Documentation install, Prettier, ESLint, and VitePress build passed. Placeholder-pin,
+  legacy-typed-read, nested-app-config, action-reference, and documentation-reference scanners
+  passed. The complete deploy-core action suite passed 302 tests with five macOS skips.
+- Fastly adapter tests passed 287 tests; both required Fastly Clippy modes passed. The generated
+  consumer workspace test passed, and the app-demo workspace passed formatting, strict Clippy, and
+  all 33 tests.
+- Independent specification-compliance and code-quality reviews approved the tranche after staged
+  identity/cleanup, fixture coherence, process-path coverage, and watcher-lifecycle hardening.
+
+The Linux no-replace branch is compile-checked but still requires hosted execution of
+`renameat2(RENAME_NOREPLACE)`. Positive literal-`/work` CLI round trips, the real GNU-target CLI,
+pinned Bookworm startup closure, controlled loader execution, and abnormal host cleanup remain Task
+2 container/image-verification obligations. This tranche does not claim an image publication,
+release, or cache-enabled deployment.

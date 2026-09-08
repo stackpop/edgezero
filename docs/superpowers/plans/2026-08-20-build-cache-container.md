@@ -392,7 +392,7 @@ protected gate baseline `G` before source revision `S` is proposed.
 
 ### 5.4 CLI/capability tranche
 
-- [ ] Write failing library integration tests using a private synthetic-root harness for deterministic
+- [x] Write failing library integration tests using a private synthetic-root harness for deterministic
       expected-write/package/validate round trips, identity mismatch, atomic cleanup, no-replace
       collision, and host-deletion recovery. This
       harness calls library entry points and is not a CLI option or production bypass. Write host process
@@ -439,7 +439,7 @@ edgezero-provenance-validator self-test \
   --fixtures /usr/local/share/edgezero/provenance-fixtures
 ```
 
-- [ ] Make production `write-expected`, `write-release-request`, `package`, and `validate` require
+- [x] Make production `write-expected`, `write-release-request`, `package`, and `validate` require
       canonical `--work-root /work`.
       `write-expected` accepts only the typed bounded scalars above, fixes schema version `1`, derives
       `container-ref`, and is the sole expected-identity encoder. Every command creates exactly one
@@ -450,15 +450,15 @@ edgezero-provenance-validator self-test \
       sibling; synthetic-root library tests model host deletion of the whole parent after
       SIGKILL/timeout. The validator never executes the app binary. Positive CLI round trips run only in
       Task 3's container, where literal `/work` exists.
-- [ ] Make `write-release-request` the sole release-request producer. Accept only typed gate SHA,
+- [x] Make `write-release-request` the sole release-request producer. Accept only typed gate SHA,
       protocol `1`, canonical release tag, and the literal fresh output path; test exact three-key JCS
       bytes, duplicate/missing/unknown flags, no-replace publication, and output cleanup.
-- [ ] Implement `self-test` as a compiled manifest of exact relative paths, fixture SHA-256 values,
+- [x] Implement `self-test` as a compiled manifest of exact relative paths, fixture SHA-256 values,
       and valid/invalid outcomes. A missing, extra, or changed fixture fails.
-- [ ] Use synchronous Rust; do not add Tokio or change dependencies of core/adapter crates.
-- [ ] Run process, focused, and full crate tests; expected: pass. Commit the green CLI/capability
+- [x] Use synchronous Rust; do not add Tokio or change dependencies of core/adapter crates.
+- [x] Run process, focused, and full crate tests; expected: pass. Commit the green CLI/capability
       tranche.
-- [ ] Run the focused crate tests, then the repository-required Rust and documentation checks.
+- [x] Run the focused crate tests, then the repository-required Rust and documentation checks.
 
 ```bash
 cargo test --manifest-path .github/tools/edgezero-provenance-validator/Cargo.toml

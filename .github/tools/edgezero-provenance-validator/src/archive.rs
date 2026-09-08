@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::json_contract::{BINARY_LIMIT, METADATA_LIMIT};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const BLOCK_SIZE: usize = 512;
@@ -223,6 +224,31 @@ pub(crate) fn copy_exact<R: Read, W: Write>(
     Ok(())
 }
 
+pub(crate) fn verify_binary_sha256<R: Read + Seek>(
+    reader: &mut R,
+    parsed: &ParsedArchive,
+    expected: &str,
+) -> Result<()> {
+    checked_seek(reader, SeekFrom::Start(parsed.binary_offset))?;
+    let mut digest = Sha256::new();
+    let mut remaining = parsed.binary_size;
+    let mut buffer = [0; IO_CHUNK_SIZE];
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| "binary size overflow")?;
+        let read = read_retry(reader, &mut buffer[..limit])?;
+        require(read != 0, "staged binary is shorter than declared")?;
+        digest.update(&buffer[..read]);
+        remaining = remaining
+            .checked_sub(read as u64)
+            .ok_or("binary size underflow")?;
+    }
+    require(
+        format!("sha256:{:x}", digest.finalize()) == expected,
+        "staged binary digest changed",
+    )
+}
+
 fn write_padding<W: Write>(writer: &mut W, size: u64) -> Result<()> {
     write_all(writer, &ZERO_BLOCK[..padding_size(size)?])
 }
@@ -281,7 +307,9 @@ mod tests {
     );
     const METADATA: &[u8] =
         include_bytes!("../../../docker/build-app-cli/fixtures/provenance/valid/static-meta.json");
-    const BINARY: &[u8] = b"#!/bin/sh\nexit 0\n";
+    const BINARY: &[u8] = include_bytes!(
+        "../../../docker/build-app-cli/fixtures/provenance/valid/elf-static/app-cli"
+    );
     const GOLDEN: &[u8] =
         include_bytes!("../../../docker/build-app-cli/fixtures/provenance/valid/archive.tar");
 
@@ -330,13 +358,13 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first, GOLDEN);
-        assert_eq!(first.len(), 7 * BLOCK_SIZE);
+        assert_eq!(first.len(), 10 * BLOCK_SIZE);
 
         let metadata_padding = 512 + METADATA.len()..3 * BLOCK_SIZE;
         assert!(first[metadata_padding].iter().all(|byte| *byte == 0));
-        let binary_padding = 4 * BLOCK_SIZE + BINARY.len()..5 * BLOCK_SIZE;
+        let binary_padding = 4 * BLOCK_SIZE + BINARY.len()..8 * BLOCK_SIZE;
         assert!(first[binary_padding].iter().all(|byte| *byte == 0));
-        assert_eq!(&first[5 * BLOCK_SIZE..], &[0; 2 * BLOCK_SIZE]);
+        assert_eq!(&first[8 * BLOCK_SIZE..], &[0; 2 * BLOCK_SIZE]);
     }
 
     #[test]
@@ -632,6 +660,28 @@ mod tests {
     }
 
     #[test]
+    fn review_staged_archive_rejects_same_size_binary_payload_corruption() {
+        use sha2::{Digest, Sha256};
+
+        let mut bytes = Vec::new();
+        encode(
+            &mut bytes,
+            &mut Cursor::new(METADATA),
+            METADATA.len() as u64,
+            &mut Cursor::new(BINARY),
+            BINARY.len() as u64,
+        )
+        .unwrap();
+        let parsed = parse(&mut Cursor::new(&bytes)).unwrap();
+        bytes[usize::try_from(parsed.binary_offset).unwrap()] ^= 1;
+        let parsed = parse(&mut Cursor::new(&bytes)).unwrap();
+        let expected = format!("sha256:{:x}", Sha256::digest(BINARY));
+
+        let error = verify_binary_sha256(&mut Cursor::new(bytes), &parsed, &expected).unwrap_err();
+        assert_eq!(error, "staged binary digest changed");
+    }
+
+    #[test]
     fn owned_path_cleanup_removes_files_accepts_absence_and_reports_failure() {
         let parent = TempDir::new();
         let path = parent.path().join("owned");
@@ -697,8 +747,35 @@ mod tests {
 
         let error = extract_binary(&mut archive, parent.path()).unwrap_err();
         assert!(error.contains("controlled binary read failure"));
-        assert!(error.contains("cleanup failed: failed to remove owned path"));
+        assert!(error.contains("cleanup failed: owned path identity changed"));
         assert!(temporary.is_dir());
+        assert!(!parent.path().join("app-cli").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_never_removes_a_replacement_at_its_owned_temporary_path() {
+        let parent = TempDir::new();
+        let temporary = parent.path().join(".app-cli.tmp");
+        let mut archive = ReplaceTempWithFile::new(GOLDEN.to_vec(), temporary.clone());
+
+        let error = extract_binary(&mut archive, parent.path()).unwrap_err();
+        assert!(error.contains("controlled binary read failure"));
+        assert!(error.contains("cleanup failed: owned path identity changed"));
+        assert_eq!(fs::read(temporary).unwrap(), b"sentinel");
+        assert!(!parent.path().join("app-cli").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_never_publishes_a_same_shape_temporary_replacement() {
+        let parent = TempDir::new();
+        let temporary = parent.path().join(".app-cli.tmp");
+        let mut archive = ReplaceTempAfterBinaryRead::new(GOLDEN.to_vec(), temporary.clone());
+
+        let error = extract_binary(&mut archive, parent.path()).unwrap_err();
+        assert!(error.contains("owned path identity changed"));
+        assert_eq!(fs::read(temporary).unwrap(), vec![b'x'; BINARY.len()]);
         assert!(!parent.path().join("app-cli").exists());
     }
 
@@ -1155,6 +1232,85 @@ mod tests {
 
     #[cfg(unix)]
     impl Seek for ReplaceTempWithDirectory {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[cfg(unix)]
+    struct ReplaceTempWithFile {
+        inner: Cursor<Vec<u8>>,
+        temporary_path: PathBuf,
+        replaced: bool,
+    }
+
+    #[cfg(unix)]
+    impl ReplaceTempWithFile {
+        fn new(bytes: Vec<u8>, temporary_path: PathBuf) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                temporary_path,
+                replaced: false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Read for ReplaceTempWithFile {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.replaced && self.inner.position() == (4 * BLOCK_SIZE) as u64 {
+                fs::remove_file(&self.temporary_path)?;
+                fs::write(&self.temporary_path, b"sentinel")?;
+                self.replaced = true;
+                return Err(io::Error::other("controlled binary read failure"));
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Seek for ReplaceTempWithFile {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[cfg(unix)]
+    struct ReplaceTempAfterBinaryRead {
+        inner: Cursor<Vec<u8>>,
+        temporary_path: PathBuf,
+        replaced: bool,
+    }
+
+    #[cfg(unix)]
+    impl ReplaceTempAfterBinaryRead {
+        fn new(bytes: Vec<u8>, temporary_path: PathBuf) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                temporary_path,
+                replaced: false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Read for ReplaceTempAfterBinaryRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let read = self.inner.read(buffer)?;
+            if !self.replaced && self.inner.position() == (4 * BLOCK_SIZE + BINARY.len()) as u64 {
+                fs::remove_file(&self.temporary_path)?;
+                fs::write(&self.temporary_path, vec![b'x'; BINARY.len()])?;
+                fs::set_permissions(&self.temporary_path, fs::Permissions::from_mode(0o755))?;
+                self.replaced = true;
+            }
+            Ok(read)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Seek for ReplaceTempAfterBinaryRead {
         fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
             self.inner.seek(position)
         }

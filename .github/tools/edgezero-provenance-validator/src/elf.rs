@@ -118,12 +118,18 @@ pub fn direct_launch(
 
 #[cfg(unix)]
 pub fn inspect(primary_path: &Path, image_root: &Path) -> Result<ElfInspection> {
+    inspect_primary(primary_path, image_root)
+}
+
+#[cfg(unix)]
+pub(crate) fn inspect_staged(primary_path: &Path, image_root: &Path) -> Result<ElfInspection> {
+    inspect_primary(primary_path, image_root)
+}
+
+#[cfg(unix)]
+fn inspect_primary(primary_path: &Path, image_root: &Path) -> Result<ElfInspection> {
     validate_root(image_root)?;
     require_no_preload(image_root)?;
-    require(
-        primary_path.file_name().and_then(|name| name.to_str()) == Some(APP_NAME),
-        "primary filename is not app-cli",
-    )?;
 
     let (primary, mut primary_file) = open_object(primary_path, APP_PATH, ObjectRole::Primary)?;
     let binary_size = primary_file.metadata().map_err(io_error)?.len();
@@ -185,6 +191,11 @@ pub fn inspect(primary_path: &Path, image_root: &Path) -> Result<ElfInspection> 
 
 #[cfg(not(unix))]
 pub fn inspect(_primary_path: &Path, _image_root: &Path) -> Result<ElfInspection> {
+    Err("Protocol-1 ELF inspection requires Unix device and inode metadata".into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn inspect_staged(_primary_path: &Path, _image_root: &Path) -> Result<ElfInspection> {
     Err("Protocol-1 ELF inspection requires Unix device and inode metadata".into())
 }
 
