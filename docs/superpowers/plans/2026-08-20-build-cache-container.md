@@ -553,7 +553,7 @@ release credential. Candidate code is always subject data. No image is published
 
 ### 6.2 Image and runtime verification
 
-- [ ] Immediately before the gate-image commit, re-resolve the official
+- [x] Immediately before the gate-image commit, re-resolve the official
       `rust:1.95.0-slim-bookworm` linux/amd64 leaf and require the reviewed digest in Section 1.
       Independently download the exact sccache asset and checksum companion and require the reviewed
       checksum. Stop for review on movement or disagreement; never commit a placeholder.
@@ -565,14 +565,14 @@ release credential. Candidate code is always subject data. No image is published
 .github/tools/edgezero-provenance-validator/Cargo.toml` inside the staged context and reject any
       workspace member or path dependency outside that validator directory. Any new effective input
       requires gate rotation.
-- [ ] Write `stage-build-context.test.sh` before its helper. Cover missing/extra/duplicate/unsorted
+- [x] Write `stage-build-context.test.sh` before its helper. Cover missing/extra/duplicate/unsorted
       manifest entries, symlink/hardlink/FIFO/device inputs, path escape, dirty gate checkout,
       candidate Dockerfile substitution, changed `S` copy of a manifested byte, unmanifested source,
       remote `ADD`, bind-mounted build context, broad `COPY`, and post-install replacement. The helper
       creates a fresh directory outside both checkouts and copies only regular manifested files from
       exact clean `G`, preserving paths and executable modes; the publisher passes that directory as
       the sole Docker context.
-- [ ] Build the validator in the Dockerfile with one
+- [x] Build the validator in the Dockerfile with one
       `cargo build --locked --release --manifest-path
 .github/tools/edgezero-provenance-validator/Cargo.toml` invocation. Test both the exact staged-
       context metadata command and exact Docker build. Use the reviewed Rust base digest and
@@ -580,7 +580,7 @@ release credential. Candidate code is always subject data. No image is published
       the exact final binaries/assets and the complete startup-library closure. No later Dockerfile
       instruction may replace an installed tool, validator, schema, fixture, interpreter, or closure
       member. Static contract tests bind the instruction sequence and destinations.
-- [ ] Populate flat `/opt/edgezero/runtime-lib` with the complete reviewed x86-64 startup closure,
+- [x] Populate flat `/opt/edgezero/runtime-lib` with the complete reviewed x86-64 startup closure,
       excluding the interpreter. Require exact dynamic interpreter `/lib64/ld-linux-x86-64.so.2`,
       validate every library's role and filename/SONAME aliases, reserve `app-cli` and
       `ld-linux-x86-64.so.2` against flat-directory copies, and remove
