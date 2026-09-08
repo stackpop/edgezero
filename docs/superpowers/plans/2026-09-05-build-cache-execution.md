@@ -170,7 +170,7 @@ Local v6.31 reconciliation verification on 2026-09-07:
   advanced-base synthetic merges, unavailable/shallow/replaced/grafted history, exact API response
   metadata, and poisoned curl/Git child environments. The repository scanner passed with 39 external
   references in bootstrap state.
-- The complete deploy-core action suite passed 300 tests with zero failures and five platform-specific
+- The complete deploy-core action suite passed 302 tests with zero failures and five platform-specific
   skips on macOS. Pinned actionlint 1.7.12 passed through the repository compatibility wrapper; zizmor
   1.16.3 reported no findings under the committed suppression policy.
 - Docs Prettier, ESLint, and VitePress build passed. Workspace tests, Rust formatting, all-target/all-
