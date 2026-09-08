@@ -112,6 +112,11 @@ function yamlReferences(document) {
 }
 
 export function scanDocument(path, text, record) {
+  if (record !== null)
+    requireThat(
+      !text.includes(placeholder),
+      `${path}: released Markdown still has an action placeholder`,
+    );
   let count = 0;
   for (const token of markdown.parse(text, {})) {
     if (
@@ -120,11 +125,6 @@ export function scanDocument(path, text, record) {
     )
       continue;
     const location = `${path}:${token.map[0] + 1}`;
-    if (record !== null)
-      requireThat(
-        !token.content.includes(placeholder),
-        `${location}: released YAML still has an action placeholder`,
-      );
     const parsed = command(
       "yq",
       [
@@ -223,7 +223,7 @@ export function selectRange(env, event, git) {
   switch (env.GITHUB_EVENT_NAME) {
     case "pull_request": {
       const pr = event.pull_request;
-      base = pr?.base?.sha;
+      const payloadBase = pr?.base?.sha;
       requireThat(
         pr?.base?.repo?.full_name === "stackpop/edgezero" &&
           pr?.base?.ref === "main",
@@ -236,14 +236,26 @@ export function selectRange(env, event, git) {
         "wrong pull request merge ref",
       );
       requireThat(
-        isSha(base) && isSha(pr?.head?.sha),
+        isSha(payloadBase) && isSha(pr?.head?.sha),
         "invalid pull request source SHA",
       );
       const observedParents = git.parents(candidate);
-      const expectedParents = [base, pr.head.sha];
       requireThat(
-        JSON.stringify(observedParents) === JSON.stringify(expectedParents),
-        `synthetic merge parents differ: expected ${JSON.stringify(expectedParents)}; observed ${JSON.stringify(observedParents)}`,
+        observedParents.length === 2 &&
+          observedParents.every(isSha) &&
+          observedParents[1] === pr.head.sha,
+        `invalid synthetic merge parents: ${JSON.stringify(observedParents)}`,
+      );
+      base = observedParents[0];
+      requireThat(
+        [payloadBase, base, pr.head.sha, candidate].every((sha) =>
+          git.availableCommit(sha),
+        ),
+        "pull request commit object is unavailable",
+      );
+      requireThat(
+        git.ancestor(payloadBase, base),
+        "pull request base is not an ancestor of its merge parent",
       );
       break;
     }
@@ -287,9 +299,11 @@ export function verifyRelease(record) {
   const version = record["action-version"];
   const token = process.env.GITHUB_TOKEN ?? "";
   requireThat(!/[\r\n"\\]/.test(token), "invalid API credential encoding");
+  const curlEnv = { PATH: process.env.PATH ?? "", LC_ALL: "C" };
   const headers = [
     'header = "Accept: application/vnd.github+json"',
-    'header = "X-GitHub-Api-Version: 2022-11-28"',
+    'header = "X-GitHub-Api-Version: 2026-03-10"',
+    'header = "User-Agent: edgezero-build-container-gate/1"',
   ];
   if (token) headers.push(`header = "Authorization: Bearer ${token}"`);
   const reply = command(
@@ -307,17 +321,24 @@ export function verifyRelease(record) {
       "--config",
       "-",
       "--write-out",
-      "\n%{http_code}",
+      "\n%{http_code}\n%header{x-github-api-version-selected}\n%header{content-type}",
       `https://api.github.com/repos/stackpop/edgezero/releases/tags/${version}`,
     ],
-    { input: headers.join("\n") + "\n" },
+    { input: headers.join("\n") + "\n", env: curlEnv },
   );
-  const split = reply.lastIndexOf("\n");
+  const metadata = /\n([0-9]{3})\n([^\r\n]*)\n([^\r\n]*)$/.exec(reply);
+  requireThat(metadata !== null, "invalid release API response metadata");
+  const [, status, selectedVersion, contentType] = metadata;
+  requireThat(status === "200", "immutable release lookup failed");
   requireThat(
-    reply.slice(split + 1) === "200",
-    "immutable release lookup failed",
+    selectedVersion === "2026-03-10",
+    "release API selected an unexpected version",
   );
-  const release = JSON.parse(reply.slice(0, split));
+  requireThat(
+    /^application\/json(?:\s*;\s*charset\s*=\s*utf-8)?$/i.test(contentType),
+    "release API returned an unsupported content type",
+  );
+  const release = JSON.parse(reply.slice(0, metadata.index));
   requireThat(
     release.tag_name === version &&
       release.draft === false &&
@@ -334,6 +355,7 @@ export function verifyRelease(record) {
     refs = command(
       "git",
       [
+        "--no-replace-objects",
         "-c",
         "credential.helper=",
         "-c",
@@ -355,6 +377,7 @@ export function verifyRelease(record) {
           GIT_CONFIG_NOSYSTEM: "1",
           GIT_CONFIG_GLOBAL: "/dev/null",
           GIT_TERMINAL_PROMPT: "0",
+          GIT_NO_REPLACE_OBJECTS: "1",
         },
       },
     )
@@ -394,7 +417,21 @@ function main(args) {
     "usage: check-doc-action-pins.sh [--subject-root PATH]",
   );
   const subject = realpathSync(args[1] ?? root);
-  const git = (...args) => command("git", ["-C", subject, ...args]);
+  const gitEnv = {
+    PATH: process.env.PATH ?? "",
+    LC_ALL: "C",
+    HOME: "/dev/null",
+    TMPDIR: "/tmp",
+    GIT_CEILING_DIRECTORIES: dirname(subject),
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  const git = (...args) =>
+    command("git", ["--no-replace-objects", "-C", subject, ...args], {
+      env: gitEnv,
+    });
   requireThat(
     git("rev-parse", "--show-toplevel").trim() === subject,
     "subject must be a repository root",
@@ -403,6 +440,20 @@ function main(args) {
     command("yq", ["--version"]).trim() ===
       "yq (https://github.com/mikefarah/yq/) version v4.53.3",
     "mikefarah yq 4.53.3 is required",
+  );
+  requireThat(
+    git("rev-parse", "--is-shallow-repository").trim() === "false",
+    "shallow repository history is not allowed",
+  );
+  requireThat(
+    git("for-each-ref", "--format=%(refname)", "refs/replace").trim() === "",
+    "repository replace refs are not allowed",
+  );
+  requireThat(
+    !existsSync(
+      resolve(subject, git("rev-parse", "--git-path", "info/grafts").trim()),
+    ),
+    "repository grafts are not allowed",
   );
   let range = { base: git("rev-parse", "HEAD").trim(), candidate: null };
   if (process.env.GITHUB_ACTIONS === "true" || process.env.CI === "true") {
@@ -414,7 +465,19 @@ function main(args) {
       readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"),
     );
     range = selectRange(process.env, event, {
-      parents: (sha) => git("show", "-s", "--format=%P", sha).trim().split(" "),
+      parents: (sha) =>
+        git("show", "-s", "--format=%P", sha)
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean),
+      availableCommit: (sha) => {
+        try {
+          git("cat-file", "-e", `${sha}^{commit}`);
+          return true;
+        } catch {
+          return false;
+        }
+      },
       ancestor: (base, head) => {
         try {
           git("merge-base", "--is-ancestor", base, head);

@@ -91,7 +91,11 @@ test("bootstrap adoption documents use their existing superpowers locations", ()
     );
   }
   assert.throws(() =>
-    scanDocument("docs/superpowers/specs/unreviewed.md", fence(example()), null),
+    scanDocument(
+      "docs/superpowers/specs/unreviewed.md",
+      fence(example()),
+      null,
+    ),
   );
 });
 
@@ -129,15 +133,13 @@ test("annotated YAML fences and root-repository refs cannot bypass policy", () =
       scanDocument(path, fence(`steps:\n  - uses: ${action}@v1.2.3\n`), record),
     );
   }
-  assert.equal(
-    scanDocument(
-      path,
-      "The prepublication placeholder was `<EDGEZERO_ACTION_VERSION>`.\n" +
-        fence(example("v1.2.3")),
-      record,
-    ),
-    1,
-  );
+  for (const text of [
+    "The prepublication placeholder was `<EDGEZERO_ACTION_VERSION>`.\n",
+    "~~~text\n<EDGEZERO_ACTION_VERSION>\n~~~\n",
+  ])
+    assert.throws(() =>
+      scanDocument(path, text + fence(example("v1.2.3")), record),
+    );
   assert.throws(() => scanDocument(path, fence(example()), record));
 });
 
@@ -258,36 +260,88 @@ test("release transitions are one-way, atomic, and independently verified", () =
 });
 
 test("event ranges are selected from exact hosted context", () => {
-  const base = "2".repeat(40),
-    head = "3".repeat(40),
-    app = "4".repeat(40);
+  const payloadBase = "2".repeat(40),
+    prHead = "3".repeat(40),
+    candidate = "4".repeat(40),
+    firstParent = "5".repeat(40);
+  const checkedCommits = [];
   const git = {
-    parents: () => [base, app],
-    ancestor: (a, b) => a === base && b === head,
+    parents: () => [firstParent, prHead],
+    ancestor: (base, head) =>
+      (base === payloadBase && head === firstParent) ||
+      (base === firstParent && head === candidate) ||
+      (base === payloadBase && head === candidate),
+    availableCommit: (sha) => {
+      checkedCommits.push(sha);
+      return true;
+    },
   };
   const env = {
     GITHUB_EVENT_NAME: "pull_request",
-    GITHUB_SHA: head,
+    GITHUB_SHA: candidate,
     GITHUB_REF: "refs/pull/9/merge",
   };
   const event = {
     number: 9,
     pull_request: {
       base: {
-        sha: base,
+        sha: payloadBase,
         ref: "main",
         repo: { full_name: "stackpop/edgezero" },
       },
-      head: { sha: app },
+      head: { sha: prHead },
     },
   };
-  assert.deepEqual(selectRange(env, event, git), { base, candidate: head });
+  assert.deepEqual(selectRange(env, event, git), {
+    base: firstParent,
+    candidate,
+  });
+  assert.deepEqual(checkedCommits, [
+    payloadBase,
+    firstParent,
+    prHead,
+    candidate,
+  ]);
+  for (const missing of [payloadBase, firstParent, prHead, candidate])
+    assert.throws(
+      () =>
+        selectRange(env, event, {
+          ...git,
+          availableCommit: (sha) => sha !== missing,
+        }),
+      /pull request commit object is unavailable/,
+    );
   assert.throws(() =>
     selectRange({ ...env, GITHUB_REF: "refs/heads/main" }, event, git),
   );
+  for (const parents of [
+    [],
+    [firstParent],
+    [prHead, firstParent],
+    [firstParent, payloadBase],
+    [firstParent, prHead, payloadBase],
+    ["0".repeat(40), prHead],
+  ])
+    assert.throws(() =>
+      selectRange(env, event, { ...git, parents: () => parents }),
+    );
   assert.throws(
-    () => selectRange(env, event, { ...git, parents: () => [app, base] }),
-    /synthetic merge parents differ: expected .*; observed /,
+    () =>
+      selectRange(env, event, {
+        ...git,
+        ancestor: (base, head) => base === firstParent && head === candidate,
+      }),
+    /pull request base is not an ancestor of its merge parent/,
+  );
+  assert.throws(
+    () =>
+      selectRange(env, event, {
+        ...git,
+        parents: () => {
+          throw Error("missing merge object");
+        },
+      }),
+    /missing merge object/,
   );
   assert.throws(() =>
     selectRange({ ...env, GITHUB_EVENT_NAME: "workflow_dispatch" }, event, git),
@@ -296,20 +350,20 @@ test("event ranges are selected from exact hosted context", () => {
     selectRange(
       {
         GITHUB_EVENT_NAME: "push",
-        GITHUB_SHA: head,
-        GITHUB_WORKFLOW_SHA: head,
+        GITHUB_SHA: candidate,
+        GITHUB_WORKFLOW_SHA: candidate,
         GITHUB_REF: "refs/heads/main",
       },
-      { before: base, after: head },
+      { before: payloadBase, after: candidate },
       git,
     ),
-    { base, candidate: head },
+    { base: payloadBase, candidate },
   );
   const group = {
     action: "checks_requested",
     merge_group: {
-      base_sha: base,
-      head_sha: head,
+      base_sha: payloadBase,
+      head_sha: candidate,
       base_ref: "refs/heads/main",
       head_ref: "refs/heads/gh-readonly-queue/main/pr-9",
     },
@@ -318,19 +372,19 @@ test("event ranges are selected from exact hosted context", () => {
     selectRange(
       {
         GITHUB_EVENT_NAME: "merge_group",
-        GITHUB_SHA: head,
+        GITHUB_SHA: candidate,
         GITHUB_REF: group.merge_group.head_ref,
       },
       group,
       git,
     ),
-    { base, candidate: head },
+    { base: payloadBase, candidate },
   );
   assert.throws(() =>
     selectRange(
       {
         GITHUB_EVENT_NAME: "merge_group",
-        GITHUB_SHA: head,
+        GITHUB_SHA: candidate,
         GITHUB_REF: group.merge_group.head_ref,
       },
       group,
@@ -348,12 +402,12 @@ test("release proof rejects API/ref substitution and redirects without leaking a
   });
   writeFileSync(
     resolve(temp, "curl"),
-    '#!/bin/sh\nprintf "%s\\n" "$@" >"$FAKE_ARGS"\ncat >"$FAKE_HEADERS"\nprintf "%s" "$FAKE_REPLY"\n',
+    '#!/bin/sh\nif [ -n "${GITHUB_TOKEN+x}${GH_TOKEN+x}${HTTPS_PROXY+x}${https_proxy+x}${HTTP_PROXY+x}${http_proxy+x}${ALL_PROXY+x}${all_proxy+x}${NO_PROXY+x}${no_proxy+x}${CURL_CA_BUNDLE+x}${SSL_CERT_FILE+x}${HOME+x}${XDG_CONFIG_HOME+x}${CURL_HOME+x}${EDGEZERO_AMBIENT_SENTINEL+x}" ]; then exit 20; fi\n[ "$LC_ALL" = C ] || exit 21\nfixture=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 22\nprintf "%s\\n" "$@" >"$fixture/args"\ncat >"$fixture/headers"\ncat "$fixture/reply"\n',
     { mode: 0o755 },
   );
   writeFileSync(
     resolve(temp, "git"),
-    '#!/bin/sh\nif [ "$GIT_CONFIG_NOSYSTEM" != 1 ] || [ "$GIT_CONFIG_GLOBAL" != /dev/null ] || [ "$GIT_TERMINAL_PROMPT" != 0 ]; then exit 9; fi\n[ "$PWD" = "$HOME" ] || exit 10\n[ -z "${GITHUB_TOKEN+x}" ] || exit 11\ncase "$*" in *http.followRedirects=false*) ;; *) exit 12 ;; esac\nprintf "%s" ' +
+    '#!/bin/sh\nif [ "$GIT_CONFIG_NOSYSTEM" != 1 ] || [ "$GIT_CONFIG_GLOBAL" != /dev/null ] || [ "$GIT_TERMINAL_PROMPT" != 0 ]; then exit 9; fi\n[ "$PWD" = "$HOME" ] || exit 10\n[ -z "${GITHUB_TOKEN+x}" ] || exit 11\ncase "$*" in *http.followRedirects=false*) ;; *) exit 12 ;; esac\n[ "$1" = "--no-replace-objects" ] || exit 13\n[ "$GIT_NO_REPLACE_OBJECTS" = 1 ] || exit 14\n[ -z "${GIT_REPLACE_REF_BASE+x}" ] || exit 15\nprintf "%s" ' +
       "'" +
       `${revision}\trefs/tags/v1.2.3\n` +
       "'\n",
@@ -361,8 +415,22 @@ test("release proof rejects API/ref substitution and redirects without leaking a
   );
   process.env.PATH = `${temp}:${original.PATH}`;
   process.env.GITHUB_TOKEN = "fixture-token";
-  process.env.FAKE_ARGS = resolve(temp, "args");
-  process.env.FAKE_HEADERS = resolve(temp, "headers");
+  process.env.GH_TOKEN = "ambient-gh-token";
+  process.env.HTTPS_PROXY = "https://hostile-proxy.invalid";
+  process.env.https_proxy = "https://hostile-proxy.invalid";
+  process.env.HTTP_PROXY = "http://hostile-proxy.invalid";
+  process.env.http_proxy = "http://hostile-proxy.invalid";
+  process.env.ALL_PROXY = "socks5://hostile-proxy.invalid";
+  process.env.all_proxy = "socks5://hostile-proxy.invalid";
+  process.env.NO_PROXY = "api.github.com";
+  process.env.no_proxy = "api.github.com";
+  process.env.CURL_CA_BUNDLE = resolve(temp, "hostile-ca.pem");
+  process.env.SSL_CERT_FILE = resolve(temp, "hostile-cert.pem");
+  process.env.HOME = resolve(temp, "hostile-home");
+  process.env.XDG_CONFIG_HOME = resolve(temp, "hostile-xdg");
+  process.env.CURL_HOME = resolve(temp, "hostile-curl-home");
+  process.env.EDGEZERO_AMBIENT_SENTINEL = "must-not-leak";
+  process.env.GIT_REPLACE_REF_BASE = "refs/hostile-replacements";
   const release = {
     tag_name: "v1.2.3",
     target_commitish: revision,
@@ -370,21 +438,45 @@ test("release proof rejects API/ref substitution and redirects without leaking a
     prerelease: false,
     immutable: true,
   };
-  process.env.FAKE_REPLY = `${JSON.stringify(release)}\n200`;
+  const reply = (
+    value = release,
+    status = "200",
+    selectedVersion = "2026-03-10",
+    contentType = "application/json; charset=utf-8",
+  ) =>
+    `${JSON.stringify(value)}\n${status}\n${selectedVersion}\n${contentType}`;
+  const setReply = (value) => writeFileSync(resolve(temp, "reply"), value);
+  setReply(reply());
   verifyRelease(record);
-  assert.ok(
-    !readFileSync(process.env.FAKE_ARGS, "utf8").includes("fixture-token"),
+  assert.equal(
+    readFileSync(resolve(temp, "headers"), "utf8"),
+    [
+      'header = "Accept: application/vnd.github+json"',
+      'header = "X-GitHub-Api-Version: 2026-03-10"',
+      'header = "User-Agent: edgezero-build-container-gate/1"',
+      'header = "Authorization: Bearer fixture-token"',
+      "",
+    ].join("\n"),
   );
   assert.ok(
-    readFileSync(process.env.FAKE_HEADERS, "utf8").includes(
+    !readFileSync(resolve(temp, "args"), "utf8").includes("fixture-token"),
+  );
+  assert.ok(
+    readFileSync(resolve(temp, "headers"), "utf8").includes(
       "Authorization: Bearer fixture-token",
     ),
   );
   assert.ok(
-    !readFileSync(process.env.FAKE_ARGS, "utf8")
+    !readFileSync(resolve(temp, "args"), "utf8")
       .split("\n")
       .some((arg) => arg === "-L" || arg === "--location"),
   );
+  setReply(
+    reply(release, "200", "2026-03-10", "Application/JSON; Charset=UTF-8"),
+  );
+  verifyRelease(record);
+  setReply(reply(release, "200", "2026-03-10", "application/json"));
+  verifyRelease(record);
   for (const change of [
     { draft: true },
     { prerelease: true },
@@ -392,12 +484,21 @@ test("release proof rejects API/ref substitution and redirects without leaking a
     { target_commitish: "main" },
     { tag_name: "v1.2.4" },
   ]) {
-    process.env.FAKE_REPLY = `${JSON.stringify({ ...release, ...change })}\n200`;
+    setReply(reply({ ...release, ...change }));
     assert.throws(() => verifyRelease(record));
   }
-  process.env.FAKE_REPLY = `${JSON.stringify(release)}\n302`;
-  assert.throws(() => verifyRelease(record));
-  process.env.FAKE_REPLY = `${JSON.stringify(release)}\n200`;
+  for (const response of [
+    reply(release, "302"),
+    reply(release, "201"),
+    reply(release, "200", ""),
+    reply(release, "200", "2022-11-28"),
+    reply(release, "200", "2026-03-10", "text/json"),
+    reply(release, "200", "2026-03-10", "application/json; charset=ascii"),
+  ]) {
+    setReply(response);
+    assert.throws(() => verifyRelease(record));
+  }
+  setReply(reply());
   writeFileSync(
     resolve(temp, "git"),
     `#!/bin/sh\nprintf '%s' '${revision}\trefs/tags/v1.2.3\n${revision}\trefs/heads/v1.2.3\n'\n`,
@@ -469,9 +570,172 @@ test("hosted scanner reads committed snapshots and fails inconsistent events", (
   const result = run();
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /1 external references; bootstrap/);
+
+  const proxyBin = resolve(temp, "bin");
+  mkdirSync(proxyBin);
+  writeFileSync(
+    resolve(proxyBin, "git"),
+    '#!/bin/sh\n[ "$1" = "--no-replace-objects" ] || exit 91\nif [ -n "${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_COMMON_DIR+x}${GIT_NAMESPACE+x}${GIT_INDEX_FILE+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}${GIT_SHALLOW_FILE+x}${GIT_CONFIG_COUNT+x}${GIT_CONFIG_KEY_0+x}${GIT_CONFIG_VALUE_0+x}${GIT_REPLACE_REF_BASE+x}${REAL_GIT+x}${XDG_CONFIG_HOME+x}${EDGEZERO_GIT_AMBIENT+x}" ]; then exit 92; fi\nif [ "$LC_ALL" != C ] || [ "$GIT_NO_REPLACE_OBJECTS" != 1 ] || [ "$GIT_CONFIG_NOSYSTEM" != 1 ] || [ "$GIT_CONFIG_GLOBAL" != /dev/null ] || [ "$GIT_TERMINAL_PROMPT" != 0 ] || [ "$HOME" != /dev/null ] || [ "$TMPDIR" != /tmp ] || [ "$GIT_CEILING_DIRECTORIES" = / ]; then exit 93; fi\ncase "$PATH" in *:*) PATH=${PATH#*:} ;; *) exit 94 ;; esac\nexport PATH\nexec git "$@"\n',
+    { mode: 0o755 },
+  );
+  const hardened = run({
+    PATH: `${proxyBin}:${process.env.PATH}`,
+    HOME: "/hostile-home",
+    GIT_CEILING_DIRECTORIES: "/",
+    GIT_DIR: "/hostile-git-dir",
+    GIT_WORK_TREE: "/hostile-work-tree",
+    GIT_COMMON_DIR: "/hostile-common-dir",
+    GIT_NAMESPACE: "hostile-namespace",
+    GIT_INDEX_FILE: "/hostile-index",
+    GIT_OBJECT_DIRECTORY: "/hostile-objects",
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: "/hostile-alternates",
+    GIT_SHALLOW_FILE: "/hostile-shallow",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.abbrev",
+    GIT_CONFIG_VALUE_0: "1",
+    GIT_REPLACE_REF_BASE: "refs/hostile-replacements",
+    REAL_GIT: "/hostile-git",
+    XDG_CONFIG_HOME: "/hostile-xdg",
+    EDGEZERO_GIT_AMBIENT: "must-not-leak",
+  });
+  assert.equal(hardened.status, 0, hardened.stderr);
+
+  const gitDir = resolve(subject, git("rev-parse", "--git-dir"));
+  const shallow = resolve(gitDir, "shallow");
+  writeFileSync(shallow, `${head}\n`);
+  const shallowResult = run();
+  assert.notEqual(shallowResult.status, 0);
+  assert.match(shallowResult.stderr, /shallow repository/);
+  rmSync(shallow);
+
+  git("replace", head, base);
+  const replaceResult = run();
+  assert.notEqual(replaceResult.status, 0);
+  assert.match(replaceResult.stderr, /replace refs/);
+  git("replace", "-d", head);
+
+  const grafts = resolve(gitDir, "info/grafts");
+  writeFileSync(grafts, `${head} ${base}\n`);
+  const graftsResult = run();
+  assert.notEqual(graftsResult.status, 0);
+  assert.match(graftsResult.stderr, /grafts/);
+  rmSync(grafts);
+
   assert.notEqual(run({ GITHUB_WORKFLOW_SHA: base }).status, 0);
   assert.notEqual(run({ GITHUB_EVENT_NAME: "workflow_dispatch" }).status, 0);
   assert.notEqual(run({ CI: "false", GITHUB_ACTIONS: "false" }).status, 0);
+});
+
+test("pull request scanning uses the synthetic merge first parent", (t) => {
+  const temp = mkdtempSync(resolve(tmpdir(), "edgezero-doc-pr-"));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const subject = resolve(temp, "subject");
+  mkdirSync(resolve(subject, "docs/guide"), { recursive: true });
+  const git = (...args) =>
+    execFileSync(
+      "git",
+      [
+        "-C",
+        subject,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        ...args,
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+  git("init", "-q", "-b", "main");
+  writeFileSync(resolve(subject, path), fence(example()));
+  git("add", ".");
+  git("commit", "-qm", "payload base");
+  const payloadBase = git("rev-parse", "HEAD");
+
+  git("checkout", "-qb", "feature");
+  writeFileSync(resolve(subject, "README.md"), "Pull request documentation\n");
+  git("add", ".");
+  git("commit", "-qm", "pull request head");
+  const prHead = git("rev-parse", "HEAD");
+
+  git("checkout", "-q", "main");
+  writeFileSync(resolve(subject, path), fence(example("v1.2.3")));
+  writeFileSync(resolve(subject, "docs/.edgezero-action-release.json"), bytes);
+  writeFileSync(resolve(subject, "release-helper.sh"), "#!/bin/sh\nexit 0\n", {
+    mode: 0o755,
+  });
+  git("add", ".");
+  git("commit", "-qm", "advanced base");
+  const firstParent = git("rev-parse", "HEAD");
+  git("merge", "--no-ff", "-qm", "synthetic merge", prHead);
+  const candidate = git("rev-parse", "HEAD");
+  assert.deepEqual(git("show", "-s", "--format=%P", candidate).split(" "), [
+    firstParent,
+    prHead,
+  ]);
+  assert.match(
+    git("ls-tree", firstParent, "--", "release-helper.sh"),
+    /^100755 blob /,
+  );
+  const staleChanges = git(
+    "diff",
+    "--no-renames",
+    "--name-only",
+    payloadBase,
+    candidate,
+    "--",
+  )
+    .split("\n")
+    .filter(Boolean);
+  let releaseVerified = false;
+  assert.throws(
+    () =>
+      checkTransition(null, record, staleChanges, () => {
+        releaseVerified = true;
+      }),
+    /release transition must change only documentation/,
+  );
+  assert.equal(releaseVerified, false);
+
+  const eventFile = resolve(temp, "event.json");
+  writeFileSync(
+    eventFile,
+    JSON.stringify({
+      number: 9,
+      pull_request: {
+        base: {
+          sha: payloadBase,
+          ref: "main",
+          repo: { full_name: "stackpop/edgezero" },
+        },
+        head: { sha: prHead },
+      },
+    }),
+  );
+  const checker = fileURLToPath(
+    new URL("./check-doc-action-pins.mjs", import.meta.url),
+  );
+  const result = spawnSync(
+    process.execPath,
+    [checker, "--subject-root", subject],
+    {
+      env: {
+        ...process.env,
+        CI: "true",
+        GITHUB_ACTIONS: "true",
+        GITHUB_EVENT_NAME: "pull_request",
+        GITHUB_EVENT_PATH: eventFile,
+        GITHUB_SHA: candidate,
+        GITHUB_REF: "refs/pull/9/merge",
+      },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /1 external references; released/);
 });
 
 test("a release transition cannot rename a non-document into documentation", (t) => {
