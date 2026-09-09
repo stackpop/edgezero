@@ -13,6 +13,7 @@ workspace = true
 [features]
 default = ["axum"]
 axum = [
+    "dep:async-stream",
     "dep:axum",
     "dep:tokio",
     "dep:tower",
@@ -27,6 +28,7 @@ cli = [
     "dep:toml",
     "dep:walkdir",
 ]
+test-utils = []
 
 [dependencies]
 edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = [
@@ -35,6 +37,7 @@ edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = [
 edgezero-core = { path = "../edgezero-core" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+async-stream = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 bytes = { workspace = true }
 ctor = { workspace = true, optional = true }
@@ -52,11 +55,13 @@ toml = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tracing = { workspace = true }
 walkdir = { workspace = true, optional = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
+flate2 = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

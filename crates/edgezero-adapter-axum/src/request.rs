@@ -7,10 +7,10 @@ use edgezero_core::body::Body;
 use edgezero_core::http::HeaderValue;
 use edgezero_core::http::Request as CoreRequest;
 use edgezero_core::http::header::CONTENT_TYPE;
-use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::outbound::HttpClient;
 
 use crate::context::AxumRequestContext;
-use crate::proxy::AxumProxyClient;
+use crate::outbound::AxumOutboundClient;
 
 /// Convert an Axum/Hyper request into an `EdgeZero` core request while preserving streaming bodies
 /// and exposing connection metadata through `AxumRequestContext`.
@@ -52,11 +52,11 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
         );
     }
 
-    let proxy_client =
-        AxumProxyClient::try_new().map_err(|err| format!("failed to build proxy client: {err}"))?;
+    let outbound_client = AxumOutboundClient::try_new()
+        .map_err(|err| format!("failed to build outbound HTTP client: {err}"))?;
     core_request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(proxy_client));
+        .insert(HttpClient::with_client(outbound_client));
 
     Ok(core_request)
 }
@@ -125,6 +125,7 @@ mod tests {
                 .get::<ConnectInfo<SocketAddr>>()
                 .is_none()
         );
+        assert!(core_request.extensions().get::<HttpClient>().is_some());
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use axum::http::{Request, Response};
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::StatusCode;
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::response::IntoResponse as _;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
@@ -190,18 +191,43 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
                 core_request.extensions_mut().insert(registry);
             }
 
-            let core_response = task::block_in_place(move || {
-                Handle::current().block_on(router.oneshot(core_request))
+            let response = task::block_in_place(move || {
+                Handle::current().block_on(async move {
+                    let core_response = match router.oneshot(core_request).await {
+                        Ok(response) => response,
+                        Err(err) => {
+                            let body = AxumBody::from(format!("internal error: {err}"));
+                            let mut fallback = Response::new(body);
+                            *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return fallback;
+                        }
+                    };
+                    match into_axum_response(core_response).await {
+                        Ok(converted) => converted,
+                        Err(error) => match error.into_response() {
+                            Ok(error_response) => match into_axum_response(error_response).await {
+                                Ok(converted) => converted,
+                                Err(fallback_error) => {
+                                    let body = AxumBody::from(format!(
+                                        "internal response conversion error: {fallback_error}"
+                                    ));
+                                    let mut fallback = Response::new(body);
+                                    *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                    fallback
+                                }
+                            },
+                            Err(fallback_error) => {
+                                let body = AxumBody::from(format!(
+                                    "internal error response error: {fallback_error}"
+                                ));
+                                let mut fallback = Response::new(body);
+                                *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                fallback
+                            }
+                        },
+                    }
+                })
             });
-            let response = match core_response {
-                Ok(response) => into_axum_response(response),
-                Err(err) => {
-                    let body = AxumBody::from(format!("internal error: {err}"));
-                    let mut fallback = Response::new(body);
-                    *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                    fallback
-                }
-            };
             Ok(response)
         })
     }

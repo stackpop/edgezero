@@ -9,7 +9,7 @@ pub mod dev_server;
 #[cfg(feature = "axum")]
 pub mod key_value_store;
 #[cfg(feature = "axum")]
-pub mod proxy;
+pub mod outbound;
 #[cfg(feature = "axum")]
 pub mod request;
 #[cfg(feature = "axum")]
