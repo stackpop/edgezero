@@ -1,6 +1,5 @@
-#![cfg(all(feature = "fastly", target_arch = "wasm32"))]
-
 // Compile-time check: FastlySecretStore implements SecretStore.
+#[cfg(all(feature = "fastly", target_arch = "wasm32"))]
 mod secret_store_compile_check {
     use edgezero_adapter_fastly::secret_store::FastlySecretStore;
     use edgezero_core::secret_store::SecretStore;
@@ -13,6 +12,7 @@ mod secret_store_compile_check {
 }
 
 #[cfg(test)]
+#[cfg(all(feature = "fastly", target_arch = "wasm32"))]
 mod tests {
     use bytes::Bytes;
     use edgezero_adapter_fastly::context::FastlyRequestContext;
@@ -212,5 +212,43 @@ mod tests {
 
         assert_eq!(response.get_status(), FastlyStatus::OK);
         assert_eq!(response.take_body_bytes(), b"hello from fastly test");
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
+mod outbound_contract_tests {
+    use bytes::Bytes;
+    use edgezero_adapter_fastly::outbound::validate_batch_request_for_test;
+    use edgezero_core::body::Body;
+    use edgezero_core::http::{Method, Uri};
+    use edgezero_core::outbound::OutboundRequest;
+    use futures_util::stream;
+
+    fn request() -> OutboundRequest {
+        OutboundRequest::new(
+            Method::POST,
+            "https://example.com/bid".parse::<Uri>().expect("URI"),
+        )
+        .expect("request")
+    }
+
+    #[test]
+    fn batch_preflight_rejects_streamed_slots_without_poisoning_siblings() {
+        let requests = [
+            request().body(Bytes::from_static(b"first")),
+            request().body(Body::stream(stream::once(async {
+                Bytes::from_static(b"streamed")
+            }))),
+            request().stream_response(),
+            request().body(Bytes::from_static(b"last")),
+        ];
+        let outcomes: Vec<_> = requests
+            .iter()
+            .map(validate_batch_request_for_test)
+            .collect();
+
+        let accepted: Vec<_> = outcomes.iter().map(Result::is_ok).collect();
+        assert_eq!(accepted, vec![true, false, false, true]);
     }
 }

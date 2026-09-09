@@ -197,13 +197,13 @@ async fn forward_request_body(
 }
 
 fn transform_stream(stream: ChunkStream, encoding: Option<&str>) -> BodyStream {
-    let stream = stream
+    let body_stream = stream
         .map(|result| result.map(Bytes::from).map_err(EdgeError::internal))
         .boxed_local();
     match encoding {
-        Some("gzip") => decode_gzip_stream(stream),
-        Some("br") => decode_brotli_stream(stream, 24, DEFAULT_MAX_BROTLI_DECODER_BYTES),
-        _ => stream,
+        Some("gzip") => decode_gzip_stream(body_stream),
+        Some("br") => decode_brotli_stream(body_stream, 24, DEFAULT_MAX_BROTLI_DECODER_BYTES),
+        _ => body_stream,
     }
 }
 

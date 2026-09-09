@@ -34,6 +34,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
+use edgezero_core::{Capability, CapabilitySupport};
 use walkdir::WalkDir;
 
 static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
@@ -389,6 +390,24 @@ struct RuntimeStoreNameReconciliation {
     reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
+    #[expect(
+        clippy::match_same_arms,
+        reason = "the complete-resource-accounting cell is explicit while the wildcard keeps future capabilities fail-closed"
+    )]
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::OutboundHeaderFidelity => CapabilitySupport::Native,
+            Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
+            Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
+            _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `fastly profile {create|delete|list}` is the native
@@ -5628,6 +5647,31 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[test]
+    fn outbound_capability_matrix_is_honest() {
+        assert_eq!(
+            FASTLY_ADAPTER.capability(Capability::OutboundHeaderFidelity),
+            CapabilitySupport::Native
+        );
+        for capability in [
+            Capability::LazyStreamedResponsePassthrough,
+            Capability::OutboundDeadlines,
+            Capability::OutboundFlexiblePhaseBudget,
+            Capability::OutboundHttp,
+            Capability::SendAllSlotIsolation,
+            Capability::StreamedUploadDeadlines,
+        ] {
+            assert_eq!(
+                FASTLY_ADAPTER.capability(capability),
+                CapabilitySupport::BestEffort
+            );
+        }
+        assert_eq!(
+            FASTLY_ADAPTER.capability(Capability::OutboundCompleteResourceAccounting),
+            CapabilitySupport::Unsupported
+        );
+    }
 
     // Shared fixture names. Pinning these as consts (instead of
     // inline `"sessions"` / `"app_config"` per call site) keeps the
