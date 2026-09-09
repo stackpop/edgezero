@@ -1,5 +1,7 @@
 use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
-use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
+use edgezero_core::manifest::{
+    CapabilitySupport, Manifest, ManifestContract, ManifestLoader, ResolvedEnvironment,
+};
 
 use std::env;
 use std::fmt;
@@ -188,6 +190,90 @@ pub fn execute_capture(
     }
     execute(adapter_name, action, manifest_loader, adapter_args)?;
     Ok(None)
+}
+
+pub(crate) fn ensure_capabilities(
+    adapter_name: &str,
+    contract: ManifestContract<'_>,
+) -> Result<(), String> {
+    let verified_manifest = match contract {
+        ManifestContract::Malformed(reason) => {
+            return Err(format!(
+                "capability check aborted: {reason}. This is an EdgeZero/app! contract bug; the baked manifest is unreadable, so required capabilities cannot be verified. Refusing to proceed rather than silently skipping enforcement."
+            ));
+        }
+        ManifestContract::None => return Ok(()),
+        ManifestContract::Present(present_manifest) => present_manifest,
+        _ => {
+            return Err(
+                "capability check aborted: unrecognized manifest-contract state. Refusing to proceed rather than skipping enforcement."
+                    .to_owned(),
+            );
+        }
+    };
+    let capabilities = &verified_manifest.capabilities;
+    let Some(adapter) = adapter_registry::get_adapter(adapter_name) else {
+        if capabilities.required.is_empty() {
+            if capabilities.optional.is_empty() {
+                log::warn!(
+                    "adapter '{adapter_name}' not in registry; capability check skipped (no capabilities declared)"
+                );
+            } else {
+                log::warn!(
+                    "adapter '{adapter_name}' not in registry; cannot verify its OPTIONAL capabilities; proceeding, since optional capabilities never hard-fail"
+                );
+            }
+            return Ok(());
+        }
+        return Err(format!(
+            "adapter '{adapter_name}' is not in the registry; cannot verify REQUIRED capabilities. Register an adapter stub that returns capability metadata, or move those entries to `optional`."
+        ));
+    };
+
+    let mut best_effort = Vec::new();
+    let mut unsupported = Vec::new();
+    for capability in capabilities.required.iter().copied() {
+        match adapter.capability(capability) {
+            CapabilitySupport::BestEffort => best_effort.push(capability.as_str()),
+            CapabilitySupport::BoundedCooperative => log::info!(
+                "adapter '{adapter_name}': required capability '{}' is bounded-cooperative; see capability docs for the bound",
+                capability.as_str()
+            ),
+            CapabilitySupport::Native => {}
+            CapabilitySupport::Unsupported | _ => unsupported.push(capability.as_str()),
+        }
+    }
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "adapter '{adapter_name}' does not support required capabilities: {}",
+            unsupported.join(", ")
+        ));
+    }
+    if !best_effort.is_empty() {
+        return Err(format!(
+            "adapter '{adapter_name}': required capabilities are only best-effort: {}. See https://edgezero.dev/guide/capabilities and declare them `optional` only when the documented limitation is acceptable.",
+            best_effort.join(", ")
+        ));
+    }
+
+    for capability in capabilities.optional.iter().copied() {
+        match adapter.capability(capability) {
+            CapabilitySupport::BestEffort => log::warn!(
+                "adapter '{adapter_name}': optional capability '{}' is best-effort; see https://edgezero.dev/guide/capabilities",
+                capability.as_str()
+            ),
+            CapabilitySupport::BoundedCooperative | CapabilitySupport::Native => {}
+            CapabilitySupport::Unsupported => log::warn!(
+                "adapter '{adapter_name}': optional capability '{}' unavailable",
+                capability.as_str()
+            ),
+            _ => log::warn!(
+                "adapter '{adapter_name}': optional capability '{}' reports an unrecognized support level; treating as degraded",
+                capability.as_str()
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Whether `action` for `adapter_name` resolves to a manifest-declared
@@ -441,11 +527,58 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, apply_environment};
+    use super::{ResolvedEnvironment, apply_environment, ensure_capabilities};
     use crate::test_support::manifest_guard;
-    use edgezero_core::manifest::ResolvedEnvironmentBinding;
+    use edgezero_adapter::registry::{Adapter, AdapterAction, register_adapter};
+    use edgezero_core::manifest::{
+        Capability, CapabilitySupport, ManifestContract, ManifestLoader, ResolvedEnvironmentBinding,
+    };
     use edgezero_core::test_env::EnvOverride;
     use std::process::Command;
+
+    static BEST_EFFORT_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-best-effort",
+        support: CapabilitySupport::BestEffort,
+    };
+    static BOUNDED_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-bounded",
+        support: CapabilitySupport::BoundedCooperative,
+    };
+    static NATIVE_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-native",
+        support: CapabilitySupport::Native,
+    };
+    static UNSUPPORTED_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-unsupported",
+        support: CapabilitySupport::Unsupported,
+    };
+
+    struct GateAdapter {
+        name: &'static str,
+        support: CapabilitySupport,
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "capability-gate fixture overrides only the relevant trait methods"
+    )]
+    impl Adapter for GateAdapter {
+        fn capability(&self, _capability: Capability) -> CapabilitySupport {
+            self.support
+        }
+
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    fn capability_manifest(section: &str) -> ManifestLoader {
+        ManifestLoader::load_from_str(&format!("[capabilities]\n{section}\n[adapters.gate]\n"))
+    }
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {
@@ -551,6 +684,78 @@ mod tests {
             injected,
             "manifest default must fill the slot when parent env is unset"
         );
+    }
+
+    #[test]
+    fn capability_gate_accepts_native_and_bounded_required_support() {
+        register_adapter(&NATIVE_ADAPTER);
+        register_adapter(&BOUNDED_ADAPTER);
+        let loader = capability_manifest("required = [\"outbound-http\"]");
+        for name in [NATIVE_ADAPTER.name, BOUNDED_ADAPTER.name] {
+            assert_eq!(
+                ensure_capabilities(name, ManifestContract::from_opt(Some(loader.manifest()))),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn capability_gate_fails_closed_for_malformed_contract() {
+        let result = ensure_capabilities(
+            "gate-missing-malformed",
+            ManifestContract::Malformed("fixture corruption"),
+        );
+        assert!(result.is_err_and(|error| error.contains("fixture corruption")));
+    }
+
+    #[test]
+    fn capability_gate_rejects_best_effort_and_unsupported_required_support() {
+        register_adapter(&BEST_EFFORT_ADAPTER);
+        register_adapter(&UNSUPPORTED_ADAPTER);
+        let loader = capability_manifest("required = [\"outbound-http\"]");
+        for name in [BEST_EFFORT_ADAPTER.name, UNSUPPORTED_ADAPTER.name] {
+            assert!(
+                ensure_capabilities(name, ManifestContract::from_opt(Some(loader.manifest())))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn capability_gate_treats_missing_registry_by_requirement_level() {
+        let required = capability_manifest("required = [\"outbound-http\"]");
+        let optional = capability_manifest("optional = [\"outbound-http\"]");
+        assert!(
+            ensure_capabilities(
+                "gate-missing-required",
+                ManifestContract::from_opt(Some(required.manifest()))
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ensure_capabilities(
+                "gate-missing-optional",
+                ManifestContract::from_opt(Some(optional.manifest()))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_capabilities("gate-missing-none", ManifestContract::None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn optional_capability_degradation_never_hard_fails() {
+        register_adapter(&BEST_EFFORT_ADAPTER);
+        register_adapter(&UNSUPPORTED_ADAPTER);
+        let loader = capability_manifest("optional = [\"outbound-http\"]");
+        for name in [BEST_EFFORT_ADAPTER.name, UNSUPPORTED_ADAPTER.name] {
+            assert_eq!(
+                ensure_capabilities(name, ManifestContract::from_opt(Some(loader.manifest()))),
+                Ok(())
+            );
+        }
     }
 
     #[test]

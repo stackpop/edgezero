@@ -25,5 +25,6 @@ pub fn run_demo() -> Result<(), String> {
     use app_demo_core::App;
     use edgezero_adapter_axum::dev_server::run_app;
 
+    crate::demo_capability_gate::<App>()?;
     run_app::<App>().map_err(|err| format!("demo server error: {err}"))
 }
