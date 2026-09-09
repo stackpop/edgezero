@@ -10,7 +10,7 @@ use edgezero_core::extractor::{
     AppConfig, Headers, Json, Kv, Path, Query, Secrets, State, ValidatedPath,
 };
 use edgezero_core::http::{self, Response, StatusCode, Uri};
-use edgezero_core::proxy::ProxyRequest;
+use edgezero_core::outbound::OutboundRequest;
 use edgezero_core::response::Text;
 use futures::{stream, StreamExt as _};
 
@@ -96,14 +96,14 @@ pub async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
 #[action]
 pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
-    let proxy_handle = ctx.proxy_handle();
+    let http_client = ctx.http_client();
     let request = ctx.into_request();
     let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
     let target = build_proxy_target(&base, &params.rest, request.uri())?;
-    let proxy_request = ProxyRequest::from_request(request, target);
+    let outbound_request = OutboundRequest::from_request(request, target)?;
 
-    if let Some(handle) = proxy_handle {
-        handle.forward(proxy_request).await
+    if let Some(client) = http_client {
+        client.send(outbound_request).await?.into_response()
     } else {
         proxy_not_available_response()
     }
@@ -130,9 +130,7 @@ fn build_proxy_target(base: &str, rest: &str, original_uri: &Uri) -> Result<Uri,
 }
 
 fn proxy_not_available_response() -> Result<Response, EdgeError> {
-    let body = Body::text(
-        "proxy example is not enabled for this adapter build; enable a proxy-capable adapter",
-    );
+    let body = Body::text("outbound HTTP is not enabled for this adapter build");
     http::response_builder()
         .status(StatusCode::NOT_IMPLEMENTED)
         .header("content-type", "text/plain; charset=utf-8")
@@ -328,8 +326,10 @@ mod tests {
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
+    use edgezero_core::outbound::{
+        HttpClient, OutboundHttpClient, OutboundResponse, OutboundSlotResult,
+    };
     use edgezero_core::params::PathParams;
-    use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
     use edgezero_core::store_registry::{
@@ -346,7 +346,7 @@ mod tests {
         data: Mutex<BTreeMap<String, Bytes>>,
     }
 
-    struct TestProxyClient;
+    struct TestOutboundClient;
 
     struct UnavailableConfigStore;
 
@@ -420,11 +420,32 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl ProxyClient for TestProxyClient {
-        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
-            let (_method, uri, _headers, _body, _) = request.into_parts();
-            assert!(uri.to_string().contains("status/201"));
-            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
+    impl OutboundHttpClient for TestOutboundClient {
+        async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
+            assert_eq!(request.method(), Method::POST);
+            assert_eq!(
+                request.uri().path_and_query().map(|value| value.as_str()),
+                Some("/status/201?source=demo")
+            );
+            let mut headers = edgezero_core::http::HeaderMap::new();
+            headers.insert("x-outbound-test", HeaderValue::from_static("preserved"));
+            Ok(OutboundResponse::new(
+                request.method().clone(),
+                StatusCode::CREATED,
+                headers,
+                Body::text("outbound-response"),
+            ))
+        }
+
+        async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
+            let mut results = Vec::with_capacity(requests.len());
+            for request in requests {
+                results.push(OutboundSlotResult::new(
+                    Duration::ZERO,
+                    self.send(request).await,
+                ));
+            }
+            results
         }
     }
 
@@ -905,15 +926,15 @@ mod tests {
     }
 
     #[test]
-    fn proxy_demo_uses_injected_handle() {
+    fn app_demo_outbound_client_preserves_method_and_uri() {
         let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/proxy/status/201")
-            .body(Body::empty())
+            .method(Method::POST)
+            .uri("/proxy/status/201?source=demo")
+            .body(Body::text("request-body"))
             .expect("request");
         request
             .extensions_mut()
-            .insert(ProxyHandle::with_client(TestProxyClient));
+            .insert(HttpClient::with_client(TestOutboundClient));
 
         let mut params = HashMap::new();
         params.insert("rest".to_owned(), "status/201".to_owned());
@@ -921,10 +942,19 @@ mod tests {
 
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["x-outbound-test"], "preserved");
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .as_ref(),
+            b"outbound-response"
+        );
     }
 
     #[test]
-    fn proxy_demo_without_handle_returns_placeholder() {
+    fn proxy_demo_without_client_returns_placeholder() {
         let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
