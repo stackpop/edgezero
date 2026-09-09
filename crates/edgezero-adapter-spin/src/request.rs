@@ -17,6 +17,7 @@ use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request, request_builder};
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::outbound::HttpClient;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
@@ -24,6 +25,8 @@ use edgezero_core::store_registry::{
 };
 use spin_sdk::http::Request as SpinRequest;
 use spin_sdk::http::body::IncomingBodyExt as _;
+
+use crate::outbound::SpinOutboundClient;
 
 /// Per-dispatch store wiring assembled before the request enters the router.
 /// The struct itself is `pub(crate)` because `dispatch_with_handles` takes it
@@ -90,6 +93,9 @@ pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
     request
         .extensions_mut()
         .insert(ProxyHandle::with_client(SpinProxyClient));
+    request
+        .extensions_mut()
+        .insert(HttpClient::with_client(SpinOutboundClient));
 
     Ok(request)
 }

@@ -1,10 +1,6 @@
-// Adapter contract tests run on the Spin wasm32 target, matching the
-// fastly and cloudflare contract suites. Gating the whole file keeps the
-// host `cargo test`/`clippy` runs consistent across adapters.
-#![cfg(all(feature = "spin", target_arch = "wasm32"))]
-
 // Compile-time check: SpinKvStore and SpinSecretStore implement their
 // respective core store traits.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod store_trait_compile_checks {
     use edgezero_adapter_spin::key_value_store::SpinKvStore;
     use edgezero_adapter_spin::secret_store::SpinSecretStore;
@@ -21,6 +17,7 @@ mod store_trait_compile_checks {
 }
 
 #[cfg(test)]
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod tests {
     // `from_core_response` tests live in a nested module so they're grouped
     // together; the `tests_outside_test_module` lint is satisfied by the
@@ -535,5 +532,46 @@ mod tests {
             b"no-handle",
             "no secret handle yields the no-handle marker"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
+mod outbound_contract_tests {
+    use bytes::Bytes;
+    use edgezero_adapter_spin::outbound::validate_batch_request_for_test;
+    use edgezero_core::body::Body;
+    use edgezero_core::http::{Method, Uri};
+    use edgezero_core::outbound::OutboundRequest;
+    use futures_util::stream;
+
+    fn request() -> OutboundRequest {
+        OutboundRequest::new(
+            Method::POST,
+            "https://example.com/bid".parse::<Uri>().expect("URI"),
+        )
+        .expect("request")
+    }
+
+    #[test]
+    fn send_all_preflight_precedence_and_indices() {
+        let requests = [
+            request().body(Bytes::from_static(b"buffered")),
+            request().body(Body::stream(stream::once(async {
+                Bytes::from_static(b"streamed")
+            }))),
+            request().stream_response(),
+            request().body(Bytes::from_static(b"last")),
+        ];
+
+        let outcomes: Vec<_> = requests
+            .iter()
+            .map(validate_batch_request_for_test)
+            .collect();
+
+        assert!(outcomes[0].is_ok());
+        assert!(outcomes[1].is_err(), "streamed upload keeps slot index 1");
+        assert!(outcomes[2].is_err(), "streamed response keeps slot index 2");
+        assert!(outcomes[3].is_ok());
     }
 }
