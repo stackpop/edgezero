@@ -9,7 +9,7 @@ Adapters translate provider-specific HTTP primitives into the portable `App` in 
 - Preserve request semantics
 - Stream responses without buffering where the provider supports it
 - Expose provider context
-- Offer a proxy bridge so handlers can forward traffic without knowing which platform they are on
+- Inject the portable outbound HTTP client without exposing provider SDK types to handlers
 
 ## Request Conversion
 
@@ -27,7 +27,7 @@ Adapters also expose `from_core_response` (or equivalent) to transform an `edgez
 
 - **Map HTTP status codes** verbatim
 - **Copy headers**, respecting casing rules enforced by the provider
-- **Preserve streaming bodies** - `Body::Stream` should be written chunk-by-chunk to the provider output without buffering the entire payload
+- **Apply the declared response boundary** - Cloudflare preserves lazy response streams; Axum, Fastly, and Spin collect portable response streams under a fixed 16 MiB conversion cap
 - **Handle encoding helpers** (`decode_gzip_stream`, `decode_brotli_stream`) where a provider requires transparent decompression
 
 ## Dispatch Helper
@@ -52,15 +52,21 @@ the id-keyed `Kv` / `Secrets` / `Config` extractors or the matching
 `ctx.kv_store(id)` / `ctx.config_store(id)` / `ctx.secret_store(id)`
 accessors. The pre-rewrite `Hooks::config_store()` hook is gone.
 
-## Proxy Integration
+## Outbound HTTP Integration
 
-Adapters implement `edgezero_core::proxy::ProxyClient` so handlers can forward outbound requests. The client must:
+Adapters implement `edgezero_core::outbound::OutboundHttpClient` and inject an `HttpClient` into
+each core request. Implementations must:
 
-- Accept a `ProxyRequest` created with `ProxyRequest::from_request`
-- Build and send an outbound provider request, reusing headers and streaming the body without buffering
-- Convert the provider response into a `ProxyResponse`, again preserving streaming behaviour and normalising encodings
-- Attach a diagnostic header (e.g., `x-edgezero-proxy`) identifying which adapter forwarded the call (Fastly and Cloudflare do this today)
-- Surface provider errors as `EdgeError::internal` so applications can decide how to respond
+- Implement both `send` and index-aligned `send_all`, including per-slot elapsed time
+- Apply the shared request validation, hop-by-hop normalization, deadline, and response-body rules
+- Enforce independent request, encoded response, decoded response, final buffer, header, Brotli, and chunk-shape controls
+- Preserve typed deadline, transport, protocol, codec, and resource failures without message matching
+- Attach `x-edgezero-proxy: <adapter>` to completed outbound responses
+- Publish an exact static capability level for every outbound capability
+
+Provider limitations are part of the contract rather than hidden implementation details. See
+[Capabilities](/guide/capabilities) for the support matrix, timing semantics, and accounting
+exclusions.
 
 ## Logging Initialisation
 
@@ -110,7 +116,7 @@ When bringing up another adapter:
 1. **Implement request/response conversion functions** that follow the rules above
 2. **Provide a context type** exposing the adapter's metadata and insert it in `into_core_request`
 3. **Implement a `dispatch` wrapper** plus logging helper
-4. **Wire up a `ProxyClient`** that streams bodies and normalises encodings
+4. **Wire up an `OutboundHttpClient`** with limits, deadlines, batching, and typed errors
 5. **Copy the contract test suite**, swapping in the new adapter types. Ensure the tests are gated to the target architecture if the adapter SDK does not compile for native hosts
 6. **Register the adapter** with `edgezero-adapter::register_adapter` (typically in a `cli` module using the `ctor` crate) so the CLI can discover it dynamically
 

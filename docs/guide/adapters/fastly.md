@@ -147,16 +147,16 @@ fastly compute deploy
 
 ## Backends
 
-EdgeZero's Fastly proxy client uses **dynamic backends** derived from the target URI (host + scheme).
-You do not need to predeclare backends in `fastly.toml` for EdgeZero proxying.
+`FastlyOutboundClient` uses deterministic **dynamic backends** derived from the canonical target,
+TLS identity, and provider timer budget. You do not predeclare those destinations in
+`fastly.toml`, but dynamic backends must be enabled on the deployed Fastly service. The local CLI
+cannot prove that service entitlement, so `outbound-http` is BestEffort. A disabled service
+returns a typed 502 with an enablement diagnostic.
 
-```rust
-use edgezero_adapter_fastly::FastlyProxyClient;
-use edgezero_core::proxy::ProxyService;
-
-let client = FastlyProxyClient;
-let response = ProxyService::new(client).forward(request).await?;
-```
+Fastly also has documented deadline, upload, elastic-budget, batch-isolation, and lazy downstream
+streaming limitations. The standard `#[fastly::main]` entrypoint buffers a portable response
+stream under the fixed 16 MiB `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` cap. See
+[Capabilities](/guide/capabilities) before marking an outbound capability required.
 
 ## Logging
 
@@ -264,9 +264,13 @@ async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
 
 ## Streaming
 
-Fastly supports native streaming via `stream_to_client`. The adapter automatically converts `Body::stream` to Fastly's streaming APIs.
+Fastly provides `stream_to_client`, but that API is incompatible with the standard
+`#[fastly::main]` entrypoint used by generated projects. The current response converter therefore
+collects `Body::stream` under a fixed 16 MiB cap before returning the final response. Outbound
+response streams retain typed read/decode/deadline errors during that collection.
 
-See the [Streaming guide](/guide/streaming) for examples and patterns.
+See the [Streaming guide](/guide/streaming) and
+[capability matrix](/guide/capabilities#outbound-matrix) for the exact boundary.
 
 ## Testing
 

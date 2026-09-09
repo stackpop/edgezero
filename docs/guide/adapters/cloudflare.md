@@ -95,17 +95,17 @@ wrangler deploy --cwd crates/my-app-adapter-cloudflare
 
 ## Fetch API
 
-Cloudflare Workers use the global `fetch` API for outbound requests:
+`CloudflareOutboundClient` uses the Workers global `fetch` API and is injected into core request
+extensions. Workers needs no backend registration, but application manifests still declare
+outbound hosts so the same portable contract validates on every target.
 
-```rust
-use edgezero_adapter_cloudflare::CloudflareProxyClient;
-use edgezero_core::proxy::ProxyService;
-
-let client = CloudflareProxyClient;
-let response = ProxyService::new(client).forward(request).await?;
-```
-
-Unlike Fastly, there's no backend configuration needed - Workers can fetch any URL directly.
+The adapter requests raw encoded upstream bytes with manual fetch encoding, disables automatic
+redirect following, and owns an abort signal for the absolute request deadline. When an encoded
+body is passed through to the downstream response, the response converter separately selects
+manual response-body encoding so Workers does not encode it again. These are two distinct
+controls. Cloudflare is the only current adapter with Native lazy streamed response passthrough;
+raw header octets and original non-`set-cookie` field boundaries remain unavailable, so header
+fidelity is BestEffort. See [Capabilities](/guide/capabilities).
 
 ## Logging
 

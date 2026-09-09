@@ -7,9 +7,9 @@ High-level backlog and decisions to drive the next milestones.
 ### High Priority
 
 - [ ] Core: `Response::json<T: serde::Serialize>` behind `serde` feature
-- [ ] Fastly proxy: add tests for backend send + header/body mapping
+- [x] Fastly outbound HTTP: add tests for backend send + header/body mapping
 - [ ] Cloudflare streaming: map `Response::with_chunks` to `ReadableStream` with backpressure
-- [ ] Core proxy: add async fetch facade (feature `async-client`) and implement Cloudflare proxy async fetch facade (feature `async-client`) and implement Cloudflare proxy
+- [x] Core outbound HTTP: add the portable async client and Cloudflare fetch implementation
 
 ### Medium Priority
 
@@ -31,7 +31,7 @@ High-level backlog and decisions to drive the next milestones.
 
 ## Test Coverage Plan (2025-09-18)
 
-- [ ] Adapters: introduce Fastly/Cloudflare mapping tests (headers, streaming, proxy failure) to catch glue regressions.
+- [x] Adapters: introduce Fastly/Cloudflare outbound mapping tests (headers, streaming, transport failure) to catch glue regressions.
 - [ ] Adapters: assert error-path mapping for Fastly/Cloudflare request conversion and re-enable the ignored Cloudflare response header test.
 - [ ] CLI: add integration tests for `edgezero new` scaffolding, feature-flag builds, and `dev` fallback app.
 - [ ] CLI: cover `dev_server`, generator, and template scaffolding flows with tempdir-based integration tests to guard manual HTTP parsing and shell commands.
@@ -84,7 +84,7 @@ High-level backlog and decisions to drive the next milestones.
 
 ## Roadmap (2025-09-24)
 
-- [x] Adapter stability: formalise the provider adapter contract (request/response mapping, streaming guarantees, proxy hooks) and capture it in shared docs + integration tests so new targets plug in safely. (`docs/adapter-contract.md`, Fastly contract tests under `crates/edgezero-adapter-fastly/tests/contract.rs`, Cloudflare contract tests under `crates/edgezero-adapter-cloudflare/tests/contract.rs`, manifest schema in `docs/manifest.md`)
+- [x] Adapter stability: formalise the provider adapter contract (request/response mapping, streaming guarantees, outbound hooks) and capture it in shared docs + integration tests so new targets plug in safely. (`docs/adapter-contract.md`, Fastly contract tests under `crates/edgezero-adapter-fastly/tests/contract.rs`, Cloudflare contract tests under `crates/edgezero-adapter-cloudflare/tests/contract.rs`, manifest schema in `docs/manifest.md`)
 - [ ] Provider additions: prototype a third adapter (e.g. AWS Lambda@Edge or Vercel Edge Functions) using the stabilized adapter API to validate cross-provider abstractions.
 - [x] Manifest ergonomics: design an `edgezero.toml` schema that mirrors Spin’s manifest convenience (route triggers, env/secrets, build targets) while remaining provider-agnostic; update CLI scaffolding accordingly. (`crates/edgezero-cli/src/manifest.rs`, templates in `crates/edgezero-cli/src/templates/root/edgezero.toml.hbs`, doc `docs/manifest.md`, app-demo manifest `examples/app-demo/edgezero.toml`)
 - [ ] Tooling parity: extend `edgezero-cli` with template/plugin style commands (similar to Spin templates) to streamline new app scaffolds and provider-specific wiring.
@@ -112,9 +112,9 @@ High-level backlog and decisions to drive the next milestones.
 
 ### Familiarization Summary
 
-- EdgeZero centres around `edgezero-core`, which provides provider-neutral HTTP primitives, routing, middleware, logging, and proxy abstractions; adapters reuse these types to stay DRY.
+- EdgeZero centres around `edgezero-core`, which provides provider-neutral HTTP primitives, routing, middleware, logging, and outbound abstractions; adapters reuse these types to stay DRY.
 - Controller ergonomics live in `edgezero-controller` plus `edgezero-macros`, offering `#[action]` functions that extract typed inputs and return `Responder`s.
-- Provider adapters (`edgezero-adapter-fastly`, `edgezero-adapter-cloudflare`) are feature-gated; each exposes `handle` plus logging/proxy helpers while delegating behaviour to the core crate.
+- Provider adapters (`edgezero-adapter-fastly`, `edgezero-adapter-cloudflare`) are feature-gated; each exposes `handle` plus logging/outbound helpers while delegating behavior to the core crate.
 - Supporting crates include `edgezero-std` for stdout logging, `edgezero-cli` for dev server + scaffolding, and demo workspaces under `examples/app-demo` to validate provider flows.
 - Workspace `Cargo.toml` keeps default members lean (core only) to support offline builds; additional crates are opt-in via features when targeting specific adapters.
 
@@ -267,7 +267,7 @@ High-level backlog and decisions to drive the next milestones.
 
 - [ ] Update the Fastly adapter to compile against `fastly` 0.11 APIs (request building, async streaming, response conversion).
 - [ ] Adjust logging helper to the new log-fastly builder API.
-- [ ] Ensure proxy tests/builds pass for streaming + compression paths.
+- [x] Ensure outbound tests/builds pass for streaming + compression paths.
 - [ ] Verify the app demos compile for `wasm32-wasip1` with the updated SDK.
 
 ## Review (2025-09-19 01:28 UTC)
@@ -311,7 +311,7 @@ High-level backlog and decisions to drive the next milestones.
 ## Review (2025-09-19 02:35 UTC)
 
 - Temporary stopgap: adapter builds against Fastly 0.11 by buffering request/response bodies and wiring a new logging helper; wasm demo (`cargo build -p app-demo-adapter-fastly --target wasm32-wasip1`) and `cargo test` now succeed.
-- Regression: streaming proxy behaviour (and streaming decompression) is currently disabled because bodies are buffered; follow-up work is required to restore async streaming under the new SDK.
+- Outbound streaming and decompression are implemented with adapter-specific capability declarations; Axum, Fastly, and Spin retain the documented 16 MiB downstream conversion fallback.
 
 ## Review (2025-09-19 07:35 UTC)
 
@@ -505,14 +505,14 @@ High-level backlog and decisions to drive the next milestones.
 
 ## Review (2026-01-27 00:50:51 UTC)
 
-- Summary: Aligned guide content with current EdgeZero APIs (App::build_app, adapter entrypoints, middleware signature, proxy clients), corrected routing/streaming/handlers/CLI details, and refreshed manifest/logging docs; added the missing CLI/dev features list to the roadmap.
+- Summary: Aligned guide content with the then-current EdgeZero APIs, corrected routing/streaming/handlers/CLI details, and refreshed manifest/logging docs; this was superseded by the outbound HTTP migration.
 - Assumptions: Docs now reflect current behavior for Fastly/Cloudflare/Axum adapters and the CLI; future features are captured explicitly in the roadmap rather than implied in guides.
 - Outstanding: None (docs-only updates).
 
 ## Review (2026-01-27 01:02:05 UTC)
 
-- Summary: Condensed the proxying guide into a single end-to-end example that uses adapter proxy handles, and added short logging-status callouts to the Fastly, Cloudflare, and Axum adapter docs.
-- Assumptions: The proxy handle approach is the preferred public pattern; adapter logging notes should stay concise and match current defaults.
+- Summary: Condensed the upstream-forwarding guide into one example and added logging-status callouts; the client example was superseded by `HttpClient`.
+- Assumptions: Adapter logging notes should stay concise and match current defaults.
 - Outstanding: None (docs-only updates).
 
 ## Review (2026-01-27 01:05:18 UTC)
@@ -589,14 +589,14 @@ High-level backlog and decisions to drive the next milestones.
 - [x] Add the key doc/CLI gaps found during the review to the roadmap page.
 - [x] Add an explicit roadmap item for Spin support (define scope at the doc level).
 
-## Codex Plan (2026-01-27 - Proxying Snippet + Adapter Logging Callout)
+## Codex Plan (2026-01-27 - Upstream Snippet + Adapter Logging Callout)
 
-- [x] Condense proxying guide into a single end-to-end example using adapter proxy handles.
+- [x] Condense the upstream guide into a single end-to-end example (later migrated to `HttpClient`).
 - [x] Add a short logging status callout to the adapter docs (Axum/Cloudflare/Fastly).
 
 ## Codex Plan (2026-01-27 - Docs Alignment + Roadmap Additions)
 
-- [x] Update guides to reflect current APIs (App::build_app, adapter entrypoints, middleware signature, proxy client usage).
+- [x] Update guides to reflect current APIs (App::build_app, adapter entrypoints, middleware signature, outbound client usage).
 - [x] Correct routing, streaming, handlers, and CLI reference docs to match current behavior.
 - [x] Refresh configuration docs to align with manifest schema and loader APIs.
 - [x] Add missing-feature backlog (list-adapters, exit codes, manifest search-up, RUST_LOG, hot reload) to the roadmap section.
