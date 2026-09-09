@@ -1,10 +1,11 @@
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Response, Uri};
+use edgezero_core::outbound::collect_response_stream;
 use fastly::Response as FastlyResponse;
 use futures::executor;
-use futures_util::StreamExt as _;
-use std::io::Write as _;
+
+pub const FASTLY_RESPONSE_STREAM_BUFFER_BYTES: u64 = 0x0100_0000;
 
 /// # Errors
 /// Returns [`EdgeError::Internal`] if the response body cannot be streamed to the Fastly send-channel.
@@ -15,14 +16,13 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
 
     match body {
         Body::Once(bytes) => fastly_response.set_body(bytes.to_vec()),
-        Body::Stream(mut stream) => {
-            let mut fastly_body = fastly::Body::new();
-            while let Some(result) = executor::block_on(stream.next()) {
-                let chunk = result?;
-                fastly_body.write_all(&chunk).map_err(EdgeError::internal)?;
-            }
-            fastly_response.set_body(fastly_body);
-        }
+        Body::Stream(stream) => fastly_response.set_body(
+            executor::block_on(collect_response_stream(
+                stream,
+                FASTLY_RESPONSE_STREAM_BUFFER_BYTES,
+            ))?
+            .to_vec(),
+        ),
     }
 
     // `append_header` preserves multi-value headers (e.g. N `Set-Cookie`). The
@@ -45,6 +45,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use edgezero_core::body::Body;
+    use edgezero_core::error::ResponseLimitReason;
     use edgezero_core::http::response_builder;
     use futures_util::stream;
 
@@ -92,5 +93,26 @@ mod tests {
         let mut fastly_response = from_core_response(response).expect("fastly response");
         let body_bytes = fastly_response.take_body_bytes();
         assert_eq!(body_bytes, b"hello world");
+    }
+
+    #[test]
+    fn stream_body_conversion_enforces_fixed_cap() {
+        let cap = usize::try_from(FASTLY_RESPONSE_STREAM_BUFFER_BYTES).expect("cap fits usize");
+        let over = response_builder()
+            .status(200)
+            .body(Body::from_stream(stream::iter([Ok(Bytes::from(vec![
+                0;
+                cap + 1
+            ]))])))
+            .expect("response");
+
+        let error = from_core_response(over).expect_err("one byte over cap");
+        assert!(matches!(
+            error,
+            EdgeError::ResponseTooLarge {
+                reason: ResponseLimitReason::BufferedBody,
+                ..
+            }
+        ));
     }
 }

@@ -2,7 +2,7 @@ use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
-use futures_util::StreamExt as _;
+use edgezero_core::outbound::collect_response_stream;
 use spin_sdk::http::{FullBody, Response as SpinResponse};
 
 use crate::SpinFullResponse;
@@ -10,12 +10,8 @@ use crate::SpinFullResponse;
 /// Maximum body size (16 MiB) when collecting a streamed body into a buffer.
 /// Prevents unbounded memory growth from malicious or misconfigured upstreams.
 ///
-/// Note: this cap only applies to `Body::Stream` variants.  `Body::Once` is
-/// already materialised in memory and bypasses this check.  The proxy module
-/// uses a separate, larger limit ([`MAX_DECOMPRESSED_SIZE`](crate::proxy) =
-/// 64 MiB) because proxy responses are untrusted external data that may
-/// decompress to a much larger size.
-const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
+/// `Body::Once` is already materialized and bypasses this converter boundary.
+pub const SPIN_RESPONSE_STREAM_BUFFER_BYTES: u64 = 0x0100_0000;
 
 /// Collect a `Body` into a `Vec<u8>`, consuming streamed chunks if necessary.
 ///
@@ -24,26 +20,12 @@ const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError> {
     match body {
         Body::Once(bytes) => Ok(bytes.to_vec()),
-        Body::Stream(mut stream) => {
-            let mut collected = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        // `usize::saturating_add` keeps the bound check
-                        // honest against pathological inputs without
-                        // triggering arithmetic_side_effects.
-                        if collected.len().saturating_add(bytes.len()) > MAX_BODY_SIZE {
-                            return Err(EdgeError::internal(anyhow::anyhow!(
-                                "body exceeds maximum size of {MAX_BODY_SIZE} bytes"
-                            )));
-                        }
-                        collected.extend_from_slice(&bytes);
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            Ok(collected)
-        }
+        Body::Stream(stream) => Ok(collect_response_stream(
+            stream,
+            SPIN_RESPONSE_STREAM_BUFFER_BYTES,
+        )
+        .await?
+        .to_vec()),
     }
 }
 
@@ -71,4 +53,27 @@ pub async fn from_core_response(response: Response) -> Result<SpinFullResponse, 
     builder
         .body(FullBody::new(Bytes::from(collected)))
         .map_err(|err| EdgeError::internal(anyhow::anyhow!("failed to build response: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edgezero_core::error::ResponseLimitReason;
+    use futures::executor::block_on;
+    use futures_util::stream;
+
+    #[test]
+    fn stream_body_conversion_enforces_fixed_cap() {
+        let cap = usize::try_from(SPIN_RESPONSE_STREAM_BUFFER_BYTES).expect("cap fits usize");
+        let body = Body::from_stream(stream::iter([Ok(Bytes::from(vec![0; cap + 1]))]));
+
+        let error = block_on(collect_body_bytes(body)).expect_err("one byte over cap");
+        assert!(matches!(
+            error,
+            EdgeError::ResponseTooLarge {
+                reason: ResponseLimitReason::BufferedBody,
+                ..
+            }
+        ));
+    }
 }
