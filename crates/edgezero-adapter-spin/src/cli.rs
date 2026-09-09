@@ -1311,32 +1311,40 @@ mod tests {
     const TEST_COMPONENT_ID: &str = "demo";
 
     #[test]
-    fn outbound_capability_matrix_is_honest() {
-        for capability in [
-            Capability::OutboundHeaderFidelity,
-            Capability::OutboundHttp,
-            Capability::SendAllSlotIsolation,
-        ] {
+    fn adapter_capability_matrix_matches_outbound_spec() {
+        let expected = [
+            (Capability::OutboundHttp, CapabilitySupport::Native),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::BestEffort,
+            ),
+        ];
+
+        for (capability, support) in expected {
             assert_eq!(
                 SPIN_ADAPTER.capability(capability),
-                CapabilitySupport::Native
+                support,
+                "{capability:?}"
             );
         }
-        for capability in [
-            Capability::LazyStreamedResponsePassthrough,
-            Capability::OutboundDeadlines,
-            Capability::OutboundFlexiblePhaseBudget,
-            Capability::StreamedUploadDeadlines,
-        ] {
-            assert_eq!(
-                SPIN_ADAPTER.capability(capability),
-                CapabilitySupport::BestEffort
-            );
-        }
-        assert_eq!(
-            SPIN_ADAPTER.capability(Capability::OutboundCompleteResourceAccounting),
-            CapabilitySupport::Unsupported
-        );
     }
 
     #[test]

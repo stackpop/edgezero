@@ -218,8 +218,12 @@ mod tests {
 #[cfg(test)]
 #[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
 mod outbound_contract_tests {
+    use std::cell::RefCell;
+
     use bytes::Bytes;
-    use edgezero_adapter_fastly::outbound::validate_batch_request_for_test;
+    use edgezero_adapter_fastly::outbound::{
+        dispatch_all_before_wait_for_test, validate_batch_request_for_test,
+    };
     use edgezero_core::body::Body;
     use edgezero_core::http::{Method, Uri};
     use edgezero_core::outbound::OutboundRequest;
@@ -250,5 +254,31 @@ mod outbound_contract_tests {
 
         let accepted: Vec<_> = outcomes.iter().map(Result::is_ok).collect();
         assert_eq!(accepted, vec![true, false, false, true]);
+    }
+
+    #[test]
+    fn send_all_dispatches_every_slot_before_wait() {
+        let events = RefCell::new(Vec::new());
+        let pending = dispatch_all_before_wait_for_test(0..3, |index| {
+            events.borrow_mut().push(format!("dispatch:{index}"));
+            Ok::<_, ()>(index)
+        });
+
+        for slot in pending {
+            let index = slot.expect("dispatch succeeds");
+            events.borrow_mut().push(format!("wait:{index}"));
+        }
+
+        assert_eq!(
+            events.into_inner(),
+            [
+                "dispatch:0",
+                "dispatch:1",
+                "dispatch:2",
+                "wait:0",
+                "wait:1",
+                "wait:2",
+            ]
+        );
     }
 }

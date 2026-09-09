@@ -88,7 +88,7 @@ async fn send_all_reports_per_slot_elapsed() {
 }
 
 #[tokio::test]
-async fn send_all_rejects_streamed_shapes_in_preflight() {
+async fn send_all_preflight_precedence_and_indices() {
     let client = AxumOutboundClient::try_new().unwrap();
     let streamed_upload = OutboundRequest::post("https://example.com/upload")
         .unwrap()
