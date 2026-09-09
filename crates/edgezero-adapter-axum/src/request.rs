@@ -30,7 +30,7 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
         }
         _ => {
             let stream = axum_body.into_data_stream();
-            Body::from_stream(stream)
+            Body::from_external_stream(stream)
         }
     };
 

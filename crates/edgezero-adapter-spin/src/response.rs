@@ -39,7 +39,7 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
                         }
                         collected.extend_from_slice(&bytes);
                     }
-                    Err(err) => return Err(EdgeError::internal(err)),
+                    Err(err) => return Err(err),
                 }
             }
             Ok(collected)

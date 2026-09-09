@@ -817,6 +817,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "brotli",
+ "brotli-decompressor",
  "bytes",
  "edgezero-macros",
  "flate2",
@@ -837,6 +838,7 @@ dependencies = [
  "toml",
  "tower-service",
  "tracing",
+ "url",
  "validator",
  "web-time",
 ]

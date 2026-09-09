@@ -8,12 +8,14 @@ use serde::de::DeserializeOwned;
 
 use crate::error::EdgeError;
 
+pub type BodyStream = LocalBoxStream<'static, Result<Bytes, EdgeError>>;
+
 /// Lightweight HTTP body that can either contain a single `Bytes` buffer or a streaming source of
 /// chunks. The streaming variant is implemented with `LocalBoxStream` so it remains compatible with
 /// `wasm32` targets that lack thread support.
 pub enum Body {
     Once(Bytes),
-    Stream(LocalBoxStream<'static, Result<Bytes, anyhow::Error>>),
+    Stream(BodyStream),
 }
 
 impl Body {
@@ -43,16 +45,26 @@ impl Body {
     }
 
     #[inline]
-    pub fn from_stream<S, E>(stream: S) -> Self
+    pub fn from_external_stream<S, E>(stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, E>> + 'static,
         anyhow::Error: From<E>,
     {
         Self::Stream(
             stream
-                .map(|res| res.map_err(anyhow::Error::from))
+                .map(|result| {
+                    result.map_err(|error| EdgeError::internal(anyhow::Error::from(error)))
+                })
                 .boxed_local(),
         )
+    }
+
+    #[inline]
+    pub fn from_stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<Bytes, EdgeError>> + 'static,
+    {
+        Self::Stream(stream.boxed_local())
     }
 
     /// Consume a buffered body and return its bytes, or `None` if this is a
@@ -84,11 +96,14 @@ impl Body {
             Body::Stream(mut stream) => {
                 let mut buf = Vec::new();
                 while let Some(result) = StreamExt::next(&mut stream).await {
-                    let chunk = result.map_err(EdgeError::internal)?;
-                    buf.extend_from_slice(&chunk);
-                    if buf.len() > max_size {
+                    let chunk = result?;
+                    let next_len = buf.len().checked_add(chunk.len()).ok_or_else(|| {
+                        EdgeError::bad_request("request body size accounting overflow")
+                    })?;
+                    if next_len > max_size {
                         return Err(EdgeError::bad_request("request body too large"));
                     }
+                    buf.extend_from_slice(&chunk);
                 }
                 Ok(Bytes::from(buf))
             }
@@ -96,7 +111,7 @@ impl Body {
     }
 
     #[inline]
-    pub fn into_stream(self) -> Option<LocalBoxStream<'static, Result<Bytes, anyhow::Error>>> {
+    pub fn into_stream(self) -> Option<BodyStream> {
         match self {
             Body::Once(_) => None,
             Body::Stream(stream) => Some(stream),
@@ -123,7 +138,7 @@ impl Body {
     where
         S: Stream<Item = Bytes> + 'static,
     {
-        Self::Stream(stream.map(Ok::<Bytes, anyhow::Error>).boxed_local())
+        Self::Stream(stream.map(Ok::<Bytes, EdgeError>).boxed_local())
     }
 
     #[inline]
@@ -170,6 +185,13 @@ impl fmt::Debug for Body {
     }
 }
 
+impl From<Bytes> for Body {
+    #[inline]
+    fn from(value: Bytes) -> Self {
+        Body::Once(value)
+    }
+}
+
 impl From<Vec<u8>> for Body {
     #[inline]
     fn from(value: Vec<u8>) -> Self {
@@ -201,9 +223,12 @@ impl From<String> for Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ResponseLimitReason;
     use futures::executor::block_on;
     use futures_util::stream;
+    use std::cell::Cell;
     use std::io;
+    use std::rc::Rc;
 
     #[test]
     fn as_bytes_returns_none_for_stream() {
@@ -248,12 +273,12 @@ mod tests {
     }
 
     #[test]
-    fn from_stream_maps_errors() {
+    fn body_from_external_stream_maps_to_internal() {
         let source = stream::iter(vec![
             Ok(Bytes::from_static(b"ok")),
             Err(io::Error::other("boom")),
         ]);
-        let body = Body::from_stream(source);
+        let body = Body::from_external_stream(source);
         let mut chunks = body.into_stream().expect("stream");
         let (first, second) = block_on(async {
             let first = chunks.next().await.expect("first").expect("ok");
@@ -262,7 +287,65 @@ mod tests {
         });
         assert_eq!(first, Bytes::from_static(b"ok"));
         let err = second.expect_err("error");
+        assert!(matches!(err, EdgeError::Internal { .. }));
         assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn body_from_stream_preserves_edge_error() {
+        let source = stream::iter([Err(EdgeError::response_too_large_with_reason(
+            "encoded cap",
+            ResponseLimitReason::EncodedBody,
+        ))]);
+        let body = Body::from_stream(source);
+        let mut chunks = body.into_stream().expect("stream");
+        let error = block_on(chunks.next())
+            .expect("item")
+            .expect_err("typed error");
+        assert!(matches!(
+            error,
+            EdgeError::ResponseTooLarge {
+                reason: ResponseLimitReason::EncodedBody,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn body_into_bytes_bounded_preserves_edge_error() {
+        let source = stream::iter([Err(EdgeError::gateway_timeout("expired"))]);
+        let error =
+            block_on(Body::from_stream(source).into_bytes_bounded(100)).expect_err("typed error");
+        assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+    }
+
+    #[test]
+    fn body_stream_accepts_infallible_bytes() {
+        let body = Body::stream(stream::iter([
+            Bytes::from_static(b"one"),
+            Bytes::from_static(b"two"),
+        ]));
+        let bytes = block_on(body.into_bytes_bounded(6)).expect("body");
+        assert_eq!(bytes, Bytes::from_static(b"onetwo"));
+        assert_eq!(
+            Body::from(Bytes::from_static(b"bytes")).as_bytes(),
+            Some(b"bytes".as_slice())
+        );
+    }
+
+    #[test]
+    fn body_bounded_checks_before_append() {
+        let polls = Rc::new(Cell::new(0_usize));
+        let observed = Rc::clone(&polls);
+        let source = stream::iter([
+            Ok(Bytes::from_static(b"too-large")),
+            Ok(Bytes::from_static(b"must-not-poll")),
+        ])
+        .inspect(move |_| observed.set(observed.get().saturating_add(1)));
+        let error =
+            block_on(Body::from_stream(source).into_bytes_bounded(3)).expect_err("over limit");
+        assert!(matches!(error, EdgeError::BadRequest { .. }));
+        assert_eq!(polls.get(), 1);
     }
 
     #[test]

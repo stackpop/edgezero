@@ -14,11 +14,13 @@ exchange state machine are later outbound/adapter work. They do not alter any Ph
 task, file, API, or verification command. In particular, this plan must not opportunistically
 change `Body`, `proxy`, or an adapter while landing the error/time primitives.
 
-**Tech Stack:** Rust 1.95 (edition 2024), `thiserror`, `serde_json`, `web-time` (for `Instant`), `futures::executor::block_on` for async tests.
+**Tech Stack:** Rust 1.95 (edition 2024), `thiserror`, `serde_json`, `web-time` (behind the public `MonotonicInstant` alias), `futures::executor::block_on` for async tests.
 
 ## Global Constraints (from the master design and phase index)
 
-- **WASM-first:** no `tokio`/runtime deps; use `web-time::Instant`, not `std::time::Instant`. Core stays `default-features = false`.
+- **WASM-first:** no `tokio`/runtime deps; public APIs use
+  `edgezero_core::time::MonotonicInstant`, backed internally by `web_time::Instant`, not
+  `std::time::Instant`. Core stays `default-features = false`.
 - **Colocated tests** (`#[cfg(test)]` same file); async tests use `futures::executor::block_on`.
 - **Verbatim constants:** `DEFAULT_NO_DEADLINE_BUDGET = 30 s`, `DEADLINE_FAR_FUTURE = 7 days`, `BATCH_DISPATCH_SLACK_MAX = 25 ms`.
 - **CI gates must stay green:** `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets`; `cargo check --workspace --all-targets --features "fastly cloudflare spin"`; `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`.
@@ -473,7 +475,15 @@ git commit -m "feat(core): add typed gateway errors"
 - Test: `crates/edgezero-core/src/time.rs` (colocated)
 
 **Interfaces:**
-- Produces (for Phase 1b `dispatch_budget` + all adapters): `Deadline` (`Copy`), `Deadline::after(Duration) -> Self`, `::at_instant(web_time::Instant) -> Self`, `::instant(&self) -> web_time::Instant`, `::remaining(&self) -> Option<Duration>`, `::is_expired(&self) -> bool`; consts `DEFAULT_NO_DEADLINE_BUDGET` (30 s), `DEADLINE_FAR_FUTURE` (7 days), `BATCH_DISPATCH_SLACK_MAX` (25 ms). **`DispatchBudget` ships in Phase 1b with `dispatch_budget`.**
+- Produces (for Phase 1b `dispatch_budget` + all adapters): public
+  `type MonotonicInstant = web_time::Instant`, `Deadline` (`Copy`),
+  `Deadline::after(Duration) -> Self`, `::at_instant(MonotonicInstant) -> Self`,
+  `::instant(&self) -> MonotonicInstant`, `::remaining(&self) -> Option<Duration>`,
+  `::is_expired(&self) -> bool`; consts `DEFAULT_NO_DEADLINE_BUDGET` (30 s),
+  `DEADLINE_FAR_FUTURE` (7 days), `BATCH_DISPATCH_SLACK_MAX` (25 ms).
+  **`DispatchBudget` ships in Phase 1b with `dispatch_budget`.** Downstream crates can name,
+  construct, and compare public timing values without declaring a direct `web-time`
+  dependency.
 
 **Deadline semantics (matches spec §3.3.2 `deadline <= now => expired`):** a deadline whose instant is **exactly now** is **expired** — `is_expired()` is `true` and `remaining()` is `None` at equality, not `Some(0)`. A naive `checked_duration_since(now).is_none()` gets this wrong (it returns `Some(ZERO)` at equality), so the impl below uses `checked_duration_since(..).filter(|r| !r.is_zero())` — the zero case is filtered explicitly.
 
@@ -487,7 +497,13 @@ use std::time::Duration;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use web_time::Instant;
+
+    #[test]
+    fn monotonic_instant_is_public_clock_type() {
+        let start = MonotonicInstant::now();
+        let deadline = Deadline::at_instant(start);
+        let _: MonotonicInstant = deadline.instant();
+    }
 
     // The public API promises `Deadline: Copy` (adapters copy it into per-slot budgets
     // rather than borrowing). Pin it at COMPILE time — a later `#[derive]` edit that
@@ -511,7 +527,7 @@ mod tests {
 
     #[test]
     fn deadline_before_now_is_expired() {
-        let base = Instant::now();
+        let base = MonotonicInstant::now();
         let past = Deadline::at_instant(base);
         let now = base
             .checked_add(Duration::from_secs(1))
@@ -525,7 +541,7 @@ mod tests {
         // The equality boundary: deadline instant == now. `deadline <= now` is
         // expired, but `checked_duration_since` returns Some(ZERO) here, so a naive
         // impl would wrongly report NOT expired.
-        let base = Instant::now();
+        let base = MonotonicInstant::now();
         let at_now = Deadline::at_instant(base);
         assert_eq!(
             at_now.remaining_at(base),
@@ -540,7 +556,7 @@ mod tests {
 
     #[test]
     fn deadline_in_future_has_exact_remaining() {
-        let base = Instant::now();
+        let base = MonotonicInstant::now();
         let future = Deadline::at_instant(
             base.checked_add(Duration::from_mins(1))
                 .expect("no overflow"),
@@ -554,9 +570,9 @@ mod tests {
     fn after_clamps_duration_max_to_far_future() {
         // Prove the 7-DAY CLAMP via bounds on the resulting INSTANT (no second
         // now()-snapshot to race against).
-        let before = Instant::now();
+        let before = MonotonicInstant::now();
         let deadline = Deadline::after(Duration::MAX);
-        let after = Instant::now();
+        let after = MonotonicInstant::now();
         // `after()` computed `t0 + FAR_FUTURE` for some t0 in [before, after],
         // so the instant must land within [before+FAR_FUTURE, after+FAR_FUTURE].
         let lower = before
@@ -570,7 +586,7 @@ mod tests {
         );
     }
 
-    // Public smoke tests: the live-clock wrappers (which call Instant::now()) actually
+    // Public smoke tests: the live-clock wrappers (which call MonotonicInstant::now()) actually
     // delegate to the pure *_at helpers. The *_at tests above cover exact arithmetic;
     // these guard the public surface AND that `after` honours its duration argument.
     #[test]
@@ -579,9 +595,9 @@ mod tests {
         // [before + 1h, after + 1h]. Any mutation that perturbs the duration — dropping
         // 30s, or clamping to DEADLINE_FAR_FUTURE = 7 days — falls outside the bracket.
         // (A loose "remaining is (59 min, 1 h]" check would survive a 30s-off mutant.)
-        let before = Instant::now();
+        let before = MonotonicInstant::now();
         let far = Deadline::after(Duration::from_hours(1));
-        let after = Instant::now();
+        let after = MonotonicInstant::now();
         assert!(!far.is_expired());
         // rustfmt-canonical SPLIT form (verified with `rustfmt --edition 2024`): the
         // `.checked_add(..).expect(..)` chain exceeds `chain_width = 60`, so rustfmt
@@ -598,7 +614,7 @@ mod tests {
         );
         assert!(far.remaining().is_some());
         // `after(ZERO)` yields `now`; by the time is_expired()/remaining() read a later
-        // Instant::now(), it is at-or-past — no `checked_sub` (would underflow a fresh
+        // MonotonicInstant::now(), it is at-or-past — no `checked_sub` (would underflow a fresh
         // WASM Instant near its epoch).
         let now_deadline = Deadline::after(Duration::ZERO);
         assert!(now_deadline.is_expired());
@@ -607,7 +623,7 @@ mod tests {
 
     #[test]
     fn instant_round_trips() {
-        let base = Instant::now()
+        let base = MonotonicInstant::now()
             .checked_add(Duration::from_secs(10))
             .expect("no overflow");
         assert_eq!(Deadline::at_instant(base).instant(), base);
@@ -626,8 +642,8 @@ Expected: FAIL to compile (`cannot find value DEFAULT_NO_DEADLINE_BUDGET`, `cann
 - [ ] **Step 3: Implement constants + `Deadline`**
 
 Insert the implementation between the existing `use std::time::Duration;` and
-`#[cfg(test)]`. Add `use web_time::Instant;` after the standard-library import; do not
-duplicate or reorder the existing `Duration` import:
+`#[cfg(test)]`. Define the public alias in this module; do not import `web_time::Instant`
+under its dependency-owned name:
 
 > **This code is written to pass the repo's strict Clippy gate.** The workspace sets
 > `restriction = { level = "deny", priority = -1 }` (root `Cargo.toml`), and **none** of
@@ -636,10 +652,9 @@ duplicate or reorder the existing `Duration` import:
 > carries **`#[inline]`** (matching the 14 existing `#[inline]`s in `error.rs`); no
 > single-char idents (`d` → `duration`); and **no bare `-`/`+`** — all arithmetic is
 > `checked_*`. The private `*_at(now)` helpers additionally make the logic **pure and
-> deterministically testable** (no hidden `Instant::now()` inside the assertion).
+> deterministically testable** (no hidden `MonotonicInstant::now()` inside the assertion).
 
 ```rust
-use web_time::Instant;
 
 /// Max adapter overhead tolerated before a fan-out slot fails closed.
 pub const BATCH_DISPATCH_SLACK_MAX: Duration = Duration::from_millis(25);
@@ -650,14 +665,17 @@ pub const DEFAULT_NO_DEADLINE_BUDGET: Duration = Duration::from_secs(30);
 
 /// An absolute, copyable monotonic deadline. A deadline at or before now is expired.
 #[derive(Debug, Clone, Copy)]
-pub struct Deadline(Instant);
+pub struct Deadline(MonotonicInstant);
+
+/// Portable monotonic clock instant used by EdgeZero timing APIs.
+pub type MonotonicInstant = web_time::Instant;
 
 impl Deadline {
     /// Returns a deadline `now + min(duration, DEADLINE_FAR_FUTURE)`; never panics.
     #[inline]
     #[must_use]
     pub fn after(duration: Duration) -> Self {
-        let now = Instant::now();
+        let now = MonotonicInstant::now();
         let clamped = duration.min(DEADLINE_FAR_FUTURE);
         Deadline(now.checked_add(clamped).unwrap_or(now))
     }
@@ -665,14 +683,14 @@ impl Deadline {
     /// Constructs a deadline from an absolute instant.
     #[inline]
     #[must_use]
-    pub fn at_instant(instant: Instant) -> Self {
+    pub fn at_instant(instant: MonotonicInstant) -> Self {
         Deadline(instant)
     }
 
     /// Returns the absolute deadline instant.
     #[inline]
     #[must_use]
-    pub fn instant(&self) -> Instant {
+    pub fn instant(&self) -> MonotonicInstant {
         self.0
     }
 
@@ -680,10 +698,10 @@ impl Deadline {
     #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.is_expired_at(Instant::now())
+        self.is_expired_at(MonotonicInstant::now())
     }
 
-    fn is_expired_at(&self, now: Instant) -> bool {
+    fn is_expired_at(&self, now: MonotonicInstant) -> bool {
         self.remaining_at(now).is_none()
     }
 
@@ -691,10 +709,10 @@ impl Deadline {
     #[inline]
     #[must_use]
     pub fn remaining(&self) -> Option<Duration> {
-        self.remaining_at(Instant::now())
+        self.remaining_at(MonotonicInstant::now())
     }
 
-    fn remaining_at(&self, now: Instant) -> Option<Duration> {
+    fn remaining_at(&self, now: MonotonicInstant) -> Option<Duration> {
         self.0
             .checked_duration_since(now)
             .filter(|remaining| !remaining.is_zero())

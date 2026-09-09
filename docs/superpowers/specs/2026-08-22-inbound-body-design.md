@@ -43,18 +43,19 @@ performs this ordered protocol exactly once per platform request:
 1. Stamp `request_start` from the adapter's monotonic clock at the earliest EdgeZero-owned
    entry point. It means "EdgeZero received control", not when the client sent its first
    byte and not when route execution began.
-2. Validate raw request framing where the platform exposes a raw boundary (§1.2). A framing
-   rejection returns 400 and closes/resets that request without invoking app admission or
-   polling/draining the body.
+2. Enforce parser-level request-target and header limits, then validate raw request framing,
+   where the platform exposes a raw boundary (§1.2). Target overflow returns 414, header
+   byte/count overflow returns 431, and framing rejection returns 400. Every rejection
+   closes/resets that request without route resolution, app admission, or body polling.
 3. Convert only request-head data, retain the unread native body separately, and call
    `RouterService::resolve(method, path)` once. Resolution returns an opaque dispatch token
    plus `RouteResolution::{Matched, MethodNotAllowed, NotFound}`. It performs no middleware,
    handler, body poll, or request-extension injection. The token owns the exact match and
    path parameters so admitted dispatch does not rerun matching.
 4. Construct a normalized `IngressHead` containing the method, target, version, visible
-   headers, `IngressFraming`, adapter request metadata, public `request_start`, and the
-   stable route resolution. The framing value itself says whether EdgeZero validated the
-   raw boundary or the host owns framing.
+   headers, `IngressHeadAccounting`, `IngressFraming`, adapter request metadata, public
+   `request_start`, and the stable route resolution. The accounting and framing values say
+   whether EdgeZero validated the raw boundary or the host owns those decisions.
 5. Invoke the one admission policy stored on `App`. It returns either `Refuse(Response)` or
    `Admit { grant: IngressGrant, read_deadline: Deadline }`. The callback is synchronous
    and body-blind: it can inspect the head but cannot obtain or poll the body. A refusal
@@ -168,7 +169,7 @@ type-id string, serializer, or platform handle API; application code knows the c
 lease type it inserted.
 
 `IngressHead::request_start()` and `RequestContext::request_start()` return the captured
-`web_time::Instant`. Both are the same value and clock domain used by `Deadline`; neither
+`MonotonicInstant`. Both are the same value and clock domain used by `Deadline`; neither
 accessor snapshots a new instant. `IngressHead::route_resolution()` exposes the value above,
 and a matched `RequestContext::route_metadata()` returns that exact matched metadata.
 
@@ -189,11 +190,79 @@ service. Paths that currently clone only `app.router()` must also carry that pol
 claim ingress admission. Hand-built adapter services expose the same explicit policy setter
 and otherwise use the portable default.
 
+Parser limits are startup policy, not admission output: the parser must know them before it
+can safely materialize `IngressHead`. `App` therefore also owns immutable
+`IngressHeadLimits`, copied into the adapter service during finalization. The default is
+finite on every target:
+
+```rust
+pub const DEFAULT_MAX_REQUEST_HEADER_BYTES: u64 = 65_536;
+pub const DEFAULT_MAX_REQUEST_HEADER_COUNT: u64 = 100;
+pub const DEFAULT_MAX_REQUEST_TARGET_BYTES: u64 = 8_192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IngressHeadLimits {
+    max_request_header_bytes: u64,
+    max_request_header_count: u64,
+    max_request_target_bytes: u64,
+}
+
+impl IngressHeadLimits {
+    pub fn max_request_header_bytes(&self) -> u64;
+    pub fn max_request_header_count(&self) -> u64;
+    pub fn max_request_target_bytes(&self) -> u64;
+    pub fn with_max_request_header_bytes(self, max: u64) -> Result<Self, EdgeError>;
+    pub fn with_max_request_header_count(self, max: u64) -> Result<Self, EdgeError>;
+    pub fn with_max_request_target_bytes(self, max: u64) -> Result<Self, EdgeError>;
+}
+```
+
+All three values must be nonzero. Validation runs when `App` is finalized and before a
+listener/guest service starts. Invalid configuration is `Internal`; it never silently means
+unlimited. Limits are inclusive and use checked `u64` accounting.
+
 This seam starts when EdgeZero receives control. It cannot reject or time-bound bytes a
 provider accepted or buffered before invoking guest code; adapter capability documentation
 must state that host-side exposure rather than attributing it to the guest deadline.
 
-### 1.2 Raw request-framing policy
+### 1.2 Raw request-head limits and framing policy
+
+At a raw parser boundary, request-target bytes are the exact octets between the first and
+second spaces of the HTTP/1 request line, before URI normalization. Header bytes are the raw
+field-section octets from the first field-name through the terminating empty line, including
+colons, optional whitespace, line endings, and the final line ending. Header count is the
+number of field lines before duplicate coalescing. The parser rejects on the first byte or
+field above the configured value; it does not read an unbounded head and check afterward.
+For multiplexed protocols, equivalent accounting is performed on the encoded field section
+only when the adapter exposes a bounded pre-materialization hook.
+
+The raw parser returns `EdgeError::UriTooLong { message }` (414) for target overflow and
+`EdgeError::RequestHeaderFieldsTooLarge { message }` (431) for header byte/count overflow.
+Neither diagnostic includes target or header contents. These failures happen before route
+resolution and therefore never enter `StoredError` through a body drain, but those variants
+are still included in its total match. Malformed request syntax remains `BadRequest` (400).
+
+Admission can inspect whether the configured parser contract actually ran:
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IngressHeadAccounting {
+    HostManaged,
+    RawValidated {
+        request_header_bytes: u64,
+        request_header_count: u64,
+        request_target_bytes: u64,
+    },
+}
+```
+
+`IngressHead::head_accounting()` returns this value. `RawValidated` is emitted only when all
+three values were measured before normalized request construction and found within the exact
+`IngressHeadLimits` installed for that service. A normalized `HeaderMap` recount may reject
+visible data as defense in depth but must report `HostManaged`; it cannot satisfy the raw
+capability or recover field-line/request-target octets discarded by the platform.
 
 `IngressFraming` distinguishes raw-validated framing from a host-managed request whose raw
 boundary EdgeZero cannot inspect:
@@ -262,21 +331,22 @@ never polled again. Expiry after a clean cached drain does not retroactively poi
 bytes. Dropping a caller future without deadline expiry keeps the separate documented
 `Internal("inbound body drain cancelled")` poison.
 
-The public deadline contract is portable; the teardown strength is not. Add three
+The public deadline contract is portable; the teardown strength is not. Add four
 non-outbound capability cells to the shared capability ladder:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
 | `ingress-admission` | Native | Native | Native | Native |
 | `inbound-read-deadlines` | Native | BestEffort until a deployed cancellation probe passes | BestEffort (synchronous host reads are not guest-preemptible) | BestEffort until host-observed cancellation is bounded |
+| `raw-ingress-head-limits` | Native after the parser-boundary work lands | Unsupported | Unsupported | Unsupported |
 | `raw-ingress-framing-validation` | Native after the parser-boundary work lands | Unsupported | Unsupported | Unsupported |
 
 BestEffort implementations still use pre-read/post-ready checks and terminate ownership on
 expiry; they do not claim a finite bound around an uninterruptible host call. A manifest
 that requires Native support fails before startup/deploy through the same capability ladder
-used elsewhere. Raw framing and body-read deadline are separate cells: a platform host may
-reject malformed framing without exposing evidence, and may expose a cancellable body while
-hiding raw field lines.
+used elsewhere. Raw head limits, raw framing, and body-read deadline are separate cells: a
+platform host may impose undocumented limits or reject malformed framing without exposing
+evidence, and may expose a cancellable body while hiding raw target/field-line bytes.
 
 ## 2. Bounded Context Helpers
 
@@ -453,11 +523,11 @@ the Fastly and Spin paths fully materialize the body too). This migration change
   impl RequestContext {
       #[inline]
       pub fn new(request: Request, params: PathParams) -> Self {
-          Self::new_low_level(request, params, web_time::Instant::now())
+          Self::new_low_level(request, params, MonotonicInstant::now())
       }
 
       #[inline]
-      pub fn request_start(&self) -> web_time::Instant;
+      pub fn request_start(&self) -> MonotonicInstant;
 
       #[inline]
       pub fn route_metadata(&self) -> Option<&RouteMetadata>;
@@ -607,6 +677,7 @@ platform runtime or network.
 | Bounded drain | `Body::Once` and multi-chunk streams succeed at and below the cap; the first byte above the cap returns `bad_request` without unchecked accounting overflow. |
 | Successful cache | The platform stream is polled only once; repeated reads clone the same bytes. A permissive read followed by a stricter cached read returns an over-cap error while leaving the cell `Cached`; a later permissive read succeeds. |
 | Failed drain | Source error and initial-drain cap overflow transition to `Poisoned`; every later buffered accessor, `take_body`, and `into_request` reconstructs the same variant, status, message, and structured fields. The source is never polled again. |
+| Parser-level head limits | Exact-limit request targets, header bytes, and header counts pass. One byte/field over rejects before route resolution, admission, request construction, or body polling with 414/431 and redacted diagnostics. Raw accounting includes duplicate field lines and framing syntax; checked overflow fails closed. Host-normalized recounts never report `RawValidated`. |
 | Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Refusal polls no body, invokes no middleware/handler, terminates the native reader, and preserves the chosen response. The default policy supplies an empty grant and one finite deadline derived from `request_start`. |
 | Request ingress metadata | `IngressHead` and matched `RequestContext` expose the same captured `request_start` and route metadata. `take_ingress_grant()` returns the non-clone grant exactly once, then `None`; untaken, refused, 404, and 405 grants each drop exactly once. The preserved low-level context constructor exposes no route and makes no admission claim. |
 | Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). Cached success is not retroactively poisoned. |
@@ -636,14 +707,16 @@ Fastly tests cooperative checks without asserting preemption of a synchronous ho
   `BodyCell`; add the state machine, bounded helpers, body-state accessors, `take_body`, and
   fallible `into_request`; store the captured request start, optional route metadata, and
   one-shot ingress grant; remove whole-request borrow accessors.
-- `crates/edgezero-core/src/app.rs`: add the synchronous, body-blind admission policy to
-  `App`, its default finite inbound read budget, and the normalized ingress-head/decision
-  types. The macro continues to use `Hooks::configure(&mut App)` as the app-owned setter
-  point.
-- `crates/edgezero-core/src/error.rs`: add `RequestTimeout { message }` with status 408 and
-  kind `request_timeout`; update every exhaustive match and wire-shape matrix.
+- `crates/edgezero-core/src/app.rs`: add the synchronous, body-blind admission policy and
+  immutable `IngressHeadLimits` to `App`, its default finite inbound read budget, and the
+  normalized ingress-head/decision/accounting types. The macro continues to use
+  `Hooks::configure(&mut App)` as the app-owned setter point.
+- `crates/edgezero-core/src/error.rs`: add `RequestHeaderFieldsTooLarge { message }` with
+  status 431 and kind `request_header_fields_too_large`, `RequestTimeout { message }` with
+  status 408 and kind `request_timeout`, and `UriTooLong { message }` with status 414 and
+  kind `uri_too_long`; update every exhaustive match and wire-shape matrix.
 - `crates/edgezero-core/src/manifest.rs` and `crates/edgezero-adapter/src/registry.rs`: add
-  the three inbound capability cells and fail-closed required-capability handling. Keep
+  the four inbound capability cells and fail-closed required-capability handling. Keep
   these counts separate from the outbound design's eight-cell tuple.
 - `crates/edgezero-core/src/extractor.rs`: route JSON/form extractors through bounded
   helpers, add explicit-cap variants, and add the two public default constants.
@@ -656,8 +729,9 @@ Fastly tests cooperative checks without asserting preemption of a synchronous ho
   opaque resolved token; and wrap each platform request body with its absolute deadline and
   native cancellation owner. Keep `Body::Once` only when the platform already owns bounded
   bytes and admission has already run.
-- `crates/edgezero-adapter-axum` server connection path: validate raw HTTP/1 field lines
-  before Hyper can discard framing evidence; reject/close on ambiguity. The normalized
+- `crates/edgezero-adapter-axum` server connection path: enforce raw request-target/header
+  limits and validate raw HTTP/1 field lines before Hyper can discard framing evidence;
+  reject/close on overflow or ambiguity. The normalized
   `Request<Body>` conversion is not the enforcement point.
 - `crates/edgezero-core` call sites and tests: migrate `request()` / `request_mut()` users
   to parts or body-specific accessors and update the now-fallible `into_request()` calls.

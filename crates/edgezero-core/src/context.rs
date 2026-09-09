@@ -1,6 +1,7 @@
 use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::Request;
+use crate::outbound::HttpClient;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
 use crate::store_registry::{
@@ -95,6 +96,12 @@ impl RequestContext {
                 "streaming bodies are not supported for form extraction",
             )),
         }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn http_client(&self) -> Option<HttpClient> {
+        self.request.extensions().get::<HttpClient>().cloned()
     }
 
     #[inline]
@@ -220,6 +227,9 @@ impl RequestContext {
 mod tests {
     use super::*;
     use crate::http::{HeaderValue, Method, StatusCode, Uri, request_builder};
+    use crate::outbound::{
+        HttpClient, OutboundHttpClient, OutboundRequest, OutboundResponse, OutboundSlotResult,
+    };
     use crate::params::PathParams;
     use crate::proxy::{ProxyClient, ProxyHandle, ProxyRequest, ProxyResponse};
     use async_trait::async_trait;
@@ -231,6 +241,8 @@ mod tests {
 
     struct DummyClient;
 
+    struct DummyOutboundClient;
+
     #[derive(Debug, PartialEq, Deserialize, Serialize)]
     struct PathData {
         id: String,
@@ -240,6 +252,22 @@ mod tests {
     impl ProxyClient for DummyClient {
         async fn send(&self, _request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
             Ok(ProxyResponse::new(StatusCode::OK, Body::empty()))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl OutboundHttpClient for DummyOutboundClient {
+        async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
+            Ok(OutboundResponse::new(
+                request.method().clone(),
+                StatusCode::OK,
+                crate::http::HeaderMap::new(),
+                Body::empty(),
+            ))
+        }
+
+        async fn send_all(&self, _requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
+            Vec::new()
         }
     }
 
@@ -286,7 +314,7 @@ mod tests {
     #[test]
     fn form_streaming_body_not_supported() {
         let stream = stream::iter(vec![Ok::<Bytes, anyhow::Error>(Bytes::from("name=demo"))]);
-        let body = Body::from_stream(stream);
+        let body = Body::from_external_stream(stream);
         let ctx = ctx("/submit", body, PathParams::default());
         let err = ctx.form::<serde_json::Value>().expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -378,6 +406,21 @@ mod tests {
                 name: "demo".into()
             }
         );
+    }
+
+    #[test]
+    fn http_client_is_retrieved_when_present() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/outbound")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(HttpClient::with_client(DummyOutboundClient));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.http_client().is_some());
     }
 
     // `RequestContext::kv_handle()` was removed. The

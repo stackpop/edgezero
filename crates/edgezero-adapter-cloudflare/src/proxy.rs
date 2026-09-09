@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use edgezero_core::body::Body;
+use edgezero_core::body::{Body, BodyStream};
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
+use edgezero_core::outbound::DEFAULT_MAX_BROTLI_DECODER_BYTES;
 use edgezero_core::proxy::{PROXY_HEADER, ProxyClient, ProxyRequest, ProxyResponse};
 use futures_util::TryStreamExt as _;
 use futures_util::stream::{self, LocalBoxStream, StreamExt as _};
@@ -134,14 +135,14 @@ fn http_method_to_cf(method: &Method) -> CfMethod {
     }
 }
 
-fn transform_stream(
-    stream: ChunkStream,
-    encoding: Option<&str>,
-) -> LocalBoxStream<'static, Result<Bytes, io::Error>> {
+fn transform_stream(stream: ChunkStream, encoding: Option<&str>) -> BodyStream {
+    let stream = stream
+        .map(|result| result.map(Bytes::from).map_err(EdgeError::internal))
+        .boxed_local();
     match encoding {
-        Some("gzip") => decode_gzip_stream(stream).boxed_local(),
-        Some("br") => decode_brotli_stream(stream).boxed_local(),
-        _ => stream.map(|res| res.map(Bytes::from)).boxed_local(),
+        Some("gzip") => decode_gzip_stream(stream),
+        Some("br") => decode_brotli_stream(stream, 24, DEFAULT_MAX_BROTLI_DECODER_BYTES),
+        _ => stream,
     }
 }
 

@@ -1549,20 +1549,24 @@ and serial response harvest delay observation. The deviation is not response-bod
 ```rust
 // crates/edgezero-core/src/time.rs (new module)
 
+/// Portable monotonic clock instant used by every public EdgeZero timing API. Downstream
+/// crates do not need a direct `web-time` dependency to name or construct this value.
+pub type MonotonicInstant = web_time::Instant;
+
 /// An absolute monotonic instant after which work should stop. A pure value type
-/// — arithmetic over `web_time::Instant`, identical on every target, with no
+/// — arithmetic over `MonotonicInstant`, identical on every target, with no
 /// runtime dependency. `time.rs` contains `Deadline`, `DispatchBudget`,
 /// `dispatch_budget`, and the public timing constants; the deliberate
 /// constraint is that core carries **no runtime / timer / platform
 /// dependency** — none of those types reaches outside the value-level
 /// arithmetic and the trait surface adapters implement.
 #[derive(Clone, Copy, Debug)]
-pub struct Deadline(web_time::Instant);
+pub struct Deadline(MonotonicInstant);
 
 impl Deadline {
  /// `now + min(d, DEADLINE_FAR_FUTURE)`, where `DEADLINE_FAR_FUTURE` is a
  /// **defined constant** clamp (7 days, see below). Bounded far-future clamping,
- /// not "saturate to whatever Instant::MAX happens to be" — `std::time::Instant`
+ /// not "saturate to whatever MonotonicInstant::MAX happens to be" — `std::time::Instant`
  /// has no `MAX` and platform overflow behaviour differs. The clamp is
  /// finite and well above any realistic fan-out batch/proxy budget, so this never
  /// truncates a legitimate caller and never panics. Adapter boundaries must
@@ -1572,8 +1576,8 @@ impl Deadline {
  /// would overflow the underlying `Instant` yields an already-expired deadline
  /// (fails closed) rather than panicking.
     pub fn after(duration: Duration) -> Self;
-    pub fn at_instant(instant: web_time::Instant) -> Self;  // construct from absolute instant
-    pub fn instant(&self) -> web_time::Instant;    // accessor for the absolute instant
+    pub fn at_instant(instant: MonotonicInstant) -> Self;  // construct from absolute instant
+    pub fn instant(&self) -> MonotonicInstant;    // accessor for the absolute instant
     pub fn is_expired(&self) -> bool;
     pub fn remaining(&self) -> Option<Duration>;   // None once passed
 }
@@ -1651,11 +1655,11 @@ pub enum BudgetSource {
 
 /// `now` is passed in (not snapshotted internally) so a single `send_all` can use
 /// **one** `now` snapshot across every slot. Without that, sequential per-slot
-/// `Instant::now` calls produce slightly different `duration` values for the same
+/// `MonotonicInstant::now` calls produce slightly different `duration` values for the same
 /// shared `Deadline`, which on Fastly would produce different `budget_ms` values
 /// and therefore different dynamic-backend identities for the same host under one
 /// batch deadline. `send` (single request) just passes
-/// `web_time::Instant::now`.
+/// `MonotonicInstant::now`.
 // PRIVACY + NAME-COLLISION CONTRACT (both verified by compiling a skeleton).
 // `time.rs` is a sibling module of `outbound.rs` and cannot read `OutboundRequest`'s
 // private fields directly — earlier pseudocode did, which does not compile.
@@ -1687,7 +1691,7 @@ pub enum BudgetSource {
 #[inline]
 pub fn dispatch_budget(
     req: &OutboundRequest,
-    now: web_time::Instant,
+    now: MonotonicInstant,
 ) -> Result<DispatchBudget, EdgeError> {
     let inputs = req.budget_inputs();   // single crate-visible accessor (see contract above)
 
@@ -1953,7 +1957,7 @@ fn fastly_timeout_ms(budget: &DispatchBudget) -> u64 {
 // entry before preflight; `send_all` snapshots once into `batch_now` at method entry and reuses it
 // across slots so the dynamic-backend identity stays consistent for a shared
 // caller Deadline.
-let now = web_time::Instant::now();             // single `send`; `send_all` passes batch_now
+let now = MonotonicInstant::now();             // single `send`; `send_all` passes batch_now
 let budget = dispatch_budget(req, now)?;
 
 // Fastly 0.12.1 exposes the timeout setters on BackendBuilder, NOT on Request — see
@@ -4268,7 +4272,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   addition to the manifest's disabled default features. This makes the raw-byte boundary
   explicit even if Reqwest feature selection changes later; only the shared EdgeZero
   classifier/decoder may transform a response body.
-- `send_all` first snapshots `let batch_now = web_time::Instant::now()` once, then runs a
+- `send_all` first snapshots `let batch_now = MonotonicInstant::now()` once, then runs a
   **preflight** per slot: call `validate_for_dispatch(&request)` first; only a request that
   passes that portable validator reaches the batch-only checks. Then any request whose `body` is
   `Body::Stream` OR whose `response_mode` is `Streamed` is converted in place to
@@ -4278,7 +4282,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   alignment is preserved by tracking the original positions while building the
   future set. It passes that entry snapshot to every per-slot
   `dispatch_budget(req, batch_now)` — see §3.3.2 / §4.3 for why a per-slot
-  `Instant::now()` would drift the shared-deadline `duration` and (on Fastly) the
+  `MonotonicInstant::now()` would drift the shared-deadline `duration` and (on Fastly) the
   backend identity.
 - A public single `send` takes its monotonic snapshot first, calls
   `validate_for_dispatch(&req)` exactly once immediately afterward, then invokes the same
@@ -4288,7 +4292,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
      never an adapter-local formula, so `DEFAULT_NO_DEADLINE_BUDGET = 30 s` is
      applied uniformly when no deadline is set). On expiry-before-dispatch this
      returns `Err(gateway_timeout)` for the slot immediately. For a single `send`,
-     `now = web_time::Instant::now()` is taken inline.
+     `now = MonotonicInstant::now()` is taken inline.
   2. **If the request body is `Body::Stream`, drain it to `Bytes` first.** Core
      `Body::Stream` is `LocalBoxStream` (not the `Send + 'static` stream
      `reqwest::Body::wrap_stream` requires), so Axum drains a streamed request body
@@ -4355,7 +4359,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
 ### 4.2 Cloudflare — `crates/edgezero-adapter-cloudflare`
 
 - `CloudflareProxyClient` → `CloudflareOutboundClient` (stays stateless).
-- `send_all` first snapshots `let batch_now = web_time::Instant::now()` once, then runs a
+- `send_all` first snapshots `let batch_now = MonotonicInstant::now()` once, then runs a
   **preflight** per slot: call `validate_for_dispatch(&request)` first; only a request that
   passes that portable validator reaches the batch-only checks. Then any request with `Body::Stream`
   OR `response_mode = Streamed` is converted to `Err(EdgeError::bad_request(..))`
@@ -4446,7 +4450,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   that implements this option and verifies actual raw bytes; successful `Reflect::set`
   alone does not prove the host honors it.
 - **Host-event fairness is required, not just repeated clock reads.** In deployed
-  Cloudflare Workers, `performance.now()` (and therefore `web_time::Instant`) advances
+  Cloudflare Workers, `performance.now()` (and therefore `MonotonicInstant`) advances
   only after I/O, unlike the normal local workerd clock
   ([Cloudflare timing semantics](https://developers.cloudflare.com/workers/runtime-apis/performance/)).
   `worker::Delay` depends on a `setTimeout` callback. An always-ready empty source can
@@ -4642,10 +4646,10 @@ enum Slot {
 }
 
 fn finish_slot(
-    batch_started_at: web_time::Instant,
+    batch_started_at: MonotonicInstant,
     outcome: Result<OutboundResponse, EdgeError>,
 ) -> OutboundSlotResult {
-    let observed_at = web_time::Instant::now();
+    let observed_at = MonotonicInstant::now();
     match observed_at.checked_duration_since(batch_started_at) {
         Some(elapsed) => OutboundSlotResult { elapsed, outcome },
         None => OutboundSlotResult {
@@ -4665,7 +4669,7 @@ async fn send_all(
  // dispatch_budget so a shared caller Deadline produces the same `duration`
  // and ceiled `budget_ms`, and therefore one dynamic-backend identity per host
  // in a homogeneous-budget batch. This is the first operation, even for an empty batch.
-    let batch_started_at = web_time::Instant::now();
+    let batch_started_at = MonotonicInstant::now();
     let request_count = reqs.len();
 
  // Phase 0 — preflight. After the method-entry clock snapshot above, **the shared
@@ -4872,7 +4876,7 @@ async fn send_all(
   homogeneous-budget batch all slots targeting the same host
   share one backend — **but only because `send_all` takes a single `now` snapshot
   and passes it to every per-slot `dispatch_budget` call** (§3.3.2). Without that,
-  sequential `Instant::now()` per slot would derive slightly different `duration`s
+  sequential `MonotonicInstant::now()` per slot would derive slightly different `duration`s
   for the same shared caller `Deadline`, which would produce slightly different
   ceiled `budget_ms` values and therefore different identities for the same host
   under one batch deadline. The shared-`now` snapshot is a normative requirement
@@ -4905,7 +4909,7 @@ async fn send_all(
     (§4.3 honesty note), and when it returns *after* the deadline, that is a genuine
     **504 timeout**, NOT an EdgeZero bug — so it must be an attributed `gateway_timeout`,
     never `internal`. **(2) THEN, only if time still remains** (`!is_expired()`) but the
-    adapter overhead exceeded the slack, `Instant::now() - batch_now >
+    adapter overhead exceeded the slack, `MonotonicInstant::now() - batch_now >
     BATCH_DISPATCH_SLACK_MAX` → the remaining slots fail closed with
     `Err(EdgeError::internal("Fastly send_all adapter overhead between batch_now \
      and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) \
@@ -5001,7 +5005,7 @@ async fn send_all(
   **(1) the absolute deadline FIRST** — `if budget.deadline.is_expired() { return
   Err(gateway_timeout_caused("deadline expired during Fastly dispatch", budget.cause)); }`
   (a cold `finish()` returning past the deadline is a genuine **504**, not an EdgeZero bug);
-  **(2) THEN, only while time remains**, `Instant::now() - now > BATCH_DISPATCH_SLACK_MAX`
+  **(2) THEN, only while time remains**, `MonotonicInstant::now() - now > BATCH_DISPATCH_SLACK_MAX`
   → `EdgeError::internal(..)` with the same "adapter overhead between dispatch_budget and
   SDK arming" diagnostic as `send_all`. So single `send` returns the attributed **504** for a
   real expiry and `internal` only for excess overhead with time to spare — identical to
@@ -5270,7 +5274,7 @@ async fn send_all(
       failure: SendFailure,
       deadline: Deadline,
       cause: BudgetSource,
-      observed_at: web_time::Instant,
+      observed_at: MonotonicInstant,
   ) -> EdgeError { /* per the table above */ }
 
  // 3. The BOUNDARY: known SDK variants are directly tested. A `_` arm is
@@ -5578,7 +5582,7 @@ current matrix remains `BestEffort`.
 ### 4.4 Spin — `crates/edgezero-adapter-spin`
 
 - `SpinProxyClient` → `SpinOutboundClient` (stays stateless).
-- `send_all` first snapshots `let batch_now = web_time::Instant::now()` once, then runs a
+- `send_all` first snapshots `let batch_now = MonotonicInstant::now()` once, then runs a
   **preflight** per slot: call `validate_for_dispatch(&request)` first; only a request that
   passes that portable validator reaches the batch-only checks. Then any request with `Body::Stream`
   OR `response_mode = Streamed` is converted to `Err(EdgeError::bad_request(..))`
@@ -5601,7 +5605,7 @@ current matrix remains `BestEffort`.
   pins the SDK timer to the absolute batch deadline, matching Axum/CF (§4.1 /
   §4.2 step 4). If `remaining()` is `None`, return
   `gateway_timeout_caused(.., budget.cause)` without
-  issuing the request. Single `send` snapshots `now = web_time::Instant::now()` at its
+  issuing the request. Single `send` snapshots `now = MonotonicInstant::now()` at its
   public method entry before preflight.
 - **Streamed responses honour the effective-budget deadline — STREAMED MODE ONLY.** This
   is the second phase for `Streamed` mode, where `to_core` returns `Body::Stream` **without
@@ -6594,7 +6598,7 @@ the durable anchors.
 **`crates/edgezero-adapter-{axum,cloudflare,fastly,spin}`**
 
 - Each `Cargo.toml` adds `web-time = { workspace = true }` to `[dependencies]` for
-  direct `web_time::Instant::now()` snapshots and `test-utils = []` to `[features]`.
+  direct `MonotonicInstant::now()` snapshots and `test-utils = []` to `[features]`.
   Core's existing `web-time` dependency and dev-dependency `test-utils` feature do not
   declare either surface for an adapter. Keep the adapter test feature independent of
   runtime/CLI features and preserve current defaults (§5.5).

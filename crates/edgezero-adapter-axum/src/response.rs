@@ -27,7 +27,7 @@ pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
                     let bytes = chunk?;
                     buf.extend_from_slice(&bytes);
                 }
-                Ok::<Vec<u8>, anyhow::Error>(buf)
+                Ok::<Vec<u8>, edgezero_core::error::EdgeError>(buf)
             });
             match result {
                 Ok(buf) => AxumBody::from(buf),
@@ -67,7 +67,7 @@ mod tests {
             Ok::<_, anyhow::Error>(bytes::Bytes::from_static(b"hel")),
             Ok(bytes::Bytes::from_static(b"lo")),
         ]);
-        let body = Body::from_stream(stream);
+        let body = Body::from_external_stream(stream);
         let response = response_builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain")
