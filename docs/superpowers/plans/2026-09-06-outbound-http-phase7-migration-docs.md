@@ -128,11 +128,12 @@ rg -n 'Body::from_stream|Body::from_external_stream|Body::Stream|Self::Stream|\.
 - Create: `scripts/check_outbound_docs_contract.mjs`
 - Modify: `CLAUDE.md`, `.claude/agents/code-architect.md`, `Cargo.toml`, `TODO.md` where they describe the active API
 
-- [ ] Document all seven capability names, support ladder semantics, exact matrix, every BestEffort footnote including Fastly's dynamic-backend service prerequisite, host grammar/defaults, request/response limits, batch memory model, and no-client behavior. The exact rows are:
+- [ ] Document all eight outbound capability names, support ladder semantics, exact matrix, every BestEffort footnote including Fastly's dynamic-backend service prerequisite, host grammar/defaults, request/response limits, batch memory model, and no-client behavior. The exact rows are:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
 | `outbound-http` | Native | Native | BestEffort | Native |
+| `outbound-complete-resource-accounting` | Unsupported | Unsupported | Unsupported | Unsupported |
 | `outbound-header-fidelity` | Native | BestEffort | Native | Native |
 | `outbound-deadlines` | Native | Native | BestEffort | BestEffort |
 | `outbound-flexible-phase-budget` | Native | Native | BestEffort | BestEffort |
@@ -142,9 +143,10 @@ rg -n 'Body::from_stream|Body::from_external_stream|Body::Stream|Self::Stream|\.
 
 - [ ] Explain that Cloudflare manual upstream fetch encoding and downstream encoded passthrough are distinct controls.
 - [ ] Explain 16 MiB downstream conversion fallback on Axum/Fastly/Spin and Native lazy passthrough only on Cloudflare.
+- [ ] Explain that the body/header/window/decoder-state controls bound named guest-visible terms, `max_chunk_bytes` shapes emitted items without limiting source allocation, and complete pre-admission process/isolate accounting is Unsupported on every current adapter because provider parser, field-section, native chunk, allocator, and host-copy terms remain opaque.
 - [ ] Before editing prose, expand `scripts/check_outbound_legacy_api.sh` to scan `docs/guide`, `README.md`, `CLAUDE.md`, `TODO.md`, root `Cargo.toml`, and `.claude/agents/code-architect.md` in addition to its existing code/template roots, adding `*.md` and `*.toml` globs. Using explicit active-source roots excludes internal history under `docs/superpowers/specs` and `docs/superpowers/plans`. Run it and require the expected stale-document failure.
 - [ ] Add exactly one sidebar item whose link is `/guide/capabilities`; verify all internal links/anchors.
-- [ ] Create `scripts/check_outbound_docs_contract.mjs`. It reads `docs/guide/capabilities.md` and `docs/.vitepress/config.mts`, locates exactly one Markdown table with the exact header `Capability | Axum | Cloudflare | Fastly | Spin`, and parses every contiguous data row in that table rather than filtering by a name prefix. It strips backticks around the first cell and only a trailing superscript footnote reference (`¹` through `⁹`) or Markdown footnote reference (`[^…]`) from support cells, then deep-compares the resulting ordered entries to the literal seven-row matrix above. It fails on a missing/duplicate matrix table or any duplicate, missing, extra, reordered, misspelled, or differently supported row, including the two valid names that do not begin `outbound-`. It also requires exactly one `/guide/capabilities` sidebar link. These assertions own `capabilities_page_lists_exact_matrix`, `docs_sidebar_links_capabilities`, and `outbound_docs_contract`.
+- [ ] Create `scripts/check_outbound_docs_contract.mjs`. It reads `docs/guide/capabilities.md` and `docs/.vitepress/config.mts`, locates exactly one Markdown table with the exact header `Capability | Axum | Cloudflare | Fastly | Spin`, and parses every contiguous data row in that table rather than filtering by a name prefix. It strips backticks around the first cell and only a trailing superscript footnote reference (`¹` through `⁹`) or Markdown footnote reference (`[^…]`) from support cells, then deep-compares the resulting ordered entries to the literal eight-row matrix above. It fails on a missing/duplicate matrix table or any duplicate, missing, extra, reordered, misspelled, or differently supported row, including the two valid names that do not begin `outbound-`. It also requires exactly one `/guide/capabilities` sidebar link. These assertions own `capabilities_page_lists_exact_matrix`, `docs_sidebar_links_capabilities`, and `outbound_docs_contract`.
 - [ ] Run `node scripts/check_outbound_docs_contract.mjs`; expect failure before the page/sidebar are complete, then exit 0 after the documentation change.
 - [ ] Run `npm --prefix docs run lint`, `npm --prefix docs run format`, and `npm --prefix docs run build`; expect success.
 - [ ] Run `bash scripts/check_outbound_legacy_api.sh` over the now-updated active docs; expect no stale API references. Legitimate protocol terminology is outside the script's exact symbol pattern and needs no broad exclusion.

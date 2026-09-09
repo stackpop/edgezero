@@ -1,11 +1,17 @@
 # Blob App Config — Design Spec
 
 **Date:** 2026-06-16
-**Status:** v1 — Plan-ready (twenty-three reviewer passes complete; reviewer cleared for plan authoring at round 24)
+**Status:** v1 — Plan-ready; typed extraction and bounded-read amendment incorporated 2026-09-08
 **Author:** Aram Grigoryan
 **Related branches:** `feature/extensible-cli` (current baseline)
 
 ## v1 changelog
+
+**Cross-contract amendment (2026-09-08):** typed app-config reads now terminate in the
+inspectable `StoreExtractionReason` contract from §6.3 and use the one-deadline bounded APIs
+from §6.3.2. This amendment supersedes historical changelog entries below that describe
+direct `ConfigOutOfDate`/`ServiceUnavailable` variants or unbounded `get`/`require_str`
+inside `AppConfig<C>`; those entries remain only as the review history of earlier drafts.
 
 Initial draft after twenty-four review rounds — one author
 self-review, twenty-three reviewer passes against the current
@@ -2690,30 +2696,54 @@ async fn extract<C>(req: &RequestContext) -> Result<C, EdgeError>
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
-    // 1. Fetch the envelope JSON string from the adapter via ConfigStore::get.
-    //    Missing blob maps to ConfigOutOfDate (Q3 (d) per round-18 M-2) —
-    //    re-running `<app-cli> config push` resolves the case, which is
-    //    exactly what ConfigOutOfDate means.
-    let raw = config_store.get(&resolved_key).await?
-        .ok_or_else(|| EdgeError::config_out_of_date(
-            format!("missing typed app-config blob at key `{resolved_key}` — run `<app-cli> config push` for this deploy"),
-            String::new(),
-        ))?;
-    let envelope: BlobEnvelope = serde_json::from_str(&raw)?;
-    envelope.verify_sha()?;
+    // 1. Fetch under the one extraction-wide byte/time budget (§6.3.2).
+    let mut budget = ConfigExtractionBudget::start(req.config_extraction_limits())?;
+    let read = config_store
+        .get_bounded(
+            &resolved_key,
+            budget.deadline(),
+            budget.remaining_backend_bytes(),
+            budget.max_blob_bytes(),
+        )
+        .await
+        .map_err(map_config_store_error)?;
+    budget.charge_backend(read.backend_bytes)?;
+    let raw = read.value.ok_or_else(|| EdgeError::store_extraction(
+        StoreExtractionReason::MissingBlob,
+        format!("missing typed app-config blob at key `{resolved_key}` — run `<app-cli> config push` for this deploy"),
+        None,
+    ))?;
+    budget.charge_value(raw.len())?;
+    let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_| {
+        EdgeError::store_extraction(
+            StoreExtractionReason::InvalidEnvelope,
+            "typed app-config envelope is invalid",
+            None,
+        )
+    })?;
+    envelope.verify_sha().map_err(|_| EdgeError::store_extraction(
+        StoreExtractionReason::IntegrityMismatch,
+        "typed app-config integrity check failed",
+        None,
+    ))?;
     let mut data: serde_json::Value = envelope.into_data();
 
     // 2. Walk SECRET_FIELDS. For each KeyInDefault / KeyInNamedStore
     //    entry, look up the named secret store, fetch the value, swap
     //    it into `data[field.name]`. StoreRef entries are untouched.
     let data_obj = data.as_object_mut()
-        .ok_or_else(|| EdgeError::internal("blob `data` is not a JSON object"))?;
+        .ok_or_else(|| EdgeError::store_extraction(
+            StoreExtractionReason::InvalidEnvelope,
+            "blob `data` is not a JSON object",
+            None,
+        ))?;
     for field in C::SECRET_FIELDS {
         let key_name = data_obj.get(field.name)
             .and_then(|v| v.as_str())
-            .ok_or_else(|| EdgeError::config_out_of_date(
+            .ok_or_else(|| EdgeError::store_extraction(
+                StoreExtractionReason::SchemaMismatch,
                 format!("missing or non-string value at `{}`", field.name),
-                field.name.to_owned(),
+                Some(field.name.to_owned()),
             ))?
             .to_owned();
         // For KeyInDefault, resolve to a BOUND default store via
@@ -2729,14 +2759,15 @@ where
         let (bound, resolved_store_id) = match field.kind {
             SecretKind::KeyInDefault => {
                 let bound = req.secret_store_default().ok_or_else(|| {
-                    EdgeError::config_out_of_date(
+                    EdgeError::store_extraction(
+                        StoreExtractionReason::MissingRegistry,
                         format!(
                             "secret field `{}` has kind KeyInDefault but \
                              no default secret store is registered (check \
                              [stores.secrets].default or declare a single id)",
                             field.name,
                         ),
-                        field.name.to_owned(),
+                        Some(field.name.to_owned()),
                     )
                 })?;
                 let id = bound.store_name().to_owned();
@@ -2746,22 +2777,45 @@ where
             SecretKind::KeyInNamedStore { store_ref_field } => {
                 let store_id_str = data_obj.get(store_ref_field)
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| EdgeError::config_out_of_date(
+                    .ok_or_else(|| EdgeError::store_extraction(
+                        StoreExtractionReason::SchemaMismatch,
                         format!("missing store_ref `{store_ref_field}` for secret field `{}`", field.name),
-                        field.name.to_owned(),
+                        Some(field.name.to_owned()),
                     ))?
                     .to_owned();
                 let bound = req.secret_store(&store_id_str).ok_or_else(|| {
-                    EdgeError::config_out_of_date(
-                        format!("blob declared store_ref `{store_id_str}` but [stores.secrets] has no such id"),
-                        field.name.to_owned(),
+                    EdgeError::store_extraction(
+                        StoreExtractionReason::UnknownStore,
+                        format!("secret field `{}` references an unregistered store (identifier redacted)", field.name),
+                        Some(field.name.to_owned()),
                     )
                 })?;
                 (bound, store_id_str)
             }
         };
-        let secret = bound.require_str(&key_name).await
+        let read = bound
+            .get_bytes_bounded(
+                &key_name,
+                budget.deadline(),
+                budget.remaining_backend_bytes(),
+                budget.max_secret_bytes(),
+            )
+            .await
             .map_err(|err| map_secret_error(err, field.name, &resolved_store_id, &key_name))?;
+        budget.charge_backend(read.backend_bytes)?;
+        let secret_bytes = read.value.ok_or_else(|| EdgeError::store_extraction(
+            StoreExtractionReason::MissingSecret,
+            format!("the secret referenced by `{}` was not found in its store (identifier redacted)", field.name),
+            Some(field.name.to_owned()),
+        ))?;
+        budget.charge_value(secret_bytes.len())?;
+        let secret = String::from_utf8(secret_bytes.to_vec()).map_err(|_| {
+            EdgeError::store_extraction(
+                StoreExtractionReason::InvalidSecretValue,
+                format!("the secret referenced by `{}` is not valid UTF-8", field.name),
+                Some(field.name.to_owned()),
+            )
+        })?;
         data_obj.insert(field.name.to_owned(), serde_json::Value::String(secret));
     }
 
@@ -2769,7 +2823,7 @@ where
     //    the field-path) + validate.
     use serde::de::IntoDeserializer as _;
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
-        .map_err(EdgeError::config_out_of_date_from_serde)?;
+        .map_err(EdgeError::store_schema_mismatch_from_serde)?;
     cfg.validate().map_err(|err| {
         // The secret walk above replaced `#[secret]` fields with their
         // RESOLVED values, and `validator`'s params echo the rejected value,
@@ -2781,7 +2835,11 @@ where
         } else {
             format!("app config failed validation for field `{field}`")
         };
-        EdgeError::config_out_of_date(message, field)
+        EdgeError::store_extraction(
+            StoreExtractionReason::SchemaMismatch,
+            message,
+            (!field.is_empty()).then_some(field),
+        )
     })?;
     Ok(cfg)
 }
@@ -2853,30 +2911,21 @@ RESOLVED value, populated by the extractor's walk.
 
 #### 3.3.6 What this means for failure modes
 
-Current `SecretError`
-(`crates/edgezero-core/src/secret_store.rs:113`) has four
-variants: `NotFound`, `Validation`, `Internal`, `Unavailable`.
-`require_str` (line 269) maps invalid-UTF-8 bytes from the
-store to `SecretError::Internal`. The extractor wraps each
-into an `EdgeError` variant based on what action the operator
-can take. The mapping below is comprehensive — every
-`SecretError` variant has a documented landing.
+Bounded extraction extends `SecretError` with `DeadlineExceeded` and `ValueTooLarge`.
+The extractor wraps every lower-level outcome in `EdgeError::StoreExtraction`; the stable
+reason remains inspectable even when several reasons share one wire kind.
 
-| Extractor failure                                  | `SecretError`                                | `EdgeError`          | Why                                                                                                                                                                                                                                                                     |
-| -------------------------------------------------- | -------------------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Secret-store ID unknown (no `[stores.secrets].id`) | none — caught before secret call             | `ConfigOutOfDate`    | Manifest declares the wrong store name OR the manifest wasn't redeployed. Re-push fixes it.                                                                                                                                                                             |
-| Secret key not found in the named store            | `SecretError::NotFound`                      | `ConfigOutOfDate`    | Operator forgot to provision the secret value. Re-run secret provisioning.                                                                                                                                                                                              |
-| Store rejected the key shape (length, charset)     | `SecretError::Validation { .. }`             | `ConfigOutOfDate`    | The blob's key name is invalid for the named store (e.g. Fastly Secret Store keys are constrained). Operator either renames the secret-store key or fixes the `<name>.toml` value.                                                                                      |
-| Secret value is bytes, not UTF-8                   | `SecretError::Internal` (from `require_str`) | `Internal`           | The store CONTAINS the key but the bytes aren't a `String`. Data quality at rest; not deploy-related. Operator audits the secret-store entry directly.                                                                                                                  |
-| Secret store unreachable (transient network)       | `SecretError::Unavailable`                   | `ServiceUnavailable` | A flaky backend is not an out-of-date config — retry is the right response. Surfaces as HTTP 503; per §6.3.1 the `Retry-After: 60` header is NOT set on `ServiceUnavailable` in v1 (audit of existing producers showed too many non-retryable cases reuse the variant). |
-| Any other `SecretError::Internal`                  | `SecretError::Internal`                      | `Internal`           | Unexpected store-side failure (an adapter bug, a wire-format change). Pages oncall; not actionable by deploy.                                                                                                                                                           |
-
-The boundary between `ConfigOutOfDate` and `Internal` is:
-**does re-running `<app-cli> config push` (or its sibling
-secret-provisioning step) fix the situation?** If yes →
-`ConfigOutOfDate`. If no → `Internal`. The invalid-UTF-8 case
-falls on the wrong side of that boundary (re-push doesn't fix
-non-string bytes in the store), so it stays on `Internal`.
+| Extractor failure | Lower-level outcome | `StoreExtractionReason` | HTTP / kind |
+| --- | --- | --- | --- |
+| No default secret registry | caught before read | `MissingRegistry` | 500 / `internal` |
+| Referenced named store is unknown | caught before read | `UnknownStore` | 500 / `internal` |
+| Secret key not found | bounded read returns `value: None` | `MissingSecret` | 503 / `config_out_of_date` |
+| Store rejects key shape | `SecretError::Validation(..)` | `InvalidKey` | 400 / `bad_request` |
+| Secret bytes are not UTF-8 | caught after bounded byte read | `InvalidSecretValue` | 500 / `internal` |
+| Secret store unavailable | `SecretError::Unavailable` | `SecretBackendUnavailable` | 503 / `service_unavailable` |
+| Bounded read deadline expires | `SecretError::DeadlineExceeded` | `DeadlineExceeded` | 503 / `service_unavailable` |
+| Per-secret or cumulative byte cap is exceeded | `SecretError::ValueTooLarge` or budget charge | `ValueTooLarge` | 500 / `internal` |
+| Any other backend failure | `SecretError::Internal(..)` | `BackendFailure` | 500 / `internal` |
 
 The extractor's wrapper around the secret-store call
 materialises this mapping ONCE near the call site:
@@ -2884,10 +2933,12 @@ materialises this mapping ONCE near the call site:
 ```rust
 // Matches the actual SecretError shape at
 // crates/edgezero-core/src/secret_store.rs:113:
+//   DeadlineExceeded                 // unit, added by §6.3.2
 //   Internal(#[from] anyhow::Error)
 //   NotFound { name: String }     // struct-like
 //   Unavailable                   // unit
 //   Validation(String)            // tuple
+//   ValueTooLarge                    // unit, added by §6.3.2
 // SECURITY: the stored key NAME, the store id, and the provider's
 // message/source are deliberately UNUSED. They are blob- or
 // provider-controlled strings that can reveal the secret or the
@@ -2902,38 +2953,43 @@ fn map_secret_error(
     _key_name: &str,
 ) -> EdgeError {
     match err {
-        SecretError::NotFound { .. } => EdgeError::config_out_of_date(
+        SecretError::DeadlineExceeded => EdgeError::store_extraction(
+            StoreExtractionReason::DeadlineExceeded,
+            format!("secret resolution for `{field_name}` exceeded its deadline"),
+            Some(field_name.to_owned()),
+        ),
+        SecretError::Internal(_source) => EdgeError::store_extraction(
+            StoreExtractionReason::BackendFailure,
+            format!("secret resolution for `{field_name}` failed (details redacted)"),
+            Some(field_name.to_owned()),
+        ),
+        SecretError::NotFound { .. } => EdgeError::store_extraction(
+            StoreExtractionReason::MissingSecret,
             format!("the secret referenced by `{field_name}` was not found in its store (identifier redacted)"),
-            field_name.to_owned(),
+            Some(field_name.to_owned()),
         ),
-        SecretError::Validation(_msg) => EdgeError::config_out_of_date(
+        SecretError::Unavailable => EdgeError::store_extraction(
+            StoreExtractionReason::SecretBackendUnavailable,
+            format!("the secret store for `{field_name}` is unreachable"),
+            Some(field_name.to_owned()),
+        ),
+        SecretError::Validation(_msg) => EdgeError::store_extraction(
+            StoreExtractionReason::InvalidKey,
             format!("the secret referenced by `{field_name}` was rejected by its store (details redacted)"),
-            field_name.to_owned(),
+            Some(field_name.to_owned()),
         ),
-        SecretError::Unavailable => EdgeError::service_unavailable(format!(
-            "the secret store for `{field_name}` is unreachable"
-        )),
-        SecretError::Internal(_source) => EdgeError::internal(anyhow::anyhow!(
-            "secret resolution for `{field_name}` failed (details redacted)"
-        )),
+        SecretError::ValueTooLarge => EdgeError::store_extraction(
+            StoreExtractionReason::ValueTooLarge,
+            format!("the secret referenced by `{field_name}` exceeds its configured byte limit"),
+            Some(field_name.to_owned()),
+        ),
     }
 }
 ```
 
-**`Retry-After: 60` is NOT set on `ServiceUnavailable` in
-v1.** An earlier draft extended the header from
-`ConfigOutOfDate` to `ServiceUnavailable`; round-10 audit
-of existing producers (KV size limits at
-`crates/edgezero-core/src/key_value_store.rs:708`, missing
-named KV store at
-`examples/app-demo/.../handlers.rs:185`, missing default
-secret store at `.../handlers.rs:285`) found that the
-variant is reused for several non-retryable failure modes
-where the header would mislead clients into a tight retry
-loop. §6.3.1 documents the narrowed rule in detail:
-header on `ConfigOutOfDate` ONLY; future v2 work may
-split `ServiceUnavailable` so each producer site picks
-the right variant.
+`Retry-After: 60` is emitted only for the effective `config_out_of_date` kind. In this
+table that is `MissingSecret`; `SecretBackendUnavailable` and `DeadlineExceeded` are
+`service_unavailable` without a retry header. §6.3.1 centralizes that policy.
 
 #### 3.3.7 Sha-canonicalisation interaction
 
@@ -3070,12 +3126,12 @@ extractor doesn't touch TOML on disk at all):
 | --------------------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `config push` / `config diff` / generated CLI `config validate` | `<name>.toml` on disk                             | `deserialize_app_config_with_options(path, app_name, opts)` → `validate_excluding_secrets(&cfg)` → §3.3.2 structural checks                                                                                                                                                                                             |
 | Bundled raw `edgezero config validate`                          | `<name>.toml` on disk                             | `load_app_config_raw(path, app_name)` (TOML round-trip, no `C`, no validators)                                                                                                                                                                                                                                          |
-| Runtime extractor (`AppConfig<C>`)                              | Envelope JSON STRING from `ConfigStore::get(key)` | envelope parse → SHA verify → secret walk (per §3.3.3) → `serde_path_to_error::Deserializer` over the JSON `data` field → `Validate::validate(&cfg)`. The runtime path does NOT load TOML and does NOT apply the env overlay; the env overlay is a CLI-side notion that the operator's push run resolved into the blob. |
+| Runtime extractor (`AppConfig<C>`)                              | Envelope JSON string from `ConfigStore::get_bounded(key, deadline, caps)` | bounded read → envelope parse → SHA verify → bounded secret walk (per §3.3.3) → `serde_path_to_error::Deserializer` over the JSON `data` field → `Validate::validate(&cfg)`. The runtime path does not load TOML and does not apply the env overlay; the operator's push run resolves that CLI-side overlay into the blob. |
 
 The CLI paths all share a `build_and_validate<C>` helper
 in `crates/edgezero-cli/src/config.rs` (sketch in §3.3.2).
 The runtime extractor's path is sketched in §3.3.3 and
-uses the §6.3.1 `EdgeError::config_out_of_date_from_serde`
+uses the §6.3.1 `EdgeError::store_schema_mismatch_from_serde`
 constructor for serde failures (preserving the
 `field_path` from `serde_path_to_error`).
 
@@ -3345,7 +3401,7 @@ the rule honest, the `#[derive(AppConfig)]` macro enforces:
   the canonicaliser's "sort keys by UTF-8 byte order of
   the field identifier" rule (the field identifier isn't
   the key any more) and complicates `serde_path_to_error`
-  paths in `EdgeError::ConfigOutOfDate`. Operators who
+  paths in `EdgeError::StoreExtraction`. Operators who
   need a flat shape define it explicitly.
 - **`#[serde(rename_all)]` is already rejected by the
   existing per-secret-field policy at
@@ -3511,15 +3567,10 @@ version, .. }`. Unknown envelope versions error with a
    pointer at the migration guide.
 2. Recompute `canonical_data_sha256(&data)`.
 3. If it doesn't match the stored `sha256`, return
-   `ConfigStoreError::internal("blob sha mismatch: stored {hex}
-!= computed {hex}")` (the existing `internal(...)`
-   constructor at `config_store.rs:180`; see §6.3 for the
-   reasoning behind keeping this on `Internal` instead of
-   adding a new variant) and DO NOT proceed. The runtime
-   gives up on this request rather than silently honouring a
-   tampered blob. The extractor maps
-   `ConfigStoreError::Internal` to `EdgeError::Internal` per
-   existing convention.
+   `EdgeError::StoreExtraction { reason: IntegrityMismatch, .. }` and DO NOT proceed. The
+   runtime gives up on this request rather than silently honouring a tampered blob. This is
+   an extractor-owned integrity decision, not a generic `ConfigStoreError::Internal`, so
+   callers retain the stable origin without parsing a diagnostic.
 4. **Secret walk (per §3.3.3).** Iterate over
    `C::SECRET_FIELDS`. For each `KeyInDefault` or
    `KeyInNamedStore` field, look up `data[field.name]` in the
@@ -3533,16 +3584,15 @@ version, .. }`. Unknown envelope versions error with a
    `serde_json::Value::into_deserializer()` (NOT
    `serde_json::from_value` directly — that path discards
    the field-path information that
-   `EdgeError::ConfigOutOfDate.field_path` requires per
+   `EdgeError::StoreExtraction.field_path` requires per
    §6.3.1). The wrapper accumulates the JSON path of any
    deserialise failure (e.g. `"feature.new_checkout"`); the
    extractor maps the resulting
    `serde_path_to_error::Error<serde_json::Error>` to
-   `EdgeError::config_out_of_date_from_serde(err)` per
-   §6.3.1's two-constructor split, which populates
+   `EdgeError::store_schema_mismatch_from_serde(err)` per
+   §6.3.1, which sets reason `SchemaMismatch` and populates
    `field_path` from `err.path()`. Without this wrapper, a
-   schema mismatch surfaces as a generic
-   `EdgeError::ConfigOutOfDate { message, field_path: "" }`
+   schema mismatch surfaces as a generic untyped error without field context
    and §12.6's field_path assertion fails.
 6. Run `Validate::validate(&cfg)` per §6.2.2 — full validation
    including secret-bearing fields, now that they hold
@@ -3831,20 +3881,41 @@ async fn extract<C>(req: &RequestContext, override_key: Option<&str>) -> Result<
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
+    let mut budget = ConfigExtractionBudget::start(req.config_extraction_limits())?;
     let binding = req
         .config_store_default_binding()
-        .ok_or_else(|| EdgeError::internal("no default config store registered"))?;
-    let key = override_key.unwrap_or(&binding.default_key);
-    // Missing blob maps to ConfigOutOfDate per §6.3 / Q3 (d) — a re-run
-    // of `<app-cli> config push` is the actionable response, not a 500.
-    let raw = binding.handle.get(key).await? // ConfigStore::get
-        .ok_or_else(|| EdgeError::config_out_of_date(
-            format!("missing typed app-config blob at key `{key}` — run `<app-cli> config push` for this deploy"),
-            String::new(),
+        .ok_or_else(|| EdgeError::store_extraction(
+            StoreExtractionReason::MissingRegistry,
+            "no default config store registered",
+            None,
         ))?;
-    // ... envelope parse, sha verify, secret walk, deserialise + validate per §4.3
+    let key = override_key.unwrap_or(&binding.default_key);
+    let read = binding
+        .handle
+        .get_bounded(
+            key,
+            budget.deadline(),
+            budget.remaining_backend_bytes(),
+            budget.max_blob_bytes(),
+        )
+        .await
+        .map_err(map_config_store_error)?;
+    budget.charge_backend(read.backend_bytes)?;
+    let raw = read.value
+        .ok_or_else(|| EdgeError::store_extraction(
+            StoreExtractionReason::MissingBlob,
+            format!("missing typed app-config blob at key `{key}` — run `<app-cli> config push` for this deploy"),
+            None,
+        ))?;
+    budget.charge_value(raw.len())?;
+    // ... envelope parse, sha verify, secret walk with &mut budget,
+    //     deserialise + validate per §4.3
 }
 ```
+
+`ConfigExtractionBudget` is extractor-private state implementing §6.3.2. The secret walk
+receives `&budget`; it passes the same absolute deadline to every bounded secret read and
+charges each returned value before insertion.
 
 `RequestContext` grows two helpers mirroring the existing
 `config_store_default()` / `config_store(id)`:
@@ -4052,8 +4123,8 @@ validate --strict` runs at push time, so env-overlay drift
 Once the extractor deserialises `data` into `C`, it calls
 `Validate::validate(&cfg)`. Validation failures map to:
 
-- `EdgeError::ConfigOutOfDate` — naming ONLY the field that
-  violated its constraint. Same surface as the
+- `EdgeError::StoreExtraction` with reason `SchemaMismatch`, naming ONLY the field that
+  violated its constraint. It has the same wire surface as the
   deserialise-failure case (§6.3): operator action is
   "re-push the typed config; the deployed `<name>.toml` is
   out of bounds for the deployed code".
@@ -4125,90 +4196,115 @@ key)`.
 
 ### 6.3 Errors
 
-> **Typed-classification gate (must resolve before implementing this extractor).** The
-> status/kind mapping below is necessary but not sufficient: callers must not infer an
-> extraction failure's origin by parsing `message`. Before the next `EdgeError` surface is
-> frozen, choose and document a Rust-inspectable, `#[non_exhaustive]`
-> `StoreExtractionReason` carrier covering at least `BackendUnavailable`,
-> `IntegrityMismatch`, `InvalidEnvelope`, `InvalidKey`, `MissingBlob`, `MissingRegistry`,
-> `MissingSecret`, `SchemaMismatch`, `SecretBackendUnavailable`, and `UnknownStore`.
-> The carrier may be a field on the affected variants, a dedicated `EdgeError` variant
-> whose status/kind delegates by reason, or a typed source retained by `EdgeError`; it must
-> survive every `AppConfig<C>`/`from_store`/secret-walk mapping and remain inspectable from
-> the returned error without downcasting a formatted string. It is Rust-side diagnostic
-> metadata and is not serialized unless a later wire contract explicitly opts in.
->
-> The chosen representation must preserve the externally documented outcomes below:
-> missing/deployment-drift/schema reasons remain `config_out_of_date` with 503 and
-> `Retry-After`; transient backend reasons remain `service_unavailable` with 503 and no
-> current `Retry-After`; caller key-shape errors remain `bad_request` with 400; integrity,
-> envelope, registry/wiring, and secret-invariant failures remain `internal` with 500.
-> Tests must enumerate every known reason, assert its status/kind/header/field-path policy,
-> and prove the JSON envelope omits the typed reason. Do not land the message-only extractor
-> mapping and defer this decision: adding fields after downstream exhaustive matches exist
-> would turn an avoidable design choice into a breaking migration.
+The typed classification is fixed before extractor implementation. Callers never parse
+`message` to discover an extraction failure's origin:
 
-The extractor surfaces:
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StoreExtractionReason {
+    BackendFailure,
+    BackendUnavailable,
+    DeadlineExceeded,
+    IntegrityMismatch,
+    InvalidEnvelope,
+    InvalidKey,
+    InvalidSecretValue,
+    MissingBlob,
+    MissingRegistry,
+    MissingSecret,
+    SchemaMismatch,
+    SecretBackendUnavailable,
+    UnknownStore,
+    ValueTooLarge,
+}
 
-- `EdgeError::ServiceUnavailable` — store unreachable, network
+// One EdgeError variant delegates status/kind/header policy to `reason`.
+StoreExtraction {
+    reason: StoreExtractionReason,
+    message: String,
+    field_path: Option<String>,
+}
+```
+
+`StoreExtractionReason` and the containing `EdgeError` variant are `#[non_exhaustive]`.
+The reason survives every `AppConfig<C>`/`from_store`/secret-walk mapping and is available
+through `EdgeError::store_extraction_reason() -> Option<StoreExtractionReason>` without a
+downcast. It is Rust-side diagnostic metadata only: the response JSON does not serialize a
+`reason` field. `field_path` is `Some` only when the failure is tied to a typed-config path;
+an empty path is represented as `None` and omitted from JSON.
+
+The mapping is total and centralized in `EdgeError::{status_code, kind, response_headers}`:
+
+| Reason | HTTP / kind | `Retry-After` | `field_path` |
+| --- | --- | --- | --- |
+| `BackendUnavailable`, `DeadlineExceeded`, `SecretBackendUnavailable` | 503 / `service_unavailable` | absent | optional only for a secret field |
+| `MissingBlob`, `MissingSecret`, `SchemaMismatch` | 503 / `config_out_of_date` | `60` | optional for schema/secret failures; absent for a missing root blob |
+| `InvalidKey` | 400 / `bad_request` | absent | absent |
+| `BackendFailure`, `IntegrityMismatch`, `InvalidEnvelope`, `InvalidSecretValue`, `MissingRegistry`, `UnknownStore`, `ValueTooLarge` | 500 / `internal` | absent | optional only when a typed field selected the store/value |
+
+`ValueTooLarge` covers any per-blob, per-secret, or cumulative extraction byte cap from
+§6.3.2; `DeadlineExceeded` covers the one absolute extraction deadline. A source error that
+arrives simultaneously with deadline expiry is classified as `DeadlineExceeded`.
+Tests enumerate every known reason, assert status/kind/header/field-path policy, and prove
+the JSON envelope omits the typed reason.
+
+The extractor surfaces the following wire outcomes through `EdgeError::StoreExtraction`:
+
+- `service_unavailable` — store unreachable, network
   errors. Maps to HTTP 503.
-- `EdgeError::ConfigOutOfDate { message, field_path }` —
+- `config_out_of_date` —
   typed-struct deserialise failure: the blob is present and
   the envelope parses, but `data` doesn't fit the runtime's
   `C` type. Almost always means "the code shipped before the
   matching `<app-cli> config push`". See the contract below.
-- `EdgeError::Internal` — sha mismatch (drift / corruption),
+- `internal` — sha mismatch (drift / corruption),
   envelope parse failure (envelope `version` unrecognised or
   shape unexpected). Maps to HTTP 500. These are genuinely
   unexpected and should page the operator.
-- **Key missing from the store** (i.e.
-  `ConfigStore::get(key)` returned `Ok(None)`) maps to
-  `EdgeError::ConfigOutOfDate` (Q3 (d) per round-18
-  M-2, restated here for §6.3 hard-cutoff). HTTP 503
-  with `Retry-After: 60`. Message: `missing typed
-app-config blob at key \`<key>\` — run \`<app-cli>
-  config push\` for this deploy`. Rationale: a missing
-typed-app-config blob is operationally
-indistinguishable from "the operator didn't run
-`config push`yet" — which is exactly the`ConfigOutOfDate`class ("re-run config push fixes
-it"). Mapping to`Internal`would page oncall on a
-push-fixable condition; mapping to`NotFound`(404)
-would imply the URL is wrong, which it isn't. A
-future`MaybeAppConfig<C>`→`Option<C>`extractor
-(Q3 (c)) could remap this for endpoints that want
-explicit defaults; v1 ships with`ConfigOutOfDate`
-  and no opt-out.
+- **Key missing from the store** (`get_bounded` returned `value: None`) becomes
+  `StoreExtractionReason::MissingBlob`, whose effective outcome is
+  `config_out_of_date`: HTTP 503 with `Retry-After: 60`. Message:
+  `missing typed app-config blob at key \`<key>\` — run \`<app-cli> config push\` for
+  this deploy`. A missing typed-config blob is operationally indistinguishable from a
+  skipped config push. Mapping it to `internal` would page on-call for a push-fixable
+  condition; mapping it to `not_found` would imply the request URL is wrong. A future
+  `MaybeAppConfig<C> -> Option<C>` extractor could provide explicit defaults; v1 has no
+  opt-out.
 
 **Implementation note — `ConfigStoreError` to `EdgeError`
-mapping.** `ConfigStoreError` (`config_store.rs:165`) has only
-three variants today: `Internal`, `InvalidKey`, `Unavailable`.
-The extractor maps:
+mapping.** The current three variants are `Internal`, `InvalidKey`, and `Unavailable`;
+§6.3.2 adds `DeadlineExceeded` and `ValueTooLarge` for bounded reads. The extractor maps:
 
-| ConfigStoreError                      | EdgeError            | HTTP | Notes                                                                                                                                                                                                                                       |
-| ------------------------------------- | -------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Unavailable`                         | `ServiceUnavailable` | 503  | Transient backend issue.                                                                                                                                                                                                                    |
-| `Internal` (sha mismatch)             | `Internal`           | 500  | Drift or corruption — the stored sha doesn't match canonical recompute.                                                                                                                                                                     |
-| `Internal` (envelope parse failure)   | `Internal`           | 500  | Envelope `version` unrecognised or shape unexpected.                                                                                                                                                                                        |
-| `InvalidKey`                          | `BadRequest`         | 400  | Adapter rejected the key shape.                                                                                                                                                                                                             |
-| _missing key_ (`Ok(None)` from `get`) | `ConfigOutOfDate`    | 503  | NOT a `ConfigStoreError` variant — caught at the extractor's `ok_or_else` after `ConfigStore::get` returns `Ok(None)`. Round-18 M-2 reversal: was `Internal` in earlier drafts; the new mapping matches Q3 (d) + §3.3.3's extractor sketch. |
+| ConfigStore outcome                   | Store extraction reason | HTTP | Notes                                                                                                                                                                                                                                       |
+| ------------------------------------- | ----------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Unavailable`                         | `BackendUnavailable`    | 503  | Transient backend issue.                                                                                                                                                                                                                    |
+| `DeadlineExceeded`                    | `DeadlineExceeded`      | 503  | The shared absolute extraction deadline expired; expiry wins simultaneous readiness.                                                                                                                                                       |
+| SHA mismatch                          | `IntegrityMismatch`     | 500  | Drift or corruption — the stored sha doesn't match canonical recompute.                                                                                                                                                                     |
+| Envelope parse/version failure        | `InvalidEnvelope`       | 500  | Envelope `version` unrecognised or shape unexpected.                                                                                                                                                                                        |
+| `InvalidKey`                          | `InvalidKey`            | 400  | Adapter rejected the key shape.                                                                                                                                                                                                             |
+| `Internal`                            | `BackendFailure`        | 500  | Unexpected backend/adapter failure whose lower layer cannot classify more narrowly.                                                                                                                                                         |
+| `ValueTooLarge`                       | `ValueTooLarge`         | 500  | Per-value or remaining backend-byte allowance was exceeded.                                                                                                                                                                                 |
+| _missing key_ (`value: None` from `get_bounded`) | `MissingBlob` | 503 | NOT a `ConfigStoreError` variant — caught at the extractor's `ok_or_else` after the bounded read returns no value. Round-18 M-2 reversal: was `Internal` in earlier drafts; the new mapping matches Q3 (d) + §3.3.3's extractor sketch. |
 
-Plus the new `ConfigOutOfDate` variant `EdgeError` gains as part
-of this work; no new variant on `ConfigStoreError` is needed.
+`ConfigStoreError` does not duplicate semantic envelope/schema/registry reasons. It exposes
+only failures owned by the backend read boundary. The extractor converts each lower-level
+store/secret result once at its ownership boundary and returns the typed
+`EdgeError::StoreExtraction` end state.
 
-**Why `ConfigOutOfDate` is separate from `Internal`:** the
-operator's response is different. `Internal` means "investigate
-what's wrong with our store / blob"; `ConfigOutOfDate` means
-"re-run `<app-cli> config push` for the deployed code
-revision". A single generic 500 conflates both and trains
-operators to ignore the class of error that's most actionable.
+**Why the `config_out_of_date` kind is separate from `internal`:** the operator's response
+is different. `internal` means "investigate the store/blob/runtime";
+`config_out_of_date` means "re-run `<app-cli> config push` or provision the referenced
+secret for the deployed revision." The typed reason preserves the more precise origin
+inside each wire class.
 
-### 6.3.1 `ConfigOutOfDate` concrete contract
+### 6.3.1 `config_out_of_date` concrete wire contract
 
-The current `EdgeError` response shape carries `status` +
-`message` only (`crates/edgezero-core/src/error.rs:159`). The
-blob model needs more structure so dashboards can route
-`ConfigOutOfDate` to a different oncall than generic 503s.
-Two specific extensions:
+The `config_out_of_date` outcome applies both to the existing
+`EdgeError::ConfigOutOfDate` variant and to `EdgeError::StoreExtraction`
+when its reason maps to that kind in §6.3. The blob model needs enough
+wire structure for dashboards to route this outcome differently from
+generic 503s. Three specific extensions:
 
 **1. Response-body shape.** Today's `EdgeError::IntoResponse`
 at `crates/edgezero-core/src/error.rs:159` writes:
@@ -4248,7 +4344,7 @@ Concretely:
   ONLY on `config_out_of_date` (and any future
   field-anchored variant). Other variants omit it. Clients
   that don't care can ignore.
-- Status code: 503 for `ConfigOutOfDate` (not 500). The
+- Status code: 503 for the `config_out_of_date` outcome (not 500). The
   semantic is "service can't honor this request because the
   deployed config + code are out of sync; retry after
   redeploy".
@@ -4259,8 +4355,9 @@ to the response body — operators who parse the body shape on
 the client side need to update. Per §1's hard-cutoff stance,
 no compat shim.
 
-**2. Send `Retry-After: 60`** on the new `ConfigOutOfDate`
-variant ONLY. Earlier drafts extended the header to all
+**2. Send `Retry-After: 60`** only when the effective kind is
+`config_out_of_date`. This includes `ConfigOutOfDate` and the three
+store-extraction reasons mapped to that kind in §6.3. Earlier drafts extended the header to all
 `ServiceUnavailable` responses; an audit of in-tree
 `ServiceUnavailable` producers shows that the variant is
 ALREADY used for several non-config-related conditions
@@ -4278,7 +4375,8 @@ Adding `Retry-After: 60` to every `ServiceUnavailable`
 would lie to clients in three of four cases. The blob
 model takes the narrower stance:
 
-- **`ConfigOutOfDate`** — header sent. The new variant is
+- **`ConfigOutOfDate` or a `StoreExtraction` reason mapped to
+  `config_out_of_date`** — header sent. This outcome is
   shaped specifically for "deployed config + code are out
   of sync; redeploy converges in <60s", which is exactly
   what the header tells clients.
@@ -4291,14 +4389,11 @@ model takes the narrower stance:
   each producer site picks the right variant; out of
   scope here.
 
-Added via
-`Response::headers_mut().insert("retry-after",
-HeaderValue::from_static("60"))` inside the
-`IntoResponse` impl branch for `ConfigOutOfDate` only.
-Other variants (`ServiceUnavailable`, `Internal`,
-`BadRequest`, etc.) do NOT set the header.
+Added via the centralized error response-header policy rather than a
+variant-only `matches!` check. Other outcomes (`service_unavailable`,
+`internal`, `bad_request`, etc.) do NOT set the header.
 
-**3. `field_path` for the variant's payload** comes from
+**3. `field_path` for the error payload** comes from
 `serde_path_to_error::Track::path()` (or equivalent), wrapped
 around the blob's `data` field's deserialiser. Plain serde
 errors only report position-in-input, not field-path; the
@@ -4307,8 +4402,8 @@ errors only report position-in-input, not field-path; the
 the deserialise itself. The dep is small (~500 LOC, no
 transitive deps) and locked-in for the variant.
 
-> **Runtime redaction (security).** In the HTTP `ConfigOutOfDate`
-> response the path's STRING segments are redacted to `<redacted>`
+> **Runtime redaction (security).** In an HTTP `config_out_of_date` response produced by
+> `StoreExtractionReason::SchemaMismatch`, the path's STRING segments are redacted to `<redacted>`
 > while structure (dots and sequence indices) is kept — e.g.
 > `<redacted>.<redacted>`. A `serde_path_to_error` segment for a struct
 > field is indistinguishable from a MAP KEY, and a map key is stored
@@ -4319,11 +4414,10 @@ transitive deps) and locked-in for the variant.
 > secret-walk/validator constructor still supplies an explicit static
 > path, since those are code-supplied field names, not stored data.
 
-**Variant declaration (sketch).** Two constructors —
-one for the serde-deserialise path (which has rich
-field-path data from `serde_path_to_error`), one for
-the secret-walk and validator paths (which already
-have an explicit `(message, field_path)` pair):
+**Variant declaration (sketch).** The fixed `ConfigOutOfDate` variant remains available
+for non-store producers. Typed store extraction uses the reason-bearing variant from §6.3
+and two constructors: one for explicit path/reason data and one for the serde-deserialise
+path:
 
 ```rust
 pub enum EdgeError {
@@ -4332,22 +4426,23 @@ pub enum EdgeError {
         message: String,      // e.g. "missing field `new_checkout`"
         field_path: String,   // e.g. "feature"
     },
+    StoreExtraction {
+        reason: StoreExtractionReason,
+        message: String,
+        field_path: Option<String>,
+    },
 }
 
 impl EdgeError {
-    /// Construct from an explicit (message, field_path) pair.
-    /// Used by the secret walk (§3.3.3) and the validator path
-    /// (§6.2.2). `field_path` SHOULD be a dotted path naming
-    /// the offending field (e.g. `"feature.new_checkout"`);
-    /// pass `String::new()` when no specific field is anchored
-    /// (the response simply omits the `field_path` key).
-    pub fn config_out_of_date(
+    pub fn store_extraction(
+        reason: StoreExtractionReason,
         message: impl Into<String>,
-        field_path: impl Into<String>,
+        field_path: Option<String>,
     ) -> Self {
-        Self::ConfigOutOfDate {
+        Self::StoreExtraction {
+            reason,
             message: message.into(),
-            field_path: field_path.into(),
+            field_path,
         }
     }
 
@@ -4365,7 +4460,7 @@ impl EdgeError {
     /// when the local TOML still matches what was deployed — it
     /// reads the local source, not the deployed blob, so a drift
     /// between them is not recoverable this way.
-    pub fn config_out_of_date_from_serde(
+    pub fn store_schema_mismatch_from_serde(
         serde_err: serde_path_to_error::Error<serde_json::Error>,
     ) -> Self {
         let category = match serde_err.inner().classify() {
@@ -4374,9 +4469,10 @@ impl EdgeError {
             Category::Eof => "unexpected end of input",
             Category::Io => "i/o error while reading",
         };
-        Self::ConfigOutOfDate {
+        Self::StoreExtraction {
+            reason: StoreExtractionReason::SchemaMismatch,
             message: format!("typed app-config is out of date ({category}; value redacted)"),
-            field_path: redact_serde_path(serde_err.path()),
+            field_path: Some(redact_serde_path(serde_err.path())),
         }
     }
 }
@@ -4385,9 +4481,9 @@ impl EdgeError {
 Caller sites:
 
 - Secret walk (§3.3.3) and validator path (§6.2.2):
-  `EdgeError::config_out_of_date(msg, field_path)`.
+  `EdgeError::store_extraction(reason, msg, Some(field_path))`.
 - Blob deserialise (§3.3.3, §6.2.2):
-  `EdgeError::config_out_of_date_from_serde(err)`.
+  `EdgeError::store_schema_mismatch_from_serde(err)`.
 
 The validator path (§6.2.2) wraps a
 `validator::ValidationErrors`. **On the RUNTIME path this runs
@@ -4405,7 +4501,11 @@ let message = if field.is_empty() {
 } else {
     format!("app config failed validation for field `{field}`")
 };
-EdgeError::config_out_of_date(message, field)      // NO validation_err.to_string()
+EdgeError::store_extraction(
+    StoreExtractionReason::SchemaMismatch,
+    message,
+    (!field.is_empty()).then_some(field),
+) // NO validation_err.to_string()
 ```
 
 The `extract_first_field` helper picks the first
@@ -4419,9 +4519,168 @@ is dropped entirely rather than logged.
 mentioning because PR #269 fought several "do we add this
 dep" rounds. Verdict: yes, this one is small enough, single
 purpose, and the only realistic way to give operators a
-useful field-path hint. Without it, every `ConfigOutOfDate`
+useful field-path hint. Without it, every schema-mismatch
 response says "missing field" with no anchor — operators have
 to grep the typed struct manually.
+
+### 6.3.2 Bounded, cancellable extraction reads
+
+Typed app-config extraction never calls the unbounded convenience methods
+`ConfigStoreHandle::get` or `SecretHandle::get_bytes`. It uses bounded variants under one
+budget captured when the extractor starts:
+
+```rust
+pub const DEFAULT_CONFIG_BLOB_BYTES: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_CONFIG_BACKEND_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_CONFIG_EXTRACTION_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_CONFIG_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONFIG_SECRET_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigExtractionLimits {
+    pub max_backend_bytes: u64,
+    pub max_blob_bytes: u64,
+    pub max_secret_bytes: u64,
+    pub max_total_bytes: u64,
+    pub timeout: Duration,
+}
+
+pub struct BoundedStoreRead<T> {
+    pub backend_bytes: u64,
+    pub value: Option<T>,
+}
+
+#[async_trait(?Send)]
+pub trait ConfigStore: Send + Sync {
+    async fn get_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError>;
+
+    // Preserved for hand-managed reads; it makes no extraction-bound claim.
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+}
+
+#[async_trait(?Send)]
+pub trait SecretStore: Send + Sync {
+    async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError>;
+
+    // Existing unbounded convenience method, not used by AppConfig<C>.
+    async fn get_bytes(
+        &self,
+        store_name: &str,
+        key: &str,
+    ) -> Result<Option<Bytes>, SecretError>;
+}
+
+impl ConfigStoreHandle {
+    pub async fn get_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError>;
+}
+
+impl SecretHandle {
+    pub async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError>;
+}
+
+impl BoundSecretStore {
+    pub async fn get_bytes_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError>;
+}
+```
+
+The bounded methods add `DeadlineExceeded` and `ValueTooLarge` to both lower-level store
+error enums. Those variants are produced at the adapter boundary without formatting away
+the cause and map directly to the same-named extraction reasons (`ValueTooLarge` maps to
+`StoreExtractionReason::ValueTooLarge`). Existing unbounded methods need not synthesize
+these variants.
+
+`ConfigExtractionLimits::default()` returns the five constants above. `App` owns one
+config-extraction-limits value, set through `Hooks::configure`; the adapter copies it into
+`RequestContext`. All values must be finite and nonzero, and
+`max_total_bytes >= max(max_blob_bytes, max_secret_bytes)`. `timeout` must not exceed
+`DEADLINE_FAR_FUTURE`; invalid startup configuration fails before serving requests.
+
+At the first `AppConfig<C>`/`named`/`from_store` call, core snapshots
+`extraction_started_at = web_time::Instant::now()` and computes exactly one absolute
+deadline with checked `extraction_started_at + limits.timeout` and
+`Deadline::at_instant(..)`. It does not call `Deadline::after` after the first snapshot.
+The deadline is not reset between the root blob read,
+Fastly pointer/chunk reads, secret resolution, deserialization, or validation. Every adapter
+checks it before entering a host read and after the host read becomes ready; a native async
+adapter additionally races the pending read with the remaining budget and drops/aborts its
+native operation on expiry. Equality is expired, and expiry wins simultaneous readiness.
+
+Each bounded method applies both remaining extraction-wide backend-byte allowance and its
+per-value output cap. `backend_bytes` counts every byte exposed to guest code while
+satisfying that logical read, including an adapter-private pointer and every chunk used to
+reconstruct one Fastly value; it does not count opaque provider work. The adapter uses
+checked accounting and never reports a value whose length exceeds `max_value_bytes` or
+whose guest-visible read cost exceeds `max_backend_bytes`. A Native implementation rejects
+before retaining the first byte beyond either allowance; an Unsupported host-allocation
+implementation may first receive a provider-materialized value, then discards it.
+
+The extractor verifies the returned count, including `backend_bytes >= value.len()` whenever
+a value is present, uses checked addition to charge it against the single extraction-wide
+`max_backend_bytes`, and separately charges each returned logical blob/secret length against
+`max_total_bytes` before retaining or inserting it. It passes the remaining backend
+allowance into the next read. Duplicate references to the same secret are charged for every
+actual backend read; §6.4 deliberately defines no extraction cache. A backend that reports
+more bytes than the allowance, a value larger than the supplied per-value limit, or a byte
+count smaller than its returned value fails closed as `BackendFailure`. Any legitimate cap
+failure detected by the adapter or extraction budget maps to
+`StoreExtractionReason::ValueTooLarge`; expiry maps to
+`StoreExtractionReason::DeadlineExceeded`. Partial values are discarded and never parsed,
+hashed, deserialized, validated, logged, or returned.
+
+These are distinct guarantees:
+
+- **Guest-visible bound:** every target enforces per-value and cumulative byte caps before
+  EdgeZero retains or processes the returned value.
+- **Host-allocation bound:** only a target whose host API supports streaming/size-aware reads
+  can prevent the provider SDK from first materializing an oversized value.
+- **Cancellation bound:** cooperative pre/post checks give a typed eventual result, but only
+  a target with a cancellable async read can claim a finite wall-clock bound.
+
+The capability ladder therefore gains two config-owned cells:
+
+| Capability | Axum | Cloudflare | Fastly | Spin |
+| --- | --- | --- | --- | --- |
+| `config-read-allocation-bounds` | Native after the local-file reader caps before allocation | Unsupported until the SDK exposes/proves a pre-materialization bound | Unsupported until host API documentation and a probe prove it | Unsupported until host API documentation and a probe prove it |
+| `config-read-deadlines` | Native | BestEffort until host cancellation is observed | BestEffort; synchronous host reads are not guest-preemptible | BestEffort until host cancellation is observed |
+
+Apps that require a strict RSS or elapsed-time guarantee declare the corresponding Native
+capability and fail before startup/deploy on weaker targets. Capability documentation must
+name provider-side materialization, parser allocation, SDK copies, and uninterruptible host
+calls as exclusions; it must not imply that a post-return `String::len()` check bounded host
+RSS. One deployed timing probe per non-Axum target records whether cancellation/return occurs
+within the documented tolerance before any capability cell is upgraded.
 
 ### 6.4 Per-request caching
 
@@ -4469,8 +4728,9 @@ scope per §3.2.
 ### 6.5 What happens to the existing `ConfigStore` trait
 
 `ConfigStore::get(key)` stays — it's still useful for ad-hoc
-lookups against the same backends. But the `AppConfig<C>` extractor
-is the ONLY supported way to read the typed app-config.
+lookups against the same backends, but it carries none of §6.3.2's extraction guarantees.
+The `AppConfig<C>` extractor uses only `get_bounded` and is the ONLY supported way to read
+the typed app-config.
 Hand-written `ctx.config_store_default()?.get("greeting")` against
 the typed app-config's store will now find a JSON blob under
 "greeting"-ish keys, not raw strings, and fail to deserialise into
@@ -4876,8 +5136,8 @@ pub trait Adapter: Sync + Send {
 
 pub enum ReadConfigEntry {
     /// The store and key both exist; the inner string is the raw
-    /// blob envelope JSON (the same shape `ConfigStore::get`
-    /// returns at runtime per `crates/edgezero-core/src/config_store.rs:214`).
+    /// blob envelope JSON (the same logical value returned by runtime
+    /// `ConfigStore::{get,get_bounded}`).
     /// Caller parses + verifies. **Round-27 reviewer flagged an
     /// earlier `Vec<u8>` draft as inconsistent with the rest of
     /// §9.1-§9.4's per-adapter wording, all of which describes
@@ -5010,22 +5270,17 @@ parsing inside the adapter.
   to `<file>.tmp`, fsync, rename). The entry value is the
   envelope serialised then `serde_json::to_string`-ed and
   inserted as a string value.
-- Runtime: the extractor stays adapter-neutral and only calls
-  `ConfigStore::get(key) -> Option<String>` per
-  `crates/edgezero-core/src/config_store.rs:214`. Axum's
-  `ConfigStore` impl wraps the file map:
+- Runtime: the extractor stays adapter-neutral and calls only `get_bounded`; raw
+  hand-managed callers may still call `get`. Axum's production bounded path reads the
+  selected map entry incrementally under the supplied deadline and refuses the first byte
+  beyond the smaller of the per-value and remaining backend allowances. It must not first
+  deserialize/clone the whole file map. The existing in-memory `from_map` test path checks
+  length before cloning the selected value. The unbounded compatibility `get` method
+  remains for hand-managed callers and delegates to the same selected-entry reader without
+  extraction limits; it is never called by `AppConfig<C>`.
 
-  ```rust
-  impl ConfigStore for AxumConfigStore {
-      async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-          let map: BTreeMap<String, String> = self.map.read().await.clone();
-          Ok(map.get(key).cloned())
-      }
-  }
-  ```
-
-  The string form keeps the per-adapter `ConfigStore::get ->
-Option<String>` contract intact across all four adapters —
+  The string form keeps the per-adapter `ConfigStore` logical value contract intact across
+  all four adapters —
   storing nested JSON objects would force the Axum store to
   re-serialise on every `get`, AND would require the extractor
   to know Axum's file shape. The string form sidesteps both.
@@ -5062,8 +5317,10 @@ bulk put <tempfile.json> --namespace-id=<id> --remote`
   `wrangler kv key get --binding <BINDING> <KEY> --remote`
   (Wrangler 4.x's four-segment subcommand path; the older
   three-segment `wrangler kv get` is deprecated).
-- Runtime: `CloudflareConfigStore::get(key)` returns the JSON
-  string; the `AppConfig<C>` extractor parses + verifies.
+- Runtime: `CloudflareConfigStore::get_bounded` returns the same JSON string and enforces
+  guest-visible byte/deadline checks from §6.3.2; the host may materialize the value before
+  guest code can reject it, so allocation support remains Unsupported. The `AppConfig<C>`
+  extractor parses and verifies only after charging the bounded read.
 - `--local` push: `wrangler kv bulk put <tempfile.json>
 --binding <BINDING> --local` — lands in
   `.wrangler/state`. Local push deliberately addresses by
@@ -5100,9 +5357,11 @@ bulk put <tempfile.json> --namespace-id=<id> --remote`
   chunk pointer, read/verify/concatenate chunks and return the
   reconstructed normal envelope string. Missing/corrupt chunks are a
   read error, not "missing key".
-- Runtime: `FastlyConfigStore::get(key)` performs the same
-  direct-or-pointer resolution and returns the normal envelope JSON
-  value; the core extractor does not know whether Fastly used chunks.
+- Runtime: `FastlyConfigStore::get_bounded` performs the same direct-or-pointer resolution,
+  passes one absolute deadline/remaining allowance to every read, and returns the normal
+  envelope JSON value. Its `backend_bytes` includes the pointer and every fetched chunk;
+  the core extractor does not know which physical form Fastly used. The preserved unbounded
+  `get` follows the same resolver for hand-managed callers.
 - Local server: `[local_server.config_stores.<id>]` now has ONE
   active root entry — the blob key. PR #269 F6 already moved local-
   server seeding to `config push --local`. Local seeding must mirror
@@ -5189,8 +5448,9 @@ key-value set --stdin` or `--from-file`.
     keeps the "no multi-blob merge" stance — splitting
     is operator-side schema work.
 
-- Runtime: `SpinConfigStore::get(key)` returns the JSON value;
-  extractor parses.
+- Runtime: `SpinConfigStore::get_bounded` returns the JSON value and applies the cooperative
+  guest-visible checks from §6.3.2; the host read is not claimed preemptible or
+  pre-allocation-bounded. The extractor parses only after the bounded read is charged.
 
 ## 10. Migration
 
@@ -6250,25 +6510,24 @@ What happens when the store has no entry at the requested key?
 - (b) Return `EdgeError::ServiceUnavailable`.
 - (c) Add a sibling extractor `MaybeAppConfig<C>` returning
   `Option<C>` for endpoints that have a sensible default.
-- (d) Return `EdgeError::ConfigOutOfDate` — matches the
-  "re-run `<app-cli> config push` fixes it" rule
-  spelled out for `ConfigOutOfDate` at §6.3.
+- (d) Return `EdgeError::StoreExtraction` with reason `MissingBlob`; §6.3 maps that reason
+  to the `config_out_of_date` wire contract because re-running `<app-cli> config push`
+  fixes it.
 - **default:** (d) for v1 (round-18 M-2 reversal of the
-  earlier (a) pick). The §6.3 rationale defines
-  `ConfigOutOfDate` as "the situation a re-run of
+  earlier (a) pick). The §6.3 rationale defines the
+  `config_out_of_date` wire class as "the situation a re-run of
   `<app-cli> config push` resolves" — and a missing
   blob is squarely in that bucket: the deployed code
   expects a blob, the store doesn't have one, an
   operator push fixes it. Mapping this to `Internal`
   would page oncall (a 500-class signal) when the
   actionable response is "push the config", which
-  `ConfigOutOfDate` (503 with `Retry-After: 60`)
-  already encodes. The §3.3.3 extractor's
+  `StoreExtractionReason::MissingBlob` (503 / `config_out_of_date` with
+  `Retry-After: 60`) already encodes. The §3.3.3 extractor's
   `ok_or_else(|| EdgeError::internal("missing typed
 app-config blob"))` call site changes to
-  `EdgeError::config_out_of_date("missing typed
-app-config blob at key `<key>`— run`<app-cli>
-  config push`", String::new())` accordingly. (c) is
+  `EdgeError::store_extraction(StoreExtractionReason::MissingBlob, "missing typed
+app-config blob at key `<key>` — run `<app-cli> config push`", None)` accordingly. (c) is
   still tracked as a follow-up for endpoints that
   want explicit `Option<C>` semantics.
 
@@ -6605,14 +6864,14 @@ length, charset) on the operator-typed KEY NAME.
   - Returns the deserialised struct for a valid blob.
   - Errors on sha mismatch (manually-edited blob).
   - **Missing key (per Q3 (d) / §6.3 — round-19/20).**
-    Fixture: `ConfigStore::get` returns `Ok(None)`.
-    Assert the extractor produces
-    `EdgeError::ConfigOutOfDate { message, field_path }`
+    Fixture: `ConfigStore::get_bounded` returns `BoundedStoreRead { value: None, .. }`.
+    Assert the extractor produces `EdgeError::StoreExtraction` with reason `MissingBlob`,
+    no field path, and a `message`
     where `message` contains the literal `key
-\`<resolved-key>\``AND the literal`run
+\`<resolved-key>\`` and the literal `run
     \`<app-cli> config push\``. Render the
 resulting `Response`; assert HTTP status 503 and
-the `Retry-After: 60`header is present. NOT`EdgeError::Internal` (the round-18 reversal that
+the `Retry-After: 60` header is present. Not `EdgeError::Internal` (the round-18 reversal that
     round-19 then propagated through §6.3).
   - `named(key)` reads a different key from the same store.
 - `BlobEnvelope` deserialise:
@@ -6782,35 +7041,23 @@ strip or revert the resolution direction:
   store-ref field, unchanged). This is the user-facing
   Model A contract — the framework swaps key NAME for
   resolved VALUE before the handler sees `cfg`.
-- **Missing secret at extract time.** Same fixture, mock
-  secret store configured to `NotFound` on lookup. Assert
-  the extractor produces `EdgeError::ConfigOutOfDate` (per
-  §3.3.6) — NOT `Unavailable` (that's reserved for
-  store-backend network errors) and NOT `Internal` (which
-  today's `SecretError::NotFound → EdgeError::Internal`
-  mapping in `crates/edgezero-core/src/secret_store.rs:131`
-  produces). The blob model's missing-secret behaviour
-  requires a DELIBERATE deviation from the current mapping:
-  the extractor wraps `SecretError::NotFound` into
-  `ConfigOutOfDate` BEFORE it bubbles, so the dashboards
-  signal "deploy is incomplete" rather than "we 500'd".
-  Calls out: the `secret_store.rs` mapping itself doesn't
-  change for raw handler-side callers (still maps to
-  `Internal`); the extractor's `?` operator catches it and
-  re-wraps. Test asserts the resulting `EdgeError` variant
-  AND the `Retry-After: 60` header per §6.3.1.
+- **Missing secret at extract time.** Same fixture, mock secret store returning no value.
+  Assert the extractor produces `EdgeError::StoreExtraction` with reason `MissingSecret`
+  (per §3.3.6), not `SecretBackendUnavailable` and not `BackendFailure`. The typed
+  extractor adds this context at its ownership boundary instead of relying on the generic
+  raw-store conversion. Assert the reason, `config_out_of_date` wire kind, field path, and
+  `Retry-After: 60` header per §6.3.1.
 - **Missing secret-store id at extract time.** Fixture:
   manifest declares no `[stores.secrets].ids = ["missing"]`,
   but a `#[secret(store_ref = "vault")]` field's value is
-  `"missing"`. Assert extractor surfaces
-  `EdgeError::ConfigOutOfDate` with the actionable message
-  "blob declared store_ref `missing` but [stores.secrets]
-  has no such id".
+  `"missing"`. Assert the extractor produces `EdgeError::StoreExtraction` with reason
+  `UnknownStore`, HTTP 500 / `internal`, a field path, and a redacted message that does not
+  repeat the stored identifier.
 - **Secret-store unreachable at extract time.** Same
   fixture, mock store configured to error with a network
-  failure (NOT NotFound). Assert extractor surfaces
-  `EdgeError::ServiceUnavailable` (per §3.3.6 — a flaky
-  backend is not an out-of-date config).
+  failure (not a missing value). Assert the extractor produces
+  `EdgeError::StoreExtraction` with reason `SecretBackendUnavailable` and the
+  `service_unavailable` wire kind (per §3.3.6).
 - **`<app-cli> config validate --strict` — structural
   checks ONLY.** Three sub-tests, each asserting on a
   structural property the validator can verify without
@@ -6845,14 +7092,12 @@ strip or revert the resolution direction:
 
 - **Validate runs on every extract.** Fixture: a blob that
   serdes cleanly but violates a `#[validate(range(min=1,
-max=10000))]` rule. Extract. Assert
-  `EdgeError::ConfigOutOfDate` with `field_path` naming the
-  offending field.
+max=10000))]` rule. Extract. Assert `EdgeError::StoreExtraction` with reason
+  `SchemaMismatch` and `field_path` naming the offending field.
 - **Validate-OK is the happy path.** Fixture: a blob in
   bounds. Extract. Assert the typed struct comes back with
   no error.
-- **Validator violation report format.** Assert the
-  `ConfigOutOfDate` response body matches the nested
+- **Validator violation report format.** Assert the `SchemaMismatch` response body matches the nested
   envelope documented in §6.3.1 exactly:
   `{ "error": { "status": 503, "kind": "config_out_of_date",
 "message": "<…>", "field_path": "<dot.path>" } }`. Assert
@@ -6861,74 +7106,36 @@ max=10000))]` rule. Extract. Assert
   fixture). Assert the response carries the
   `Retry-After: 60` header.
 
-#### 12.6.1 `kind` strings on every `EdgeError` variant + header policy (round-23 M-1)
+#### 12.6.1 End-state `EdgeError` wire matrix and store-reason policy
 
-§6.3.1 adds a stable `kind: String` field to the response
-body for EVERY `EdgeError` variant (`bad_request`,
-`internal`, `method_not_allowed`, `not_found`,
-`not_implemented`, `service_unavailable`, `validation`,
-and the new `config_out_of_date`). The earlier test plan
-only asserted the `config_out_of_date` body; this section
-covers the other six and the cross-cutting
-header / field-presence rules so a future refactor can't
-silently drop or rename a `kind` string.
+The implementing branch enumerates every then-present `EdgeError` variant without a
+wildcard. Final integration includes variants owned by the outbound and inbound specs as
+well as this config design:
 
-- **Stable `kind` strings.** One fixture per variant
-  that triggers it (e.g. a handler that returns
-  `Err(EdgeError::not_found("…"))` for `not_found`).
-  Render the `Response`. Parse the body as JSON.
-  Assert `body.error.kind` equals the exact string
-  documented in §6.3.1. Variant → expected string:
+| Variant | Expected `kind` | HTTP |
+| --- | --- | --- |
+| `BadGateway` | `"bad_gateway"` | 502 |
+| `BadRequest` | `"bad_request"` | 400 |
+| `ConfigOutOfDate` | `"config_out_of_date"` | 503 |
+| `GatewayTimeout` | `"gateway_timeout"` | 504 |
+| `Internal` | `"internal"` | 500 |
+| `MethodNotAllowed` | `"method_not_allowed"` | 405 |
+| `NotFound` | `"not_found"` | 404 |
+| `NotImplemented` | `"not_implemented"` | 501 |
+| `RequestTimeout` | `"request_timeout"` | 408 |
+| `ResponseTooLarge` | `"response_too_large"` | 502 |
+| `ServiceUnavailable` | `"service_unavailable"` | 503 |
+| `StoreExtraction` | reason-dependent per §6.3 | reason-dependent per §6.3 |
+| `Validation` | `"validation"` | 422 |
 
-  | Variant              | Expected `kind` string  |
-  | -------------------- | ----------------------- |
-  | `BadRequest`         | `"bad_request"`         |
-  | `Internal`           | `"internal"`            |
-  | `MethodNotAllowed`   | `"method_not_allowed"`  |
-  | `NotFound`           | `"not_found"`           |
-  | `NotImplemented`     | `"not_implemented"`     |
-  | `ServiceUnavailable` | `"service_unavailable"` |
-  | `Validation`         | `"validation"`          |
-  | `ConfigOutOfDate`    | `"config_out_of_date"`  |
-
-- **`field_path` is OMITTED outside `ConfigOutOfDate`.**
-  For each non-`ConfigOutOfDate` variant fixture above,
-  assert `body.error.get("field_path")` is `None` (the
-  field is absent from the JSON, not present with an
-  empty string). Per §6.3.1's "ONLY on
-  `config_out_of_date`" rule.
-
-- **`Retry-After: 60` is PRESENT on `ConfigOutOfDate`
-  ONLY.** Fixture per variant: render the response,
-  assert `response.headers().get("retry-after")`:
-  - `ConfigOutOfDate`: `Some("60")`.
-  - `ServiceUnavailable`: `None`. Round-10 H-3 audit
-    found the variant is reused for several
-    non-retryable cases (KV size limit, missing
-    named KV store, missing default secret store);
-    sending the header would mislead clients into a
-    tight retry loop. The §6.3.1 narrowing pins
-    `ServiceUnavailable` to no `Retry-After`.
-  - All other variants: `None`.
-
-- **Status codes match the documented variant → HTTP
-  mapping.** Fixture per variant: assert
-  `response.status()`:
-
-  | Variant              | HTTP status |
-  | -------------------- | ----------- |
-  | `BadRequest`         | 400         |
-  | `Internal`           | 500         |
-  | `MethodNotAllowed`   | 405         |
-  | `NotFound`           | 404         |
-  | `NotImplemented`     | 501         |
-  | `ServiceUnavailable` | 503         |
-  | `Validation`         | 422         |
-  | `ConfigOutOfDate`    | 503         |
-
-  (The two 503-class variants are deliberately
-  distinguished by the `kind` string + the
-  `Retry-After` header, not the status code.)
+For every ordinary variant, render a response and assert status, kind, and omission of the
+Rust-only typed reason. For every known `StoreExtractionReason`, assert the exact §6.3
+status/kind/`Retry-After`/field-path row. `field_path` is omitted outside
+`ConfigOutOfDate` and `StoreExtraction`; it is also omitted when either carrier has no
+non-empty path. `Retry-After: 60` appears only on an effective `config_out_of_date` outcome:
+the existing `ConfigOutOfDate` variant plus `MissingBlob`, `MissingSecret`, and
+`SchemaMismatch`. A plain `ServiceUnavailable` and store reasons mapped to
+`service_unavailable` carry no retry header.
 
 ### 12.7 Env-var key override (§5.2)
 
@@ -7420,9 +7627,8 @@ default_key }` on `ConfigRegistry`. `Config::default()`
    the load-bearing commit; everything it touches has
    to land together per §10's hard-cutoff rule:
    - `AppConfig<C>` extractor + secret resolution
-     wired into all four adapters' `ConfigStore::get`
-     read path. Missing-blob maps to
-     `EdgeError::ConfigOutOfDate` per Q3 (d).
+     wired into all four adapters' bounded config-read path. Missing blob maps to
+     `EdgeError::StoreExtraction` with reason `MissingBlob` per Q3 (d).
    - `config push` rewrite — single-blob writers per
      adapter (Axum file map / Cloudflare bulk-put /
      Fastly `--upsert --stdin` / Spin direct-write).
