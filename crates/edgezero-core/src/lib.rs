@@ -61,9 +61,9 @@ pub use manifest::{
 pub use outbound::{
     DEFAULT_MAX_BROTLI_DECODER_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_OUTBOUND_REQUEST_BODY_BYTES, HttpClient, OutboundHttpClient, OutboundRequest,
-    OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseBodyDisposition,
-    ResponseHeaderLimiter, ResponseMode, collect_response_stream, enforce_payload_content_length,
-    limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch, normalize_response_headers,
-    rechunk_stream, validate_for_dispatch,
+    OutboundRequestParts, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
+    ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
+    enforce_payload_content_length, limit_decoded_stream, limit_encoded_stream,
+    normalize_for_dispatch, normalize_response_headers, rechunk_stream, validate_for_dispatch,
 };
 pub use time::{Deadline, DispatchBudget, MonotonicInstant, dispatch_budget};

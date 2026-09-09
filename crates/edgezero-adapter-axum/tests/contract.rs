@@ -14,7 +14,7 @@ use edgezero_adapter_axum::outbound::AxumOutboundClient;
 use edgezero_core::body::Body as CoreBody;
 use edgezero_core::error::{BadGatewayReason, EdgeError, ResponseLimitReason};
 use edgezero_core::http::{Method, StatusCode};
-use edgezero_core::{OutboundHttpClient, OutboundRequest};
+use edgezero_core::{OutboundHttpClient, OutboundRequest, PROXY_HEADER};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
@@ -52,6 +52,13 @@ async fn redirect_response_is_not_followed() {
     let response = client.send(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(PROXY_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("axum")
+    );
 }
 
 #[tokio::test]
