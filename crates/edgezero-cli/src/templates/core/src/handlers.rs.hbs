@@ -5,7 +5,7 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::extractor::{Headers, Json, Path};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
-use edgezero_core::proxy::ProxyRequest;
+use edgezero_core::outbound::OutboundRequest;
 use edgezero_core::response::Text;
 use futures::{StreamExt as _, stream};
 use std::env;
@@ -68,13 +68,13 @@ pub async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
 #[action]
 pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
-    let proxy_handle = ctx.proxy_handle();
+    let http_client = ctx.http_client();
     let request = ctx.into_request();
     let target = build_proxy_target(&params.rest, request.uri())?;
-    let proxy_request = ProxyRequest::from_request(request, target);
+    let outbound_request = OutboundRequest::from_request(request, target)?;
 
-    if let Some(handle) = proxy_handle {
-        handle.forward(proxy_request).await
+    if let Some(client) = http_client {
+        client.send(outbound_request).await?.into_response()
     } else {
         proxy_not_available_response()
     }
@@ -103,7 +103,7 @@ fn build_proxy_target(rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> 
 
 fn proxy_not_available_response() -> Result<Response, EdgeError> {
     let body = Body::text(
-        "proxy example is not enabled for this adapter build; enable a proxy-capable adapter",
+        "outbound HTTP is not enabled for this adapter build",
     );
     http::response_builder()
         .status(StatusCode::NOT_IMPLEMENTED)
@@ -138,20 +138,39 @@ mod tests {
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{Method, StatusCode, Uri, request_builder};
     use edgezero_core::params::PathParams;
-    use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
+    use edgezero_core::outbound::{
+        HttpClient, OutboundHttpClient, OutboundResponse, OutboundSlotResult,
+    };
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::test_env::{EnvOverride, env_lock};
     use futures::executor::block_on;
     use std::collections::HashMap;
+    use std::time::Duration;
 
-    struct TestProxyClient;
+    struct TestOutboundClient;
 
     #[async_trait(?Send)]
-    impl ProxyClient for TestProxyClient {
-        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
-            let (_method, uri, _headers, _body, _) = request.into_parts();
-            assert!(uri.to_string().contains("status/201"));
-            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
+    impl OutboundHttpClient for TestOutboundClient {
+        async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
+            assert_eq!(request.method(), Method::GET);
+            assert!(request.uri().to_string().contains("status/201"));
+            Ok(OutboundResponse::new(
+                request.method().clone(),
+                StatusCode::CREATED,
+                edgezero_core::http::HeaderMap::new(),
+                Body::empty(),
+            ))
+        }
+
+        async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
+            let mut results = Vec::with_capacity(requests.len());
+            for request in requests {
+                results.push(OutboundSlotResult::new(
+                    Duration::ZERO,
+                    self.send(request).await,
+                ));
+            }
+            results
         }
     }
 
@@ -246,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_demo_uses_injected_handle() {
+    fn generated_outbound_http_smoke() {
         let _lock = env_lock().lock().expect("env lock");
 
         let mut request = request_builder()
@@ -256,7 +275,7 @@ mod tests {
             .expect("request");
         request
             .extensions_mut()
-            .insert(ProxyHandle::with_client(TestProxyClient));
+            .insert(HttpClient::with_client(TestOutboundClient));
 
         let mut params = HashMap::new();
         params.insert("rest".to_owned(), "status/201".to_owned());
