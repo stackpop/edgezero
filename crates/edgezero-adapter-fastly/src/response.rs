@@ -18,7 +18,7 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
         Body::Stream(mut stream) => {
             let mut fastly_body = fastly::Body::new();
             while let Some(result) = executor::block_on(stream.next()) {
-                let chunk = result.map_err(EdgeError::internal)?;
+                let chunk = result?;
                 fastly_body.write_all(&chunk).map_err(EdgeError::internal)?;
             }
             fastly_response.set_body(fastly_body);

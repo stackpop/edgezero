@@ -51,7 +51,7 @@ impl ProxyClient for AxumProxyClient {
             Body::Stream(mut stream) => {
                 let mut buf = Vec::new();
                 while let Some(result) = stream.next().await {
-                    let chunk = result.map_err(EdgeError::internal)?;
+                    let chunk = result?;
                     buf.extend_from_slice(&chunk);
                 }
                 builder.body(buf)

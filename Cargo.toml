@@ -28,7 +28,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
-async-compression = { version = "0.4", features = [
+async-compression = { version = "=0.4.43", features = [
     "futures-io",
     "gzip",
     "brotli",
@@ -36,7 +36,8 @@ async-compression = { version = "0.4", features = [
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = true }
-brotli = "8"
+brotli = "=8.0.4"
+brotli-decompressor = "=5.0.1"
 bytes = "1"
 chrono = "0.4"
 ctor = "1.0"
@@ -95,6 +96,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"
+url = "=2.5.8"
 validator = { version = "0.20", features = ["derive"] }
 walkdir = { version = "2" }
 web-time = "1"

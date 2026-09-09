@@ -1,10 +1,11 @@
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
-use edgezero_core::body::Body;
+use edgezero_core::body::{Body, BodyStream};
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderMap, HeaderValue, Method, Uri, header};
+use edgezero_core::outbound::DEFAULT_MAX_BROTLI_DECODER_BYTES;
 use edgezero_core::proxy::{PROXY_HEADER, ProxyClient, ProxyRequest, ProxyResponse};
 use fastly::{
     Backend, Request as FastlyRequest, Response as FastlyResponse, error::anyhow,
@@ -182,7 +183,7 @@ async fn forward_request_body(
         }
         Body::Stream(mut stream) => {
             while let Some(result) = stream.next().await {
-                let chunk = result.map_err(EdgeError::internal)?;
+                let chunk = result?;
                 streaming_body
                     .write_all(&chunk)
                     .map_err(EdgeError::internal)?;
@@ -195,14 +196,14 @@ async fn forward_request_body(
     Ok(())
 }
 
-fn transform_stream(
-    stream: ChunkStream,
-    encoding: Option<&str>,
-) -> BoxStream<'static, Result<Bytes, io::Error>> {
+fn transform_stream(stream: ChunkStream, encoding: Option<&str>) -> BodyStream {
+    let stream = stream
+        .map(|result| result.map(Bytes::from).map_err(EdgeError::internal))
+        .boxed_local();
     match encoding {
-        Some("gzip") => decode_gzip_stream(stream).boxed(),
-        Some("br") => decode_brotli_stream(stream).boxed(),
-        _ => stream.map(|res| res.map(Bytes::from)).boxed(),
+        Some("gzip") => decode_gzip_stream(stream),
+        Some("br") => decode_brotli_stream(stream, 24, DEFAULT_MAX_BROTLI_DECODER_BYTES),
+        _ => stream,
     }
 }
 

@@ -26,7 +26,7 @@ not evidence that bytes reached the client.
 
 ### 2.1 Policy and timing
 
-Every adapter snapshots `egress_started_at` from `web_time::Instant` immediately before its
+Every adapter snapshots `egress_started_at` from `MonotonicInstant` immediately before its
 first response-conversion operation. It then obtains one finite absolute deadline:
 
 ```rust
@@ -80,7 +80,7 @@ pub struct ResponseEgressReport {
     pub bytes_written: u64,
     pub elapsed: Duration,
     pub outcome: ResponseEgressOutcome,
-    pub request_start: web_time::Instant,
+    pub request_start: MonotonicInstant,
     pub route: Option<RouteMetadata>,
 }
 

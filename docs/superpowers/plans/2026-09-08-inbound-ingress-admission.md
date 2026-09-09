@@ -5,8 +5,9 @@
 > implementation phases.
 
 **Goal:** Add stable pre-dispatch route resolution, one app-owned ingress admission gate,
-request-owned grants, absolute body-read deadlines, raw HTTP/1 framing rejection on Axum,
-and lazy bounded inbound-body consumption across all adapters.
+request-owned grants, absolute body-read deadlines, parser-level request-target/header
+limits and raw HTTP/1 framing rejection on Axum, and lazy bounded inbound-body consumption
+across all adapters.
 
 **Architecture:** Each adapter stamps one monotonic request start and validates raw framing
 where possible. Core resolves the route once without dispatching, admission sees that stable
@@ -28,8 +29,9 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
   changed method/path.
 - Every admitted body has one finite absolute deadline. Relative per-read timeout resets are
   forbidden.
-- Raw framing validation must use a pre-normalization parser boundary. A `HeaderMap` check
-  cannot claim request-smuggling protection.
+- Raw head limits and framing validation must use a pre-normalization parser boundary. A
+  normalized target or `HeaderMap` check cannot claim parser-allocation or
+  request-smuggling protection.
 - Preserve `RequestContext::new(Request, PathParams)` for low-level callers; it records no
   route or admission grant.
 - Follow red-green-refactor for every behavioral task and run the focused test after each
@@ -49,16 +51,17 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
   `RouterService::resolve`, and `dispatch_resolved` exactly as specified.
 - [ ] Run `cargo test -p edgezero-core --lib router`.
 
-## Task 2: App admission policy and normalized ingress head
+## Task 2: App admission policy, parser limits, and normalized ingress head
 
 **Files:** `crates/edgezero-core/src/app.rs`, app tests, macro/configure tests.
 
-- [ ] Write red tests for `IngressFraming`, immutable/body-blind `IngressHead`,
-  `AdmissionDecision`, and non-clone opaque `IngressGrant` downcast behavior.
+- [ ] Write red tests for validated nonzero `IngressHeadLimits`, `IngressHeadAccounting`,
+  `IngressFraming`, immutable/body-blind `IngressHead`, `AdmissionDecision`, and non-clone
+  opaque `IngressGrant` downcast behavior.
 - [ ] Write red ordering tests: framing, resolution, admission, then dispatch; refusal skips
   middleware/handler/body polling and retains the chosen response.
-- [ ] Add the synchronous policy setter on `App`; preserve it through complete app-to-service
-  construction rather than cloning only `app.router()`.
+- [ ] Add the synchronous policy and immutable head-limit setters on `App`; preserve both
+  through complete app-to-service construction rather than cloning only `app.router()`.
 - [ ] Add the default decision: empty grant plus
   `request_start + DEFAULT_INBOUND_READ_BUDGET` (30 seconds). Clamp every policy deadline
   to `request_start + DEADLINE_FAR_FUTURE` with checked arithmetic; reject overflow or an
@@ -70,7 +73,7 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
 **Files:** `crates/edgezero-core/src/context.rs`, router/context tests.
 
 - [ ] Write red tests proving `IngressHead` and routed `RequestContext` expose the identical
-  `web_time::Instant` and `RouteMetadata` values.
+  `MonotonicInstant` and `RouteMetadata` values.
 - [ ] Write red drop-count tests for taken, untaken, refused, 404, and 405 grants. A second
   `take_ingress_grant()` returns `None`; no grant type is clonable or serialized.
 - [ ] Preserve `RequestContext::new(Request, PathParams)`: snapshot start at construction,
@@ -94,30 +97,36 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
 - [ ] Migrate JSON/form extractors to the documented defaults and explicit `Within` forms.
 - [ ] Run `cargo test -p edgezero-core`.
 
-## Task 5: Axum raw framing boundary
+## Task 5: Axum raw request-head and framing boundary
 
 **Files:** pinned Hyper patch/upstream hook, workspace dependency patch, Axum connection
 setup/request conversion, raw-socket integration tests.
 
-- [ ] Add red raw-socket tests for CL+TE in both orders; duplicate equal/unequal and
-  comma-list CL; signed/malformed/overflow CL; repeated/non-final/unsupported TE; HTTP/2 TE;
-  and valid CL/chunked controls.
+- [ ] Add red raw-socket tests for exact/over-limit request-target bytes, raw header bytes,
+  and field-line count; checked accounting overflow; CL+TE in both orders; duplicate
+  equal/unequal and comma-list CL; signed/malformed/overflow CL;
+  repeated/non-final/unsupported TE; HTTP/2 TE; and valid controls.
+- [ ] Assert target overflow is 414, header byte/count overflow is 431, diagnostics echo no
+  request data, and every head rejection happens before resolution/admission/body polling.
+  Exact limits pass and expose the exact `IngressHeadAccounting::RawValidated` totals.
 - [ ] Assert rejection is 400, closes HTTP/1 or resets only the multiplexed stream, invokes
   no admission policy, and polls no body.
 - [ ] Characterize pinned Hyper 1.10.1 first: preserve source references and tests proving a
   `Content-Length` after `Transfer-Encoding` is skipped and equal duplicate lengths are
   accepted. These are the red cases the patch must change.
 - [ ] Add the smallest audited parser patch (or consume an upstream equivalent) in Hyper's
-  existing ordered `httparse` header loop: reject any CL+TE presence in either order; any
-  second or comma-list CL; and malformed, repeated/non-final `chunked`, or unsupported
-  transfer codings before normalization. Keep Hyper as the only HTTP/1 parser; do not add an
-  independent socket pre-parser that could disagree on pipelined boundaries.
+  existing request-line/ordered `httparse` header path. Bound parser reads so the raw head is
+  rejected rather than accumulated past the installed target/header policy; count duplicate
+  field lines and exact syntax bytes. In the same boundary reject any CL+TE presence in
+  either order; any second or comma-list CL; and malformed, repeated/non-final `chunked`, or
+  unsupported transfer codings before normalization. Keep Hyper as the only HTTP/1 parser;
+  do not add an independent socket pre-parser that could disagree on pipelined boundaries.
 - [ ] Pin the exact patched source/revision and add an upgrade gate that fails when the
   patch no longer applies or its source assertions change. Document the upstream issue/PR
   and removal condition.
 - [ ] Only after raw acceptance, derive the normalized `IngressFraming` summary from the
-  surviving headers and HTTP version. Do not claim the summary itself performed smuggling
-  validation.
+  surviving headers and HTTP version and attach the raw accounting totals. Do not claim the
+  summaries themselves performed parser enforcement or smuggling validation.
 - [ ] Convert accepted bodies lazily, wrap native cancellation under the admitted absolute
   deadline, and dispatch with the exact resolved token.
 - [ ] Run Axum unit, integration, and raw-socket suites.
@@ -127,8 +136,10 @@ setup/request conversion, raw-socket integration tests.
 **Files:** each adapter request/service entry point and contract tests.
 
 - [ ] Write per-adapter ordering tests with an observable first body poll.
-- [ ] Stamp `request_start` at earliest guest entry, pass `HostManaged` framing, resolve once,
-  invoke policy once, and preserve the resolved token through dispatch.
+- [ ] Stamp `request_start` at earliest guest entry, pass `HostManaged` framing, attach
+  `IngressHeadAccounting::HostManaged`, apply only documented post-materialization
+  defense-in-depth limits, invoke policy once, and preserve the resolved token through
+  dispatch.
 - [ ] Implement pre-read/post-ready deadline checks and the strongest available drop/abort
   primitive. Do not claim preemption around synchronous host calls.
 - [ ] Prove buffered provider values enter as `Body::Once` only after admission and within a
@@ -139,8 +150,9 @@ setup/request conversion, raw-socket integration tests.
 
 **Files:** manifest schema/parser, adapter registry, CLI checks, scaffold templates, docs.
 
-- [ ] Add separate `ingress-admission`, `inbound-read-deadlines`, and
-  `raw-ingress-framing-validation` cells with the exact initial matrix in the spec.
+- [ ] Add separate `ingress-admission`, `inbound-read-deadlines`,
+  `raw-ingress-head-limits`, and `raw-ingress-framing-validation` cells with the exact
+  initial matrix in the spec.
 - [ ] Test parse/display/round-trip, unknown value rejection, and fail-closed build/serve/
   deploy/demo behavior for Native requirements.
 - [ ] Update manifest-generated and hand-written app construction so both retain admission
@@ -151,8 +163,9 @@ setup/request conversion, raw-socket integration tests.
 
 ## Task 8: Final verification and integration boundary
 
-- [ ] Audit for eager request-body collection, normalized-header framing claims, rematching
-  after admission, relative timeout resets, wildcard `EdgeError` matches, and leaked grants.
+- [ ] Audit for eager request-body collection, post-materialization parser-limit claims,
+  normalized-header framing claims, rematching after admission, relative timeout resets,
+  wildcard `EdgeError` matches, and leaked grants.
 - [ ] Run:
 
 ```bash

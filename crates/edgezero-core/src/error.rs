@@ -43,6 +43,20 @@ pub enum BudgetSource {
     Unspecified,
 }
 
+/// Stable identity for a response resource limit enforced by `EdgeZero`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResponseLimitReason {
+    BrotliWindow,
+    BufferedBody,
+    DecodedBody,
+    DecoderMemory,
+    EncodedBody,
+    HeaderBytes,
+    HeaderCount,
+    Unspecified,
+}
+
 /// Application-level error that carries an HTTP status code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -78,6 +92,12 @@ pub enum EdgeError {
     NotFound { path: String },
     #[error("not implemented: {message}")]
     NotImplemented { message: String },
+    /// An upstream response exceeded an EdgeZero-owned resource policy. HTTP 502.
+    #[error("{message}")]
+    ResponseTooLarge {
+        message: String,
+        reason: ResponseLimitReason,
+    },
     #[error("service unavailable: {message}")]
     ServiceUnavailable { message: String },
     #[error("validation error: {message}")]
@@ -188,6 +208,7 @@ impl EdgeError {
             | EdgeError::GatewayTimeout { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::ResponseTooLarge { .. }
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::Validation { .. }
             | EdgeError::ServiceUnavailable { .. } => None,
@@ -214,6 +235,7 @@ impl EdgeError {
             EdgeError::MethodNotAllowed { .. } => "method_not_allowed",
             EdgeError::NotFound { .. } => "not_found",
             EdgeError::NotImplemented { .. } => "not_implemented",
+            EdgeError::ResponseTooLarge { .. } => "response_too_large",
             EdgeError::ServiceUnavailable { .. } => "service_unavailable",
             EdgeError::Validation { .. } => "validation",
         }
@@ -227,6 +249,7 @@ impl EdgeError {
             | EdgeError::BadRequest { message }
             | EdgeError::ConfigOutOfDate { message, .. }
             | EdgeError::GatewayTimeout { message, .. }
+            | EdgeError::ResponseTooLarge { message, .. }
             | EdgeError::Validation { message }
             | EdgeError::NotImplemented { message }
             | EdgeError::ServiceUnavailable { message } => message.clone(),
@@ -270,6 +293,25 @@ impl EdgeError {
     }
 
     #[inline]
+    pub fn response_too_large<S: Into<String>>(message: S) -> Self {
+        EdgeError::ResponseTooLarge {
+            message: message.into(),
+            reason: ResponseLimitReason::Unspecified,
+        }
+    }
+
+    #[inline]
+    pub fn response_too_large_with_reason<S: Into<String>>(
+        message: S,
+        reason: ResponseLimitReason,
+    ) -> Self {
+        EdgeError::ResponseTooLarge {
+            message: message.into(),
+            reason,
+        }
+    }
+
+    #[inline]
     pub fn service_unavailable<S: Into<String>>(message: S) -> Self {
         EdgeError::ServiceUnavailable {
             message: message.into(),
@@ -280,7 +322,9 @@ impl EdgeError {
     #[inline]
     pub fn status(&self) -> StatusCode {
         match self {
-            EdgeError::BadGateway { .. } => StatusCode::BAD_GATEWAY,
+            EdgeError::BadGateway { .. } | EdgeError::ResponseTooLarge { .. } => {
+                StatusCode::BAD_GATEWAY
+            }
             EdgeError::BadRequest { .. } => StatusCode::BAD_REQUEST,
             EdgeError::ConfigOutOfDate { .. } | EdgeError::ServiceUnavailable { .. } => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -333,6 +377,7 @@ impl IntoResponse for EdgeError {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
             | EdgeError::Validation { .. } => None,
         };
@@ -592,6 +637,7 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
@@ -644,6 +690,7 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
@@ -700,6 +747,7 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
@@ -741,6 +789,7 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
@@ -916,6 +965,11 @@ mod tests {
         );
         assert_kind!(EdgeError::not_found("/x"), "not_found", 404_u16);
         assert_kind!(EdgeError::not_implemented("x"), "not_implemented", 501_u16);
+        assert_kind!(
+            EdgeError::response_too_large("x"),
+            "response_too_large",
+            502_u16
+        );
         assert_kind!(EdgeError::gateway_timeout("x"), "gateway_timeout", 504_u16);
         assert_kind!(
             EdgeError::service_unavailable("x"),
@@ -943,9 +997,60 @@ mod tests {
         assert_retry_after!(EdgeError::bad_request("x"), false);
         assert_retry_after!(EdgeError::gateway_timeout("x"), false);
         assert_retry_after!(EdgeError::internal(anyhow::anyhow!("x")), false);
+        assert_retry_after!(EdgeError::response_too_large("x"), false);
         // ServiceUnavailable is also 503 but must NOT carry Retry-After
         assert_retry_after!(EdgeError::service_unavailable("x"), false);
         assert_retry_after!(EdgeError::config_out_of_date("x", "f"), true);
+    }
+
+    #[test]
+    fn response_too_large_constructors_preserve_unspecified_and_specific_reason() {
+        let EdgeError::ResponseTooLarge { reason, .. } = EdgeError::response_too_large("large")
+        else {
+            panic!("expected ResponseTooLarge");
+        };
+        assert_eq!(reason, ResponseLimitReason::Unspecified);
+
+        let EdgeError::ResponseTooLarge { reason, .. } =
+            EdgeError::response_too_large_with_reason("large", ResponseLimitReason::EncodedBody)
+        else {
+            panic!("expected ResponseTooLarge");
+        };
+        assert_eq!(reason, ResponseLimitReason::EncodedBody);
+    }
+
+    #[test]
+    fn response_too_large_preserves_every_reason_without_serializing_it() {
+        for reason in [
+            ResponseLimitReason::BrotliWindow,
+            ResponseLimitReason::BufferedBody,
+            ResponseLimitReason::DecodedBody,
+            ResponseLimitReason::DecoderMemory,
+            ResponseLimitReason::EncodedBody,
+            ResponseLimitReason::HeaderBytes,
+            ResponseLimitReason::HeaderCount,
+            ResponseLimitReason::Unspecified,
+        ] {
+            let error = EdgeError::response_too_large_with_reason("response limit", reason);
+            assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+            let EdgeError::ResponseTooLarge {
+                reason: stored_reason,
+                ..
+            } = &error
+            else {
+                panic!("expected ResponseTooLarge");
+            };
+            assert_eq!(*stored_reason, reason);
+
+            let response = error.into_response().expect("response");
+            assert!(response.headers().get(RETRY_AFTER).is_none());
+            let body = parse_body(response);
+            assert_eq!(body["error"]["status"], 502_u16);
+            assert_eq!(body["error"]["kind"], "response_too_large");
+            assert_eq!(body["error"]["message"], "response limit");
+            assert!(body["error"].get("reason").is_none());
+            assert!(body["error"].get("field_path").is_none());
+        }
     }
 
     #[test]
