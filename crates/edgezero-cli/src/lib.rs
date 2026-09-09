@@ -58,8 +58,10 @@ pub use provision::run_provision;
 use args::{
     ActiveVersionArgs, BuildArgs, DeployArgs, HealthcheckArgs, NewArgs, RollbackArgs, ServeArgs,
 };
+#[cfg(any(test, feature = "demo-example"))]
+use edgezero_core::app::Hooks;
 #[cfg(feature = "cli")]
-use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::manifest::{ManifestContract, ManifestLoader};
 #[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
@@ -140,6 +142,10 @@ pub fn init_cli_logger() {
 pub fn run_build(args: &BuildArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    adapter::ensure_capabilities(
+        &args.adapter,
+        ManifestContract::from_opt(manifest.as_ref().map(ManifestLoader::manifest)),
+    )?;
     if let Some(loader) = &manifest {
         log_store_bindings(&args.adapter, loader);
     }
@@ -183,6 +189,10 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
 
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    adapter::ensure_capabilities(
+        &args.adapter,
+        ManifestContract::from_opt(manifest.as_ref().map(ManifestLoader::manifest)),
+    )?;
 
     // Thread `--service-id` into the adapter invocation
     // when provided, ahead of any operator passthrough args. Fastly
@@ -564,6 +574,10 @@ pub fn run_active_version(args: &ActiveVersionArgs) -> Result<(), String> {
 pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    adapter::ensure_capabilities(
+        &args.adapter,
+        ManifestContract::from_opt(manifest.as_ref().map(ManifestLoader::manifest)),
+    )?;
     adapter::execute(
         &args.adapter,
         adapter::Action::Serve,
@@ -595,6 +609,11 @@ pub fn run_new(args: &NewArgs) -> Result<(), String> {
 #[inline]
 pub fn run_demo() -> Result<(), String> {
     demo_server::run_demo()
+}
+
+#[cfg(any(test, feature = "demo-example"))]
+fn demo_capability_gate<Application: Hooks>() -> Result<(), String> {
+    adapter::ensure_capabilities("axum", Application::manifest().as_contract())
 }
 
 #[cfg(feature = "cli")]
@@ -680,10 +699,35 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 mod tests {
     use super::*;
     use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
-    use edgezero_core::manifest::ManifestLoader;
+    use edgezero_core::app::Hooks;
+    use edgezero_core::manifest::{BakedManifest, Manifest, ManifestLoader};
+    use edgezero_core::router::RouterService;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    struct CapabilityGateApp;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook overrides only routes and the baked manifest under test"
+    )]
+    impl Hooks for CapabilityGateApp {
+        fn manifest() -> BakedManifest {
+            Manifest::from_baked_json(
+                r#"{"capabilities":{"required":["outbound-complete-resource-accounting"]}}"#,
+            )
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[test]
+    fn demo_capability_gate_runs_before_server_start() {
+        assert!(demo_capability_gate::<CapabilityGateApp>().is_err());
+    }
 
     #[test]
     fn load_manifest_optional_hard_errors_when_explicit_env_path_missing() {

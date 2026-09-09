@@ -17,6 +17,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
+use edgezero_core::{Capability, CapabilitySupport};
 use walkdir::WalkDir;
 
 static CLOUDFLARE_ADAPTER: CloudflareCliAdapter = CloudflareCliAdapter;
@@ -134,6 +135,24 @@ struct CloudflareCliAdapter;
     reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for CloudflareCliAdapter {
+    #[expect(
+        clippy::match_same_arms,
+        reason = "the complete-resource-accounting cell is stated explicitly while the wildcard keeps future capabilities fail-closed"
+    )]
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
+            Capability::OutboundHeaderFidelity => CapabilitySupport::BestEffort,
+            Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
+            _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `wrangler` is the native sign-in surface for Cloudflare

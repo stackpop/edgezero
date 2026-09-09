@@ -20,6 +20,7 @@ use edgezero_adapter::scaffold::{
 };
 use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::{Capability, CapabilitySupport};
 use toml::Value;
 use walkdir::WalkDir;
 
@@ -133,6 +134,24 @@ struct EdgezeroAxumConfig {
     reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for AxumCliAdapter {
+    #[expect(
+        clippy::match_same_arms,
+        reason = "the complete-resource-accounting cell is stated explicitly while the wildcard keeps future capabilities fail-closed"
+    )]
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::LazyStreamedResponsePassthrough => CapabilitySupport::BestEffort,
+            Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
+            Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHeaderFidelity
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
+            _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // The axum adapter is the in-process native dev server —

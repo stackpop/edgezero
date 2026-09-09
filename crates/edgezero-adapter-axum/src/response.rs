@@ -6,7 +6,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response as CoreResponse;
 use edgezero_core::outbound::collect_response_stream;
 
-pub const AXUM_RESPONSE_STREAM_BUFFER_BYTES: u64 = 16_777_216;
+pub const AXUM_RESPONSE_STREAM_BUFFER_BYTES: u64 = 0x0100_0000;
 
 /// Convert an `EdgeZero` response into one consumable by Axum/Hyper.
 ///
