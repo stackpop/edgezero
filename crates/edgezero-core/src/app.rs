@@ -1,3 +1,4 @@
+use crate::manifest::BakedManifest;
 use crate::router::RouterService;
 
 /// Canonical adapter name for the Axum adapter.
@@ -119,6 +120,23 @@ pub trait Hooks {
     /// The default implementation performs no changes.
     #[inline]
     fn configure(_app: &mut App) {}
+
+    /// Parsed and finalized manifest contract baked by `app!`.
+    ///
+    /// The default is deliberately uncached: every macro-generated application
+    /// supplies its own per-implementation cache.
+    #[must_use]
+    #[inline]
+    fn manifest() -> BakedManifest {
+        BakedManifest::Absent
+    }
+
+    /// Raw manifest JSON baked at compile time by `app!`.
+    #[must_use]
+    #[inline]
+    fn manifest_json() -> Option<&'static str> {
+        None
+    }
 
     /// Display name for the application. Defaults to `"EdgeZero App"`.
     #[must_use]
@@ -257,6 +275,11 @@ mod tests {
     fn default_hooks_use_default_name_and_into_router() {
         let app = DefaultHooks::build_app();
         assert_eq!(app.name(), App::default_name());
+        assert!(matches!(
+            DefaultHooks::manifest(),
+            crate::manifest::BakedManifest::Absent
+        ));
+        assert_eq!(DefaultHooks::manifest_json(), None);
         assert_eq!(DefaultHooks::stores(), StoresMetadata::default());
         let router = app.into_router();
         assert!(router.routes().is_empty());

@@ -250,7 +250,11 @@ fn deadline_stream(mut source: BodyStream, budget: DispatchBudget) -> BodyStream
                 return;
             }
             match next_item {
-                Some(item) => yield item,
+                Some(Ok(bytes)) => yield Ok(bytes),
+                Some(Err(error)) => {
+                    yield Err(error);
+                    return;
+                }
                 None => return,
             }
         }

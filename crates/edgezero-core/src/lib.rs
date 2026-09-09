@@ -55,8 +55,9 @@ pub use error::{
     BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
 };
 pub use manifest::{
-    AtomicHost, Capability, CapabilitySupport, HostParseError, HostPat, ManifestCapabilities,
-    ManifestOutboundCapability, Port, Scheme, canonicalize_outbound_host,
+    AtomicHost, BakedManifest, Capability, CapabilitySupport, HostParseError, HostPat,
+    ManifestCapabilities, ManifestContract, ManifestOutboundCapability, Port, Scheme,
+    canonicalize_outbound_host,
 };
 pub use outbound::{
     DEFAULT_MAX_BROTLI_DECODER_BYTES, DEFAULT_MAX_RESPONSE_BYTES,

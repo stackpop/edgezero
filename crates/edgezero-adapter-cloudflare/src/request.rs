@@ -9,7 +9,7 @@ use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method as CoreMethod, Request, Uri, request_builder};
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::outbound::HttpClient;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
@@ -21,7 +21,7 @@ use worker::{
 use crate::config_store::CloudflareConfigStore;
 use crate::context::CloudflareRequestContext;
 use crate::key_value_store::CloudflareKvStore;
-use crate::proxy::CloudflareProxyClient;
+use crate::outbound::CloudflareOutboundClient;
 use crate::response::from_core_response;
 use crate::secret_store::CloudflareSecretStore;
 
@@ -269,7 +269,7 @@ pub async fn into_core_request(
     CloudflareRequestContext::insert(&mut request, env, ctx);
     request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(CloudflareProxyClient));
+        .insert(HttpClient::with_client(CloudflareOutboundClient));
     Ok(request)
 }
 

@@ -1,6 +1,5 @@
-#![cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-
 // Compile-time check: CloudflareSecretStore implements SecretStore.
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod secret_store_compile_check {
     use edgezero_adapter_cloudflare::secret_store::CloudflareSecretStore;
     use edgezero_core::secret_store::SecretStore;
@@ -12,7 +11,7 @@ mod secret_store_compile_check {
     const _: fn() = assert_provider_impl::<CloudflareSecretStore>;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cloudflare", target_arch = "wasm32"))]
 mod tests {
     use std::sync::Arc;
 
@@ -284,5 +283,51 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::OK.as_u16());
         let body = response.text().await.expect("text");
         assert_eq!(body, "no");
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    #[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
+    mod enabled {
+        use bytes::Bytes;
+        use edgezero_adapter_cloudflare::outbound::validate_batch_request_for_test;
+        use edgezero_core::body::Body;
+        use edgezero_core::error::EdgeError;
+        use edgezero_core::outbound::OutboundRequest;
+        use futures_util::stream;
+
+        fn message(result: Result<(), EdgeError>) -> Option<String> {
+            if let Err(EdgeError::BadRequest { message }) = result {
+                Some(message)
+            } else {
+                None
+            }
+        }
+
+        #[test]
+        fn send_all_preflight_precedence_and_indices() {
+            let streamed_upload = OutboundRequest::post("https://example.com/upload")
+                .expect("request")
+                .body(Body::stream(stream::iter([Bytes::from_static(b"body")])));
+            let streamed_response = OutboundRequest::get("https://example.com/response")
+                .expect("request")
+                .stream_response();
+            let get_stream = OutboundRequest::get("https://example.com/get")
+                .expect("request")
+                .body(Body::stream(stream::iter([Bytes::new()])));
+
+            assert_eq!(
+                [streamed_upload, streamed_response, get_stream]
+                    .iter()
+                    .map(|request| message(validate_batch_request_for_test(request)))
+                    .collect::<Vec<_>>(),
+                [
+                    Some("send_all requires buffered request bodies; use send for a streamed upload".to_owned()),
+                    Some("send_all requires buffered responses; use send for a streamed response".to_owned()),
+                    Some("GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream".to_owned()),
+                ]
+            );
+        }
     }
 }

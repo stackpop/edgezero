@@ -1,10 +1,10 @@
-use crate::manifest_definitions::{Manifest, StoreDeclaration};
+use crate::manifest_definitions::{Manifest, StoreDeclaration, reject_misplaced_capabilities};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitStr, Token, parse_macro_input};
 use validator::Validate as _;
@@ -165,18 +165,10 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
         }
     };
 
-    let mut manifest: Manifest = match toml::from_str(&manifest_source) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            let msg = format!("failed to parse {}: {err}", manifest_path.display());
-            return quote!(compile_error!(#msg);).into();
-        }
+    let manifest = match parse_manifest(&manifest_source, &manifest_path) {
+        Ok(manifest) => manifest,
+        Err(msg) => return quote!(compile_error!(#msg);).into(),
     };
-    if let Err(err) = manifest.validate() {
-        let msg = format!("failed to validate {}: {err}", manifest_path.display());
-        return quote!(compile_error!(#msg);).into();
-    }
-    manifest.finalize();
 
     let manifest_json = match serde_json::to_string(&manifest) {
         Ok(json) => json,
@@ -233,6 +225,24 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
             fn configure(_app: &mut edgezero_core::app::App) {}
 
+            fn manifest() -> ::edgezero_core::manifest::BakedManifest {
+                static CACHE: ::std::sync::OnceLock<
+                    ::edgezero_core::manifest::BakedManifest,
+                > = ::std::sync::OnceLock::new();
+                *CACHE.get_or_init(|| {
+                    match <Self as ::edgezero_core::app::Hooks>::manifest_json() {
+                        None => ::edgezero_core::manifest::BakedManifest::Absent,
+                        Some(json) => {
+                            ::edgezero_core::manifest::Manifest::from_baked_json(json)
+                        }
+                    }
+                })
+            }
+
+            fn manifest_json() -> Option<&'static str> {
+                Some(#manifest_json_lit)
+            }
+
             fn owns_logging() -> bool {
                 #owns_logging_lit
             }
@@ -261,6 +271,21 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     };
 
     output.into()
+}
+
+fn parse_manifest(source: &str, path: &Path) -> Result<Manifest, String> {
+    let value: toml::Value = toml::from_str(source)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    reject_misplaced_capabilities(&value)
+        .map_err(|error| format!("failed to validate {}: {error}", path.display()))?;
+    let mut manifest: Manifest = value
+        .try_into()
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    manifest
+        .validate()
+        .map_err(|error| format!("failed to validate {}: {error}", path.display()))?;
+    manifest.finalize();
+    Ok(manifest)
 }
 
 /// Parses a handler reference like `crate::handlers::root` from `edgezero.toml`
