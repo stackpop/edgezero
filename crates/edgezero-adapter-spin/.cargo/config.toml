@@ -1,9 +1,8 @@
 [build]
 target = "wasm32-wasip2"
 
-# Wasmtime runs the spin contract tests (no Fastly host imports needed).
-# Only applies when cargo is invoked from inside this package directory.
-# CI overrides via `CARGO_TARGET_WASM32_WASIP2_RUNNER` env var in
-# `.github/workflows/test.yml`.
+# Wasmtime 44.0.1 runs the Spin SDK resource tests with Preview 3 async and
+# WASI HTTP imports enabled. Only applies when Cargo is invoked from this
+# package directory. CI uses the same command through the target runner env.
 [target.'cfg(target_arch = "wasm32")']
-runner = "wasmtime run"
+runner = "wasmtime run -W component-model-async=y -S p3=y -S http=y"
