@@ -24,6 +24,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
+use edgezero_core::{Capability, CapabilitySupport};
 use walkdir::WalkDir;
 
 mod push_cloud;
@@ -136,6 +137,24 @@ struct SpinCliAdapter;
     reason = "KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch)."
 )]
 impl Adapter for SpinCliAdapter {
+    #[expect(
+        clippy::match_same_arms,
+        reason = "the complete-resource-accounting cell is explicit while the wildcard keeps future capabilities fail-closed"
+    )]
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::OutboundHeaderFidelity
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation => CapabilitySupport::Native,
+            Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
+            Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
+            _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `spin cloud {login|logout|info}` is the native sign-in
@@ -1290,6 +1309,35 @@ mod tests {
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
     const TEST_COMPONENT_ID: &str = "demo";
+
+    #[test]
+    fn outbound_capability_matrix_is_honest() {
+        for capability in [
+            Capability::OutboundHeaderFidelity,
+            Capability::OutboundHttp,
+            Capability::SendAllSlotIsolation,
+        ] {
+            assert_eq!(
+                SPIN_ADAPTER.capability(capability),
+                CapabilitySupport::Native
+            );
+        }
+        for capability in [
+            Capability::LazyStreamedResponsePassthrough,
+            Capability::OutboundDeadlines,
+            Capability::OutboundFlexiblePhaseBudget,
+            Capability::StreamedUploadDeadlines,
+        ] {
+            assert_eq!(
+                SPIN_ADAPTER.capability(capability),
+                CapabilitySupport::BestEffort
+            );
+        }
+        assert_eq!(
+            SPIN_ADAPTER.capability(Capability::OutboundCompleteResourceAccounting),
+            CapabilitySupport::Unsupported
+        );
+    }
 
     #[test]
     fn is_valid_spin_key_accepts_lowercase_with_digits_and_underscores() {
