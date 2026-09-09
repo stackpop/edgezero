@@ -20,6 +20,7 @@ cli = [
     "dep:walkdir",
 ]
 fastly = ["dep:fastly", "dep:log-fastly"]
+test-utils = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -46,6 +47,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml_edit = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }

@@ -15,6 +15,8 @@ pub mod context;
 pub mod key_value_store;
 #[cfg(feature = "fastly")]
 pub mod logger;
+#[cfg(any(feature = "test-utils", feature = "fastly"))]
+pub mod outbound;
 #[cfg(feature = "fastly")]
 pub mod proxy;
 #[cfg(feature = "fastly")]
