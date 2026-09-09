@@ -786,6 +786,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml_edit",
  "walkdir",
+ "web-time",
 ]
 
 [[package]]
@@ -793,6 +794,7 @@ name = "edgezero-adapter-spin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "brotli",
  "bytes",
