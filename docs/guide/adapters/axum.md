@@ -77,19 +77,16 @@ cargo build -p my-app-adapter-axum --release
 
 The binary is placed in `target/release/my-app-adapter-axum`.
 
-## Proxy Client
+## Outbound HTTP
 
-The Axum adapter provides a native HTTP client for proxying:
+The Axum adapter injects `AxumOutboundClient`, backed by `reqwest`. Application handlers use the
+portable client from `RequestContext::http_client()`; direct wiring and tests can construct the
+adapter client with `AxumOutboundClient::try_new()`.
 
-```rust
-use edgezero_adapter_axum::AxumProxyClient;
-use edgezero_core::proxy::ProxyService;
-
-let client = AxumProxyClient::default();
-let response = ProxyService::new(client).forward(request).await?;
-```
-
-This uses `reqwest` under the hood for outbound HTTP requests.
+Axum provides native total deadlines, elastic phase budgeting, batch slot isolation, header
+fidelity, and streamed upload cancellation. A portable response stream is non-`Send`, while
+Hyper requires a `Send` body, so downstream conversion collects it under the fixed 16 MiB
+`AXUM_RESPONSE_STREAM_BUFFER_BYTES` cap. See [Capabilities](/guide/capabilities).
 
 ## Logging
 

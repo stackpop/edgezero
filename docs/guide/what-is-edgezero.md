@@ -1,16 +1,16 @@
 # What is EdgeZero?
 
-EdgeZero is a production-ready toolkit for writing an HTTP workload once and deploying it across multiple edge providers. The core stays runtime-agnostic so it compiles cleanly to WebAssembly targets (Fastly Compute@Edge, Cloudflare Workers) and to native hosts (Axum/Tokio) without code changes.
+EdgeZero is a production-ready toolkit for writing an HTTP workload once and deploying it across multiple edge providers. The core stays runtime-agnostic so it compiles cleanly to WebAssembly targets (Fastly Compute, Cloudflare Workers, Fermyon Spin) and to native hosts (Axum/Tokio) without code changes.
 
 ## Key Features
 
 EdgeZero provides developers with:
 
 - **Portable HTTP workloads** - Write your business logic once using the shared `edgezero-core` primitives, then compile to any supported target
-- **Multiple deployment targets** - Deploy to Fastly Compute@Edge, Cloudflare Workers, or native Axum servers from the same codebase
+- **Multiple deployment targets** - Deploy to Fastly Compute, Cloudflare Workers, Fermyon Spin, or native Axum servers from the same codebase
 - **Type-safe extractors** - Use ergonomic extractors like `Json<T>`, `Path<T>`, and `ValidatedQuery<T>` for clean handler code
 - **Streaming support** - Stream responses progressively with `Body::stream` for long-lived or chunked responses
-- **Proxy helpers** - Forward traffic upstream with built-in `ProxyRequest` and `ProxyService` abstractions
+- **Outbound HTTP** - Send typed, bounded requests through one portable client with deadlines and partial-failure batching
 - **CLI tooling** - Scaffold projects, run dev servers, and deploy with the `edgezero` CLI
 
 ## How It Works
@@ -33,6 +33,7 @@ This architecture means you can:
 | ------------------- | ------------------------ | ------ |
 | Fastly Compute@Edge | `wasm32-wasip1`          | Stable |
 | Cloudflare Workers  | `wasm32-unknown-unknown` | Stable |
+| Fermyon Spin        | `wasm32-wasip2`          | Stable |
 | Axum/Tokio (native) | Native host              | Stable |
 
 ## Use Cases

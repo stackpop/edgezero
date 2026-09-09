@@ -202,17 +202,17 @@ async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
 
 `RequestContext` provides these methods:
 
-| Method           | Returns                                    |
-| ---------------- | ------------------------------------------ |
-| `request()`      | `&Request` - full HTTP request             |
-| `path_params()`  | `&PathParams` - raw path parameters        |
-| `path::<T>()`    | Deserialize path params to `T`             |
-| `query::<T>()`   | Deserialize query string to `T`            |
-| `json::<T>()`    | Deserialize JSON body to `T`               |
-| `form::<T>()`    | Deserialize form body to `T`               |
-| `body()`         | `&Body` - raw request body                 |
-| `into_request()` | `Request` - consume context, take request  |
-| `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
+| Method           | Returns                                             |
+| ---------------- | --------------------------------------------------- |
+| `request()`      | `&Request` - full HTTP request                      |
+| `path_params()`  | `&PathParams` - raw path parameters                 |
+| `path::<T>()`    | Deserialize path params to `T`                      |
+| `query::<T>()`   | Deserialize query string to `T`                     |
+| `json::<T>()`    | Deserialize JSON body to `T`                        |
+| `form::<T>()`    | Deserialize form body to `T`                        |
+| `body()`         | `&Body` - raw request body                          |
+| `into_request()` | `Request` - consume context, take request           |
+| `http_client()`  | `Option<HttpClient>` - adapter outbound HTTP client |
 
 ## Sharing app state
 

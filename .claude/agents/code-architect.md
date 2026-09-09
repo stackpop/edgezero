@@ -16,7 +16,7 @@ architectural principles:
 
 3. **Thin adapters**: each adapter translates platform types to/from core types.
    Business logic never lives in adapters. The adapter file structure is:
-   `context.rs`, `request.rs`, `response.rs`, `proxy.rs`, `logger.rs`, `cli.rs`.
+   `context.rs`, `request.rs`, `response.rs`, `outbound.rs`, `logger.rs`, `cli.rs`.
 
 4. **Contract testing**: every adapter has `tests/contract.rs` that validates
    request/response mapping. New adapters must follow this pattern.

@@ -71,6 +71,19 @@ edgezero deploy --adapter spin
 spin deploy --from crates/my-app-adapter-spin
 ```
 
+## Outbound HTTP
+
+`SpinOutboundClient` uses the WASI HTTP 0.3 interfaces directly so request-body production,
+response completion, limits, and the guest-visible deadline race share one owner. Generated
+`spin.toml` files default `allowed_outbound_hosts` to `https://*:*`; cleartext requires an explicit
+manifest declaration.
+
+Spin exposes raw header bytes and supports isolated concurrent `send_all` slots. Deadline and
+streamed-upload cancellation remain BestEffort until host teardown has a documented observed
+bound, and provider phase-timer defaults may prevent a fully elastic budget. The current
+`SpinFullResponse` converter also buffers portable response streams under the fixed 16 MiB
+`SPIN_RESPONSE_STREAM_BUFFER_BYTES` cap. See [Capabilities](/guide/capabilities).
+
 ## KV Storage
 
 Spin KV is **label-backed and multi-store** — each logical id in

@@ -86,17 +86,24 @@ body-mode = "buffered"  # or "stream"
 | `buffered` | Body is fully read into memory before handler runs    |
 | `stream`   | Body is passed as a stream for progressive processing |
 
-## Transparent Decompression
+## Outbound Response Decompression
 
-EdgeZero automatically decompresses gzip and brotli responses from upstream services:
+The outbound client decodes a single bare `gzip` or `br` content coding through shared
+`edgezero-core` decoders. Unknown, parameterized, or stacked codings pass through unchanged.
+Encoded transport bytes, decoded output, and final buffered bytes have independent limits; see
+[Capabilities](/guide/capabilities#limits-and-accounting).
 
 ```rust
-// Proxied response with Content-Encoding: gzip is automatically decoded
-let response = proxy.forward(request).await?;
-// response.body is now decompressed
+let request = OutboundRequest::get("https://api.example.com/data")?
+    .max_encoded_response_bytes(2 * 1024 * 1024)
+    .max_decoded_response_bytes(8 * 1024 * 1024)
+    .stream_response();
+let body = client.send(request).await?.into_body();
 ```
 
-This happens transparently in the adapter layer using shared decoders from `edgezero-core`.
+Multi-member gzip streams are decoded through every member and drained to transport EOF.
+For Brotli, the stream window is checked before decoder allocation and decoder state is charged
+against the configured policy limit.
 
 ## Memory Considerations
 
@@ -131,5 +138,5 @@ async fn dynamic_content() -> Response {
 
 ## Next Steps
 
-- Learn about [Proxying](/guide/proxying) for forwarding requests upstream
+- Learn about [Outbound HTTP](/guide/proxying) for upstream requests
 - Explore adapter-specific streaming in [Fastly](/guide/adapters/fastly) and [Cloudflare](/guide/adapters/cloudflare) guides

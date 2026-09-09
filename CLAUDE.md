@@ -12,7 +12,7 @@ CI workflows under `.github/workflows/`.
 
 ```
 crates/
-  edgezero-core/              # Core: routing, extractors, middleware, proxy, body, errors
+  edgezero-core/              # Core: routing, extractors, middleware, outbound HTTP, body, errors
   edgezero-macros/            # Proc macros: #[action], #[app]
   edgezero-adapter/           # Adapter registry and traits
   edgezero-adapter-fastly/    # Fastly Compute bridge (wasm32-wasip1)
@@ -134,11 +134,13 @@ impl Middleware for MyMiddleware {
 }
 ```
 
-### Proxy
+### Outbound HTTP
 
-Use `ProxyService` with adapter-specific clients (`FastlyProxyClient`,
-`CloudflareProxyClient`, `SpinProxyClient`). Keep proxy logic provider-agnostic
-in core.
+Handlers obtain `HttpClient` from `RequestContext::http_client()`, construct
+`OutboundRequest` values, and consume `OutboundResponse` or per-slot
+`OutboundSlotResult` outcomes. Keep provider transport logic in adapter-specific
+`*OutboundClient` implementations and use the capability matrix for behavioral
+differences.
 
 ### Logging
 
@@ -168,7 +170,7 @@ Each adapter follows the same structure:
 - `context.rs` — platform-specific request context
 - `request.rs` — platform request → core request conversion
 - `response.rs` — core response → platform response conversion
-- `proxy.rs` — platform-specific proxy client
+- `outbound.rs` — platform-specific outbound HTTP client
 - `logger.rs` — platform-specific logging init
 - `cli.rs` — adapter dispatch behind the `cli` feature: `build` / `deploy` / `serve` (legacy) plus `Adapter::execute` for `auth` (login/logout/status) and dedicated trait methods `provision` (Stage 6 — platform-resource creation) and `push_config_entries` (Stage 7 — `config push` writeback). Self-registers via `#[ctor]` into the `edgezero-adapter` registry.
 
