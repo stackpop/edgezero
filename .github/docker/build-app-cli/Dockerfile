@@ -76,6 +76,7 @@ COPY .tool-versions /usr/local/share/edgezero/.tool-versions
 COPY .github/actions/deploy-fastly/versions.json /usr/local/share/edgezero/fastly-versions.json
 COPY .github/docker/build-app-cli/provenance.schema.json /usr/local/share/edgezero/provenance.schema.json
 COPY .github/docker/build-app-cli/fixtures/provenance /usr/local/share/edgezero/provenance-fixtures
+COPY .github/docker/build-app-cli/fixtures/gnu-smoke.rs /usr/local/share/edgezero/gnu-smoke.rs
 COPY .github/docker/build-app-cli/fixtures/wasm-smoke.rs /usr/local/share/edgezero/wasm-smoke.rs
 COPY .github/docker/build-app-cli/verify-toolchain.sh /usr/local/bin/verify-toolchain
 

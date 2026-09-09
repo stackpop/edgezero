@@ -557,7 +557,7 @@ release credential. Candidate code is always subject data. No image is published
       `rust:1.95.0-slim-bookworm` linux/amd64 leaf and require the reviewed digest in Section 1.
       Independently download the exact sccache asset and checksum companion and require the reviewed
       checksum. Stop for review on movement or disagreement; never commit a placeholder.
-- [ ] Commit the exact multi-stage Dockerfile, root `.dockerignore`, and sorted
+- [x] Commit the exact multi-stage Dockerfile, root `.dockerignore`, and sorted
       `image-context-paths.txt` as gate-owned inputs. The context manifest excludes the root workspace
       manifests and contains only the complete standalone validator directory, schema/fixtures,
       `.tool-versions`, Fastly versions, Dockerfile, and `.dockerignore`; every entry is also in
@@ -588,19 +588,19 @@ release credential. Candidate code is always subject data. No image is published
       interpreter options `--inhibit-cache --glibc-hwcaps-mask '' --library-path
 /opt/edgezero/runtime-lib`; static binaries run directly. Test that no shell, cache, default
       directory, hardware-capability directory, or preload can substitute a startup object.
-- [ ] Before freezing `G`, compile a real GNU-target Rust CLI using the selected image toolchain.
+- [x] Before freezing `G`, compile a real GNU-target Rust CLI using the selected image toolchain.
       Run package, validate, and controlled-loader smoke through their exact isolated profiles against
       the image's actual Bookworm libc/interpreter closure. Record the measured libc/loader digests
       and accepted headers; do not substitute synthetic ELF fixtures or a distro-package inspection
       for this image acceptance test. In a separate isolated loader-comparison harness, prove primary
       and dependency SONAME-collision fixtures are rejected and the interpreter alias resolves to the
       same object the parser predicts. No application execution occurs in the parser profile.
-- [ ] Write failing command-fixture tests for `verify-toolchain.sh`. Cover exact, prerelease,
+- [x] Write failing command-fixture tests for `verify-toolchain.sh`. Cover exact, prerelease,
       extra-text, missing, and malformed Rust/Fastly/sccache version output; absent
       `wasm32-wasip1`; failed minimal compile; invalid wasm magic; validator self-test failure;
       wrong uid/gid; read-only-root failure; and missing, replaced, or semantically incompatible GNU
       `/usr/bin/env -S`.
-- [ ] Snapshot the `self-test` container's complete create/run contract: digest-pinned linux/amd64
+- [x] Snapshot the `self-test` container's complete create/run contract: digest-pinned linux/amd64
       image, uid/gid 1001, read-only root, all capabilities dropped, no-new-privileges, no network,
       2 GiB memory/swap, 64 pids, 10-minute wall limit, no host bind mounts, only `/work/home` and
       `/work/tmp` tmpfs, fixed `/usr/bin/env` entrypoint, exact `-S` plus sorted placeholder split
@@ -609,14 +609,14 @@ release credential. Candidate code is always subject data. No image is published
       target environment name, mount, flag, entrypoint, command prefix, non-placeholder assignment,
       value-derived argv construction, or path. Snapshot the exact container `Path` and `Args`; do not
       use accidental byte inequality between values and argv as the assertion.
-- [ ] Before publication, drive the verifier through real `docker create --env-file`, delete and
+- [x] Before publication, drive the verifier through real `docker create --env-file`, delete and
       verify absence of that file before `docker start --attach`, and assert exact post-`env -i`
       bytes for empty values plus spaces, quotes, backslashes, dollar signs, `#`, `=`, literal
       `${...}` text, and non-ASCII values. Prove expansion is neither recursive nor resplit, the
       placeholder list and env-file names agree exactly, and image/Docker poison is absent. Reject
       newline/NUL serialization, duplicate/bare/comment/blank/extra env-file entries, missing
       placeholders, and any argv element constructed by inserting a value.
-- [ ] Implement exact semantic-version parsing, installed-target inspection, and compilation of the
+- [x] Implement exact semantic-version parsing, installed-target inspection, and compilation of the
       committed `wasm-smoke.rs` library into tmpfs. Substring version matching is forbidden.
 - [x] Write failing fixture tests for `verify-published-image.sh`. Cover accepted leaf Docker and
       OCI manifests; rejected one-entry/multi-entry indexes; missing config/layers; malformed BuildKit

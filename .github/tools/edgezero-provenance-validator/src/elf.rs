@@ -1940,6 +1940,24 @@ mod tests {
         let libraries = std::collections::BTreeMap::from([("libalias.so".into(), colliding)]);
 
         assert!(super::validate_aliases(&primary, &loader, &libraries).is_err());
+
+        let first = object(
+            "/opt/edgezero/runtime-lib/libfirst.so",
+            ObjectRole::Library,
+            3,
+            Some("libfirst.so"),
+        );
+        let second = object(
+            "/opt/edgezero/runtime-lib/libsecond.so",
+            ObjectRole::Library,
+            4,
+            Some("libfirst.so"),
+        );
+        let libraries = std::collections::BTreeMap::from([
+            ("libfirst.so".into(), first),
+            ("libsecond.so".into(), second),
+        ]);
+        assert!(super::validate_aliases(&primary, &loader, &libraries).is_err());
     }
 
     struct TrackingReader {

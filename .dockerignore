@@ -9,6 +9,7 @@
 !.github/docker/build-app-cli/
 !.github/docker/build-app-cli/Dockerfile
 !.github/docker/build-app-cli/fixtures/
+!.github/docker/build-app-cli/fixtures/gnu-smoke.rs
 !.github/docker/build-app-cli/fixtures/provenance/
 !.github/docker/build-app-cli/fixtures/provenance/**
 !.github/docker/build-app-cli/fixtures/wasm-smoke.rs

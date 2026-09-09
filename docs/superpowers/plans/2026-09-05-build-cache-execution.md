@@ -347,4 +347,65 @@ then passed after normalization. Final local verification on 2026-09-08:
 The paired validator requires both current records and the writer cannot partially add or replace a
 pair. Git range-level atomic add/change/delete classification remains the explicit Section 6.5
 classifier obligation. Image creation, toolchain/runtime verification, publication, protected gate
-activation, and caching integration remain open.
+activation, and caching integration were open at that checkpoint. The following tranche completes
+local image creation and runtime verification; publication, gate activation, and caching integration
+remain open.
+
+## Build Image and Runtime Verification Tranche
+
+Task 2 Section 6.2 now has the closed staged image context, pinned multi-stage Dockerfile, immutable-
+identity local and published-image verifier modes, and an exact runtime-capability verifier. The image
+contains the standalone validator, protocol schema/corpus, Rust 1.95.0 toolchain with exactly the GNU
+host and `wasm32-wasip1` targets, Fastly CLI 15.1.0, sccache 0.10.0, and the reviewed Bookworm startup
+closure. Version checks combine strict stable-SemVer extraction with byte-exact complete command
+output; target inspection compares the complete sorted set and compiles the committed wasm fixture.
+
+The measured runtime closure is four regular, single-link ELF64 little-endian x86-64 shared objects:
+
+- `/lib64/ld-linux-x86-64.so.2` (GNU OSABI):
+  `02bcda52c1a5dfc236f94d9e5255b4a0e26347d8a372a5223b650e31f291ce3c`.
+- `libc.so.6` (GNU OSABI):
+  `6b4a45352fd0c540a9c7c718f35ce8c8e46a4e482f9d3885a910c32d1a0e1421`.
+- `libgcc_s.so.1` (System-V OSABI):
+  `2bd1552c47799ef67e701e81d4383061fd76059868e446e63560f0dd0d5ec14e`.
+- `libm.so.6` (GNU OSABI):
+  `7f2ca87f652f56b094462474b076749e90e689d0ecb9cb63c7679820b271b4e7`.
+
+The closure verifier requires exact member count, bytes, ELF role, machine, SONAME, direct needed
+set, supported dependency interpreter metadata, and absent `/etc/ld.so.preload`. The loader has no
+`PT_INTERP`, has exact SONAME `ld-linux-x86-64.so.2`, and has no `DT_NEEDED`. Existing isolated ELF
+tests separately reject primary/dependency alias collisions, prove the fixed loader alias resolves to
+the already validated interpreter, ignore cache/default/hwcaps substitutions, and record `dlopen` as
+outside the startup-only claim.
+
+The image verifier compiles a committed real GNU Rust CLI with the selected image toolchain, packages
+it through the provenance validator, validates it into a separate profile, and invokes only the
+validated output through the fixed loader arguments. Every container uses a named create/inspect/
+start/remove lifecycle, immutable linux/amd64 identity, uid/gid 1001, read-only root, no capabilities,
+no-new-privileges, no network, bounded memory/pids/time, profile-specific mounts, and only home/temp
+tmpfs. Before start, the verifier compares Docker's persisted `Path`/`Args`, removes the mode-0600
+single-link env file, and verifies absence. The real environment probe preserves empty and special
+UTF-8 values without recursive expansion or resplitting and proves inherited image/Docker variables
+are absent after `env -i`.
+
+Final local verification on 2026-09-08:
+
+- Toolchain/runtime command fixtures: 38 passed, zero failed.
+- Published/local image verifier fixtures: 52 passed, zero failed.
+- Dockerfile/context contract: 13 passed, zero failed; isolated context staging: 26 passed, zero
+  failed.
+- Complete deploy-core action suite: 308 passed, zero failed, five platform-specific checks skipped
+  on macOS.
+- Complete standalone validator: 76 unit and 21 process/integration tests passed. The complete
+  repository workspace test suite, repository and standalone formatting, strict all-target/all-
+  feature Clippy, and the combined Fastly/Cloudflare feature check passed.
+- Documentation Prettier, ESLint, and VitePress production build passed.
+- Shell syntax and ShellCheck at warning severity passed. A real linux/amd64 image build completed,
+  and the complete verifier passed against its immutable local image ID, including actual Docker
+  env-file deletion, persisted process inspection, real GNU compile/package/validate/smoke, golden
+  deterministic archive equality, and every malformed archive fixture.
+
+No image has been published and no gate SHA, release tag, digest pin, release evidence, protected
+workflow, or cache-enabled action is claimed by this tranche. Section 6.3 and later Task 2 work remain
+open, and the same image verification must run again against the eventual protected/published
+identities.

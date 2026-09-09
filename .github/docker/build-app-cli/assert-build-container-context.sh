@@ -57,6 +57,7 @@ trap 'rm -f "$expected" "$actual" "$metadata"' EXIT
     .dockerignore \
     .github/actions/deploy-fastly/versions.json \
     .github/docker/build-app-cli/Dockerfile \
+    .github/docker/build-app-cli/fixtures/gnu-smoke.rs \
     .github/docker/build-app-cli/fixtures/wasm-smoke.rs \
     .github/docker/build-app-cli/image-context-paths.txt \
     .github/docker/build-app-cli/provenance.schema.json \
@@ -133,6 +134,7 @@ COPY .tool-versions /usr/local/share/edgezero/.tool-versions
 COPY .github/actions/deploy-fastly/versions.json /usr/local/share/edgezero/fastly-versions.json
 COPY .github/docker/build-app-cli/provenance.schema.json /usr/local/share/edgezero/provenance.schema.json
 COPY .github/docker/build-app-cli/fixtures/provenance /usr/local/share/edgezero/provenance-fixtures
+COPY .github/docker/build-app-cli/fixtures/gnu-smoke.rs /usr/local/share/edgezero/gnu-smoke.rs
 COPY .github/docker/build-app-cli/fixtures/wasm-smoke.rs /usr/local/share/edgezero/wasm-smoke.rs
 COPY .github/docker/build-app-cli/verify-toolchain.sh /usr/local/bin/verify-toolchain
 EOF
@@ -163,6 +165,7 @@ for required in \
   'COPY --from=builder /usr/local/rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib/rustlib/multirust-config.toml /usr/local/rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib/rustlib/multirust-config.toml' \
   'COPY .github/docker/build-app-cli/provenance.schema.json /usr/local/share/edgezero/provenance.schema.json' \
   'COPY .github/docker/build-app-cli/fixtures/provenance /usr/local/share/edgezero/provenance-fixtures' \
+  'COPY .github/docker/build-app-cli/fixtures/gnu-smoke.rs /usr/local/share/edgezero/gnu-smoke.rs' \
   'COPY .github/docker/build-app-cli/fixtures/wasm-smoke.rs /usr/local/share/edgezero/wasm-smoke.rs' \
   'COPY .github/docker/build-app-cli/verify-toolchain.sh /usr/local/bin/verify-toolchain' \
   'USER 1001:1001' \

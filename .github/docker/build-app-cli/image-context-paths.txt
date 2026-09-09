@@ -1,6 +1,7 @@
 .dockerignore
 .github/actions/deploy-fastly/versions.json
 .github/docker/build-app-cli/Dockerfile
+.github/docker/build-app-cli/fixtures/gnu-smoke.rs
 .github/docker/build-app-cli/fixtures/provenance/invalid/archive-base256.tar
 .github/docker/build-app-cli/fixtures/provenance/invalid/archive-checksum.tar
 .github/docker/build-app-cli/fixtures/provenance/invalid/archive-duplicate.tar

@@ -3,6 +3,7 @@ set -euo pipefail
 
 DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VERIFY="$DIR/../../../docker/build-app-cli/verify-published-image.sh"
+FIXTURES=$(cd -- "$DIR/../../../docker/build-app-cli/fixtures/provenance" && pwd -P)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"
@@ -37,6 +38,10 @@ SOURCE=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 cat >"$BIN/timeout" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+count=$(cat "$FAKE_STATE/timeout-count")
+count=$((count + 1))
+printf '%s\n' "$count" >"$FAKE_STATE/timeout-count"
+printf '%s\n' "$@" >"$FAKE_STATE/timeout-$count.args"
 while (($#)) && [[ "$1" == --* ]]; do
   shift
 done
@@ -45,6 +50,29 @@ shift
 exec "$@"
 EOF
 chmod 0755 "$BIN/timeout"
+
+cat >"$BIN/chmod" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+/bin/chmod "$@"
+path=${!#}
+[[ "${FAKE_ENV_FILE_MUTATION:-}" != "" && "$path" == */probe.env ]] || exit 0
+case "$FAKE_ENV_FILE_MUTATION" in
+  bare) printf 'BARE_NAME\n' >>"$path" ;;
+  blank) printf '\n' >>"$path" ;;
+  comment) printf '#COMMENT=value\n' >>"$path" ;;
+  duplicate) printf 'HOME=/attacker\n' >>"$path" ;;
+  extra) printf 'EXTRA=value\n' >>"$path" ;;
+  hardlink) ln "$path" "$path.link" ;;
+  missing) sed '/^HOME=/d' "$path" >"$path.new"; mv "$path.new" "$path" ;;
+  missing-final-newline) bytes=$(cat "$path"); printf '%s' "$bytes" >"$path" ;;
+  mode) /bin/chmod 0644 "$path" ;;
+  nul) printf '\0' >>"$path" ;;
+  symlink) mv "$path" "$path.target"; ln -s "$path.target" "$path" ;;
+  *) exit 94 ;;
+esac
+EOF
+chmod 0755 "$BIN/chmod"
 
 cat >"$BIN/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -78,6 +106,25 @@ case "$1" in
     printf '%s\n' "$count" >"$FAKE_STATE/create-count"
     args="$FAKE_STATE/create-$count.args"
     printf '%s\n' "${@:2}" >"$args"
+    create_argv=("${@:2}")
+    process_path=
+    process_start=
+    for ((index = 0; index < ${#create_argv[@]}; index++)); do
+      if [[ "${create_argv[$index]}" == --entrypoint ]]; then
+        process_path=${create_argv[$((index + 1))]}
+        process_start=$((index + 3))
+        break
+      fi
+    done
+    [[ -n "$process_path" && -n "$process_start" ]]
+    process_args=("${create_argv[@]:$process_start}")
+    if [[ "${FAKE_PROCESS_MUTATE_ID:-}" == "$count" ]]; then
+      [[ -z "${FAKE_PROCESS_PATH:-}" ]] || process_path=$FAKE_PROCESS_PATH
+      [[ -z "${FAKE_PROCESS_EXTRA_ARG:-}" ]] || process_args+=("$FAKE_PROCESS_EXTRA_ARG")
+    fi
+    jq -cn --arg path "$process_path" --args \
+      '[{Path: $path, Args: $ARGS.positional}]' -- "${process_args[@]}" \
+      >"$FAKE_STATE/create-$count.inspect.json"
     previous=
     for argument in "${@:2}"; do
       if [[ "$previous" == --env-file ]]; then
@@ -109,6 +156,14 @@ case "$1" in
           value=${argument#type=bind,src=}
           printf '%s\n' "${value%,dst=/work/validated}" >"$FAKE_STATE/create-$count.mount-validated"
           ;;
+        type=bind,src=*,dst=/work/compiled)
+          value=${argument#type=bind,src=}
+          printf '%s\n' "${value%,dst=/work/compiled}" >"$FAKE_STATE/create-$count.mount-compiled"
+          ;;
+        type=bind,src=*,dst=/work/bin/app-cli,readonly)
+          value=${argument#type=bind,src=}
+          printf '%s\n' "${value%,dst=/work/bin/app-cli,readonly}" >"$FAKE_STATE/create-$count.mount-smoke-binary"
+          ;;
       esac
       previous=$argument
     done
@@ -126,23 +181,45 @@ case "$1" in
       2) [[ "${FAKE_TOOLCHAIN_STATUS:-0}" == 0 ]] || exit "$FAKE_TOOLCHAIN_STATUS" ;;
       3) [[ "${FAKE_SELF_TEST_STATUS:-0}" == 0 ]] || exit "$FAKE_SELF_TEST_STATUS" ;;
       *)
-        if grep -Fxq write-expected "$FAKE_STATE/create-$id.args"; then
+        if grep -Fxq /usr/local/rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc \
+          "$FAKE_STATE/create-$id.args"; then
+          output="$(cat "$FAKE_STATE/create-$id.mount-compiled")/app-cli"
+          printf '#!/usr/bin/env bash\nprintf "edgezero image runtime smoke\\n"\n' >"$output"
+          chmod 0755 "$output"
+        elif grep -Fxq write-expected "$FAKE_STATE/create-$id.args"; then
           cp "$FAKE_FIXTURES/valid/expected.json" \
             "$(cat "$FAKE_STATE/create-$id.mount-expected")/expected.json"
         elif grep -Fxq package "$FAKE_STATE/create-$id.args"; then
-          cp "$FAKE_FIXTURES/valid/archive.tar" \
-            "$(cat "$FAKE_STATE/create-$id.mount-packaged")/artifact.tar"
+          binary=$(cat "$FAKE_STATE/create-$id.mount-app-cli")
+          if [[ "$binary" == "$FAKE_FIXTURES/valid/elf-static/app-cli" ]]; then
+            cp "$FAKE_FIXTURES/valid/archive.tar" \
+              "$(cat "$FAKE_STATE/create-$id.mount-packaged")/artifact.tar"
+          else
+            cp "$binary" "$(cat "$FAKE_STATE/create-$id.mount-packaged")/artifact.tar"
+            chmod 0644 "$(cat "$FAKE_STATE/create-$id.mount-packaged")/artifact.tar"
+          fi
         elif grep -Fxq validate "$FAKE_STATE/create-$id.args"; then
           archive=$(cat "$FAKE_STATE/create-$id.mount-artifact")
           [[ "$archive" != */invalid/* ]] || exit 1
-          cp "$FAKE_FIXTURES/valid/elf-static/app-cli" \
-            "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
+          if [[ "$archive" == */package-real/artifact.tar ]]; then
+            cp "$archive" "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
+          else
+            cp "$FAKE_FIXTURES/valid/elf-static/app-cli" \
+              "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
+          fi
           chmod 0755 "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
+        elif grep -Fxq /lib64/ld-linux-x86-64.so.2 "$FAKE_STATE/create-$id.args"; then
+          printf 'edgezero image runtime smoke\n'
         else
           exit 98
         fi
         ;;
     esac
+    ;;
+  container)
+    [[ "$2" == inspect ]]
+    id=${3##*-}
+    cat "$FAKE_STATE/create-$id.inspect.json"
     ;;
   rm) ;;
   *) exit 99 ;;
@@ -180,6 +257,7 @@ reset_state() {
   mkdir -p "$STATE/hostile-docker-config"
   printf '{"auths":{"ghcr.io":{"auth":"hostile"}}}\n' >"$STATE/hostile-docker-config/config.json"
   printf '0\n' >"$STATE/create-count"
+  printf '0\n' >"$STATE/timeout-count"
   write_oci_manifest
   write_image
   write_local_image
@@ -207,11 +285,15 @@ run_verify() {
     FAKE_INSPECT_STATUS="${FAKE_INSPECT_STATUS:-0}" \
     FAKE_PULL_STATUS="${FAKE_PULL_STATUS:-0}" \
     FAKE_ENV_STATUS="${FAKE_ENV_STATUS:-0}" \
+    FAKE_ENV_FILE_MUTATION="${FAKE_ENV_FILE_MUTATION:-}" \
     FAKE_TOOLCHAIN_STATUS="${FAKE_TOOLCHAIN_STATUS:-0}" \
     FAKE_SELF_TEST_STATUS="${FAKE_SELF_TEST_STATUS:-0}" \
     FAKE_CREATE_OUTPUT="${FAKE_CREATE_OUTPUT:-}" \
+    FAKE_PROCESS_MUTATE_ID="${FAKE_PROCESS_MUTATE_ID:-}" \
+    FAKE_PROCESS_PATH="${FAKE_PROCESS_PATH:-}" \
+    FAKE_PROCESS_EXTRA_ARG="${FAKE_PROCESS_EXTRA_ARG:-}" \
     FAKE_LOCAL_ID="$LOCAL_ID" \
-    FAKE_FIXTURES="$DIR/../../../docker/build-app-cli/fixtures/provenance" \
+    FAKE_FIXTURES="$FIXTURES" \
     DOCKER_CONFIG="$STATE/hostile-docker-config" \
     bash "$VERIFY" \
     --ref "$REF" \
@@ -225,11 +307,15 @@ run_verify_local() {
   PATH="$BIN:$PATH" \
     FAKE_STATE="$STATE" \
     FAKE_ENV_STATUS="${FAKE_ENV_STATUS:-0}" \
+    FAKE_ENV_FILE_MUTATION="${FAKE_ENV_FILE_MUTATION:-}" \
     FAKE_TOOLCHAIN_STATUS="${FAKE_TOOLCHAIN_STATUS:-0}" \
     FAKE_SELF_TEST_STATUS="${FAKE_SELF_TEST_STATUS:-0}" \
     FAKE_CREATE_OUTPUT="${FAKE_CREATE_OUTPUT:-}" \
+    FAKE_PROCESS_MUTATE_ID="${FAKE_PROCESS_MUTATE_ID:-}" \
+    FAKE_PROCESS_PATH="${FAKE_PROCESS_PATH:-}" \
+    FAKE_PROCESS_EXTRA_ARG="${FAKE_PROCESS_EXTRA_ARG:-}" \
     FAKE_LOCAL_ID="$LOCAL_ID" \
-    FAKE_FIXTURES="$DIR/../../../docker/build-app-cli/fixtures/provenance" \
+    FAKE_FIXTURES="$FIXTURES" \
     DOCKER_CONFIG="$STATE/hostile-docker-config" \
     bash "$VERIFY" \
     --local-image-id "$LOCAL_ID" \
@@ -331,6 +417,13 @@ FAKE_ENV_STATUS=1
 assert_fail "the real env-file capability probe must pass" run_verify
 unset FAKE_ENV_STATUS
 
+for mutation in bare blank comment duplicate extra hardlink missing missing-final-newline mode nul symlink; do
+  reset_state
+  FAKE_ENV_FILE_MUTATION=$mutation
+  assert_fail "a $mutation env-file mutation is rejected before create" run_verify
+done
+unset FAKE_ENV_FILE_MUTATION
+
 reset_state
 FAKE_CREATE_OUTPUT='daemon-output-is-not-container-authority'
 assert_pass "daemon create output cannot redirect start or cleanup" run_verify
@@ -351,9 +444,28 @@ assert_fail "a validator self-test failure propagates" run_verify
 unset FAKE_SELF_TEST_STATUS
 
 reset_state
+FAKE_PROCESS_MUTATE_ID=3
+FAKE_PROCESS_PATH=/bin/sh
+assert_fail "a changed persisted self-test process path is rejected" run_verify
+unset FAKE_PROCESS_MUTATE_ID FAKE_PROCESS_PATH
+
+reset_state
+FAKE_PROCESS_MUTATE_ID=3
+FAKE_PROCESS_EXTRA_ARG=attacker-argument
+assert_fail "a changed persisted self-test process argument is rejected" run_verify
+unset FAKE_PROCESS_MUTATE_ID FAKE_PROCESS_EXTRA_ARG
+
+reset_state
 run_verify >/dev/null
 [[ "$(cat "$STATE/create-count")" -gt 8 ]] && ok "the verifier exercises every baked archive fixture" ||
   no "the verifier exercises every baked archive fixture"
+gnu_compile_count=$(grep -lFx -- /usr/local/share/edgezero/gnu-smoke.rs "$STATE"/create-*.args | wc -l | tr -d ' ')
+smoke_create_count=$(grep -lFx -- /lib64/ld-linux-x86-64.so.2 "$STATE"/create-*.args | wc -l | tr -d ' ')
+if [[ "$gnu_compile_count" == 1 && "$smoke_create_count" == 1 ]]; then
+  ok "exactly one real GNU CLI compile and controlled-loader launch are exercised"
+else
+  no "exactly one real GNU CLI compile and controlled-loader launch are exercised"
+fi
 if [[ "$(cat "$STATE/create-3.env")" == $'HOME=/work/home\nPATH=/usr/local/bin:/usr/local/cargo/bin:/usr/bin:/bin\nTMPDIR=/work/tmp' ]]; then
   ok "self-test receives exactly the sorted three-variable environment"
 else
@@ -408,6 +520,106 @@ if cmp -s "$STATE/create-3.normalized" "$STATE/create-3.expected"; then
 else
   diff -u "$STATE/create-3.expected" "$STATE/create-3.normalized" >&2 || true
   no "self-test create argv has the exact hardened runtime contract"
+fi
+cat >"$STATE/create-3.process.expected" <<'EOF'
+{"Path":"/usr/bin/env","Args":["-S","-i HOME=${HOME} PATH=${PATH} TMPDIR=${TMPDIR}","/usr/local/bin/edgezero-provenance-validator","self-test","--fixtures","/usr/local/share/edgezero/provenance-fixtures"]}
+EOF
+jq -c '.[0] | {Path, Args}' "$STATE/create-3.inspect.json" >"$STATE/create-3.process.actual"
+if cmp -s "$STATE/create-3.process.expected" "$STATE/create-3.process.actual"; then
+  ok "self-test persisted Path and Args match the exact process contract"
+else
+  diff -u "$STATE/create-3.process.expected" "$STATE/create-3.process.actual" >&2 || true
+  no "self-test persisted Path and Args match the exact process contract"
+fi
+awk '
+  previous == "--attach" { $0 = "<container>" }
+  /^DOCKER_CONFIG=/ { $0 = "DOCKER_CONFIG=<docker-config>" }
+  { print; previous = $0 }
+' "$STATE/timeout-3.args" >"$STATE/timeout-3.normalized"
+cat >"$STATE/timeout-3.expected" <<'EOF'
+--signal=TERM
+--kill-after=10s
+600s
+env
+DOCKER_CONFIG=<docker-config>
+docker
+start
+--attach
+<container>
+EOF
+if cmp -s "$STATE/timeout-3.expected" "$STATE/timeout-3.normalized"; then
+  ok "self-test start uses the exact bounded attach contract"
+else
+  diff -u "$STATE/timeout-3.expected" "$STATE/timeout-3.normalized" >&2 || true
+  no "self-test start uses the exact bounded attach contract"
+fi
+
+smoke_args=$(grep -lFx -- /lib64/ld-linux-x86-64.so.2 "$STATE"/create-*.args)
+smoke_id=${smoke_args##*/create-}
+smoke_id=${smoke_id%.args}
+awk -v ref="$REF" '
+  previous == "--name" { $0 = "<name>" }
+  previous == "--env-file" { $0 = "<env-file>" }
+  /^type=bind,src=.*dst=\/work\/bin\/app-cli,readonly$/ {
+    $0 = "type=bind,src=<binary>,dst=/work/bin/app-cli,readonly"
+  }
+  $0 == ref { $0 = "<ref>" }
+  { print; previous = $0 }
+' "$smoke_args" >"$STATE/smoke.normalized"
+cat >"$STATE/smoke.expected" <<'EOF'
+--name
+<name>
+--platform
+linux/amd64
+--user
+1001:1001
+--read-only
+--cap-drop=ALL
+--security-opt=no-new-privileges
+--network=none
+--memory
+512m
+--memory-swap
+512m
+--pids-limit
+64
+--tmpfs
+/work/home:rw,noexec,nosuid,nodev,mode=0700,uid=1001,gid=1001
+--tmpfs
+/work/tmp:rw,noexec,nosuid,nodev,mode=0700,uid=1001,gid=1001
+--env-file
+<env-file>
+--mount
+type=bind,src=<binary>,dst=/work/bin/app-cli,readonly
+--entrypoint
+/usr/bin/env
+<ref>
+-S
+-i HOME=${HOME} PATH=${PATH} TMPDIR=${TMPDIR}
+/lib64/ld-linux-x86-64.so.2
+--inhibit-cache
+--glibc-hwcaps-mask
+
+--library-path
+/opt/edgezero/runtime-lib
+/work/bin/app-cli
+--help
+EOF
+if cmp -s "$STATE/smoke.expected" "$STATE/smoke.normalized"; then
+  ok "binary smoke create argv has the exact controlled-loader profile"
+else
+  diff -u "$STATE/smoke.expected" "$STATE/smoke.normalized" >&2 || true
+  no "binary smoke create argv has the exact controlled-loader profile"
+fi
+cat >"$STATE/smoke.process.expected" <<'EOF'
+{"Path":"/usr/bin/env","Args":["-S","-i HOME=${HOME} PATH=${PATH} TMPDIR=${TMPDIR}","/lib64/ld-linux-x86-64.so.2","--inhibit-cache","--glibc-hwcaps-mask","","--library-path","/opt/edgezero/runtime-lib","/work/bin/app-cli","--help"]}
+EOF
+jq -c '.[0] | {Path, Args}' "$STATE/create-$smoke_id.inspect.json" >"$STATE/smoke.process.actual"
+if cmp -s "$STATE/smoke.process.expected" "$STATE/smoke.process.actual"; then
+  ok "binary smoke persisted Path and Args match the controlled-loader contract"
+else
+  diff -u "$STATE/smoke.process.expected" "$STATE/smoke.process.actual" >&2 || true
+  no "binary smoke persisted Path and Args match the controlled-loader contract"
 fi
 
 printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
