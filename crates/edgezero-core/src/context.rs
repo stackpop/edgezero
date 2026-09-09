@@ -1,18 +1,27 @@
+use std::cell::RefCell;
+
 use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::Request;
+use crate::ingress::{AdmittedIngress, IngressGrant};
 use crate::outbound::HttpClient;
 use crate::params::PathParams;
+use crate::router::RouteMetadata;
 use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
     KvRegistry, SecretRegistry, StoreRegistry,
 };
+use crate::time::{Deadline, MonotonicInstant};
 use serde::de::DeserializeOwned;
 
 /// Request context exposed to handlers and middleware.
 pub struct RequestContext {
+    ingress_grant: RefCell<Option<IngressGrant>>,
     path_params: PathParams,
+    read_deadline: Option<Deadline>,
     request: Request,
+    request_start: MonotonicInstant,
+    route_metadata: Option<RouteMetadata>,
 }
 
 impl RequestContext {
@@ -148,8 +157,29 @@ impl RequestContext {
     #[inline]
     pub fn new(request: Request, params: PathParams) -> Self {
         Self {
+            ingress_grant: RefCell::new(None),
             path_params: params,
+            read_deadline: None,
             request,
+            request_start: MonotonicInstant::now(),
+            route_metadata: None,
+        }
+    }
+
+    pub(crate) fn new_routed(
+        request: Request,
+        params: PathParams,
+        route_metadata: RouteMetadata,
+        ingress: AdmittedIngress,
+    ) -> Self {
+        let (request_start, read_deadline, grant) = ingress.into_parts();
+        Self {
+            ingress_grant: RefCell::new(Some(grant)),
+            path_params: params,
+            read_deadline: Some(read_deadline),
+            request,
+            request_start,
+            route_metadata: Some(route_metadata),
         }
     }
 
@@ -182,6 +212,14 @@ impl RequestContext {
             .map_err(|err| EdgeError::bad_request(format!("invalid query string: {err}")))
     }
 
+    /// Absolute deadline governing the admitted inbound body, if this context entered
+    /// through the adapter admission seam.
+    #[must_use]
+    #[inline]
+    pub fn read_deadline(&self) -> Option<Deadline> {
+        self.read_deadline
+    }
+
     #[inline]
     pub fn request(&self) -> &Request {
         &self.request
@@ -190,6 +228,20 @@ impl RequestContext {
     #[inline]
     pub fn request_mut(&mut self) -> &mut Request {
         &mut self.request
+    }
+
+    /// Monotonic instant captured at ingress entry or low-level context construction.
+    #[must_use]
+    #[inline]
+    pub fn request_start(&self) -> MonotonicInstant {
+        self.request_start
+    }
+
+    /// Canonical matched route metadata, absent for low-level contexts.
+    #[must_use]
+    #[inline]
+    pub fn route_metadata(&self) -> Option<&RouteMetadata> {
+        self.route_metadata.as_ref()
     }
 
     /// Resolve the [`BoundSecretStore`] for `id`. Strict lookup: when a
@@ -214,6 +266,13 @@ impl RequestContext {
             .extensions()
             .get::<SecretRegistry>()
             .and_then(StoreRegistry::default)
+    }
+
+    /// Takes the application-owned ingress grant at most once.
+    #[must_use]
+    #[inline]
+    pub fn take_ingress_grant(&self) -> Option<IngressGrant> {
+        self.ingress_grant.borrow_mut().take()
     }
 }
 
@@ -462,6 +521,9 @@ mod tests {
         );
         assert_eq!(ctx.path_params().get("id"), Some("123"));
         assert_eq!(ctx.body().as_bytes().expect("buffered"), b"payload");
+        assert!(ctx.route_metadata().is_none());
+        assert!(ctx.read_deadline().is_none());
+        assert!(ctx.take_ingress_grant().is_none());
 
         let request = ctx.into_request();
         assert_eq!(request.uri().path(), "/items/123");

@@ -27,6 +27,7 @@ pub mod error;
 pub mod extractor;
 pub mod handler;
 pub mod http;
+pub mod ingress;
 pub mod introspection;
 pub mod key_value_store;
 pub mod manifest;
@@ -53,6 +54,12 @@ pub use edgezero_macros::{AppConfig, action, app};
 pub use error::{
     BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
 };
+pub use ingress::{
+    AdmissionDecision, AdmittedIngress, DEFAULT_INBOUND_READ_BUDGET,
+    DEFAULT_MAX_REQUEST_HEADER_BYTES, DEFAULT_MAX_REQUEST_HEADER_COUNT,
+    DEFAULT_MAX_REQUEST_TARGET_BYTES, IngressAdmissionOutcome, IngressFraming, IngressGrant,
+    IngressHead, IngressHeadAccounting, IngressHeadLimits,
+};
 pub use manifest::{
     AtomicHost, BakedManifest, Capability, CapabilitySupport, HostParseError, HostPat,
     ManifestCapabilities, ManifestContract, ManifestOutboundCapability, Port, Scheme,
@@ -66,4 +73,5 @@ pub use outbound::{
     enforce_payload_content_length, limit_decoded_stream, limit_encoded_stream,
     normalize_for_dispatch, normalize_response_headers, rechunk_stream, validate_for_dispatch,
 };
+pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
 pub use time::{Deadline, DispatchBudget, MonotonicInstant, dispatch_budget};

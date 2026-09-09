@@ -1,5 +1,16 @@
+use std::sync::Arc;
+
+use crate::error::EdgeError;
+use crate::http::{Request, Response};
+use crate::ingress::{
+    AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressFraming,
+    IngressHead, IngressHeadAccounting, IngressHeadLimits, apply_admission_policy,
+    default_admission_policy,
+};
 use crate::manifest::BakedManifest;
+use crate::response::IntoResponse as _;
 use crate::router::RouterService;
+use crate::time::MonotonicInstant;
 
 /// Canonical adapter name for the Axum adapter.
 pub const AXUM_ADAPTER: &str = "axum";
@@ -13,16 +24,74 @@ pub const SPIN_ADAPTER: &str = "spin";
 
 /// Lightweight container around a `RouterService` that can be extended via hook implementations.
 pub struct App {
+    ingress_head_limits: IngressHeadLimits,
+    ingress_policy: IngressAdmissionPolicy,
     name: String,
     router: RouterService,
 }
 
 impl App {
+    /// Runs the configured body-blind admission policy exactly once.
+    ///
+    /// # Errors
+    /// Returns an internal policy error if the resulting absolute deadline cannot be
+    /// normalized safely.
+    #[inline]
+    pub fn admit_ingress(&self, head: &IngressHead) -> Result<IngressAdmissionOutcome, EdgeError> {
+        apply_admission_policy(&self.ingress_policy, head)
+    }
+
     /// Default name used when none is provided.
     #[must_use]
     #[inline]
     pub fn default_name() -> &'static str {
         DEFAULT_APP_NAME
+    }
+
+    /// Resolves, admits, and dispatches one normalized inbound request.
+    ///
+    /// Adapters must call this before polling the request body. The route selected for admission
+    /// is consumed during dispatch, so handlers cannot observe a different route identity.
+    ///
+    /// # Errors
+    /// Returns an error only when admission or error rendering fails. Handler and routing errors
+    /// are rendered with the same semantics as [`RouterService::oneshot`].
+    #[inline]
+    pub async fn dispatch_ingress(
+        &self,
+        request: Request,
+        request_start: MonotonicInstant,
+        head_accounting: IngressHeadAccounting,
+        framing: IngressFraming,
+    ) -> Result<Response, EdgeError> {
+        let resolved = self.router.resolve(request.method(), request.uri().path());
+        let head = IngressHead::from_request(
+            &request,
+            request_start,
+            resolved.resolution().clone(),
+            head_accounting,
+            framing,
+        );
+
+        match self.admit_ingress(&head)? {
+            IngressAdmissionOutcome::Admitted(admitted) => {
+                match self
+                    .router
+                    .dispatch_resolved(resolved, request, admitted)
+                    .await
+                {
+                    Ok(response) => Ok(response),
+                    Err(error) => error.into_response(),
+                }
+            }
+            IngressAdmissionOutcome::Refused(response) => Ok(response),
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn ingress_head_limits(&self) -> IngressHeadLimits {
+        self.ingress_head_limits
     }
 
     /// Consume the app and return the contained router service.
@@ -53,6 +122,21 @@ impl App {
         &self.router
     }
 
+    /// Installs the synchronous body-blind ingress admission callback.
+    #[inline]
+    pub fn set_ingress_admission_policy<Policy>(&mut self, policy: Policy)
+    where
+        Policy: Fn(&IngressHead) -> AdmissionDecision + Send + Sync + 'static,
+    {
+        self.ingress_policy = Arc::new(policy);
+    }
+
+    /// Installs already-validated finite request-head limits.
+    #[inline]
+    pub fn set_ingress_head_limits(&mut self, limits: IngressHeadLimits) {
+        self.ingress_head_limits = limits;
+    }
+
     /// Update the application name.
     #[inline]
     pub fn set_name<S>(&mut self, name: S)
@@ -69,8 +153,10 @@ impl App {
         S: Into<String>,
     {
         Self {
-            router,
+            ingress_head_limits: IngressHeadLimits::default(),
+            ingress_policy: default_admission_policy(),
             name: name.into(),
+            router,
         }
     }
 }
@@ -170,12 +256,22 @@ pub trait Hooks {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
     use super::*;
     use crate::body::Body;
     use crate::context::RequestContext;
     use crate::error::EdgeError;
-    use crate::http::{Method, StatusCode, request_builder};
+    use crate::http::{Method, StatusCode, request_builder, response_builder};
+    use crate::ingress::{IngressFraming, IngressHeadAccounting};
+    use crate::manifest::BakedManifest;
+    use crate::router::RouteResolution;
+    use crate::time::{DEADLINE_FAR_FUTURE, MonotonicInstant};
+    use bytes::Bytes;
     use futures::executor::block_on;
+    use futures::stream::poll_fn;
     use tower_service::Service as _;
 
     struct DefaultHooks;
@@ -267,6 +363,89 @@ mod tests {
     }
 
     #[test]
+    fn default_app_admits_with_finite_deadline_and_empty_grant() {
+        let app = App::new(empty_router());
+        let start = MonotonicInstant::now();
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        let head = IngressHead::from_request(
+            &request,
+            start,
+            RouteResolution::NotFound,
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        );
+
+        let IngressAdmissionOutcome::Admitted(admitted) =
+            app.admit_ingress(&head).expect("admitted")
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(admitted.request_start(), start);
+        assert!(admitted.read_deadline().instant() > start);
+        assert!(
+            admitted.read_deadline().instant()
+                <= start.checked_add(DEADLINE_FAR_FUTURE).expect("maximum")
+        );
+        let (_, _, grant) = admitted.into_parts();
+        grant.downcast::<()>().expect_err("empty grant");
+    }
+
+    #[test]
+    fn ingress_refusal_skips_handler_and_body_poll() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_counter = Arc::clone(&handler_calls);
+        let router = RouterService::builder()
+            .post("/upload", move |_ctx: RequestContext| {
+                let call_counter = Arc::clone(&handler_counter);
+                async move {
+                    call_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("unexpected")
+                }
+            })
+            .build();
+        let mut app = App::new(router);
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let admission_counter = Arc::clone(&admission_calls);
+        app.set_ingress_admission_policy(move |_| {
+            admission_counter.fetch_add(1, Ordering::SeqCst);
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Body::empty())
+                    .expect("response"),
+            )
+        });
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let poll_counter = Arc::clone(&body_polls);
+        let body = Body::stream(poll_fn(move |_| {
+            poll_counter.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(None::<Bytes>)
+        }));
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .body(body)
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn default_hooks_do_not_own_logging() {
         assert!(!DefaultHooks::owns_logging());
     }
@@ -275,10 +454,7 @@ mod tests {
     fn default_hooks_use_default_name_and_into_router() {
         let app = DefaultHooks::build_app();
         assert_eq!(app.name(), App::default_name());
-        assert!(matches!(
-            DefaultHooks::manifest(),
-            crate::manifest::BakedManifest::Absent
-        ));
+        assert!(matches!(DefaultHooks::manifest(), BakedManifest::Absent));
         assert_eq!(DefaultHooks::manifest_json(), None);
         assert_eq!(DefaultHooks::stores(), StoresMetadata::default());
         let router = app.into_router();
