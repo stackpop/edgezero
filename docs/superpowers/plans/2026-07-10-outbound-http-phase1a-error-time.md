@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Land the **additive, no-new-dependency on the current baseline** core primitives from the outbound-HTTP spec ([`2026-05-21-outbound-http-design.md`](../specs/2026-05-21-outbound-http-design.md)): `EdgeError::BadGateway { reason: BadGatewayReason }`, `GatewayTimeout { cause: BudgetSource }`, and the `edgezero-core::time` module's `Deadline` + budget constants. `BadGatewayReason` and `BudgetSource` land in `error.rs`, Task 1, because the variants name them; `dispatch_budget` remains Phase 1b. Neither task touches the `proxy → outbound` rename or `Body`, so each task keeps `cargo test --workspace` green. **Scope caveat:** per-task verification is a deliberate local subset (Task 3); generated projects, `app-demo`, and expanded adapter-specific WASM matrices remain CI backstops.
+**Goal:** Land the **additive, no-new-dependency on the current baseline** core primitives from the outbound-HTTP spec ([`2026-05-21-outbound-http-design.md`](../specs/2026-05-21-outbound-http-design.md)): `EdgeError::BadGateway { reason: BadGatewayReason }`, `GatewayTimeout { cause: BudgetSource }`, and the `edgezero-core::time` module's `Deadline` + budget constants. `BadGatewayDecodeReason`, `BadGatewayReason`, and `BudgetSource` land in `error.rs`, Task 1, because the variants name them; `dispatch_budget` remains Phase 1b. Neither task touches the `proxy → outbound` rename or `Body`, so each task keeps `cargo test --workspace` green. **Scope caveat:** per-task verification is a deliberate local subset (Task 3); generated projects, `app-demo`, and expanded adapter-specific WASM matrices remain CI backstops.
 
-**Architecture:** `edgezero-core` only. Additive: two new `EdgeError` variants, their two non-exhaustive reason/provenance enums, and a new `time` module. The `EdgeError` enum is `#[non_exhaustive]`, but matches inside its defining crate remain exhaustive and must gain both arms. `BadGatewayReason` is intentionally coarse (`Decode`, `Protocol`, `Transport`, `Unspecified`) so every adapter can report a stable category without exposing provider enums. No reason/cause field is serialized. No adapter, CLI, or app-demo change. **`DispatchBudget` and `dispatch_budget` are both deferred to Phase 1b**; Phase 1a lands `Deadline` + constants only.
+**Architecture:** `edgezero-core` only. Additive: two new `EdgeError` variants, three non-exhaustive reason/provenance enums, and a new `time` module. The `EdgeError` enum is `#[non_exhaustive]`, but matches inside its defining crate remain exhaustive and must gain both arms. `BadGatewayReason` distinguishes pre-response unreachability from later transport/protocol failures, while `BadGatewayDecodeReason` preserves the EdgeZero-owned codec identity. No reason/cause field is serialized. No adapter, CLI, or app-demo change. **`DispatchBudget` and `dispatch_budget` are both deferred to Phase 1b**; Phase 1a lands `Deadline` + constants only.
 
 **Round-59 scope alignment:** the master spec's response resource limits, canonical URL
 parser, adapter scheduling/completion rules, ingress ownership, and response-egress gate are
@@ -67,7 +67,8 @@ implementation.
 - Produces `bad_gateway(msg)` with `reason: BadGatewayReason::Unspecified`,
   `bad_gateway_with_reason(msg, reason)`, `gateway_timeout(msg)` with
   `cause: BudgetSource::Unspecified`, and `gateway_timeout_caused(msg, cause)`.
-  `BadGatewayReason::{Decode, Protocol, Transport, Unspecified}` and
+  `BadGatewayReason::{Decode(BadGatewayDecodeReason), Protocol, Transport, Unreachable,
+  Unspecified}`, `BadGatewayDecodeReason::{Brotli, Gzip, Json, Unspecified}`, and
   `BudgetSource::{BatchDeadline, Default, PerCallTimeout, Unspecified}` are
   `#[non_exhaustive]`, `Clone + Copy + Debug + Eq`. Consumers inspect fields by matching the
   variant. The JSON envelope remains `{ "error": { "status", "kind", "message" } }` with
@@ -122,12 +123,6 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
             "nope",
         ),
         (
-            EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Decode),
-            502_u16,
-            "bad_gateway",
-            "nope",
-        ),
-        (
             EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Protocol),
             502_u16,
             "bad_gateway",
@@ -135,6 +130,12 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
         ),
         (
             EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Transport),
+            502_u16,
+            "bad_gateway",
+            "nope",
+        ),
+        (
+            EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Unreachable),
             502_u16,
             "bad_gateway",
             "nope",
@@ -190,6 +191,27 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
 }
 
 #[test]
+fn bad_gateway_decode_reason_is_not_serialized() {
+    for reason in [
+        BadGatewayDecodeReason::Brotli,
+        BadGatewayDecodeReason::Gzip,
+        BadGatewayDecodeReason::Json,
+        BadGatewayDecodeReason::Unspecified,
+    ] {
+        let err = EdgeError::bad_gateway_with_reason(
+            "nope",
+            BadGatewayReason::Decode(reason),
+        );
+        let response = err.into_response().expect("response");
+        let body_json = parse_body(response);
+        assert_eq!(body_json["error"]["status"], 502_u16);
+        assert_eq!(body_json["error"]["kind"], "bad_gateway");
+        assert_eq!(body_json["error"]["message"], "nope");
+        assert!(body_json["error"].get("reason").is_none());
+    }
+}
+
+#[test]
 fn bad_gateway_reason_is_typed() {
     let EdgeError::BadGateway { reason, .. } = EdgeError::bad_gateway("x") else {
         panic!("expected BadGateway");
@@ -197,9 +219,13 @@ fn bad_gateway_reason_is_typed() {
     assert_eq!(reason, BadGatewayReason::Unspecified);
 
     for expected in [
-        BadGatewayReason::Decode,
+        BadGatewayReason::Decode(BadGatewayDecodeReason::Brotli),
+        BadGatewayReason::Decode(BadGatewayDecodeReason::Gzip),
+        BadGatewayReason::Decode(BadGatewayDecodeReason::Json),
+        BadGatewayReason::Decode(BadGatewayDecodeReason::Unspecified),
         BadGatewayReason::Protocol,
         BadGatewayReason::Transport,
+        BadGatewayReason::Unreachable,
         BadGatewayReason::Unspecified,
     ] {
         let EdgeError::BadGateway { reason, .. } =
@@ -311,11 +337,12 @@ Resulting order: `BadGateway, BadRequest, ConfigOutOfDate, GatewayTimeout, Inter
     GatewayTimeout { message: String, cause: BudgetSource },
 ```
 
-`BadGatewayReason` and `BudgetSource` are defined **in `error.rs` in THIS task (Task 1)**,
-NOT in `time.rs` (Task 2). That ordering is load-bearing: Task 1 lands/commits/builds
-**before** Task 2, and the two variants name these enums, so a `time`-module home would
-make the standalone Task-1 commit fail to compile. Define both immediately **before
-`EdgeError`** in alphabetical item order (`BadGatewayReason`, `BudgetSource`, `EdgeError`);
+`BadGatewayDecodeReason`, `BadGatewayReason`, and `BudgetSource` are defined **in `error.rs`
+in THIS task (Task 1)**, NOT in `time.rs` (Task 2). That ordering is load-bearing: Task 1
+lands/commits/builds **before** Task 2, and the two variants name these enums, so a
+`time`-module home would make the standalone Task-1 commit fail to compile. Define all three
+immediately **before `EdgeError`** in alphabetical item order (`BadGatewayDecodeReason`,
+`BadGatewayReason`, `BudgetSource`, `EdgeError`);
 `time.rs` (Task 2) and `dispatch_budget` (Phase 1b) later
 `use crate::error::BudgetSource;`.
 
@@ -328,10 +355,20 @@ The **derives and variant order are compile-verified** (a throwaway crate under 
 // Variants ALPHABETICAL: `arbitrary_source_item_ordering` (denied) rejects any other order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+pub enum BadGatewayDecodeReason {
+    Brotli,
+    Gzip,
+    Json,
+    Unspecified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BadGatewayReason {
-    Decode,
+    Decode(BadGatewayDecodeReason),
     Protocol,
     Transport,
+    Unreachable,
     Unspecified,
 }
 

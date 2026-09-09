@@ -12,13 +12,24 @@ use crate::http::{
 };
 use crate::response::{IntoResponse, response_with_body};
 
+/// Stable identity for an EdgeZero-owned upstream decode failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BadGatewayDecodeReason {
+    Brotli,
+    Gzip,
+    Json,
+    Unspecified,
+}
+
 /// Stable classification for upstream failures that map to HTTP 502.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BadGatewayReason {
-    Decode,
+    Decode(BadGatewayDecodeReason),
     Protocol,
     Transport,
+    Unreachable,
     Unspecified,
 }
 
@@ -436,13 +447,13 @@ mod tests {
                 "nope",
             ),
             (
-                EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Decode),
+                EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Protocol),
                 502_u16,
                 "bad_gateway",
                 "nope",
             ),
             (
-                EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Protocol),
+                EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Unreachable),
                 502_u16,
                 "bad_gateway",
                 "nope",
@@ -500,6 +511,25 @@ mod tests {
     }
 
     #[test]
+    fn bad_gateway_decode_reason_is_not_serialized() {
+        for reason in [
+            BadGatewayDecodeReason::Brotli,
+            BadGatewayDecodeReason::Gzip,
+            BadGatewayDecodeReason::Json,
+            BadGatewayDecodeReason::Unspecified,
+        ] {
+            let err = EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Decode(reason));
+            let response = err.into_response().expect("response");
+            assert_eq!(response.status().as_u16(), 502);
+            let body_json = parse_body(response);
+            assert_eq!(body_json["error"]["status"], 502_u16);
+            assert_eq!(body_json["error"]["kind"], "bad_gateway");
+            assert_eq!(body_json["error"]["message"], "nope");
+            assert!(body_json["error"].get("reason").is_none());
+        }
+    }
+
+    #[test]
     fn bad_gateway_reason_is_typed() {
         let EdgeError::BadGateway {
             reason: default_reason,
@@ -511,9 +541,13 @@ mod tests {
         assert_eq!(default_reason, BadGatewayReason::Unspecified);
 
         for expected in [
-            BadGatewayReason::Decode,
+            BadGatewayReason::Decode(BadGatewayDecodeReason::Brotli),
+            BadGatewayReason::Decode(BadGatewayDecodeReason::Gzip),
+            BadGatewayReason::Decode(BadGatewayDecodeReason::Json),
+            BadGatewayReason::Decode(BadGatewayDecodeReason::Unspecified),
             BadGatewayReason::Protocol,
             BadGatewayReason::Transport,
+            BadGatewayReason::Unreachable,
             BadGatewayReason::Unspecified,
         ] {
             let EdgeError::BadGateway { reason, .. } =

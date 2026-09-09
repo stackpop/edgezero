@@ -32,7 +32,7 @@ For each task: write only the named unit/integration/trybuild cases; run the exa
 
 **Public surface:** `Capability`, `CapabilitySupport`, `ManifestCapabilities`, `ManifestOutboundCapability`, `AtomicHost`, `HostParseError`, `HostPat`, `Port`, `Scheme`, and `canonicalize_outbound_host` exactly as specified in §3.5.1.
 
-- [ ] Add failing manifest tests for all seven kebab-case capabilities, unknown keys, duplicate required/optional entries, required/optional overlap, and serialization round trips. Add a table that rejects any nested key equal to `capabilities` ignoring ASCII case, rejects non-lowercase top-level spellings, and accepts only exact lowercase top-level `capabilities`; recurse through tables and arrays.
+- [ ] Add failing manifest tests for all eight kebab-case outbound capabilities, including `outbound-complete-resource-accounting`, unknown keys, duplicate required/optional entries, required/optional overlap, and serialization round trips. Add a table that rejects any nested key equal to `capabilities` ignoring ASCII case, rejects non-lowercase top-level spellings, and accepts only exact lowercase top-level `capabilities`; recurse through tables and arrays.
 - [ ] Add table tests for every accepted/rejected host grammar row from §3.5.1, including IPv4/IPv6, wildcard expansion, ports, LDH limits, punycode, raw Unicode, userinfo, paths, queries, fragments, whitespace, and malformed brackets.
 - [ ] Map every rejected host row to the exact non-exhaustive `HostParseError` variant and stable nonempty Display text specified in §3.5.1; messages must not echo caller input. Use `Port::Any`, never a nonexistent wildcard variant.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib manifest::tests::`; expect failure.

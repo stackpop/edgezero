@@ -4,7 +4,7 @@
 
 **Goal:** Complete the portable response pipeline: exact typed stream errors, response-limit errors, header/body normalization, encoded and decoded caps, Brotli preflight, gzip/Brotli completion, optional rechunking, and deadline-aware drains.
 
-**Architecture:** Keep all transport-independent byte accounting and decoding in core. Adapters retain timers, abort handles, trailer/completion protocols, and native body ownership. The pipeline order is fixed: visible header limits, normalization, body disposition, encoded limit, Brotli-window gate, decoder/native EOF, rechunker, outer deadline/cancellation wrapper, then decoded limit or consumer.
+**Architecture:** Keep all transport-independent byte accounting and decoding in core. Adapters retain timers, abort handles, trailer/completion protocols, and native body ownership. The pipeline order is fixed: cumulative visible-field accounting, normalization, body disposition and sound `Content-Length` checks, encoded limit, lazy Brotli WBITS/decoder-charge gate, decoder/native EOF, decoded limit for identity or EdgeZero-decoded bodies only, rechunker, outer deadline/cancellation wrapper, then either the independent final Buffered collection cap or a lazy Streamed body.
 
 **Tech Stack:** Rust 1.95, `bytes`, `futures`, exact manifest-pinned `async-compression = 0.4.43`, `http`, `serde`, `serde_json`.
 
@@ -21,7 +21,7 @@
 
 For every task: add only the named tests; run the exact focused filter and require failure from the missing behavior; implement the listed API/algorithm; rerun that filter and the full core library suite; run `git diff --check`; then stage only the task's files and make the stated commit. For stream tests, use poll-counting scripted sources so early-stop, order, and EOF claims are executable assertions rather than comments.
 
-**Required exact test names:** `response_too_large_preserves_every_reason_without_serializing_it`, `response_too_large_constructors_preserve_unspecified_and_specific_reason`, `body_from_stream_preserves_edge_error`, `body_from_external_stream_maps_to_internal`, `body_into_bytes_bounded_preserves_edge_error`, `body_stream_accepts_infallible_bytes`, `body_bounded_checks_before_append`, `response_normalization_precedence_table`, `response_resource_header_limit_count_wins_tie`, `content_encoding_classifier_covers_every_visible_shape`, `payload_content_length_rejects_before_body_poll`, `payload_content_length_explicit_identity_rejects_before_body_poll`, `payload_content_length_skips_decoded_cap_for_compressed_body`, `outbound_response_into_response_reapplies_normalization`, `encoded_limit_stops_before_decoder`, `rechunk_stream_is_lazy_and_ordered`, `outbound_response_until_deadline_wins_ready_result`, `outbound_response_json_error_classification`, `decoder_carrier_restores_exact_edge_error`, `decode_gzip_drains_every_member_to_native_eof`, `decode_brotli_rejects_trailing_data`, and `brotli_window_rejects_before_decoder_allocation`.
+**Required exact test names:** `response_too_large_preserves_every_reason_without_serializing_it`, `response_too_large_constructors_preserve_unspecified_and_specific_reason`, `body_from_stream_preserves_edge_error`, `body_from_external_stream_maps_to_internal`, `body_into_bytes_bounded_preserves_edge_error`, `body_stream_accepts_infallible_bytes`, `body_bounded_checks_before_append`, `response_normalization_precedence_table`, `response_header_limiter_accumulates_field_sections`, `response_resource_header_limit_count_wins_tie`, `content_encoding_classifier_covers_every_visible_shape`, `payload_content_length_rejects_before_body_poll`, `payload_content_length_explicit_identity_rejects_before_body_poll`, `payload_content_length_passthrough_uses_buffered_not_decoded_cap`, `payload_content_length_skips_output_caps_for_compressed_body`, `outbound_response_into_response_reapplies_normalization`, `encoded_limit_stops_before_decoder`, `decoded_limit_bypasses_raw_passthrough`, `buffered_collection_limit_is_independent`, `rechunk_stream_is_lazy_and_ordered`, `outbound_response_until_deadline_wins_ready_result`, `outbound_response_json_error_classification`, `decoder_carrier_restores_exact_edge_error`, `decode_gzip_drains_every_member_to_native_eof`, `decode_brotli_rejects_trailing_data`, `brotli_memory_charge_is_pinned_and_checked`, and `brotli_window_rejects_before_decoder_allocation`.
 
 **Expected red:** each task either fails to resolve its new type/helper or observes the old behavior: 500/untyped limit, erased stream error, retained unsafe header, over-limit poll/append, cap winning an expired deadline, decoder stopping at its first end marker, or decoder construction before WBITS rejection. Do not accept a panic as the intended red result.
 
@@ -29,18 +29,24 @@ For every task: add only the named tests; run the exact focused filter and requi
 
 ```rust
 let encoding = classify_content_encoding(&headers);
+let max_buffered_response_bytes = match response_mode {
+    ResponseMode::Buffered { max_bytes } => Some(max_bytes),
+    ResponseMode::Streamed => None,
+};
 enforce_payload_content_length(
     &headers,
-    encoding == ContentEncoding::Identity,
+    encoding,
+    max_buffered_response_bytes,
     max_decoded_response_bytes,
     max_encoded_response_bytes,
 )?;
 let raw = limit_encoded_stream(native_body, max_encoded_response_bytes);
 let decoded = match encoding {
-    ContentEncoding::Brotli => decode_brotli_stream(gate_brotli_window(
+    ContentEncoding::Brotli => decode_brotli_stream(
         raw,
         max_brotli_window_bits,
-    )),
+        max_brotli_decoder_bytes,
+    ),
     ContentEncoding::Gzip => decode_gzip_stream(raw),
     ContentEncoding::Identity => raw,
     ContentEncoding::Passthrough => raw,
@@ -49,12 +55,27 @@ if matches!(encoding, ContentEncoding::Brotli | ContentEncoding::Gzip) {
     headers.remove(CONTENT_ENCODING);
     headers.remove(CONTENT_LENGTH);
 }
-let shaped = rechunk_stream(decoded, max_chunk_bytes);
+let output_limited = match encoding {
+    ContentEncoding::Brotli | ContentEncoding::Gzip | ContentEncoding::Identity => {
+        limit_decoded_stream(decoded, max_decoded_response_bytes)
+    }
+    ContentEncoding::Passthrough => decoded,
+};
+let shaped = rechunk_stream(output_limited, max_chunk_bytes);
 let timed = adapter_deadline_wrapper(shaped, budget, native_completion);
-let body = drain_or_stream_with_decoded_cap(timed, response_mode);
+let body = match response_mode {
+    ResponseMode::Buffered { max_bytes } => {
+        Body::from(collect_response_stream(timed, max_bytes).await?)
+    }
+    ResponseMode::Streamed => Body::from_stream(timed),
+};
 ```
 
 `adapter_deadline_wrapper` and `native_completion` above are adapter-owned placeholders, not core APIs; they show why rechunking must remain inside the outer timer/cancellation wrapper.
+The wrapper rechecks the absolute deadline whenever an inner resource error becomes ready,
+so an already-expired adapter budget retains the spec's 504 precedence. The decoded limiter
+must remain inside that wrapper, while the final collection helper remains outside it and
+preserves the narrower generic-consumer precedence documented in §3.4.5.
 
 Every transport-independent stream helper accepts and returns the same concrete erased type;
 none returns a branch-specific opaque `impl Stream`:
@@ -62,31 +83,41 @@ none returns a branch-specific opaque `impl Stream`:
 ```rust
 pub type BodyStream = LocalBoxStream<'static, Result<Bytes, EdgeError>>;
 
-pub fn decode_brotli_stream(stream: BodyStream) -> BodyStream;
+pub const BROTLI_DECODER_FIXED_CHARGE_BYTES: u64 = 16_777_216;
+pub fn brotli_decoder_memory_charge(window_bits: u8) -> Result<u64, EdgeError>;
+pub fn decode_brotli_stream(
+    stream: BodyStream,
+    max_window_bits: u8,
+    max_decoder_bytes: u64,
+) -> BodyStream;
 pub fn decode_gzip_stream(stream: BodyStream) -> BodyStream;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentEncoding { Brotli, Gzip, Identity, Passthrough }
 pub fn classify_content_encoding(headers: &HeaderMap) -> ContentEncoding;
-pub fn enforce_response_header_limits(
-    headers: &HeaderMap,
-    max_bytes: Option<u64>,
-    max_count: Option<u64>,
-) -> Result<(), EdgeError>;
+pub async fn collect_response_stream(stream: BodyStream, max: u64) -> Result<Bytes, EdgeError>;
 pub fn enforce_payload_content_length(
     headers: &HeaderMap,
-    is_identity: bool,
+    encoding: ContentEncoding,
+    max_buffered_bytes: Option<u64>,
     max_decoded_bytes: Option<u64>,
     max_encoded_bytes: Option<u64>,
 ) -> Result<(), EdgeError>;
-pub fn gate_brotli_window(stream: BodyStream, max_bits: u8) -> BodyStream;
+pub fn limit_decoded_stream(stream: BodyStream, max: Option<u64>) -> BodyStream;
 pub fn limit_encoded_stream(stream: BodyStream, max: Option<u64>) -> BodyStream;
 pub fn rechunk_stream(stream: BodyStream, max: Option<NonZeroU64>) -> BodyStream;
+
+pub struct ResponseHeaderLimiter { /* private checked-u64 counters and limits */ }
+impl ResponseHeaderLimiter {
+    pub fn new(max_bytes: Option<u64>, max_count: Option<u64>) -> Self;
+    pub fn observe(&mut self, headers: &HeaderMap) -> Result<(), EdgeError>;
+}
 ```
 
 Ownership is exact: `BodyStream` lives at `edgezero_core::body::BodyStream`;
-`ContentEncoding`, `classify_content_encoding`, `decode_brotli_stream`,
-`decode_gzip_stream`, and `gate_brotli_window` live in `edgezero_core::compression`;
-`enforce_payload_content_length`, `enforce_response_header_limits`,
+`BROTLI_DECODER_FIXED_CHARGE_BYTES`, `ContentEncoding`,
+`brotli_decoder_memory_charge`, `classify_content_encoding`, `decode_brotli_stream`, and
+`decode_gzip_stream` live in `edgezero_core::compression`; `ResponseHeaderLimiter`,
+`collect_response_stream`, `enforce_payload_content_length`, `limit_decoded_stream`,
 `limit_encoded_stream`, and `rechunk_stream` live in `edgezero_core::outbound`. Core re-exports
 every one at the `edgezero_core` root, and adapter crates use that single stable import
 surface. Core owns typed source restoration and codec/accounting errors; adapters own the
@@ -98,7 +129,7 @@ outer deadline, cancellation guard, and native-completion protocol.
 - Modify: `crates/edgezero-core/src/error.rs`
 - Modify: `crates/edgezero-core/src/lib.rs`
 
-- [ ] Add failing `response_too_large_*` tests for all reasons: `BrotliWindow`, `DecodedBody`, `EncodedBody`, `HeaderBytes`, `HeaderCount`, and `Unspecified`.
+- [ ] Add failing `response_too_large_*` tests for all reasons: `BrotliWindow`, `BufferedBody`, `DecodedBody`, `DecoderMemory`, `EncodedBody`, `HeaderBytes`, `HeaderCount`, and `Unspecified`.
 - [ ] Assert status 502, kind `response_too_large`, no `reason`, `field_path`, or `Retry-After` in the wire response, and preservation of the Rust-side reason.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib response_too_large_`; expect failure.
 - [ ] Add `ResponseLimitReason` and `EdgeError::ResponseTooLarge`; update every exhaustive match in production and tests in alphabetical order.
@@ -169,6 +200,7 @@ pub fn stream<S>(stream: S) -> Self;                // infallible Bytes
 **Files:**
 - Modify: `crates/edgezero-core/src/compression.rs`
 - Modify: `crates/edgezero-core/src/lib.rs`
+- Modify: `crates/edgezero-core/Cargo.toml`
 - Modify: `crates/edgezero-core/src/outbound.rs`
 
 **Pre-poll length contract:** adapters call this only after response normalization and only
@@ -177,16 +209,18 @@ for `ResponseBodyDisposition::Payload`:
 ```rust
 pub fn enforce_payload_content_length(
     headers: &HeaderMap,
-    is_identity: bool,
+    encoding: ContentEncoding,
+    max_buffered_bytes: Option<u64>,
     max_decoded_bytes: Option<u64>,
     max_encoded_bytes: Option<u64>,
 ) -> Result<(), EdgeError>;
 ```
 
-- [ ] Add failing `response_resource_*` tests for exact and over-limit header count/bytes, repeated values, checked overflow, and count-before-bytes precedence.
+- [ ] Add failing `response_resource_*` tests for exact and over-limit header count/bytes, repeated values, checked overflow, count-before-bytes precedence, and cumulative accounting across successive informational/final/trailer `ResponseHeaderLimiter::observe` calls. Prove a limit cannot reset at a field-section boundary. Adapters still document whether those sections are exposed before host allocation.
 - [ ] Add classifier tables for absent and exactly one bare `identity`, `gzip`, or `br`; ASCII case and surrounding space/tab; repeated fields; comma-stacked, parameterized, empty, malformed/non-UTF-8, and unknown values. The alphabetically declared results are `Brotli`, `Gzip`, `Identity`, and `Passthrough`; every adapter consumes this helper rather than inspecting the header itself.
-- [ ] Add payload-length tables for absent/zero/exact/over values; malformed, comma-list, and conflicting values; effective identity (absent or one bare `identity`) versus gzip/br/passthrough coding; encoded-only, decoded-only, and combined caps. Encoded applies to every coding; decoded rejects early only for effective identity. Include an explicit-identity overage that rejects before the scripted body is polled. HEAD/1xx/204/304 never call this helper; 205 uses its disposition protocol.
+- [ ] Add payload-length tables for absent/zero/exact/over values; malformed, comma-list, and conflicting values; effective identity (absent or one bare `identity`) versus gzip/br/passthrough coding; encoded-only, decoded-only, final-buffer-only, and combined caps. Encoded applies to every coding. Decoded rejects early only for effective identity. The final Buffered cap rejects early for identity and passthrough, where wire bytes are final bytes, but never for gzip/Brotli that EdgeZero decodes. Include explicit-identity and passthrough final-buffer overages that reject before the scripted body is polled, plus a passthrough body larger than the decoded cap that succeeds when the independent final cap permits it. HEAD/1xx/204/304 never call this helper; 205 uses its disposition protocol.
 - [ ] Add encoded-limit tests for exact/over limit, empty chunks counting as zero but remaining observable, cumulative gzip-member input, early stop, and typed source-error preservation.
+- [ ] Add decoded-limit tests for exact/over cumulative identity, gzip, and Brotli output; checked overflow; empty chunks; early stop; and typed source-error preservation. A pipeline table proves passthrough never enters this wrapper.
 - [ ] Add `rechunk_*` tests for lazy pulls, order preservation, exact maximum item size, empty items, source error ordering, early drop, and no claim about backing allocation/RSS.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib response_resource_`; expect a nonzero failure.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib content_encoding_classifier_`; expect a nonzero failure.
@@ -194,8 +228,8 @@ pub fn enforce_payload_content_length(
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib encoded_limit_`; expect a nonzero failure.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib rechunk_`; expect a nonzero failure.
 - [ ] Implement `ContentEncoding` and `classify_content_encoding` in `compression.rs`;
-  implement `enforce_payload_content_length`, `enforce_response_header_limits`,
-  `limit_encoded_stream`, and `rechunk_stream` in `outbound.rs`, with the exact shared
+  implement `ResponseHeaderLimiter`, `enforce_payload_content_length`,
+  `limit_decoded_stream`, `limit_encoded_stream`, and `rechunk_stream` in `outbound.rs`, with the exact shared
   signatures above. Re-export every new public item from `lib.rs`. The classifier uses
   `HeaderMap::get_all`; only one bare visible field can select Identity/Gzip/Brotli, and
   every repeated/stacked/parameterized/malformed/non-UTF-8/unknown shape is Passthrough. No
@@ -208,13 +242,13 @@ pub fn enforce_payload_content_length(
 **Files:**
 - Modify: `crates/edgezero-core/src/outbound.rs`
 
-- [ ] Add failing `outbound_response_drain_*` tests for empty and nonempty `Once` plus `Stream`; exact/over decoded limits; typed source failures; and pre-append accounting.
+- [ ] Add failing `outbound_response_drain_*` tests for empty and nonempty `Once` plus `Stream`; exact/over final collection limits; typed source failures; pre-append accounting; and `ResponseLimitReason::BufferedBody`. Exercise the same `collect_response_stream` helper adapters use before constructing a Buffered response.
 - [ ] Add `_until` tests for entry, pre-poll, post-ready chunk, source error, cap result, and EOF checks. If expired when a decision is ready, 504 wins with `BudgetSource::Unspecified`, because this API receives only `Deadline`. Separately prove an adapter-style wrapper preserves its supplied `DispatchBudget::cause`.
 - [ ] Add `outbound_response_json_*` tests for valid/malformed JSON, buffered/streamed modes, and streamed `json` invalid-state mapping to protocol 502.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib outbound_response_drain_`; expect a nonzero failure.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib outbound_response_until_`; expect a nonzero failure.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib outbound_response_json_`; expect a nonzero failure.
-- [ ] Implement synchronous `json<T>(&self)` for `Body::Once`, returning protocol 502 for `Body::Stream`; implement consuming `into_bytes_bounded`, `into_bytes_bounded_until`, `json_bounded`, and `json_bounded_until`. Malformed upstream JSON is decode 502. Do not delegate to the inbound body helper.
+- [ ] Implement `collect_response_stream` plus synchronous `json<T>(&self)` for `Body::Once`, returning protocol 502 for `Body::Stream`; implement consuming `into_bytes_bounded`, `into_bytes_bounded_until`, `json_bounded`, and `json_bounded_until`. These helpers own a final collection cap and report `BufferedBody`; the request's independent decoded-output policy has already wrapped eligible streams. Malformed upstream JSON is 502 with `BadGatewayReason::Decode(BadGatewayDecodeReason::Json)`. Do not delegate to the inbound body helper.
 - [ ] Rerun focused/core tests; expect success.
 - [ ] Commit: `feat(core): add bounded outbound response drains`.
 
@@ -229,11 +263,13 @@ pub fn enforce_payload_content_length(
 - Modify: `Cargo.lock`
 - Modify: `examples/app-demo/Cargo.lock`
 
-- [ ] Add failing `decoder_carrier_*` tests proving all `EdgeError` variants survive the `io::Error` bridge unchanged and decoder-originated errors become `BadGatewayReason::Decode` with diagnostics.
-- [ ] Change the workspace requirement to exact `async-compression = "=0.4.43"`, then refresh both lockfiles with `cargo update --offline -p async-compression --precise 0.4.43` and `cargo update --offline --manifest-path examples/app-demo/Cargo.toml -p async-compression --precise 0.4.43`.
-- [ ] Assert both graphs resolve exactly 0.4.43:
+- [ ] Add failing `decoder_carrier_*` tests proving all `EdgeError` variants survive the `io::Error` bridge unchanged and decoder-originated errors become `BadGatewayReason::Decode(BadGatewayDecodeReason::Gzip)` or `Decode(BadGatewayDecodeReason::Brotli)` with diagnostics.
+- [ ] Change the workspace requirements to exact `async-compression = "=0.4.43"`, `brotli = "=8.0.4"`, and `brotli-decompressor = "=5.0.1"`; add the decompressor as a core dev dependency so Cargo constrains the same implementation used transitively. Refresh both lockfiles with exact `cargo update --offline --precise` commands for all three packages.
+- [ ] Assert both graphs resolve exactly 0.4.43, 8.0.4, and 5.0.1 with no duplicate Brotli decoder version:
   - `cargo tree --offline --locked -p edgezero-core -e normal | rg 'async-compression v0\.4\.43'`
+  - `cargo tree --offline --locked -p edgezero-core | rg 'brotli v8\.0\.4|brotli-decompressor v5\.0\.1'`
   - `cargo tree --offline --locked --manifest-path examples/app-demo/Cargo.toml -p app-demo-core -e normal | rg 'async-compression v0\.4\.43'`
+  - `cargo tree --offline --locked --manifest-path examples/app-demo/Cargo.toml -p app-demo-core | rg 'brotli v8\.0\.4|brotli-decompressor v5\.0\.1'`
 - [ ] Add `decode_gzip_*` tests for one member, concatenated/empty/split members, cumulative output, corrupt/truncated later members, trailing garbage, late source errors, empty chunks, and drain to native EOF.
 - [ ] Add `decode_brotli_*` tests for one stream, buffered read-ahead recovery, trailing bytes, a second stream, late source errors, empty chunks, and native EOF.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib decoder_carrier_`; expect a nonzero failure.
@@ -250,10 +286,11 @@ pub fn enforce_payload_content_length(
 - Modify: `crates/edgezero-core/src/lib.rs`
 - Modify: `crates/edgezero-core/src/outbound.rs`
 
-- [ ] Add failing `brotli_window_*` tests for all WBITS values 10 through 30, standard and two-byte large-window forms, every split prefix boundary, exact/over configured limits, malformed/truncated prefixes, replay fidelity, and proof that rejection occurs before decoder construction.
+- [ ] Add failing `brotli_window_*` tests for all WBITS values 10 through 30, standard and two-byte large-window forms, every split prefix boundary, exact/over configured window limits, malformed/truncated prefixes, replay fidelity, and proof that both window and decoder-charge rejection occur before decoder construction. Add `brotli_decoder_memory_charge_*` tables asserting `16_777_216 + 2^WBITS` with checked `u64` arithmetic, exact/one-byte-under policy boundaries, default WBITS 24 fitting the 32 MiB default, and no decoder/source poll after a failed preconstruction gate.
 - [ ] Run `cargo test --offline --locked -p edgezero-core --lib brotli_window_`; expect failure.
-- [ ] Implement a bounded prefix parser that returns replayable bytes plus WBITS. Over-limit is `BrotliWindow`; invalid syntax is decode 502.
-- [ ] Compose only the **core-owned segment** in a private core test helper: classify -> payload-length checks -> encoded counter -> optional Brotli prefix gate -> decoder -> optional rechunker. Add table tests for absent/identity, bare case-insensitive gzip/br, unknown, parameterized, stacked, and repeated encodings. The helper mutates test headers to assert the contract that known decoded layers remove visible `content-encoding` and `content-length`, while Identity and Passthrough preserve them. Do not add a production response orchestrator, adapter deadline/cancellation wrapper, native-completion source, or platform response constructor in core. Phases 4-6 compose these public helpers at each native boundary and perform the specified header mutation before `OutboundResponse` construction.
+- [ ] Audit the exact locked `brotli 8.0.4 -> brotli-decompressor 5.0.1` source graph. Record in a code comment every decoder allocation family covered by `BROTLI_DECODER_FIXED_CHARGE_BYTES = 16_777_216` and why its grammar maximum fits; separately account for the maximum `2^WBITS` ring window. This source proof owns the constant. Corpus/allocation measurements are regression evidence only and may not substitute for the audit. Add exact `cargo tree --locked` assertions so a dependency update cannot retain the old charge silently.
+- [ ] Implement one lazy Brotli state machine in `decode_brotli_stream(stream, max_window_bits, max_decoder_bytes)`: read only the fixed-size prefix, compute the source-audited charge, return `BrotliWindow` or `DecoderMemory` before decoder construction, replay the prefix, then construct and drive the decoder. Invalid syntax is `Decode(Brotli)`. Because construction happens on first poll, adapter polling places prefix reads and allocation inside the outer absolute deadline/cancellation wrapper.
+- [ ] Compose only the **core-owned segment** in a private core test helper: classify -> payload-length checks -> encoded counter -> decoder (including the lazy Brotli prefix/charge gate) -> decoded counter only for Identity/Gzip/Brotli -> optional rechunker -> final collection cap. Add table tests for absent/identity, bare case-insensitive gzip/br, unknown, parameterized, stacked, and repeated encodings. Give decoded and final caps unequal values in both directions; prove passthrough bypasses only the decoded cap while every Buffered disposition still receives `BufferedBody` at its final cap. The helper mutates test headers to assert the contract that known decoded layers remove visible `content-encoding` and `content-length`, while Identity and Passthrough preserve them. Do not add a production response orchestrator, adapter deadline/cancellation wrapper, native-completion source, or platform response constructor in core. Phases 4-6 compose these public helpers at each native boundary and perform the specified header mutation before `OutboundResponse` construction.
 - [ ] Rerun focused/core tests; expect success.
 - [ ] Commit: `feat(core): gate brotli decoder allocation`.
 

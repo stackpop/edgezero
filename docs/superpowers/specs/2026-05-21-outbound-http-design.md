@@ -1,6 +1,6 @@
 # EdgeZero Outbound HTTP — Design Spec
 
-> **Status:** Normative design complete; implementation plans are authored through Phase 7. Phase 0 and Phases 1b-4 are executable; Phase 0 must land before Phase 4 starts. Phase 5 is executable only through its mandatory Task 0 SDK-resource runner proof, and the rest of Phases 5-7 remain blocked until that proof records a nonzero passing runtime/harness · **Date:** 2026-09-07
+> **Status:** Normative design complete; implementation plans are authored through Phase 7. Phase 0 and Phases 1b-4 are executable; Phase 0 must land before Phase 4 starts. Phase 5 is executable only through its mandatory Task 0 SDK-resource runner proof, and the rest of Phases 5-7 remain blocked until that proof records a nonzero passing runtime/harness · **Date:** 2026-09-08
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). Relevant baseline changes are the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, expanded runtime `AdapterAction` variants, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the app-demo integration crate. Non-outbound store/config lifecycle changes remain outside this design.
@@ -45,11 +45,12 @@ Applications today proxy a single outbound request through the current
   [inbound-body design](2026-08-22-inbound-body-design.md), not by outbound HTTP. Outbound
   implementation may start independently; it must not claim those ingress guarantees.
 - The lifetime after a core `Response` reaches a platform response converter is a separate
-  downstream-response concern. This design requires a dedicated response-egress contract
-  before any adapter claims bounded response writes: the contract must cover an absolute
-  write deadline through backpressure/finish, platform-supported abort on expiry or client
-  disconnect, and exactly one terminal completion notification. §3.3.3 defines the precise
-  boundary of the outbound request deadline.
+  downstream-response concern owned by the
+  [response-egress design](2026-09-08-response-egress-design.md) and its
+  [implementation plan](../plans/2026-09-08-response-egress-implementation.md). No adapter
+  may claim bounded response writes until that contract's absolute write deadline,
+  backpressure/finish, platform abort, disconnect, and exactly-once terminal reporting work
+  lands. §3.3.3 defines the precise boundary of the outbound request deadline.
 
 ### 1.4 Decisions locked before / during review
 
@@ -129,6 +130,14 @@ streaming is an explicit opt-in that preserves proxy-forwarding.
 ```rust
 // crates/edgezero-core/src/outbound.rs
 
+/// One index-aligned terminal result from `send_all`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct OutboundSlotResult {
+    pub elapsed: Duration,
+    pub outcome: Result<OutboundResponse, EdgeError>,
+}
+
 #[async_trait(?Send)]
 pub trait OutboundHttpClient: Send + Sync {
  /// Send a single request. Accepts streamed request bodies — this is the API
@@ -136,7 +145,8 @@ pub trait OutboundHttpClient: Send + Sync {
  ///
  /// **`Buffered` mode:** `Ok(resp)` means the full exchange completed —
  /// headers AND the response body buffered within the deadline and the
- /// decompressed-byte cap. `Err(_)` is returned for transport failure
+ /// final collection cap, plus any configured encoded/decoded/resource caps.
+ /// `Err(_)` is returned for transport failure
  /// (DNS/TLS/connect), deadline expiry, or over-cap.
  ///
  /// **`Streamed` mode:** `Ok(resp)` means headers completed. Body-phase
@@ -144,17 +154,20 @@ pub trait OutboundHttpClient: Send + Sync {
  /// - **Read errors / decompression failures / deadline expiry** during
  /// chunk reads come from the deadline-aware stream wrapper
  /// as `Err(EdgeError::..)` chunks.
- /// - **Decoded-body over-cap** fires only when the consumer uses a bounded helper
- /// (`OutboundResponse::into_bytes_bounded(max)`, `into_bytes_bounded_until`,
- /// `json_bounded[_until]`) — the streaming decoder itself does **not**
- /// count decoded bytes ("Cap ownership"). Independently configured response-resource
- /// controls still apply: header limits can fail `send` before it returns; encoded-byte
- /// and Brotli-window limits can yield a typed error from the returned stream; and
- /// `max_chunk_bytes` shapes its emitted items (§3.4.5).
- /// - Raw `into_response` passthrough carries no decoded EdgeZero cap **only on
- /// Cloudflare**, the sole adapter that streams `Body::Stream` lazily to the downstream
- /// wire. **Axum, Fastly, AND Spin all BUFFER `Body::Stream`** in their response
- /// converters within an adapter-level 16 MiB cap
+ /// - A configured **decoded-output cap** wraps effective identity and EdgeZero-decoded
+ /// gzip/Brotli output in both response modes, but never raw passthrough. It can yield
+ /// `ResponseLimitReason::DecodedBody` from the returned stream. A later bounded helper
+ /// (`OutboundResponse::into_bytes_bounded(max)`, `into_bytes_bounded_until`, or
+ /// `json_bounded[_until]`) owns a distinct final collection cap and reports
+ /// `BufferedBody`. Independently configured response-resource controls still apply:
+ /// header limits can fail `send` before it returns; encoded-byte, Brotli-window, and
+ /// decoder-heap limits can yield a typed error from the returned stream; and
+ /// `max_chunk_bytes` shapes emitted items (§3.4.5).
+ /// - Raw passthrough bypasses `max_decoded_response_bytes` on every adapter because
+ /// EdgeZero did not produce decoded output. Cloudflare is the sole adapter that streams
+ /// that `Body::Stream` lazily to the downstream wire without an additional converter
+ /// collection cap. **Axum, Fastly, AND Spin all BUFFER `Body::Stream`** in their response
+ /// converters within a separate adapter-level 16 MiB cap
  /// (`AXUM_/FASTLY_/SPIN_RESPONSE_STREAM_BUFFER_BYTES` → 502 on overflow), so on those
  /// three a raw passthrough is still capped. Cloudflare is the exception, not Axum.
  /// If the caller has *already started writing the downstream response
@@ -170,8 +183,21 @@ pub trait OutboundHttpClient: Send + Sync {
 
  /// Issue every request concurrently, then collect every result.
  ///
- /// The returned vec is index-aligned with `reqs`: `out[i]` is the result of
- /// `reqs[i]`. **Input handling is isolated per slot**: a `bad_request` for
+ /// The returned vec is index-aligned with `reqs`: `out[i].outcome` is the result of
+ /// `reqs[i]`, and `out[i].elapsed` is that slot's terminal elapsed time. `send_all`
+ /// captures one `batch_started_at` monotonic instant as its first operation. Every slot,
+ /// including a slot rejected during preflight, measures from that same instant through
+ /// the instant its own outcome becomes terminal. Elapsed time therefore includes
+ /// EdgeZero validation, adapter preparation, provider queueing, upload, response headers,
+ /// Buffered body drain, and any platform-imposed delayed observation. It is not a pure
+ /// wire RTT. Each terminal slot samples the clock independently; the batch's eventual
+ /// return time is never copied into every slot. Monotonic subtraction is checked. A
+ /// backwards injected clock replaces that slot's outcome with an internal invariant error
+ /// and uses `elapsed = Duration::ZERO` as a fallback. Zero is also a valid elapsed value
+ /// when start and terminal samples are equal at the clock's resolution; callers distinguish
+ /// the clock-fault case by its internal outcome, not by elapsed alone.
+ ///
+ /// **Input handling is isolated per slot**: a `bad_request` for
  /// one preflight failure never changes another slot's input shape, and one
  /// slot's `Ok`/`Err` type never mutates another's. Cross-slot *timing* is
  /// **not uniformly isolated** — see the `send-all-slot-isolation` capability
@@ -186,7 +212,7 @@ pub trait OutboundHttpClient: Send + Sync {
  /// guarantee declare the capability required and get a hard build failure
  /// on Fastly. `send_all(vec![])` returns `vec![]`.
  ///
- /// **Memory model — CORE-OWNED retained memory only.** This formula bounds the
+ /// **Memory model — CORE-OWNED retained payload only.** This formula bounds the
  /// buffers EdgeZero core holds; it deliberately EXCLUDES (a) adapter-side upload
  /// staging copies (e.g. a `chunk.to_vec()` handed to a platform write path) and
  /// (b) opaque host/runtime buffering (the Fastly/CF/Spin host may retain its own
@@ -194,9 +220,9 @@ pub trait OutboundHttpClient: Send + Sync {
  /// one `send_all` is `Σᵢ request_bodyᵢ.len + Σᵢ max_response_bytesᵢ`
  /// (per-slot caps). Transient core overhead during a buffered drain adds up to
  /// one in-flight chunk per actively-draining slot (the
- /// `sizeof(current_chunk)` term from §3.4.4); the full core-owned bound is therefore
+ /// `current_chunk.len()` term from §3.4.4); the full core-owned bound is therefore
  /// `Σᵢ request_bodyᵢ.len + Σᵢ max_response_bytesᵢ + Σⱼ
- /// sizeof(current_chunkⱼ)` where j ranges over slots currently in a drain
+ /// current_chunkⱼ.len()` where j ranges over slots currently in a drain
  /// step. Actual process RSS can exceed this by the excluded adapter/host terms. EdgeZero does NOT impose a global cap on N — apps are
  /// responsible for bounding the number of requests passed in. Fastly attempts
  /// to dispatch every slot before harvest, and every slot whose sequential
@@ -208,7 +234,7 @@ pub trait OutboundHttpClient: Send + Sync {
  /// (typically the fan-out batch's target count).
  ///
  /// **Request bodies MUST be buffered (`Body::Once`).** A `Body::Stream`
- /// request body yields `out[i] = Err(EdgeError::bad_request("send_all
+ /// request body yields `out[i].outcome = Err(EdgeError::bad_request("send_all
  /// requires buffered request bodies; use send for a streamed upload"))`,
  /// identically on every adapter. This rule removes the unbounded
  /// **source-pull** problem from portable fan-out. It does NOT bound Fastly's
@@ -216,7 +242,7 @@ pub trait OutboundHttpClient: Send + Sync {
  /// cross-slot limitation is owned by `send-all-slot-isolation` footnote 4.
  ///
  /// **Response mode MUST be Buffered.** A request whose `response_mode`
- /// is `Streamed` (via `stream_response`) yields `out[i] =
+ /// is `Streamed` (via `stream_response`) yields `out[i].outcome =
  /// Err(EdgeError::bad_request("send_all requires buffered responses;
  /// use send for a streamed response"))`, identically on every adapter.
  /// Reason: `send_all` returns its `Vec` only after every slot has reached
@@ -258,7 +284,7 @@ pub trait OutboundHttpClient: Send + Sync {
  ///
  /// Per-slot `Ok`/`Err` semantics: since preflight rejects streamed bodies AND
  /// streamed responses, every surviving slot is Buffered on both sides, so the
- /// per-slot result shape matches `send`'s **Buffered-mode** semantics — `Ok(resp)`
+ /// per-slot outcome shape matches `send`'s **Buffered-mode** semantics — `Ok(resp)`
  /// means the full exchange completed within the deadline and the body fits
  /// within `max_response_bytes`; `Err(_)` is transport / deadline / over-cap.
  /// Streamed-mode `Ok`-means-headers-only does not apply here because there are
@@ -266,7 +292,7 @@ pub trait OutboundHttpClient: Send + Sync {
     async fn send_all(
         &self,
         reqs: Vec<OutboundRequest>,
-    ) -> Vec<Result<OutboundResponse, EdgeError>>;
+    ) -> Vec<OutboundSlotResult>;
 }
 ```
 
@@ -291,7 +317,7 @@ impl HttpClient {
     pub async fn send_all(
         &self,
         reqs: Vec<OutboundRequest>,
-    ) -> Vec<Result<OutboundResponse, EdgeError>>;
+    ) -> Vec<OutboundSlotResult>;
     pub fn with_client<C: OutboundHttpClient + 'static>(client: C) -> Self;
 }
 ```
@@ -317,8 +343,10 @@ pub struct OutboundRequest {
     body: Body,                          // buffered or streamed
     deadline: Option<Deadline>,          // shared absolute cap; copy one value into every target request, do not recompute per request (see §3.3.2)
     headers: HeaderMap,
+    max_brotli_decoder_bytes: u64,        // source-audited decoder-state charge cap; default 32 MiB
     max_brotli_window_bits: u8,          // advertised-window cap; default 24, valid 10..=30
     max_chunk_bytes: Option<NonZeroU64>, // opt-in Streamed output rechunker
+    max_decoded_response_bytes: Option<u64>, // identity/EdgeZero-decoded output only
     max_encoded_response_bytes: Option<u64>, // pre-decode guest-visible body cap
     max_request_body_bytes: u64,         // cap when `body` is Body::Stream (default 8 MiB)
     max_response_header_bytes: Option<u64>, // guest-visible names + values
@@ -344,15 +372,18 @@ pub struct OutboundRequest {
 // size, so it can be compared against the
 // `u64` decoded cap for an early over-cap reject BEFORE buffering. For a **compressed**
 // response the wire `Content-Length` is the compressed size and does NOT bound the decoded
-// size, so it cannot early-reject against `max_response_bytes`. When the optional
+// size, so it cannot early-reject against either the decoded-output or final-buffer cap. When the optional
 // `max_encoded_response_bytes` cap is set, that same length can reject against the encoded
 // cap before the body read (§3.4.5). Conversions use `u64::from` / `TryFrom`, never `as`
 // (denied lint).
 
 /// How the adapter delivers the response body. Default is `Buffered`.
 pub enum ResponseMode {
- /// Adapter reads the full body within the deadline, enforcing a decompressed
- /// byte cap. `OutboundResponse.body` is `Body::Once`.
+ /// Adapter reads the full delivered body within the deadline, enforcing a final
+ /// collection/allocation cap regardless of whether the bytes are identity, decoded, or
+ /// raw passthrough. `OutboundResponse.body` is `Body::Once`. This is independent of
+ /// `max_decoded_response_bytes`: choose a larger `max_bytes` to permit a large raw
+ /// passthrough while retaining a smaller decoded-output cap.
     Buffered { max_bytes: u64 },     // default max_bytes = DEFAULT_MAX_RESPONSE_BYTES
  /// Adapter returns headers; `OutboundResponse.body` is `Body::Stream`. The
  /// caller buffers later (e.g. `into_bytes_bounded`) or passes the body through.
@@ -521,8 +552,10 @@ impl OutboundRequest {
 
     pub fn timeout(self, duration: Duration) -> Self;
     pub fn deadline(self, deadline: Deadline) -> Self;
+    pub fn max_brotli_decoder_bytes(self, max: u64) -> Self;
     pub fn max_brotli_window_bits(self, bits: u8) -> Self; // 10..=30 at dispatch
     pub fn max_chunk_bytes(self, max: NonZeroU64) -> Self;   // Streamed emitted-item size
+    pub fn max_decoded_response_bytes(self, max: u64) -> Self;
     pub fn max_encoded_response_bytes(self, max: u64) -> Self;
     pub fn max_response_header_bytes(self, max: u64) -> Self;
     pub fn max_response_header_count(self, max: u64) -> Self;
@@ -670,11 +703,12 @@ pub enum Body {
 // Public ownership paths are exact and stable:
 // - `edgezero_core::body::BodyStream` and the root re-export
 //   `edgezero_core::BodyStream` own the shared body stream type.
-// - `edgezero_core::compression::{ContentEncoding, classify_content_encoding,
-//   decode_brotli_stream, decode_gzip_stream, gate_brotli_window}` own codec policy.
-// - `edgezero_core::outbound::{enforce_payload_content_length,
-//   enforce_response_header_limits, limit_encoded_stream, normalize_response_headers,
-//   rechunk_stream}` own outbound response policy.
+// - `edgezero_core::compression::{BROTLI_DECODER_FIXED_CHARGE_BYTES, ContentEncoding,
+//   brotli_decoder_memory_charge, classify_content_encoding, decode_brotli_stream,
+//   decode_gzip_stream}` own codec policy.
+// - `edgezero_core::outbound::{ResponseHeaderLimiter, collect_response_stream,
+//   enforce_payload_content_length, limit_decoded_stream, limit_encoded_stream,
+//   normalize_response_headers, rechunk_stream}` own outbound response policy.
 // Every listed item is also re-exported from `edgezero_core`; adapter crates import the
 // root path and do not depend on private module layout.
 
@@ -733,6 +767,7 @@ impl From<Bytes> for Body {
 // adapters are separate crates. Every branch accepts and returns the same `BodyStream`,
 // preserving exact typed source errors and making the pipeline skeleton buildable.
 // `edgezero_core::compression` items, in module order:
+pub const BROTLI_DECODER_FIXED_CHARGE_BYTES: u64 = 16_777_216;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentEncoding {
     /// One bare, case-insensitive `br` field.
@@ -744,27 +779,41 @@ pub enum ContentEncoding {
     /// Repeated, stacked, parameterized, malformed, non-UTF-8, or unknown coding.
     Passthrough,
 }
+pub fn brotli_decoder_memory_charge(window_bits: u8) -> Result<u64, EdgeError>;
 pub fn classify_content_encoding(headers: &HeaderMap) -> ContentEncoding;
-pub fn decode_brotli_stream(stream: BodyStream) -> BodyStream;
+/// The returned state machine reads and validates the fixed-size stream prefix before it
+/// constructs the decoder, so polling it inside the adapter wrapper keeps prefix reads,
+/// decoder allocation, and all output under one absolute deadline/cancellation owner.
+pub fn decode_brotli_stream(
+    stream: BodyStream,
+    max_window_bits: u8,
+    max_decoder_bytes: u64,
+) -> BodyStream;
 pub fn decode_gzip_stream(stream: BodyStream) -> BodyStream;
-pub fn gate_brotli_window(stream: BodyStream, max_bits: u8) -> BodyStream;
 
 // `edgezero_core::outbound` items, in module order:
-pub fn enforce_response_header_limits(
-    headers: &HeaderMap,
-    max_bytes: Option<u64>,
-    max_count: Option<u64>,
-) -> Result<(), EdgeError>;
+pub async fn collect_response_stream(stream: BodyStream, max: u64) -> Result<Bytes, EdgeError>;
+pub fn limit_decoded_stream(stream: BodyStream, max: Option<u64>) -> BodyStream;
 pub fn limit_encoded_stream(stream: BodyStream, max: Option<u64>) -> BodyStream;
 pub fn rechunk_stream(stream: BodyStream, max: Option<NonZeroU64>) -> BodyStream;
+
+/// Cumulative guest-visible field-section accounting retained by the adapter from the
+/// first exposed informational block through final headers and exposed trailers.
+pub struct ResponseHeaderLimiter { /* private checked-u64 counters and limits */ }
+impl ResponseHeaderLimiter {
+    pub fn new(max_bytes: Option<u64>, max_count: Option<u64>) -> Self;
+    pub fn observe(&mut self, headers: &HeaderMap) -> Result<(), EdgeError>;
+}
 
 /// Disassembled form of an `OutboundRequest`. Adapter-facing only.
 pub struct OutboundRequestParts {
     pub body: Body,
     pub deadline: Option<Deadline>,
     pub headers: HeaderMap,
+    pub max_brotli_decoder_bytes: u64,
     pub max_brotli_window_bits: u8,
     pub max_chunk_bytes: Option<NonZeroU64>,
+    pub max_decoded_response_bytes: Option<u64>,
     pub max_encoded_response_bytes: Option<u64>,
     pub max_request_body_bytes: u64,      // applies when `body` is Body::Stream (u64 — see cap note)
     pub max_response_header_bytes: Option<u64>,
@@ -795,14 +844,16 @@ pub enum ResponseBodyDisposition {
 
 /// Parse the already-normalized payload-bearing `content-length` and apply every
 /// sound pre-poll size decision. Adapters call this only for `Payload`: bodyless and
-/// 205 settlement is owned by `ResponseBodyDisposition`. `max_decoded_bytes` is `Some`
-/// only for Buffered mode. `is_identity` means **effective identity**: no visible
-/// `content-encoding`, or exactly one bare case-insensitive `identity` value.
-/// Malformed, comma-list, or conflicting lengths are protocol 502; the encoded cap applies
-/// to every coding, while the decoded cap applies early only to identity.
+/// 205 settlement is owned by `ResponseBodyDisposition`. `max_buffered_bytes` is `Some`
+/// only for Buffered mode; the independent decoded cap may also be present in Streamed.
+/// Malformed, comma-list, or conflicting lengths are protocol 502. The encoded cap applies
+/// to every coding. Effective identity compares decoded and Buffered caps too; raw
+/// passthrough compares the Buffered cap but never the decoded cap; gzip/Brotli-to-decode
+/// cannot soundly compare wire length with either output cap.
 pub fn enforce_payload_content_length(
     headers: &HeaderMap,
-    is_identity: bool,
+    encoding: ContentEncoding,
+    max_buffered_bytes: Option<u64>,
     max_decoded_bytes: Option<u64>,
     max_encoded_bytes: Option<u64>,
 ) -> Result<(), EdgeError>;
@@ -867,21 +918,23 @@ impl OutboundResponse {
  /// have returned headers. `send_all` remains buffered-only.
     pub fn into_body(self) -> Body;
 
- /// Buffer the body with a decompressed-byte cap. Works for both `Once`
+ /// Buffer the delivered body with a final collection cap. Works for both `Once`
  /// and `Stream`. Over-cap yields
  /// `Err(EdgeError::response_too_large_with_reason(..,
- /// ResponseLimitReason::DecodedBody))` (distinct kind, 502 — NOT
+ /// ResponseLimitReason::BufferedBody))` (distinct kind, 502 — NOT
  /// `bad_gateway`; §3.4.1).
  ///
  /// This is NOT a thin wrapper over `Body::into_bytes_bounded` — that
  /// helper maps over-limit to `bad_request` (400), correct for inbound
  /// bodies but wrong for an over-large upstream response. This method
  /// performs its own bounded drain (pre-append checked accounting)
- /// and maps over-cap to `response_too_large` with reason `DecodedBody`
+ /// and maps over-cap to `response_too_large` with reason `BufferedBody`
  /// (distinct kind, 502 — §3.4.1; consistent with the top of this doc,
  /// NOT `bad_gateway`).
- /// On adapters that decompress
- /// the cap is enforced against decompressed output here too.
+ /// For effective identity or EdgeZero-decoded gzip/Brotli, the request's independent
+ /// `max_decoded_response_bytes` policy has already wrapped the response stream. For raw
+ /// passthrough, this helper counts the delivered encoded bytes and does not invent a
+ /// decoded interpretation.
  ///
  /// **Effective-budget deadline is already honoured on a streamed body.**
  /// Adapters wrap `Streamed` response bodies with a deadline-aware stream bounded by
@@ -1021,14 +1074,14 @@ impl OutboundResponse {
  /// JSON-decode the already-buffered body. Requires `Body::Once`; on a
  /// `Body::Stream` returns `Err(EdgeError::bad_gateway_with_reason("response body
  /// not buffered; use json_bounded(max) or json_bounded_until(max,
- /// deadline)", BadGatewayReason::Protocol))`. Malformed JSON uses reason `Decode` — an
- /// upstream returning unparseable JSON is a 502 outcome, not a 400.
+ /// deadline)", BadGatewayReason::Protocol))`. Malformed JSON uses reason
+ /// `Decode(Json)` — an upstream returning unparseable JSON is a 502 outcome, not a 400.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, EdgeError>;
 
- /// Buffer (with a decompressed-byte cap) then JSON-decode in one step.
+ /// Buffer (with a final collection cap) then JSON-decode in one step.
  /// Consuming convenience for the `Streamed` mode: equivalent to
  /// `into_bytes_bounded(max).await` + `serde_json::from_slice`, with
- /// malformed JSON mapping to `bad_gateway` reason `Decode` (502).
+ /// malformed JSON mapping to `bad_gateway` reason `Decode(Json)` (502).
     pub async fn json_bounded<T: DeserializeOwned>(self, max: u64)
         -> Result<T, EdgeError>;
 
@@ -1052,7 +1105,7 @@ impl OutboundResponse {
  /// timer-backed preemption of a deadline tighter than the request
  /// budget set `.deadline(min(req_deadline, app_inner_deadline))` on
  /// the `OutboundRequest` builder so the tighter deadline lands in the
- /// wrapper. Malformed JSON maps to `bad_gateway` reason `Decode` (502).
+ /// wrapper. Malformed JSON maps to `bad_gateway` reason `Decode(Json)` (502).
     pub async fn json_bounded_until<T: DeserializeOwned>(
         self,
         max: u64,
@@ -1097,7 +1150,8 @@ impl OutboundResponse {
 ```
 
 The complete builder surface — `new`/`get`/`post`/`from_request`/`header`/`headers_mut`/
-`body`/`json`/`timeout`/`deadline`/`max_brotli_window_bits`/`max_chunk_bytes`/
+`body`/`json`/`timeout`/`deadline`/`max_brotli_decoder_bytes`/
+`max_brotli_window_bits`/`max_chunk_bytes`/`max_decoded_response_bytes`/
 `max_encoded_response_bytes`/`max_request_body_bytes`/`max_response_header_bytes`/
 `max_response_header_count`/`max_response_bytes`/`stream_response`. Every fallible step
 returns `EdgeError`, so handler code uses `?` uniformly.
@@ -1474,10 +1528,12 @@ fan-out — `Streamed` mode defers drain but does not let the app consume chunks
 concurrently across slots either (no guest reactor; §3.2). This is a known
 limitation, not a recommendation.
 
-**Partial failure.** `send_all` returns `Vec<Result<OutboundResponse, EdgeError>>`
-index-aligned with the input. A single target timing out or returning a 502 yields
-`out[i] = Err(..)` or `out[i] = Ok(non-2xx)` without changing the *type* of any
-other slot's result. Cross-slot **timing** is governed by `send-all-slot-isolation`
+**Partial failure.** `send_all` returns `Vec<OutboundSlotResult>` index-aligned with the
+input. A single target timing out or returning a 502 yields
+`out[i].outcome = Err(..)` or `out[i].outcome = Ok(non-2xx)` without changing the *type*
+of any other slot's result. `out[i].elapsed` is captured when that individual outcome
+becomes terminal, including for preflight and dispatch failures; it is not measured when
+the whole vector is returned. Cross-slot **timing** is governed by `send-all-slot-isolation`
 (§3.5.1 footnote 4): `Native` on Axum/CF/Spin, `BestEffort` on Fastly because cold
 registration can delay issuance, while unresolved background request writes and serial
 response harvest can delay observation past the result a slot would have produced in
@@ -2208,14 +2264,16 @@ gzip` + representation `Content-Length`, no body → passes through, headers pre
 decode/cap rules below apply to payload-bearing responses.
 
 In `Buffered` mode, `max_response_bytes` (default `DEFAULT_MAX_RESPONSE_BYTES = 1 MiB`)
-caps the body. The cap is measured in **decompressed, app-visible bytes**, not
-compressed wire bytes. Every adapter that transparently decompresses gzip/br
-**must enforce the cap incrementally during decompression** and abort as soon as the
-decompressed output exceeds the cap — this closes the decompression-bomb gap so a
-small compressed body cannot expand past the limit. Over-cap →
+caps the final collected `Body::Once` for every coding disposition. The independent
+`max_decoded_response_bytes` cap is measured only in effective-identity or
+EdgeZero-decoded gzip/Brotli output. Every adapter **must enforce that decoded cap
+incrementally** and abort as soon as output exceeds it; this closes the decompression-bomb
+gap while allowing a caller to set a larger final buffer for an intentionally retained raw
+passthrough body. Decoded over-cap →
 `Err(EdgeError::response_too_large_with_reason("response body exceeded N bytes",
 ResponseLimitReason::DecodedBody))` (the distinct kind, 502 — §3.4.3; NOT
-`bad_gateway`, so a consumer classifies it apart from transport).
+`bad_gateway`, so a consumer classifies it apart from transport). Final collection
+over-cap uses `ResponseLimitReason::BufferedBody` instead.
 
 **Early `Content-Length` rejection is sound ONLY for effective identity (no
 `content-encoding`, or exactly one bare `identity` value) responses.** In that case the wire
@@ -2242,9 +2300,9 @@ small cap would otherwise allocate past the limit before erroring. The persisten
 buffer therefore never exceeds `max`; inbound bounded-drain semantics are owned by the
 [inbound body design](2026-08-22-inbound-body-design.md).
 
-Worst-case **transient** resident memory during a drain is `max + sizeof(current_chunk)`:
+Worst-case **transient** resident memory during a drain is `max + current_chunk.len()`:
 the in-flight chunk briefly co-exists with the collected buffer during the check, then
-is dropped (over-cap) or appended (under-cap). **`sizeof(current_chunk)` is
+is dropped (over-cap) or appended (under-cap). **`current_chunk.len()` is
 source-controlled, not bounded by this spec.** The `8–64 KiB` figure typical sources
 yield (`tokio::io` 8 KiB, `hyper` 16 KiB, WASI body reads 64 KiB) is descriptive of the
 adapters' incoming stream chunking, not a contract. Three concrete consequences readers
@@ -2260,7 +2318,7 @@ must internalise:
   boundaries. Rechunking limits emitted item length; it does not prevent the adapter/host
   from allocating or yielding one large source chunk, and shared `Bytes` slices may retain
   that large backing allocation until the last slice is dropped.
-- **The batch model in §3.4.4 inherits the same property.** `Σⱼ sizeof(current_chunkⱼ)`
+- **The batch model in §3.4.4 inherits the same property.** `Σⱼ current_chunkⱼ.len()`
   for actively-draining slots is bounded by what each source yields, not by EdgeZero.
   EdgeZero cannot currently provide a hard per-batch ceiling against adversarial source
   allocation. Apps that require one must bound fan-out (N) against a documented
@@ -2271,11 +2329,11 @@ This is a per-call drain bound, **not** a whole-process memory ceiling; the batc
 bound is `Σ persistent buffers + Σ in-flight chunks` per §3.4.4, with the same
 source-controlled caveat on the in-flight term.
 
-Decompression-cap responsibility per adapter:
+Decoded-output-cap responsibility per adapter:
 
 - **Cloudflare** — first disables host response decoding in the final fetch options
   using `encodeResponseBody: "manual"` (§4.2). Only then can the shared decoder apply
-  this policy and its decompressed-byte cap. Existing explicit decoding alone does
+  this policy and its independent decoded-output cap. Existing explicit decoding alone does
   not prevent workerd from decoding the subrequest body first.
 - **Fastly, Spin** — already decompress gzip/br explicitly today; the cap obligation
   applies in-line in their decode paths.
@@ -2289,7 +2347,7 @@ Decompression-cap responsibility per adapter:
   honour the portable contract (case-insensitive `GZIP`, `identity`, unknown/**stacked**/
   repeated → passthrough untouched). Instead Axum routes the raw response body through
   the **same shared `content-encoding` inspection + decoder** the other adapters use
-  (§3.4.1 policy table), enforcing the decompressed-byte cap incrementally. This is the
+  (§3.4.1 policy table), enforcing the independent decoded-output cap incrementally. This is the
   only way all four adapters share one decompression contract.
 
 **Portable `content-encoding` policy for visible values.** The action table is identical on
@@ -2300,12 +2358,12 @@ Every adapter calls the public core `classify_content_encoding(&HeaderMap)` help
 its four-state `ContentEncoding::{Brotli, Gzip, Identity, Passthrough}` result. `Identity`
 is distinct from `Passthrough` internally even though neither decodes: only `Identity` lets
 `enforce_payload_content_length` compare the visible length with the decoded cap before the
-first body poll. Unknown/stacked passthrough bytes may still be encoded, so only their
-encoded cap is sound at that point.
+first body poll. Unknown/stacked passthrough bytes may still be encoded, so their encoded
+cap and, in Buffered mode, raw final-buffer cap are sound; the decoded cap is not.
 
 | `content-encoding` value | Action |
 | --- | --- |
-| absent, or `identity` | **Passthrough** — no decode; body delivered as-is. `identity` is treated exactly as absent. |
+| absent, or `identity` | **Identity delivery** — no codec runs and bytes are delivered as-is, but the independent decoded-output counter applies because these are already representation bytes. `identity` is treated exactly as absent. |
 | a single `gzip` | **Decode** one gzip layer; strip `content-encoding` + `content-length`. |
 | a single `br` | **Decode** one brotli layer; strip `content-encoding` + `content-length`. |
 | anything else — an **unknown** token (`zstd`, `deflate`, `compress`, …) **or a stacked list** (`gzip, br`, `br, gzip`, …) | **Passthrough, untouched** — do **not** attempt to decode; deliver the raw bytes **and leave `content-encoding` / `content-length` intact** so the app can decode itself. Never a hard failure. |
@@ -2324,8 +2382,10 @@ encoded cap is sound at that point.
   bare single-layer forms decode; everything else passes through.
 - **A repeated `content-encoding` field** (two header lines) is treated as the stacked
   case → passthrough untouched.
-- Passthrough here means the byte cap (`max_response_bytes` / decompressed-count) is
-  applied to the **raw** bytes, since no decode happens.
+- Passthrough here means `max_encoded_response_bytes` still counts the raw transport body
+  and Buffered `max_response_bytes` caps the raw final collection. The independent
+  `max_decoded_response_bytes` counter does not run because EdgeZero produced no decoded
+  representation.
 - Rationale: decoding stacked/unknown encodings is unbounded surface for little value on
   edge fan-out; failing them hard (`502`) would break apps that can decode a `zstd` body
   themselves. Passthrough is deterministic and never worse than "the app got the bytes."
@@ -2351,16 +2411,17 @@ downstream of it within its adapter-level constant —
 `AXUM_RESPONSE_STREAM_BUFFER_BYTES` / `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` /
 `SPIN_RESPONSE_STREAM_BUFFER_BYTES`, all 16 MiB.) The decoder's *only*
 responsibilities are decoding bytes, stripping the two compressed-only headers, and
-surfacing decoder errors — it deliberately does **not** enforce the decoded-byte cap,
-because `ResponseMode::Streamed` carries no `max_bytes` (§3.1.3) and that cap lives with
-the consumer. The encoded-byte counter and Brotli-window prefix gate are separate upstream
-layers (§3.4.5):
+surfacing decoder errors. The independent `max_decoded_response_bytes` counter wraps
+effective identity and known decoded output in both response modes; it is not part of the
+codec implementation and never wraps passthrough. `ResponseMode::Streamed` carries no final
+collection cap. The encoded-byte counter and Brotli prefix/window/decoder-state charge are
+separate upstream layers (§3.4.5):
 
 1. Pull a raw compressed chunk from the platform stream.
 2. Feed it into the decoder; emit whatever decompressed output is currently available
    (zero, one, or many output chunks per input chunk).
-3. Yield each decompressed chunk verbatim from the decoder. **No decoded-byte counting in
-   the decoder wrapper.** A later optional rechunker may split that item.
+3. Yield each decompressed chunk through the decoded-output counter. The decoder itself does
+   no policy accounting. A later optional rechunker may split that item.
 4. End successfully only after codec completion **and** verified native-body EOF;
    a codec end marker alone is not EOF. Apply the completion protocol below.
 5. `content-encoding` and `content-length` are stripped from
@@ -2466,14 +2527,14 @@ must preserve all decoded payload and observe late source errors before reportin
 - **Gzip:** enable `GzipDecoder::multiple_members(true)` in exact manifest-pinned
   `async-compression` 0.4.43. Decode every member in order under the same absolute
   deadline, including empty members. Any configured decoded-byte cap counts cumulatively
-  across members at its existing consumer-owned boundary; no new cap enters the decoder.
+  across members in the separate output wrapper; no cap enters the decoder.
   Member boundaries reset neither budget. A truncated/corrupt later member or trailing bytes
-  that are not a valid member are `bad_gateway` reason `Decode`; stacked content-coding
+  that are not a valid member are `bad_gateway` reason `Decode(Gzip)`; stacked content-coding
   passthrough is unchanged.
 - **Brotli:** EdgeZero accepts one complete Brotli stream for a single `br` coding.
   After decoder completion, recover its buffered reader and inspect both unread buffered
   bytes and subsequent source input. Any trailing non-empty bytes, including a second
-  Brotli stream, are `bad_gateway` reason `Decode`; never silently discard read-ahead bytes
+  Brotli stream, are `bad_gateway` reason `Decode(Brotli)`; never silently discard read-ahead bytes
   when recovering the reader. Empty source items are not EOF. Continue completion checks until native EOF
   or failure, inside the same deadline wrapper and Cloudflare yield discipline.
 - **Both:** a late source `EdgeError` still passes through the exact carrier restoration
@@ -2496,8 +2557,9 @@ carrier: `stream.map_err(|error| io::Error::other(Carried(error)))`. On output, 
 capture the `io::Error` diagnostic, then inspect `into_inner()` and restore the original
 `EdgeError` only when the boxed source downcasts exactly to `Carried`. A missing or failed
 downcast is the decoder's own failure and maps to
-`EdgeError::bad_gateway_with_reason(.., BadGatewayReason::Decode)` while
-preserving the captured diagnostic. The restored stream is then wrapped by the
+`EdgeError::bad_gateway_with_reason(.., BadGatewayReason::Decode(coding))`, where the
+helper supplies `Gzip` or `Brotli`, while preserving the captured diagnostic. The restored
+stream is then wrapped by the
 decoded-output deadline guard above, so a lazy stream checks every yield and terminal EOF.
 
 CF/Fastly/Spin response converters call
@@ -2509,10 +2571,13 @@ response converter re-collects the already-decompressed chunks into `Bytes` at t
 `AXUM_RESPONSE_STREAM_BUFFER_BYTES`; the decoder itself never buffers the whole body,
 and `Streamed` mode never collects except at that final conversion step (§4.1).
 
-In `Streamed` mode no **decoded app-visible byte cap** is pre-enforced unless the caller
-later applies one via `OutboundResponse::into_bytes_bounded(max)`. The independent encoded,
-header, and Brotli-window limits in §3.4.5 still apply before or during streamed delivery.
-That method does **not** delegate to
+In `Streamed` mode a configured `max_decoded_response_bytes` is enforced incrementally on
+effective identity and EdgeZero-decoded gzip/Brotli output before each item reaches the app.
+If that optional policy is unset, there is no default decoded-output cap. A caller may still
+apply a distinct final collection cap later with
+`OutboundResponse::into_bytes_bounded(max)`. The independent encoded, header, and
+Brotli-window/decoder-state limits in §3.4.5 also apply before or during streamed delivery.
+The bounded collection method does **not** delegate to
 `Body::into_bytes_bounded` directly — `Body::into_bytes_bounded` maps over-limit to
 `bad_request` (400), correct for the inbound body case but wrong for an over-large
 upstream response. `OutboundResponse::into_bytes_bounded` performs its own bounded
@@ -2553,7 +2618,17 @@ EdgeError::ResponseTooLarge { message: String, reason: ResponseLimitReason }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum BadGatewayReason { Decode, Protocol, Transport, Unspecified }
+pub enum BadGatewayDecodeReason { Brotli, Gzip, Json, Unspecified }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BadGatewayReason {
+    Decode(BadGatewayDecodeReason),
+    Protocol,
+    Transport,
+    Unreachable,
+    Unspecified,
+}
 
 // Defined ONCE in `error.rs` (this file's crate, Phase 1a Task 1); §3.3.2's `DispatchBudget`
 // uses it from here. `dispatch_budget` sets `PerCallTimeout`/`BatchDeadline`/`Default`;
@@ -2571,7 +2646,9 @@ pub enum BudgetSource { BatchDeadline, Default, PerCallTimeout, Unspecified }
 #[non_exhaustive]
 pub enum ResponseLimitReason {
     BrotliWindow,
+    BufferedBody,
     DecodedBody,
+    DecoderMemory,
     EncodedBody,
     HeaderBytes,
     HeaderCount,
@@ -2592,6 +2669,16 @@ pub fn response_too_large_with_reason(
 ) -> Self;
 ```
 
+`Unreachable` is reserved for a failure before any upstream response head is available:
+DNS resolution, connection establishment/refusal, or TLS establishment. `Transport` covers
+an established exchange failing during request upload, response body/trailer reads, native
+completion, or a later connection termination. If a provider does not expose enough phase
+information, use `Unspecified`; never guess from message text. EdgeZero-owned decoders always
+use `Decode(BadGatewayDecodeReason::{Brotli,Gzip,Json})` as applicable. `Decode(Unspecified)`
+is only for an EdgeZero-owned decoder whose format is genuinely unavailable at the mapping
+site; provider-native decoding remains `Unspecified` unless the adapter can establish the
+coding without parsing a diagnostic string.
+
 `EdgeError::status()` gains `BadGateway => 502`, `GatewayTimeout => 504`, and (outbound
 phase) `ResponseTooLarge => 502` with `kind_str() == "response_too_large"`. Like the other
 two it carries no `Retry-After` and no `field_path`. `BadGatewayReason` and
@@ -2604,10 +2691,11 @@ the third plus `ResponseLimitReason` in the same mechanical style.
 | Condition | `EdgeError` | HTTP status |
 | --- | --- | --- |
 | Invalid outbound URI (relative / no authority / bad scheme) | `bad_request` | 400 |
-| Outbound transport failure (DNS / TLS / connect / read / write) | `bad_gateway`, reason `Transport` when the adapter can establish it, else `Unspecified` | 502 |
+| Upstream unreachable before a response head (DNS / connect / TLS establishment / connection refusal) | `bad_gateway`, reason `Unreachable` when the adapter can establish it, else `Unspecified` | 502 |
+| Outbound transport failure after connection progress (request upload, response read, trailer/completion, connection termination) | `bad_gateway`, reason `Transport` when the adapter can establish it, else `Unspecified` | 502 |
 | Outbound protocol/framing/completion failure | `bad_gateway`, reason `Protocol` | 502 |
 | Outbound response over a body/header/window resource limit | `response_too_large`, typed `ResponseLimitReason` (§3.4.5) | 502 |
-| Outbound response body not valid JSON, gzip, or Brotli / `json::<T>` called on a streamed body | `bad_gateway`, reason `Decode` for malformed content and `Protocol` for invalid API state | 502 |
+| Outbound response body not valid JSON, gzip, or Brotli / `json::<T>` called on a streamed body | `bad_gateway`, reason `Decode(Json/Gzip/Brotli)` for malformed content and `Protocol` for invalid API state | 502 |
 | Outbound per-request timeout or batch deadline exceeded | `gateway_timeout` (carries `budget.cause`: per-call vs batch — §3.3.2) | 504 |
 | Outbound completed with a non-2xx status | **not an error** — `Ok(OutboundResponse)` | app decides |
 
@@ -2616,7 +2704,8 @@ outcome, not a transport error.
 
 #### 3.4.4 Batch memory model (explicit)
 
-`send_all` does not impose a global allocation ceiling. The bound comes in two parts —
+`send_all` does not impose a global allocation ceiling. Its logical payload accounting has
+two parts —
 a **persistent collected buffer** term that holds the request payloads and the
 buffered response payloads, plus a **transient in-flight chunk** term that
 briefly co-exists with the collected buffer per actively-draining slot (per
@@ -2627,18 +2716,20 @@ overflow check before being appended or dropped):
 persistent collected buffer  =  Σᵢ request_bodyᵢ.len()
                               + Σᵢ max_response_bytesᵢ      (send_all is buffered-only)
 
-transient in-flight chunks   =  Σⱼ sizeof(current_chunkⱼ)
+transient in-flight chunks   =  Σⱼ current_chunkⱼ.len()
                                                             // j ranges over slots
                                                             // currently inside a drain
                                                             // step; typically 8-64 KiB
                                                             // per active slot
 
-worst-case CORE-OWNED PAYLOAD bytes   =  persistent + transient
-// This is a LOGICAL payload bound, NOT true process RSS. It counts the bytes EdgeZero
-// core deliberately holds; it EXCLUDES: `Vec`/`BytesMut` spare capacity (amortised growth
-// over-allocates), shared `Bytes` backing allocations not yet freed, gzip/brotli decoder
-// working state, and allocator overhead/fragmentation. Actual RSS is this plus those
-// core-owned-but-unmodelled terms plus any adapter/host buffering (§ send_all rustdoc).
+worst-case LOGICAL PAYLOAD bytes   =  persistent + transient
+// This is NOT a complete core-allocation or process-RSS bound. It EXCLUDES:
+// `Vec`/`BytesMut` spare capacity (amortised growth over-allocates), shared `Bytes` backing
+// allocations not yet freed, gzip decoder state, Brotli state other than the separately
+// bounded source-audited decoder-state charge, and allocator overhead/fragmentation. During active Brotli
+// decodes, add up to each slot's `max_brotli_decoder_bytes` to this logical payload number;
+// even that sum remains narrower than RSS. Actual RSS also includes adapter/host buffering
+// and every opaque term listed below (§ send_all rustdoc).
 
 // Equivalently, when all slots share the same response cap, the persistent term is:
 //     Σᵢ request_bodyᵢ.len()  +  N × max_response_bytes
@@ -2653,19 +2744,33 @@ with `Streamed` is the path for lazy bodies, where memory is bounded by the
 streaming chunk buffer plus whatever the consumer chooses to buffer via
 `into_bytes_bounded`.
 
+This arithmetic is not an admission-safe process/isolate RSS bound. Informational response
+blocks that a host consumes before exposing the final response, parser tables, provider-side
+field sections, trailers not exposed to the guest, native receive-chunk allocation, shared
+backing storage, `BytesMut` spare capacity, allocator metadata/fragmentation, task stacks,
+and host copies can all exist outside it. When an adapter exposes informational fields or
+trailers to guest code, it applies the configured header count/byte totals cumulatively
+across every exposed field section and final completion; it never claims that this prevents
+an earlier host allocation. When those fields are not exposed, their allocation is opaque.
+The `outbound-complete-resource-accounting` capability is therefore `Unsupported` for every
+current adapter. This is a deliberate fail-closed statement, not a reason to weaken the
+narrower limits below.
+
 EdgeZero's contract — **persistent** (post-append, retained) vs **transient**
 (in-flight, dropped after the cap check):
 
 - **Per-response (Buffered).** *Persistent* memory — the collected buffer — is bounded
   by `max_response_bytes`. *Transient* worst-case core-owned payload during a drain is
-  `max_response_bytes + sizeof(current_chunk)`, where `sizeof(current_chunk)` is
+  `max_response_bytes + current_chunk.len()`, where `current_chunk.len()` is
   source-controlled (§3.4.1). The post-check buffer never exceeds `max_response_bytes`.
 - **Batch (N)** memory is the app's responsibility: the app must bound the number of
   requests passed to `send_all`. Both terms add up — *persistent* is
   `Σᵢ request_bodyᵢ.len() + Σᵢ max_response_bytesᵢ` (`request_bodyᵢ` and
   `max_response_bytesᵢ` denote slot `i`'s buffered request body length and its
   per-request response cap respectively); *transient* adds
-  `Σⱼ sizeof(current_chunkⱼ)` over actively-draining slots, source-controlled.
+  `Σⱼ current_chunkⱼ.len()` over actively-draining slots, source-controlled, plus up to
+  `Σₖ max_brotli_decoder_bytesₖ` over actively decoding Brotli slots. This remains a set of
+  enforceable guest terms rather than a complete memory bound.
   For typical fan-out workloads this is intrinsic — `N` is the fixed, configured target count and
   target responses are small JSON. The spec deliberately does **not** add a
   `max_concurrency` knob: on Fastly all requests must be in-flight at once for
@@ -2676,17 +2781,23 @@ EdgeZero's contract — **persistent** (post-append, retained) vs **transient**
 
 #### 3.4.5 Response resource limits
 
-`max_response_bytes` remains the decoded Buffered-body cap. Five additional controls bound
-distinct response resources; combining them is intentional because no one counter covers a
-compressed stream, header metadata, and decoder allocation safely:
+`ResponseMode::Buffered { max_bytes }` (set by `max_response_bytes`) is the final collection
+cap for every Buffered response, including raw passthrough. It is not the decoded-output
+policy. Eight independent controls cover transport bytes, identity/decoded output, decoder
+heap requests, field metadata, and Streamed item shape. This separation permits, for
+example, a 4 MiB decoded limit with a 16 MiB final buffer for an intentionally retained raw
+passthrough representation:
 
 | Builder | Default | Measures | Typed overflow/rejection reason |
 | --- | --- | --- | --- |
+| `max_brotli_decoder_bytes(u64)` | `DEFAULT_MAX_BROTLI_DECODER_BYTES = 32 MiB` | conservative decoder-state charge `BROTLI_DECODER_FIXED_CHARGE_BYTES + 2^WBITS`, checked before decoder construction | `ResponseLimitReason::DecoderMemory` |
 | `max_encoded_response_bytes(u64)` | unset | cumulative guest-visible body bytes before content decoding | `ResponseLimitReason::EncodedBody` |
+| `max_decoded_response_bytes(u64)` | unset | cumulative identity or EdgeZero-decoded gzip/Brotli output; never raw passthrough | `ResponseLimitReason::DecodedBody` |
 | `max_response_header_bytes(u64)` | unset | sum of each guest-visible field name length plus value length | `ResponseLimitReason::HeaderBytes` |
 | `max_response_header_count(u64)` | unset | guest-visible name/value entries, including repeated values | `ResponseLimitReason::HeaderCount` |
 | `max_brotli_window_bits(u8)` | `DEFAULT_MAX_BROTLI_WINDOW_BITS = 24` | advertised Brotli window bits, valid configured range `10..=30` | `ResponseLimitReason::BrotliWindow` |
 | `max_chunk_bytes(NonZeroU64)` | unset | each app-visible `Body::Stream` item after decode or passthrough | no overflow; items are split lazily |
+| `max_response_bytes(u64)` | `DEFAULT_MAX_RESPONSE_BYTES = 1 MiB` | final bytes collected into `Body::Once`, regardless of coding disposition | `ResponseLimitReason::BufferedBody` |
 
 All byte/count fields and running totals use checked `u64` arithmetic. A Brotli limit outside
 `10..=30` is caller configuration and fails dispatch as `bad_request`; zero chunk size is
@@ -2695,19 +2806,27 @@ These are per-response controls, not aggregate batch limits.
 
 **Enforcement order and precedence:**
 
-1. At the earliest adapter boundary where headers are guest-visible, count entries and
-   `name.as_bytes().len() + value.as_bytes().len()` for every visible pair before
-   normalization, duplicate coalescing by EdgeZero, or additional collected header state.
+1. At the earliest adapter boundary where a response field section is guest-visible, count
+   entries and `name.as_bytes().len() + value.as_bytes().len()` for every visible pair
+   before normalization, duplicate coalescing by EdgeZero, or additional collected header
+   state. Maintain one cumulative count/byte total across every guest-visible informational
+   block, the final response headers, and guest-visible trailers; a later field section can
+   therefore fail the returned body/completion stream with the same typed reason.
    Increment and check the entry count before adding/checking bytes for that entry, so if
    the same field crosses both configured limits, `HeaderCount` wins. Reject on the first
    exceeded configured limit; never truncate. Cloudflare can measure
    only workerd's already-materialized strings and merged non-`set-cookie` entries. No
-   adapter claims these limits prevent provider/SDK allocation or a host-side rejection
-   that occurs before metadata reaches the guest.
+   adapter claims these limits prevent provider/SDK allocation, parsing of an informational
+   block or trailer the SDK does not expose, or a host-side rejection that occurs before
+   metadata reaches the guest.
 2. Apply bodyless/205 disposition. Framing-bodyless responses do not consume a body or
    invoke body/window limits. A visible normalized `Content-Length` greater than a configured
    encoded cap rejects a payload-bearing response before reading, including compressed
-   responses; identity responses may independently reject against the decoded cap. For a
+   responses. Identity responses independently reject against the decoded cap and, in
+   Buffered mode, the final-buffer cap. Passthrough responses compare their raw length to
+   the encoded cap and, in Buffered mode, the final-buffer cap, but never to the decoded cap.
+   A compressed response that EdgeZero will decode cannot compare wire `Content-Length` to
+   either output cap. For a
    payload-bearing response or 205, malformed, comma-list, or conflicting repeated visible
    `Content-Length` is `bad_gateway` reason `Protocol` before body reads. HEAD/304 preserve
    representation metadata without interpreting it as a body promise.
@@ -2721,9 +2840,29 @@ These are per-response controls, not aggregate batch limits.
    bytes unchanged. The parser handles both the standard one-byte encoding and the pinned
    decoder's two-byte large-window extension (10 through 30 bits); the extension cannot
    bypass the configured cap. A valid over-limit value is `BrotliWindow`; malformed or
-   truncated prefix syntax is `bad_gateway` with reason `Decode`. The limit bounds the
-   advertised window, not total decoder RSS.
-5. Apply the existing decoded-byte cap and, for Streamed output, the optional rechunker.
+   truncated prefix syntax is `bad_gateway` with reason `Decode(Brotli)`.
+5. Before decoder construction, compute
+   `brotli_decoder_memory_charge(WBITS) = BROTLI_DECODER_FIXED_CHARGE_BYTES + 2^WBITS`
+   with checked `u64` arithmetic. `BROTLI_DECODER_FIXED_CHARGE_BYTES` is 16 MiB and covers
+   the pinned Rust decoder's non-ring state; `2^WBITS` charges its maximum ring window. The
+   implementation plan pins and source-audits the decoder graph, records every allocation
+   family included in the 16 MiB constant, and runs an allocation-tracking adversarial
+   corpus for every supported WBITS. A dependency upgrade must repeat that audit and may
+   raise the constant; it may not retain the old charge on test evidence alone. Reject with
+   `DecoderMemory` before constructing the decoder when the charge exceeds
+   `max_brotli_decoder_bytes`. The default 32 MiB cap therefore admits the default WBITS 24
+   and rejects a raised window unless the caller also raises the memory policy. This is a
+   conservative reservation charge, not a claim that the process reserves or uses exactly
+   that many bytes. It excludes allocator metadata, fragmentation, output/body buffers,
+   task stacks, adapter/SDK buffers, and host RSS; `outbound-complete-resource-accounting`
+   remains Unsupported because those terms are not portable (§3.5.2).
+6. Apply `max_decoded_response_bytes` only to effective identity and EdgeZero-decoded
+   gzip/Brotli output. Unknown, parameterized, stacked, or otherwise passthrough encodings
+   bypass this decoded counter. The encoded counter still applies to every path.
+7. For Streamed output apply the optional rechunker, then wrap the stream in the adapter's
+   absolute deadline/cancellation owner. For Buffered output, collect under
+   `ResponseMode::Buffered { max_bytes }`; that final cap applies to identity, decoded, and
+   passthrough bytes and reports `BufferedBody`.
    The rechunker preserves byte order, error order, cancellation ownership, and absolute
    deadline/fairness checks. It pulls lazily and emits items no larger than the configured
    value. It does not alter a final Buffered body. Splitting a `Bytes` value may retain its
@@ -2781,6 +2920,9 @@ pub enum Capability {
     LazyStreamedResponsePassthrough, // downstream response chunks flow without
                                      // collecting the whole body. Cloudflare is
                                      // Native; Axum/Fastly/Spin are BestEffort.
+    OutboundCompleteResourceAccounting, // every response allocation from host parsing
+                                        // through guest delivery has a portable bound;
+                                        // Unsupported on all current targets.
     OutboundDeadlines,               // one exchange budget: connect, headers,
                                      // buffered body, and streamed body yields.
                                      // Cross-slot harvest delay is owned by
@@ -3158,12 +3300,25 @@ Capability matrix (all four adapters):
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
 | `outbound-http` | Native | Native | BestEffort⁹ | Native |
+| `outbound-complete-resource-accounting` | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] |
 | `outbound-header-fidelity` | Native | BestEffort⁸ | Native | Native |
 | `outbound-deadlines` | Native | Native | BestEffort¹ | BestEffort⁸ |
 | `outbound-flexible-phase-budget` | Native | Native | BestEffort⁵ | BestEffort⁵ |
 | `send-all-slot-isolation` | Native | Native | BestEffort⁴ | Native |
 | `streamed-upload-deadlines` | Native | Native | BestEffort² | BestEffort⁸ |
 | `lazy-streamed-response-passthrough` | BestEffort³ | Native | BestEffort⁶ | BestEffort⁷ |
+
+[^resource-accounting]: This capability means a complete pre-admission bound for process or
+    isolate memory attributable to one outbound response, including provider parser and
+    field-section materialization, informational responses, final headers, trailers,
+    native receive chunks, guest buffers and spare capacity, decoder state, allocator
+    metadata, and runtime copies. Current platform APIs do not expose or bound every term,
+    so all four adapters report `Unsupported`. EdgeZero still enforces and documents its
+    narrower guest-visible limits: encoded bytes, decoded bytes, final Buffered bytes,
+    visible header fields, Brotli decoder-state charge, and emitted item shape. A caller
+    requiring a complete RSS/isolate bound must declare this capability required and fail
+    closed on every current target rather than treating the narrower arithmetic in §3.4.4
+    as a complete memory guarantee.
 
 ¹ **Fastly `outbound-deadlines` is `BestEffort`, because it cannot be guaranteed on
 every request.** Even with an already-registered/cached backend, any non-empty request body
@@ -4181,12 +4336,15 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   independent timer task must make progress, proving the fallback neither deadlocks nor
   monopolizes the sole worker.
 - Errors: `reqwest` timeout → **`gateway_timeout_caused(msg, budget.cause)`** (carries the
-  attribution — §3.3.2, NOT bare `gateway_timeout`); connect/DNS/TLS →
-  `bad_gateway_with_reason(.., Transport)`; invalid upstream framing/completion →
-  `Protocol`; shared JSON/compression failures → `Decode`; response over-cap → the exact
+  attribution — §3.3.2, NOT bare `gateway_timeout`); connect/DNS/TLS before a response
+  head → `bad_gateway_with_reason(.., Unreachable)`; transport failure after connection
+  progress → `Transport`; invalid upstream framing/completion → `Protocol`; shared JSON,
+  gzip, and Brotli failures → `Decode(Json)`, `Decode(Gzip)`, and `Decode(Brotli)`;
+  response over-cap → the exact
   typed `response_too_large` reason (§3.4.5). Any completed exchange (incl. non-2xx) →
   `Ok`.
 - `capability()` per §3.5.2: `outbound-http` = `Native`,
+  `outbound-complete-resource-accounting` = `Unsupported`,
   `outbound-header-fidelity` = `Native`, `outbound-deadlines` = `Native`,
   `outbound-flexible-phase-budget` = `Native` (Axum's reqwest exposes a single total
   timeout, not a phase split), `send-all-slot-isolation` = `Native`,
@@ -4249,8 +4407,10 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
        `fetch_with_request_and_init(request.inner(), &init)`. Await the Promise through
        `worker::wasm_bindgen_futures::JsFuture`, cast the result to
        `worker::web_sys::Response` with `JsCast`, then convert it to `worker::Response`.
-       Fetch rejection is `bad_gateway` reason `Transport` unless the deadline has expired;
-       an unexpected JS response type is an `internal` binding invariant failure.
+       Fetch rejection before a response head is `bad_gateway` reason `Unreachable` when
+       the platform evidence establishes DNS/connect/TLS establishment failure, otherwise
+       `Unspecified`; expiry still wins. An unexpected JS response type is an `internal`
+       binding invariant failure.
 
      Redirect mode remains on the already-constructed Request; the final raw
      `web_sys::RequestInit` owns only the abort signal and response-encoding override and
@@ -4267,9 +4427,9 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
      cancel the in-flight subrequest; dropping the guarded send future cancels it through
      the guard's `Drop`. Return `gateway_timeout_caused(.., budget.cause)` on expiry.
      The existing gzip/br
-     decompression path is kept; the decompressed-byte cap is enforced
-     incrementally while decompressing (§3.4.1), with pre-append checked
-     accounting.
+     decompression path is kept; the independent decoded-output cap is enforced
+     incrementally for identity and EdgeZero-decoded output (§3.4.1). The final Buffered
+     collection cap is enforced separately for every coding disposition.
 - **Raw-response option placement is mandatory.** Workerd's
   [request initializer](https://github.com/cloudflare/workerd/blob/f2300a54038995b2ceaf0851447aa5b5b36cda13/src/workerd/api/http.h)
   defaults to automatic response decoding; `encodeResponseBody: "manual"` returns raw
@@ -4331,7 +4491,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   the native body has completed. Abort is idempotent, and the guard records settlement
   so explicit abort followed by `Drop` does not repeat it. Native transport failures use
   `BadGatewayReason::Transport`; protocol/completion failures use `Protocol`; shared
-  codec/trailing-data failures use `Decode`. In worker 0.8.3,
+  codec/trailing-data failures use `Decode(Gzip)` or `Decode(Brotli)`. In worker 0.8.3,
   `AbortController::abort(self)` consumes the controller: store it as an `Option` and
   `take()` it when aborting or disarming; `Drop` aborts only a remaining `Some`.
   A successful Streamed return moves the still-armed guard into the decoded-output
@@ -4361,9 +4521,11 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   produce a second observable disconnect and is not used as cancellation evidence.
 - Errors: `worker::Delay` expiry →
   **`gateway_timeout_caused(msg, budget.cause)`** (attributed — §3.3.2);
-  `worker::fetch` DNS/TLS/connection failures →
-  `bad_gateway_with_reason(.., Transport)`; invalid visible upstream framing/completion →
-  `Protocol`; shared JSON/compression failures → `Decode`; **request**-body over-cap →
+  `worker::fetch` DNS/TLS/connection-establishment failures before a response head →
+  `bad_gateway_with_reason(.., Unreachable)` when provider evidence establishes that
+  category, otherwise `Unspecified`; later transport failures → `Transport`; invalid
+  visible upstream framing/completion → `Protocol`; shared JSON/gzip/Brotli failures →
+  `Decode(Json)` / `Decode(Gzip)` / `Decode(Brotli)`; **request**-body over-cap →
   `bad_request` (400); response-resource failures preserve their exact
   `ResponseLimitReason`. A provider error with no defensible narrower category uses
   `Unspecified`. Any completed exchange (incl. non-2xx) → `Ok`.
@@ -4411,12 +4573,13 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   `Content-Length` retention is part of Cloudflare's documented
   `outbound-header-fidelity = BestEffort` deviation; the app-visible header decision and
   raw encoded payload remain deterministic.
-- `capability()` per §3.5.2: `Native` for six outbound capabilities
+- `capability()` per §3.5.2: `Native` for six of the eight outbound capabilities
   (`outbound-http`, `outbound-deadlines`, `outbound-flexible-phase-budget` (single
   `worker::Delay` for the total race, no per-phase split), `send-all-slot-isolation`,
-  `streamed-upload-deadlines`, `lazy-streamed-response-passthrough`) and `BestEffort`
+  `streamed-upload-deadlines`, `lazy-streamed-response-passthrough`), `BestEffort`
   for `outbound-header-fidelity` because workerd removes raw-octet/field-line information
-  before the guest. Cloudflare's WASM single-threaded guest carries no
+  before the guest, and `Unsupported` for `outbound-complete-resource-accounting`.
+  Cloudflare's WASM single-threaded guest carries no
   `Send` constraint, so `worker::Body::from_stream` consumes the core `Body::Stream`
   directly **in the response-out direction**
   (`lazy-streamed-response-passthrough` — see §7 `src/response.rs`). The
@@ -4456,8 +4619,10 @@ slot** with `wait()` / `poll()`:
 // streamed responses in preflight, so `max_chunk_bytes` has no effect on this path;
 // all settings that apply to Buffered responses remain in the policy.
 struct PendingResponsePolicy {
+    max_brotli_decoder_bytes: u64,
     max_brotli_window_bits: u8,
-    max_decoded_bytes: u64, // from ResponseMode::Buffered { max_bytes }
+    max_buffered_response_bytes: u64, // from ResponseMode::Buffered { max_bytes }
+    max_decoded_response_bytes: Option<u64>,
     max_encoded_response_bytes: Option<u64>,
     max_response_header_bytes: Option<u64>,
     max_response_header_count: Option<u64>,
@@ -4471,22 +4636,37 @@ struct PendingSlot {
 }
 
 enum Slot {
-    Done(Result<OutboundResponse, EdgeError>),
+    Done(OutboundSlotResult),
     Pending(PendingSlot),
     Taken,
+}
+
+fn finish_slot(
+    batch_started_at: web_time::Instant,
+    outcome: Result<OutboundResponse, EdgeError>,
+) -> OutboundSlotResult {
+    let observed_at = web_time::Instant::now();
+    match observed_at.checked_duration_since(batch_started_at) {
+        Some(elapsed) => OutboundSlotResult { elapsed, outcome },
+        None => OutboundSlotResult {
+            elapsed: Duration::ZERO,
+            outcome: Err(EdgeError::internal(anyhow::anyhow!(
+                "outbound slot clock moved before batch start (adapter bug)"
+            ))),
+        },
+    }
 }
 
 async fn send_all(
     &self,
     reqs: Vec<OutboundRequest>,
-) -> Vec<Result<OutboundResponse, EdgeError>> {
-    let request_count = reqs.len();
-
+) -> Vec<OutboundSlotResult> {
  // Single batch-level `now` snapshot — same value passed to every per-slot
  // dispatch_budget so a shared caller Deadline produces the same `duration`
  // and ceiled `budget_ms`, and therefore one dynamic-backend identity per host
- // in a homogeneous-budget batch.
-    let batch_now = web_time::Instant::now();
+ // in a homogeneous-budget batch. This is the first operation, even for an empty batch.
+    let batch_started_at = web_time::Instant::now();
+    let request_count = reqs.len();
 
  // Phase 0 — preflight. After the method-entry clock snapshot above, **the shared
  // `validate_for_dispatch` runs FIRST, exactly once per slot** (§3.1.4 — the mandatory
@@ -4518,9 +4698,9 @@ async fn send_all(
  // check below.
     let mut slots: Vec<Slot> = reqs.into_iter()
         .map(|maybe_req| match maybe_req {
-            Err(err)  => Slot::Done(Err(err)),
+            Err(err)  => Slot::Done(finish_slot(batch_started_at, Err(err))),
             Ok(req) => {
-                match dispatch(req, batch_now) {
+                match dispatch(req, batch_started_at) {
  // `dispatch` moves the applicable fields from `OutboundRequestParts` into
  // `PendingResponsePolicy` before handing the request to Fastly. In particular, it
  // captures `request_method` for HEAD disposition and all Buffered response limits.
@@ -4528,7 +4708,7 @@ async fn send_all(
                     Ok((pending, budget, response)) => Slot::Pending(PendingSlot {
                         pending, budget, response,
                     }),
-                    Err(err) => Slot::Done(Err(err)),
+                    Err(err) => Slot::Done(finish_slot(batch_started_at, Err(err))),
                 }
             },
         })
@@ -4541,17 +4721,20 @@ async fn send_all(
  // "Buffered body drain runs in harvest order". poll opportunistically
  // collects siblings that already finished headers. Only Buffered responses
  // reach this point — Streamed responses were rejected in Phase 0 preflight.
-    let mut outputs: Vec<Option<Result<OutboundResponse, EdgeError>>> =
+    let mut outputs: Vec<Option<OutboundSlotResult>> =
         (0..request_count).map(|_| None).collect();
     for index in 0..request_count {
         match std::mem::replace(&mut slots[index], Slot::Taken) {
             Slot::Done(result)     => outputs[index] = Some(result),
             Slot::Taken       => { /* already harvested by an earlier poll() */ }
             Slot::Pending(pending_slot)  => {
-                outputs[index] = Some(harvest(
-                    pending_slot.pending.wait(),
-                    &pending_slot.budget,
-                    &pending_slot.response,
+                outputs[index] = Some(finish_slot(
+                    batch_started_at,
+                    harvest(
+                        pending_slot.pending.wait(),
+                        &pending_slot.budget,
+                        &pending_slot.response,
+                    ),
                 ));
                 for sibling_index in index.saturating_add(1)..request_count {
  // Carefully preserve every variant; the bug we are
@@ -4564,11 +4747,12 @@ async fn send_all(
                         Slot::Done(result) => outputs[sibling_index] = Some(result), // preserve preflight / dispatch error
                         Slot::Taken       => { /* already harvested */ }
                         Slot::Pending(sibling) => match sibling.pending.poll() {
-                            PollResult::Done(result) => outputs[sibling_index] = Some(harvest(
-                                result,
-                                &sibling.budget,
-                                &sibling.response,
-                            )),
+                            PollResult::Done(result) => {
+                                outputs[sibling_index] = Some(finish_slot(
+                                    batch_started_at,
+                                    harvest(result, &sibling.budget, &sibling.response),
+                                ));
+                            }
                             PollResult::Pending(pending) => slots[sibling_index] = Slot::Pending(PendingSlot {
                                 pending,
                                 budget: sibling.budget,
@@ -4585,9 +4769,12 @@ async fn send_all(
  // crash the host on a contract bug.
     outputs.into_iter()
         .enumerate()
-        .map(|(index, result)| result.unwrap_or_else(|| Err(EdgeError::internal(anyhow::anyhow!(
-            "fastly outbound: slot {index} unresolved by harvest loop (adapter bug)"
-        )))))
+        .map(|(index, result)| result.unwrap_or_else(|| finish_slot(
+            batch_started_at,
+            Err(EdgeError::internal(anyhow::anyhow!(
+                "fastly outbound: slot {index} unresolved by harvest loop (adapter bug)"
+            ))),
+        )))
         .collect()
 }
 ```
@@ -5038,8 +5225,9 @@ async fn send_all(
   | --- | --- | --- |
   | `DnsTimeout` | `gateway_timeout`; `Unspecified` before absolute expiry, selected cause at/after expiry | **504** |
   | `ConnectionTimeout`, `HttpResponseTimeout` | `gateway_timeout` with selected cause because EdgeZero configures those phase timers from the selected budget | **504** |
-  | `DnsError`, `DestinationNotFound`, `DestinationUnavailable`, `DestinationIpUnroutable`, `ConnectionRefused`, `ConnectionTerminated`, `ConnectionLimitReached` | `bad_gateway`, reason `Transport` | 502 |
-  | `TlsProtocolError`, `TlsCertificateError`, `TlsAlertReceived`, `TlsConfigurationError` | `bad_gateway`, reason `Transport` | 502 |
+  | `DnsError`, `DestinationNotFound`, `DestinationUnavailable`, `DestinationIpUnroutable`, `ConnectionRefused`, `ConnectionLimitReached` | `bad_gateway`, reason `Unreachable` | 502 — the exchange did not establish a usable upstream response path. |
+  | `TlsProtocolError`, `TlsCertificateError`, `TlsAlertReceived`, `TlsConfigurationError` | `bad_gateway`, reason `Unreachable` | 502 — TLS establishment failed before a response head. |
+  | `ConnectionTerminated` | `bad_gateway`, reason `Transport` | 502 — the connection made progress and then terminated. |
   | `HttpIncompleteResponse`, `HttpResponseHeaderSectionTooLarge`, `HttpResponseBodyTooLarge`, `HttpResponseStatusInvalid`, `HttpUpgradeFailed`, `Http2StreamError`, `HttpProtocolError` | `bad_gateway`, reason `Protocol` | 502 — malformed/oversized **upstream** response. |
   | `IoError` | `bad_gateway`, reason `Transport` | 502 |
   | `ImageOptimizerUnsupported` | `bad_gateway`, reason `Unspecified` | 502 — no narrower portable category. |
@@ -5063,8 +5251,9 @@ async fn send_all(
       LocalInvariant,    // HttpRequestUriInvalid | HttpRequestCacheKeyInvalid | HttpCacheLimitExceeded | HttpCacheApiUnsupported
       PlatformInternal,  // InternalError: Fastly host/runtime internal fault, not caller input
       ProviderTimeout,   // DnsTimeout: no Fastly SDK DNS-timeout setter
-      Transport,         // DnsError | Destination* | Connection{Refused,Terminated,LimitReached} | Tls*
+      Transport,         // ConnectionTerminated | IoError
       Unknown,           // Custom, and any future #[non_exhaustive] variant
+      Unreachable,       // DnsError | Destination* | Connection{Refused,LimitReached} | Tls*
       UpstreamProtocol,  // HttpIncompleteResponse | Http*TooLarge | HttpStatusInvalid | Http2StreamError | ...
   }
 
@@ -5074,8 +5263,8 @@ async fn send_all(
  // because EdgeZero configured Fastly's connect/response phase timer from that budget.
  // `ProviderTimeout` is unattributed before the absolute deadline because Fastly exposes no
  // DNS-timeout setter; at/after the deadline, deadline precedence attributes any result. The
- // other arms select `BadGatewayReason::{Protocol, Transport, Unspecified}` from `failure`
- // when observed in budget. Injecting the instant makes the boundary deterministic and avoids
+ // other arms select `BadGatewayReason::{Protocol, Transport, Unreachable, Unspecified}`
+ // from `failure` when observed in budget. Injecting the instant makes the boundary deterministic and avoids
  // a second clock read inside the classifier.
   pub(crate) fn classify(
       failure: SendFailure,
@@ -5194,8 +5383,9 @@ async fn send_all(
   capability and the service prerequisite below).
 - Requests in `send_all` are required to have buffered request bodies AND buffered
   response mode per the trait contract (§3.1.1). A `Body::Stream` request body
-  yields `out[i] = Err(EdgeError::bad_request(..))`; a request with
-  `response_mode = Streamed` also yields `out[i] = Err(EdgeError::bad_request(..))`.
+  yields `out[i].outcome = Err(EdgeError::bad_request(..))`; a request with
+  `response_mode = Streamed` also yields
+  `out[i].outcome = Err(EdgeError::bad_request(..))`.
   This removes unbounded application **source pulls** from Fastly's
   dispatch-all-then-harvest model and removes the cross-slot streamed-response
   deadline-lifetime problem (§3.1.1), identically on every adapter. It does not
@@ -5317,6 +5507,7 @@ async fn send_all(
     target an adapter whose upload path is Native.
 - `capability()` per §3.5.2: `outbound-http` = `BestEffort` (footnote 9: adapter
   support depends on a service entitlement the static gate cannot verify),
+  `outbound-complete-resource-accounting` = `Unsupported`,
   `outbound-header-fidelity` = `Native`, `outbound-deadlines` =
   **`BestEffort`** (footnote 1 — a warm zero-body path has documented partial bounds, but
   every non-empty request retains an unbounded host-write interval and the FIRST request
@@ -5797,8 +5988,9 @@ current matrix remains `BestEffort`.
   §3.3.3 wrapper), so upload time is included in the batch budget rather than added on top.
   (An earlier draft prescribed this second race unconditionally, contradicting the buffered
   single-race flow — corrected to Streamed-only here.)
-- Existing gzip/br decompression is kept; decompressed-byte cap enforced incrementally
-  (§3.4.1). `Streamed` mode wraps the response body as `Body::Stream`.
+- Existing gzip/br decompression is kept; the independent decoded-output cap is enforced
+  incrementally for identity and EdgeZero-decoded output (§3.4.1), while the final
+  Buffered cap remains separate. `Streamed` mode wraps the response body as `Body::Stream`.
 - **Errors — `map_spin_send_err(err, deadline, cause)` classifies the WASI `ErrorCode`,
   mirroring Fastly's deadline-aware `classify` policy (§4.3) but without inventing
   provenance.** At the mapping instant it checks `deadline.is_expired()` first. If true,
@@ -5826,9 +6018,10 @@ current matrix remains `BestEffort`.
     `BudgetSource::Unspecified`. **None may fall through to the generic 502.** An exhaustive
     classifier unit test against the pinned SDK exercises every timeout before and after
     deadline expiry.
-  - DNS resolution failure, connection refused/terminated, TLS/certificate errors,
-    destination-not-found/unavailable →
-    **`bad_gateway_with_reason(.., Transport)` (502)**.
+  - DNS resolution failure, connection refused, TLS/certificate establishment errors,
+    destination-not-found/unavailable before a response head →
+    **`bad_gateway_with_reason(.., Unreachable)` (502)**. Connection termination/read/write
+    failure after connection progress uses **`Transport`**.
   - Caller-controlled request-policy/size failures → **`bad_request` (400)**:
     `HttpRequestDenied`, `HttpRequestBodySize`, `HttpRequestUriTooLong`,
     `HttpRequestHeaderSectionSize`, and `HttpRequestHeaderSize`. These can be caused by
@@ -5841,7 +6034,8 @@ current matrix remains `BestEffort`.
     and `ConfigurationError` (the adapter constructed the request options).
   - Upstream response framing/protocol variants →
     **`bad_gateway_with_reason(.., Protocol)` (502)**. Shared decoder/JSON failures use
-    `Decode`; they do not enter this WASI classifier.
+    `Decode(Gzip)` / `Decode(Brotli)` / `Decode(Json)`; they do not enter this WASI
+    classifier.
   - Host/runtime catch-all `InternalError` →
     **`bad_gateway_with_reason(.., Unspecified)` (502)**. WASI defines this as the fallback
     when no specific code fits; it is not evidence that an EdgeZero invariant failed. The
@@ -5875,9 +6069,10 @@ current matrix remains `BestEffort`.
     completed exchange (incl. non-2xx) → `Ok`.
 - Spin requires `allowed_outbound_hosts`; the adapter renders it from
   `[capabilities.outbound].hosts` per §3.5.4 when generating `spin.toml`.
-- `capability()` per §3.5.2 reports the exact seven outbound-cell tuple (additional
+- `capability()` per §3.5.2 reports the exact eight outbound-cell tuple (additional
   non-outbound capability variants are owned by their respective specifications):
   `outbound-http` = `Native`, `outbound-header-fidelity` = `Native`,
+  `outbound-complete-resource-accounting` = `Unsupported`,
   `outbound-deadlines` = `BestEffort` (footnote 8),
   `outbound-flexible-phase-budget` = `BestEffort` (footnote 5: request-option setters may
   be unsupported and leave earlier host defaults), `send-all-slot-isolation` = `Native`,
@@ -5971,8 +6166,9 @@ Required coverage:
   lazy source pulls, error order, early drop, and deadline/fairness behavior. They explicitly
   retain the source-allocation term rather than claiming the wrapper caps RSS.
 - The decoder error carrier restores the exact original `EdgeError` variant/status/kind.
-  Raw decompressor failures become `bad_gateway` reason `Decode`; over-cap becomes
-  `response_too_large`; no path stringifies a typed error.
+  Raw decompressor failures become `bad_gateway` reason `Decode(Gzip)` or
+  `Decode(Brotli)`; over-cap becomes `response_too_large`; no path stringifies a typed
+  error.
 - The deadline wrapper around **decoded output** covers: compressed input that stalls before
   first decoded output, stalls after output, stalls at terminal EOF/trailer validation, and
   yields an error concurrently with deadline expiry. It checks every yield and terminal
@@ -6015,10 +6211,10 @@ Each adapter crate tests its shipped conversion and classification seams.
 
 | Surface | Required assertions |
 | --- | --- |
-| Capability metadata | All four adapters return the exact seven **outbound** cells in §3.5.2, including Fastly outbound HTTP = BestEffort, Cloudflare header fidelity = BestEffort, and Spin deadline/upload/flexible-phase-budget = BestEffort. Tests do not assert that the shared enum has only seven global variants; non-outbound cells belong to their own specs. A fixture adapter that relies on the trait default returns Unsupported. Because each adapter crate matches core's non-exhaustive `Capability` enum across a crate boundary, normal adapter compilation requires a wildcard; review asserts that its result is `_ => Unsupported`. A hypothetical future variant is a structural fail-closed invariant, not a value current Rust code can safely construct at runtime. |
+| Capability metadata | All four adapters return the exact eight **outbound** cells in §3.5.2, including complete resource accounting = Unsupported everywhere, Fastly outbound HTTP = BestEffort, Cloudflare header fidelity = BestEffort, and Spin deadline/upload/flexible-phase-budget = BestEffort. Tests do not assert that the shared enum has only eight global variants; non-outbound cells belong to their own specs. A fixture adapter that relies on the trait default returns Unsupported. Because each adapter crate matches core's non-exhaustive `Capability` enum across a crate boundary, normal adapter compilation requires a wildcard; review asserts that its result is `_ => Unsupported`. A hypothetical future variant is a structural fail-closed invariant, not a value current Rust code can safely construct at runtime. |
 | Request conversion | Method/body/headers/full canonical URI survive conversion; normalized hop-by-hop fields cannot reappear; buffered and streamed request caps map to 400. Dot-segment/percent/numeric-host/IDNA cases use the exact core serialization rather than adapter reconstruction. Typed `EdgeError` request chunks survive adapter conversion; in-tree paths never route them through `from_external_stream`. |
 | Deadline anchoring | Every adapter captures one monotonic snapshot as the first operation in `send`/`send_all`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
-| `send_all` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Valid one-slot buffered batches match single-send preflight/result semantics. All slots share one clock snapshot. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Fastly tests dispatch-before-harvest ordering and its documented serial timing caveats, without claiming Native slot isolation. |
+| `send_all` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Assert every slot carries its own elapsed time from the one method-entry snapshot through that slot's terminal point; advance the injected clock during preflight to prove that time is included. A same-tick terminal result may legitimately report zero. A slow sibling's later completion must not overwrite an earlier slot's elapsed value. Valid one-slot buffered batches match single-send outcome semantics while elapsed is asserted independently. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Fastly tests dispatch-before-harvest ordering, samples elapsed immediately after each harvest/preflight/dispatch terminal result, and retains its documented serial timing caveats without claiming Native slot isolation. Backwards injected time produces zero plus an internal outcome, distinguishable from legitimate zero by outcome. |
 | Streamed fan-out usage | On Axum/Cloudflare/Spin, join per-request tasks containing both `send` and body consumption. Script a fast response whose body can finish before its deadline while a sibling's headers remain pending beyond it. Assert the fast body is consumed and succeeds before those sibling headers arrive. Joining only sends and delaying all body consumption must fail this regression. Fastly is excluded from this non-portable usage pattern. |
 | Response conversion | Every adapter enforces guest-visible header limits before normalization, then normalizes before body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
 | 205 settlement | Test declared-body immediate abort, one in-budget clean EOF, observed non-empty bytes, read failure, and deadline precedence. Where the SDK exposes empty items, one empty item aborts without another read; on Fastly a non-empty read buffer returning zero is EOF. Cloudflare additionally tests null-body host suppression with absent/zero and positive visible lengths without claiming hidden-byte visibility. Assert native-handle cleanup and Spin completion signalling using observable results, never synthetic wire-frame visibility. |
@@ -6033,11 +6229,11 @@ Each adapter crate tests its shipped conversion and classification seams.
 | Streamed request deadline boundary | Axum and Cloudflare check expiry before every pull and after every ready source result. Fake-time streams cover a chunk, EOF, and source error becoming ready exactly at expiry, plus always-ready empty chunks. Cloudflare's clock fixture remains frozen until the injected host-event yield completes: assert the ready-item quota is finite/nonzero and no greater than 64, survives polls/stream yields, counts empty items, and permits no next item before the quota-triggered host yield. Ready-only terminal success/error/cap paths also yield before their expiry decision. Assert attributed 504 without reanchoring the deadline. |
 | Cloudflare decoder fairness | With the same frozen clock, test ready-empty raw input that never produces decoded output, continuously ready decoded output, and native-EOF validation after codec completion. Both input and output quotas force host-event progress; terminal EOF/error and adapter-owned cap decisions at expiry yield attributed 504. Generic streamed-consumer caps after a within-budget yield retain §3.4.1's narrower ownership rule. Dropping during a host yield cleans up the owned subrequest guard. An independently advancing fake clock alone cannot establish these invariants. |
 | Timeout provenance | Each adapter's actual timed-out result covers timeout-wins, deadline-wins, and synthetic-default input selection in single send, buffered fan-out, and streamed error chunks; no adapter emits a bare un-attributed timeout **for an EdgeZero-owned budget timer**. Spin separately proves that an early WASI provider timeout is 504 with `BudgetSource::Unspecified`, while an error observed at/after absolute expiry is attributed to the selected budget. Fastly proves configured connection/response phase timers retain the selected cause, an early unconfigured DNS timeout is `Unspecified`, and absolute expiry wins every simultaneous result. |
-| Fastly stages | Backend identity/canonical host/TLS/SNI inputs, phase-timer rounding, cold registration, serial harvest, and streamed-upload cooperative checks match §4.3. The feature-gated overhead seam proves the slack invariant. `SendFailure` distinguishes budgeted phase timeout from unconfigured provider timeout; both map to 504, with the exact provenance boundary above. Transport -> 502 reason `Transport`, upstream protocol -> 502 reason `Protocol`, unknown/registration rejection -> 502 reason `Unspecified`, local invariants -> 500, and the separately named Fastly platform-internal class -> 500. SDK-gated in-crate tests construct every known `SendErrorCause` and assert both `cause_to_failure` and composed status/kind/reason, including before/at/after deadline provenance; the Fastly WASM `--lib` gate executes them. Only hypothetical future variants remain compile/review coverage. |
+| Fastly stages | Backend identity/canonical host/TLS/SNI inputs, phase-timer rounding, cold registration, serial harvest, and streamed-upload cooperative checks match §4.3. The feature-gated overhead seam proves the slack invariant. `SendFailure` distinguishes budgeted phase timeout from unconfigured provider timeout; both map to 504, with the exact provenance boundary above. Pre-response DNS/connect/TLS establishment -> 502 reason `Unreachable`, later transport -> 502 reason `Transport`, upstream protocol -> 502 reason `Protocol`, unknown/registration rejection -> 502 reason `Unspecified`, local invariants -> 500, and the separately named Fastly platform-internal class -> 500. SDK-gated in-crate tests construct every known `SendErrorCause` and assert both `cause_to_failure` and composed status/kind/reason, including before/at/after deadline provenance; the Fastly WASM `--lib` gate executes them. Only hypothetical future variants remain compile/review coverage. |
 | Fastly upload finalization | Empty-source EOF and multi-chunk success call `finish()` exactly once before response wait. Source/cap failure and pre-finish expiry drop both handles without finishing; a typed source error is preserved. Write/flush/finish errors within budget are 502; success or failure returning at expiry is attributed 504. A finish failure or post-finish expiry never waits on `PendingRequest`, and dropping the send future settles its owned handles without successful finalization. Tests use the production upload driver with a scripted writer/pending-handle seam; they do not claim a finite host-write bound. |
 | Spin request protocol | Exercise every `run_exchange` transition and ownership boundary: after full upload, `send` continues to be polled but a ready result is retained until `request_done` succeeds; a `request_done` error wins over that stored result and is mapped; reader-gone retains but never polls `request_done` until `send` resolves, then drops it before response conversion; send-first drops all request handles; clean EOF/reader-gone writes `Ok(None)` trailers; source/cap/deadline failure leaves the default `Err`. Biased simultaneous readiness makes an already-ready pump failure beat `send`, while send ready before a later source failure remains authoritative. An always-ready empty-chunk source yields between chunks so send/timer polling cannot starve, and no request-side handle enters a streamed response wrapper. The target-neutral injected RequestOptions suite covers all setters accepted, any setter NotSupported (warn once and retain the outer race), Immutable, and Other. The real SDK-resource suite invokes each setter and asserts only the pinned host's actual result. |
 | Spin response protocol | `consume_body` receives the caller-result reader; stream/trailer handles retain the writer; clean EOF/trailers writes `Ok`; body/decode/deadline failure writes or defaults to `Err`; no handle is dropped before its terminal branch. Ready-empty raw input and continuously ready decoded output hit finite input/output quotas, return `Pending`, poll the outer timer/siblings, and retain counters across calls. |
-| Spin error classifier | Enumerate every pinned `ErrorCode` with no wildcard. At/after absolute expiry every simultaneous SDK result -> attributed 504. Before expiry, the five provider timeout variants -> 504 with `BudgetSource::Unspecified`; caller-controlled request denied/body/URI/header-size variants -> 400; demonstrated length/method/URI/trailer/config invariants -> 500; DNS/TLS/connection -> 502 reason `Transport`; upstream response framing/protocol -> 502 reason `Protocol`; host `InternalError`/forced future fallback -> 502 reason `Unspecified`. Shared decode failures separately assert `Decode`. Test the three actual `ErrorCode` sites: `client::send`, `request_done`, and the response trailers/completion future. Test component-stream termination and caller-result `FutureWriteError` through their distinct policies; synthetic setter outcomes stay in the injected suite because the real host controls them. |
+| Spin error classifier | Enumerate every pinned `ErrorCode` with no wildcard. At/after absolute expiry every simultaneous SDK result -> attributed 504. Before expiry, the five provider timeout variants -> 504 with `BudgetSource::Unspecified`; caller-controlled request denied/body/URI/header-size variants -> 400; demonstrated length/method/URI/trailer/config invariants -> 500; pre-response DNS/connect/TLS establishment -> 502 reason `Unreachable`; later connection/read/write failure -> 502 reason `Transport`; upstream response framing/protocol -> 502 reason `Protocol`; host `InternalError`/forced future fallback -> 502 reason `Unspecified`. Shared decode failures separately assert the exact coding reason. Test the three actual `ErrorCode` sites: `client::send`, `request_done`, and the response trailers/completion future. Test component-stream termination and caller-result `FutureWriteError` through their distinct policies; synthetic setter outcomes stay in the injected suite because the real host controls them. |
 | Spin timer | Timer selection returns guest-visible 504 and drops owned guest handles. Tests do **not** claim bounded host teardown; that remains Tier 3 characterization and an upgrade criterion. |
 | Simultaneous terminal race | For decoder, transport, and Spin exchange seams, a result becoming ready at the absolute deadline yields attributed 504 whether the competing result is success or error. |
 | CLI runtime gates | Table-drive every constructible ladder state: required Native/BoundedCooperative succeeds; required BestEffort/Unsupported fails; optional degradation warns and proceeds. Cover missing-registry empty, optional-only, and required manifests; `ManifestContract::None` proceeds while Malformed fails closed. Normal CLI compilation matches core's non-exhaustive `CapabilitySupport` and `ManifestContract` across the crate boundary and therefore requires wildcard arms; review asserts that required-support and contract wildcards return errors, while the optional-support wildcard warns. Hypothetical future variants are not fabricated with unsafe runtime construction. Build/serve/deploy/deploy-staged gate before shell dispatch through both `execute_runtime` and `execute_capture_runtime`, and demo gates before startup. Auth/version/healthcheck/rollback remain on the existing exempt dispatcher and never construct `ResolvedRuntime`. Both outbound-scoped dispatchers derive adapter/action from the owned runtime, so no caller-supplied identity can diverge between gate and side effect. Provision/config commands are outside this spec and are not asserted. |
@@ -6141,8 +6337,8 @@ runtime. `scripts/run_test_nonzero.sh [--ignored] <sentinel> <command...>` lists
 suite first, requires the exact sentinel and at least one listed test, then runs the same
 selection; every native/WASM/SDK-resource/CLI suite in CI uses it. Workerd/deployed probes
 instead require exact probe IDs plus a positive summary count in their own driver. These
-gates become runnable as the features and test modules land, not in the docs-only
-PR or Phase 1a. Extend the existing WASM contract matrix's feature argument to
+gates become runnable as the features and test modules land, not in the design/Phase 1a
+change set. Extend the existing WASM contract matrix's feature argument to
 `--features "${{ matrix.adapter }},test-utils"`. Retain the Cloudflare and Fastly target
 and runner settings. **Spin's bare `wasmtime run` is not an SDK-resource execution gate.**
 Pinned Wasmtime 44.0.1 requires `-S http=y` and `-S p3=y` to register Preview 3 HTTP imports
@@ -6279,12 +6475,12 @@ Outbound-facing changes:
   `GatewayTimeout { cause: BudgetSource }`, and
   `ResponseTooLarge { reason: ResponseLimitReason }`. Their JSON wire shape remains the
   existing error envelope and does not serialize any reason/provenance field.
-- `Manifest` gains the seven outbound capabilities and
+- `Manifest` gains the eight outbound capabilities and
   `[capabilities.outbound].hosts`. Existing non-outbound capability and store schemas are
   unchanged. The depth-independent misplaced-`capabilities` rejection is intentionally
   fail-closed.
 - `Adapter` gains the defaulted `capability()` method. Each in-tree adapter returns all
-  seven matrix values and ends its non-exhaustive match with
+  eight matrix values and ends its non-exhaustive match with
   `_ => CapabilitySupport::Unsupported`.
 - Capability enforcement uses outbound-scoped `execute_runtime(..)` and
   `execute_capture_runtime(..)`, which share one helper that gates `build` / `serve` / `deploy` /
@@ -6301,7 +6497,7 @@ Outbound-facing changes:
   because Fastly's service entitlement is not statically provable; single-target apps may
   declare it required on an adapter whose matrix cell satisfies the gate.
   Spin's generated platform manifest consumes the canonical outbound host list.
-- `docs/guide/capabilities.md` documents all seven outbound capabilities, the support
+- `docs/guide/capabilities.md` documents all eight outbound capabilities, the support
   matrix, and each BestEffort caveat, and is linked from the VitePress sidebar because
   runtime diagnostics point to that published page.
 
@@ -6324,11 +6520,13 @@ the durable anchors.
 
 - `src/lib.rs` exports `body`, `compression`, `outbound`, and `time`, plus root re-exports
   `BodyStream`, `ContentEncoding`, `Deadline`, `DispatchBudget`, `HttpClient`, `OutboundHttpClient`,
-  `OutboundRequest`, `OutboundResponse`, `ResponseBodyDisposition`, `ResponseMode`,
-  `classify_content_encoding`, `decode_brotli_stream`, `decode_gzip_stream`,
+  `OutboundRequest`, `OutboundResponse`, `OutboundSlotResult`, `ResponseBodyDisposition`,
+  `ResponseHeaderLimiter`, `ResponseMode`, `BROTLI_DECODER_FIXED_CHARGE_BYTES`,
+  `brotli_decoder_memory_charge`, `classify_content_encoding`, `collect_response_stream`,
+  `decode_brotli_stream`, `decode_gzip_stream`,
   `dispatch_budget`,
-  `enforce_payload_content_length`, `enforce_response_header_limits`,
-  `gate_brotli_window`, `limit_encoded_stream`, `normalize_response_headers`,
+  `enforce_payload_content_length`, `limit_decoded_stream`, `limit_encoded_stream`,
+  `normalize_response_headers`,
   `rechunk_stream`, `validate_for_dispatch`, and the outbound capability types; remove proxy exports. Adapter crates
   use these root re-exports as their stable import surface.
 - `src/proxy.rs` becomes `src/outbound.rs`. It owns request construction and
@@ -6367,7 +6565,7 @@ the durable anchors.
   this specification; any local test fixture affected by the global `Body::from_stream`
   signature change switches to the appropriate explicit constructor without changing
   behavior.
-- `src/manifest.rs` adds the seven outbound capabilities,
+- `src/manifest.rs` adds the eight outbound capabilities,
   `ManifestCapabilities`, `ManifestOutboundCapability`, host validation, misplaced
   nested-`capabilities` rejection, and the three-state baked-manifest contract.
   Runtime and baked parse paths run the same validation/finalization logic.
@@ -6388,7 +6586,7 @@ the durable anchors.
   `edgezero-core`. This creates no cycle: core depends on macros, while neither core nor
   macros depends on `edgezero-adapter`.
 - `src/registry.rs` adds the defaulted `Adapter::capability()` method. In-tree
-  overrides return all seven outbound matrix cells and use a final
+  overrides return all eight outbound matrix cells and use a final
   `_ => Unsupported` arm for the non-exhaustive enum. Update the trait rustdoc that
   currently promises the crate remains dependency-free from core. No store/provision
   API changes belong to this spec.
@@ -6406,7 +6604,7 @@ the durable anchors.
 - Rename each outbound provider module/client from `proxy` / `*ProxyClient` to
   `outbound` / `*OutboundClient`; implement both response modes, request preflight,
   method-aware `OutboundResponse` construction, request and response normalization,
-  decompressed-byte caps, typed decoder errors, and the exact seven outbound-cell
+  independent encoded/decoded/final-buffer caps, typed decoder errors, and the exact eight outbound-cell
   capability tuple. Before the native request consumes `OutboundRequestParts`, retain the
   originating method, response mode, and every response-resource setting in the owned
   response-conversion state; no adapter may reconstruct or default those values after send.
@@ -6514,7 +6712,7 @@ Adapter-specific work:
   promote it to `required` when its selected adapter satisfies the matrix. Spin's generated
   platform manifest renders the canonical outbound host list.
 - Update public proxying, handler, architecture, streaming, and adapter docs. Add
-  `docs/guide/capabilities.md` with all seven outbound capabilities and sidebar
+  `docs/guide/capabilities.md` with all eight outbound capabilities and sidebar
   navigation.
 - Build one generated project and the excluded `examples/app-demo` workspace so
   template/example drift cannot hide behind the root workspace build. The generated
@@ -6540,7 +6738,7 @@ Adapter-specific work:
 - Required local gates are the repository `CLAUDE.md` commands, all adapter WASM
   target checks, the generated-project compile plus explicit nonzero core-test execution,
   and the app-demo build. Phase 7 adds deterministic legacy-API and published-capability
-  document checks; the latter compares all seven rows/support values and requires exactly
+  document checks; the latter compares all eight rows/support values and requires exactly
   one VitePress sidebar link. Documentation-only edits use Markdown/link/diff verification
   rather than rebuilding Rust.
 
@@ -6622,7 +6820,7 @@ Adapter-specific work:
     this documentation-only cleanup is not a prerequisite for the outbound design.
 11. **Per-batch transient-memory cap against adversarial chunking — PARTIALLY
     RESOLVED.** §3.4.1's
-    `sizeof(current_chunk)` term is source-controlled — an upstream peer that
+    `current_chunk.len()` term is source-controlled — an upstream peer that
     yields one large `Bytes` produces a transient resident footprint equal to
     that chunk size plus the persistent buffer cap. The design now includes opt-in
     `OutboundRequest::max_chunk_bytes(NonZeroU64)` and a lazy consumer-side rechunker
