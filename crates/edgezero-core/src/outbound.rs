@@ -16,8 +16,8 @@ use crate::body::{Body, BodyStream};
 use crate::compression::ContentEncoding;
 use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError, ResponseLimitReason};
 use crate::http::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
-    TRAILER, TRANSFER_ENCODING, UPGRADE,
+    CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, PROXY_AUTHENTICATE,
+    PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use crate::http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
@@ -108,6 +108,14 @@ pub struct OutboundResponse {
 pub struct OutboundSlotResult {
     pub elapsed: Duration,
     pub outcome: Result<OutboundResponse, EdgeError>,
+}
+
+impl OutboundSlotResult {
+    #[must_use]
+    #[inline]
+    pub fn new(elapsed: Duration, outcome: Result<OutboundResponse, EdgeError>) -> Self {
+        Self { elapsed, outcome }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1087,8 +1095,11 @@ fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>, EdgeError> {
         if raw.contains(',') {
             return Err(protocol_content_length());
         }
-        let length = raw
-            .trim()
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(protocol_content_length());
+        }
+        let length = trimmed
             .parse::<u64>()
             .map_err(|_error| protocol_content_length())?;
         if parsed.is_some_and(|previous| previous != length) {
@@ -1113,7 +1124,10 @@ fn response_limit_error(reason: ResponseLimitReason) -> EdgeError {
 fn retain_utf8_header_values(headers: &mut HeaderMap, response: bool) {
     let mut retained = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers.iter() {
-        if name != CONNECTION && str::from_utf8(value.as_bytes()).is_err() {
+        if name != CONNECTION
+            && name != CONTENT_ENCODING
+            && str::from_utf8(value.as_bytes()).is_err()
+        {
             if response {
                 log::warn!("dropping non-UTF-8 outbound response header: {name}");
             } else {
@@ -1207,7 +1221,7 @@ mod tests {
     use futures_util::{StreamExt as _, stream};
 
     use crate::body::Body;
-    use crate::compression::ContentEncoding;
+    use crate::compression::{ContentEncoding, classify_content_encoding};
     use crate::error::{BudgetSource, EdgeError, ResponseLimitReason};
     use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, request_builder};
     use crate::time::{
@@ -1595,7 +1609,7 @@ mod tests {
             }
         ));
 
-        for value in ["bad", "1, 1"] {
+        for value in ["", "+1", "-1", "bad", "1, 1"] {
             let mut headers = HeaderMap::new();
             headers.append(
                 "content-length",
@@ -1817,6 +1831,26 @@ mod tests {
         assert!(nominated.get("content-encoding").is_none());
         assert!(nominated.get("content-length").is_none());
         assert!(nominated.get("keep-alive").is_none());
+
+        let mut ambiguous_encoding = HeaderMap::new();
+        ambiguous_encoding.append("content-encoding", HeaderValue::from_static("gzip"));
+        ambiguous_encoding.append(
+            "content-encoding",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header value"),
+        );
+        normalize_response_headers(&Method::GET, StatusCode::OK, &mut ambiguous_encoding)
+            .expect("invalid encoding sibling must remain visible to classification");
+        assert_eq!(
+            classify_content_encoding(&ambiguous_encoding),
+            ContentEncoding::Passthrough
+        );
+        assert_eq!(
+            ambiguous_encoding
+                .get_all("content-encoding")
+                .iter()
+                .count(),
+            2
+        );
 
         for malformed in ["x-good,,x-other", "bad name", ",x-good", "x-good,"] {
             let mut headers = HeaderMap::new();

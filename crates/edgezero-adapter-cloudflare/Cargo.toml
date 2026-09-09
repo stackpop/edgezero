@@ -22,6 +22,7 @@ cli = [
     "dep:toml_edit",
     "dep:walkdir",
 ]
+test-utils = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -40,7 +41,8 @@ ctor = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 toml_edit = { workspace = true, optional = true }
-worker = { version = "0.8", default-features = false, features = ["http"], optional = true }
+web-time = { workspace = true }
+worker = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]

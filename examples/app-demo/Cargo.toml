@@ -45,7 +45,7 @@ simple_logger = "4"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
-worker = { version = "0.8", default-features = false, features = ["http"] }
+worker = { version = "=0.8.3", default-features = false, features = ["http"] }
 
 [profile.release]
 debug = 1
