@@ -18,8 +18,6 @@ pub mod logger;
 #[cfg(any(feature = "test-utils", feature = "fastly"))]
 pub mod outbound;
 #[cfg(feature = "fastly")]
-pub mod proxy;
-#[cfg(feature = "fastly")]
 pub mod request;
 #[cfg(feature = "fastly")]
 pub mod response;

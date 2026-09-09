@@ -3,7 +3,6 @@ use crate::error::EdgeError;
 use crate::http::Request;
 use crate::outbound::HttpClient;
 use crate::params::PathParams;
-use crate::proxy::ProxyHandle;
 use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
     KvRegistry, SecretRegistry, StoreRegistry,
@@ -171,11 +170,6 @@ impl RequestContext {
         &self.path_params
     }
 
-    #[inline]
-    pub fn proxy_handle(&self) -> Option<ProxyHandle> {
-        self.request.extensions().get::<ProxyHandle>().cloned()
-    }
-
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the query string cannot be deserialized into `T`.
     #[inline]
@@ -226,12 +220,11 @@ impl RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{HeaderValue, Method, StatusCode, Uri, request_builder};
+    use crate::http::{HeaderValue, Method, StatusCode, request_builder};
     use crate::outbound::{
         HttpClient, OutboundHttpClient, OutboundRequest, OutboundResponse, OutboundSlotResult,
     };
     use crate::params::PathParams;
-    use crate::proxy::{ProxyClient, ProxyHandle, ProxyRequest, ProxyResponse};
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::executor::block_on;
@@ -239,20 +232,11 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
-    struct DummyClient;
-
     struct DummyOutboundClient;
 
     #[derive(Debug, PartialEq, Deserialize, Serialize)]
     struct PathData {
         id: String,
-    }
-
-    #[async_trait(?Send)]
-    impl ProxyClient for DummyClient {
-        async fn send(&self, _request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
-            Ok(ProxyResponse::new(StatusCode::OK, Body::empty()))
-        }
     }
 
     #[async_trait(?Send)]
@@ -434,29 +418,6 @@ mod tests {
         assert_eq!(parsed, PathData { id: "42".into() });
         let serialized = serde_json::to_string(&parsed).expect("serialize");
         assert!(serialized.contains("42"));
-    }
-
-    #[test]
-    fn proxy_handle_forwards_with_dummy_client() {
-        let handle = ProxyHandle::with_client(DummyClient);
-        let request = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
-        let response = block_on(handle.forward(request)).expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[test]
-    fn proxy_handle_is_retrieved_when_present() {
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/proxy")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(ProxyHandle::with_client(DummyClient));
-
-        let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.proxy_handle().is_some());
     }
 
     #[test]

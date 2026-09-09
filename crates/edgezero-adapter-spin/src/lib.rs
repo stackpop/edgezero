@@ -16,8 +16,6 @@ mod kv_pagination;
 #[cfg(any(feature = "test-utils", all(feature = "spin", target_arch = "wasm32")))]
 pub mod outbound;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub mod proxy;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub mod request;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub mod response;

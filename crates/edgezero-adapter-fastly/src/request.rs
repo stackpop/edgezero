@@ -11,7 +11,6 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request, request_builder};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
-use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
@@ -24,7 +23,6 @@ use crate::config_store::FastlyConfigStore;
 use crate::context::FastlyRequestContext;
 use crate::key_value_store::FastlyKvStore;
 use crate::outbound::FastlyOutboundClient;
-use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
 use crate::secret_store::FastlySecretStore;
 
@@ -511,9 +509,6 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
         client_ip: req.get_client_ip_addr(),
     };
     FastlyRequestContext::insert(&mut request, context);
-    request
-        .extensions_mut()
-        .insert(ProxyHandle::with_client(FastlyProxyClient));
     request
         .extensions_mut()
         .insert(HttpClient::with_client(FastlyOutboundClient::new()));

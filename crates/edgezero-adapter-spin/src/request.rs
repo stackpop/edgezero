@@ -7,7 +7,6 @@ use crate::SpinFullResponse;
 use crate::config_store::SpinConfigStore;
 use crate::context::{SpinRequestContext, parse_client_addr};
 use crate::key_value_store::{DEFAULT_MAX_LIST_KEYS, SpinKvStore};
-use crate::proxy::SpinProxyClient;
 use crate::response::from_core_response;
 use crate::secret_store::SpinSecretStore;
 use edgezero_core::app::{App, StoreMetadata};
@@ -18,7 +17,6 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request, request_builder};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
-use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
@@ -45,7 +43,7 @@ pub(crate) struct Stores {
 /// Convert a Spin `Request` into an `EdgeZero` core `Request`.
 ///
 /// Reads the full body into a buffered `Body::Once`, inserts
-/// `SpinRequestContext` and a `ProxyHandle` into extensions.
+/// `SpinRequestContext` and an outbound [`HttpClient`] into extensions.
 ///
 /// # Errors
 /// Returns [`EdgeError::bad_request`] if the request body cannot be read or
@@ -90,9 +88,6 @@ pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
             full_url,
         },
     );
-    request
-        .extensions_mut()
-        .insert(ProxyHandle::with_client(SpinProxyClient));
     request
         .extensions_mut()
         .insert(HttpClient::with_client(SpinOutboundClient));
