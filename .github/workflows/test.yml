@@ -35,7 +35,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust tool chain
@@ -55,6 +55,14 @@ jobs:
       - name: No legacy typed reads
         run: ./scripts/check_no_legacy_typed_reads.sh
 
+      # These roots are the active API surface. Historical design and plan
+      # documents under docs/superpowers intentionally remain immutable.
+      - name: No legacy outbound API
+        run: bash scripts/check_outbound_legacy_api.sh
+
+      - name: Outbound documentation contract
+        run: node scripts/check_outbound_docs_contract.mjs
+
       - name: Nested AppConfig audit
         run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
 
@@ -68,6 +76,13 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 
+      - name: Run native outbound adapter contracts
+        run: |
+          scripts/run_test_nonzero.sh send_all_preflight_precedence_and_indices cargo test --offline --locked -p edgezero-adapter-axum --no-default-features --features axum,test-utils --test contract
+          scripts/run_test_nonzero.sh send_all_preflight_precedence_and_indices cargo test --offline --locked -p edgezero-adapter-cloudflare --no-default-features --features test-utils --test contract
+          scripts/run_test_nonzero.sh send_all_dispatches_every_slot_before_wait cargo test --offline --locked -p edgezero-adapter-fastly --no-default-features --features test-utils --test contract
+          scripts/run_test_nonzero.sh send_all_preflight_precedence_and_indices cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features test-utils --test contract
+
       # The adapter CLI dispatch (build/deploy/stage/healthcheck/rollback) and
       # its tests live behind the `cli` feature, which the unfeatured
       # `cargo test --workspace` step above does not enable — so none of those
@@ -75,11 +90,18 @@ jobs:
       - name: Adapter CLI dispatch tests
         run: cargo test -p edgezero-adapter-fastly --all-targets --features cli
 
+      - name: Verify exact outbound capability matrices
+        run: |
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-axum --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-cloudflare --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-fastly --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
+
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
       - name: Verify a generated project compiles
-        run: cargo test -p edgezero-cli --test generated_project_builds -- --ignored
+        run: scripts/run_test_nonzero.sh --ignored generated_workspace_compiles cargo test --offline --locked -p edgezero-cli --test generated_project_builds
 
       # `examples/app-demo` is excluded from the root workspace, so
       # `cargo test --workspace` above does not cover it. Run its own
@@ -101,6 +123,13 @@ jobs:
         working-directory: examples/app-demo
         run: cargo test --locked --workspace --all-targets
 
+      - name: Check app-demo wasm targets
+        working-directory: examples/app-demo
+        run: |
+          cargo check --locked -p app-demo-adapter-cloudflare --target wasm32-unknown-unknown --no-default-features --features cloudflare
+          cargo check --locked -p app-demo-adapter-fastly --target wasm32-wasip1 --no-default-features --features fastly
+          cargo check --locked -p app-demo-adapter-spin --target wasm32-wasip2 --no-default-features --features spin
+
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests
     runs-on: ubuntu-latest
@@ -112,14 +141,17 @@ jobs:
             target: wasm32-unknown-unknown
             runner_env: CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER
             runner_value: wasm-bindgen-test-runner
+            sentinel: dispatch_runs_router_and_returns_response
           - adapter: fastly
             target: wasm32-wasip1
             runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
             runner_value: viceroy run
+            sentinel: dispatch_runs_router_and_returns_response
           - adapter: spin
             target: wasm32-wasip2
             runner_env: CARGO_TARGET_WASM32_WASIP2_RUNNER
             runner_value: wasmtime run -W component-model-async=y -S p3=y -S http=y
+            sentinel: router_dispatches_get_and_returns_response
     steps:
       - uses: actions/checkout@v6
 
@@ -139,7 +171,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust tool chain
@@ -235,13 +267,13 @@ jobs:
       - name: Run ${{ matrix.adapter }} wasm tests
         env:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
-        run: cargo test -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --test contract
+        run: scripts/run_test_nonzero.sh ${{ matrix.sentinel }} cargo test --offline --locked -p edgezero-adapter-${{ matrix.adapter }} --no-default-features --features ${{ matrix.adapter }},test-utils --target ${{ matrix.target }} --test contract
 
       - name: Run Spin WASI HTTP SDK resource tests
         if: matrix.adapter == 'spin'
         env:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
-        run: scripts/run_test_nonzero.sh sdk_fields_preserve_duplicate_values cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features spin,test-utils --target wasm32-wasip2 --test sdk_resources
+        run: scripts/run_test_nonzero.sh spin_error_code_table_is_exhaustive cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features spin,test-utils --target wasm32-wasip2 --test sdk_resources
 
       # The colocated runtime unit tests (config-store resolver, chunk
       # remediation) need the `fastly` feature and only RUN under Viceroy — the
@@ -251,7 +283,8 @@ jobs:
         if: matrix.adapter == 'fastly'
         env:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
-        run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --lib
+        working-directory: crates/edgezero-adapter-fastly
+        run: ../../scripts/run_test_nonzero.sh backend_creation_error_table_is_exhaustive cargo test --offline --locked --no-default-features --features fastly,test-utils --lib
 
       - name: Check ${{ matrix.adapter }} wasm target
-        run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}
+        run: cargo check --offline --locked -p edgezero-adapter-${{ matrix.adapter }} --no-default-features --features ${{ matrix.adapter }} --target ${{ matrix.target }}

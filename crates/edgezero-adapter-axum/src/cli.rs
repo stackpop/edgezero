@@ -761,6 +761,43 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn adapter_capability_matrix_matches_outbound_spec() {
+        let expected = [
+            (Capability::OutboundHttp, CapabilitySupport::Native),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::Native),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::Native,
+            ),
+            (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::BestEffort,
+            ),
+        ];
+
+        for (capability, support) in expected {
+            assert_eq!(
+                AXUM_ADAPTER.capability(capability),
+                support,
+                "{capability:?}"
+            );
+        }
+    }
+
+    #[test]
     fn read_axum_project_loads_defaults() {
         let dir = tempdir().unwrap();
         let root = dir.path();

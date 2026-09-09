@@ -47,7 +47,7 @@ mod fastly_impl {
     use futures_util::StreamExt as _;
     use sha2::{Digest as _, Sha256};
 
-    use super::{timeout_error, validate_batch_request};
+    use super::{dispatch_all_before_wait, timeout_error, validate_batch_request};
 
     pub const DYNAMIC_BACKENDS_DISABLED_MESSAGE: &str = "Fastly dynamic backends are not enabled on this service; enable them in the service configuration";
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
@@ -332,17 +332,18 @@ mod fastly_impl {
         #[inline]
         async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
             let batch_started_at = MonotonicInstant::now();
-            let mut slots: Vec<Slot> = requests
-                .into_iter()
-                .map(|request| {
-                    self.prepare_batch(request, batch_started_at)
-                        .and_then(Self::dispatch_batch_slot)
-                        .map_or_else(
-                            |error| Slot::Done(finish_slot(batch_started_at, Err(error))),
-                            |pending| Slot::Pending(Box::new(pending)),
-                        )
-                })
-                .collect();
+            let mut slots: Vec<Slot> = dispatch_all_before_wait(requests, |request| {
+                self.prepare_batch(request, batch_started_at)
+                    .and_then(Self::dispatch_batch_slot)
+            })
+            .into_iter()
+            .map(|result| {
+                result.map_or_else(
+                    |error| Slot::Done(finish_slot(batch_started_at, Err(error))),
+                    |pending| Slot::Pending(Box::new(pending)),
+                )
+            })
+            .collect();
 
             for index in 0..slots.len() {
                 let Some(slot) = slots.get_mut(index) else {
@@ -933,6 +934,13 @@ mod fastly_impl {
 #[cfg(feature = "fastly")]
 pub use fastly_impl::{DYNAMIC_BACKENDS_DISABLED_MESSAGE, FastlyOutboundClient};
 
+fn dispatch_all_before_wait<Item, Pending, Failure>(
+    items: impl IntoIterator<Item = Item>,
+    dispatch: impl FnMut(Item) -> Result<Pending, Failure>,
+) -> Vec<Result<Pending, Failure>> {
+    items.into_iter().map(dispatch).collect()
+}
+
 fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_for_dispatch(request)?;
     if request.is_stream_body() {
@@ -956,6 +964,16 @@ fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
 #[inline]
 pub fn validate_batch_request_for_test(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_batch_request(request)
+}
+
+/// Runs the same eager dispatch phase used by Fastly production batching.
+#[cfg(feature = "test-utils")]
+#[inline]
+pub fn dispatch_all_before_wait_for_test<Item, Pending, Failure>(
+    items: impl IntoIterator<Item = Item>,
+    dispatch: impl FnMut(Item) -> Result<Pending, Failure>,
+) -> Vec<Result<Pending, Failure>> {
+    dispatch_all_before_wait(items, dispatch)
 }
 
 #[cfg(feature = "fastly")]

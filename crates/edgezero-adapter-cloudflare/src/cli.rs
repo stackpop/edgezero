@@ -1223,6 +1223,43 @@ mod tests {
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
 
+    #[test]
+    fn adapter_capability_matrix_matches_outbound_spec() {
+        let expected = [
+            (Capability::OutboundHttp, CapabilitySupport::Native),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::Native),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::Native,
+            ),
+            (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::Native,
+            ),
+        ];
+
+        for (capability, support) in expected {
+            assert_eq!(
+                CLOUDFLARE_ADAPTER.capability(capability),
+                support,
+                "{capability:?}"
+            );
+        }
+    }
+
     // ---------- extract_namespace_id ----------
 
     #[test]

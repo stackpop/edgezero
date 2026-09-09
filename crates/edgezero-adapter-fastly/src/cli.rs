@@ -5649,28 +5649,43 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn outbound_capability_matrix_is_honest() {
-        assert_eq!(
-            FASTLY_ADAPTER.capability(Capability::OutboundHeaderFidelity),
-            CapabilitySupport::Native
-        );
-        for capability in [
-            Capability::LazyStreamedResponsePassthrough,
-            Capability::OutboundDeadlines,
-            Capability::OutboundFlexiblePhaseBudget,
-            Capability::OutboundHttp,
-            Capability::SendAllSlotIsolation,
-            Capability::StreamedUploadDeadlines,
-        ] {
+    fn adapter_capability_matrix_matches_outbound_spec() {
+        let expected = [
+            (Capability::OutboundHttp, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::SendAllSlotIsolation,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::BestEffort,
+            ),
+        ];
+
+        for (capability, support) in expected {
             assert_eq!(
                 FASTLY_ADAPTER.capability(capability),
-                CapabilitySupport::BestEffort
+                support,
+                "{capability:?}"
             );
         }
-        assert_eq!(
-            FASTLY_ADAPTER.capability(Capability::OutboundCompleteResourceAccounting),
-            CapabilitySupport::Unsupported
-        );
     }
 
     // Shared fixture names. Pinning these as consts (instead of
