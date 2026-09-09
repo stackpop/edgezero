@@ -28,6 +28,8 @@ use crate::time::Deadline;
 pub const DEFAULT_MAX_BROTLI_DECODER_BYTES: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_OUTBOUND_REQUEST_BODY_BYTES: u64 = 8 * 1024 * 1024;
+/// Response header identifying the adapter that completed an outbound request.
+pub const PROXY_HEADER: &str = "x-edgezero-proxy";
 
 #[derive(Clone, Copy)]
 pub(crate) struct BudgetInputs {

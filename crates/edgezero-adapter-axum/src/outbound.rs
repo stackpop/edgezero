@@ -12,7 +12,7 @@ use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LEN
 use edgezero_core::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use edgezero_core::outbound::{
     OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
-    OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
+    OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
     collect_response_stream, enforce_payload_content_length, limit_decoded_stream,
     limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
     validate_for_dispatch,
@@ -302,6 +302,7 @@ async fn process_response(
         ResponseHeaderLimiter::new(max_response_header_bytes, max_response_header_count);
     header_limiter.observe(&headers)?;
     let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
+    headers.insert(PROXY_HEADER, HeaderValue::from_static("axum"));
 
     if disposition == ResponseBodyDisposition::FramingBodyless {
         return Ok(OutboundResponse::new(

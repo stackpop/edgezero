@@ -19,10 +19,10 @@ mod worker_impl {
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
     use edgezero_core::outbound::{
         OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
-        OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
-        collect_response_stream, enforce_payload_content_length, limit_decoded_stream,
-        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
-        validate_for_dispatch,
+        OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition, ResponseHeaderLimiter,
+        ResponseMode, collect_response_stream, enforce_payload_content_length,
+        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
+        normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
     use edgezero_core::time::{DispatchBudget, MonotonicInstant, dispatch_budget};
     use futures_util::StreamExt as _;
@@ -310,6 +310,7 @@ mod worker_impl {
             ResponseHeaderLimiter::new(max_response_header_bytes, max_response_header_count);
         header_limiter.observe(&headers)?;
         let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
+        headers.insert(PROXY_HEADER, HeaderValue::from_static("cloudflare"));
 
         if disposition == ResponseBodyDisposition::FramingBodyless {
             return Ok(OutboundResponse::new(
