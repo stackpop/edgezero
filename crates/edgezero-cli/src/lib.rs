@@ -32,6 +32,8 @@ mod diff;
 #[cfg(feature = "cli")]
 mod generator;
 #[cfg(feature = "cli")]
+mod manifest_source;
+#[cfg(feature = "cli")]
 mod provision;
 #[cfg(feature = "cli")]
 mod scaffold;
@@ -61,7 +63,7 @@ use args::{
 #[cfg(any(test, feature = "demo-example"))]
 use edgezero_core::app::Hooks;
 #[cfg(feature = "cli")]
-use edgezero_core::manifest::{ManifestContract, ManifestLoader};
+use edgezero_core::manifest::{Manifest, ManifestLoader};
 #[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
@@ -140,21 +142,11 @@ pub fn init_cli_logger() {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_build(args: &BuildArgs) -> Result<(), String> {
-    let manifest = load_manifest_optional()?;
-    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
-    adapter::ensure_capabilities(
-        &args.adapter,
-        ManifestContract::from_opt(manifest.as_ref().map(ManifestLoader::manifest)),
-    )?;
-    if let Some(loader) = &manifest {
-        log_store_bindings(&args.adapter, loader);
+    let runtime = manifest_source::resolve_runtime(&args.adapter, adapter::Action::Build)?;
+    if let Some(manifest) = runtime.manifest() {
+        log_store_bindings(runtime.adapter_name(), manifest);
     }
-    adapter::execute(
-        &args.adapter,
-        adapter::Action::Build,
-        manifest.as_ref(),
-        &args.adapter_args,
-    )
+    adapter::execute_runtime(&runtime, &args.adapter_args)
 }
 
 /// Deploy the project to a target edge adapter.
@@ -187,13 +179,6 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         ));
     }
 
-    let manifest = load_manifest_optional()?;
-    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
-    adapter::ensure_capabilities(
-        &args.adapter,
-        ManifestContract::from_opt(manifest.as_ref().map(ManifestLoader::manifest)),
-    )?;
-
     // Thread `--service-id` into the adapter invocation
     // when provided, ahead of any operator passthrough args. Fastly
     // consumes it; adapters that don't need a service id ignore it.
@@ -202,6 +187,8 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     } else {
         adapter::Action::Deploy
     };
+    let runtime = manifest_source::resolve_runtime(&args.adapter, action)?;
+    let adapter_name = runtime.adapter_name().to_owned();
 
     let mut passthrough: Vec<String> = Vec::new();
     // Thread the manifest-configured platform manifest path (resolved
@@ -220,13 +207,6 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     // command already runs in the manifest root and picks its own
     // project directory. (Staged deploys are never manifest-declared
     // commands, so they always get the flag.)
-    if !adapter::has_manifest_command(manifest.as_ref(), &args.adapter, action)
-        && let Some(manifest_path) =
-            resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)?
-    {
-        passthrough.push("--manifest-path".to_owned());
-        passthrough.push(manifest_path);
-    }
     if let Some(service_id) = &args.service_id {
         passthrough.push("--service-id".to_owned());
         passthrough.push(service_id.clone());
@@ -239,8 +219,8 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         // adapter reads config usage from THIS list, never a remote probe —
         // avoiding a lookup that fails open. One inline token per store; the
         // adapter strips them before `fastly compute update`.
-        if let Some(loader) = manifest.as_ref()
-            && let Some(config) = loader.manifest().stores.config.as_ref()
+        if let Some(manifest) = runtime.manifest()
+            && let Some(config) = manifest.stores.config.as_ref()
         {
             for id in &config.ids {
                 passthrough.push(format!("--edgezero-staging-config={id}"));
@@ -250,12 +230,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         // package to a new draft, mark it staged, and emit the staged
         // version. Never runs the manifest `deploy`
         // command, which would activate production.
-        return adapter::execute(
-            &args.adapter,
-            adapter::Action::DeployStaged,
-            manifest.as_ref(),
-            &passthrough,
-        );
+        return adapter::execute_runtime(&runtime, &passthrough);
     }
 
     // Production deploy also emits the activated version
@@ -274,13 +249,8 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     //      (`EmitVersion`), which needs a live API + a real token.
     //   3. If BOTH fail: a clear `Err`. We never silently emit an empty
     //      version — that was the original bug.
-    if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
-        let captured = adapter::execute_capture(
-            &args.adapter,
-            adapter::Action::Deploy,
-            manifest.as_ref(),
-            &passthrough,
-        )?;
+    if args.service_id.is_some() && adapter_name.eq_ignore_ascii_case("fastly") {
+        let captured = adapter::execute_capture_runtime(&runtime, &passthrough)?;
         if let Some(version) = captured.as_deref().and_then(parse_deploy_version) {
             log::info!("version={version}");
             return Ok(());
@@ -293,9 +263,9 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         let mut emit_args = passthrough.clone();
         emit_args.push("--require-active".to_owned());
         return adapter::execute(
-            &args.adapter,
+            &adapter_name,
             adapter::Action::EmitVersion,
-            manifest.as_ref(),
+            None,
             &emit_args,
         )
         .map_err(|err| {
@@ -307,12 +277,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         });
     }
 
-    adapter::execute(
-        &args.adapter,
-        adapter::Action::Deploy,
-        manifest.as_ref(),
-        &passthrough,
-    )
+    adapter::execute_runtime(&runtime, &passthrough)
 }
 
 /// Parse an activated service version out of a deploy command's output.
@@ -398,6 +363,7 @@ fn parse_native_version_mention(output: &str) -> Option<u64> {
 /// required to be a regular file beneath the (canonicalized) manifest
 /// root, and any escape is a hard error.
 #[cfg(feature = "cli")]
+#[cfg(test)]
 fn resolve_adapter_manifest_path(
     loader: Option<&ManifestLoader>,
     adapter: &str,
@@ -572,18 +538,8 @@ pub fn run_active_version(args: &ActiveVersionArgs) -> Result<(), String> {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
-    let manifest = load_manifest_optional()?;
-    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
-    adapter::ensure_capabilities(
-        &args.adapter,
-        ManifestContract::from_opt(manifest.as_ref().map(ManifestLoader::manifest)),
-    )?;
-    adapter::execute(
-        &args.adapter,
-        adapter::Action::Serve,
-        manifest.as_ref(),
-        &[],
-    )
+    let runtime = manifest_source::resolve_runtime(&args.adapter, adapter::Action::Serve)?;
+    adapter::execute_runtime(&runtime, &[])
 }
 
 /// Create a new `EdgeZero` app skeleton.
@@ -617,9 +573,8 @@ fn demo_capability_gate<Application: Hooks>() -> Result<(), String> {
 }
 
 #[cfg(feature = "cli")]
-fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Option<String> {
-    let manifest_data = manifest.manifest();
-    if !manifest_data.secret_store_enabled(adapter_name) {
+fn store_bindings_message(adapter_name: &str, manifest: &Manifest) -> Option<String> {
+    if !manifest.secret_store_enabled(adapter_name) {
         return None;
     }
 
@@ -644,7 +599,7 @@ fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Opti
 }
 
 #[cfg(feature = "cli")]
-fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
+fn log_store_bindings(adapter_name: &str, manifest: &Manifest) {
     if let Some(message) = store_bindings_message(adapter_name, manifest) {
         log::info!("{message}");
     }
@@ -1116,19 +1071,20 @@ ids = ["MY_SECRETS"]
 "#,
         );
 
-        let axum = store_bindings_message("axum", &loader).expect("axum message");
+        let axum = store_bindings_message("axum", loader.manifest()).expect("axum message");
         assert!(axum.contains("environment variables"));
 
-        let cloudflare = store_bindings_message("cloudflare", &loader).expect("cloudflare message");
+        let cloudflare =
+            store_bindings_message("cloudflare", loader.manifest()).expect("cloudflare message");
         assert!(cloudflare.contains("wrangler"));
 
-        let fastly = store_bindings_message("fastly", &loader).expect("fastly message");
+        let fastly = store_bindings_message("fastly", loader.manifest()).expect("fastly message");
         assert!(fastly.contains("secrets enabled"));
     }
 
     #[test]
     fn store_bindings_message_is_absent_without_secret_store() {
         let loader = ManifestLoader::load_from_str("[app]\nname = \"x\"\n");
-        assert!(store_bindings_message("fastly", &loader).is_none());
+        assert!(store_bindings_message("fastly", loader.manifest()).is_none());
     }
 }
