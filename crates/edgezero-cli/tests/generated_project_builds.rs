@@ -19,6 +19,38 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, ExitStatus};
 
+    fn require_listed_test(output: &str, sentinel: &str) -> Result<(), String> {
+        let tests: Vec<_> = output
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix(": test"))
+            .collect();
+        if tests.is_empty() {
+            return Err("generated core test listing contained zero tests".to_owned());
+        }
+        let matches = tests
+            .iter()
+            .filter(|name| {
+                **name == sentinel
+                    || name
+                        .strip_suffix(sentinel)
+                        .is_some_and(|prefix| prefix.ends_with("::"))
+            })
+            .count();
+        if matches != 1 {
+            return Err(format!(
+                "expected exactly one generated `{sentinel}` test, found {matches}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generated_core_test_gate_rejects_zero_tests() {
+        let error = require_listed_test("0 tests, 0 benchmarks\n", "generated_outbound_http_smoke")
+            .expect_err("a zero-test listing must fail closed");
+        assert!(error.contains("zero tests"));
+    }
+
     /// Targets installed for the toolchain that builds `project`. A wasm
     /// check is skipped when its target is absent (e.g. a local run where
     /// the project sits outside a checkout that pins the wasm targets); CI
@@ -107,6 +139,26 @@ mod tests {
             host.success(),
             "generated workspace should compile for the host target",
         );
+
+        let listed = Command::new(env!("CARGO"))
+            .args(["test", "-p", "scaffold-probe-core", "--lib", "--", "--list"])
+            .current_dir(&project)
+            .output()
+            .expect("list generated core tests");
+        assert!(
+            listed.status.success(),
+            "generated core test list should succeed"
+        );
+        let listed_stdout = String::from_utf8_lossy(&listed.stdout);
+        require_listed_test(&listed_stdout, "generated_outbound_http_smoke")
+            .expect("generated outbound smoke test must be listed exactly once");
+
+        let core_tests = Command::new(env!("CARGO"))
+            .args(["test", "-p", "scaffold-probe-core", "--lib"])
+            .current_dir(&project)
+            .status()
+            .expect("run generated core tests");
+        assert!(core_tests.success(), "generated core tests should pass");
 
         // Typed config validation via the generated `<name>-cli` binary.
         // The raw `edgezero config validate` above exercises the manifest

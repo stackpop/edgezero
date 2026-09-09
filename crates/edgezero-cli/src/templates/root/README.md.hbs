@@ -13,7 +13,18 @@ This workspace demonstrates a multi-target EdgeZero app.
 - `GET /headers` - prints the incoming `user-agent`
 - `GET /stream` - emits a short streamed response body
 - `POST /echo` - echoes JSON payloads
-- `GET|POST /proxy/{*rest}` - forwards requests to `API_BASE_URL`, falling back to a 501 when the active adapter does not expose a proxy client
+- `GET|POST /proxy/{*rest}` - sends the request to `API_BASE_URL`, falling back to a 501 when the active adapter does not inject an outbound HTTP client
+
+## Outbound HTTP
+
+The generated `edgezero.toml` declares `outbound-http` as optional and grants
+HTTPS destinations only. An optional capability accepts documented behavioral
+deviations and may fail at runtime when a deployment prerequisite has not been
+verified. If application behavior depends on successful outbound requests,
+promote `outbound-http` to `required` and choose an adapter and deployment whose
+capability check passes. See the
+[capability guide](https://stackpop.github.io/edgezero/guide/capabilities) for
+the current support matrix and deployment prerequisites.
 
 ## Dev
 

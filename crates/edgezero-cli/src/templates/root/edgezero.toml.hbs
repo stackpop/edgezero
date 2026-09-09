@@ -7,6 +7,12 @@ version = "0.1.0"
 kind = "http"
 entry = "crates/{{proj_core}}"
 
+[capabilities]
+optional = ["outbound-http"]
+
+[capabilities.outbound]
+hosts = ["https://*:*"]
+
 [[triggers.http]]
 id = "root"
 path = "/"
