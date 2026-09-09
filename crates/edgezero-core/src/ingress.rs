@@ -3,9 +3,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
 use crate::http::{Extensions, HeaderMap, Method, Request, Response, Uri, Version};
-use crate::router::RouteResolution;
+use crate::router::{ResolvedDispatch, RouteResolution};
 use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicInstant};
 
 pub const DEFAULT_INBOUND_READ_BUDGET: Duration = Duration::from_secs(30);
@@ -84,16 +85,36 @@ pub enum IngressAdmissionOutcome {
     Refused(Response),
 }
 
+/// Result of route resolution plus application admission before native body ownership moves.
+#[non_exhaustive]
+pub enum IngressBeginOutcome {
+    Admitted(PreparedIngress),
+    Refused(Response),
+}
+
 /// Proof that the application admitted one request with a finite read deadline.
 pub struct AdmittedIngress {
+    config_extraction_limits: ConfigExtractionLimits,
     grant: IngressGrant,
     read_deadline: Deadline,
     request_start: MonotonicInstant,
 }
 
 impl AdmittedIngress {
-    pub(crate) fn into_parts(self) -> (MonotonicInstant, Deadline, IngressGrant) {
-        (self.request_start, self.read_deadline, self.grant)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        MonotonicInstant,
+        Deadline,
+        IngressGrant,
+        ConfigExtractionLimits,
+    ) {
+        (
+            self.request_start,
+            self.read_deadline,
+            self.grant,
+            self.config_extraction_limits,
+        )
     }
 
     #[must_use]
@@ -106,6 +127,11 @@ impl AdmittedIngress {
     #[inline]
     pub fn request_start(&self) -> MonotonicInstant {
         self.request_start
+    }
+
+    pub(crate) fn with_config_extraction_limits(mut self, limits: ConfigExtractionLimits) -> Self {
+        self.config_extraction_limits = limits;
+        self
     }
 }
 
@@ -199,6 +225,108 @@ impl Default for IngressHeadLimits {
     }
 }
 
+/// Normalized, body-free request metadata supplied by an adapter before admission.
+pub struct IngressHeadParts {
+    extensions: Extensions,
+    framing: IngressFraming,
+    head_accounting: IngressHeadAccounting,
+    headers: HeaderMap,
+    method: Method,
+    target: Uri,
+    version: Version,
+}
+
+impl IngressHeadParts {
+    /// Copies normalized metadata from a core request without inspecting its body.
+    #[must_use]
+    #[inline]
+    pub fn from_request(
+        request: &Request,
+        head_accounting: IngressHeadAccounting,
+        framing: IngressFraming,
+    ) -> Self {
+        Self {
+            extensions: request.extensions().clone(),
+            framing,
+            head_accounting,
+            headers: request.headers().clone(),
+            method: request.method().clone(),
+            target: request.uri().clone(),
+            version: request.version(),
+        }
+    }
+
+    pub(crate) fn into_head(
+        self,
+        request_start: MonotonicInstant,
+        route_resolution: RouteResolution,
+    ) -> IngressHead {
+        IngressHead {
+            extensions: self.extensions,
+            framing: self.framing,
+            head_accounting: self.head_accounting,
+            headers: self.headers,
+            method: self.method,
+            request_start,
+            route_resolution,
+            target: self.target,
+            version: self.version,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// Creates host-managed request-head metadata. Adapters with a raw parser boundary replace
+    /// the accounting and framing markers through the builder methods below.
+    #[must_use]
+    #[inline]
+    pub fn new(method: Method, target: Uri, version: Version, headers: HeaderMap) -> Self {
+        Self {
+            extensions: Extensions::new(),
+            framing: IngressFraming::HostManaged,
+            head_accounting: IngressHeadAccounting::HostManaged,
+            headers,
+            method,
+            target,
+            version,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn target(&self) -> &Uri {
+        &self.target
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn with_extension<T>(mut self, value: T) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.extensions.insert(value);
+        self
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn with_framing(mut self, framing: IngressFraming) -> Self {
+        self.framing = framing;
+        self
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn with_head_accounting(mut self, head_accounting: IngressHeadAccounting) -> Self {
+        self.head_accounting = head_accounting;
+        self
+    }
+}
+
 /// Immutable request-head view supplied to the application admission policy.
 pub struct IngressHead {
     extensions: Extensions,
@@ -238,17 +366,8 @@ impl IngressHead {
         head_accounting: IngressHeadAccounting,
         framing: IngressFraming,
     ) -> Self {
-        Self {
-            extensions: request.extensions().clone(),
-            framing,
-            head_accounting,
-            headers: request.headers().clone(),
-            method: request.method().clone(),
-            request_start,
-            route_resolution,
-            target: request.uri().clone(),
-            version: request.version(),
-        }
+        IngressHeadParts::from_request(request, head_accounting, framing)
+            .into_head(request_start, route_resolution)
     }
 
     #[must_use]
@@ -304,6 +423,40 @@ impl IngressHead {
     }
 }
 
+/// Opaque, single-use admission proof paired with the exact resolved dispatch token.
+pub struct PreparedIngress {
+    admitted: AdmittedIngress,
+    resolved: ResolvedDispatch,
+}
+
+impl PreparedIngress {
+    pub(crate) fn into_parts(self) -> (ResolvedDispatch, AdmittedIngress) {
+        (self.resolved, self.admitted)
+    }
+
+    pub(crate) fn new(resolved: ResolvedDispatch, admitted: AdmittedIngress) -> Self {
+        Self { admitted, resolved }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn read_deadline(&self) -> Deadline {
+        self.admitted.read_deadline()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn request_start(&self) -> MonotonicInstant {
+        self.admitted.request_start()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn route_resolution(&self) -> &RouteResolution {
+        self.resolved.resolution()
+    }
+}
+
 pub(crate) type IngressAdmissionPolicy =
     Arc<dyn Fn(&IngressHead) -> AdmissionDecision + Send + Sync>;
 
@@ -338,6 +491,7 @@ pub(crate) fn apply_admission_policy(
                 })?;
             let deadline = Deadline::at_instant(read_deadline.instant().min(maximum));
             Ok(IngressAdmissionOutcome::Admitted(AdmittedIngress {
+                config_extraction_limits: ConfigExtractionLimits::default(),
                 grant,
                 read_deadline: deadline,
                 request_start: head.request_start(),

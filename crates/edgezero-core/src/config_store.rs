@@ -6,10 +6,14 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Error as AnyError;
 use async_trait::async_trait;
 use thiserror::Error;
+
+use crate::error::EdgeError;
+use crate::time::{DEADLINE_FAR_FUTURE, Deadline};
 
 // ---------------------------------------------------------------------------
 // Contract test macro
@@ -153,6 +157,65 @@ macro_rules! config_store_contract_tests {
     };
 }
 
+pub const DEFAULT_CONFIG_BACKEND_BYTES: u64 = 0x0100_0000;
+pub const DEFAULT_CONFIG_BLOB_BYTES: u64 = 0x0080_0000;
+pub const DEFAULT_CONFIG_EXTRACTION_BYTES: u64 = 0x0100_0000;
+pub const DEFAULT_CONFIG_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONFIG_SECRET_BYTES: u64 = 0x0010_0000;
+
+/// Per-extraction limits shared by the root config blob and every referenced secret.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigExtractionLimits {
+    pub max_backend_bytes: u64,
+    pub max_blob_bytes: u64,
+    pub max_secret_bytes: u64,
+    pub max_total_bytes: u64,
+    pub timeout: Duration,
+}
+
+impl ConfigExtractionLimits {
+    /// Validates this startup policy before an adapter begins serving.
+    ///
+    /// # Errors
+    /// Returns an internal policy error for zero, inconsistent, or unbounded values.
+    #[inline]
+    pub fn validate(self) -> Result<Self, EdgeError> {
+        if self.max_backend_bytes == 0
+            || self.max_blob_bytes == 0
+            || self.max_secret_bytes == 0
+            || self.max_total_bytes == 0
+        {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction byte limits must be nonzero"
+            )));
+        }
+        if self.max_total_bytes < self.max_blob_bytes.max(self.max_secret_bytes) {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction total byte limit is below a per-value limit"
+            )));
+        }
+        if self.timeout.is_zero() || self.timeout > DEADLINE_FAR_FUTURE {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction timeout must be finite and nonzero"
+            )));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for ConfigExtractionLimits {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            max_backend_bytes: DEFAULT_CONFIG_BACKEND_BYTES,
+            max_blob_bytes: DEFAULT_CONFIG_BLOB_BYTES,
+            max_secret_bytes: DEFAULT_CONFIG_SECRET_BYTES,
+            max_total_bytes: DEFAULT_CONFIG_EXTRACTION_BYTES,
+            timeout: DEFAULT_CONFIG_EXTRACTION_TIMEOUT,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -163,6 +226,9 @@ macro_rules! config_store_contract_tests {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigStoreError {
+    /// The absolute read deadline expired before a complete value was available.
+    #[error("config store read deadline exceeded")]
+    DeadlineExceeded,
     /// An unexpected backend or provider failure occurred.
     #[error("config store error: {source}")]
     Internal { source: AnyError },
@@ -172,6 +238,9 @@ pub enum ConfigStoreError {
     /// The configured backend cannot currently serve requests.
     #[error("config store unavailable: {message}")]
     Unavailable { message: String },
+    /// The value or guest-visible backend read exceeded its supplied allowance.
+    #[error("config store value exceeds configured byte limit")]
+    ValueTooLarge,
 }
 
 impl ConfigStoreError {
@@ -203,6 +272,13 @@ impl ConfigStoreError {
     }
 }
 
+/// Result of one bounded store lookup, including all bytes exposed to guest code.
+#[derive(Debug)]
+pub struct BoundedStoreRead<T> {
+    pub backend_bytes: u64,
+    pub value: Option<T>,
+}
+
 /// Object-safe interface for read-only configuration store backends.
 ///
 /// Implementations exist per adapter:
@@ -217,6 +293,39 @@ pub trait ConfigStore: Send + Sync {
     /// # Errors
     /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
     async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+
+    /// Retrieves one value under an absolute deadline and independent backend/value caps.
+    ///
+    /// The default is a cooperative compatibility implementation: it checks before and after
+    /// the unbounded provider call, then discards an oversized materialized result. Providers
+    /// must override it before claiming native allocation or cancellation guarantees.
+    #[inline]
+    async fn get_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        if deadline.is_expired() {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
+        let value = self.get(key).await?;
+        if deadline.is_expired() {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
+        let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+            u64::try_from(stored_value.len())
+                .map_err(|_length_error| ConfigStoreError::ValueTooLarge)
+        })?;
+        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+            return Err(ConfigStoreError::ValueTooLarge);
+        }
+        Ok(BoundedStoreRead {
+            backend_bytes,
+            value,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +353,23 @@ impl ConfigStoreHandle {
     #[inline]
     pub async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         self.store.get(key).await
+    }
+
+    /// Get a config value under one absolute deadline and two byte limits.
+    ///
+    /// # Errors
+    /// Preserves the provider's typed bounded-read error.
+    #[inline]
+    pub async fn get_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        self.store
+            .get_bounded(key, deadline, max_backend_bytes, max_value_bytes)
+            .await
     }
 
     /// Create a new handle wrapping a config store implementation.
@@ -320,6 +446,56 @@ mod tests {
             block_on(store_handle.get("feature.checkout")).expect("config value"),
             Some("true".to_owned())
         );
+    }
+
+    #[test]
+    fn bounded_exact_cap_succeeds_and_over_cap_discards_value() {
+        use std::time::Duration;
+
+        use crate::time::Deadline;
+
+        let store_handle = handle(&[("feature.checkout", "true")]);
+        let exact = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            Deadline::after(Duration::from_secs(1)),
+            4,
+            4,
+        ))
+        .expect("exact bounded read");
+        assert_eq!(exact.backend_bytes, 4);
+        assert_eq!(exact.value.as_deref(), Some("true"));
+
+        let error = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            Deadline::after(Duration::from_secs(1)),
+            3,
+            4,
+        ))
+        .expect_err("backend cap");
+        assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_limit_defaults_are_finite_and_validation_rejects_invalid_relationships() {
+        let limits = ConfigExtractionLimits::default();
+        assert_eq!(limits.max_blob_bytes, DEFAULT_CONFIG_BLOB_BYTES);
+        assert_eq!(limits.max_backend_bytes, DEFAULT_CONFIG_BACKEND_BYTES);
+        assert_eq!(limits.max_secret_bytes, DEFAULT_CONFIG_SECRET_BYTES);
+        assert_eq!(limits.max_total_bytes, DEFAULT_CONFIG_EXTRACTION_BYTES);
+        assert_eq!(limits.timeout, DEFAULT_CONFIG_EXTRACTION_TIMEOUT);
+        limits.validate().expect("valid defaults");
+
+        let invalid = ConfigExtractionLimits {
+            max_total_bytes: 1,
+            ..limits
+        };
+        invalid.validate().expect_err("total below per-value cap");
+
+        let invalid = ConfigExtractionLimits {
+            timeout: std::time::Duration::ZERO,
+            ..limits
+        };
+        invalid.validate().expect_err("zero timeout");
     }
 
     #[test]

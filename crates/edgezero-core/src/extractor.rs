@@ -10,15 +10,16 @@ use validator::Validate;
 
 use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use crate::blob_envelope::{BlobEnvelope, BlobEnvelopeError};
-use crate::config_store::ConfigStoreHandle;
+use crate::config_store::{ConfigExtractionLimits, ConfigStoreError, ConfigStoreHandle};
 use crate::context::RequestContext;
-use crate::error::EdgeError;
+use crate::error::{EdgeError, StoreExtractionReason};
 use crate::http::HeaderMap;
 use crate::secret_store::SecretError;
 use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
     KvRegistry, SecretRegistry,
 };
+use crate::time::{Deadline, MonotonicInstant};
 use serde::de::IntoDeserializer as _;
 
 #[async_trait(?Send)]
@@ -755,9 +756,11 @@ where
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let binding = ctx.config_store_default_binding().ok_or_else(|| {
-            EdgeError::internal(anyhow::anyhow!(
-                "no default config store registered \u{2014} check [stores.config] in edgezero.toml"
-            ))
+            EdgeError::store_extraction(
+                StoreExtractionReason::MissingRegistry,
+                "no default config store registered; check [stores.config] in edgezero.toml",
+                None,
+            )
         })?;
         let key = binding.default_key.clone();
         extract_from_handle::<C>(ctx, &binding.handle, &key)
@@ -783,9 +786,11 @@ where
         key: Option<&str>,
     ) -> Result<C, EdgeError> {
         let binding = ctx.config_store_binding(store_id).ok_or_else(|| {
-            EdgeError::internal(anyhow::anyhow!(
-                "no config store registered for id `{store_id}`"
-            ))
+            EdgeError::store_extraction(
+                StoreExtractionReason::UnknownStore,
+                "no config store is registered for the requested id",
+                None,
+            )
         })?;
         let resolved_key = key.unwrap_or(&binding.default_key).to_owned();
         extract_from_handle::<C>(ctx, &binding.handle, &resolved_key).await
@@ -803,12 +808,123 @@ where
     #[inline]
     pub async fn named(ctx: &RequestContext, key: &str) -> Result<C, EdgeError> {
         let binding = ctx.config_store_default_binding().ok_or_else(|| {
-            EdgeError::internal(anyhow::anyhow!(
-                "no default config store registered \u{2014} check [stores.config] in edgezero.toml"
-            ))
+            EdgeError::store_extraction(
+                StoreExtractionReason::MissingRegistry,
+                "no default config store registered; check [stores.config] in edgezero.toml",
+                None,
+            )
         })?;
         extract_from_handle::<C>(ctx, &binding.handle, key).await
     }
+}
+
+/// Extraction-scoped accounting. One instance is created for each public
+/// `AppConfig` call and shared by the root blob and all secret reads.
+struct ConfigExtractionBudget {
+    deadline: Deadline,
+    max_blob_bytes: u64,
+    max_secret_bytes: u64,
+    remaining_backend_bytes: u64,
+    remaining_total_bytes: u64,
+}
+
+impl ConfigExtractionBudget {
+    fn accept_read(
+        &mut self,
+        backend_bytes: u64,
+        value_length: Option<usize>,
+        max_value_bytes: u64,
+    ) -> Result<(), EdgeError> {
+        if self.deadline.is_expired() {
+            return Err(store_extraction_error(
+                StoreExtractionReason::DeadlineExceeded,
+                "typed app-config extraction deadline exceeded",
+                None,
+            ));
+        }
+
+        let converted_value_bytes = value_length
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_length_error| backend_contract_error())?;
+        if backend_bytes > self.remaining_backend_bytes
+            || converted_value_bytes
+                .is_some_and(|bytes| bytes > max_value_bytes || backend_bytes < bytes)
+        {
+            return Err(backend_contract_error());
+        }
+
+        self.remaining_backend_bytes = self
+            .remaining_backend_bytes
+            .checked_sub(backend_bytes)
+            .ok_or_else(backend_contract_error)?;
+        if let Some(retained_bytes) = converted_value_bytes {
+            self.remaining_total_bytes = self
+                .remaining_total_bytes
+                .checked_sub(retained_bytes)
+                .ok_or_else(|| {
+                    store_extraction_error(
+                        StoreExtractionReason::ValueTooLarge,
+                        "typed app-config extraction exceeded its cumulative byte limit",
+                        None,
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+
+    fn max_blob_bytes(&self) -> u64 {
+        self.max_blob_bytes
+    }
+
+    fn max_secret_bytes(&self) -> u64 {
+        self.max_secret_bytes
+    }
+
+    fn remaining_backend_bytes(&self) -> u64 {
+        self.remaining_backend_bytes
+    }
+
+    fn start(configured_limits: ConfigExtractionLimits) -> Result<Self, EdgeError> {
+        let validated_limits = configured_limits.validate()?;
+        let started_at = MonotonicInstant::now();
+        let deadline = started_at
+            .checked_add(validated_limits.timeout)
+            .ok_or_else(|| {
+                EdgeError::store_extraction(
+                    StoreExtractionReason::BackendFailure,
+                    "config extraction deadline could not be represented",
+                    None,
+                )
+            })?;
+        Ok(Self {
+            deadline: Deadline::at_instant(deadline),
+            max_blob_bytes: validated_limits.max_blob_bytes,
+            max_secret_bytes: validated_limits.max_secret_bytes,
+            remaining_backend_bytes: validated_limits.max_backend_bytes,
+            remaining_total_bytes: validated_limits.max_total_bytes,
+        })
+    }
+}
+
+fn backend_contract_error() -> EdgeError {
+    store_extraction_error(
+        StoreExtractionReason::BackendFailure,
+        "a store backend violated the bounded-read contract",
+        None,
+    )
+}
+
+fn store_extraction_error(
+    reason: StoreExtractionReason,
+    message: impl Into<String>,
+    field_path: Option<String>,
+) -> EdgeError {
+    EdgeError::store_extraction(reason, message, field_path)
 }
 
 /// A redacted reason when `raw` is a NEWER format this build must not apply, or
@@ -855,14 +971,8 @@ fn future_format_reason(raw: &str) -> Option<String> {
 ///
 /// # Errors
 ///
-/// - [`EdgeError::ConfigOutOfDate`] — missing blob, missing secret key,
-///   deserialise failure, or validation failure on a non-secret field.
-/// - [`EdgeError::Internal`] — envelope parse failure or SHA mismatch
-///   (envelope integrity failures indicate a corrupt/tampered store entry,
-///   not a stale config — they surface as 500 Internal).
-/// - [`EdgeError::ServiceUnavailable`] — config-store backend temporarily down
-///   (`ConfigStoreError::Unavailable`).
-/// - [`EdgeError::BadRequest`] — malformed key (`ConfigStoreError::InvalidKey`).
+/// Returns [`EdgeError::StoreExtraction`] with the stable reason corresponding
+/// to store, envelope, secret, or schema failure.
 async fn extract_from_handle<C>(
     ctx: &RequestContext,
     handle: &ConfigStoreHandle,
@@ -871,107 +981,127 @@ async fn extract_from_handle<C>(
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
-    // ConfigStoreError → EdgeError uses the existing `impl
-    // From<ConfigStoreError> for EdgeError` at
-    // `crates/edgezero-core/src/error.rs`, which maps:
-    //   Unavailable  → ServiceUnavailable (503)
-    //   InvalidKey   → BadRequest (400)
-    //   Internal     → Internal (500)
-    // NEVER `map_err(EdgeError::internal)` here — that collapses
-    // backpressure / bad-key signals into 500s.
-    let raw = handle
-        .get(key)
+    let mut budget = ConfigExtractionBudget::start(ctx.config_extraction_limits())?;
+    let read = handle
+        .get_bounded(
+            key,
+            budget.deadline(),
+            budget.remaining_backend_bytes(),
+            budget.max_blob_bytes(),
+        )
         .await
-        .map_err(EdgeError::from)?
-        .ok_or_else(|| {
-            EdgeError::config_out_of_date(
-                format!(
-                    "missing typed app-config blob at key `{key}` — \
-                     run `<app-cli> config push` for this deploy"
-                ),
-                String::new(),
-            )
-        })?;
-    // Neither the parse error nor the verify error is echoed into the
-    // client-facing message: a serde error embeds the offending input, and a
-    // `BlobEnvelope` integrity failure names the stored hashes — both are
-    // config-store values that may hold secrets, and this message reaches the
-    // HTTP body. Report a category only.
-    //
-    // A value written by a NEWER format (a bumped envelope version OR an unknown
-    // `edgezero_kind` discriminator) needs a DIFFERENT remediation than
-    // corruption: re-pushing the same config cannot help a build older than its
-    // config; the deployed build must be UPGRADED. The version case is already
-    // caught by `verify()` below (`UnknownVersion`); the two it does NOT catch are
-    // an `edgezero_kind` on a v1-shaped value (serde ignores the unknown field)
-    // and a schema-changed envelope that fails the v1 deserialize outright. A
-    // cheap substring gate keeps the second full JSON parse (`future_format_reason`,
-    // which reparses the whole blob as a `Value`) OFF the happy path -- this runs
-    // per request in the edge guest, over a blob that is by definition large
-    // wherever chunking matters. The reason names only the version/field, never a
-    // value, so surfacing it is safe.
+        .map_err(|store_error| map_config_store_error(&store_error))?;
+    budget.accept_read(
+        read.backend_bytes,
+        read.value.as_ref().map(String::len),
+        budget.max_blob_bytes(),
+    )?;
+    let raw = read.value.ok_or_else(|| {
+        store_extraction_error(
+            StoreExtractionReason::MissingBlob,
+            format!(
+                "missing typed app-config blob at key `{key}`; run `<app-cli> config push` for this deploy"
+            ),
+            None,
+        )
+    })?;
+
+    // Neither parsing nor verification diagnostics may echo stored values.
     let kind_tagged = raw.contains("edgezero_kind");
     let envelope: BlobEnvelope = match serde_json::from_str::<BlobEnvelope>(&raw) {
         Ok(envelope) if !kind_tagged => envelope,
         parsed => {
             if let Some(reason) = future_format_reason(&raw) {
-                return Err(EdgeError::internal(anyhow::anyhow!(
-                    "typed app-config blob uses {reason}, which this build does not understand; \
-                     redeploy this service with an updated build (re-pushing will not help)"
-                )));
+                return Err(store_extraction_error(
+                    StoreExtractionReason::InvalidEnvelope,
+                    format!(
+                        "typed app-config blob uses {reason}, which this build does not understand; redeploy this service with an updated build"
+                    ),
+                    None,
+                ));
             }
             parsed.map_err(|_err| {
-                EdgeError::internal(anyhow::anyhow!(
-                    "typed app-config blob is not a valid envelope (details redacted)"
-                ))
+                store_extraction_error(
+                    StoreExtractionReason::InvalidEnvelope,
+                    "typed app-config blob is not a valid envelope (details redacted)",
+                    None,
+                )
             })?
         }
     };
     envelope.verify().map_err(|err| match err {
-        BlobEnvelopeError::UnknownVersion(version) => EdgeError::internal(anyhow::anyhow!(
-            "typed app-config blob uses envelope version {version}, which this build does not \
-             understand; redeploy this service with an updated build (re-pushing will not help)"
-        )),
-        BlobEnvelopeError::ShaMismatch { .. } => EdgeError::internal(anyhow::anyhow!(
-            "typed app-config blob failed its integrity check (details redacted)"
-        )),
+        BlobEnvelopeError::UnknownVersion(version) => store_extraction_error(
+            StoreExtractionReason::InvalidEnvelope,
+            format!(
+                "typed app-config blob uses envelope version {version}, which this build does not understand; redeploy this service with an updated build"
+            ),
+            None,
+        ),
+        BlobEnvelopeError::ShaMismatch { .. } => store_extraction_error(
+            StoreExtractionReason::IntegrityMismatch,
+            "typed app-config blob failed its integrity check (details redacted)",
+            None,
+        ),
     })?;
     let mut data = envelope.into_data();
-    // Secret walk per spec 3.3.3.
-    secret_walk::<C>(ctx, &mut data).await?;
-    // Deserialise via serde_path_to_error so failures carry a dotted
-    // field path for ConfigOutOfDate per spec 4.3.
+    secret_walk::<C>(ctx, &mut budget, &mut data).await?;
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
-        .map_err(|err| EdgeError::config_out_of_date_from_serde(&err))?;
-    // RUNTIME uses cfg.validate(): after secret_walk the fields hold
-    // RESOLVED values, so every validator rule — including those on
-    // secret fields (e.g. length/regex on the actual token value) —
-    // MUST run. Spec 3.3.8 split: PUSH skips secret-field validators
-    // (via validate_excluding_secrets) because the value at push time
-    // is a key NAME; RUNTIME runs cfg.validate() because the value is
-    // now the resolved secret.
+        .map_err(|serde_error| EdgeError::store_schema_mismatch_from_serde(&serde_error))?;
     cfg.validate().map_err(|err| {
-        // SECURITY: `secret_walk` has replaced `#[secret]` fields with their
-        // RESOLVED values, and `validator`'s error params echo the rejected
-        // value — so `err.to_string()` here can leak a secret into the HTTP
-        // response body and logs. Keep the field path (structural, not secret)
-        // but drop the formatted validator details on this runtime path.
         let field = first_violating_field(&err).unwrap_or_default();
         let message = if field.is_empty() {
             "app config failed validation".to_owned()
         } else {
             format!("app config failed validation for field `{field}`")
         };
-        EdgeError::config_out_of_date(message, field)
+        store_extraction_error(
+            StoreExtractionReason::SchemaMismatch,
+            message,
+            (!field.is_empty()).then_some(field),
+        )
     })?;
     Ok(cfg)
+}
+
+fn map_config_store_error(err: &ConfigStoreError) -> EdgeError {
+    match err {
+        ConfigStoreError::DeadlineExceeded => store_extraction_error(
+            StoreExtractionReason::DeadlineExceeded,
+            "typed app-config store read deadline exceeded",
+            None,
+        ),
+        ConfigStoreError::Internal { .. } => store_extraction_error(
+            StoreExtractionReason::BackendFailure,
+            "typed app-config store read failed (details redacted)",
+            None,
+        ),
+        ConfigStoreError::InvalidKey { .. } => store_extraction_error(
+            StoreExtractionReason::InvalidKey,
+            "typed app-config store rejected the requested key (details redacted)",
+            None,
+        ),
+        ConfigStoreError::Unavailable { .. } => store_extraction_error(
+            StoreExtractionReason::BackendUnavailable,
+            "typed app-config store is unavailable",
+            None,
+        ),
+        ConfigStoreError::ValueTooLarge => store_extraction_error(
+            StoreExtractionReason::ValueTooLarge,
+            "typed app-config store value exceeded its read limit",
+            None,
+        ),
+    }
 }
 
 /// Walk `C::secret_fields()` and replace each `#[secret]` key NAME in `data`
 /// with the resolved secret VALUE from the appropriate secret store.
 ///
 /// `StoreRef` fields are skipped — their value is a store id, not a key.
-async fn secret_walk<C>(ctx: &RequestContext, data: &mut serde_json::Value) -> Result<(), EdgeError>
+async fn secret_walk<C>(
+    ctx: &RequestContext,
+    budget: &mut ConfigExtractionBudget,
+    data: &mut serde_json::Value,
+) -> Result<(), EdgeError>
 where
     C: AppConfigMeta,
 {
@@ -982,7 +1112,7 @@ where
         if matches!(field.kind, SecretKind::StoreRef) {
             continue;
         }
-        resolve_secret_field(ctx, data, &field, &field.path, String::new()).await?;
+        resolve_secret_field(ctx, budget, data, &field, &field.path, String::new()).await?;
     }
     Ok(())
 }
@@ -992,6 +1122,7 @@ where
 /// indices) for error hints.
 fn resolve_secret_field<'walk>(
     ctx: &'walk RequestContext,
+    budget: &'walk mut ConfigExtractionBudget,
     node: &'walk mut serde_json::Value,
     field: &'walk SecretField,
     remaining: &'walk [SecretPathSegment],
@@ -1001,7 +1132,7 @@ fn resolve_secret_field<'walk>(
         match remaining.split_first() {
             // Leaf reached: `node` is the PARENT object; the last field is the key.
             Some((SecretPathSegment::Field(name), [])) => {
-                resolve_leaf(ctx, node, field, name.as_ref(), &rendered).await
+                resolve_leaf(ctx, budget, node, field, name.as_ref(), &rendered).await
             }
             Some((SecretPathSegment::OptionalField(name), [])) => {
                 if node.as_object().is_some_and(|parent| {
@@ -1012,7 +1143,7 @@ fn resolve_secret_field<'walk>(
                 }) {
                     return Ok(());
                 }
-                resolve_leaf(ctx, node, field, name.as_ref(), &rendered).await
+                resolve_leaf(ctx, budget, node, field, name.as_ref(), &rendered).await
             }
             // Required intermediates still reject stale blobs. Optional
             // intermediates are represented explicitly below rather than by the
@@ -1020,27 +1151,29 @@ fn resolve_secret_field<'walk>(
             Some((SecretPathSegment::Field(name), rest)) => {
                 let next_rendered = join_field(&rendered, name.as_ref());
                 match node.get_mut(name.as_ref()) {
-                    None | Some(serde_json::Value::Null) => Err(EdgeError::config_out_of_date(
+                    None | Some(serde_json::Value::Null) => Err(store_extraction_error(
+                        StoreExtractionReason::SchemaMismatch,
                         format!("missing or null value at `{next_rendered}`"),
-                        next_rendered,
+                        Some(next_rendered),
                     )),
                     Some(child) => {
-                        resolve_secret_field(ctx, child, field, rest, next_rendered).await
+                        resolve_secret_field(ctx, budget, child, field, rest, next_rendered).await
                     }
                 }
             }
             Some((SecretPathSegment::OptionalField(name), rest)) => {
                 let Some(parent) = node.as_object_mut() else {
-                    return Err(EdgeError::config_out_of_date(
+                    return Err(store_extraction_error(
+                        StoreExtractionReason::SchemaMismatch,
                         format!("expected an object at `{rendered}`"),
-                        rendered,
+                        Some(rendered),
                     ));
                 };
                 let next_rendered = join_field(&rendered, name.as_ref());
                 match parent.get_mut(name.as_ref()) {
                     None | Some(serde_json::Value::Null) => Ok(()),
                     Some(child) => {
-                        resolve_secret_field(ctx, child, field, rest, next_rendered).await
+                        resolve_secret_field(ctx, budget, child, field, rest, next_rendered).await
                     }
                 }
             }
@@ -1048,14 +1181,15 @@ fn resolve_secret_field<'walk>(
             // intermediate unless its containing field was optional above.
             Some((SecretPathSegment::ArrayEach, rest)) => {
                 let Some(items) = node.as_array_mut() else {
-                    return Err(EdgeError::config_out_of_date(
+                    return Err(store_extraction_error(
+                        StoreExtractionReason::SchemaMismatch,
                         format!("expected an array at `{rendered}`"),
-                        rendered,
+                        Some(rendered),
                     ));
                 };
                 for (idx, item) in items.iter_mut().enumerate() {
                     let indexed = format!("{rendered}[{idx}]");
-                    resolve_secret_field(ctx, item, field, rest, indexed).await?;
+                    resolve_secret_field(ctx, budget, item, field, rest, indexed).await?;
                 }
                 Ok(())
             }
@@ -1077,6 +1211,7 @@ fn join_field(prefix: &str, name: &str) -> String {
 /// within `parent`.
 async fn resolve_leaf(
     ctx: &RequestContext,
+    budget: &mut ConfigExtractionBudget,
     parent: &mut serde_json::Value,
     field: &SecretField,
     key: &str,
@@ -1089,9 +1224,10 @@ async fn resolve_leaf(
     let leaf_path = join_field(rendered_parent, key);
 
     let Some(parent_obj) = parent.as_object_mut() else {
-        return Err(EdgeError::config_out_of_date(
+        return Err(store_extraction_error(
+            StoreExtractionReason::SchemaMismatch,
             format!("expected an object containing `{key}` at `{rendered_parent}`"),
-            leaf_path,
+            Some(leaf_path),
         ));
     };
 
@@ -1103,9 +1239,10 @@ async fn resolve_leaf(
         // cases must skip — not just the missing-key case.
         None | Some(serde_json::Value::Null) if field.optional => return Ok(()),
         _ => {
-            return Err(EdgeError::config_out_of_date(
+            return Err(store_extraction_error(
+                StoreExtractionReason::SchemaMismatch,
                 format!("missing or non-string value at `{leaf_path}`"),
-                leaf_path,
+                Some(leaf_path),
             ));
         }
     };
@@ -1113,12 +1250,13 @@ async fn resolve_leaf(
     let (bound, resolved_store_id) = match field.kind {
         SecretKind::KeyInDefault => {
             let bound = ctx.secret_store_default().ok_or_else(|| {
-                EdgeError::config_out_of_date(
+                store_extraction_error(
+                    StoreExtractionReason::MissingRegistry,
                     format!(
                         "secret field `{leaf_path}` has kind KeyInDefault but no default secret \
                          store is registered"
                     ),
-                    leaf_path.clone(),
+                    Some(leaf_path.clone()),
                 )
             })?;
             let id = bound.store_name().to_owned();
@@ -1130,11 +1268,12 @@ async fn resolve_leaf(
                 .get(store_ref_field)
                 .and_then(|val| val.as_str())
                 .ok_or_else(|| {
-                    EdgeError::config_out_of_date(
+                    store_extraction_error(
+                        StoreExtractionReason::SchemaMismatch,
                         format!(
                             "missing store_ref `{store_ref_field}` for secret field `{leaf_path}`"
                         ),
-                        leaf_path.clone(),
+                        Some(leaf_path.clone()),
                     )
                 })?
                 .to_owned();
@@ -1142,22 +1281,49 @@ async fn resolve_leaf(
                 // `store_id_str` is the blob's store_ref VALUE — config data that
                 // may be sensitive — and this message reaches the HTTP body. Name
                 // the field, not the stored id.
-                EdgeError::config_out_of_date(
+                store_extraction_error(
+                    StoreExtractionReason::UnknownStore,
                     format!(
                         "secret field `{leaf_path}` names a store_ref that is not declared in \
                          [stores.secrets] (id redacted)"
                     ),
-                    leaf_path.clone(),
+                    Some(leaf_path.clone()),
                 )
             })?;
             (bound, store_id_str)
         }
     };
 
-    let secret = bound
-        .require_str(&key_name)
+    let read = bound
+        .get_bytes_bounded(
+            &key_name,
+            budget.deadline(),
+            budget.remaining_backend_bytes(),
+            budget.max_secret_bytes(),
+        )
         .await
         .map_err(|err| map_secret_error(err, &leaf_path, &resolved_store_id, &key_name))?;
+    budget.accept_read(
+        read.backend_bytes,
+        read.value.as_ref().map(bytes::Bytes::len),
+        budget.max_secret_bytes(),
+    )?;
+    let secret_bytes = read.value.ok_or_else(|| {
+        store_extraction_error(
+            StoreExtractionReason::MissingSecret,
+            format!(
+                "the secret referenced by `{leaf_path}` was not found in its store (identifier redacted)"
+            ),
+            Some(leaf_path.clone()),
+        )
+    })?;
+    let secret = String::from_utf8(secret_bytes.to_vec()).map_err(|_utf8_error| {
+        store_extraction_error(
+            StoreExtractionReason::InvalidSecretValue,
+            format!("secret for field `{leaf_path}` is not valid UTF-8"),
+            Some(leaf_path.clone()),
+        )
+    })?;
     parent_obj.insert(key.to_owned(), serde_json::Value::String(secret));
     Ok(())
 }
@@ -1175,24 +1341,40 @@ fn map_secret_error(
     _key_name: &str,
 ) -> EdgeError {
     match err {
-        SecretError::NotFound { .. } => EdgeError::config_out_of_date(
+        SecretError::DeadlineExceeded => EdgeError::store_extraction(
+            StoreExtractionReason::DeadlineExceeded,
+            format!("secret resolution for `{field_name}` exceeded its deadline"),
+            Some(field_name.to_owned()),
+        ),
+        SecretError::Internal(_source) => EdgeError::store_extraction(
+            StoreExtractionReason::BackendFailure,
+            format!("secret resolution for `{field_name}` failed (details redacted)"),
+            Some(field_name.to_owned()),
+        ),
+        SecretError::NotFound { .. } => EdgeError::store_extraction(
+            StoreExtractionReason::MissingSecret,
             format!(
                 "the secret referenced by `{field_name}` was not found in its store (identifier redacted)"
             ),
-            field_name.to_owned(),
+            Some(field_name.to_owned()),
         ),
-        SecretError::Validation(_msg) => EdgeError::config_out_of_date(
+        SecretError::Unavailable => EdgeError::store_extraction(
+            StoreExtractionReason::SecretBackendUnavailable,
+            format!("the secret store for `{field_name}` is unreachable"),
+            Some(field_name.to_owned()),
+        ),
+        SecretError::Validation(_msg) => EdgeError::store_extraction(
+            StoreExtractionReason::InvalidKey,
             format!(
                 "the secret referenced by `{field_name}` was rejected by its store (details redacted)"
             ),
-            field_name.to_owned(),
+            Some(field_name.to_owned()),
         ),
-        SecretError::Unavailable => EdgeError::service_unavailable(format!(
-            "the secret store for `{field_name}` is unreachable"
-        )),
-        SecretError::Internal(_source) => EdgeError::internal(anyhow::anyhow!(
-            "secret resolution for `{field_name}` failed (details redacted)"
-        )),
+        SecretError::ValueTooLarge => EdgeError::store_extraction(
+            StoreExtractionReason::ValueTooLarge,
+            format!("the secret referenced by `{field_name}` exceeds its configured byte limit"),
+            Some(field_name.to_owned()),
+        ),
     }
 }
 
@@ -2333,6 +2515,18 @@ mod tests {
         serde_json::to_string(&envelope).expect("serialise envelope")
     }
 
+    async fn test_secret_walk<C>(
+        ctx: &RequestContext,
+        data: &mut serde_json::Value,
+    ) -> Result<(), EdgeError>
+    where
+        C: AppConfigMeta,
+    {
+        let mut budget =
+            ConfigExtractionBudget::start(ConfigExtractionLimits::default()).expect("test budget");
+        secret_walk::<C>(ctx, &mut budget, data).await
+    }
+
     #[test]
     fn app_config_extractor_happy_path() {
         struct FixedStore(String);
@@ -2353,7 +2547,173 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_returns_config_out_of_date_on_missing_blob() {
+    fn app_config_extractor_uses_bounded_root_read() {
+        use std::sync::Mutex;
+
+        use crate::config_store::{BoundedStoreRead, ConfigExtractionLimits};
+        use crate::time::Deadline;
+
+        struct BoundedOnlyStore {
+            blob: String,
+            observed: Arc<Mutex<Option<(Deadline, u64, u64)>>>,
+        }
+
+        #[async_trait(?Send)]
+        impl ConfigStore for BoundedOnlyStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                panic!("typed extraction must not call the unbounded config-store API");
+            }
+
+            async fn get_bounded(
+                &self,
+                _key: &str,
+                deadline: Deadline,
+                max_backend_bytes: u64,
+                max_value_bytes: u64,
+            ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+                *self.observed.lock().expect("record bounded read") =
+                    Some((deadline, max_backend_bytes, max_value_bytes));
+                Ok(BoundedStoreRead {
+                    backend_bytes: u64::try_from(self.blob.len()).expect("fixture length"),
+                    value: Some(self.blob.clone()),
+                })
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(None));
+        let blob =
+            make_envelope(serde_json::json!({ "greeting": "bounded", "timeout_ms": 500_u32 }));
+        let ctx = ctx_with_config_store(
+            BoundedOnlyStore {
+                blob,
+                observed: Arc::clone(&observed),
+            },
+            "the_key",
+        );
+
+        let AppConfig(cfg) =
+            block_on(AppConfig::<FixtureCfg>::from_request(&ctx)).expect("bounded extraction");
+        assert_eq!(cfg.greeting, "bounded");
+
+        let (_, max_backend_bytes, max_value_bytes) = observed
+            .lock()
+            .expect("read observation")
+            .expect("bounded read called");
+        let limits = ConfigExtractionLimits::default();
+        assert_eq!(max_backend_bytes, limits.max_backend_bytes);
+        assert_eq!(max_value_bytes, limits.max_blob_bytes);
+    }
+
+    #[test]
+    fn app_config_extractor_shares_deadline_and_budget_with_secret_reads() {
+        use std::sync::Mutex;
+
+        use crate::config_store::BoundedStoreRead;
+        use crate::time::{Deadline, MonotonicInstant};
+        use bytes::Bytes;
+
+        type Observation = (MonotonicInstant, u64, u64);
+
+        struct RecordingConfigStore {
+            blob: String,
+            observed: Arc<Mutex<Vec<Observation>>>,
+        }
+
+        #[async_trait(?Send)]
+        impl ConfigStore for RecordingConfigStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                panic!("typed extraction must not call unbounded config reads");
+            }
+
+            async fn get_bounded(
+                &self,
+                _key: &str,
+                deadline: Deadline,
+                max_backend_bytes: u64,
+                max_value_bytes: u64,
+            ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+                self.observed.lock().expect("config observation").push((
+                    deadline.instant(),
+                    max_backend_bytes,
+                    max_value_bytes,
+                ));
+                Ok(BoundedStoreRead {
+                    backend_bytes: u64::try_from(self.blob.len()).expect("fixture length"),
+                    value: Some(self.blob.clone()),
+                })
+            }
+        }
+
+        struct RecordingSecretStore {
+            observed: Arc<Mutex<Vec<Observation>>>,
+        }
+
+        #[async_trait(?Send)]
+        impl SecretStore for RecordingSecretStore {
+            async fn get_bytes(
+                &self,
+                _store_name: &str,
+                _key: &str,
+            ) -> Result<Option<Bytes>, SecretError> {
+                panic!("typed extraction must not call unbounded secret reads");
+            }
+
+            async fn get_bytes_bounded(
+                &self,
+                _store_name: &str,
+                _key: &str,
+                deadline: Deadline,
+                max_backend_bytes: u64,
+                max_value_bytes: u64,
+            ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+                self.observed.lock().expect("secret observation").push((
+                    deadline.instant(),
+                    max_backend_bytes,
+                    max_value_bytes,
+                ));
+                Ok(BoundedStoreRead {
+                    backend_bytes: 6,
+                    value: Some(Bytes::from_static(b"secret")),
+                })
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let blob =
+            make_envelope(serde_json::json!({ "greeting": "bounded", "api_token": "token-key" }));
+        let blob_bytes = u64::try_from(blob.len()).expect("fixture length");
+        let ctx = ctx_with_config_and_secrets(
+            RecordingConfigStore {
+                blob,
+                observed: Arc::clone(&observed),
+            },
+            "the_key",
+            RecordingSecretStore {
+                observed: Arc::clone(&observed),
+            },
+            "vault",
+        );
+
+        let AppConfig(cfg) =
+            block_on(AppConfig::<SecretCfg>::from_request(&ctx)).expect("bounded extraction");
+        assert_eq!(cfg.api_token, "secret");
+
+        let observed = observed.lock().expect("observations");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, observed[1].0, "deadline must not reset");
+        assert_eq!(
+            observed[1].1,
+            observed[0].1 - blob_bytes,
+            "secret read receives the remaining backend allowance"
+        );
+        assert_eq!(
+            observed[1].2,
+            ConfigExtractionLimits::default().max_secret_bytes
+        );
+    }
+
+    #[test]
+    fn app_config_extractor_returns_typed_missing_blob() {
         struct EmptyStore;
         #[async_trait(?Send)]
         impl ConfigStore for EmptyStore {
@@ -2365,9 +2725,9 @@ mod tests {
         let ctx = ctx_with_config_store(EmptyStore, "the_key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("missing blob must error");
-        assert!(
-            matches!(err, EdgeError::ConfigOutOfDate { .. }),
-            "expected ConfigOutOfDate, got {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::MissingBlob)
         );
         assert!(
             err.message().contains("missing typed app-config blob"),
@@ -2380,7 +2740,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_maps_config_store_unavailable_to_service_unavailable() {
+    fn app_config_extractor_maps_config_store_unavailable() {
         struct DownStore;
         #[async_trait(?Send)]
         impl ConfigStore for DownStore {
@@ -2392,14 +2752,14 @@ mod tests {
         let ctx = ctx_with_config_store(DownStore, "the_key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("unavailable store must error");
-        assert!(
-            matches!(err, EdgeError::ServiceUnavailable { .. }),
-            "ConfigStoreError::Unavailable must map to ServiceUnavailable (not Internal): {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::BackendUnavailable)
         );
     }
 
     #[test]
-    fn app_config_extractor_maps_config_store_invalid_key_to_bad_request() {
+    fn app_config_extractor_maps_config_store_invalid_key() {
         struct BadKeyStore;
         #[async_trait(?Send)]
         impl ConfigStore for BadKeyStore {
@@ -2411,14 +2771,14 @@ mod tests {
         let ctx = ctx_with_config_store(BadKeyStore, "the_key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("invalid key must error");
-        assert!(
-            matches!(err, EdgeError::BadRequest { .. }),
-            "ConfigStoreError::InvalidKey must map to BadRequest (not Internal): {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::InvalidKey)
         );
     }
 
     #[test]
-    fn app_config_extractor_maps_config_store_internal_to_internal() {
+    fn app_config_extractor_maps_config_store_internal() {
         struct BrokenStore;
         #[async_trait(?Send)]
         impl ConfigStore for BrokenStore {
@@ -2430,14 +2790,14 @@ mod tests {
         let ctx = ctx_with_config_store(BrokenStore, "the_key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("internal store error must error");
-        assert!(
-            matches!(err, EdgeError::Internal { .. }),
-            "ConfigStoreError::Internal must map to Internal: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::BackendFailure)
         );
     }
 
     #[test]
-    fn app_config_extractor_returns_internal_on_sha_mismatch() {
+    fn app_config_extractor_returns_integrity_mismatch_on_sha_mismatch() {
         const SENTINEL: &str = "SUPER_SECRET_STORED_HASH";
         struct TamperedStore;
         #[async_trait(?Send)]
@@ -2459,10 +2819,9 @@ mod tests {
         let ctx = ctx_with_config_store(TamperedStore, "key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("sha mismatch must error");
-        // SHA mismatch → internal error (envelope integrity failure).
-        assert!(
-            matches!(err, EdgeError::Internal { .. }),
-            "SHA mismatch must surface as Internal: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::IntegrityMismatch)
         );
         // The client-facing message (the HTTP body) must not carry the stored
         // hash, only a redacted category.
@@ -2501,9 +2860,9 @@ mod tests {
         let ctx = ctx_with_config_store(FutureVersionStore, "key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("a future envelope version must error");
-        assert!(
-            matches!(err, EdgeError::Internal { .. }),
-            "a future version is Internal, not transient: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::InvalidEnvelope)
         );
         let message = err.message().to_lowercase();
         assert!(
@@ -2542,7 +2901,7 @@ mod tests {
             .expect_err("an unknown edgezero_kind must error");
         let message = err.message().to_lowercase();
         assert!(
-            matches!(err, EdgeError::Internal { .. })
+            err.store_extraction_reason() == Some(StoreExtractionReason::InvalidEnvelope)
                 && message.contains("redeploy")
                 && message.contains("edgezero_kind"),
             "an unknown discriminator must ask to redeploy: {err:?}"
@@ -2571,9 +2930,9 @@ mod tests {
         let ctx = ctx_with_config_store(TypeErrorStore, "key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("a type mismatch in the typed config must error");
-        assert!(
-            matches!(err, EdgeError::ConfigOutOfDate { .. }),
-            "a typed deserialize failure must be ConfigOutOfDate: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::SchemaMismatch)
         );
         assert!(
             !err.message().contains(SENTINEL),
@@ -2581,16 +2940,18 @@ mod tests {
         );
         // The field path segments are redacted (a map key is indistinguishable
         // from a struct field and may be a secret); structure is kept.
-        if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
+        if let EdgeError::StoreExtraction { field_path, .. } = &err {
             assert!(
-                !field_path.contains("timeout_ms") && field_path.contains("<redacted>"),
-                "the field path must be redacted: {field_path}"
+                field_path.as_deref().is_some_and(|path| {
+                    !path.contains("timeout_ms") && path.contains("<redacted>")
+                }),
+                "the field path must be redacted: {field_path:?}"
             );
         }
     }
 
     #[test]
-    fn app_config_extractor_returns_internal_on_bad_envelope_json() {
+    fn app_config_extractor_returns_invalid_envelope_on_bad_json() {
         struct GarbageStore;
         #[async_trait(?Send)]
         impl ConfigStore for GarbageStore {
@@ -2602,9 +2963,9 @@ mod tests {
         let ctx = ctx_with_config_store(GarbageStore, "key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("bad envelope JSON must error");
-        assert!(
-            matches!(err, EdgeError::Internal { .. }),
-            "Envelope parse failure must be Internal: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::InvalidEnvelope)
         );
         assert!(
             err.message().contains("not a valid envelope"),
@@ -2619,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_returns_config_out_of_date_on_deserialise_failure() {
+    fn app_config_extractor_returns_schema_mismatch_on_deserialise_failure() {
         use crate::config_store::{ConfigStore, ConfigStoreError};
 
         // Blob has wrong type for `timeout_ms` (string instead of u32).
@@ -2638,21 +2999,22 @@ mod tests {
         let ctx = ctx_with_config_store(BadDataStore, "key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("type mismatch must error");
-        assert!(
-            matches!(err, EdgeError::ConfigOutOfDate { .. }),
-            "deserialise failure must be ConfigOutOfDate: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::SchemaMismatch)
         );
         // The field path segment is redacted (indistinguishable from a map key).
-        if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
+        if let EdgeError::StoreExtraction { field_path, .. } = &err {
             assert_eq!(
-                field_path, "<redacted>",
+                field_path.as_deref(),
+                Some("<redacted>"),
                 "the field path must be redacted: {err:?}"
             );
         }
     }
 
     #[test]
-    fn app_config_extractor_returns_config_out_of_date_on_validation_failure() {
+    fn app_config_extractor_returns_schema_mismatch_on_validation_failure() {
         use crate::config_store::{ConfigStore, ConfigStoreError};
 
         // `timeout_ms = 0` violates `range(min = 1)`.
@@ -2668,13 +3030,14 @@ mod tests {
         let ctx = ctx_with_config_store(ZeroTimeoutStore, "key");
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("validation failure must error");
-        assert!(
-            matches!(err, EdgeError::ConfigOutOfDate { .. }),
-            "validation failure must be ConfigOutOfDate: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::SchemaMismatch)
         );
-        if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
+        if let EdgeError::StoreExtraction { field_path, .. } = &err {
             assert_eq!(
-                field_path, "timeout_ms",
+                field_path.as_deref(),
+                Some("timeout_ms"),
                 "field_path names the violator: {err:?}"
             );
         }
@@ -2709,7 +3072,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_secret_walk_missing_key_in_default_store_is_config_out_of_date() {
+    fn app_config_secret_walk_missing_key_has_typed_reason() {
         use crate::config_store::{ConfigStore, ConfigStoreError};
         struct BlobStore(String);
         #[async_trait(?Send)]
@@ -2726,13 +3089,14 @@ mod tests {
         let ctx = ctx_with_config_and_secrets(BlobStore(blob), "key", NoopSecretStore, "vault");
         let err = block_on(AppConfig::<SecretCfg>::from_request(&ctx))
             .expect_err("missing secret must error");
-        assert!(
-            matches!(err, EdgeError::ConfigOutOfDate { .. }),
-            "missing secret must be ConfigOutOfDate: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::MissingSecret)
         );
-        if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
+        if let EdgeError::StoreExtraction { field_path, .. } = &err {
             assert_eq!(
-                field_path, "api_token",
+                field_path.as_deref(),
+                Some("api_token"),
                 "field_path names the secret field: {err:?}"
             );
         }
@@ -2813,7 +3177,7 @@ mod tests {
         let mut data = serde_json::json!({
             "integrations": { "datadome": { "server_side_key": "dd_key" } }
         });
-        block_on(secret_walk::<NestedCfg>(&ctx, &mut data)).expect("walk");
+        block_on(test_secret_walk::<NestedCfg>(&ctx, &mut data)).expect("walk");
         assert_eq!(
             data["integrations"]["datadome"]["server_side_key"],
             serde_json::json!("resolved-dd")
@@ -2826,7 +3190,7 @@ mod tests {
         let mut data = serde_json::json!({
             "partners": [ { "api_key": "k0" }, { "api_key": "k1" } ]
         });
-        block_on(secret_walk::<ArrayCfg>(&ctx, &mut data)).expect("walk");
+        block_on(test_secret_walk::<ArrayCfg>(&ctx, &mut data)).expect("walk");
         assert_eq!(data["partners"][0]["api_key"], serde_json::json!("v0"));
         assert_eq!(data["partners"][1]["api_key"], serde_json::json!("v1"));
     }
@@ -2837,7 +3201,7 @@ mod tests {
         let mut data = serde_json::json!({
             "vaulted": { "token": "tok_key", "vault": "named" }
         });
-        block_on(secret_walk::<NamedStoreCfg>(&ctx, &mut data)).expect("walk");
+        block_on(test_secret_walk::<NamedStoreCfg>(&ctx, &mut data)).expect("walk");
         assert_eq!(data["vaulted"]["token"], serde_json::json!("TOK"));
         // The store_ref sibling is left intact (it names a store, not a secret).
         assert_eq!(data["vaulted"]["vault"], serde_json::json!("named"));
@@ -2847,7 +3211,7 @@ mod tests {
     fn secret_walk_nested_named_store_missing_sibling_errors_with_dotted_path() {
         let ctx = ctx_with_named_secret_store("named", "tok_key", "TOK");
         let mut data = serde_json::json!({ "vaulted": { "token": "tok_key" } }); // no `vault`
-        let err = block_on(secret_walk::<NamedStoreCfg>(&ctx, &mut data))
+        let err = block_on(test_secret_walk::<NamedStoreCfg>(&ctx, &mut data))
             .expect_err("missing store_ref sibling");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(err.to_string().contains("vaulted.token"));
@@ -2857,7 +3221,8 @@ mod tests {
     fn secret_walk_skips_absent_optional_leaf() {
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "greeting": "hi" }); // no maybe_key
-        block_on(secret_walk::<OptionalCfg>(&ctx, &mut data)).expect("absent optional is fine");
+        block_on(test_secret_walk::<OptionalCfg>(&ctx, &mut data))
+            .expect("absent optional is fine");
         assert!(data.get("maybe_key").is_none());
     }
 
@@ -2867,7 +3232,7 @@ mod tests {
         // not omitted). The walk must skip a null optional leaf, not error it.
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "maybe_key": null });
-        block_on(secret_walk::<OptionalCfg>(&ctx, &mut data))
+        block_on(test_secret_walk::<OptionalCfg>(&ctx, &mut data))
             .expect("null optional is skipped, not treated as non-string");
         assert_eq!(data["maybe_key"], serde_json::json!(null)); // left untouched
     }
@@ -2876,7 +3241,7 @@ mod tests {
     fn secret_walk_missing_required_nested_leaf_errors_with_dotted_path() {
         let ctx = ctx_with_default_secret_store("dd_key", "resolved-dd");
         let mut data = serde_json::json!({ "integrations": { "datadome": {} } });
-        let err = block_on(secret_walk::<NestedCfg>(&ctx, &mut data))
+        let err = block_on(test_secret_walk::<NestedCfg>(&ctx, &mut data))
             .expect_err("missing required nested leaf");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -2893,7 +3258,7 @@ mod tests {
         // vaguer serde error downstream.
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "greeting": "hi" }); // no `integrations`
-        let err = block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+        let err = block_on(test_secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
             .expect_err("missing required intermediate");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -2906,7 +3271,7 @@ mod tests {
     fn secret_walk_skips_absent_optional_intermediate() {
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "integrations": {} });
-        block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+        block_on(test_secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
             .expect("absent optional intermediate is fine");
     }
 
@@ -2914,7 +3279,7 @@ mod tests {
     fn secret_walk_skips_null_optional_intermediate() {
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "integrations": { "datadome": null } });
-        block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+        block_on(test_secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
             .expect("null optional intermediate is fine");
     }
 
@@ -2922,7 +3287,7 @@ mod tests {
     fn secret_walk_rejects_scalar_parent_of_optional_intermediate() {
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "integrations": "not-an-object" });
-        let err = block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+        let err = block_on(test_secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
             .expect_err("a present optional intermediate must have an object parent");
 
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2930,31 +3295,39 @@ mod tests {
             err.to_string().contains("integrations"),
             "error names the malformed parent: {err}"
         );
-        let EdgeError::ConfigOutOfDate { field_path, .. } = &err else {
-            panic!("malformed optional parent must be ConfigOutOfDate: {err:?}");
+        let EdgeError::StoreExtraction {
+            reason, field_path, ..
+        } = &err
+        else {
+            panic!("malformed optional parent must be typed: {err:?}");
         };
-        assert_eq!(field_path, "integrations");
+        assert_eq!(*reason, StoreExtractionReason::SchemaMismatch);
+        assert_eq!(field_path.as_deref(), Some("integrations"));
     }
 
     #[test]
     fn secret_walk_rejects_scalar_parent_of_terminal_optional_field() {
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "integrations": "not-an-object" });
-        let err = block_on(secret_walk::<TerminalOptionalCfg>(&ctx, &mut data))
+        let err = block_on(test_secret_walk::<TerminalOptionalCfg>(&ctx, &mut data))
             .expect_err("a terminal optional field must have an object parent");
 
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let EdgeError::ConfigOutOfDate { field_path, .. } = &err else {
-            panic!("malformed optional parent must be ConfigOutOfDate: {err:?}");
+        let EdgeError::StoreExtraction {
+            reason, field_path, ..
+        } = &err
+        else {
+            panic!("malformed optional parent must be typed: {err:?}");
         };
-        assert_eq!(field_path, "integrations.webhook_key");
+        assert_eq!(*reason, StoreExtractionReason::SchemaMismatch);
+        assert_eq!(field_path.as_deref(), Some("integrations.webhook_key"));
     }
 
     #[test]
     fn secret_walk_present_intermediate_absent_optional_leaf_is_ok() {
         let ctx = ctx_with_default_secret_store("unused", "unused");
         let mut data = serde_json::json!({ "integrations": { "datadome": {} } });
-        block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+        block_on(test_secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
             .expect("absent optional leaf under present intermediates is fine");
     }
 
@@ -3023,8 +3396,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_no_registry_returns_internal_error() {
-        // No ConfigRegistry in extensions → Internal error.
+    fn app_config_no_registry_returns_typed_error() {
         let request = request_builder()
             .method(Method::GET)
             .uri("/cfg")
@@ -3033,9 +3405,9 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
             .expect_err("no registry must error");
-        assert!(
-            matches!(err, EdgeError::Internal { .. }),
-            "no registry must surface as Internal: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::MissingRegistry)
         );
         assert!(
             err.message().contains("no default config store registered"),
@@ -3092,7 +3464,7 @@ mod tests {
     }
 
     /// Spec 3.3.8: a resolved secret that FAILS a validator on the secret
-    /// field must produce `ConfigOutOfDate` — the runtime runs the full validator.
+    /// field must produce a typed schema mismatch; runtime runs the full validator.
     #[test]
     fn runtime_rejects_resolved_secret_failing_validator() {
         use crate::config_store::{ConfigStore, ConfigStoreError};
@@ -3129,13 +3501,14 @@ mod tests {
         let ctx = ctx_with_config_and_secrets(BlobStore(blob), "key", secret_store, "vault");
         let err = block_on(AppConfig::<SecretLen>::from_request(&ctx))
             .expect_err("short resolved secret must fail validator");
-        assert!(
-            matches!(err, EdgeError::ConfigOutOfDate { .. }),
-            "validator failure on resolved secret must be ConfigOutOfDate: {err:?}"
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::SchemaMismatch)
         );
-        if let EdgeError::ConfigOutOfDate { field_path, .. } = &err {
+        if let EdgeError::StoreExtraction { field_path, .. } = &err {
             assert_eq!(
-                field_path, "api_token",
+                field_path.as_deref(),
+                Some("api_token"),
                 "field_path names the violating secret field: {err:?}"
             );
         }

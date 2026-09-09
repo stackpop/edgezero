@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
 use crate::http::{Request, Response};
 use crate::ingress::{
-    AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressFraming,
-    IngressHead, IngressHeadAccounting, IngressHeadLimits, apply_admission_policy,
-    default_admission_policy,
+    AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressBeginOutcome,
+    IngressFraming, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
+    PreparedIngress, apply_admission_policy, default_admission_policy,
 };
 use crate::manifest::BakedManifest;
 use crate::response::IntoResponse as _;
@@ -24,6 +25,7 @@ pub const SPIN_ADAPTER: &str = "spin";
 
 /// Lightweight container around a `RouterService` that can be extended via hook implementations.
 pub struct App {
+    config_extraction_limits: ConfigExtractionLimits,
     ingress_head_limits: IngressHeadLimits,
     ingress_policy: IngressAdmissionPolicy,
     name: String,
@@ -38,7 +40,46 @@ impl App {
     /// normalized safely.
     #[inline]
     pub fn admit_ingress(&self, head: &IngressHead) -> Result<IngressAdmissionOutcome, EdgeError> {
-        apply_admission_policy(&self.ingress_policy, head)
+        match apply_admission_policy(&self.ingress_policy, head)? {
+            IngressAdmissionOutcome::Admitted(admitted) => Ok(IngressAdmissionOutcome::Admitted(
+                admitted.with_config_extraction_limits(self.config_extraction_limits),
+            )),
+            IngressAdmissionOutcome::Refused(response) => {
+                Ok(IngressAdmissionOutcome::Refused(response))
+            }
+        }
+    }
+
+    /// Resolves and admits a normalized request head before an adapter transfers native body
+    /// ownership into a core [`Request`].
+    ///
+    /// # Errors
+    /// Returns an internal policy error if the admission deadline cannot be normalized safely.
+    #[inline]
+    pub fn begin_ingress(
+        &self,
+        head_parts: IngressHeadParts,
+        request_start: MonotonicInstant,
+    ) -> Result<IngressBeginOutcome, EdgeError> {
+        let resolved = self
+            .router
+            .resolve(head_parts.method(), head_parts.target().path());
+        let head = head_parts.into_head(request_start, resolved.resolution().clone());
+
+        match self.admit_ingress(&head)? {
+            IngressAdmissionOutcome::Admitted(admitted) => Ok(IngressBeginOutcome::Admitted(
+                PreparedIngress::new(resolved, admitted),
+            )),
+            IngressAdmissionOutcome::Refused(response) => {
+                Ok(IngressBeginOutcome::Refused(response))
+            }
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn config_extraction_limits(&self) -> ConfigExtractionLimits {
+        self.config_extraction_limits
     }
 
     /// Default name used when none is provided.
@@ -46,6 +87,27 @@ impl App {
     #[inline]
     pub fn default_name() -> &'static str {
         DEFAULT_APP_NAME
+    }
+
+    /// Dispatches a request whose native body was wrapped after admission.
+    ///
+    /// # Errors
+    /// Returns an error only when handler/routing error rendering fails.
+    #[inline]
+    pub async fn dispatch_admitted(
+        &self,
+        prepared: PreparedIngress,
+        request: Request,
+    ) -> Result<Response, EdgeError> {
+        let (resolved, admitted) = prepared.into_parts();
+        match self
+            .router
+            .dispatch_resolved(resolved, request, admitted)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => error.into_response(),
+        }
     }
 
     /// Resolves, admits, and dispatches one normalized inbound request.
@@ -64,27 +126,12 @@ impl App {
         head_accounting: IngressHeadAccounting,
         framing: IngressFraming,
     ) -> Result<Response, EdgeError> {
-        let resolved = self.router.resolve(request.method(), request.uri().path());
-        let head = IngressHead::from_request(
-            &request,
-            request_start,
-            resolved.resolution().clone(),
-            head_accounting,
-            framing,
-        );
-
-        match self.admit_ingress(&head)? {
-            IngressAdmissionOutcome::Admitted(admitted) => {
-                match self
-                    .router
-                    .dispatch_resolved(resolved, request, admitted)
-                    .await
-                {
-                    Ok(response) => Ok(response),
-                    Err(error) => error.into_response(),
-                }
+        let head_parts = IngressHeadParts::from_request(&request, head_accounting, framing);
+        match self.begin_ingress(head_parts, request_start)? {
+            IngressBeginOutcome::Admitted(prepared) => {
+                self.dispatch_admitted(prepared, request).await
             }
-            IngressAdmissionOutcome::Refused(response) => Ok(response),
+            IngressBeginOutcome::Refused(response) => Ok(response),
         }
     }
 
@@ -122,6 +169,19 @@ impl App {
         &self.router
     }
 
+    /// Installs validated typed-config extraction limits.
+    ///
+    /// # Errors
+    /// Returns an internal startup-policy error when limits are zero, inconsistent, or unbounded.
+    #[inline]
+    pub fn set_config_extraction_limits(
+        &mut self,
+        limits: ConfigExtractionLimits,
+    ) -> Result<(), EdgeError> {
+        self.config_extraction_limits = limits.validate()?;
+        Ok(())
+    }
+
     /// Installs the synchronous body-blind ingress admission callback.
     #[inline]
     pub fn set_ingress_admission_policy<Policy>(&mut self, policy: Policy)
@@ -153,6 +213,7 @@ impl App {
         S: Into<String>,
     {
         Self {
+            config_extraction_limits: ConfigExtractionLimits::default(),
             ingress_head_limits: IngressHeadLimits::default(),
             ingress_policy: default_admission_policy(),
             name: name.into(),
@@ -259,9 +320,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Poll;
+    use std::time::Duration;
 
     use super::*;
     use crate::body::Body;
+    use crate::config_store::ConfigExtractionLimits;
     use crate::context::RequestContext;
     use crate::error::EdgeError;
     use crate::http::{Method, StatusCode, request_builder, response_builder};
@@ -363,6 +426,40 @@ mod tests {
     }
 
     #[test]
+    fn config_extraction_limits_are_validated_and_reach_routed_context() {
+        let limits = ConfigExtractionLimits {
+            max_backend_bytes: 64,
+            max_blob_bytes: 32,
+            max_secret_bytes: 16,
+            max_total_bytes: 48,
+            timeout: Duration::from_secs(2),
+        };
+        let router = RouterService::builder()
+            .get("/limits", move |ctx: RequestContext| async move {
+                assert_eq!(ctx.config_extraction_limits(), limits);
+                Ok::<_, EdgeError>("ok")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_config_extraction_limits(limits)
+            .expect("valid extraction limits");
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/limits")
+            .body(Body::empty())
+            .expect("request");
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
     fn default_app_admits_with_finite_deadline_and_empty_grant() {
         let app = App::new(empty_router());
         let start = MonotonicInstant::now();
@@ -390,7 +487,7 @@ mod tests {
             admitted.read_deadline().instant()
                 <= start.checked_add(DEADLINE_FAR_FUTURE).expect("maximum")
         );
-        let (_, _, grant) = admitted.into_parts();
+        let (_, _, grant, _) = admitted.into_parts();
         grant.downcast::<()>().expect_err("empty grant");
     }
 
@@ -443,6 +540,48 @@ mod tests {
         assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
         assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
         assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn ingress_two_phase_admission_precedes_body_construction() {
+        let router = RouterService::builder()
+            .post("/upload", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("accepted")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| {
+            assert!(matches!(
+                head.route_resolution(),
+                RouteResolution::Matched(metadata) if metadata.pattern() == "/upload"
+            ));
+            AdmissionDecision::Admit {
+                grant: crate::ingress::IngressGrant::empty(),
+                read_deadline: crate::time::Deadline::after(std::time::Duration::from_secs(1)),
+            }
+        });
+        let head = crate::ingress::IngressHeadParts::new(
+            Method::POST,
+            "/upload".parse().expect("URI"),
+            crate::http::Version::HTTP_11,
+            crate::http::HeaderMap::new(),
+        );
+        let start = MonotonicInstant::now();
+
+        let crate::ingress::IngressBeginOutcome::Admitted(prepared) =
+            app.begin_ingress(head, start).expect("begin ingress")
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(prepared.request_start(), start);
+
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .body(Body::from("payload"))
+            .expect("request");
+        let response = block_on(app.dispatch_admitted(prepared, request)).expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
