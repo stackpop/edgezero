@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 use edgezero_core::{Capability, CapabilitySupport};
@@ -41,6 +41,53 @@ pub enum AdapterAction {
     /// adapters return "unsupported".
     Rollback,
     Serve,
+}
+
+/// Canonical application target selected by the CLI before adapter dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct AdapterExecutionTarget {
+    app_root: PathBuf,
+    component: Option<String>,
+    platform_manifest: Option<PathBuf>,
+}
+
+impl AdapterExecutionTarget {
+    /// Canonical application root used for this action.
+    #[must_use]
+    #[inline]
+    pub fn app_root(&self) -> &Path {
+        &self.app_root
+    }
+
+    /// Optional platform component selected by the manifest.
+    #[must_use]
+    #[inline]
+    pub fn component(&self) -> Option<&str> {
+        self.component.as_deref()
+    }
+
+    /// Construct a target after the caller has canonicalized and validated it.
+    #[must_use]
+    #[inline]
+    pub fn new(
+        app_root: PathBuf,
+        component: Option<String>,
+        platform_manifest: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            app_root,
+            component,
+            platform_manifest,
+        }
+    }
+
+    /// Canonical platform manifest selected for this action, when applicable.
+    #[must_use]
+    #[inline]
+    pub fn platform_manifest(&self) -> Option<&Path> {
+        self.platform_manifest.as_deref()
+    }
 }
 
 /// A single declared store id, paired with the platform name the
@@ -298,6 +345,27 @@ pub trait Adapter: Sync + Send {
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+
+    /// Execute against a target already selected and validated by the CLI.
+    ///
+    /// The default refuses rather than falling back to [`Self::execute`], which
+    /// could rediscover a different project from the process working directory.
+    ///
+    /// # Errors
+    /// Returns an explicit unsupported error unless the adapter implements
+    /// pinned-target dispatch.
+    #[inline]
+    fn execute_target(
+        &self,
+        _action: AdapterAction,
+        _target: &AdapterExecutionTarget,
+        _args: &[String],
+    ) -> Result<(), String> {
+        Err(format!(
+            "adapter `{}` does not support pinned execution targets",
+            self.name()
+        ))
+    }
 
     /// Reclaim chunk entries that no LIVE config pointer references.
     ///
@@ -749,6 +817,18 @@ mod tests {
             adapter.capability(Capability::OutboundCompleteResourceAccounting),
             CapabilitySupport::Unsupported
         );
+    }
+
+    #[test]
+    fn adapter_execute_target_default_refuses_rediscovery() {
+        let _guard = TEST_LOCK.lock().expect("lock");
+        reset();
+        let target = AdapterExecutionTarget::new(PathBuf::from("/tmp"), None, None);
+        let error = FIRST
+            .execute_target(AdapterAction::Build, &target, &[])
+            .expect_err("default target execution must fail closed");
+        assert!(error.contains("pinned execution targets"));
+        assert_eq!(HIT.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -3,6 +3,8 @@ use edgezero_core::manifest::{
     CapabilitySupport, Manifest, ManifestContract, ManifestLoader, ResolvedEnvironment,
 };
 
+use crate::manifest_source::{ResolvedAdapterTarget, ResolvedRuntime};
+
 use std::env;
 use std::fmt;
 use std::io::{self, BufRead as _, BufReader, Read, Write};
@@ -165,6 +167,10 @@ pub fn execute(
 /// the inherited stdio, so there is nothing for us to capture and the
 /// caller must fall back to another source of truth (for Fastly deploy:
 /// the Fastly API).
+#[expect(
+    dead_code,
+    reason = "retained operational dispatcher API; runtime-producing actions use execute_capture_runtime"
+)]
 pub fn execute_capture(
     adapter_name: &str,
     action: Action,
@@ -190,6 +196,89 @@ pub fn execute_capture(
     }
     execute(adapter_name, action, manifest_loader, adapter_args)?;
     Ok(None)
+}
+
+/// Dispatch a runtime-producing action against one pre-resolved target/contract pair.
+pub(crate) fn execute_runtime(
+    runtime: &ResolvedRuntime,
+    adapter_args: &[String],
+) -> Result<(), String> {
+    ensure_action_capabilities(runtime)?;
+    execute_after_gate(runtime, adapter_args)
+}
+
+/// Capturing variant of [`execute_runtime`] for manifest shell commands.
+pub(crate) fn execute_capture_runtime(
+    runtime: &ResolvedRuntime,
+    adapter_args: &[String],
+) -> Result<Option<String>, String> {
+    ensure_action_capabilities(runtime)?;
+    if let ResolvedAdapterTarget::Shell(shell) = runtime.target() {
+        return run_shell_tee(
+            shell.command(),
+            shell.root(),
+            runtime.adapter_name(),
+            runtime.action(),
+            Some(shell.environment().clone()),
+            (shell.bind_host().map(str::to_owned), shell.bind_port()),
+            adapter_args,
+        )
+        .map(Some);
+    }
+    execute_registered_after_gate(runtime, adapter_args)?;
+    Ok(None)
+}
+
+fn ensure_action_capabilities(runtime: &ResolvedRuntime) -> Result<(), String> {
+    if !produces_current_runtime(runtime.action()) {
+        return Err("operational action entered outbound runtime dispatcher".to_owned());
+    }
+    ensure_capabilities(
+        runtime.adapter_name(),
+        ManifestContract::from_opt(runtime.manifest()),
+    )
+}
+
+fn execute_after_gate(runtime: &ResolvedRuntime, adapter_args: &[String]) -> Result<(), String> {
+    match runtime.target() {
+        ResolvedAdapterTarget::Registered(_target) => {
+            execute_registered_after_gate(runtime, adapter_args)
+        }
+        ResolvedAdapterTarget::Shell(shell) => run_shell(
+            shell.command(),
+            shell.root(),
+            runtime.adapter_name(),
+            runtime.action(),
+            Some(shell.environment().clone()),
+            (shell.bind_host().map(str::to_owned), shell.bind_port()),
+            adapter_args,
+        ),
+    }
+}
+
+fn execute_registered_after_gate(
+    runtime: &ResolvedRuntime,
+    adapter_args: &[String],
+) -> Result<(), String> {
+    let ResolvedAdapterTarget::Registered(target) = runtime.target() else {
+        return Err("registered runtime dispatcher received a shell target".to_owned());
+    };
+    let adapter = adapter_registry::get_adapter(runtime.adapter_name()).ok_or_else(|| {
+        let available = adapter_registry::registered_adapters();
+        if available.is_empty() {
+            format!(
+                "adapter `{}` is not registered (no adapters available)",
+                runtime.adapter_name()
+            )
+        } else {
+            format!(
+                "adapter `{}` is not registered (available: {})",
+                runtime.adapter_name(),
+                available.join(", ")
+            )
+        }
+    })?;
+    adapter.execute_target(AdapterAction::from(runtime.action()), target, adapter_args)
 }
 
 pub(crate) fn ensure_capabilities(
@@ -276,20 +365,16 @@ pub(crate) fn ensure_capabilities(
     Ok(())
 }
 
-/// Whether `action` for `adapter_name` resolves to a manifest-declared
-/// shell command (rather than the registered adapter's built-in logic).
-///
-/// Callers use this to decide whether an EdgeZero-internal directive
-/// (e.g. `--manifest-path`, understood only by the built-in adapter) is
-/// safe to thread into `adapter_args`: a manifest shell command receives
-/// those args verbatim and would choke on a flag its own CLI lacks.
-pub fn has_manifest_command(
-    manifest_loader: Option<&ManifestLoader>,
-    adapter_name: &str,
-    action: Action,
-) -> bool {
-    manifest_loader
-        .is_some_and(|loader| manifest_command(loader.manifest(), adapter_name, action).is_some())
+fn produces_current_runtime(action: Action) -> bool {
+    match action {
+        Action::Build | Action::Deploy | Action::DeployStaged | Action::Serve => true,
+        Action::AuthLogin
+        | Action::AuthLogout
+        | Action::AuthStatus
+        | Action::EmitVersion
+        | Action::Healthcheck
+        | Action::Rollback => false,
+    }
 }
 
 fn manifest_command<'manifest>(
