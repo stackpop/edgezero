@@ -20,6 +20,7 @@ cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:rusqlite
 edgezero-core = { path = "../edgezero-core" }
 edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = ["cli"] }
 anyhow = { workspace = true }
+async-stream = { workspace = true }
 async-trait = { workspace = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
