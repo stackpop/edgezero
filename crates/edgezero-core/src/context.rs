@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use crate::body::Body;
+use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
 use crate::http::Request;
 use crate::ingress::{AdmittedIngress, IngressGrant};
@@ -16,6 +17,7 @@ use serde::de::DeserializeOwned;
 
 /// Request context exposed to handlers and middleware.
 pub struct RequestContext {
+    config_extraction_limits: ConfigExtractionLimits,
     ingress_grant: RefCell<Option<IngressGrant>>,
     path_params: PathParams,
     read_deadline: Option<Deadline>,
@@ -28,6 +30,12 @@ impl RequestContext {
     #[inline]
     pub fn body(&self) -> &Body {
         self.request.body()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn config_extraction_limits(&self) -> ConfigExtractionLimits {
+        self.config_extraction_limits
     }
 
     /// Resolve the [`BoundConfigStore`] for `id`. Strict lookup: when a
@@ -157,6 +165,7 @@ impl RequestContext {
     #[inline]
     pub fn new(request: Request, params: PathParams) -> Self {
         Self {
+            config_extraction_limits: ConfigExtractionLimits::default(),
             ingress_grant: RefCell::new(None),
             path_params: params,
             read_deadline: None,
@@ -172,8 +181,9 @@ impl RequestContext {
         route_metadata: RouteMetadata,
         ingress: AdmittedIngress,
     ) -> Self {
-        let (request_start, read_deadline, grant) = ingress.into_parts();
+        let (request_start, read_deadline, grant, config_extraction_limits) = ingress.into_parts();
         Self {
+            config_extraction_limits,
             ingress_grant: RefCell::new(Some(grant)),
             path_params: params,
             read_deadline: Some(read_deadline),

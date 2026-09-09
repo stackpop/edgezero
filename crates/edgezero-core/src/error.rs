@@ -57,6 +57,64 @@ pub enum ResponseLimitReason {
     Unspecified,
 }
 
+/// Stable classification for typed configuration extraction failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoreExtractionReason {
+    BackendFailure,
+    BackendUnavailable,
+    DeadlineExceeded,
+    IntegrityMismatch,
+    InvalidEnvelope,
+    InvalidKey,
+    InvalidSecretValue,
+    MissingBlob,
+    MissingRegistry,
+    MissingSecret,
+    SchemaMismatch,
+    SecretBackendUnavailable,
+    UnknownStore,
+    ValueTooLarge,
+}
+
+impl StoreExtractionReason {
+    fn wire_kind(self) -> &'static str {
+        match self {
+            Self::BackendFailure
+            | Self::IntegrityMismatch
+            | Self::InvalidEnvelope
+            | Self::InvalidSecretValue
+            | Self::MissingRegistry
+            | Self::UnknownStore
+            | Self::ValueTooLarge => "internal",
+            Self::BackendUnavailable | Self::DeadlineExceeded | Self::SecretBackendUnavailable => {
+                "service_unavailable"
+            }
+            Self::InvalidKey => "bad_request",
+            Self::MissingBlob | Self::MissingSecret | Self::SchemaMismatch => "config_out_of_date",
+        }
+    }
+
+    fn wire_status(self) -> StatusCode {
+        match self {
+            Self::BackendFailure
+            | Self::IntegrityMismatch
+            | Self::InvalidEnvelope
+            | Self::InvalidSecretValue
+            | Self::MissingRegistry
+            | Self::UnknownStore
+            | Self::ValueTooLarge => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::BackendUnavailable
+            | Self::DeadlineExceeded
+            | Self::MissingBlob
+            | Self::MissingSecret
+            | Self::SchemaMismatch
+            | Self::SecretBackendUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InvalidKey => StatusCode::BAD_REQUEST,
+        }
+    }
+}
+
 /// Application-level error that carries an HTTP status code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -92,6 +150,10 @@ pub enum EdgeError {
     NotFound { path: String },
     #[error("not implemented: {message}")]
     NotImplemented { message: String },
+    #[error("{message}")]
+    RequestHeaderFieldsTooLarge { message: String },
+    #[error("{message}")]
+    RequestTimeout { message: String },
     /// An upstream response exceeded an EdgeZero-owned resource policy. HTTP 502.
     #[error("{message}")]
     ResponseTooLarge {
@@ -100,6 +162,14 @@ pub enum EdgeError {
     },
     #[error("service unavailable: {message}")]
     ServiceUnavailable { message: String },
+    #[error("{message}")]
+    StoreExtraction {
+        reason: StoreExtractionReason,
+        message: String,
+        field_path: Option<String>,
+    },
+    #[error("{message}")]
+    UriTooLong { message: String },
     #[error("validation error: {message}")]
     Validation { message: String },
 }
@@ -208,8 +278,12 @@ impl EdgeError {
             | EdgeError::GatewayTimeout { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
             | EdgeError::ResponseTooLarge { .. }
             | EdgeError::MethodNotAllowed { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
             | EdgeError::Validation { .. }
             | EdgeError::ServiceUnavailable { .. } => None,
         }
@@ -235,8 +309,12 @@ impl EdgeError {
             EdgeError::MethodNotAllowed { .. } => "method_not_allowed",
             EdgeError::NotFound { .. } => "not_found",
             EdgeError::NotImplemented { .. } => "not_implemented",
+            EdgeError::RequestHeaderFieldsTooLarge { .. } => "request_header_fields_too_large",
+            EdgeError::RequestTimeout { .. } => "request_timeout",
             EdgeError::ResponseTooLarge { .. } => "response_too_large",
             EdgeError::ServiceUnavailable { .. } => "service_unavailable",
+            EdgeError::StoreExtraction { reason, .. } => reason.wire_kind(),
+            EdgeError::UriTooLong { .. } => "uri_too_long",
             EdgeError::Validation { .. } => "validation",
         }
     }
@@ -249,7 +327,11 @@ impl EdgeError {
             | EdgeError::BadRequest { message }
             | EdgeError::ConfigOutOfDate { message, .. }
             | EdgeError::GatewayTimeout { message, .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { message }
+            | EdgeError::RequestTimeout { message }
             | EdgeError::ResponseTooLarge { message, .. }
+            | EdgeError::StoreExtraction { message, .. }
+            | EdgeError::UriTooLong { message }
             | EdgeError::Validation { message }
             | EdgeError::NotImplemented { message }
             | EdgeError::ServiceUnavailable { message } => message.clone(),
@@ -293,6 +375,20 @@ impl EdgeError {
     }
 
     #[inline]
+    pub fn request_header_fields_too_large<S: Into<String>>(message: S) -> Self {
+        Self::RequestHeaderFieldsTooLarge {
+            message: message.into(),
+        }
+    }
+
+    #[inline]
+    pub fn request_timeout<S: Into<String>>(message: S) -> Self {
+        Self::RequestTimeout {
+            message: message.into(),
+        }
+    }
+
+    #[inline]
     pub fn response_too_large<S: Into<String>>(message: S) -> Self {
         EdgeError::ResponseTooLarge {
             message: message.into(),
@@ -330,11 +426,80 @@ impl EdgeError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             EdgeError::GatewayTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            EdgeError::RequestHeaderFieldsTooLarge { .. } => {
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            }
+            EdgeError::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
             EdgeError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
             EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             EdgeError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
+            EdgeError::StoreExtraction { reason, .. } => reason.wire_status(),
+            EdgeError::UriTooLong { .. } => StatusCode::URI_TOO_LONG,
             EdgeError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn store_extraction<Msg: Into<String>>(
+        reason: StoreExtractionReason,
+        message: Msg,
+        field_path: Option<String>,
+    ) -> Self {
+        Self::StoreExtraction {
+            reason,
+            message: message.into(),
+            field_path: field_path.filter(|path| !path.is_empty()),
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn store_extraction_reason(&self) -> Option<StoreExtractionReason> {
+        match self {
+            Self::StoreExtraction { reason, .. } => Some(*reason),
+            Self::BadGateway { .. }
+            | Self::BadRequest { .. }
+            | Self::ConfigOutOfDate { .. }
+            | Self::GatewayTimeout { .. }
+            | Self::Internal { .. }
+            | Self::MethodNotAllowed { .. }
+            | Self::NotFound { .. }
+            | Self::NotImplemented { .. }
+            | Self::RequestHeaderFieldsTooLarge { .. }
+            | Self::RequestTimeout { .. }
+            | Self::ResponseTooLarge { .. }
+            | Self::ServiceUnavailable { .. }
+            | Self::UriTooLong { .. }
+            | Self::Validation { .. } => None,
+        }
+    }
+
+    /// Constructs a redacted schema mismatch from a serde path error.
+    #[must_use]
+    #[inline]
+    pub fn store_schema_mismatch_from_serde(serde_err: &SerdePathError<serde_json::Error>) -> Self {
+        use serde_json::error::Category;
+
+        let category = match serde_err.inner().classify() {
+            Category::Data => "wrong type or invalid value",
+            Category::Syntax => "malformed JSON",
+            Category::Eof => "unexpected end of input",
+            Category::Io => "i/o error while reading",
+        };
+        let path = redact_serde_path(serde_err.path());
+        Self::store_extraction(
+            StoreExtractionReason::SchemaMismatch,
+            format!("typed app-config is out of date ({category}; value redacted)"),
+            Some(path),
+        )
+    }
+
+    #[inline]
+    pub fn uri_too_long<S: Into<String>>(message: S) -> Self {
+        Self::UriTooLong {
+            message: message.into(),
         }
     }
 
@@ -350,8 +515,14 @@ impl From<ConfigStoreError> for EdgeError {
     #[inline]
     fn from(err: ConfigStoreError) -> Self {
         match err {
+            ConfigStoreError::DeadlineExceeded => {
+                EdgeError::service_unavailable("config store read deadline exceeded")
+            }
             ConfigStoreError::InvalidKey { message } => EdgeError::bad_request(message),
             ConfigStoreError::Unavailable { message } => EdgeError::service_unavailable(message),
+            ConfigStoreError::ValueTooLarge => {
+                EdgeError::internal(anyhow::anyhow!("config store value too large"))
+            }
             ConfigStoreError::Internal { source } => EdgeError::internal(source),
         }
     }
@@ -361,7 +532,7 @@ impl IntoResponse for EdgeError {
     #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         let kind = self.kind_str();
-        let is_config_out_of_date = matches!(self, EdgeError::ConfigOutOfDate { .. });
+        let is_config_out_of_date = self.kind_str() == "config_out_of_date";
         // `ConfigOutOfDate { field_path: String::new(), .. }` (the missing-blob
         // path) must OMIT the `field_path` JSON key entirely, not emit
         // `"field_path": ""`. Per spec 6.3.1.
@@ -369,6 +540,10 @@ impl IntoResponse for EdgeError {
             EdgeError::ConfigOutOfDate { field_path, .. } if !field_path.is_empty() => {
                 Some(field_path.as_str())
             }
+            EdgeError::StoreExtraction {
+                field_path: Some(field_path),
+                ..
+            } => Some(field_path.as_str()),
             EdgeError::BadGateway { .. }
             | EdgeError::BadRequest { .. }
             | EdgeError::ConfigOutOfDate { .. }
@@ -377,8 +552,12 @@ impl IntoResponse for EdgeError {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
             | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
             | EdgeError::Validation { .. } => None,
         };
         let status = self.status();
@@ -637,8 +816,12 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
             | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
     }
@@ -690,8 +873,12 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
             | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
     }
@@ -747,8 +934,12 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
             | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
     }
@@ -789,8 +980,12 @@ mod tests {
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::NotFound { .. }
             | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
             | EdgeError::ResponseTooLarge { .. }
             | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
     }
@@ -1049,6 +1244,142 @@ mod tests {
             assert_eq!(body["error"]["kind"], "response_too_large");
             assert_eq!(body["error"]["message"], "response limit");
             assert!(body["error"].get("reason").is_none());
+            assert!(body["error"].get("field_path").is_none());
+        }
+    }
+
+    #[test]
+    fn store_extraction_reason_wire_policy_table() {
+        let cases = [
+            (
+                StoreExtractionReason::BackendFailure,
+                500_u16,
+                "internal",
+                false,
+            ),
+            (
+                StoreExtractionReason::BackendUnavailable,
+                503_u16,
+                "service_unavailable",
+                false,
+            ),
+            (
+                StoreExtractionReason::DeadlineExceeded,
+                503_u16,
+                "service_unavailable",
+                false,
+            ),
+            (
+                StoreExtractionReason::IntegrityMismatch,
+                500_u16,
+                "internal",
+                false,
+            ),
+            (
+                StoreExtractionReason::InvalidEnvelope,
+                500_u16,
+                "internal",
+                false,
+            ),
+            (
+                StoreExtractionReason::InvalidKey,
+                400_u16,
+                "bad_request",
+                false,
+            ),
+            (
+                StoreExtractionReason::InvalidSecretValue,
+                500_u16,
+                "internal",
+                false,
+            ),
+            (
+                StoreExtractionReason::MissingBlob,
+                503_u16,
+                "config_out_of_date",
+                true,
+            ),
+            (
+                StoreExtractionReason::MissingRegistry,
+                500_u16,
+                "internal",
+                false,
+            ),
+            (
+                StoreExtractionReason::MissingSecret,
+                503_u16,
+                "config_out_of_date",
+                true,
+            ),
+            (
+                StoreExtractionReason::SchemaMismatch,
+                503_u16,
+                "config_out_of_date",
+                true,
+            ),
+            (
+                StoreExtractionReason::SecretBackendUnavailable,
+                503_u16,
+                "service_unavailable",
+                false,
+            ),
+            (
+                StoreExtractionReason::UnknownStore,
+                500_u16,
+                "internal",
+                false,
+            ),
+            (
+                StoreExtractionReason::ValueTooLarge,
+                500_u16,
+                "internal",
+                false,
+            ),
+        ];
+
+        for (reason, status, kind, retry_after) in cases {
+            let error = EdgeError::store_extraction(
+                reason,
+                "safe extraction diagnostic",
+                Some(String::from("field")),
+            );
+            assert_eq!(error.store_extraction_reason(), Some(reason));
+            let response = error.into_response().expect("response");
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers().contains_key(RETRY_AFTER), retry_after);
+            let body = parse_body(response);
+            assert_eq!(body["error"]["kind"], kind);
+            assert_eq!(body["error"]["field_path"], "field");
+            assert!(body["error"].get("reason").is_none());
+        }
+
+        let error = EdgeError::store_extraction(
+            StoreExtractionReason::MissingBlob,
+            "missing",
+            Some(String::new()),
+        );
+        let body = parse_body(error.into_response().expect("response"));
+        assert!(body["error"].get("field_path").is_none());
+    }
+
+    #[test]
+    fn inbound_boundary_errors_have_distinct_status_and_kind() {
+        for (error, status, kind) in [
+            (
+                EdgeError::request_header_fields_too_large("headers"),
+                431_u16,
+                "request_header_fields_too_large",
+            ),
+            (
+                EdgeError::request_timeout("request body deadline exceeded"),
+                408_u16,
+                "request_timeout",
+            ),
+            (EdgeError::uri_too_long("target"), 414_u16, "uri_too_long"),
+        ] {
+            assert_eq!(error.status().as_u16(), status);
+            let body = parse_body(error.into_response().expect("response"));
+            assert_eq!(body["error"]["kind"], kind);
             assert!(body["error"].get("field_path").is_none());
         }
     }

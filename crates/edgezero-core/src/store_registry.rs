@@ -25,9 +25,10 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 
-use crate::config_store::ConfigStoreHandle;
+use crate::config_store::{BoundedStoreRead, ConfigStoreHandle};
 use crate::key_value_store::KvHandle;
 use crate::secret_store::{SecretError, SecretHandle};
+use crate::time::Deadline;
 
 /// A per-bind KV handle, returned by [`KvRegistry::named`] / [`KvRegistry::default`].
 pub type BoundKvStore = KvHandle;
@@ -69,6 +70,29 @@ impl BoundSecretStore {
     #[inline]
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, SecretError> {
         self.handle.get_bytes(&self.store_name, key).await
+    }
+
+    /// Retrieve a secret against the bound store under one absolute deadline and byte budget.
+    ///
+    /// # Errors
+    /// Preserves validation and the provider's typed bounded-read errors.
+    #[inline]
+    pub async fn get_bytes_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        self.handle
+            .get_bytes_bounded(
+                &self.store_name,
+                key,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
+            .await
     }
 
     /// Underlying [`SecretHandle`] (escape hatch for callers that need the
