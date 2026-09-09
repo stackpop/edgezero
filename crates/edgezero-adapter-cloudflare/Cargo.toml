@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-cloudflare = ["dep:worker", "dep:serde_json"]
+cloudflare = ["dep:async-stream", "dep:worker", "dep:serde_json"]
 cli = [
     "dep:edgezero-adapter",
     "edgezero-adapter/cli",
@@ -31,6 +31,7 @@ edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = [
     "cli",
 ] }
 async-trait = { workspace = true }
+async-stream = { workspace = true, optional = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }

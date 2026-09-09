@@ -11,8 +11,11 @@ pub mod config_store;
 pub mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod key_value_store;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub mod proxy;
+#[cfg(any(
+    feature = "test-utils",
+    all(feature = "cloudflare", target_arch = "wasm32")
+))]
+pub mod outbound;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]

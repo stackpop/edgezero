@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{LazyLock, PoisonError, RwLock};
 
+use edgezero_core::{Capability, CapabilitySupport};
+
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -269,11 +271,18 @@ pub enum ReadConfigEntry {
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 ///
 /// The non-`execute` methods carry the adapter's `config validate`
-/// rules. They take primitive parameters (no `Manifest` /
-/// `SecretField` from `edgezero-core`) so this crate stays dep-free
-/// of `edgezero-core`. Defaults are no-ops; adapters override what
-/// they actually need.
+/// rules. Defaults are no-ops; adapters override what they actually need.
 pub trait Adapter: Sync + Send {
+    /// Report this adapter's support for an application capability.
+    ///
+    /// The fail-closed default prevents an adapter from accidentally claiming
+    /// support merely because a new capability was added to core.
+    #[must_use]
+    #[inline]
+    fn capability(&self, _capability: Capability) -> CapabilitySupport {
+        CapabilitySupport::Unsupported
+    }
+
     /// Execute the requested action with optional adapter-specific args.
     ///
     /// `args` is a stringly-typed pass-through for arguments meant
@@ -666,6 +675,32 @@ mod tests {
         name: &'static str,
     }
 
+    struct CapabilityAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "fixture overrides only the behavior under test"
+    )]
+    impl Adapter for CapabilityAdapter {
+        fn capability(&self, capability: Capability) -> CapabilitySupport {
+            match capability {
+                Capability::LazyStreamedResponsePassthrough => CapabilitySupport::BestEffort,
+                Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
+                Capability::OutboundDeadlines => CapabilitySupport::BoundedCooperative,
+                Capability::OutboundHttp => CapabilitySupport::Native,
+                _ => CapabilitySupport::Unsupported,
+            }
+        }
+
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "capability-fixture"
+        }
+    }
+
     #[expect(
         clippy::missing_trait_methods,
         reason = "TestAdapter only exercises register / get / execute; the validation methods inherit the trait defaults (no-ops)"
@@ -685,6 +720,35 @@ mod tests {
         let mut registry = super::REGISTRY.write().expect("registry lock");
         registry.clear();
         HIT.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn adapter_capability_default_is_unsupported() {
+        assert_eq!(
+            FIRST.capability(Capability::OutboundHttp),
+            CapabilitySupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn adapter_capability_reports_each_support_level() {
+        let adapter = CapabilityAdapter;
+        assert_eq!(
+            adapter.capability(Capability::OutboundHttp),
+            CapabilitySupport::Native
+        );
+        assert_eq!(
+            adapter.capability(Capability::OutboundDeadlines),
+            CapabilitySupport::BoundedCooperative
+        );
+        assert_eq!(
+            adapter.capability(Capability::LazyStreamedResponsePassthrough),
+            CapabilitySupport::BestEffort
+        );
+        assert_eq!(
+            adapter.capability(Capability::OutboundCompleteResourceAccounting),
+            CapabilitySupport::Unsupported
+        );
     }
 
     #[test]

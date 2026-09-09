@@ -52,6 +52,34 @@ impl AtomicHost {
     }
 }
 
+/// Compile-time manifest state exposed by macro-generated application hooks.
+///
+/// This distinguishes an application without a baked manifest from a corrupt
+/// baked contract so capability enforcement cannot fail open.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum BakedManifest {
+    /// No manifest was baked into this application.
+    Absent,
+    /// A baked manifest was present but could not be reconstructed safely.
+    Malformed(&'static str),
+    /// A parsed, validated, and finalized baked manifest.
+    Present(&'static Manifest),
+}
+
+impl BakedManifest {
+    /// Borrow this baked state as the lifetime-neutral capability-gate input.
+    #[must_use]
+    #[inline]
+    pub fn as_contract(&self) -> ManifestContract<'_> {
+        match self {
+            Self::Absent => ManifestContract::None,
+            Self::Malformed(reason) => ManifestContract::Malformed(reason),
+            Self::Present(manifest) => ManifestContract::Present(manifest),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -98,6 +126,30 @@ pub enum CapabilitySupport {
     BoundedCooperative,
     Native,
     Unsupported,
+}
+
+/// Manifest input accepted by runtime capability gates.
+///
+/// File-backed manifests may be borrowed for any lifetime, while a baked
+/// manifest converts through [`BakedManifest::as_contract`].
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum ManifestContract<'manifest> {
+    /// A manifest contract exists but cannot be verified.
+    Malformed(&'static str),
+    /// No capability contract exists.
+    None,
+    /// A parsed and validated manifest contract.
+    Present(&'manifest Manifest),
+}
+
+impl<'manifest> ManifestContract<'manifest> {
+    /// Convert an optional file-backed manifest reference into a contract.
+    #[must_use]
+    #[inline]
+    pub fn from_opt(manifest: Option<&'manifest Manifest>) -> Self {
+        manifest.map_or(Self::None, Self::Present)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -373,6 +425,37 @@ impl Manifest {
         }
 
         self.logging_resolved = resolved;
+    }
+
+    /// Parse, validate, and finalize JSON emitted by the `app!` macro.
+    ///
+    /// This is macro-support API. Call it at most once per application process;
+    /// a successful call intentionally leaks one manifest so generated hooks can
+    /// expose it for the process lifetime.
+    #[doc(hidden)]
+    #[inline]
+    #[must_use]
+    pub fn from_baked_json(json: &'static str) -> BakedManifest {
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(value) => value,
+            Err(_error) => {
+                return BakedManifest::Malformed("baked manifest did not parse");
+            }
+        };
+        if reject_misplaced_capabilities_json(&value).is_err() {
+            return BakedManifest::Malformed("baked manifest has misplaced capabilities");
+        }
+        let mut manifest: Self = match serde_json::from_value(value) {
+            Ok(manifest) => manifest,
+            Err(_error) => {
+                return BakedManifest::Malformed("baked manifest did not parse");
+            }
+        };
+        if manifest.validate().is_err() {
+            return BakedManifest::Malformed("baked manifest failed validation");
+        }
+        manifest.finalize();
+        BakedManifest::Present(Box::leak(Box::new(manifest)))
     }
 
     #[must_use]
@@ -1220,6 +1303,33 @@ pub(crate) fn reject_misplaced_capabilities(value: &toml::Value) -> Result<(), &
             | toml::Value::Float(_)
             | toml::Value::Integer(_)
             | toml::Value::String(_) => {}
+        }
+        Ok(())
+    }
+
+    walk(value, true)
+}
+
+fn reject_misplaced_capabilities_json(value: &serde_json::Value) -> Result<(), ()> {
+    fn walk(value: &serde_json::Value, top_level: bool) -> Result<(), ()> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for array_value in values {
+                    walk(array_value, false)?;
+                }
+            }
+            serde_json::Value::Object(object) => {
+                for (key, nested_value) in object {
+                    if is_reserved_capabilities_key(key) && (!top_level || key != "capabilities") {
+                        return Err(());
+                    }
+                    walk(nested_value, false)?;
+                }
+            }
+            serde_json::Value::Bool(_)
+            | serde_json::Value::Null
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
         }
         Ok(())
     }
@@ -3134,4 +3244,28 @@ default = "feature__flags"
             .err()
             .expect("double-underscore store id must fail validation");
     }
+}
+#[test]
+fn baked_manifest_states_are_distinct() {
+    assert!(matches!(
+        Manifest::from_baked_json("not json"),
+        BakedManifest::Malformed("baked manifest did not parse")
+    ));
+    assert!(matches!(
+        Manifest::from_baked_json(r#"{"app":{"Capabilities":{}}}"#),
+        BakedManifest::Malformed("baked manifest has misplaced capabilities")
+    ));
+    let baked = Manifest::from_baked_json(r#"{"capabilities":{"required":["outbound-http"]}}"#);
+    let BakedManifest::Present(manifest) = baked else {
+        panic!("expected present baked manifest");
+    };
+    assert_eq!(manifest.capabilities.required, [Capability::OutboundHttp]);
+    assert!(matches!(
+        BakedManifest::Absent.as_contract(),
+        ManifestContract::None
+    ));
+    assert!(matches!(
+        ManifestContract::from_opt(Some(manifest)),
+        ManifestContract::Present(_)
+    ));
 }
