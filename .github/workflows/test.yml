@@ -119,7 +119,7 @@ jobs:
           - adapter: spin
             target: wasm32-wasip2
             runner_env: CARGO_TARGET_WASM32_WASIP2_RUNNER
-            runner_value: wasmtime run
+            runner_value: wasmtime run -W component-model-async=y -S p3=y -S http=y
     steps:
       - uses: actions/checkout@v6
 
@@ -236,6 +236,12 @@ jobs:
         env:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: cargo test -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --test contract
+
+      - name: Run Spin WASI HTTP SDK resource tests
+        if: matrix.adapter == 'spin'
+        env:
+          ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
+        run: scripts/run_test_nonzero.sh sdk_fields_preserve_duplicate_values cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features spin,test-utils --target wasm32-wasip2 --test sdk_resources
 
       # The colocated runtime unit tests (config-store resolver, chunk
       # remediation) need the `fastly` feature and only RUN under Viceroy — the

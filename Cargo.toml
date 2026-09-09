@@ -81,11 +81,9 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 syn = { version = "3", features = ["full", "extra-traits", "visit"] }
 subtle = "2"
-# Pinned to the `~6.0` range (allows 6.0.x, blocks 6.1+) so a minor
-# bump that touches `key_value::Store::open`'s async signature or the
-# wasi-http import surface fails at build time rather than at `spin
-# up` (where a runtime mismatch surfaces as opaque WIT linker errors).
-spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
+# The Spin outbound classifier exhaustively matches this SDK's WASI HTTP
+# snapshot, so both dependencies move only through an explicit review.
+spin-sdk = { version = "=6.0.0", default-features = false, features = ["http", "key-value", "variables"] }
 tempfile = "3"
 toml_edit = "0.25"
 thiserror = "2"
@@ -99,6 +97,7 @@ tracing = "0.1"
 url = "=2.5.8"
 validator = { version = "0.20", features = ["derive"] }
 walkdir = { version = "2" }
+wasip3 = "=0.6.0"
 web-time = "1"
 worker = { version = "=0.8.3", default-features = false, features = ["http"] }
 
