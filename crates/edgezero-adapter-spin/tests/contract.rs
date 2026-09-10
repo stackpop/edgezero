@@ -126,6 +126,10 @@ mod tests {
     }
 
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for FixedConfigStore {
         async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             if key == self.key {
@@ -188,6 +192,10 @@ mod tests {
     }
 
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl SecretStore for FixedSecretStore {
         async fn get_bytes(
             &self,

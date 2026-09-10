@@ -21,7 +21,9 @@
 
 use sha2::{Digest as _, Sha256};
 
+#[cfg(any(feature = "fastly", test))]
 use edgezero_core::config_store::ConfigStoreError;
+#[cfg(any(feature = "fastly", test))]
 use edgezero_core::{BoundedStoreRead, Deadline, MonotonicInstant};
 
 /// Per-entry value limit enforced by Fastly Config Store. Used by the CLI writer
@@ -52,9 +54,11 @@ pub(crate) const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
 pub(crate) const POINTER_KIND: &str = "fastly_config_chunks";
 
 #[derive(Debug, Eq, PartialEq)]
+#[cfg(any(feature = "fastly", test))]
 pub(crate) struct FastlyReadTooLarge;
 
 #[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
 pub(crate) enum SyncHostCallError<E> {
     Backend(E),
     DeadlineExceeded,
@@ -117,6 +121,7 @@ pub(crate) enum ResolveFailure {
 /// A bounded resolver failure that preserves store boundary errors instead of
 /// misclassifying them as corrupt pointer state.
 #[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
 pub(crate) enum BoundedResolveFailure {
     Backend(ConfigStoreError),
     DeadlineExceeded,
@@ -179,6 +184,7 @@ pub(crate) enum GcRootValue {
 // ---------------------------------------------------------------------------
 
 /// Account for the exact bytes materialized by a Fastly store operation.
+#[cfg(any(feature = "fastly", test))]
 pub(crate) fn exact_fastly_read<T>(
     value: Option<T>,
     max_backend_bytes: u64,
@@ -202,6 +208,7 @@ where
 ///
 /// The host call itself is not preemptible. An overrun is observed immediately
 /// after the call returns and its result is discarded.
+#[cfg(any(feature = "fastly", test))]
 pub(crate) fn run_sync_host_call<T, E, F>(
     deadline: Deadline,
     call: F,
@@ -212,6 +219,7 @@ where
     run_sync_host_call_at(deadline, MonotonicInstant::now, call)
 }
 
+#[cfg(any(feature = "fastly", test))]
 fn run_sync_host_call_at<T, E, N, F>(
     deadline: Deadline,
     mut now: N,
@@ -653,6 +661,7 @@ where
 /// `fetch` receives the backend allowance left after the root pointer and all
 /// prior chunks. Deadline checks are cooperative: they bracket each callback,
 /// but cannot interrupt a synchronous host call already in progress.
+#[cfg(any(feature = "fastly", test))]
 pub(crate) fn resolve_fastly_config_value_typed_bounded<F>(
     root_key: &str,
     root_value: String,
@@ -1451,6 +1460,58 @@ mod tests {
             SyncHostCallError::DeadlineExceeded
         ));
         assert!(!called_after_expiry, "an expired call must not be started");
+    }
+
+    #[test]
+    fn bounded_failures_preserve_backend_and_resolver_payloads() {
+        let backend_failure = BoundedResolveFailure::Backend(ConfigStoreError::unavailable(
+            "temporary store failure",
+        ));
+        match backend_failure {
+            BoundedResolveFailure::Backend(error) => drop(error),
+            BoundedResolveFailure::DeadlineExceeded
+            | BoundedResolveFailure::Resolve(_)
+            | BoundedResolveFailure::ValueTooLarge => {
+                panic!("backend failure variant changed");
+            }
+        }
+
+        let resolve_failure =
+            BoundedResolveFailure::Resolve(ResolveFailure::Corrupt("invalid pointer".to_owned()));
+        match resolve_failure {
+            BoundedResolveFailure::Resolve(error) => {
+                assert_eq!(error.into_message(), "invalid pointer");
+            }
+            BoundedResolveFailure::Backend(_)
+            | BoundedResolveFailure::DeadlineExceeded
+            | BoundedResolveFailure::ValueTooLarge => {
+                panic!("resolver failure variant changed");
+            }
+        }
+
+        let start = MonotonicInstant::now();
+        let deadline = Deadline::at_instant(
+            start
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let mut observations = [start, start].into_iter();
+        let backend_error = run_sync_host_call_at(
+            deadline,
+            || observations.next().expect("clock observation"),
+            || Err::<(), _>("backend failed"),
+        )
+        .expect_err("backend failure must remain inspectable");
+        match backend_error {
+            SyncHostCallError::Backend(message) => assert_eq!(message, "backend failed"),
+            SyncHostCallError::DeadlineExceeded => panic!("deadline must not win"),
+        }
+
+        let wrapper_result = run_sync_host_call(Deadline::after(Duration::from_secs(1)), || {
+            Ok::<_, ()>("materialized")
+        })
+        .expect("wrapper call before its deadline must succeed");
+        assert_eq!(wrapper_result, "materialized");
     }
 
     #[test]

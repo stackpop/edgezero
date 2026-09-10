@@ -1,9 +1,25 @@
+#![cfg_attr(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "the target-gated implementation module is kept before shared test seams"
+    )
+)]
+#![cfg_attr(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    expect(
+        clippy::pub_use,
+        reason = "the target-gated implementation keeps Workers imports out of native builds"
+    )
+)]
+
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod worker_impl {
     use std::cell::RefCell;
+    use std::num::NonZeroU64;
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -27,7 +43,7 @@ mod worker_impl {
     use edgezero_core::time::{DispatchBudget, MonotonicInstant, dispatch_budget};
     use futures_util::StreamExt as _;
     use futures_util::future::{Either, join_all, select};
-    use worker::js_sys::{Reflect, Uint8Array};
+    use worker::js_sys::{Reflect, Uint8Array, global};
     use worker::wasm_bindgen::{JsCast as _, JsValue};
     use worker::wasm_bindgen_futures::JsFuture;
     use worker::web_sys;
@@ -97,7 +113,8 @@ mod worker_impl {
                 budget,
                 Rc::clone(&upload_error),
             )?;
-            let request = build_worker_request(&method, uri.to_string(), &headers, worker_body)?;
+            let url = uri.to_string();
+            let request = build_worker_request(&method, &url, &headers, worker_body)?;
             let (response, abort_guard) =
                 raw_fetch(request, budget, Rc::clone(&upload_error)).await?;
 
@@ -192,12 +209,12 @@ mod worker_impl {
 
     fn build_headers(headers: &HeaderMap) -> Result<Headers, EdgeError> {
         let worker_headers = Headers::new();
-        for (name, value) in headers {
-            let value = value.to_str().map_err(|_error| {
+        for (name, header_value) in headers {
+            let header_value_str = header_value.to_str().map_err(|_error| {
                 EdgeError::bad_request(format!("header value is not valid UTF-8: {name}"))
             })?;
             worker_headers
-                .append(name.as_str(), value)
+                .append(name.as_str(), header_value_str)
                 .map_err(EdgeError::internal)?;
         }
         Ok(worker_headers)
@@ -205,18 +222,18 @@ mod worker_impl {
 
     fn build_worker_request(
         method: &Method,
-        url: String,
+        url: &str,
         headers: &HeaderMap,
-        body: Option<JsValue>,
+        request_body: Option<JsValue>,
     ) -> Result<WorkerRequest, EdgeError> {
         let mut init = RequestInit::new();
         init.with_headers(build_headers(headers)?)
             .with_method(worker_method(method))
             .with_redirect(RequestRedirect::Manual);
-        if let Some(body) = body {
-            init.with_body(Some(body));
+        if let Some(worker_body) = request_body {
+            init.with_body(Some(worker_body));
         }
-        WorkerRequest::new_with_init(&url, &init).map_err(EdgeError::internal)
+        WorkerRequest::new_with_init(url, &init).map_err(EdgeError::internal)
     }
 
     fn deadline_stream(
@@ -297,7 +314,7 @@ mod worker_impl {
         budget: DispatchBudget,
         max_brotli_decoder_bytes: u64,
         max_brotli_window_bits: u8,
-        max_chunk_bytes: Option<std::num::NonZeroU64>,
+        max_chunk_bytes: Option<NonZeroU64>,
         max_decoded_response_bytes: Option<u64>,
         max_encoded_response_bytes: Option<u64>,
         max_response_header_bytes: Option<u64>,
@@ -422,7 +439,7 @@ mod worker_impl {
             )));
         }
 
-        let global: web_sys::WorkerGlobalScope = worker::js_sys::global().unchecked_into();
+        let global: web_sys::WorkerGlobalScope = global().unchecked_into();
         let promise = global.fetch_with_request_and_init(request.inner(), &fetch_init);
         let fetch = JsFuture::from(promise);
         let timer = Delay::from(remaining);
@@ -440,13 +457,13 @@ mod worker_impl {
                 }
                 return Err(EdgeError::bad_gateway_with_reason(
                     format!("outbound fetch failed: {error:?}"),
-                    BadGatewayReason::Unspecified,
+                    BadGatewayReason::Unreachable,
                 ));
             }
         };
-        let web_response: web_sys::Response = value.dyn_into().map_err(|value| {
+        let web_response: web_sys::Response = value.dyn_into().map_err(|non_response| {
             EdgeError::internal(anyhow::anyhow!(
-                "fetch returned a non-response value: {value:?}"
+                "fetch returned a non-response value: {non_response:?}"
             ))
         })?;
         Ok((WorkerResponse::from(web_response), abort_guard))
@@ -492,20 +509,20 @@ mod worker_impl {
 
     fn response_headers(response: &WorkerResponse) -> Result<HeaderMap, EdgeError> {
         let mut headers = HeaderMap::new();
-        for (name, value) in response.headers().entries() {
-            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_error| {
+        for (raw_name, raw_value) in response.headers().entries() {
+            let parsed_name = HeaderName::from_bytes(raw_name.as_bytes()).map_err(|_error| {
                 EdgeError::bad_gateway_with_reason(
                     "upstream response contains an invalid header name",
                     BadGatewayReason::Protocol,
                 )
             })?;
-            let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_error| {
+            let parsed_value = HeaderValue::from_bytes(raw_value.as_bytes()).map_err(|_error| {
                 EdgeError::bad_gateway_with_reason(
                     "upstream response contains an invalid header value",
                     BadGatewayReason::Protocol,
                 )
             })?;
-            headers.append(name, value);
+            headers.append(parsed_name, parsed_value);
         }
         Ok(headers)
     }
@@ -555,7 +572,7 @@ mod worker_impl {
             let next = source.next();
             let timer = Delay::from(remaining);
             futures_util::pin_mut!(next, timer);
-            let item = match select(next, timer).await {
+            let next_item = match select(next, timer).await {
                 Either::Left((item, _timer)) => item,
                 Either::Right(((), _next)) => {
                     yield Err(timeout_error(budget.cause));
@@ -566,7 +583,7 @@ mod worker_impl {
                 yield Err(timeout_error(budget.cause));
                 return;
             }
-            let Some(item) = item else {
+            let Some(item) = next_item else {
                 return;
             };
             let bytes = match item {
@@ -600,7 +617,6 @@ mod worker_impl {
     fn worker_method(method: &Method) -> WorkerMethod {
         match *method {
             Method::DELETE => WorkerMethod::Delete,
-            Method::GET => WorkerMethod::Get,
             Method::HEAD => WorkerMethod::Head,
             Method::OPTIONS => WorkerMethod::Options,
             Method::PATCH => WorkerMethod::Patch,
