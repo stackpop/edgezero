@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 #[path = "../src/secret_store.rs"]
 mod secret_store;
 

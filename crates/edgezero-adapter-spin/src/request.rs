@@ -25,6 +25,7 @@ use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use edgezero_core::time::{Deadline, MonotonicInstant};
+use futures_util::stream::unfold;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use spin_sdk::http::Request as SpinRequest;
 use spin_sdk::http::body::IncomingBodyExt as _;
@@ -54,14 +55,18 @@ pub(crate) struct Stores {
 /// Returns [`EdgeError::bad_request`] if the request body cannot be read or
 /// the core `Request` cannot be built from the resulting parts.
 #[inline]
+#[expect(
+    clippy::unused_async,
+    reason = "the public converter retains its established async API while request bodies remain lazy"
+)]
 pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
     let (parts, body) = req.into_parts();
-    let mut request = into_core_request_head(parts)?;
+    let mut request = into_core_request_head(parts);
     *request.body_mut() = Body::from_external_stream(body.stream());
     Ok(request)
 }
 
-fn into_core_request_head(parts: RequestParts) -> Result<Request, EdgeError> {
+fn into_core_request_head(parts: RequestParts) -> Request {
     let client_addr = parts
         .headers
         .get("spin-client-addr")
@@ -86,7 +91,7 @@ fn into_core_request_head(parts: RequestParts) -> Result<Request, EdgeError> {
         .extensions_mut()
         .insert(HttpClient::with_client(SpinOutboundClient));
 
-    Ok(request)
+    request
 }
 
 fn spin_deadline_body<Source, SourceError>(source: Source, deadline: Deadline) -> Body
@@ -94,9 +99,10 @@ where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
 {
-    let source = source.map_err(Into::into).boxed_local();
-    let stream =
-        futures_util::stream::unfold((source, false), move |(mut source, terminal)| async move {
+    let boxed_stream = source.map_err(Into::into).boxed_local();
+    let stream = unfold(
+        (boxed_stream, false),
+        move |(mut body_stream, terminal)| async move {
             if terminal {
                 return None;
             }
@@ -105,24 +111,25 @@ where
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (source, true),
+                    (body_stream, true),
                 ));
             }
-            let item = source.next().await;
+            let item = body_stream.next().await;
             if deadline.is_expired() {
                 return Some((
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (source, true),
+                    (body_stream, true),
                 ));
             }
             match item {
-                Some(Ok(bytes)) => Some((Ok(bytes), (source, false))),
-                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (source, true))),
+                Some(Ok(bytes)) => Some((Ok(bytes), (body_stream, false))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (body_stream, true))),
                 None => None,
             }
-        });
+        },
+    );
     Body::from_stream(stream)
 }
 
@@ -184,7 +191,7 @@ pub(crate) async fn dispatch_with_handles(
 ) -> anyhow::Result<SpinFullResponse> {
     let request_start = MonotonicInstant::now();
     let (parts, native_body) = req.into_parts();
-    let mut core_request = into_core_request_head(parts)?;
+    let mut core_request = into_core_request_head(parts);
     let head_parts = IngressHeadParts::from_request(
         &core_request,
         IngressHeadAccounting::HostManaged,
@@ -432,6 +439,10 @@ mod synthesis_tests {
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for StubConfig {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(None)

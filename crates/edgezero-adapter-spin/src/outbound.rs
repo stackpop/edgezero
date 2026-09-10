@@ -1,3 +1,18 @@
+#![cfg_attr(
+    all(feature = "spin", target_arch = "wasm32"),
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "the target-gated implementation groups request preparation before transport execution"
+    )
+)]
+#![cfg_attr(
+    all(feature = "spin", target_arch = "wasm32"),
+    expect(
+        clippy::pub_use,
+        reason = "the target-gated implementation keeps Spin SDK imports out of native builds"
+    )
+)]
+
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 

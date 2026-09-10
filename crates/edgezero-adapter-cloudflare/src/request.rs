@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
@@ -18,9 +19,11 @@ use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use edgezero_core::time::{Deadline, MonotonicInstant};
+use futures_util::future::{Either, select};
+use futures_util::stream::unfold;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use worker::{
-    Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
+    Context, Delay, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
 
 use crate::config_store::CloudflareConfigStore;
@@ -245,6 +248,10 @@ pub(crate) struct RegistryInputs<'env> {
 /// and [`EdgeError::internal`] if the body cannot be read or the core
 /// request cannot be built.
 #[inline]
+#[expect(
+    clippy::unused_async,
+    reason = "the public converter retains its established async API while request bodies remain lazy"
+)]
 pub async fn into_core_request(
     req: CfRequest,
     env: Env,
@@ -303,9 +310,10 @@ where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
 {
-    let source = source.map_err(Into::into).boxed_local();
-    let stream =
-        futures_util::stream::unfold((source, false), move |(mut source, terminal)| async move {
+    let boxed_stream = source.map_err(Into::into).boxed_local();
+    let stream = unfold(
+        (boxed_stream, false),
+        move |(mut body_stream, terminal)| async move {
             if terminal {
                 return None;
             }
@@ -314,12 +322,12 @@ where
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (source, true),
+                    (body_stream, true),
                 ));
             }
 
             #[cfg(target_arch = "wasm32")]
-            worker::Delay::from(std::time::Duration::ZERO).await;
+            Delay::from(Duration::ZERO).await;
 
             #[cfg(target_arch = "wasm32")]
             let item = {
@@ -328,39 +336,40 @@ where
                         Err(EdgeError::request_timeout(
                             "inbound body read deadline exceeded",
                         )),
-                        (source, true),
+                        (body_stream, true),
                     ));
                 };
-                let timer = worker::Delay::from(remaining);
-                let next = source.next();
-                match futures_util::future::select(timer, next).await {
-                    futures_util::future::Either::Left(((), _)) => {
+                let timer = Delay::from(remaining);
+                let next = body_stream.next();
+                match select(timer, next).await {
+                    Either::Left(((), _)) => {
                         return Some((
                             Err(EdgeError::request_timeout(
                                 "inbound body read deadline exceeded",
                             )),
-                            (source, true),
+                            (body_stream, true),
                         ));
                     }
-                    futures_util::future::Either::Right((item, _)) => item,
+                    Either::Right((item, _)) => item,
                 }
             };
             #[cfg(not(target_arch = "wasm32"))]
-            let item = source.next().await;
+            let item = body_stream.next().await;
             if deadline.is_expired() {
                 return Some((
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (source, true),
+                    (body_stream, true),
                 ));
             }
             match item {
-                Some(Ok(bytes)) => Some((Ok(bytes), (source, false))),
-                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (source, true))),
+                Some(Ok(bytes)) => Some((Ok(bytes), (body_stream, false))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (body_stream, true))),
                 None => None,
             }
-        });
+        },
+    );
     Body::from_stream(stream)
 }
 
@@ -716,6 +725,10 @@ mod synthesis_tests {
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for StubConfig {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(None)

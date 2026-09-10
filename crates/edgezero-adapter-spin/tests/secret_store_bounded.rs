@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 extern crate self as spin_sdk;
 
 mod variables {

@@ -33,6 +33,10 @@ mod tests {
     struct FixedConfigStore(&'static str);
 
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for FixedConfigStore {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.to_owned()))

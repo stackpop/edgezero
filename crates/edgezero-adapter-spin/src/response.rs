@@ -19,6 +19,7 @@ pub const SPIN_RESPONSE_STREAM_BUFFER_BYTES: u64 = 0x0100_0000;
 ///
 /// Stream bodies are capped at [`MAX_BODY_SIZE`] bytes. If the accumulated
 /// size exceeds the limit, collection stops and an error is returned.
+#[cfg(test)]
 pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError> {
     collect_body_bytes_with_deadline(body, None).await
 }
@@ -35,11 +36,11 @@ async fn collect_body_bytes_with_deadline(
         }
         Body::Stream(stream) => {
             let collected = match deadline {
-                Some(deadline) => {
+                Some(write_deadline) => {
                     collect_response_stream_until(
                         stream,
                         SPIN_RESPONSE_STREAM_BUFFER_BYTES,
-                        deadline,
+                        write_deadline,
                     )
                     .await?
                 }
@@ -68,9 +69,10 @@ pub(crate) async fn from_egress_response(
     egress: ResponseEgressEnvelope,
 ) -> Result<SpinFullResponse, EdgeError> {
     let started_at = MonotonicInstant::now();
-    let (response, policy, mut attempt) = egress
-        .begin(started_at)
-        .map_err(|_| EdgeError::internal(anyhow::anyhow!("response-egress policy failed")))?;
+    let (core_response, policy, mut attempt) =
+        egress.begin(started_at).map_err(|_policy_error| {
+            EdgeError::internal(anyhow::anyhow!("response-egress policy failed"))
+        })?;
     if policy.write_deadline.is_expired() {
         attempt.terminate(
             ResponseEgressOutcome::DeadlineExceeded,
@@ -79,16 +81,17 @@ pub(crate) async fn from_egress_response(
         return deadline_response();
     }
 
-    let converted = from_core_response_with_deadline(response, Some(policy.write_deadline)).await;
+    let converted =
+        from_core_response_with_deadline(core_response, Some(policy.write_deadline)).await;
     let observed_at = MonotonicInstant::now();
     if policy.write_deadline.is_expired() {
         attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, observed_at);
         return deadline_response();
     }
     match converted {
-        Ok(response) => {
+        Ok(converted_response) => {
             attempt.terminate(ResponseEgressOutcome::ResponseReturned, observed_at);
-            Ok(response)
+            Ok(converted_response)
         }
         Err(error) => {
             let outcome = if matches!(error, EdgeError::ResponseTooLarge { .. }) {
@@ -143,7 +146,7 @@ fn deadline_response() -> Result<SpinFullResponse, EdgeError> {
 }
 
 fn ensure_write_deadline(deadline: Option<Deadline>) -> Result<(), EdgeError> {
-    if deadline.is_some_and(|deadline| deadline.is_expired()) {
+    if deadline.is_some_and(|write_deadline| write_deadline.is_expired()) {
         return Err(EdgeError::gateway_timeout(
             "response write deadline exceeded",
         ));
