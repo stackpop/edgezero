@@ -74,6 +74,24 @@ mod tests {
             .unwrap_or_else(|err| panic!("run generated CLI with {args:?}: {err}"))
     }
 
+    fn assert_cargo_success(project: &Path, args: &[&str], expectation: &str) {
+        let status = Command::new(env!("CARGO"))
+            .args(args)
+            .current_dir(project)
+            .status()
+            .unwrap_or_else(|err| panic!("run cargo with {args:?}: {err}"));
+        assert!(status.success(), "{expectation}");
+    }
+
+    fn assert_edgezero_success(project: &Path, args: &[&str], expectation: &str) {
+        let status = Command::new(env!("CARGO_BIN_EXE_edgezero"))
+            .args(args)
+            .current_dir(project)
+            .status()
+            .unwrap_or_else(|err| panic!("run edgezero with {args:?}: {err}"));
+        assert!(status.success(), "{expectation}");
+    }
+
     #[test]
     #[ignore = "compiles a generated workspace and may fetch crates; run explicitly"]
     #[expect(
@@ -101,13 +119,9 @@ mod tests {
         // `cargo check` so a manifest/config drift surfaces as a
         // fast, clear error -- not as a compilation cascade from
         // a downstream macro tripping over the bad config.
-        let validate = Command::new(env!("CARGO_BIN_EXE_edgezero"))
-            .args(["config", "validate"])
-            .current_dir(&project)
-            .status()
-            .expect("run `edgezero config validate` on the generated workspace");
-        assert!(
-            validate.success(),
+        assert_edgezero_success(
+            &project,
+            &["config", "validate"],
             "generated workspace should pass `edgezero config validate`",
         );
 
@@ -118,26 +132,38 @@ mod tests {
         // with a malformed handler or a manifest that violates the
         // adapter capability matrix would silently pass plain
         // validate but fail under strict.
-        let validate_strict = Command::new(env!("CARGO_BIN_EXE_edgezero"))
-            .args(["config", "validate", "--strict"])
-            .current_dir(&project)
-            .status()
-            .expect("run `edgezero config validate --strict` on the generated workspace");
-        assert!(
-            validate_strict.success(),
+        assert_edgezero_success(
+            &project,
+            &["config", "validate", "--strict"],
             "generated workspace should pass `edgezero config validate --strict`",
+        );
+
+        assert_cargo_success(
+            &project,
+            &["fmt", "--all", "--", "--check"],
+            "generated workspace should be rustfmt-clean",
         );
 
         // Host target: the whole workspace, including the generated CLI
         // crate that imports `edgezero_cli`.
-        let host = Command::new(env!("CARGO"))
-            .args(["check", "--workspace"])
-            .current_dir(&project)
-            .status()
-            .expect("run `cargo check` on the generated workspace");
-        assert!(
-            host.success(),
+        assert_cargo_success(
+            &project,
+            &["check", "--workspace"],
             "generated workspace should compile for the host target",
+        );
+
+        assert_cargo_success(
+            &project,
+            &[
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            "generated workspace should pass strict clippy",
         );
 
         let listed = Command::new(env!("CARGO"))
@@ -153,12 +179,11 @@ mod tests {
         require_listed_test(&listed_stdout, "generated_outbound_http_smoke")
             .expect("generated outbound smoke test must be listed exactly once");
 
-        let core_tests = Command::new(env!("CARGO"))
-            .args(["test", "-p", "scaffold-probe-core", "--lib"])
-            .current_dir(&project)
-            .status()
-            .expect("run generated core tests");
-        assert!(core_tests.success(), "generated core tests should pass");
+        assert_cargo_success(
+            &project,
+            &["test", "-p", "scaffold-probe-core", "--lib"],
+            "generated core tests should pass",
+        );
 
         // Typed config validation via the generated `<name>-cli` binary.
         // The raw `edgezero config validate` above exercises the manifest
@@ -193,8 +218,9 @@ mod tests {
                 continue;
             }
             let crate_name = format!("scaffold-probe-adapter-{adapter}");
-            let wasm = Command::new(env!("CARGO"))
-                .args([
+            assert_cargo_success(
+                &project,
+                &[
                     "check",
                     "-p",
                     &crate_name,
@@ -202,13 +228,8 @@ mod tests {
                     target,
                     "--features",
                     adapter,
-                ])
-                .current_dir(&project)
-                .status()
-                .expect("run `cargo check` for a wasm adapter target");
-            assert!(
-                wasm.success(),
-                "generated {adapter} adapter should compile for {target}",
+                ],
+                &format!("generated {adapter} adapter should compile for {target}"),
             );
         }
     }

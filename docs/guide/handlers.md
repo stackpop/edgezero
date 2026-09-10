@@ -301,6 +301,31 @@ app-state struct and register that.
 > hand out clones (e.g. a `OnceLock<Arc<AppState>>` as above, or a `static`), and
 > let `T = Arc<AppState>` so each call is just a refcount bump. Do **not** `Arc::new(HeavyThing::build())` directly in the `state` expression.
 
+### Configuring the application lifecycle
+
+Macro-driven apps can customize the generated `App` through the existing
+`Hooks::configure` seam without replacing manifest-driven routing:
+
+```rust
+use edgezero_core::{AdmissionDecision, IngressGrant};
+use std::time::Duration;
+
+fn configure_app(app: &mut edgezero_core::app::App) {
+    app.set_ingress_admission_policy(|head| AdmissionDecision::Admit {
+        grant: IngressGrant::empty(),
+        read_deadline: head.read_deadline_after(Duration::from_secs(30)),
+    });
+}
+
+edgezero_core::app!("edgezero.toml", configure = crate::configure_app);
+```
+
+`configure = <expr>` must evaluate to a callable that accepts `&mut App`. It is
+invoked after the manifest router is built and before the app begins serving, so
+it can install ingress admission, request-head limits, config extraction limits,
+the monotonic clock, and response-egress policy or observation hooks. Keep the
+callback cheap for the same adapter-lifecycle reasons as `state = <expr>` above.
+
 ## Response Types
 
 ### Text Responses

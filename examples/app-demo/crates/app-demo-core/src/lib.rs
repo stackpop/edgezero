@@ -9,6 +9,18 @@ pub mod config;
 pub mod handlers;
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use edgezero_core::app::App as EdgeZeroApp;
+use edgezero_core::{AdmissionDecision, IngressGrant, RouteResolution};
+
+const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
+const OUTBOUND_INGRESS_READ_BUDGET: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Eq, PartialEq)]
+struct AdmissionLease {
+    route_class: Option<String>,
+}
 
 /// App-owned shared state for the `app!(..., state = ...)` demonstration,
 /// handed to handlers via `State<Arc<DemoState>>`.
@@ -16,6 +28,28 @@ use std::sync::{Arc, OnceLock};
 pub struct DemoState {
     /// A greeting the handler echoes, proving the value reached the handler.
     pub greeting: String,
+}
+
+/// Installs request-lifecycle policy before any adapter begins polling a body.
+fn configure_app(app: &mut EdgeZeroApp) {
+    app.set_ingress_admission_policy(|head| {
+        let route_class =
+            if let RouteResolution::Matched(metadata) = head.route_resolution().clone() {
+                metadata.class().map(str::to_owned)
+            } else {
+                None
+            };
+        let read_budget = if route_class.as_deref() == Some("outbound") {
+            OUTBOUND_INGRESS_READ_BUDGET
+        } else {
+            DEFAULT_INGRESS_READ_BUDGET
+        };
+
+        AdmissionDecision::Admit {
+            grant: IngressGrant::new(AdmissionLease { route_class }),
+            read_deadline: head.read_deadline_after(read_budget),
+        }
+    });
 }
 
 /// Returns the shared app state, referenced by `app!(..., state = crate::app_state())`.
@@ -38,4 +72,88 @@ pub fn app_state() -> Arc<DemoState> {
     }))
 }
 
-edgezero_core::app!("../../edgezero.toml", state = crate::app_state());
+edgezero_core::app!(
+    "../../edgezero.toml",
+    configure = crate::configure_app,
+    state = crate::app_state()
+);
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use edgezero_core::app::{App as EdgeZeroApp, Hooks as _};
+    use edgezero_core::body::Body;
+    use edgezero_core::http::{request_builder, HeaderMap, Method, Version};
+    use edgezero_core::ingress::{IngressBeginOutcome, IngressHeadParts};
+    use edgezero_core::router::RouteResolution;
+    use edgezero_core::time::MonotonicInstant;
+    use futures::executor::block_on;
+    use std::time::Duration;
+
+    #[test]
+    fn manifest_route_classes_reach_route_resolution() {
+        let resolved = crate::build_router().resolve(&Method::GET, "/proxy/status/200");
+        let RouteResolution::Matched(metadata) = resolved.resolution().clone() else {
+            panic!("proxy route must resolve");
+        };
+        assert_eq!(metadata.class(), Some("outbound"));
+    }
+
+    #[test]
+    fn configured_admission_uses_finite_class_aware_deadlines() {
+        let app = super::App::build_app();
+        let start = MonotonicInstant::now();
+
+        let outbound = begin_ingress(&app, "/proxy/status/200", start);
+        assert_eq!(
+            outbound.read_deadline().instant(),
+            start
+                .checked_add(Duration::from_secs(10))
+                .expect("deadline")
+        );
+
+        let health = begin_ingress(&app, "/", start);
+        assert_eq!(
+            health.read_deadline().instant(),
+            start
+                .checked_add(Duration::from_secs(30))
+                .expect("deadline")
+        );
+    }
+
+    #[test]
+    fn admission_handler_consumes_the_typed_grant_once() {
+        let app = super::App::build_app();
+        let start = MonotonicInstant::now();
+        let prepared = begin_ingress(&app, "/admission", start);
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/admission")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(app.dispatch_admitted(prepared, request))
+            .expect("dispatch")
+            .into_response();
+        let payload: serde_json::Value = response.body().to_json().expect("json");
+        assert_eq!(payload["route_class"], "diagnostic");
+        assert_eq!(payload["grant_consumed_once"], true);
+    }
+
+    fn begin_ingress(
+        app: &EdgeZeroApp,
+        path: &str,
+        start: MonotonicInstant,
+    ) -> edgezero_core::PreparedIngress {
+        let head = IngressHeadParts::new(
+            Method::GET,
+            path.parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        match app.begin_ingress(head, start).expect("begin ingress") {
+            IngressBeginOutcome::Admitted(prepared) => prepared,
+            IngressBeginOutcome::Refused(_) => panic!("demo policy must admit request"),
+            _ => panic!("unknown admission outcome"),
+        }
+    }
+}

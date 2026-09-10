@@ -20,7 +20,11 @@ use edgezero_cli::args::{
 use {{proj_core_mod}}::config::{{NameUpperCamel}}Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "{{proj_cli}}", version, about = "{{name}} edge CLI")]
+#[command(
+    name = "{{proj_cli}}",
+    version,
+    about = "{{name}} edge CLI"
+)]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -69,6 +73,12 @@ enum {{NameUpperCamel}}ConfigCmd {
     /// store and report changes. Exits 0 (no changes), 1 (changes with
     /// `--exit-code`), or 2 (unsupported / error).
     Diff(ConfigDiffArgs),
+    /// Reclaim orphaned chunk entries the config store leaked from prior
+    /// oversized pushes. Store-derived and untyped (no `{{NameUpperCamel}}Config`).
+    /// A dry-run by default; deletes only with `--yes` + an explicit
+    /// `--older-than` (YOUR assertion that nothing superseded within that
+    /// window is still being served, and no push is running).
+    Gc(ConfigGcArgs),
     /// Push `{{name}}.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
     /// (Model A -- `#[secret]` fields store the key NAME,
@@ -78,12 +88,6 @@ enum {{NameUpperCamel}}ConfigCmd {
     /// Validate `edgezero.toml` and `{{name}}.toml` against the
     /// typed `{{NameUpperCamel}}Config` contract.
     Validate(ConfigValidateArgs),
-    /// Reclaim orphaned chunk entries the config store leaked from prior
-    /// oversized pushes. Store-derived and untyped (no `{{NameUpperCamel}}Config`).
-    /// A dry-run by default; deletes only with `--yes` + an explicit
-    /// `--older-than` (YOUR assertion that nothing superseded within that
-    /// window is still being served, and no push is running).
-    Gc(ConfigGcArgs),
 }
 
 fn main() {
@@ -105,15 +109,15 @@ fn main() {
                 Err(err) => Err(err),
             }
         }
+        // `gc` inspects the STORE, not the typed config, so it is not
+        // parameterised over `{{NameUpperCamel}}Config`.
+        Cmd::Config({{NameUpperCamel}}ConfigCmd::Gc(args)) => edgezero_cli::run_config_gc(&args),
         Cmd::Config({{NameUpperCamel}}ConfigCmd::Push(args)) => {
             edgezero_cli::run_config_push_typed::<{{NameUpperCamel}}Config>(&args)
         }
         Cmd::Config({{NameUpperCamel}}ConfigCmd::Validate(args)) => {
             edgezero_cli::run_config_validate_typed::<{{NameUpperCamel}}Config>(&args)
         }
-        // `gc` inspects the STORE, not the typed config, so it is not
-        // parameterised over `{{NameUpperCamel}}Config`.
-        Cmd::Config({{NameUpperCamel}}ConfigCmd::Gc(args)) => edgezero_cli::run_config_gc(&args),
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
         Cmd::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
         Cmd::New(args) => edgezero_cli::run_new(&args),
