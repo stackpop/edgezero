@@ -969,10 +969,14 @@ pub fn validate_batch_request_for_test(request: &OutboundRequest) -> Result<(), 
 /// Runs the same eager dispatch phase used by Fastly production batching.
 #[cfg(feature = "test-utils")]
 #[inline]
-pub fn dispatch_all_before_wait_for_test<Item, Pending, Failure>(
-    items: impl IntoIterator<Item = Item>,
-    dispatch: impl FnMut(Item) -> Result<Pending, Failure>,
-) -> Vec<Result<Pending, Failure>> {
+pub fn dispatch_all_before_wait_for_test<Items, Dispatch, Item, Pending, Failure>(
+    items: Items,
+    dispatch: Dispatch,
+) -> Vec<Result<Pending, Failure>>
+where
+    Items: IntoIterator<Item = Item>,
+    Dispatch: FnMut(Item) -> Result<Pending, Failure>,
+{
     dispatch_all_before_wait(items, dispatch)
 }
 

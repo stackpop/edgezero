@@ -8,12 +8,17 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method as CoreMethod, Request, Uri, request_builder};
+use edgezero_core::ingress::{
+    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
+};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
+use edgezero_core::time::{Deadline, MonotonicInstant};
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
@@ -22,7 +27,7 @@ use crate::config_store::CloudflareConfigStore;
 use crate::context::CloudflareRequestContext;
 use crate::key_value_store::CloudflareKvStore;
 use crate::outbound::CloudflareOutboundClient;
-use crate::response::from_core_response;
+use crate::response::from_egress_response;
 use crate::secret_store::CloudflareSecretStore;
 
 /// Groups the optional per-request store handles injected at dispatch time.
@@ -241,10 +246,15 @@ pub(crate) struct RegistryInputs<'env> {
 /// request cannot be built.
 #[inline]
 pub async fn into_core_request(
-    mut req: CfRequest,
+    req: CfRequest,
     env: Env,
     ctx: Context,
 ) -> Result<Request, EdgeError> {
+    let request = into_core_request_head(&req, env, ctx)?;
+    attach_core_body(req, request, None)
+}
+
+fn into_core_request_head(req: &CfRequest, env: Env, ctx: Context) -> Result<Request, EdgeError> {
     let method = into_core_method(&req.method());
     let url = req
         .url()
@@ -260,17 +270,98 @@ pub async fn into_core_request(
         builder = builder.header(name.as_str(), value);
     }
 
-    let bytes = req.bytes().await.map_err(EdgeError::internal)?;
-
-    let mut request = builder
-        .body(Body::from(bytes))
-        .map_err(EdgeError::internal)?;
+    let mut request = builder.body(Body::empty()).map_err(EdgeError::internal)?;
 
     CloudflareRequestContext::insert(&mut request, env, ctx);
     request
         .extensions_mut()
         .insert(HttpClient::with_client(CloudflareOutboundClient));
     Ok(request)
+}
+
+fn attach_core_body(
+    mut req: CfRequest,
+    mut request: Request,
+    read_deadline: Option<Deadline>,
+) -> Result<Request, EdgeError> {
+    if req.inner().body().is_none() {
+        return Ok(request);
+    }
+    let stream = req
+        .stream()
+        .map_err(EdgeError::internal)?
+        .map_ok(bytes::Bytes::from);
+    *request.body_mut() = match read_deadline {
+        Some(deadline) => cloudflare_deadline_body(stream, deadline),
+        None => Body::from_external_stream(stream),
+    };
+    Ok(request)
+}
+
+fn cloudflare_deadline_body<Source, SourceError>(source: Source, deadline: Deadline) -> Body
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+{
+    let source = source.map_err(Into::into).boxed_local();
+    let stream =
+        futures_util::stream::unfold((source, false), move |(mut source, terminal)| async move {
+            if terminal {
+                return None;
+            }
+            if deadline.is_expired() {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    (source, true),
+                ));
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            worker::Delay::from(std::time::Duration::ZERO).await;
+
+            #[cfg(target_arch = "wasm32")]
+            let item = {
+                let Some(remaining) = deadline.remaining() else {
+                    return Some((
+                        Err(EdgeError::request_timeout(
+                            "inbound body read deadline exceeded",
+                        )),
+                        (source, true),
+                    ));
+                };
+                let timer = worker::Delay::from(remaining);
+                let next = source.next();
+                match futures_util::future::select(timer, next).await {
+                    futures_util::future::Either::Left(((), _)) => {
+                        return Some((
+                            Err(EdgeError::request_timeout(
+                                "inbound body read deadline exceeded",
+                            )),
+                            (source, true),
+                        ));
+                    }
+                    futures_util::future::Either::Right((item, _)) => item,
+                }
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let item = source.next().await;
+            if deadline.is_expired() {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    (source, true),
+                ));
+            }
+            match item {
+                Some(Ok(bytes)) => Some((Ok(bytes), (source, false))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (source, true))),
+                None => None,
+            }
+        });
+    Body::from_stream(stream)
 }
 
 pub(crate) async fn dispatch_with_handles(
@@ -280,10 +371,34 @@ pub(crate) async fn dispatch_with_handles(
     ctx: Context,
     stores: Stores,
 ) -> Result<CfResponse, WorkerError> {
-    let core_request = into_core_request(req, env, ctx)
-        .await
-        .map_err(|err| edge_error_to_worker(&err))?;
-    dispatch_core_request(app, core_request, stores).await
+    let request_start = MonotonicInstant::now();
+    let head_request =
+        into_core_request_head(&req, env, ctx).map_err(|error| edge_error_to_worker(&error))?;
+    let head_parts = IngressHeadParts::from_request(
+        &head_request,
+        IngressHeadAccounting::HostManaged,
+        IngressFraming::HostManaged,
+    );
+    head_parts
+        .validate_normalized(app.ingress_head_limits())
+        .map_err(|error| edge_error_to_worker(&error))?;
+    let prepared = match app
+        .begin_ingress(head_parts, request_start)
+        .map_err(|error| edge_error_to_worker(&error))?
+    {
+        IngressBeginOutcome::Admitted(prepared) => prepared,
+        IngressBeginOutcome::Refused(response) => {
+            return from_egress_response(response).map_err(|error| edge_error_to_worker(&error));
+        }
+        _ => {
+            return Err(WorkerError::RustError(
+                "unsupported ingress admission outcome".to_owned(),
+            ));
+        }
+    };
+    let core_request = attach_core_body(req, head_request, Some(prepared.read_deadline()))
+        .map_err(|error| edge_error_to_worker(&error))?;
+    dispatch_core_request(app, core_request, stores, prepared).await
 }
 
 /// Dispatch with per-id store registries built from baked metadata.
@@ -442,6 +557,7 @@ async fn dispatch_core_request(
     app: &App,
     mut core_request: Request,
     stores: Stores,
+    prepared: PreparedIngress,
 ) -> Result<CfResponse, WorkerError> {
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
@@ -457,12 +573,11 @@ async fn dispatch_core_request(
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let svc = app.router().clone();
-    let response = svc
-        .oneshot(core_request)
+    let response = app
+        .dispatch_admitted(prepared, core_request)
         .await
         .map_err(|err| edge_error_to_worker(&err))?;
-    from_core_response(response).map_err(|err| edge_error_to_worker(&err))
+    from_egress_response(response).map_err(|err| edge_error_to_worker(&err))
 }
 
 fn edge_error_to_worker(err: &EdgeError) -> WorkerError {

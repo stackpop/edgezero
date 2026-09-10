@@ -5,8 +5,12 @@ use std::time::Duration;
 
 use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
-use crate::http::{Extensions, HeaderMap, Method, Request, Response, Uri, Version};
-use crate::router::{ResolvedDispatch, RouteResolution};
+use crate::http::{
+    Extensions, HeaderMap, Method, Request, RequestParts, Response, Uri, Version,
+    header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+};
+use crate::response_egress::ResponseEgressEnvelope;
+use crate::router::{ResolvedDispatch, RouteMetadata, RouteResolution};
 use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicInstant};
 
 pub const DEFAULT_INBOUND_READ_BUDGET: Duration = Duration::from_secs(30);
@@ -89,7 +93,7 @@ pub enum IngressAdmissionOutcome {
 #[non_exhaustive]
 pub enum IngressBeginOutcome {
     Admitted(PreparedIngress),
-    Refused(Response),
+    Refused(ResponseEgressEnvelope),
 }
 
 /// Proof that the application admitted one request with a finite read deadline.
@@ -237,6 +241,25 @@ pub struct IngressHeadParts {
 }
 
 impl IngressHeadParts {
+    /// Copies normalized metadata from body-free request parts.
+    #[must_use]
+    #[inline]
+    pub fn from_parts(
+        parts: &RequestParts,
+        head_accounting: IngressHeadAccounting,
+        framing: IngressFraming,
+    ) -> Self {
+        Self {
+            extensions: parts.extensions.clone(),
+            framing,
+            head_accounting,
+            headers: parts.headers.clone(),
+            method: parts.method.clone(),
+            target: parts.uri.clone(),
+            version: parts.version,
+        }
+    }
+
     /// Copies normalized metadata from a core request without inspecting its body.
     #[must_use]
     #[inline]
@@ -300,6 +323,15 @@ impl IngressHeadParts {
     #[inline]
     pub fn target(&self) -> &Uri {
         &self.target
+    }
+
+    /// Applies normalized defense-in-depth checks without making a raw-boundary claim.
+    ///
+    /// # Errors
+    /// Returns 414/431 for normalized head overages and 400 for visible ambiguous framing.
+    #[inline]
+    pub fn validate_normalized(&self, limits: IngressHeadLimits) -> Result<(), EdgeError> {
+        validate_normalized_head(&self.target, self.version, &self.headers, limits)
     }
 
     #[must_use]
@@ -450,6 +482,16 @@ impl PreparedIngress {
         self.admitted.request_start()
     }
 
+    /// Canonical metadata for the admitted matched route, if any.
+    #[must_use]
+    #[inline]
+    pub fn route_metadata(&self) -> Option<&RouteMetadata> {
+        match self.resolved.resolution() {
+            RouteResolution::Matched(route) => Some(route),
+            RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound => None,
+        }
+    }
+
     #[must_use]
     #[inline]
     pub fn route_resolution(&self) -> &RouteResolution {
@@ -509,11 +551,147 @@ fn require_nonzero(name: &str, value: u64) -> Result<(), EdgeError> {
     Ok(())
 }
 
+/// Applies finite defense-in-depth limits and framing checks to a normalized head.
+///
+/// This cannot recover raw HTTP field-line or request-target octets and therefore never
+/// upgrades [`IngressHeadAccounting::HostManaged`] or [`IngressFraming::HostManaged`].
+///
+/// # Errors
+/// Returns 414/431 for normalized head overages and 400 for visible ambiguous framing.
+#[inline]
+pub fn validate_normalized_ingress_parts(
+    parts: &RequestParts,
+    limits: IngressHeadLimits,
+) -> Result<(), EdgeError> {
+    validate_normalized_head(&parts.uri, parts.version, &parts.headers, limits)
+}
+
+fn validate_normalized_head(
+    target: &Uri,
+    version: Version,
+    headers: &HeaderMap,
+    limits: IngressHeadLimits,
+) -> Result<(), EdgeError> {
+    let target_bytes = u64::try_from(target.to_string().len()).map_err(|_length_error| {
+        EdgeError::uri_too_long("normalized request target is too large")
+    })?;
+    if target_bytes > limits.max_request_target_bytes() {
+        return Err(EdgeError::uri_too_long(
+            "normalized request target exceeds configured limit",
+        ));
+    }
+
+    let header_count = u64::try_from(headers.len()).map_err(|_length_error| {
+        EdgeError::request_header_fields_too_large("normalized request has too many headers")
+    })?;
+    if header_count > limits.max_request_header_count() {
+        return Err(EdgeError::request_header_fields_too_large(
+            "normalized request header count exceeds configured limit",
+        ));
+    }
+
+    let mut header_bytes = 2_u64;
+    for (name, value) in headers {
+        let line_bytes = name
+            .as_str()
+            .len()
+            .checked_add(value.as_bytes().len())
+            .and_then(|bytes| bytes.checked_add(4))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                EdgeError::request_header_fields_too_large(
+                    "normalized request header size accounting overflow",
+                )
+            })?;
+        header_bytes = header_bytes.checked_add(line_bytes).ok_or_else(|| {
+            EdgeError::request_header_fields_too_large(
+                "normalized request header size accounting overflow",
+            )
+        })?;
+        if header_bytes > limits.max_request_header_bytes() {
+            return Err(EdgeError::request_header_fields_too_large(
+                "normalized request headers exceed configured limit",
+            ));
+        }
+    }
+
+    validate_normalized_framing(version, headers)
+}
+
+fn validate_normalized_framing(version: Version, headers: &HeaderMap) -> Result<(), EdgeError> {
+    let content_lengths = headers.get_all(CONTENT_LENGTH).iter().collect::<Vec<_>>();
+    let transfer_encodings = headers
+        .get_all(TRANSFER_ENCODING)
+        .iter()
+        .collect::<Vec<_>>();
+
+    if !content_lengths.is_empty() && !transfer_encodings.is_empty() {
+        return Err(EdgeError::bad_request(
+            "ambiguous request framing is not accepted",
+        ));
+    }
+    if content_lengths.len() > 1 {
+        return Err(EdgeError::bad_request(
+            "duplicate content-length is not accepted",
+        ));
+    }
+    if let Some(value) = content_lengths.first() {
+        let raw = value
+            .to_str()
+            .map_err(|_utf8_error| EdgeError::bad_request("malformed content-length"))?
+            .trim();
+        if raw.is_empty()
+            || raw.contains(',')
+            || raw.starts_with(['+', '-'])
+            || raw.parse::<u64>().is_err()
+        {
+            return Err(EdgeError::bad_request("malformed content-length"));
+        }
+    }
+
+    if transfer_encodings.len() > 1 {
+        return Err(EdgeError::bad_request(
+            "duplicate transfer-encoding is not accepted",
+        ));
+    }
+    if let Some(value) = transfer_encodings.first() {
+        if version != Version::HTTP_11 {
+            return Err(EdgeError::bad_request(
+                "transfer-encoding is not accepted for this HTTP version",
+            ));
+        }
+        let raw = value
+            .to_str()
+            .map_err(|_utf8_error| EdgeError::bad_request("malformed transfer-encoding"))?;
+        if raw.contains(',') || !raw.trim().eq_ignore_ascii_case("chunked") {
+            return Err(EdgeError::bad_request(
+                "unsupported or malformed transfer-encoding",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::body::Body;
-    use crate::http::{StatusCode, request_builder, response_builder};
+    use crate::http::{HeaderName, HeaderValue, StatusCode, request_builder, response_builder};
+
+    fn parts_with_headers(version: Version, headers: &[(&str, &str)]) -> RequestParts {
+        let mut request = request_builder()
+            .uri("/")
+            .version(version)
+            .body(Body::empty())
+            .expect("request");
+        for (name, value) in headers {
+            request.headers_mut().append(
+                name.parse::<HeaderName>().expect("header name"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        request.into_parts().0
+    }
 
     #[test]
     fn ingress_grant_downcasts_once_without_exposing_type_metadata() {
@@ -543,6 +721,84 @@ mod tests {
         limits
             .with_max_request_target_bytes(0)
             .expect_err("zero target bytes");
+    }
+
+    #[test]
+    fn normalized_head_limits_reject_before_admission_without_raw_claims() {
+        let target_request = request_builder()
+            .uri("/1234")
+            .body(Body::empty())
+            .expect("request");
+        let target_parts = target_request.into_parts().0;
+        let target_limits = IngressHeadLimits::default()
+            .with_max_request_target_bytes(4)
+            .expect("target limit");
+        assert_eq!(
+            validate_normalized_ingress_parts(&target_parts, target_limits)
+                .expect_err("target over limit")
+                .status(),
+            StatusCode::URI_TOO_LONG
+        );
+
+        let count_parts = parts_with_headers(Version::HTTP_11, &[("x-a", "1"), ("x-b", "2")]);
+        let count_limits = IngressHeadLimits::default()
+            .with_max_request_header_count(1)
+            .expect("count limit");
+        assert_eq!(
+            validate_normalized_ingress_parts(&count_parts, count_limits)
+                .expect_err("header count over limit")
+                .status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+
+        let bytes_parts = parts_with_headers(Version::HTTP_11, &[("x", "1")]);
+        let bytes_limits = IngressHeadLimits::default()
+            .with_max_request_header_bytes(7)
+            .expect("bytes limit");
+        assert_eq!(
+            validate_normalized_ingress_parts(&bytes_parts, bytes_limits)
+                .expect_err("header bytes over limit")
+                .status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn normalized_framing_defense_rejects_visible_ambiguous_shapes() {
+        let cases = [
+            parts_with_headers(
+                Version::HTTP_11,
+                &[("content-length", "1"), ("transfer-encoding", "chunked")],
+            ),
+            parts_with_headers(
+                Version::HTTP_11,
+                &[("content-length", "1"), ("content-length", "1")],
+            ),
+            parts_with_headers(Version::HTTP_11, &[("content-length", "1, 1")]),
+            parts_with_headers(Version::HTTP_11, &[("content-length", "+1")]),
+            parts_with_headers(
+                Version::HTTP_11,
+                &[("content-length", "18446744073709551616")],
+            ),
+            parts_with_headers(Version::HTTP_11, &[("transfer-encoding", "gzip, chunked")]),
+            parts_with_headers(Version::HTTP_2, &[("transfer-encoding", "chunked")]),
+        ];
+        for parts in cases {
+            assert_eq!(
+                validate_normalized_ingress_parts(&parts, IngressHeadLimits::default())
+                    .expect_err("ambiguous framing")
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        for parts in [
+            parts_with_headers(Version::HTTP_11, &[("content-length", "1")]),
+            parts_with_headers(Version::HTTP_11, &[("transfer-encoding", "chunked")]),
+        ] {
+            validate_normalized_ingress_parts(&parts, IngressHeadLimits::default())
+                .expect("unambiguous visible framing");
+        }
     }
 
     #[test]

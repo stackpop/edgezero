@@ -4,9 +4,14 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::collections::HashMap;
 
-use crate::chunked_config::resolve_fastly_config_value_typed;
+use crate::chunked_config::{
+    BoundedResolveFailure, ResolveFailure, SyncHostCallError, exact_fastly_read,
+    resolve_fastly_config_value_typed, resolve_fastly_config_value_typed_bounded,
+    run_sync_host_call,
+};
 use async_trait::async_trait;
-use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
+use edgezero_core::Deadline;
+use edgezero_core::config_store::{BoundedStoreRead, ConfigStore, ConfigStoreError};
 use fastly::ConfigStore as FastlyConfigStoreInner;
 use fastly::config_store::{LookupError, OpenError};
 
@@ -111,46 +116,120 @@ impl ConfigStore for FastlyConfigStore {
             }
             Ok(got)
         });
-        match outcome {
-            Ok(resolved) => Ok(Some(resolved)),
-            Err(err) if err.is_future_format() => {
-                // A NEWER format in OUR reserved namespace (an unknown
-                // `edgezero_kind`, or a future pointer/inner-envelope version):
-                // re-pushing the same config will not help; the deployed build
-                // must be UPGRADED.
-                log::warn!(
-                    "Fastly config-store value for `{key}` uses a NEWER format than this build \
-                     understands: {}. Re-pushing the same config will not help -- redeploy this \
-                     service with an updated EdgeZero build.",
-                    err.into_message()
-                );
-                Err(ConfigStoreError::internal(anyhow::anyhow!(
-                    "config store value uses a newer format than this build understands; redeploy \
-                     this service with an updated build (re-pushing will not help)"
-                )))
-            }
-            Err(err) => {
-                let message = err.into_message();
-                if transient.get() {
-                    log::warn!(
-                        "Fastly config-store chunk lookup for `{key}` was transiently \
-                         unavailable: {message}"
-                    );
-                    Err(ConfigStoreError::unavailable(
-                        "config store temporarily unavailable",
-                    ))
-                } else {
-                    log::warn!(
-                        "Fastly config-store chunk resolution failed for `{key}`: {message}. \
-                         Re-run `<app-cli> config push` to repair the store."
-                    );
-                    Err(ConfigStoreError::internal(anyhow::anyhow!(
-                        "config store entry is corrupt or incomplete; re-run config push to \
-                         repair: {message}"
-                    )))
+        outcome
+            .map(Some)
+            .map_err(|error| map_resolve_failure(key, transient.get(), error))
+    }
+
+    #[inline]
+    async fn get_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        let materialized_root = run_sync_host_call(deadline, || {
+            Ok(match &self.inner {
+                FastlyConfigStoreBackend::Fastly(inner) => {
+                    inner.try_get(key).map_err(|err| map_lookup_error(&err))?
                 }
+                #[cfg(test)]
+                FastlyConfigStoreBackend::InMemory(data) => data.get(key).cloned(),
+            })
+        })
+        .map_err(map_sync_config_error)?;
+        let root_read = exact_fastly_read(materialized_root, max_backend_bytes)
+            .map_err(|_size_error| ConfigStoreError::ValueTooLarge)?;
+        let Some(root_value) = root_read.value else {
+            return Ok(root_read);
+        };
+
+        let transient = Cell::new(false);
+        let outcome = resolve_fastly_config_value_typed_bounded(
+            key,
+            root_value,
+            root_read.backend_bytes,
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+            |chunk_key, remaining_backend_bytes| {
+                let chunk_value = run_sync_host_call(deadline, || {
+                    Ok(match &self.inner {
+                        FastlyConfigStoreBackend::Fastly(inner) => {
+                            inner.try_get(chunk_key).map_err(|err| {
+                                if is_transient_lookup(&err) {
+                                    transient.set(true);
+                                    ConfigStoreError::unavailable(
+                                        "config store temporarily unavailable",
+                                    )
+                                } else {
+                                    ConfigStoreError::internal(anyhow::anyhow!(
+                                        "config store chunk key is invalid"
+                                    ))
+                                }
+                            })?
+                        }
+                        #[cfg(test)]
+                        FastlyConfigStoreBackend::InMemory(data) => data.get(chunk_key).cloned(),
+                    })
+                })
+                .map_err(map_sync_config_error)?;
+                if chunk_value.is_none() {
+                    transient.set(true);
+                }
+                exact_fastly_read(chunk_value, remaining_backend_bytes)
+                    .map_err(|_size_error| ConfigStoreError::ValueTooLarge)
+            },
+        );
+
+        match outcome {
+            Ok(read) => Ok(read),
+            Err(BoundedResolveFailure::Backend(error)) => Err(error),
+            Err(BoundedResolveFailure::DeadlineExceeded) => Err(ConfigStoreError::DeadlineExceeded),
+            Err(BoundedResolveFailure::Resolve(error)) => {
+                Err(map_resolve_failure(key, transient.get(), error))
             }
+            Err(BoundedResolveFailure::ValueTooLarge) => Err(ConfigStoreError::ValueTooLarge),
         }
+    }
+}
+
+fn map_sync_config_error(call_error: SyncHostCallError<ConfigStoreError>) -> ConfigStoreError {
+    match call_error {
+        SyncHostCallError::Backend(backend_error) => backend_error,
+        SyncHostCallError::DeadlineExceeded => ConfigStoreError::DeadlineExceeded,
+    }
+}
+
+fn map_resolve_failure(key: &str, transient: bool, error: ResolveFailure) -> ConfigStoreError {
+    if error.is_future_format() {
+        log::warn!(
+            "Fastly config-store value for `{key}` uses a NEWER format than this build \
+             understands: {}. Re-pushing the same config will not help -- redeploy this \
+             service with an updated EdgeZero build.",
+            error.into_message()
+        );
+        return ConfigStoreError::internal(anyhow::anyhow!(
+            "config store value uses a newer format than this build understands; redeploy \
+             this service with an updated build (re-pushing will not help)"
+        ));
+    }
+
+    let message = error.into_message();
+    if transient {
+        log::warn!(
+            "Fastly config-store chunk lookup for `{key}` was transiently unavailable: {message}"
+        );
+        ConfigStoreError::unavailable("config store temporarily unavailable")
+    } else {
+        log::warn!(
+            "Fastly config-store chunk resolution failed for `{key}`: {message}. \
+             Re-run `<app-cli> config push` to repair the store."
+        );
+        ConfigStoreError::internal(anyhow::anyhow!(
+            "config store entry is corrupt or incomplete; re-run config push to repair: {message}"
+        ))
     }
 }
 
@@ -189,6 +268,8 @@ fn map_lookup_error(err: &LookupError) -> ConfigStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::Deadline;
+    use std::time::Duration;
 
     edgezero_core::config_store_contract_tests!(fastly_config_store_contract, {
         FastlyConfigStore::from_entries([
@@ -196,6 +277,37 @@ mod tests {
             ("contract.key.b".to_owned(), "value_b".to_owned()),
         ])
     });
+
+    #[test]
+    fn bounded_chunked_read_counts_root_pointer_and_all_chunks() {
+        use crate::chunked_config::prepare_fastly_config_entries;
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use futures::executor::block_on;
+        use serde_json::json;
+
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "pad": "x".repeat(9_000) }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let entries = prepare_fastly_config_entries("app_config", &envelope).expect("entries");
+        let maybe_backend_bytes = entries.iter().try_fold(0_u64, |total, (_, value)| {
+            total.checked_add(u64::try_from(value.len()).ok()?)
+        });
+        let expected_backend_bytes = maybe_backend_bytes.expect("backend byte sum");
+        let store = FastlyConfigStore::from_entries(entries);
+
+        let read = block_on(store.get_bounded(
+            "app_config",
+            Deadline::after(Duration::from_secs(1)),
+            expected_backend_bytes,
+            u64::try_from(envelope.len()).expect("envelope length"),
+        ))
+        .expect("exact aggregate cap must succeed");
+
+        assert_eq!(read.backend_bytes, expected_backend_bytes);
+        assert_eq!(read.value.as_deref(), Some(envelope.as_str()));
+    }
 
     #[test]
     fn key_invalid_maps_to_invalid_key_error() {

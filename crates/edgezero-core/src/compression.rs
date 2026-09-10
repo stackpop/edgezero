@@ -372,10 +372,10 @@ mod tests {
 
         for (value, expected) in cases {
             let mut headers = HeaderMap::new();
-            if let Some(value) = value {
+            if let Some(raw_value) = value {
                 headers.append(
                     "content-encoding",
-                    HeaderValue::from_bytes(value).expect("header"),
+                    HeaderValue::from_bytes(raw_value).expect("header"),
                 );
             }
             assert_eq!(classify_content_encoding(&headers), expected);
@@ -393,11 +393,11 @@ mod tests {
     #[test]
     fn brotli_decoder_memory_charge_is_pinned_and_checked() {
         assert_eq!(
-            brotli_decoder_memory_charge(24).unwrap(),
-            BROTLI_DECODER_FIXED_CHARGE_BYTES + (1_u64 << 24)
+            brotli_decoder_memory_charge(24_u8).unwrap(),
+            BROTLI_DECODER_FIXED_CHARGE_BYTES + (1_u64 << 24_u32)
         );
-        assert!(brotli_decoder_memory_charge(9).is_err());
-        assert!(brotli_decoder_memory_charge(31).is_err());
+        brotli_decoder_memory_charge(9).unwrap_err();
+        brotli_decoder_memory_charge(31).unwrap_err();
     }
 
     #[test]
@@ -465,17 +465,15 @@ mod tests {
     #[test]
     fn decoder_carrier_restores_exact_edge_error() {
         let expected = BudgetSource::BatchDeadline;
-        for decode in [decode_gzip_stream as fn(BodyStream) -> BodyStream] {
-            let stream = source(vec![
-                Ok(Bytes::from_static(&[0x1f, 0x8b])),
-                Err(EdgeError::gateway_timeout_caused("late", expected)),
-            ]);
-            let result = block_on(decode(stream).try_collect::<Vec<_>>());
-            assert!(matches!(
-                result,
-                Err(EdgeError::GatewayTimeout { cause, .. }) if cause == expected
-            ));
-        }
+        let stream = source(vec![
+            Ok(Bytes::from_static(&[0x1f, 0x8b])),
+            Err(EdgeError::gateway_timeout_caused("late", expected)),
+        ]);
+        let result = block_on(decode_gzip_stream(stream).try_collect::<Vec<_>>());
+        assert!(matches!(
+            result,
+            Err(EdgeError::GatewayTimeout { cause, .. }) if cause == expected
+        ));
     }
 
     #[test]
@@ -489,10 +487,10 @@ mod tests {
         .concat();
         assert_eq!(decoded, b"onetwo");
 
-        let encoded = gzip(b"one");
+        let encoded_member = gzip(b"one");
         let result = block_on(
             decode_gzip_stream(source(vec![
-                Ok(Bytes::from(encoded)),
+                Ok(Bytes::from(encoded_member)),
                 Err(EdgeError::bad_gateway_with_reason(
                     "late transport failure",
                     BadGatewayReason::Transport,
@@ -551,7 +549,7 @@ mod tests {
                 BrotliPrefix::WindowBits(bits)
             );
         }
-        for bits in 10..=30 {
+        for bits in 10_u8..=30 {
             assert_eq!(
                 parse_brotli_prefix(&[0x11, bits]).unwrap(),
                 BrotliPrefix::WindowBits(bits)
@@ -561,26 +559,26 @@ mod tests {
             parse_brotli_prefix(&[0x11]).unwrap(),
             BrotliPrefix::NeedSecondByte
         );
-        assert!(parse_brotli_prefix(&[0x91, 24]).is_err());
-        assert!(parse_brotli_prefix(&[0x11, 9]).is_err());
-        assert!(parse_brotli_prefix(&[0x11, 31]).is_err());
+        parse_brotli_prefix(&[0x91, 24]).unwrap_err();
+        parse_brotli_prefix(&[0x11, 9]).unwrap_err();
+        parse_brotli_prefix(&[0x11, 31]).unwrap_err();
     }
 
     #[test]
     fn brotli_window_rejects_before_decoder_allocation() {
-        let result = block_on(
+        let window_error = block_on(
             decode_brotli_stream(source(vec![Ok(Bytes::from_static(&[0x0f]))]), 23, u64::MAX)
                 .try_collect::<Vec<_>>(),
         );
         assert!(matches!(
-            result,
+            window_error,
             Err(EdgeError::ResponseTooLarge {
                 reason: ResponseLimitReason::BrotliWindow,
                 ..
             })
         ));
 
-        let result = block_on(
+        let memory_error = block_on(
             decode_brotli_stream(
                 source(vec![Ok(Bytes::from_static(&[0x0f]))]),
                 24,
@@ -589,7 +587,7 @@ mod tests {
             .try_collect::<Vec<_>>(),
         );
         assert!(matches!(
-            result,
+            memory_error,
             Err(EdgeError::ResponseTooLarge {
                 reason: ResponseLimitReason::DecoderMemory,
                 ..

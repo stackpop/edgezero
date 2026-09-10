@@ -202,6 +202,31 @@ impl SecretStore for InMemorySecretStore {
         let compound = format!("{store_name}/{key}");
         Ok(self.secrets.get(&compound).cloned())
     }
+
+    #[inline]
+    async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        if deadline.is_expired() {
+            return Err(SecretError::DeadlineExceeded);
+        }
+        let value = self.get_bytes(store_name, key).await?;
+        let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+            u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
+        })?;
+        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+            return Err(SecretError::ValueTooLarge);
+        }
+        Ok(BoundedStoreRead {
+            backend_bytes,
+            value,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +245,24 @@ impl SecretStore for NoopSecretStore {
     #[inline]
     async fn get_bytes(&self, _store_name: &str, _key: &str) -> Result<Option<Bytes>, SecretError> {
         Ok(None)
+    }
+
+    #[inline]
+    async fn get_bytes_bounded(
+        &self,
+        _store_name: &str,
+        _key: &str,
+        deadline: Deadline,
+        _max_backend_bytes: u64,
+        _max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        if deadline.is_expired() {
+            return Err(SecretError::DeadlineExceeded);
+        }
+        Ok(BoundedStoreRead {
+            backend_bytes: 0,
+            value: None,
+        })
     }
 }
 

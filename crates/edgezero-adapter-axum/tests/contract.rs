@@ -1,36 +1,44 @@
-#![cfg(feature = "axum")]
+#![cfg(all(test, feature = "axum"))]
+#![expect(
+    clippy::expect_used,
+    clippy::tests_outside_test_module,
+    reason = "this integration-test crate uses explicit fixture diagnostics and consists only of contract tests"
+)]
 
 use core::convert::Infallible;
 use std::io::Write as _;
 use std::time::Duration;
 
+use async_stream::stream as async_body_stream;
 use axum::Router;
 use axum::body::Body;
 use axum::http::HeaderValue;
 use axum::http::header::{CONTENT_ENCODING, SET_COOKIE};
 use axum::response::Response;
 use axum::routing::get;
+use bytes::Bytes;
 use edgezero_adapter_axum::outbound::AxumOutboundClient;
 use edgezero_core::body::Body as CoreBody;
 use edgezero_core::error::{BadGatewayReason, EdgeError, ResponseLimitReason};
 use edgezero_core::http::{Method, StatusCode};
-use edgezero_core::{OutboundHttpClient, OutboundRequest, PROXY_HEADER};
+use edgezero_core::{OutboundHttpClient as _, OutboundRequest, PROXY_HEADER};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
 use tokio::net::TcpListener;
+use tokio::time::sleep;
 
 fn gzip(input: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(input).unwrap();
-    encoder.finish().unwrap()
+    encoder.write_all(input).expect("gzip input");
+    encoder.finish().expect("gzip output")
 }
 
 async fn start_origin(router: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let address = listener.local_addr().expect("origin address");
     tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(listener, router).await.expect("serve origin");
     });
     format!("http://{address}")
 }
@@ -46,10 +54,10 @@ async fn redirect_response_is_not_followed() {
             ),
     )
     .await;
-    let client = AxumOutboundClient::try_new().unwrap();
-    let request = OutboundRequest::get(format!("{origin}/redirect")).unwrap();
+    let client = AxumOutboundClient::try_new().expect("client");
+    let request = OutboundRequest::get(format!("{origin}/redirect")).expect("request");
 
-    let response = client.send(request).await.unwrap();
+    let response = client.send(request).await.expect("response");
 
     assert_eq!(response.status(), StatusCode::FOUND);
     assert_eq!(
@@ -64,20 +72,25 @@ async fn redirect_response_is_not_followed() {
 #[tokio::test]
 async fn send_all_reports_per_slot_elapsed() {
     let origin = start_origin(Router::new().route("/", get(|| async { "ok" }))).await;
-    let client = AxumOutboundClient::try_new().unwrap();
+    let client = AxumOutboundClient::try_new().expect("client");
     let requests = vec![
-        OutboundRequest::get(format!("{origin}/")).unwrap(),
+        OutboundRequest::get(format!("{origin}/")).expect("reachable request"),
         OutboundRequest::new(
             Method::GET,
-            "http://127.0.0.1:1/unreachable".parse().unwrap(),
+            "http://127.0.0.1:1/unreachable"
+                .parse()
+                .expect("unreachable URI"),
         )
-        .unwrap(),
+        .expect("unreachable request"),
     ];
 
     let results = client.send_all(requests).await;
 
     assert_eq!(results.len(), 2);
-    assert!(results[0].outcome.is_ok());
+    results[0]
+        .outcome
+        .as_ref()
+        .expect("reachable slot succeeds");
     assert!(matches!(
         results[1].outcome,
         Err(EdgeError::BadGateway {
@@ -89,17 +102,17 @@ async fn send_all_reports_per_slot_elapsed() {
 
 #[tokio::test]
 async fn send_all_preflight_precedence_and_indices() {
-    let client = AxumOutboundClient::try_new().unwrap();
+    let client = AxumOutboundClient::try_new().expect("client");
     let streamed_upload = OutboundRequest::post("https://example.com/upload")
-        .unwrap()
+        .expect("upload request")
         .body(CoreBody::stream(stream::iter([bytes::Bytes::from_static(
             b"body",
         )])));
     let streamed_response = OutboundRequest::get("https://example.com/stream")
-        .unwrap()
+        .expect("stream request")
         .stream_response();
     let method_error = OutboundRequest::get("https://example.com/get")
-        .unwrap()
+        .expect("GET request")
         .body(CoreBody::stream(stream::iter([bytes::Bytes::new()])));
 
     let results = client
@@ -128,18 +141,18 @@ async fn buffered_response_deadline_covers_body_completion() {
     let origin = start_origin(Router::new().route(
         "/",
         get(|| async {
-            let body = async_stream::stream! {
-                yield Ok::<_, Infallible>(bytes::Bytes::from_static(b"first"));
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                yield Ok::<_, Infallible>(bytes::Bytes::from_static(b"second"));
+            let body = async_body_stream! {
+                yield Ok::<_, Infallible>(Bytes::from_static(b"first"));
+                sleep(Duration::from_millis(100)).await;
+                yield Ok::<_, Infallible>(Bytes::from_static(b"second"));
             };
             Response::new(Body::from_stream(body))
         }),
     ))
     .await;
-    let client = AxumOutboundClient::try_new().unwrap();
+    let client = AxumOutboundClient::try_new().expect("client");
     let request = OutboundRequest::get(format!("{origin}/"))
-        .unwrap()
+        .expect("request")
         .timeout(Duration::from_millis(10));
 
     let error = client
@@ -163,18 +176,18 @@ async fn encoded_and_decoded_limits_report_independent_origins() {
                 Response::builder()
                     .header(CONTENT_ENCODING, "gzip")
                     .body(Body::from(bytes))
-                    .unwrap()
+                    .expect("origin response")
             }
         }),
     ))
     .await;
-    let client = AxumOutboundClient::try_new().unwrap();
+    let client = AxumOutboundClient::try_new().expect("client");
 
     let decoded_error = client
         .send(
             OutboundRequest::get(format!("{origin}/"))
-                .unwrap()
-                .max_encoded_response_bytes(u64::try_from(encoded.len()).unwrap())
+                .expect("decoded-limit request")
+                .max_encoded_response_bytes(u64::try_from(encoded.len()).expect("encoded length"))
                 .max_decoded_response_bytes(128),
         )
         .await
@@ -190,9 +203,13 @@ async fn encoded_and_decoded_limits_report_independent_origins() {
     let encoded_error = client
         .send(
             OutboundRequest::get(format!("{origin}/"))
-                .unwrap()
-                .max_encoded_response_bytes(u64::try_from(encoded.len()).unwrap().saturating_sub(1))
-                .max_decoded_response_bytes(u64::try_from(decoded.len()).unwrap()),
+                .expect("encoded-limit request")
+                .max_encoded_response_bytes(
+                    u64::try_from(encoded.len())
+                        .expect("encoded length")
+                        .saturating_sub(1),
+                )
+                .max_decoded_response_bytes(u64::try_from(decoded.len()).expect("decoded length")),
         )
         .await
         .expect_err("encoded response must exceed its independent limit");
@@ -213,18 +230,18 @@ async fn passthrough_coding_is_not_charged_to_decoded_limit() {
             Response::builder()
                 .header(CONTENT_ENCODING, "zstd")
                 .body(Body::from("opaque"))
-                .unwrap()
+                .expect("origin response")
         }),
     ))
     .await;
-    let client = AxumOutboundClient::try_new().unwrap();
+    let client = AxumOutboundClient::try_new().expect("client");
     let request = OutboundRequest::get(format!("{origin}/"))
-        .unwrap()
+        .expect("request")
         .max_encoded_response_bytes(6)
         .max_decoded_response_bytes(1);
 
-    let response = client.send(request).await.unwrap();
-    let bytes = response.into_bytes_bounded(6).await.unwrap();
+    let response = client.send(request).await.expect("response");
+    let bytes = response.into_bytes_bounded(6).await.expect("response body");
 
     assert_eq!(bytes, "opaque");
 }
@@ -245,17 +262,17 @@ async fn repeated_response_headers_are_preserved() {
         }),
     ))
     .await;
-    let client = AxumOutboundClient::try_new().unwrap();
+    let client = AxumOutboundClient::try_new().expect("client");
 
     let response = client
-        .send(OutboundRequest::get(format!("{origin}/")).unwrap())
+        .send(OutboundRequest::get(format!("{origin}/")).expect("request"))
         .await
-        .unwrap();
+        .expect("response");
     let values: Vec<_> = response
         .headers()
         .get_all(SET_COOKIE)
         .iter()
-        .map(|value| value.to_str().unwrap())
+        .map(|value| value.to_str().expect("header value"))
         .collect();
 
     assert_eq!(values, ["a=1", "b=2"]);

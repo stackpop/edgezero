@@ -1,12 +1,3 @@
-#![expect(
-    clippy::arbitrary_source_item_ordering,
-    reason = "the target-gated implementation module is kept before shared test seams"
-)]
-#![expect(
-    clippy::pub_use,
-    reason = "the target-gated implementation keeps WASI imports out of native builds"
-)]
-
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 

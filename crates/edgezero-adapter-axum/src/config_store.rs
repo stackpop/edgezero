@@ -17,9 +17,12 @@ use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
+use edgezero_core::{BoundedStoreRead, Deadline};
 
 /// Local-file config store used by the Axum dev server.
 ///
@@ -28,12 +31,16 @@ use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 /// state, not an error.
 pub struct AxumConfigStore {
     data: HashMap<String, String>,
+    #[cfg(test)]
+    unbounded_get_calls: AtomicUsize,
 }
 
 impl AxumConfigStore {
     fn empty() -> Self {
         Self {
             data: HashMap::new(),
+            #[cfg(test)]
+            unbounded_get_calls: AtomicUsize::new(0),
         }
     }
 
@@ -62,6 +69,8 @@ impl AxumConfigStore {
     {
         Self {
             data: entries.into_iter().collect(),
+            #[cfg(test)]
+            unbounded_get_calls: AtomicUsize::new(0),
         }
     }
 
@@ -115,7 +124,11 @@ impl AxumConfigStore {
                 path.display()
             ))
         })?;
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            #[cfg(test)]
+            unbounded_get_calls: AtomicUsize::new(0),
+        })
     }
 
     /// Resolve the on-disk path for the given logical config id.
@@ -158,7 +171,46 @@ impl AxumConfigStore {
 impl ConfigStore for AxumConfigStore {
     #[inline]
     async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        #[cfg(test)]
+        self.unbounded_get_calls.fetch_add(1, Ordering::Relaxed);
         Ok(self.data.get(key).cloned())
+    }
+
+    #[inline]
+    async fn get_bounded(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        if deadline.is_expired() {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
+
+        // Values are already resident after startup JSON parsing. This bounds
+        // request-time materialization; it does not bound startup file allocation.
+        let stored_value = self.data.get(key);
+        if deadline.is_expired() {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
+
+        let backend_bytes = stored_value.map_or(Ok(0_u64), |value| {
+            u64::try_from(value.len()).map_err(|_length_error| ConfigStoreError::ValueTooLarge)
+        })?;
+        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+            return Err(ConfigStoreError::ValueTooLarge);
+        }
+
+        let value = stored_value.cloned();
+        if deadline.is_expired() {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
+
+        Ok(BoundedStoreRead {
+            backend_bytes,
+            value,
+        })
     }
 }
 
@@ -199,8 +251,53 @@ mod tests {
     });
 
     use super::*;
+    use edgezero_core::{Deadline, MonotonicInstant};
     use futures::executor::block_on;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn bounded_get_accepts_exact_caps_and_reports_exact_backend_bytes() {
+        let cs = AxumConfigStore::from_map([("greeting".to_owned(), "hello".to_owned())]);
+
+        let read =
+            block_on(cs.get_bounded("greeting", Deadline::after(Duration::from_secs(1)), 5, 5))
+                .expect("exact cap must succeed");
+
+        assert_eq!(read.backend_bytes, 5);
+        assert_eq!(read.value.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn bounded_get_rejects_either_cap_without_using_cloning_get() {
+        for (max_backend_bytes, max_value_bytes) in [(4, 5), (5, 4)] {
+            let cs = AxumConfigStore::from_map([("greeting".to_owned(), "hello".to_owned())]);
+
+            let error = block_on(cs.get_bounded(
+                "greeting",
+                Deadline::after(Duration::from_secs(1)),
+                max_backend_bytes,
+                max_value_bytes,
+            ))
+            .expect_err("over-cap value must fail");
+
+            assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+            assert_eq!(cs.unbounded_get_calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_get_rejects_an_expired_deadline_before_reading() {
+        let cs = AxumConfigStore::from_map([("greeting".to_owned(), "hello".to_owned())]);
+        let expired = Deadline::at_instant(MonotonicInstant::now());
+
+        let error = block_on(cs.get_bounded("greeting", expired, 5, 5))
+            .expect_err("expired deadline must fail");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+        assert_eq!(cs.unbounded_get_calls.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn axum_config_store_from_map_returns_values() {

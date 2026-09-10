@@ -2918,8 +2918,9 @@ hosts = ["*"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive] // a future capability must not break out-of-tree adapters
-// Declaration order follows the repository's alphabetical-item lint. The matrix remains
-// in product order; serde names and as_str() make declaration order unobservable.
+// Outbound-only excerpt. The complete shared enum also contains config, ingress, and
+// response-egress cells specified by their owning designs. Declaration order follows the
+// repository's alphabetical-item lint.
 pub enum Capability {
     LazyStreamedResponsePassthrough, // downstream response chunks flow without
                                      // collecting the whole body. Cloudflare is

@@ -4672,8 +4672,8 @@ The capability ladder therefore gains two config-owned cells:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
-| `config-read-allocation-bounds` | Native after the local-file reader caps before allocation | Unsupported until the SDK exposes/proves a pre-materialization bound | Unsupported until host API documentation and a probe prove it | Unsupported until host API documentation and a probe prove it |
-| `config-read-deadlines` | Native | BestEffort until host cancellation is observed | BestEffort; synchronous host reads are not guest-preemptible | BestEffort until host cancellation is observed |
+| `config-read-allocation-bounds` | Unsupported while startup JSON is preloaded; promote only after the local-file reader caps before allocation | Unsupported until the SDK exposes/proves a pre-materialization bound | Unsupported until host API documentation and a probe prove it | Unsupported until host API documentation and a probe prove it |
+| `config-read-deadlines` | BestEffort while request-time reads are synchronous map clones with pre/post checks | BestEffort until host cancellation is observed | BestEffort; synchronous host reads are not guest-preemptible | BestEffort until host cancellation is observed |
 
 Apps that require a strict RSS or elapsed-time guarantee declare the corresponding Native
 capability and fail before startup/deploy on weaker targets. Capability documentation must

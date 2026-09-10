@@ -1,50 +1,67 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body as AxumBody;
 use axum::http::{Request, Response};
+use edgezero_core::app::App;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::StatusCode;
+use edgezero_core::ingress::{
+    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts,
+    validate_normalized_ingress_parts,
+};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::response::IntoResponse as _;
+use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry,
 };
+use edgezero_core::time::MonotonicInstant;
+use tokio::time::timeout;
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
-use crate::request::into_core_request;
+use crate::request::into_core_request_parts;
 use crate::response::into_axum_response;
 
 /// Tower service that adapts `EdgeZero` router requests to Axum/Hyper compatible responses.
 #[derive(Clone)]
 pub struct EdgeZeroAxumService {
+    app: Arc<App>,
     config_registry: Option<ConfigRegistry>,
     config_store_handle: Option<ConfigStoreHandle>,
     kv_handle: Option<KvHandle>,
     kv_registry: Option<KvRegistry>,
-    router: RouterService,
     secret_handle: Option<SecretHandle>,
     secret_registry: Option<SecretRegistry>,
 }
 
 impl EdgeZeroAxumService {
+    /// Creates a service that preserves all policies configured on `App`.
     #[must_use]
     #[inline]
-    pub fn new(router: RouterService) -> Self {
+    pub fn from_app(app: App) -> Self {
         Self {
+            app: Arc::new(app),
             config_registry: None,
             config_store_handle: None,
             kv_handle: None,
             kv_registry: None,
-            router,
             secret_handle: None,
             secret_registry: None,
         }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn new(router: RouterService) -> Self {
+        Self::from_app(App::new(router))
     }
 
     /// Attach an id-keyed config-store registry to this service.
@@ -131,7 +148,8 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 
     #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
-        let router = self.router.clone();
+        let app = Arc::clone(&self.app);
+        let request_start = MonotonicInstant::now();
         // Hard-cutoff: legacy bare `KvHandle` /
         // `ConfigStoreHandle` / `SecretHandle` entries are NO
         // LONGER inserted into request extensions. The legacy
@@ -171,61 +189,53 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
             })
         });
         Box::pin(async move {
-            let mut core_request = match into_core_request(req).await {
-                Ok(converted) => converted,
-                Err(err) => {
-                    let mut err_response = Response::new(AxumBody::from(err.clone()));
-                    *err_response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-
-                    return Ok(err_response);
-                }
-            };
-
-            if let Some(registry) = config_registry {
-                core_request.extensions_mut().insert(registry);
-            }
-            if let Some(registry) = kv_registry {
-                core_request.extensions_mut().insert(registry);
-            }
-            if let Some(registry) = secret_registry {
-                core_request.extensions_mut().insert(registry);
-            }
-
             let response = task::block_in_place(move || {
                 Handle::current().block_on(async move {
-                    let core_response = match router.oneshot(core_request).await {
-                        Ok(response) => response,
-                        Err(err) => {
-                            let body = AxumBody::from(format!("internal error: {err}"));
-                            let mut fallback = Response::new(body);
-                            *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                            return fallback;
+                    let (parts, native_body) = req.into_parts();
+                    if let Err(error) =
+                        validate_normalized_ingress_parts(&parts, app.ingress_head_limits())
+                    {
+                        return convert_error_response(error).await;
+                    }
+                    let head_parts = IngressHeadParts::from_parts(
+                        &parts,
+                        IngressHeadAccounting::HostManaged,
+                        IngressFraming::HostManaged,
+                    );
+                    let prepared = match app.begin_ingress(head_parts, request_start) {
+                        Ok(IngressBeginOutcome::Admitted(prepared)) => prepared,
+                        Ok(IngressBeginOutcome::Refused(response)) => {
+                            return convert_egress_envelope(response).await;
+                        }
+                        Err(error) => return convert_error_response(error).await,
+                        Ok(_) => {
+                            return minimal_error_response(
+                                "unsupported ingress admission outcome".to_owned(),
+                            );
                         }
                     };
-                    match into_axum_response(core_response).await {
-                        Ok(converted) => converted,
-                        Err(error) => match error.into_response() {
-                            Ok(error_response) => match into_axum_response(error_response).await {
-                                Ok(converted) => converted,
-                                Err(fallback_error) => {
-                                    let body = AxumBody::from(format!(
-                                        "internal response conversion error: {fallback_error}"
-                                    ));
-                                    let mut fallback = Response::new(body);
-                                    *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                                    fallback
-                                }
-                            },
-                            Err(fallback_error) => {
-                                let body = AxumBody::from(format!(
-                                    "internal error response error: {fallback_error}"
-                                ));
-                                let mut fallback = Response::new(body);
-                                *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                                fallback
-                            }
-                        },
+                    let read_deadline = prepared.read_deadline();
+                    let mut core_request =
+                        match into_core_request_parts(parts, native_body, Some(read_deadline)) {
+                            Ok(converted) => converted,
+                            Err(err) => return minimal_error_response(err),
+                        };
+
+                    if let Some(registry) = config_registry {
+                        core_request.extensions_mut().insert(registry);
                     }
+                    if let Some(registry) = kv_registry {
+                        core_request.extensions_mut().insert(registry);
+                    }
+                    if let Some(registry) = secret_registry {
+                        core_request.extensions_mut().insert(registry);
+                    }
+
+                    let egress = match app.dispatch_admitted(prepared, core_request).await {
+                        Ok(egress) => egress,
+                        Err(error) => return convert_error_response(error).await,
+                    };
+                    convert_egress_envelope(egress).await
                 })
             });
             Ok(response)
@@ -238,22 +248,122 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     }
 }
 
+async fn convert_egress_envelope(egress: ResponseEgressEnvelope) -> Response<AxumBody> {
+    let started_at = MonotonicInstant::now();
+    let Ok((response, policy, mut attempt)) = egress.begin(started_at) else {
+        return minimal_error_response("response-egress policy failed".to_owned());
+    };
+    let Some(remaining) = policy.write_deadline.remaining() else {
+        attempt.terminate(
+            ResponseEgressOutcome::DeadlineExceeded,
+            MonotonicInstant::now(),
+        );
+        return minimal_status_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "response write deadline exceeded".to_owned(),
+        );
+    };
+
+    let result = match timeout(remaining, into_axum_response(response)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            attempt.terminate(
+                ResponseEgressOutcome::DeadlineExceeded,
+                MonotonicInstant::now(),
+            );
+            return minimal_status_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "response write deadline exceeded".to_owned(),
+            );
+        }
+    };
+    let observed_at = MonotonicInstant::now();
+    if policy.write_deadline.is_expired() {
+        attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, observed_at);
+        return minimal_status_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "response write deadline exceeded".to_owned(),
+        );
+    }
+    match result {
+        Ok(converted) => {
+            attempt.terminate(ResponseEgressOutcome::ResponseReturned, observed_at);
+            converted
+        }
+        Err(error) => {
+            let outcome = if matches!(error, EdgeError::ResponseTooLarge { .. }) {
+                ResponseEgressOutcome::ConversionError
+            } else {
+                ResponseEgressOutcome::SourceError
+            };
+            attempt.terminate(outcome, observed_at);
+            convert_error_response(error).await
+        }
+    }
+}
+
+async fn convert_error_response(error: EdgeError) -> Response<AxumBody> {
+    match error.into_response() {
+        Ok(error_response) => match into_axum_response(error_response).await {
+            Ok(converted) => converted,
+            Err(fallback_error) => minimal_error_response(format!(
+                "internal response conversion error: {fallback_error}"
+            )),
+        },
+        Err(fallback_error) => {
+            minimal_error_response(format!("internal error response error: {fallback_error}"))
+        }
+    }
+}
+
+fn minimal_error_response(message: String) -> Response<AxumBody> {
+    minimal_status_response(StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn minimal_status_response(status: StatusCode, message: String) -> Response<AxumBody> {
+    let mut response = Response::new(AxumBody::from(message));
+    *response.status_mut() = status;
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{StatusCode, response_builder};
+    use edgezero_core::ingress::{AdmissionDecision, IngressGrant};
     use edgezero_core::key_value_store::KvStore;
-    use std::sync::Arc;
+    use edgezero_core::response_egress::{ResponseEgressObserver, ResponseEgressReport};
+    use edgezero_core::router::{RouteMetadata, RouteResolution};
+    use edgezero_core::time::Deadline;
+    use futures_util::stream::poll_fn;
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use tower::ServiceExt as _;
 
     struct FixedConfigStore(String);
 
+    #[derive(Clone)]
+    struct RecordingEgressObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
+
+    impl ResponseEgressObserver for RecordingEgressObserver {
+        fn complete(&self, report: &ResponseEgressReport) {
+            self.0.lock().expect("reports lock").push(report.clone());
+        }
+    }
+
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the legacy test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for FixedConfigStore {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.clone()))
@@ -276,6 +386,105 @@ mod tests {
         let request = Request::builder().uri("/").body(AxumBody::empty()).unwrap();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_admission_refuses_before_native_body_poll() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&admission_calls);
+        let observed_during_admission = Arc::clone(&body_polls);
+
+        let router = RouterService::builder()
+            .post("/upload", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("handler must not run")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(move |head| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(observed_during_admission.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                head.route_resolution(),
+                RouteResolution::Matched(_)
+            ));
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Body::empty())
+                    .expect("refusal"),
+            )
+        });
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(native_body)
+            .expect("request");
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn returned_response_reports_once_without_claiming_host_handoff() {
+        let router = RouterService::builder()
+            .get("/observed", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("ok")
+            })
+            .build();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(router);
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/observed")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let observed = reports.lock().expect("reports lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].outcome, ResponseEgressOutcome::ResponseReturned);
+        assert_eq!(observed[0].bytes_written, 0);
+        assert_eq!(
+            observed[0].route.as_ref().map(RouteMetadata::pattern),
+            Some("/observed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_deadline_reaches_body_cell_as_request_timeout() {
+        let router = RouterService::builder()
+            .post("/upload", |ctx: RequestContext| async move {
+                let _bytes = ctx.body_bytes(1024).await?;
+                Ok::<_, EdgeError>("unexpected success")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| AdmissionDecision::Admit {
+            grant: IngressGrant::empty(),
+            read_deadline: Deadline::at_instant(head.request_start()),
+        });
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(AxumBody::from("data"))
+            .expect("request");
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

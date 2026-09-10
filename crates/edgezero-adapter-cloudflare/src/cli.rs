@@ -135,21 +135,27 @@ struct CloudflareCliAdapter;
     reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for CloudflareCliAdapter {
-    #[expect(
-        clippy::match_same_arms,
-        reason = "the complete-resource-accounting cell is stated explicitly while the wildcard keeps future capabilities fail-closed"
-    )]
     fn capability(&self, capability: Capability) -> CapabilitySupport {
         match capability {
-            Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
-            Capability::OutboundHeaderFidelity => CapabilitySupport::BestEffort,
-            Capability::LazyStreamedResponsePassthrough
+            Capability::ConfigReadDeadlines
+            | Capability::InboundReadDeadlines
+            | Capability::OutboundHeaderFidelity => CapabilitySupport::BestEffort,
+            Capability::IngressAdmission
+            | Capability::LazyStreamedResponsePassthrough
             | Capability::OutboundDeadlines
             | Capability::OutboundFlexiblePhaseBudget
             | Capability::OutboundHttp
             | Capability::SendAllSlotIsolation
             | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
-            _ => CapabilitySupport::Unsupported,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
+            | _ => CapabilitySupport::Unsupported,
         }
     }
 
@@ -1224,8 +1230,45 @@ mod tests {
     const TEST_SECRET_ID: &str = "default";
 
     #[test]
-    fn adapter_capability_matrix_matches_outbound_spec() {
+    fn adapter_capability_matrix_matches_contracts() {
         let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::InboundReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::Unsupported,
+            ),
             (Capability::OutboundHttp, CapabilitySupport::Native),
             (
                 Capability::OutboundCompleteResourceAccounting,

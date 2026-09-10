@@ -41,7 +41,7 @@ mod tests {
 
     fn build_test_app() -> App {
         async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
-            let body = Body::text(ctx.request().uri().to_string());
+            let body = Body::text(ctx.uri().to_string());
             let response = response_builder()
                 .status(StatusCode::OK)
                 .body(body)
@@ -50,7 +50,7 @@ mod tests {
         }
 
         async fn mirror_body(ctx: RequestContext) -> Result<Response, EdgeError> {
-            let bytes = ctx.request().body().as_bytes().expect("buffered").to_vec();
+            let bytes = ctx.body_bytes(1024 * 1024).await?.to_vec();
             let response = response_builder()
                 .status(StatusCode::OK)
                 .body(Body::from(bytes))
@@ -259,7 +259,7 @@ mod outbound_contract_tests {
     #[test]
     fn send_all_dispatches_every_slot_before_wait() {
         let events = RefCell::new(Vec::new());
-        let pending = dispatch_all_before_wait_for_test(0..3, |index| {
+        let pending = dispatch_all_before_wait_for_test(0_usize..3_usize, |index| {
             events.borrow_mut().push(format!("dispatch:{index}"));
             Ok::<_, ()>(index)
         });

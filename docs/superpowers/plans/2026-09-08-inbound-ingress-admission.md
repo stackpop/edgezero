@@ -1,6 +1,9 @@
 # Inbound Ingress Admission Implementation Plan
 
-> **Status:** Planned follow-up. This plan is owned by the
+> **Status:** Partially implemented in PR #275. Core route resolution, admission, grants,
+> request timing, lazy bounded body state, and adapter entry seams are implemented. The Axum
+> raw-parser boundary and deployed cancellation probes remain open; raw framing/head-limit
+> capabilities stay `Unsupported`. This plan is owned by the
 > [inbound-body design](../specs/2026-08-22-inbound-body-design.md), not the outbound HTTP
 > implementation phases.
 

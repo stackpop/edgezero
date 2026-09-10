@@ -983,7 +983,12 @@ async fn collect_response_stream_inner(
     }
 }
 
-async fn collect_response_stream_until(
+/// Collects a response stream under both a byte cap and one absolute deadline.
+///
+/// # Errors
+/// Returns a typed buffered-body overflow or gateway timeout while preserving source errors.
+#[inline]
+pub async fn collect_response_stream_until(
     stream: BodyStream,
     max: u64,
     deadline: Deadline,
@@ -1213,7 +1218,15 @@ fn reject_ambiguous_raw_target(raw: &str) -> Result<(), EdgeError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::shadow_reuse,
+        clippy::shadow_unrelated,
+        reason = "table-driven tests intentionally reuse conventional request, response, and budget names"
+    )]
+
+    use std::cell::Cell;
     use std::num::NonZeroU64;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1224,7 +1237,9 @@ mod tests {
 
     use crate::body::Body;
     use crate::compression::{ContentEncoding, classify_content_encoding};
-    use crate::error::{BudgetSource, EdgeError, ResponseLimitReason};
+    use crate::error::{
+        BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
+    };
     use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, request_builder};
     use crate::time::{
         DEADLINE_FAR_FUTURE, DEFAULT_NO_DEADLINE_BUDGET, Deadline, MonotonicInstant,
@@ -1284,6 +1299,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "EdgeError is non-exhaustive and this assertion helper must reject future variants"
+    )]
     fn bad_request_message(error: EdgeError) -> String {
         match error {
             EdgeError::BadRequest { message } => message,
@@ -1427,8 +1446,8 @@ mod tests {
 
     #[test]
     fn encoded_limit_stops_before_decoder() {
-        let polls = std::rc::Rc::new(std::cell::Cell::new(0_usize));
-        let observed = std::rc::Rc::clone(&polls);
+        let polls = Rc::new(Cell::new(0_usize));
+        let observed = Rc::clone(&polls);
         let source = Body::from_stream(
             stream::iter([
                 Ok(Bytes::from_static(b"four")),
@@ -1493,12 +1512,12 @@ mod tests {
         assert_eq!(results[0].elapsed, Duration::from_millis(1));
         assert_eq!(results[1].elapsed, Duration::from_millis(2));
         assert_eq!(results[2].elapsed, Duration::from_millis(3));
-        assert!(results[0].outcome.is_ok());
+        results[0].outcome.as_ref().expect("first slot success");
         assert!(matches!(
             results[1].outcome,
             Err(EdgeError::BadGateway { .. })
         ));
-        assert!(results[2].outcome.is_ok());
+        results[2].outcome.as_ref().expect("third slot success");
     }
 
     #[test]
@@ -1617,16 +1636,8 @@ mod tests {
                 "content-length",
                 HeaderValue::from_bytes(value.as_bytes()).expect("header"),
             );
-            assert!(
-                enforce_payload_content_length(
-                    &headers,
-                    ContentEncoding::Identity,
-                    None,
-                    None,
-                    None,
-                )
-                .is_err()
-            );
+            enforce_payload_content_length(&headers, ContentEncoding::Identity, None, None, None)
+                .expect_err("malformed content-length");
         }
     }
 
@@ -1775,9 +1786,7 @@ mod tests {
         assert!(matches!(
             error,
             EdgeError::BadGateway {
-                reason: crate::error::BadGatewayReason::Decode(
-                    crate::error::BadGatewayDecodeReason::Json
-                ),
+                reason: BadGatewayReason::Decode(BadGatewayDecodeReason::Json),
                 ..
             }
         ));
@@ -1788,7 +1797,7 @@ mod tests {
         assert!(matches!(
             streamed,
             EdgeError::BadGateway {
-                reason: crate::error::BadGatewayReason::Protocol,
+                reason: BadGatewayReason::Protocol,
                 ..
             }
         ));
@@ -1816,6 +1825,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one precedence table documents all response-normalization interactions"
+    )]
     fn response_normalization_precedence_table() {
         let mut nominated = HeaderMap::new();
         nominated.append(
@@ -1865,7 +1878,7 @@ mod tests {
             assert!(matches!(
                 error,
                 EdgeError::BadGateway {
-                    reason: crate::error::BadGatewayReason::Protocol,
+                    reason: BadGatewayReason::Protocol,
                     ..
                 }
             ));
@@ -1918,9 +1931,8 @@ mod tests {
         let mut conflicting = HeaderMap::new();
         conflicting.append("content-length", HeaderValue::from_static("7"));
         conflicting.append("content-length", HeaderValue::from_static("8"));
-        assert!(
-            normalize_response_headers(&Method::GET, StatusCode::OK, &mut conflicting).is_err()
-        );
+        normalize_response_headers(&Method::GET, StatusCode::OK, &mut conflicting)
+            .expect_err("conflicting content-length");
 
         let mut idempotent = HeaderMap::new();
         idempotent.append("x-keep", HeaderValue::from_static("yes"));
@@ -2097,10 +2109,14 @@ mod tests {
             "connection",
             HeaderValue::from_bytes(b"x-private,\xff").expect("opaque header"),
         );
-        assert!(normalize_for_dispatch(&mut request).is_err());
+        normalize_for_dispatch(&mut request).expect_err("opaque connection nomination");
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "the round-trip contract intentionally verifies every independent outbound field"
+    )]
     fn outbound_request_defaults_and_parts_round_trip() {
         let deadline = Deadline::after(Duration::from_secs(9));
         let request = OutboundRequest::post("https://example.com/items")
@@ -2227,7 +2243,7 @@ mod tests {
 
     #[test]
     fn outbound_request_rejects_empty_userinfo() {
-        assert!(OutboundRequest::get("https://@example.com/").is_err());
+        OutboundRequest::get("https://@example.com/").expect_err("empty userinfo");
     }
 
     #[test]
@@ -2293,12 +2309,18 @@ mod tests {
     #[test]
     fn outbound_request_rejects_invalid_header_bytes() {
         let request = OutboundRequest::get("https://example.com").expect("request");
-        assert!(request.header(b"bad name", b"value").is_err());
+        request
+            .header(b"bad name", b"value")
+            .expect_err("invalid header name");
 
         let request = OutboundRequest::get("https://example.com").expect("request");
-        assert!(request.header(b"x-test", [0xff]).is_err());
+        request
+            .header(b"x-test", [0xff])
+            .expect_err("invalid header value");
 
         let request = OutboundRequest::get("https://example.com").expect("request");
-        assert!(request.header(b"x-test", b"line\nbreak").is_err());
+        request
+            .header(b"x-test", b"line\nbreak")
+            .expect_err("header value line break");
     }
 }

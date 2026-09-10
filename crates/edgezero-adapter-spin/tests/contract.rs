@@ -204,7 +204,7 @@ mod tests {
 
     fn build_test_app() -> App {
         async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
-            let body = Body::text(ctx.request().uri().to_string());
+            let body = Body::text(ctx.uri().to_string());
             let response = response_builder()
                 .status(StatusCode::OK)
                 .body(body)
@@ -213,12 +213,7 @@ mod tests {
         }
 
         async fn mirror_body(ctx: RequestContext) -> Result<Response, EdgeError> {
-            let bytes = ctx
-                .request()
-                .body()
-                .as_bytes()
-                .expect("buffered request body")
-                .to_vec();
+            let bytes = ctx.body_bytes(1024 * 1024).await?.to_vec();
             let response = response_builder()
                 .status(StatusCode::OK)
                 .body(Body::from(bytes))
@@ -569,9 +564,9 @@ mod outbound_contract_tests {
             .map(validate_batch_request_for_test)
             .collect();
 
-        assert!(outcomes[0].is_ok());
+        outcomes[0].as_ref().expect("buffered slot 0");
         assert!(outcomes[1].is_err(), "streamed upload keeps slot index 1");
         assert!(outcomes[2].is_err(), "streamed response keeps slot index 2");
-        assert!(outcomes[3].is_ok());
+        outcomes[3].as_ref().expect("buffered slot 3");
     }
 }

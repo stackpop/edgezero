@@ -5,9 +5,15 @@
 //! each lookup.
 
 #[cfg(feature = "fastly")]
+use crate::chunked_config::{SyncHostCallError, exact_fastly_read, run_sync_host_call};
+#[cfg(feature = "fastly")]
 use async_trait::async_trait;
 #[cfg(feature = "fastly")]
 use bytes::Bytes;
+#[cfg(feature = "fastly")]
+use edgezero_core::Deadline;
+#[cfg(feature = "fastly")]
+use edgezero_core::config_store::BoundedStoreRead;
 #[cfg(feature = "fastly")]
 use edgezero_core::secret_store::{SecretError, SecretStore};
 #[cfg(feature = "fastly")]
@@ -21,6 +27,37 @@ pub struct FastlyNamedStore {
 
 #[cfg(feature = "fastly")]
 impl FastlyNamedStore {
+    fn get_bytes_bounded_sync(
+        &self,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        let lookup = run_sync_host_call(deadline, || {
+            self.store.try_get(key).map_err(|err| {
+                SecretError::Internal(anyhow::anyhow!("secret lookup failed: {err}"))
+            })
+        })
+        .map_err(map_sync_secret_error)?;
+
+        let Some(secret) = lookup else {
+            return Ok(BoundedStoreRead {
+                backend_bytes: 0,
+                value: None,
+            });
+        };
+        let plaintext = run_sync_host_call(deadline, || {
+            secret.try_plaintext().map_err(|err| {
+                SecretError::Internal(anyhow::anyhow!("secret decryption failed: {err}"))
+            })
+        })
+        .map_err(map_sync_secret_error)?;
+
+        exact_fastly_read(Some(plaintext), max_backend_bytes.min(max_value_bytes))
+            .map_err(|_size_error| SecretError::ValueTooLarge)
+    }
+
     pub(crate) fn get_bytes_sync(&self, key: &str) -> Result<Option<Bytes>, SecretError> {
         let lookup = self
             .store
@@ -53,6 +90,10 @@ impl FastlyNamedStore {
         })?;
         Ok(Self { store })
     }
+
+    fn open_bounded(name: &str, deadline: Deadline) -> Result<Self, SecretError> {
+        run_sync_host_call(deadline, || Self::open(name)).map_err(map_sync_secret_error)
+    }
 }
 
 /// Multi-store provider backed by Fastly's `SecretStore` API.
@@ -69,6 +110,27 @@ impl SecretStore for FastlySecretStore {
     async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         let store = FastlyNamedStore::open(store_name)?;
         store.get_bytes_sync(key)
+    }
+
+    #[inline]
+    async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        let store = FastlyNamedStore::open_bounded(store_name, deadline)?;
+        store.get_bytes_bounded_sync(key, deadline, max_backend_bytes, max_value_bytes)
+    }
+}
+
+#[cfg(feature = "fastly")]
+fn map_sync_secret_error(call_error: SyncHostCallError<SecretError>) -> SecretError {
+    match call_error {
+        SyncHostCallError::Backend(backend_error) => backend_error,
+        SyncHostCallError::DeadlineExceeded => SecretError::DeadlineExceeded,
     }
 }
 

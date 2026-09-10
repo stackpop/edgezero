@@ -385,6 +385,11 @@ impl ConfigStoreHandle {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::missing_trait_methods,
+        reason = "legacy provider stubs intentionally exercise the bounded-read compatibility default"
+    )]
+
     // Run the shared contract tests against TestConfigStore.
     crate::config_store_contract_tests!(
         test_config_store_contract,
@@ -392,8 +397,10 @@ mod tests {
     );
 
     use super::*;
+    use crate::time::Deadline;
     use futures::executor::block_on;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     struct FailingConfigStore;
 
@@ -450,10 +457,6 @@ mod tests {
 
     #[test]
     fn bounded_exact_cap_succeeds_and_over_cap_discards_value() {
-        use std::time::Duration;
-
-        use crate::time::Deadline;
-
         let store_handle = handle(&[("feature.checkout", "true")]);
         let exact = block_on(store_handle.get_bounded(
             "feature.checkout",
@@ -485,17 +488,19 @@ mod tests {
         assert_eq!(limits.timeout, DEFAULT_CONFIG_EXTRACTION_TIMEOUT);
         limits.validate().expect("valid defaults");
 
-        let invalid = ConfigExtractionLimits {
+        let invalid_total = ConfigExtractionLimits {
             max_total_bytes: 1,
             ..limits
         };
-        invalid.validate().expect_err("total below per-value cap");
+        invalid_total
+            .validate()
+            .expect_err("total below per-value cap");
 
-        let invalid = ConfigExtractionLimits {
-            timeout: std::time::Duration::ZERO,
+        let invalid_timeout = ConfigExtractionLimits {
+            timeout: Duration::ZERO,
             ..limits
         };
-        invalid.validate().expect_err("zero timeout");
+        invalid_timeout.validate().expect_err("zero timeout");
     }
 
     #[test]
