@@ -98,9 +98,9 @@
 - [x] Run `cargo check --workspace --all-targets --features "fastly cloudflare spin"`.
 - [x] Compile and lint Cloudflare, Fastly, and Spin on their target-specific WASM triples; run the exact Fastly and Spin CI sentinels locally.
 - [x] Make the Fastly outbound concurrency sentinel part of the WASM contract binary, as required by the existing CI matrix, and prove it under Viceroy.
-- [ ] Confirm the Cloudflare browser-runtime contract through the PR's Linux CI job; local Safari WebDriver cannot start in this environment.
+- [x] Confirm the Cloudflare browser-runtime contract through the PR's Linux CI job; local Safari WebDriver cannot start in this environment.
 - [x] Run documentation contract, formatting, lint, and build checks.
-- [ ] Commit, push, wait for PR checks, and verify the branch is clean and synchronized.
+- [x] Commit, push, wait for PR checks, and verify the branch is clean and synchronized.
 
 ### Task 6: Final Self-Review Corrections
 
