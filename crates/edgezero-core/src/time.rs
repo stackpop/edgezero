@@ -1,3 +1,5 @@
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{BudgetSource, EdgeError};
@@ -24,6 +26,43 @@ pub struct DispatchBudget {
 
 /// Portable monotonic clock instant used by `EdgeZero` timing APIs.
 pub type MonotonicInstant = web_time::Instant;
+
+/// Cloneable monotonic clock source shared by one application and its admitted requests.
+#[derive(Clone)]
+pub struct MonotonicClock {
+    now: Arc<dyn Fn() -> MonotonicInstant + Send + Sync>,
+}
+
+impl MonotonicClock {
+    #[must_use]
+    #[inline]
+    pub fn new<Now>(now: Now) -> Self
+    where
+        Now: Fn() -> MonotonicInstant + Send + Sync + 'static,
+    {
+        Self { now: Arc::new(now) }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn now(&self) -> MonotonicInstant {
+        (self.now)()
+    }
+}
+
+impl Default for MonotonicClock {
+    #[inline]
+    fn default() -> Self {
+        Self::new(MonotonicInstant::now)
+    }
+}
+
+impl fmt::Debug for MonotonicClock {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MonotonicClock").finish_non_exhaustive()
+    }
+}
 
 impl Deadline {
     /// Returns a deadline `now + min(duration, DEADLINE_FAR_FUTURE)`; never panics.
@@ -56,7 +95,10 @@ impl Deadline {
         self.is_expired_at(MonotonicInstant::now())
     }
 
-    fn is_expired_at(&self, now: MonotonicInstant) -> bool {
+    /// Returns `true` when this deadline is at or before the supplied clock snapshot.
+    #[inline]
+    #[must_use]
+    pub fn is_expired_at(&self, now: MonotonicInstant) -> bool {
         self.remaining_at(now).is_none()
     }
 
@@ -67,7 +109,10 @@ impl Deadline {
         self.remaining_at(MonotonicInstant::now())
     }
 
-    fn remaining_at(&self, now: MonotonicInstant) -> Option<Duration> {
+    /// Returns time remaining at an explicit clock snapshot, or `None` at/past expiry.
+    #[inline]
+    #[must_use]
+    pub fn remaining_at(&self, now: MonotonicInstant) -> Option<Duration> {
         self.0
             .checked_duration_since(now)
             .filter(|remaining| !remaining.is_zero())
@@ -128,6 +173,23 @@ pub fn dispatch_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn monotonic_clock_uses_the_injected_source() {
+        let start = MonotonicInstant::now();
+        let now = Arc::new(Mutex::new(start));
+        let observed_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *observed_now.lock().expect("clock lock"));
+
+        assert_eq!(clock.now(), start);
+        let advanced = start
+            .checked_add(Duration::from_secs(2))
+            .expect("advanced instant");
+        *now.lock().expect("clock lock") = advanced;
+        assert_eq!(clock.now(), advanced);
+        assert_eq!(clock.clone().now(), advanced);
+    }
 
     #[test]
     fn monotonic_instant_is_public_clock_type() {

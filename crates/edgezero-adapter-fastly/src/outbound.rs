@@ -789,24 +789,24 @@ mod fastly_impl {
                     "outbound request body exceeded configured limit",
                 ));
             }
-            writer.write_all(&bytes).map_err(|error| {
+            writer.write_all(&bytes).map_err(|_error| {
                 EdgeError::bad_gateway_with_reason(
-                    format!("Fastly outbound request body write failed: {error}"),
+                    "Fastly outbound request body write failed",
                     BadGatewayReason::Transport,
                 )
             })?;
-            writer.flush().map_err(|error| {
+            writer.flush().map_err(|_error| {
                 EdgeError::bad_gateway_with_reason(
-                    format!("Fastly outbound request body flush failed: {error}"),
+                    "Fastly outbound request body flush failed",
                     BadGatewayReason::Transport,
                 )
             })?;
             budget_remaining(budget)?;
             total = next_total;
         }
-        writer.finish().map_err(|error| {
+        writer.finish().map_err(|_error| {
             EdgeError::bad_gateway_with_reason(
-                format!("Fastly outbound request completion failed: {error}"),
+                "Fastly outbound request completion failed",
                 BadGatewayReason::Transport,
             )
         })?;
@@ -826,12 +826,12 @@ mod fastly_impl {
                         budget_remaining(budget)?;
                         yield Ok(Bytes::from(chunk));
                     }
-                    Some(Err(error)) => {
+                    Some(Err(_error)) => {
                         if budget.deadline.is_expired() {
                             yield Err(timeout_error(budget.cause));
                         } else {
                             yield Err(EdgeError::bad_gateway_with_reason(
-                                format!("Fastly upstream response body failed: {error}"),
+                                "Fastly upstream response body failed",
                                 BadGatewayReason::Transport,
                             ));
                         }

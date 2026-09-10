@@ -11,7 +11,31 @@ const expectedHeader = [
   'Fastly',
   'Spin',
 ]
-const expectedRows = [
+const expectedIngressRows = [
+  ['ingress-admission', 'Native', 'Native', 'Native', 'Native'],
+  [
+    'inbound-read-deadlines',
+    'Native',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+  ],
+  [
+    'raw-ingress-head-limits',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+  ],
+  [
+    'raw-ingress-framing-validation',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+  ],
+]
+const expectedOutboundRows = [
   ['outbound-http', 'Native', 'Native', 'BestEffort', 'Native'],
   [
     'outbound-complete-resource-accounting',
@@ -86,37 +110,45 @@ const headerIndices = lines
   .filter(({ row }) => JSON.stringify(row) === JSON.stringify(expectedHeader))
   .map(({ index }) => index)
 
-if (headerIndices.length !== 1) {
-  fail(`expected exactly one capability matrix, found ${headerIndices.length}`)
+if (headerIndices.length !== 2) {
+  fail(`expected exactly two capability matrices, found ${headerIndices.length}`)
 }
 
-const headerIndex = headerIndices[0]
-const separator = cells(lines[headerIndex + 1] ?? '')
-if (
-  separator === null ||
-  separator.length !== expectedHeader.length ||
-  !separator.every((value) => /^:?-{3,}:?$/u.test(value))
-) {
-  fail('capability matrix is missing its five-column separator row')
-}
-
-const actualRows = []
-for (let index = headerIndex + 2; index < lines.length; index += 1) {
-  const row = cells(lines[index])
-  if (row === null) break
-  if (row.length !== expectedHeader.length) {
-    fail(`capability matrix row ${index + 1} has ${row.length} cells, expected 5`)
+function readMatrix(headerIndex, name) {
+  const separator = cells(lines[headerIndex + 1] ?? '')
+  if (
+    separator === null ||
+    separator.length !== expectedHeader.length ||
+    !separator.every((value) => /^:?-{3,}:?$/u.test(value))
+  ) {
+    fail(`${name} capability matrix is missing its five-column separator row`)
   }
-  actualRows.push([
-    normalizeCapability(row[0]),
-    ...row.slice(1).map(normalizeSupport),
-  ])
+
+  const actualRows = []
+  for (let index = headerIndex + 2; index < lines.length; index += 1) {
+    const row = cells(lines[index])
+    if (row === null) break
+    if (row.length !== expectedHeader.length) {
+      fail(`${name} capability matrix row ${index + 1} has ${row.length} cells, expected 5`)
+    }
+    actualRows.push([
+      normalizeCapability(row[0]),
+      ...row.slice(1).map(normalizeSupport),
+    ])
+  }
+  return actualRows
 }
 
-if (JSON.stringify(actualRows) !== JSON.stringify(expectedRows)) {
-  fail(
-    `capability matrix mismatch\nexpected=${JSON.stringify(expectedRows)}\nactual=${JSON.stringify(actualRows)}`,
-  )
+const matrices = [
+  ['ingress', expectedIngressRows, readMatrix(headerIndices[0], 'ingress')],
+  ['outbound', expectedOutboundRows, readMatrix(headerIndices[1], 'outbound')],
+]
+for (const [name, expectedRows, actualRows] of matrices) {
+  if (JSON.stringify(actualRows) !== JSON.stringify(expectedRows)) {
+    fail(
+      `${name} capability matrix mismatch\nexpected=${JSON.stringify(expectedRows)}\nactual=${JSON.stringify(actualRows)}`,
+    )
+  }
 }
 
 const sidebarSource = readFileSync(sidebarPath, 'utf8')

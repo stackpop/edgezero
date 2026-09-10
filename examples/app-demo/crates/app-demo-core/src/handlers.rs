@@ -1018,7 +1018,8 @@ mod tests {
                 .to_vec(),
         )
         .expect("utf8");
-        assert!(body.contains("required secret is not configured"));
+        assert!(body.contains("internal server error"));
+        assert!(!body.contains("required secret is not configured"));
         assert!(!body.contains("SMOKE_SECRET_MISSING"));
     }
 

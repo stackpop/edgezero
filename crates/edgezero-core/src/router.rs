@@ -68,10 +68,18 @@ impl RouteId {
 /// Canonical metadata for one registered route.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteMetadata {
+    class: Option<Arc<str>>,
     id: RouteId,
 }
 
 impl RouteMetadata {
+    /// Opaque manifest-sourced route class used by admission policy.
+    #[must_use]
+    #[inline]
+    pub fn class(&self) -> Option<&str> {
+        self.class.as_deref()
+    }
+
     #[must_use]
     #[inline]
     pub fn id(&self) -> &RouteId {
@@ -87,6 +95,18 @@ impl RouteMetadata {
     #[inline]
     pub fn new<S: Into<String>>(method: Method, pattern: S) -> Self {
         Self {
+            class: None,
+            id: RouteId::new(method, pattern),
+        }
+    }
+
+    fn new_with_class<S, C>(method: Method, pattern: S, class: C) -> Self
+    where
+        C: Into<Arc<str>>,
+        S: Into<String>,
+    {
+        Self {
+            class: Some(class.into()),
             id: RouteId::new(method, pattern),
         }
     }
@@ -162,11 +182,14 @@ impl RouterBuilder {
         clippy::panic,
         reason = "duplicate route is a build-time programmer error, not a runtime condition"
     )]
-    fn add_route<H>(&mut self, path: &str, method: Method, handler: H)
+    fn add_route<H>(&mut self, path: &str, method: Method, class: Option<Arc<str>>, handler: H)
     where
         H: IntoHandler,
     {
-        let metadata = RouteMetadata::new(method.clone(), path);
+        let metadata = class.map_or_else(
+            || RouteMetadata::new(method.clone(), path),
+            |route_class| RouteMetadata::new_with_class(method.clone(), path, route_class),
+        );
         let router = self.routes.entry(method).or_default();
 
         // The handler reports which introspection payloads its route needs; the
@@ -267,7 +290,25 @@ impl RouterBuilder {
     where
         H: IntoHandler,
     {
-        self.add_route(path, method, handler);
+        self.add_route(path, method, None, handler);
+        self
+    }
+
+    /// Registers a route with opaque admission metadata from the manifest.
+    #[must_use]
+    #[inline]
+    pub fn route_with_class<H, C>(
+        mut self,
+        path: &str,
+        method: Method,
+        class: C,
+        handler: H,
+    ) -> Self
+    where
+        C: Into<Arc<str>>,
+        H: IntoHandler,
+    {
+        self.add_route(path, method, Some(class.into()), handler);
         self
     }
 
@@ -704,7 +745,7 @@ mod tests {
 
         let router = RouterService::builder()
             .post("/users/{id}", handler)
-            .get("/users/{id}", handler)
+            .route_with_class("/users/{id}", Method::GET, "auction", handler)
             .build();
 
         let matched = router.resolve(&Method::GET, "/users/42");
@@ -715,6 +756,7 @@ mod tests {
         assert_eq!(metadata.pattern(), "/users/{id}");
         assert_eq!(metadata.id().method(), Method::GET);
         assert_eq!(metadata.id().pattern(), "/users/{id}");
+        assert_eq!(metadata.class(), Some("auction"));
 
         let rejected = router.resolve(&Method::DELETE, "/users/99");
         let RouteResolution::MethodNotAllowed { allowed } = rejected.resolution() else {
@@ -723,6 +765,8 @@ mod tests {
         assert_eq!(allowed.len(), 2);
         assert_eq!(allowed[0].method(), Method::GET);
         assert_eq!(allowed[1].method(), Method::POST);
+        assert_eq!(allowed[0].class(), Some("auction"));
+        assert_eq!(allowed[1].class(), None);
 
         assert!(matches!(
             router.resolve(&Method::GET, "/missing").resolution(),
@@ -759,10 +803,16 @@ mod tests {
             let grant = ctx.take_ingress_grant().expect("ingress grant");
             assert!(ctx.take_ingress_grant().is_none());
             let lease = grant.downcast::<String>().expect("lease type");
-            Ok(format!("{}:{lease}", metadata.pattern()))
+            Ok(format!(
+                "{}:{}:{lease}",
+                metadata.pattern(),
+                metadata.class().expect("route class")
+            ))
         }
 
-        let router = RouterService::builder().get("/users/{id}", handler).build();
+        let router = RouterService::builder()
+            .route_with_class("/users/{id}", Method::GET, "auction", handler)
+            .build();
         let resolved = router.resolve(&Method::GET, "/users/42");
         let start = MonotonicInstant::now();
         let request = request_builder()
@@ -792,7 +842,7 @@ mod tests {
             .expect("resolved response");
         assert_eq!(
             response.body().as_bytes().expect("buffered"),
-            b"/users/{id}:lease"
+            b"/users/{id}:auction:lease"
         );
     }
 

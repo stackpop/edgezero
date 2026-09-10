@@ -394,7 +394,7 @@ fn classify_send_error(error: &reqwest::Error, cause: BudgetSource) -> EdgeError
     } else {
         BadGatewayReason::Transport
     };
-    EdgeError::bad_gateway_with_reason(format!("upstream request failed: {error}"), reason)
+    EdgeError::bad_gateway_with_reason("upstream request failed", reason)
 }
 
 fn copy_headers(headers: &ReqwestHeaderMap) -> HeaderMap {
@@ -420,7 +420,7 @@ fn response_stream(mut response: reqwest::Response, cause: BudgetSource) -> Body
                         timeout_error(cause)
                     } else {
                         EdgeError::bad_gateway_with_reason(
-                            format!("upstream response body failed: {error}"),
+                            "upstream response body failed",
                             BadGatewayReason::Transport,
                         )
                     };

@@ -14,7 +14,7 @@ use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
     KvRegistry, SecretRegistry, StoreRegistry,
 };
-use crate::time::{Deadline, MonotonicInstant};
+use crate::time::{Deadline, MonotonicClock, MonotonicInstant};
 use futures_util::StreamExt as _;
 use serde::de::DeserializeOwned;
 
@@ -139,6 +139,7 @@ pub struct RequestContext {
     body: RefCell<BodyState>,
     config_extraction_limits: ConfigExtractionLimits,
     ingress_grant: RefCell<Option<IngressGrant>>,
+    monotonic_clock: MonotonicClock,
     parts: RequestParts,
     path_params: PathParams,
     read_deadline: Option<Deadline>,
@@ -208,7 +209,7 @@ impl RequestContext {
             armed: true,
             body: &self.body,
         };
-        let result = drain_body(body, max, self.read_deadline).await;
+        let result = drain_body(body, max, self.read_deadline, &self.monotonic_clock).await;
         match result {
             Ok(bytes) => {
                 *self.body.borrow_mut() = BodyState::Cached(bytes.clone());
@@ -401,6 +402,13 @@ impl RequestContext {
         &self.parts.method
     }
 
+    /// Returns the clock paired with this request's admitted ingress lifetime.
+    #[must_use]
+    #[inline]
+    pub fn monotonic_clock(&self) -> MonotonicClock {
+        self.monotonic_clock.clone()
+    }
+
     #[inline]
     pub fn new(request: Request, params: PathParams) -> Self {
         let (parts, body) = request.into_parts();
@@ -408,6 +416,7 @@ impl RequestContext {
             body: RefCell::new(BodyState::Initial(body)),
             config_extraction_limits: ConfigExtractionLimits::default(),
             ingress_grant: RefCell::new(None),
+            monotonic_clock: MonotonicClock::default(),
             parts,
             path_params: params,
             read_deadline: None,
@@ -422,12 +431,14 @@ impl RequestContext {
         route_metadata: RouteMetadata,
         ingress: AdmittedIngress,
     ) -> Self {
-        let (request_start, read_deadline, grant, config_extraction_limits) = ingress.into_parts();
+        let (request_start, read_deadline, grant, config_extraction_limits, monotonic_clock) =
+            ingress.into_parts();
         let (parts, body) = request.into_parts();
         Self {
             body: RefCell::new(BodyState::Initial(body)),
             config_extraction_limits,
             ingress_grant: RefCell::new(Some(grant)),
+            monotonic_clock,
             parts,
             path_params: params,
             read_deadline: Some(read_deadline),
@@ -573,8 +584,11 @@ fn check_cached_body(bytes: &bytes::Bytes, max: usize) -> Result<bytes::Bytes, E
     Ok(bytes.clone())
 }
 
-fn check_read_deadline(deadline: Option<Deadline>) -> Result<(), EdgeError> {
-    if deadline.is_some_and(|candidate| candidate.is_expired()) {
+fn check_read_deadline(
+    deadline: Option<Deadline>,
+    monotonic_clock: &MonotonicClock,
+) -> Result<(), EdgeError> {
+    if deadline.is_some_and(|candidate| candidate.is_expired_at(monotonic_clock.now())) {
         return Err(EdgeError::request_timeout(
             "inbound body read deadline exceeded",
         ));
@@ -586,20 +600,21 @@ async fn drain_body(
     body: Body,
     max: usize,
     deadline: Option<Deadline>,
+    monotonic_clock: &MonotonicClock,
 ) -> Result<bytes::Bytes, EdgeError> {
-    check_read_deadline(deadline)?;
+    check_read_deadline(deadline, monotonic_clock)?;
     match body {
         Body::Once(bytes) => {
-            check_read_deadline(deadline)?;
+            check_read_deadline(deadline, monotonic_clock)?;
             check_cached_body(&bytes, max)
         }
         Body::Stream(mut stream) => {
             let mut buffered = Vec::new();
             loop {
-                check_read_deadline(deadline)?;
+                check_read_deadline(deadline, monotonic_clock)?;
                 let next = stream.next().await;
                 // Deadline wins a simultaneous body/error/EOF observation.
-                check_read_deadline(deadline)?;
+                check_read_deadline(deadline, monotonic_clock)?;
                 let Some(result) = next else {
                     return Ok(bytes::Bytes::from(buffered));
                 };
@@ -639,6 +654,7 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future as _;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -838,6 +854,25 @@ mod tests {
         assert_eq!(first.status(), StatusCode::REQUEST_TIMEOUT);
         assert_eq!(second.status(), StatusCode::REQUEST_TIMEOUT);
         assert!(matches!(second, EdgeError::RequestTimeout { .. }));
+    }
+
+    #[test]
+    fn injected_clock_controls_read_deadline_and_sticky_poison() {
+        let start = MonotonicInstant::now();
+        let now = Arc::new(Mutex::new(start));
+        let observed_now = Arc::clone(&now);
+        let mut ctx = ctx("/body", Body::from("available"), PathParams::default());
+        ctx.monotonic_clock =
+            MonotonicClock::new(move || *observed_now.lock().expect("clock lock"));
+        let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
+        ctx.read_deadline = Some(Deadline::at_instant(deadline));
+        *now.lock().expect("clock lock") = deadline;
+
+        let first = block_on(ctx.body_bytes(32)).expect_err("expired");
+        let second = block_on(ctx.body_bytes(32)).expect_err("sticky expired");
+        assert_eq!(first.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(second.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(ctx.body_kind(), BodyKind::Poisoned);
     }
 
     #[test]

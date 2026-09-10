@@ -1000,9 +1000,9 @@ fn decode_json<Value>(bytes: &[u8]) -> Result<Value, EdgeError>
 where
     Value: DeserializeOwned,
 {
-    serde_json::from_slice(bytes).map_err(|error| {
+    serde_json::from_slice(bytes).map_err(|_error| {
         EdgeError::bad_gateway_with_reason(
-            format!("failed to decode upstream JSON: {error}"),
+            "failed to decode upstream JSON",
             BadGatewayReason::Decode(BadGatewayDecodeReason::Json),
         )
     })

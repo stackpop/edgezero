@@ -998,7 +998,7 @@ default = "feature__flags"
 Run: `cargo test -p edgezero-core --lib manifest`
 Expected: 3 new tests pass.
 
-## Task B2 — `EdgeError::ConfigOutOfDate` variant + two constructors
+## Task B2 — `EdgeError::ConfigOutOfDate` variant + explicit-pair constructor
 
 **Files:**
 
@@ -1010,7 +1010,6 @@ Expected: 3 new tests pass.
 - Produces:
   - `EdgeError::ConfigOutOfDate { message: String, field_path: String }`
   - `EdgeError::config_out_of_date(message: impl Into<String>, field_path: impl Into<String>) -> Self`
-  - `EdgeError::config_out_of_date_from_serde(err: serde_path_to_error::Error<serde_json::Error>) -> Self`
 
 - [ ] **Step 1: Add the variant.**
 
@@ -1045,17 +1044,12 @@ Edit `crates/edgezero-core/src/error.rs` near the existing enum. Insert:
         }
     }
 
-    /// Construct from a `serde_path_to_error` error returned by
-    /// the deserialise wrapper around the blob's `data` field.
-    pub fn config_out_of_date_from_serde(
-        serde_err: serde_path_to_error::Error<serde_json::Error>,
-    ) -> Self {
-        Self::ConfigOutOfDate {
-            message: serde_err.inner().to_string(),
-            field_path: serde_err.path().to_string(),
-        }
-    }
 ```
+
+Typed store deserialization is added by Task B2.5 through
+`store_deserialization_from_serde`, which carries the inspectable
+`StoreExtractionReason::Deserialization`. The earlier compatibility constructor is
+intentionally absent so consumers must migrate to the reason-bearing API.
 
 - [ ] **Step 3: Add `serde_path_to_error` to `crates/edgezero-core/Cargo.toml`.**
 
@@ -1130,7 +1124,7 @@ Expected: pass; no existing test broken (the three exhaustive matches above — 
 - Produces: the exact `#[non_exhaustive] StoreExtractionReason` enum and
   `EdgeError::StoreExtraction { reason, message, field_path }` contract from spec §6.3.
 - Produces: `EdgeError::store_extraction`,
-  `EdgeError::store_schema_mismatch_from_serde`, and
+  `EdgeError::store_deserialization_from_serde`, and
   `EdgeError::store_extraction_reason`.
 
 - [ ] **Step 1: Write the red error-classification matrix.** Enumerate every reason from
@@ -1147,8 +1141,8 @@ exist. A malformed test is not an acceptable red.
 - [ ] **Step 3: Add the enum, variant, constructors, accessor, and centralized mapping.**
   Keep `ConfigOutOfDate` for non-store callers. `StoreExtraction` delegates status/kind and
   response-header policy to its reason. Migrate typed extraction to
-  `store_schema_mismatch_from_serde`; remove `config_out_of_date_from_serde` if `rg` finds
-  no remaining non-store caller. Do not leave a typed store path on the old constructor,
+  `store_deserialization_from_serde`; do not retain a compatibility constructor for typed
+  store deserialization. Do not leave a typed store path on `config_out_of_date`,
   serialize the reason, or include an empty `field_path`.
 
 - [ ] **Step 4: Update every exhaustive match.** This includes `StoredError` in the inbound
@@ -1224,7 +1218,8 @@ fail; compilation and unrelated behavior remain intact.
   `StoreExtractionReason`; no fake `message` fields and no wildcard matches.
 
 - [ ] **Step 3: Add `Retry-After` assertions.** Assert `60` for
-  `ConfigOutOfDate` and store reasons `MissingBlob`, `MissingSecret`, and `SchemaMismatch`.
+  `ConfigOutOfDate` and store reasons `Deserialization`, `MissingBlob`, `MissingSecret`,
+  and `Validation`.
   Assert absence for every other reason and ordinary variant, including plain
   `ServiceUnavailable` and `DeadlineExceeded`.
 
@@ -2797,7 +2792,7 @@ where
 {
     let data_obj = data.as_object_mut().ok_or_else(|| {
         EdgeError::store_extraction(
-            StoreExtractionReason::InvalidEnvelope,
+            StoreExtractionReason::Deserialization,
             "blob `data` is not a JSON object",
             None,
         )
@@ -2807,7 +2802,7 @@ where
             .get(field.name)
             .and_then(|v| v.as_str())
             .ok_or_else(|| EdgeError::store_extraction(
-                StoreExtractionReason::SchemaMismatch,
+                StoreExtractionReason::Deserialization,
                 format!("missing or non-string value at `{}`", field.name),
                 Some(field.name.to_owned()),
             ))?
@@ -2833,7 +2828,7 @@ where
                     .get(store_ref_field)
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| EdgeError::store_extraction(
-                        StoreExtractionReason::SchemaMismatch,
+                        StoreExtractionReason::Deserialization,
                         format!("missing store_ref `{store_ref_field}` for secret field `{}`", field.name),
                         Some(field.name.to_owned()),
                     ))?
@@ -2937,19 +2932,19 @@ fn map_config_store_error(err: ConfigStoreError) -> EdgeError {
             "typed app-config store read deadline exceeded",
             None,
         ),
-        ConfigStoreError::InvalidKey { message } => EdgeError::store_extraction(
+        ConfigStoreError::InvalidKey { .. } => EdgeError::store_extraction(
             StoreExtractionReason::InvalidKey,
-            message,
+            "typed app-config store rejected the requested key (details redacted)",
             None,
         ),
-        ConfigStoreError::Unavailable { message } => EdgeError::store_extraction(
+        ConfigStoreError::Unavailable { .. } => EdgeError::store_extraction(
             StoreExtractionReason::BackendUnavailable,
-            message,
+            "typed app-config store is unavailable",
             None,
         ),
-        ConfigStoreError::Internal { source } => EdgeError::store_extraction(
+        ConfigStoreError::Internal { .. } => EdgeError::store_extraction(
             StoreExtractionReason::BackendFailure,
-            source.to_string(),
+            "typed app-config store read failed (details redacted)",
             None,
         ),
         ConfigStoreError::ValueTooLarge => EdgeError::store_extraction(
@@ -3038,7 +3033,7 @@ where
     budget.charge_value(raw.len())?;
     let envelope: BlobEnvelope = serde_json::from_str(&raw)
         .map_err(|_| EdgeError::store_extraction(
-            StoreExtractionReason::InvalidEnvelope,
+            StoreExtractionReason::MalformedEnvelope,
             "typed app-config envelope is invalid",
             None,
         ))?;
@@ -3053,11 +3048,11 @@ where
     secret_walk::<C>(ctx, &mut budget, &mut data).await?;
     use serde::de::IntoDeserializer as _;
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
-        .map_err(EdgeError::store_schema_mismatch_from_serde)?;
+        .map_err(EdgeError::store_deserialization_from_serde)?;
     cfg.validate().map_err(|err| {
         let field = first_violating_field(&err).unwrap_or_default();
         EdgeError::store_extraction(
-            StoreExtractionReason::SchemaMismatch,
+            StoreExtractionReason::Validation,
             "typed app-config failed validation",
             (!field.is_empty()).then_some(field),
         )
@@ -3109,9 +3104,10 @@ directly, then assert its wire status/kind/header/path. Include these boundary c
   `InvalidKey`, `BackendUnavailable`, and `BackendFailure`, respectively.
 - A missing root returns `MissingBlob`; missing/unknown registries are distinct; a missing
   secret returns `MissingSecret`; non-UTF-8 secret bytes return `InvalidSecretValue`.
-- Envelope parse/version and SHA mismatch remain `InvalidEnvelope` and
-  `IntegrityMismatch`; deserialize/validator failures remain `SchemaMismatch` with redacted
-  paths and messages that never include stored or resolved secret values.
+- Envelope parse, unsupported version/discriminator, and SHA mismatch map to
+  `MalformedEnvelope`, `UnsupportedVersion`, and `IntegrityMismatch`; deserialize and
+  validator failures map independently to `Deserialization` and `Validation`, with
+  redacted paths and messages that never include stored or resolved secret values.
 
 Do not use the generic `From<ConfigStoreError> for EdgeError` in this extractor: that impl is
 for hand-managed reads and intentionally lacks extraction context.

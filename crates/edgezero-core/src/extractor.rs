@@ -1086,31 +1086,25 @@ where
     })?;
 
     // Neither parsing nor verification diagnostics may echo stored values.
-    let kind_tagged = raw.contains("edgezero_kind");
-    let envelope: BlobEnvelope = match serde_json::from_str::<BlobEnvelope>(&raw) {
-        Ok(envelope) if !kind_tagged => envelope,
-        parsed => {
-            if let Some(reason) = future_format_reason(&raw) {
-                return Err(store_extraction_error(
-                    StoreExtractionReason::InvalidEnvelope,
-                    format!(
-                        "typed app-config blob uses {reason}, which this build does not understand; redeploy this service with an updated build"
-                    ),
-                    None,
-                ));
-            }
-            parsed.map_err(|_err| {
-                store_extraction_error(
-                    StoreExtractionReason::InvalidEnvelope,
-                    "typed app-config blob is not a valid envelope (details redacted)",
-                    None,
-                )
-            })?
-        }
-    };
+    if let Some(reason) = future_format_reason(&raw) {
+        return Err(store_extraction_error(
+            StoreExtractionReason::UnsupportedVersion,
+            format!(
+                "typed app-config blob uses {reason}, which this build does not understand; redeploy this service with an updated build"
+            ),
+            None,
+        ));
+    }
+    let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
+        store_extraction_error(
+            StoreExtractionReason::MalformedEnvelope,
+            "typed app-config blob is not a valid envelope (details redacted)",
+            None,
+        )
+    })?;
     envelope.verify().map_err(|err| match err {
         BlobEnvelopeError::UnknownVersion(version) => store_extraction_error(
-            StoreExtractionReason::InvalidEnvelope,
+            StoreExtractionReason::UnsupportedVersion,
             format!(
                 "typed app-config blob uses envelope version {version}, which this build does not understand; redeploy this service with an updated build"
             ),
@@ -1125,7 +1119,7 @@ where
     let mut data = envelope.into_data();
     secret_walk::<C>(ctx, &mut budget, &mut data).await?;
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
-        .map_err(|serde_error| EdgeError::store_schema_mismatch_from_serde(&serde_error))?;
+        .map_err(|serde_error| EdgeError::store_deserialization_from_serde(&serde_error))?;
     cfg.validate().map_err(|err| {
         let field = first_violating_field(&err).unwrap_or_default();
         let message = if field.is_empty() {
@@ -1134,7 +1128,7 @@ where
             format!("app config failed validation for field `{field}`")
         };
         store_extraction_error(
-            StoreExtractionReason::SchemaMismatch,
+            StoreExtractionReason::Validation,
             message,
             (!field.is_empty()).then_some(field),
         )
@@ -1231,7 +1225,7 @@ fn resolve_secret_field<'walk>(
                 let next_rendered = join_field(&rendered, name.as_ref());
                 match node.get_mut(name.as_ref()) {
                     None | Some(serde_json::Value::Null) => Err(store_extraction_error(
-                        StoreExtractionReason::SchemaMismatch,
+                        StoreExtractionReason::Deserialization,
                         format!("missing or null value at `{next_rendered}`"),
                         Some(next_rendered),
                     )),
@@ -1243,7 +1237,7 @@ fn resolve_secret_field<'walk>(
             Some((SecretPathSegment::OptionalField(name), rest)) => {
                 let Some(parent) = node.as_object_mut() else {
                     return Err(store_extraction_error(
-                        StoreExtractionReason::SchemaMismatch,
+                        StoreExtractionReason::Deserialization,
                         format!("expected an object at `{rendered}`"),
                         Some(rendered),
                     ));
@@ -1261,7 +1255,7 @@ fn resolve_secret_field<'walk>(
             Some((SecretPathSegment::ArrayEach, rest)) => {
                 let Some(items) = node.as_array_mut() else {
                     return Err(store_extraction_error(
-                        StoreExtractionReason::SchemaMismatch,
+                        StoreExtractionReason::Deserialization,
                         format!("expected an array at `{rendered}`"),
                         Some(rendered),
                     ));
@@ -1304,7 +1298,7 @@ async fn resolve_leaf(
 
     let Some(parent_obj) = parent.as_object_mut() else {
         return Err(store_extraction_error(
-            StoreExtractionReason::SchemaMismatch,
+            StoreExtractionReason::Deserialization,
             format!("expected an object containing `{key}` at `{rendered_parent}`"),
             Some(leaf_path),
         ));
@@ -1319,7 +1313,7 @@ async fn resolve_leaf(
         None | Some(serde_json::Value::Null) if field.optional => return Ok(()),
         _ => {
             return Err(store_extraction_error(
-                StoreExtractionReason::SchemaMismatch,
+                StoreExtractionReason::Deserialization,
                 format!("missing or non-string value at `{leaf_path}`"),
                 Some(leaf_path),
             ));
@@ -1348,7 +1342,7 @@ async fn resolve_leaf(
                 .and_then(|val| val.as_str())
                 .ok_or_else(|| {
                     store_extraction_error(
-                        StoreExtractionReason::SchemaMismatch,
+                        StoreExtractionReason::Deserialization,
                         format!(
                             "missing store_ref `{store_ref_field}` for secret field `{leaf_path}`"
                         ),
@@ -2948,7 +2942,7 @@ mod tests {
             .expect_err("a future envelope version must error");
         assert_eq!(
             err.store_extraction_reason(),
-            Some(StoreExtractionReason::InvalidEnvelope)
+            Some(StoreExtractionReason::UnsupportedVersion)
         );
         let message = err.message().to_lowercase();
         assert!(
@@ -2987,11 +2981,39 @@ mod tests {
             .expect_err("an unknown edgezero_kind must error");
         let message = err.message().to_lowercase();
         assert!(
-            err.store_extraction_reason() == Some(StoreExtractionReason::InvalidEnvelope)
+            err.store_extraction_reason() == Some(StoreExtractionReason::UnsupportedVersion)
                 && message.contains("redeploy")
                 && message.contains("edgezero_kind"),
             "an unknown discriminator must ask to redeploy: {err:?}"
         );
+    }
+
+    #[test]
+    fn app_config_extractor_rejects_an_escaped_edgezero_kind_key() {
+        struct EscapedKindTaggedStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for EscapedKindTaggedStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                let env = BlobEnvelope::new(
+                    serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
+                    "2026-01-01T00:00:00Z".into(),
+                );
+                let serialized = serde_json::to_string(&env).expect("envelope");
+                let serialized_body = serialized.strip_prefix('{').expect("JSON object");
+                Ok(Some(format!(
+                    "{{\"edgezero_\\u006bind\":\"new_format\",{serialized_body}"
+                )))
+            }
+        }
+
+        let ctx = ctx_with_config_store(EscapedKindTaggedStore, "key");
+        let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
+            .expect_err("an escaped edgezero_kind must error");
+        assert_eq!(
+            err.store_extraction_reason(),
+            Some(StoreExtractionReason::UnsupportedVersion)
+        );
+        assert!(err.message().contains("edgezero_kind"));
     }
 
     #[test]
@@ -3018,7 +3040,7 @@ mod tests {
             .expect_err("a type mismatch in the typed config must error");
         assert_eq!(
             err.store_extraction_reason(),
-            Some(StoreExtractionReason::SchemaMismatch)
+            Some(StoreExtractionReason::Deserialization)
         );
         assert!(
             !err.message().contains(SENTINEL),
@@ -3037,7 +3059,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_returns_invalid_envelope_on_bad_json() {
+    fn app_config_extractor_returns_malformed_envelope_on_bad_json() {
         struct GarbageStore;
         #[async_trait(?Send)]
         impl ConfigStore for GarbageStore {
@@ -3051,7 +3073,7 @@ mod tests {
             .expect_err("bad envelope JSON must error");
         assert_eq!(
             err.store_extraction_reason(),
-            Some(StoreExtractionReason::InvalidEnvelope)
+            Some(StoreExtractionReason::MalformedEnvelope)
         );
         assert!(
             err.message().contains("not a valid envelope"),
@@ -3066,7 +3088,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_returns_schema_mismatch_on_deserialise_failure() {
+    fn app_config_extractor_returns_deserialization_on_deserialise_failure() {
         use crate::config_store::{ConfigStore, ConfigStoreError};
 
         // Blob has wrong type for `timeout_ms` (string instead of u32).
@@ -3087,7 +3109,7 @@ mod tests {
             .expect_err("type mismatch must error");
         assert_eq!(
             err.store_extraction_reason(),
-            Some(StoreExtractionReason::SchemaMismatch)
+            Some(StoreExtractionReason::Deserialization)
         );
         // The field path segment is redacted (indistinguishable from a map key).
         if let EdgeError::StoreExtraction { field_path, .. } = &err {
@@ -3100,7 +3122,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_returns_schema_mismatch_on_validation_failure() {
+    fn app_config_extractor_returns_validation_on_validation_failure() {
         use crate::config_store::{ConfigStore, ConfigStoreError};
 
         // `timeout_ms = 0` violates `range(min = 1)`.
@@ -3118,7 +3140,7 @@ mod tests {
             .expect_err("validation failure must error");
         assert_eq!(
             err.store_extraction_reason(),
-            Some(StoreExtractionReason::SchemaMismatch)
+            Some(StoreExtractionReason::Validation)
         );
         if let EdgeError::StoreExtraction { field_path, .. } = &err {
             assert_eq!(
@@ -3387,7 +3409,7 @@ mod tests {
         else {
             panic!("malformed optional parent must be typed: {err:?}");
         };
-        assert_eq!(*reason, StoreExtractionReason::SchemaMismatch);
+        assert_eq!(*reason, StoreExtractionReason::Deserialization);
         assert_eq!(field_path.as_deref(), Some("integrations"));
     }
 
@@ -3405,7 +3427,7 @@ mod tests {
         else {
             panic!("malformed optional parent must be typed: {err:?}");
         };
-        assert_eq!(*reason, StoreExtractionReason::SchemaMismatch);
+        assert_eq!(*reason, StoreExtractionReason::Deserialization);
         assert_eq!(field_path.as_deref(), Some("integrations.webhook_key"));
     }
 
@@ -3589,7 +3611,7 @@ mod tests {
             .expect_err("short resolved secret must fail validator");
         assert_eq!(
             err.store_extraction_reason(),
-            Some(StoreExtractionReason::SchemaMismatch)
+            Some(StoreExtractionReason::Validation)
         );
         if let EdgeError::StoreExtraction { field_path, .. } = &err {
             assert_eq!(

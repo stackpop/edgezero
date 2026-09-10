@@ -145,9 +145,18 @@ fn build_route_tokens(manifest: &Manifest) -> Result<Vec<TokenStream2>, String> 
         };
         let handler_path = parse_handler_path(handler)?;
         let path_lit = LitStr::new(&trigger.path, Span::call_site());
+        let class_lit = trigger
+            .class
+            .as_deref()
+            .map(|class| LitStr::new(class, Span::call_site()));
 
         for method in trigger.methods() {
-            tokens.push(route_for_method(method, &path_lit, &handler_path));
+            tokens.push(route_for_method(
+                method,
+                &path_lit,
+                class_lit.as_ref(),
+                &handler_path,
+            ));
         }
     }
     Ok(tokens)
@@ -338,7 +347,32 @@ fn resolve_manifest_path(relative: String) -> PathBuf {
     PathBuf::from(manifest_dir).join(relative)
 }
 
-fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> TokenStream2 {
+fn route_for_method(
+    method: &str,
+    path: &LitStr,
+    class: Option<&LitStr>,
+    handler: &syn::ExprPath,
+) -> TokenStream2 {
+    if let Some(route_class) = class {
+        let method_tokens = match method {
+            "GET" => quote! { edgezero_core::http::Method::GET },
+            "POST" => quote! { edgezero_core::http::Method::POST },
+            "PUT" => quote! { edgezero_core::http::Method::PUT },
+            "DELETE" => quote! { edgezero_core::http::Method::DELETE },
+            custom_method => {
+                let method_bytes =
+                    syn::LitByteStr::new(custom_method.as_bytes(), Span::call_site());
+                quote! {
+                    edgezero_core::http::Method::from_bytes(#method_bytes)
+                        .expect("invalid HTTP method in manifest")
+                }
+            }
+        };
+        return quote! {
+            builder = builder.route_with_class(#path, #method_tokens, #route_class, #handler);
+        };
+    }
+
     match method {
         "GET" => quote! { builder = builder.get(#path, #handler); },
         "POST" => quote! { builder = builder.post(#path, #handler); },
@@ -526,6 +560,31 @@ handler = "crate::handlers::root"
         let tokens = build_route_tokens(&manifest).expect("valid manifest builds routes");
         // One route token per (trigger × method): 1 trigger × 3 methods.
         assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn build_route_tokens_propagates_manifest_route_class() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+class = "auction"
+path = "/bid"
+methods = ["GET", "POST"]
+handler = "crate::handlers::bid"
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let tokens = build_route_tokens(&manifest).expect("valid manifest builds routes");
+        assert_eq!(tokens.len(), 2);
+        for token in tokens {
+            let rendered = token.to_string();
+            assert!(rendered.contains("route_with_class"), "{rendered}");
+            assert!(rendered.contains("auction"), "{rendered}");
+        }
     }
 
     #[test]

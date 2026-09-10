@@ -219,7 +219,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
+#[cfg(feature = "test-utils")]
 mod outbound_contract_tests {
     use std::cell::RefCell;
 

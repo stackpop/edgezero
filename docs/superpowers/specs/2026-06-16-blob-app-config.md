@@ -747,19 +747,18 @@ runtime accuracy + parser fidelity:**
   to detect any nested reference. §12.17 extended to
   cover all six generic-wrap shapes plus the multi-line
   derive case plus the malformed-input case (exit 2).
-- **§6.3.1 `EdgeError::config_out_of_date` split into
-  two constructors.** Round 10 had two contradictory
+- **§6.3.1 typed deserialization gained a reason-bearing
+  constructor.** Round 10 had two contradictory
   signatures: secret walk called
   `config_out_of_date(msg, field_path)` (round 10
   sketch); §6.3.1 declared the constructor takes a
-  `serde_path_to_error::Error`. Aligned: two
+  `serde_path_to_error::Error`. The intermediate draft aligned this with two
   constructors,
   `config_out_of_date(message, field_path)` for
   explicit-pair callers (secret walk + validator
-  path) and `config_out_of_date_from_serde(err)` for
-  the deserialise path. Extractor sketch updated to
-  use the serde constructor; secret-walk + validator
-  paths use the explicit-pair form.
+  path) and a serde-specific helper for the deserialise path. The final hard-cut API replaces
+  the latter with `store_deserialization_from_serde(err)` so typed store extraction always
+  exposes `StoreExtractionReason::Deserialization`; no compatibility alias remains.
 - **§3.2.2 + Q10 — `--exit-code` does not mask
   errors.** Round 10 §12.11 test asserted that
   without `--exit-code`, a remote-read network
@@ -1176,8 +1175,7 @@ validate --help`).
   populated. Step 5 now wraps
   `Value::into_deserializer()` with
   `serde_path_to_error::deserialize` and maps the
-  error via `config_out_of_date_from_serde` per
-  the round-11 two-constructor split. Without
+  error via `store_deserialization_from_serde`. Without
   this, §12.6's `field_path` assertion would fail.
 - **Q6 + §12.10 Fastly cap stated as ONE number
   (64 KiB).** Q6 earlier called it ~8 KiB
@@ -2716,7 +2714,7 @@ where
     budget.charge_value(raw.len())?;
     let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_| {
         EdgeError::store_extraction(
-            StoreExtractionReason::InvalidEnvelope,
+            StoreExtractionReason::MalformedEnvelope,
             "typed app-config envelope is invalid",
             None,
         )
@@ -2733,7 +2731,7 @@ where
     //    it into `data[field.name]`. StoreRef entries are untouched.
     let data_obj = data.as_object_mut()
         .ok_or_else(|| EdgeError::store_extraction(
-            StoreExtractionReason::InvalidEnvelope,
+            StoreExtractionReason::Deserialization,
             "blob `data` is not a JSON object",
             None,
         ))?;
@@ -2741,7 +2739,7 @@ where
         let key_name = data_obj.get(field.name)
             .and_then(|v| v.as_str())
             .ok_or_else(|| EdgeError::store_extraction(
-                StoreExtractionReason::SchemaMismatch,
+                StoreExtractionReason::Deserialization,
                 format!("missing or non-string value at `{}`", field.name),
                 Some(field.name.to_owned()),
             ))?
@@ -2778,7 +2776,7 @@ where
                 let store_id_str = data_obj.get(store_ref_field)
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| EdgeError::store_extraction(
-                        StoreExtractionReason::SchemaMismatch,
+                        StoreExtractionReason::Deserialization,
                         format!("missing store_ref `{store_ref_field}` for secret field `{}`", field.name),
                         Some(field.name.to_owned()),
                     ))?
@@ -2823,7 +2821,7 @@ where
     //    the field-path) + validate.
     use serde::de::IntoDeserializer as _;
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
-        .map_err(EdgeError::store_schema_mismatch_from_serde)?;
+        .map_err(EdgeError::store_deserialization_from_serde)?;
     cfg.validate().map_err(|err| {
         // The secret walk above replaced `#[secret]` fields with their
         // RESOLVED values, and `validator`'s params echo the rejected value,
@@ -2836,7 +2834,7 @@ where
             format!("app config failed validation for field `{field}`")
         };
         EdgeError::store_extraction(
-            StoreExtractionReason::SchemaMismatch,
+            StoreExtractionReason::Validation,
             message,
             (!field.is_empty()).then_some(field),
         )
@@ -3131,7 +3129,7 @@ extractor doesn't touch TOML on disk at all):
 The CLI paths all share a `build_and_validate<C>` helper
 in `crates/edgezero-cli/src/config.rs` (sketch in §3.3.2).
 The runtime extractor's path is sketched in §3.3.3 and
-uses the §6.3.1 `EdgeError::store_schema_mismatch_from_serde`
+uses the §6.3.1 `EdgeError::store_deserialization_from_serde`
 constructor for serde failures (preserving the
 `field_path` from `serde_path_to_error`).
 
@@ -3589,8 +3587,8 @@ version, .. }`. Unknown envelope versions error with a
    deserialise failure (e.g. `"feature.new_checkout"`); the
    extractor maps the resulting
    `serde_path_to_error::Error<serde_json::Error>` to
-   `EdgeError::store_schema_mismatch_from_serde(err)` per
-   §6.3.1, which sets reason `SchemaMismatch` and populates
+   `EdgeError::store_deserialization_from_serde(err)` per
+   §6.3.1, which sets reason `Deserialization` and populates
    `field_path` from `err.path()`. Without this wrapper, a
    schema mismatch surfaces as a generic untyped error without field context
    and §12.6's field_path assertion fails.
@@ -4123,7 +4121,7 @@ validate --strict` runs at push time, so env-overlay drift
 Once the extractor deserialises `data` into `C`, it calls
 `Validate::validate(&cfg)`. Validation failures map to:
 
-- `EdgeError::StoreExtraction` with reason `SchemaMismatch`, naming ONLY the field that
+- `EdgeError::StoreExtraction` with reason `Validation`, naming ONLY the field that
   violated its constraint. It has the same wire surface as the
   deserialise-failure case (§6.3): operator action is
   "re-push the typed config; the deployed `<name>.toml` is
@@ -4206,16 +4204,18 @@ pub enum StoreExtractionReason {
     BackendFailure,
     BackendUnavailable,
     DeadlineExceeded,
+    Deserialization,
     IntegrityMismatch,
-    InvalidEnvelope,
     InvalidKey,
     InvalidSecretValue,
+    MalformedEnvelope,
     MissingBlob,
     MissingRegistry,
     MissingSecret,
-    SchemaMismatch,
     SecretBackendUnavailable,
+    UnsupportedVersion,
     UnknownStore,
+    Validation,
     ValueTooLarge,
 }
 
@@ -4239,9 +4239,9 @@ The mapping is total and centralized in `EdgeError::{status_code, kind, response
 | Reason | HTTP / kind | `Retry-After` | `field_path` |
 | --- | --- | --- | --- |
 | `BackendUnavailable`, `DeadlineExceeded`, `SecretBackendUnavailable` | 503 / `service_unavailable` | absent | optional only for a secret field |
-| `MissingBlob`, `MissingSecret`, `SchemaMismatch` | 503 / `config_out_of_date` | `60` | optional for schema/secret failures; absent for a missing root blob |
+| `Deserialization`, `MissingBlob`, `MissingSecret`, `Validation` | 503 / `config_out_of_date` | `60` | optional for typed-data/validation/secret failures; absent for a missing root blob |
 | `InvalidKey` | 400 / `bad_request` | absent | absent |
-| `BackendFailure`, `IntegrityMismatch`, `InvalidEnvelope`, `InvalidSecretValue`, `MissingRegistry`, `UnknownStore`, `ValueTooLarge` | 500 / `internal` | absent | optional only when a typed field selected the store/value |
+| `BackendFailure`, `IntegrityMismatch`, `InvalidSecretValue`, `MalformedEnvelope`, `MissingRegistry`, `UnknownStore`, `UnsupportedVersion`, `ValueTooLarge` | 500 / `internal` | absent | optional only when a typed field selected the store/value |
 
 `ValueTooLarge` covers any per-blob, per-secret, or cumulative extraction byte cap from
 §6.3.2; `DeadlineExceeded` covers the one absolute extraction deadline. A source error that
@@ -4281,7 +4281,8 @@ mapping.** The current three variants are `Internal`, `InvalidKey`, and `Unavail
 | `Unavailable`                         | `BackendUnavailable`    | 503  | Transient backend issue.                                                                                                                                                                                                                    |
 | `DeadlineExceeded`                    | `DeadlineExceeded`      | 503  | The shared absolute extraction deadline expired; expiry wins simultaneous readiness.                                                                                                                                                       |
 | SHA mismatch                          | `IntegrityMismatch`     | 500  | Drift or corruption — the stored sha doesn't match canonical recompute.                                                                                                                                                                     |
-| Envelope parse/version failure        | `InvalidEnvelope`       | 500  | Envelope `version` unrecognised or shape unexpected.                                                                                                                                                                                        |
+| Envelope parse/shape failure          | `MalformedEnvelope`     | 500  | The stored value is not a syntactically valid supported envelope.                                                                                                                                                                           |
+| Envelope version/discriminator failure | `UnsupportedVersion`  | 500  | The envelope `version` or `edgezero_kind` is not understood by this build; redeploy an updated build.                                                                                                                                        |
 | `InvalidKey`                          | `InvalidKey`            | 400  | Adapter rejected the key shape.                                                                                                                                                                                                             |
 | `Internal`                            | `BackendFailure`        | 500  | Unexpected backend/adapter failure whose lower layer cannot classify more narrowly.                                                                                                                                                         |
 | `ValueTooLarge`                       | `ValueTooLarge`         | 500  | Per-value or remaining backend-byte allowance was exceeded.                                                                                                                                                                                 |
@@ -4403,7 +4404,7 @@ the deserialise itself. The dep is small (~500 LOC, no
 transitive deps) and locked-in for the variant.
 
 > **Runtime redaction (security).** In an HTTP `config_out_of_date` response produced by
-> `StoreExtractionReason::SchemaMismatch`, the path's STRING segments are redacted to `<redacted>`
+> `StoreExtractionReason::Deserialization`, the path's STRING segments are redacted to `<redacted>`
 > while structure (dots and sequence indices) is kept — e.g.
 > `<redacted>.<redacted>`. A `serde_path_to_error` segment for a struct
 > field is indistinguishable from a MAP KEY, and a map key is stored
@@ -4460,7 +4461,7 @@ impl EdgeError {
     /// when the local TOML still matches what was deployed — it
     /// reads the local source, not the deployed blob, so a drift
     /// between them is not recoverable this way.
-    pub fn store_schema_mismatch_from_serde(
+    pub fn store_deserialization_from_serde(
         serde_err: serde_path_to_error::Error<serde_json::Error>,
     ) -> Self {
         let category = match serde_err.inner().classify() {
@@ -4470,7 +4471,7 @@ impl EdgeError {
             Category::Io => "i/o error while reading",
         };
         Self::StoreExtraction {
-            reason: StoreExtractionReason::SchemaMismatch,
+            reason: StoreExtractionReason::Deserialization,
             message: format!("typed app-config is out of date ({category}; value redacted)"),
             field_path: Some(redact_serde_path(serde_err.path())),
         }
@@ -4483,7 +4484,7 @@ Caller sites:
 - Secret walk (§3.3.3) and validator path (§6.2.2):
   `EdgeError::store_extraction(reason, msg, Some(field_path))`.
 - Blob deserialise (§3.3.3, §6.2.2):
-  `EdgeError::store_schema_mismatch_from_serde(err)`.
+  `EdgeError::store_deserialization_from_serde(err)`.
 
 The validator path (§6.2.2) wraps a
 `validator::ValidationErrors`. **On the RUNTIME path this runs
@@ -4502,7 +4503,7 @@ let message = if field.is_empty() {
     format!("app config failed validation for field `{field}`")
 };
 EdgeError::store_extraction(
-    StoreExtractionReason::SchemaMismatch,
+    StoreExtractionReason::Validation,
     message,
     (!field.is_empty()).then_some(field),
 ) // NO validation_err.to_string()
@@ -7093,11 +7094,11 @@ strip or revert the resolution direction:
 - **Validate runs on every extract.** Fixture: a blob that
   serdes cleanly but violates a `#[validate(range(min=1,
 max=10000))]` rule. Extract. Assert `EdgeError::StoreExtraction` with reason
-  `SchemaMismatch` and `field_path` naming the offending field.
+  `Validation` and `field_path` naming the offending field.
 - **Validate-OK is the happy path.** Fixture: a blob in
   bounds. Extract. Assert the typed struct comes back with
   no error.
-- **Validator violation report format.** Assert the `SchemaMismatch` response body matches the nested
+- **Validator violation report format.** Assert the `Validation` response body matches the nested
   envelope documented in §6.3.1 exactly:
   `{ "error": { "status": 503, "kind": "config_out_of_date",
 "message": "<…>", "field_path": "<dot.path>" } }`. Assert
@@ -7133,8 +7134,8 @@ Rust-only typed reason. For every known `StoreExtractionReason`, assert the exac
 status/kind/`Retry-After`/field-path row. `field_path` is omitted outside
 `ConfigOutOfDate` and `StoreExtraction`; it is also omitted when either carrier has no
 non-empty path. `Retry-After: 60` appears only on an effective `config_out_of_date` outcome:
-the existing `ConfigOutOfDate` variant plus `MissingBlob`, `MissingSecret`, and
-`SchemaMismatch`. A plain `ServiceUnavailable` and store reasons mapped to
+the existing `ConfigOutOfDate` variant plus `Deserialization`, `MissingBlob`,
+`MissingSecret`, and `Validation`. A plain `ServiceUnavailable` and store reasons mapped to
 `service_unavailable` carry no retry header.
 
 ### 12.7 Env-var key override (§5.2)

@@ -102,6 +102,7 @@ mod tests {
 
     use bytes::Bytes;
     use edgezero_adapter_spin::context::SpinRequestContext;
+    use edgezero_adapter_spin::request::deadline_body_releases_source_for_test;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
@@ -331,6 +332,11 @@ mod tests {
         // Smoke test: ensure the router builds without panicking and that
         // the test helpers are usable for future integration tests.
         let _app = build_test_app();
+    }
+
+    #[test]
+    fn deadline_body_releases_source_when_timeout_is_emitted() {
+        assert!(deadline_body_releases_source_for_test());
     }
 
     #[test]

@@ -40,9 +40,10 @@ the one deliberate exception: the router resolves once before admission so polic
 canonical route identity, but it does not dispatch middleware or a handler. The seam
 performs this ordered protocol exactly once per platform request:
 
-1. Stamp `request_start` from the adapter's monotonic clock at the earliest EdgeZero-owned
-   entry point. It means "EdgeZero received control", not when the client sent its first
-   byte and not when route execution began.
+1. Stamp `request_start` from the `App`-owned `MonotonicClock` at the earliest
+   EdgeZero-owned entry point by calling `App::monotonic_now()`. It means "EdgeZero
+   received control", not when the client sent its first byte and not when route execution
+   began. The same cloneable clock handle is attached to the admitted request.
 2. Enforce parser-level request-target and header limits, then validate raw request framing,
    where the platform exposes a raw boundary (§1.2). Target overflow returns 414, header
    byte/count overflow returns 431, and framing rejection returns 400. Every rejection
@@ -83,9 +84,10 @@ impl RouteId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RouteMetadata { /* private RouteId; no duplicate mutable identity fields */ }
+pub struct RouteMetadata { /* private RouteId + optional opaque class */ }
 
 impl RouteMetadata {
+    pub fn class(&self) -> Option<&str>;
     pub fn id(&self) -> &RouteId;
     pub fn method(&self) -> &Method;
     pub fn pattern(&self) -> &str;
@@ -101,9 +103,13 @@ pub enum RouteResolution {
 ```
 
 `RouteId` equality/hash is the canonical `(method, registered route pattern)` pair. Dynamic
-path parameter values never enter it. `RouteMetadata` owns exactly that `RouteId`; its
+path parameter values and route class never enter it. `RouteMetadata` owns exactly that
+`RouteId` plus optional opaque manifest metadata from `class = "auction"`; its
 method/pattern accessors delegate to the id, so independently mutable duplicate fields
-cannot disagree. `MethodNotAllowed.allowed` contains every matched
+cannot disagree. Class is for application admission policy and is neither globally unique
+nor interpreted by EdgeZero. `RouterBuilder::route_with_class(path, method, class, handler)`
+is the generated-route path; existing route builders produce `class() == None`.
+`MethodNotAllowed.allowed` contains every matched
 pattern/method candidate sorted by method then pattern; callers derive an Allow set without
 depending on `HashMap` order. `RouteInfo` reuses `RouteMetadata` rather than defining a
 second identity. Duplicate method/pattern registration remains the existing build-time
@@ -136,8 +142,8 @@ created it. `dispatch_resolved` rejects a token from another router as `Internal
 the token, and never matches the method/path again. The `Request` method and path must equal
 the values captured by the token; a mismatch is also `Internal`. This prevents middleware or
 adapter conversion from admitting one route and dispatching another. `AdmittedIngress`
-contains the captured start, finite deadline, and grant; it has no public constructor so only
-the ingress protocol can claim admission occurred.
+contains the captured start, finite deadline, paired monotonic clock, and grant; it has no
+public constructor so only the ingress protocol can claim admission occurred.
 
 `IngressGrant` is an opaque request-owned lease carrier. It is intentionally not `Clone`:
 
@@ -170,8 +176,42 @@ lease type it inserted.
 
 `IngressHead::request_start()` and `RequestContext::request_start()` return the captured
 `MonotonicInstant`. Both are the same value and clock domain used by `Deadline`; neither
-accessor snapshots a new instant. `IngressHead::route_resolution()` exposes the value above,
-and a matched `RequestContext::route_metadata()` returns that exact matched metadata.
+accessor snapshots a new instant. `PreparedIngress::monotonic_clock()` and
+`RequestContext::monotonic_clock()` return clones of the exact app clock handle attached at
+admission. `IngressHead::route_resolution()` exposes the value above, and a matched
+`RequestContext::route_metadata()` returns that exact matched metadata.
+
+```rust
+pub type MonotonicInstant = web_time::Instant;
+
+#[derive(Clone)]
+pub struct MonotonicClock { /* Arc<dyn Fn() -> MonotonicInstant + Send + Sync> */ }
+
+impl MonotonicClock {
+    pub fn new<Now>(now: Now) -> Self
+    where Now: Fn() -> MonotonicInstant + Send + Sync + 'static;
+    pub fn now(&self) -> MonotonicInstant;
+}
+
+impl IngressHead {
+    pub fn read_deadline_after(&self, duration: Duration) -> Deadline;
+}
+
+impl App {
+    pub fn monotonic_clock(&self) -> MonotonicClock;
+    pub fn monotonic_now(&self) -> MonotonicInstant;
+    pub fn set_monotonic_clock(&mut self, clock: MonotonicClock);
+}
+```
+
+`MonotonicClock::default()` uses `web_time::Instant::now`. Injection is application-wide:
+standard adapters take `request_start` from the app before head conversion, admission
+stores that same handle, and core plus adapter body checks use
+`Deadline::{remaining_at,is_expired_at}(clock.now())`. Admission policies should construct
+relative deadlines with `IngressHead::read_deadline_after`, which uses the captured start
+and clamps to `DEADLINE_FAR_FUTURE`. Calling the global-clock `Deadline::after` from a policy
+while a custom app clock is installed is a caller error; explicit low-level APIs likewise
+cannot validate that two bare `MonotonicInstant` values came from the same source.
 
 `Hooks::configure(&mut App)` is the existing app-owned configuration point and uses a new
 `App` admission-policy setter. Manifest-generated and hand-written apps that do not install
@@ -315,15 +355,16 @@ behavior; they remain Unsupported until a documented/testable raw rejection seam
 
 ### 1.3 Absolute body-read deadline and cancellation
 
-The admitted `read_deadline` is carried with the native body and governs the full inbound
+The admitted `read_deadline` and its paired `MonotonicClock` are carried with the native
+body and govern the full inbound
 read lifetime: waiting for the first byte, every inter-chunk wait, drain completion, and
 late EOF/error. It is not reset by routing, middleware, extractors, repeated cached reads,
 or transfer into `OutboundRequest::from_request`. Before each platform read and immediately
 after any chunk/EOF/error becomes ready, compare the same absolute deadline. At simultaneous
 read completion and expiry, expiry wins.
 
-On expiry, the adapter cancels the pending platform read with its strongest available native
-primitive, drops/settles every owned reader, and yields
+When expiry is observable at a guest boundary, the adapter drops or aborts the owned reader
+with its strongest available platform primitive and yields
 `EdgeError::RequestTimeout { message }` (408). If `BodyCell` is draining, its existing
 capture path transitions exactly once to `Poisoned(StoredError::RequestTimeout { .. })`;
 the first and every later accessor observe the same status/kind/message and the source is
@@ -341,12 +382,22 @@ non-outbound capability cells to the shared capability ladder:
 | `raw-ingress-head-limits` | Native after the parser-boundary work lands | Unsupported | Unsupported | Unsupported |
 | `raw-ingress-framing-validation` | Native after the parser-boundary work lands | Unsupported | Unsupported | Unsupported |
 
-BestEffort implementations still use pre-read/post-ready checks and terminate ownership on
-expiry; they do not claim a finite bound around an uninterruptible host call. A manifest
+BestEffort implementations still use pre-read/post-ready checks and release ownership when
+expiry is observed; they do not claim a finite bound around an uninterruptible or opaque host
+call. Fastly cannot preempt its synchronous read, and Spin cannot race its opaque body stream
+against a guest-owned cancellation primitive. A manifest
 that requires Native support fails before startup/deploy through the same capability ladder
 used elsewhere. Raw head limits, raw framing, and body-read deadline are separate cells: a
 platform host may impose undocumented limits or reject malformed framing without exposing
 evidence, and may expose a cancellable body while hiding raw target/field-line bytes.
+
+Cloudflare performs one `Delay::from(Duration::ZERO).await` cooperative yield before
+selecting the body read against its host timer. A deliberately frozen injected clock means
+clock-based post-ready checks cannot independently observe elapsed time; the real host timer
+still uses the last positive `remaining_at` snapshot. This is deterministic test support,
+not a claim that production time can freeze. Native promotion requires one deployed timing
+probe that records runtime version, configured deadline, observed cancellation latency, and
+tolerance; local mocked timers are insufficient.
 
 ## 2. Bounded Context Helpers
 
@@ -530,6 +581,9 @@ the Fastly and Spin paths fully materialize the body too). This migration change
       pub fn request_start(&self) -> MonotonicInstant;
 
       #[inline]
+      pub fn monotonic_clock(&self) -> MonotonicClock;
+
+      #[inline]
       pub fn route_metadata(&self) -> Option<&RouteMetadata>;
 
       #[inline]
@@ -678,9 +732,9 @@ platform runtime or network.
 | Successful cache | The platform stream is polled only once; repeated reads clone the same bytes. A permissive read followed by a stricter cached read returns an over-cap error while leaving the cell `Cached`; a later permissive read succeeds. |
 | Failed drain | Source error and initial-drain cap overflow transition to `Poisoned`; every later buffered accessor, `take_body`, and `into_request` reconstructs the same variant, status, message, and structured fields. The source is never polled again. |
 | Parser-level head limits | Exact-limit request targets, header bytes, and header counts pass. One byte/field over rejects before route resolution, admission, request construction, or body polling with 414/431 and redacted diagnostics. Raw accounting includes duplicate field lines and framing syntax; checked overflow fails closed. Host-normalized recounts never report `RawValidated`. |
-| Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Refusal polls no body, invokes no middleware/handler, terminates the native reader, and preserves the chosen response. The default policy supplies an empty grant and one finite deadline derived from `request_start`. |
-| Request ingress metadata | `IngressHead` and matched `RequestContext` expose the same captured `request_start` and route metadata. `take_ingress_grant()` returns the non-clone grant exactly once, then `None`; untaken, refused, 404, and 405 grants each drop exactly once. The preserved low-level context constructor exposes no route and makes no admission claim. |
-| Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). Cached success is not retroactively poisoned. |
+| Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Route class reaches matched and 405 metadata but never changes `RouteId`. Refusal polls no body, invokes no middleware/handler, terminates the native reader, and preserves the chosen response. The default policy supplies an empty grant and one finite deadline derived from `request_start`. |
+| Request ingress metadata | `IngressHead` and matched `RequestContext` expose the same captured `request_start`, paired app clock, and route metadata. `take_ingress_grant()` returns the non-clone grant exactly once, then `None`; untaken, refused, 404, and 405 grants each drop exactly once. The preserved low-level context constructor exposes no route and makes no admission claim. |
+| Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline and the admitted app clock; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). A manually advanced injected clock proves the tie behavior without wall-clock sleeps. Cached success is not retroactively poisoned. |
 | Cancellation | A stream held at `Pending` leaves the cell `Draining`; dropping the first `body_bytes` future transitions it to the documented cancellation poison, and the next access returns that stored internal error. |
 | Reentrancy | While the first scripted drain is pending, a second body accessor returns `internal("body read already in progress")` without a `RefCell` panic. Resuming the first future can still complete and cache bytes. |
 | Consumption | `take_body` and `into_request` cover Initial, Cached, Draining, Poisoned, and Taken. Initial preserves a stream; Cached reassembles `Body::Once`; Taken deliberately produces an empty body only where specified. |
@@ -706,18 +760,22 @@ Fastly tests cooperative checks without asserting preemption of a synchronous ho
 - `crates/edgezero-core/src/context.rs`: split requests internally into private parts plus
   `BodyCell`; add the state machine, bounded helpers, body-state accessors, `take_body`, and
   fallible `into_request`; store the captured request start, optional route metadata, and
-  one-shot ingress grant; remove whole-request borrow accessors.
+  one-shot ingress grant; carry the admitted clock into every body deadline check; remove
+  whole-request borrow accessors.
 - `crates/edgezero-core/src/app.rs`: add the synchronous, body-blind admission policy and
-  immutable `IngressHeadLimits` to `App`, its default finite inbound read budget, and the
-  normalized ingress-head/decision/accounting types. The macro continues to use
+  immutable `IngressHeadLimits` plus the injectable `MonotonicClock` to `App`, its default
+  finite inbound read budget, and the normalized ingress-head/decision/accounting types.
+  The macro continues to use
   `Hooks::configure(&mut App)` as the app-owned setter point.
 - `crates/edgezero-core/src/error.rs`: add `RequestHeaderFieldsTooLarge { message }` with
   status 431 and kind `request_header_fields_too_large`, `RequestTimeout { message }` with
   status 408 and kind `request_timeout`, and `UriTooLong { message }` with status 414 and
   kind `uri_too_long`; update every exhaustive match and wire-shape matrix.
-- `crates/edgezero-core/src/manifest.rs` and `crates/edgezero-adapter/src/registry.rs`: add
-  the four inbound capability cells and fail-closed required-capability handling. Keep
-  these counts separate from the outbound design's eight-cell tuple.
+- `crates/edgezero-core/src/manifest.rs`, `crates/edgezero-core/src/router.rs`, and
+  `crates/edgezero-adapter/src/registry.rs`: add optional trigger `class`, carry it as
+  non-identity route metadata, add the four inbound capability cells, and retain fail-closed
+  required-capability handling. Keep these counts separate from the outbound design's
+  eight-cell tuple.
 - `crates/edgezero-core/src/extractor.rs`: route JSON/form extractors through bounded
   helpers, add explicit-cap variants, and add the two public default constants.
 - `crates/edgezero-core/src/body.rs`: retain the core bounded-drain primitive used by the
@@ -727,7 +785,7 @@ Fastly tests cooperative checks without asserting preemption of a synchronous ho
   `request_start`, run framing validation, resolve once, and run app admission before
   middleware/handler dispatch or body polling; stop eager collection; dispatch with the
   opaque resolved token; and wrap each platform request body with its absolute deadline and
-  native cancellation owner. Keep `Body::Once` only when the platform already owns bounded
+  strongest available read-ownership primitive. Keep `Body::Once` only when the platform already owns bounded
   bytes and admission has already run.
 - `crates/edgezero-adapter-axum` server connection path: enforce raw request-target/header
   limits and validate raw HTTP/1 field lines before Hyper can discard framing evidence;

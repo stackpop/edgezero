@@ -64,16 +64,18 @@ pub enum StoreExtractionReason {
     BackendFailure,
     BackendUnavailable,
     DeadlineExceeded,
+    Deserialization,
     IntegrityMismatch,
-    InvalidEnvelope,
     InvalidKey,
     InvalidSecretValue,
+    MalformedEnvelope,
     MissingBlob,
     MissingRegistry,
     MissingSecret,
-    SchemaMismatch,
     SecretBackendUnavailable,
     UnknownStore,
+    UnsupportedVersion,
+    Validation,
     ValueTooLarge,
 }
 
@@ -82,16 +84,19 @@ impl StoreExtractionReason {
         match self {
             Self::BackendFailure
             | Self::IntegrityMismatch
-            | Self::InvalidEnvelope
             | Self::InvalidSecretValue
+            | Self::MalformedEnvelope
             | Self::MissingRegistry
+            | Self::UnsupportedVersion
             | Self::UnknownStore
             | Self::ValueTooLarge => "internal",
             Self::BackendUnavailable | Self::DeadlineExceeded | Self::SecretBackendUnavailable => {
                 "service_unavailable"
             }
             Self::InvalidKey => "bad_request",
-            Self::MissingBlob | Self::MissingSecret | Self::SchemaMismatch => "config_out_of_date",
+            Self::Deserialization | Self::MissingBlob | Self::MissingSecret | Self::Validation => {
+                "config_out_of_date"
+            }
         }
     }
 
@@ -99,17 +104,19 @@ impl StoreExtractionReason {
         match self {
             Self::BackendFailure
             | Self::IntegrityMismatch
-            | Self::InvalidEnvelope
             | Self::InvalidSecretValue
+            | Self::MalformedEnvelope
             | Self::MissingRegistry
+            | Self::UnsupportedVersion
             | Self::UnknownStore
             | Self::ValueTooLarge => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BackendUnavailable
             | Self::DeadlineExceeded
+            | Self::Deserialization
             | Self::MissingBlob
             | Self::MissingSecret
-            | Self::SchemaMismatch
-            | Self::SecretBackendUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::SecretBackendUnavailable
+            | Self::Validation => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidKey => StatusCode::BAD_REQUEST,
         }
     }
@@ -211,37 +218,6 @@ impl EdgeError {
         Self::ConfigOutOfDate {
             message: message.into(),
             field_path: field_path.into(),
-        }
-    }
-
-    /// Construct from a `serde_path_to_error` error returned by
-    /// the deserialise wrapper around the blob's `data` field.
-    #[must_use]
-    #[inline]
-    pub fn config_out_of_date_from_serde(serde_err: &SerdePathError<serde_json::Error>) -> Self {
-        // The serde message embeds the offending stored VALUE (e.g. `invalid
-        // type: string "hunter2", expected u32`), and this message is serialised
-        // into the HTTP error body. The config blob may hold secrets, so the
-        // VALUE must not escape — report only the category.
-        //
-        // The `field_path` STRING segments are redacted (structure kept): a map
-        // key is indistinguishable from a struct field here and may be a secret,
-        // and the redaction invariant forbids a stored string on any path. The
-        // exact path is available from a local `config validate`. See
-        // `redact_serde_path`.
-        use serde_json::error::Category;
-        let category = match serde_err.inner().classify() {
-            Category::Data => "wrong type or invalid value",
-            Category::Syntax => "malformed JSON",
-            Category::Eof => "unexpected end of input",
-            Category::Io => "i/o error while reading",
-        };
-        Self::ConfigOutOfDate {
-            message: format!(
-                "typed app-config is out of date ({category}; value redacted) — \
-                 run `<app-cli> config push` for this deploy"
-            ),
-            field_path: redact_serde_path(serde_err.path()),
         }
     }
 
@@ -440,6 +416,26 @@ impl EdgeError {
         }
     }
 
+    /// Constructs a redacted deserialization failure from a serde path error.
+    #[must_use]
+    #[inline]
+    pub fn store_deserialization_from_serde(serde_err: &SerdePathError<serde_json::Error>) -> Self {
+        use serde_json::error::Category;
+
+        let category = match serde_err.inner().classify() {
+            Category::Data => "wrong type or invalid value",
+            Category::Syntax => "malformed JSON",
+            Category::Eof => "unexpected end of input",
+            Category::Io => "i/o error while reading",
+        };
+        let path = redact_serde_path(serde_err.path());
+        Self::store_extraction(
+            StoreExtractionReason::Deserialization,
+            format!("typed app-config is out of date ({category}; value redacted)"),
+            Some(path),
+        )
+    }
+
     #[must_use]
     #[inline]
     pub fn store_extraction<Msg: Into<String>>(
@@ -476,26 +472,6 @@ impl EdgeError {
         }
     }
 
-    /// Constructs a redacted schema mismatch from a serde path error.
-    #[must_use]
-    #[inline]
-    pub fn store_schema_mismatch_from_serde(serde_err: &SerdePathError<serde_json::Error>) -> Self {
-        use serde_json::error::Category;
-
-        let category = match serde_err.inner().classify() {
-            Category::Data => "wrong type or invalid value",
-            Category::Syntax => "malformed JSON",
-            Category::Eof => "unexpected end of input",
-            Category::Io => "i/o error while reading",
-        };
-        let path = redact_serde_path(serde_err.path());
-        Self::store_extraction(
-            StoreExtractionReason::SchemaMismatch,
-            format!("typed app-config is out of date ({category}; value redacted)"),
-            Some(path),
-        )
-    }
-
     #[inline]
     pub fn uri_too_long<S: Into<String>>(message: S) -> Self {
         Self::UriTooLong {
@@ -509,6 +485,28 @@ impl EdgeError {
             message: message.into(),
         }
     }
+
+    fn wire_message(&self) -> String {
+        match self {
+            EdgeError::BadGateway { .. } => "bad gateway".to_owned(),
+            EdgeError::GatewayTimeout { .. } => "gateway timeout".to_owned(),
+            EdgeError::Internal { .. } => "internal server error".to_owned(),
+            EdgeError::ResponseTooLarge { .. } => {
+                "upstream response exceeded configured limits".to_owned()
+            }
+            EdgeError::BadRequest { .. }
+            | EdgeError::ConfigOutOfDate { .. }
+            | EdgeError::MethodNotAllowed { .. }
+            | EdgeError::NotFound { .. }
+            | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
+            | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
+            | EdgeError::Validation { .. } => self.message(),
+        }
+    }
 }
 
 impl From<ConfigStoreError> for EdgeError {
@@ -518,8 +516,12 @@ impl From<ConfigStoreError> for EdgeError {
             ConfigStoreError::DeadlineExceeded => {
                 EdgeError::service_unavailable("config store read deadline exceeded")
             }
-            ConfigStoreError::InvalidKey { message } => EdgeError::bad_request(message),
-            ConfigStoreError::Unavailable { message } => EdgeError::service_unavailable(message),
+            ConfigStoreError::InvalidKey { .. } => {
+                EdgeError::bad_request("config store rejected the requested key")
+            }
+            ConfigStoreError::Unavailable { .. } => {
+                EdgeError::service_unavailable("config store is unavailable")
+            }
             ConfigStoreError::ValueTooLarge => {
                 EdgeError::internal(anyhow::anyhow!("config store value too large"))
             }
@@ -561,7 +563,7 @@ impl IntoResponse for EdgeError {
             | EdgeError::Validation { .. } => None,
         };
         let status = self.status();
-        let message = self.message();
+        let message = self.wire_message();
 
         let mut error_obj = serde_json::Map::new();
         error_obj.insert("status".into(), serde_json::Value::from(status.as_u16()));
@@ -668,49 +670,49 @@ mod tests {
                 EdgeError::bad_gateway("nope"),
                 502_u16,
                 "bad_gateway",
-                "nope",
+                "bad gateway",
             ),
             (
                 EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Protocol),
                 502_u16,
                 "bad_gateway",
-                "nope",
+                "bad gateway",
             ),
             (
                 EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Unreachable),
                 502_u16,
                 "bad_gateway",
-                "nope",
+                "bad gateway",
             ),
             (
                 EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Transport),
                 502_u16,
                 "bad_gateway",
-                "nope",
+                "bad gateway",
             ),
             (
                 EdgeError::gateway_timeout("late"),
                 504_u16,
                 "gateway_timeout",
-                "late",
+                "gateway timeout",
             ),
             (
                 EdgeError::gateway_timeout_caused("late", BudgetSource::PerCallTimeout),
                 504_u16,
                 "gateway_timeout",
-                "late",
+                "gateway timeout",
             ),
             (
                 EdgeError::gateway_timeout_caused("late", BudgetSource::BatchDeadline),
                 504_u16,
                 "gateway_timeout",
-                "late",
+                "gateway timeout",
             ),
             (
                 EdgeError::gateway_timeout_caused("late", BudgetSource::Default),
                 504_u16,
                 "gateway_timeout",
-                "late",
+                "gateway timeout",
             ),
         ] {
             let response = err.into_response().expect("response");
@@ -748,8 +750,88 @@ mod tests {
             let body_json = parse_body(response);
             assert_eq!(body_json["error"]["status"], 502_u16);
             assert_eq!(body_json["error"]["kind"], "bad_gateway");
-            assert_eq!(body_json["error"]["message"], "nope");
+            assert_eq!(body_json["error"]["message"], "bad gateway");
             assert!(body_json["error"].get("reason").is_none());
+        }
+    }
+
+    #[test]
+    fn server_error_wire_messages_do_not_expose_internal_diagnostics() {
+        const TOKEN: &str = "super-secret-token";
+        let diagnostic = format!(
+            "provider failed for https://example.com/bid?access_token={TOKEN}: connection refused"
+        );
+        let cases = [
+            (
+                EdgeError::bad_gateway_with_reason(
+                    diagnostic.clone(),
+                    BadGatewayReason::Unreachable,
+                ),
+                "bad gateway",
+            ),
+            (
+                EdgeError::gateway_timeout_caused(diagnostic.clone(), BudgetSource::PerCallTimeout),
+                "gateway timeout",
+            ),
+            (
+                EdgeError::internal(anyhow::anyhow!(diagnostic.clone())),
+                "internal server error",
+            ),
+            (
+                EdgeError::response_too_large_with_reason(
+                    diagnostic,
+                    ResponseLimitReason::EncodedBody,
+                ),
+                "upstream response exceeded configured limits",
+            ),
+        ];
+
+        for (error, public_message) in cases {
+            assert!(
+                error.message().contains(TOKEN),
+                "the diagnostic remains available before wire conversion"
+            );
+            let response = error.into_response().expect("response");
+            let body = parse_body(response);
+            assert_eq!(body["error"]["message"], public_message);
+            let encoded = body.to_string();
+            assert!(!encoded.contains(TOKEN), "token escaped in {encoded}");
+            assert!(
+                !encoded.contains("access_token"),
+                "query escaped in {encoded}"
+            );
+            assert!(
+                !encoded.contains("connection refused"),
+                "provider diagnostic escaped in {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_store_provider_diagnostics_do_not_reach_wire() {
+        const TOKEN: &str = "provider-secret-token";
+        let cases = [
+            (
+                ConfigStoreError::InvalidKey {
+                    message: format!("invalid key includes {TOKEN}"),
+                },
+                "config store rejected the requested key",
+            ),
+            (
+                ConfigStoreError::Unavailable {
+                    message: format!("provider unavailable at https://user:{TOKEN}@config.invalid"),
+                },
+                "config store is unavailable",
+            ),
+        ];
+
+        for (provider_error, public_message) in cases {
+            let response = EdgeError::from(provider_error)
+                .into_response()
+                .expect("response");
+            let body = parse_body(response);
+            assert_eq!(body["error"]["message"], public_message);
+            assert!(!body.to_string().contains(TOKEN));
         }
     }
 
@@ -835,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn config_out_of_date_from_serde_extracts_path_and_message() {
+    fn store_deserialization_from_serde_extracts_path_and_message() {
         use serde::Deserialize;
 
         #[derive(Debug, Deserialize)]
@@ -857,34 +939,24 @@ mod tests {
         let result: Result<Outer, _> = serde_path_to_error::deserialize(de);
         let serde_err = result.expect_err("expected deserialization error");
 
-        let err = EdgeError::config_out_of_date_from_serde(&serde_err);
+        let err = EdgeError::store_deserialization_from_serde(&serde_err);
 
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!err.message().is_empty());
-        match err {
-            EdgeError::ConfigOutOfDate { field_path, .. } => {
-                // String segments redacted, structure preserved.
-                assert_eq!(field_path, "<redacted>.<redacted>");
-            }
-            EdgeError::BadGateway { .. }
-            | EdgeError::BadRequest { .. }
-            | EdgeError::GatewayTimeout { .. }
-            | EdgeError::Internal { .. }
-            | EdgeError::MethodNotAllowed { .. }
-            | EdgeError::NotFound { .. }
-            | EdgeError::NotImplemented { .. }
-            | EdgeError::RequestHeaderFieldsTooLarge { .. }
-            | EdgeError::RequestTimeout { .. }
-            | EdgeError::ResponseTooLarge { .. }
-            | EdgeError::ServiceUnavailable { .. }
-            | EdgeError::StoreExtraction { .. }
-            | EdgeError::UriTooLong { .. }
-            | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
-        }
+        let EdgeError::StoreExtraction {
+            field_path: Some(field_path),
+            reason: StoreExtractionReason::Deserialization,
+            ..
+        } = err
+        else {
+            panic!("expected deserialization store extraction");
+        };
+        // String segments redacted, structure preserved.
+        assert_eq!(field_path, "<redacted>.<redacted>");
     }
 
     #[test]
-    fn config_out_of_date_from_serde_redacts_map_key_from_path_and_message() {
+    fn store_deserialization_from_serde_redacts_map_key_from_path_and_message() {
         use serde::Deserialize;
         use std::collections::BTreeMap;
 
@@ -910,42 +982,29 @@ mod tests {
         let result: Result<Outer, _> = serde_path_to_error::deserialize(de);
         let serde_err = result.expect_err("expected deserialization error");
 
-        let err = EdgeError::config_out_of_date_from_serde(&serde_err);
-        match err {
-            EdgeError::ConfigOutOfDate {
-                field_path,
-                message,
-            } => {
-                assert!(
-                    !message.contains(SENTINEL),
-                    "a stored map key must never reach the message: {message}"
-                );
-                assert!(
-                    !field_path.contains(SENTINEL),
-                    "a stored map key must never reach the field_path: {field_path}"
-                );
-                // Structure is preserved (items.<key>.port -> redacted, dotted).
-                assert_eq!(field_path, "<redacted>.<redacted>.<redacted>");
-            }
-            EdgeError::BadGateway { .. }
-            | EdgeError::BadRequest { .. }
-            | EdgeError::GatewayTimeout { .. }
-            | EdgeError::Internal { .. }
-            | EdgeError::MethodNotAllowed { .. }
-            | EdgeError::NotFound { .. }
-            | EdgeError::NotImplemented { .. }
-            | EdgeError::RequestHeaderFieldsTooLarge { .. }
-            | EdgeError::RequestTimeout { .. }
-            | EdgeError::ResponseTooLarge { .. }
-            | EdgeError::ServiceUnavailable { .. }
-            | EdgeError::StoreExtraction { .. }
-            | EdgeError::UriTooLong { .. }
-            | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
-        }
+        let err = EdgeError::store_deserialization_from_serde(&serde_err);
+        let EdgeError::StoreExtraction {
+            field_path: Some(field_path),
+            message,
+            reason: StoreExtractionReason::Deserialization,
+        } = err
+        else {
+            panic!("expected deserialization store extraction");
+        };
+        assert!(
+            !message.contains(SENTINEL),
+            "a stored map key must never reach the message: {message}"
+        );
+        assert!(
+            !field_path.contains(SENTINEL),
+            "a stored map key must never reach the field_path: {field_path}"
+        );
+        // Structure is preserved (items.<key>.port -> redacted, dotted).
+        assert_eq!(field_path, "<redacted>.<redacted>.<redacted>");
     }
 
     #[test]
-    fn config_out_of_date_from_serde_root_error_passes_through_sentinel() {
+    fn store_deserialization_from_serde_root_error_passes_through_sentinel() {
         use serde::Deserialize;
 
         #[derive(Debug, Deserialize)]
@@ -962,32 +1021,22 @@ mod tests {
         let serde_err = result.expect_err("expected deserialization error");
 
         let expected_path = serde_err.path().to_string();
-        let err = EdgeError::config_out_of_date_from_serde(&serde_err);
+        let err = EdgeError::store_deserialization_from_serde(&serde_err);
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        match err {
-            EdgeError::ConfigOutOfDate { field_path, .. } => {
-                // The from_serde constructor passes the library's path through
-                // verbatim; for root-level errors that is ".".
-                assert_eq!(
-                    field_path, expected_path,
-                    "field_path should match serde_path_to_error sentinel"
-                );
-            }
-            EdgeError::BadGateway { .. }
-            | EdgeError::BadRequest { .. }
-            | EdgeError::GatewayTimeout { .. }
-            | EdgeError::Internal { .. }
-            | EdgeError::MethodNotAllowed { .. }
-            | EdgeError::NotFound { .. }
-            | EdgeError::NotImplemented { .. }
-            | EdgeError::RequestHeaderFieldsTooLarge { .. }
-            | EdgeError::RequestTimeout { .. }
-            | EdgeError::ResponseTooLarge { .. }
-            | EdgeError::ServiceUnavailable { .. }
-            | EdgeError::StoreExtraction { .. }
-            | EdgeError::UriTooLong { .. }
-            | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
-        }
+        let EdgeError::StoreExtraction {
+            field_path: Some(field_path),
+            reason: StoreExtractionReason::Deserialization,
+            ..
+        } = err
+        else {
+            panic!("expected deserialization store extraction");
+        };
+        // The serde constructor passes the library's path through verbatim;
+        // for root-level errors that is ".".
+        assert_eq!(
+            field_path, expected_path,
+            "field_path should match serde_path_to_error sentinel"
+        );
     }
 
     #[test]
@@ -1001,14 +1050,14 @@ mod tests {
     fn config_store_error_invalid_key_maps_to_bad_request() {
         let err = EdgeError::from(ConfigStoreError::invalid_key("invalid config key"));
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(err.message(), "invalid config key");
+        assert_eq!(err.message(), "config store rejected the requested key");
     }
 
     #[test]
     fn config_store_error_unavailable_maps_to_service_unavailable() {
         let err = EdgeError::from(ConfigStoreError::unavailable("backend offline"));
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(err.message(), "backend offline");
+        assert_eq!(err.message(), "config store is unavailable");
     }
 
     #[test]
@@ -1244,7 +1293,10 @@ mod tests {
             let body = parse_body(response);
             assert_eq!(body["error"]["status"], 502_u16);
             assert_eq!(body["error"]["kind"], "response_too_large");
-            assert_eq!(body["error"]["message"], "response limit");
+            assert_eq!(
+                body["error"]["message"],
+                "upstream response exceeded configured limits"
+            );
             assert!(body["error"].get("reason").is_none());
             assert!(body["error"].get("field_path").is_none());
         }
@@ -1282,7 +1334,7 @@ mod tests {
                 false,
             ),
             (
-                StoreExtractionReason::InvalidEnvelope,
+                StoreExtractionReason::MalformedEnvelope,
                 500_u16,
                 "internal",
                 false,
@@ -1318,7 +1370,7 @@ mod tests {
                 true,
             ),
             (
-                StoreExtractionReason::SchemaMismatch,
+                StoreExtractionReason::Deserialization,
                 503_u16,
                 "config_out_of_date",
                 true,
@@ -1330,10 +1382,22 @@ mod tests {
                 false,
             ),
             (
+                StoreExtractionReason::UnsupportedVersion,
+                500_u16,
+                "internal",
+                false,
+            ),
+            (
                 StoreExtractionReason::UnknownStore,
                 500_u16,
                 "internal",
                 false,
+            ),
+            (
+                StoreExtractionReason::Validation,
+                503_u16,
+                "config_out_of_date",
+                true,
             ),
             (
                 StoreExtractionReason::ValueTooLarge,

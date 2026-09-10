@@ -269,6 +269,12 @@ jobs:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: scripts/run_test_nonzero.sh ${{ matrix.sentinel }} cargo test --offline --locked -p edgezero-adapter-${{ matrix.adapter }} --no-default-features --features ${{ matrix.adapter }},test-utils --target ${{ matrix.target }} --test contract
 
+      - name: Run Fastly outbound concurrency wasm sentinel
+        if: matrix.adapter == 'fastly'
+        env:
+          ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
+        run: scripts/run_test_nonzero.sh send_all_dispatches_every_slot_before_wait cargo test --offline --locked -p edgezero-adapter-fastly --no-default-features --features fastly,test-utils --target wasm32-wasip1 --test contract
+
       - name: Run Spin WASI HTTP SDK resource tests
         if: matrix.adapter == 'spin'
         env:
