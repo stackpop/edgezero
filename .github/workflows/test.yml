@@ -92,10 +92,10 @@ jobs:
 
       - name: Verify exact outbound capability matrices
         run: |
-          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-axum --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
-          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-cloudflare --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
-          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-fastly --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
-          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_contracts cargo test --offline --locked -p edgezero-adapter-axum --no-default-features --features cli --lib adapter_capability_matrix_matches_contracts
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_contracts cargo test --offline --locked -p edgezero-adapter-cloudflare --no-default-features --features cli --lib adapter_capability_matrix_matches_contracts
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_contracts cargo test --offline --locked -p edgezero-adapter-fastly --no-default-features --features cli --lib adapter_capability_matrix_matches_contracts
+          scripts/run_test_nonzero.sh adapter_capability_matrix_matches_contracts cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features cli --lib adapter_capability_matrix_matches_contracts
 
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"

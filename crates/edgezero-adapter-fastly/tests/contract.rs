@@ -27,7 +27,7 @@ mod tests {
     use edgezero_core::router::RouterService;
     use fastly::Request as FastlyRequest;
     use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
-    use futures::stream;
+    use futures::{executor::block_on, stream};
     use std::sync::Arc;
 
     struct FixedConfigStore(&'static str);
@@ -136,13 +136,12 @@ mod tests {
             Some("1")
         );
 
-        assert_eq!(
-            core_request.body().as_bytes().expect("buffered"),
-            b"payload"
-        );
-
         let context = FastlyRequestContext::get(&core_request).expect("context");
         assert_eq!(context.client_ip, expected_ip);
+
+        let body =
+            block_on(core_request.into_body().into_bytes_bounded(1024)).expect("request body");
+        assert_eq!(body.as_ref(), b"payload");
     }
 
     #[test]
