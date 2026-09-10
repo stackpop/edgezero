@@ -317,6 +317,11 @@ pub async fn state_demo(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::missing_trait_methods,
+        reason = "legacy config fixtures intentionally exercise the bounded-read compatibility default"
+    )]
+
     use super::*;
     use async_trait::async_trait;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -324,7 +329,7 @@ mod tests {
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
-    use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
+    use edgezero_core::http::{request_builder, HeaderMap, Method, StatusCode, Uri};
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::outbound::{
         HttpClient, OutboundHttpClient, OutboundResponse, OutboundSlotResult,
@@ -423,11 +428,11 @@ mod tests {
     impl OutboundHttpClient for TestOutboundClient {
         async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
             assert_eq!(request.method(), Method::POST);
-            assert_eq!(
-                request.uri().path_and_query().map(|value| value.as_str()),
-                Some("/status/201?source=demo")
-            );
-            let mut headers = edgezero_core::http::HeaderMap::new();
+            assert!(request
+                .uri()
+                .path_and_query()
+                .is_some_and(|value| value.as_str() == "/status/201?source=demo"));
+            let mut headers = HeaderMap::new();
             headers.insert("x-outbound-test", HeaderValue::from_static("preserved"));
             Ok(OutboundResponse::new(
                 request.method().clone(),
