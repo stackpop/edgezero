@@ -36,6 +36,7 @@ pub mod outbound;
 pub mod params;
 pub mod responder;
 pub mod response;
+pub mod response_egress;
 pub mod router;
 pub mod secret_store;
 pub mod store_registry;
@@ -55,6 +56,41 @@ pub use config_store::{
     DEFAULT_CONFIG_BLOB_BYTES, DEFAULT_CONFIG_EXTRACTION_BYTES, DEFAULT_CONFIG_EXTRACTION_TIMEOUT,
     DEFAULT_CONFIG_SECRET_BYTES,
 };
+
+pub use edgezero_macros::{AppConfig, action, app};
+pub use error::{
+    BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
+    StoreExtractionReason,
+};
+pub use ingress::{
+    AdmissionDecision, AdmittedIngress, DEFAULT_INBOUND_READ_BUDGET,
+    DEFAULT_MAX_REQUEST_HEADER_BYTES, DEFAULT_MAX_REQUEST_HEADER_COUNT,
+    DEFAULT_MAX_REQUEST_TARGET_BYTES, IngressAdmissionOutcome, IngressBeginOutcome, IngressFraming,
+    IngressGrant, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
+    PreparedIngress,
+};
+pub use manifest::{
+    AtomicHost, BakedManifest, Capability, CapabilitySupport, HostParseError, HostPat,
+    ManifestCapabilities, ManifestContract, ManifestOutboundCapability, Port, Scheme,
+    canonicalize_outbound_host,
+};
+pub use outbound::{
+    DEFAULT_MAX_BROTLI_DECODER_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_OUTBOUND_REQUEST_BODY_BYTES, HttpClient, OutboundHttpClient, OutboundRequest,
+    OutboundRequestParts, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
+    ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
+    collect_response_stream_until, enforce_payload_content_length, limit_decoded_stream,
+    limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
+    validate_for_dispatch,
+};
+pub use response_egress::{
+    DEFAULT_RESPONSE_WRITE_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
+    ResponseEgressHead, ResponseEgressObserver, ResponseEgressObserverHandle,
+    ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressPolicyCallback,
+    ResponseEgressReport, default_response_egress_policy,
+};
+pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
+pub use time::{Deadline, DispatchBudget, MonotonicInstant, dispatch_budget};
 
 #[cfg(test)]
 mod public_config_extraction_contract_tests {
@@ -78,30 +114,3 @@ mod public_config_extraction_contract_tests {
         assert_eq!(limits.timeout, crate::DEFAULT_CONFIG_EXTRACTION_TIMEOUT);
     }
 }
-pub use edgezero_macros::{AppConfig, action, app};
-pub use error::{
-    BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
-    StoreExtractionReason,
-};
-pub use ingress::{
-    AdmissionDecision, AdmittedIngress, DEFAULT_INBOUND_READ_BUDGET,
-    DEFAULT_MAX_REQUEST_HEADER_BYTES, DEFAULT_MAX_REQUEST_HEADER_COUNT,
-    DEFAULT_MAX_REQUEST_TARGET_BYTES, IngressAdmissionOutcome, IngressBeginOutcome, IngressFraming,
-    IngressGrant, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
-    PreparedIngress,
-};
-pub use manifest::{
-    AtomicHost, BakedManifest, Capability, CapabilitySupport, HostParseError, HostPat,
-    ManifestCapabilities, ManifestContract, ManifestOutboundCapability, Port, Scheme,
-    canonicalize_outbound_host,
-};
-pub use outbound::{
-    DEFAULT_MAX_BROTLI_DECODER_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
-    DEFAULT_OUTBOUND_REQUEST_BODY_BYTES, HttpClient, OutboundHttpClient, OutboundRequest,
-    OutboundRequestParts, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
-    ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-    enforce_payload_content_length, limit_decoded_stream, limit_encoded_stream,
-    normalize_for_dispatch, normalize_response_headers, rechunk_stream, validate_for_dispatch,
-};
-pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
-pub use time::{Deadline, DispatchBudget, MonotonicInstant, dispatch_budget};

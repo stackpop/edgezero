@@ -1,6 +1,9 @@
 # Response Egress Implementation Plan
 
-> **Status:** Planned follow-up. Source of truth:
+> **Status:** Partially implemented in PR #275. Core policy, reports, completion guards,
+> dispatch metadata, converter-level deadlines/fallback reporting, and capability cells are
+> implemented. Transport-observable abort, backpressure, completion, write deadlines, and
+> deployed probes remain open; all four capability cells stay `Unsupported`. Source of truth:
 > [response-egress design](../specs/2026-09-08-response-egress-design.md).
 
 **Goal:** Make client-response conversion and delivery observable and deadline-bounded where
@@ -40,7 +43,8 @@ service handoff preserves the original request metadata.
   backwards clock and assert zero elapsed plus `Unspecified`, one notification, and a log.
 - [ ] Add `ResponseEgressPolicy`, body-blind immutable head accessors, outcome/report,
   observer handle,
-  and crate-private completion guard. Keep observer payload bounded and body/header-free.
+  and a public, non-clone, adapter-facing completion guard (optionally `#[doc(hidden)]`). Keep
+  observer payload bounded and body/header-free.
 - [ ] Run `cargo test -p edgezero-core --lib response_egress`.
 
 ## Task 2: Preserve request metadata through dispatch
@@ -80,9 +84,12 @@ service handoff preserves the original request metadata.
   error; sink error; body drop; normal EOF; and competing drop/deadline notification.
 - [ ] Write red raw-socket tests for a client that does not read, disconnects before body,
   disconnects mid-body, and consumes normally. Assert reset/close and exactly one report.
-- [ ] Replace `block_on` collection with a Hyper-compatible body wrapper. Retain the guard in
-  the body until EOF/drop, and race the source against an adapter-owned Tokio sleep created
-  from the same absolute deadline.
+- [ ] Add a bounded local-executor/channel bridge from core's non-`Send` stream to Axum's
+  `Send` body requirement. Retain the guard through that bridge and race source progress
+  against an adapter-owned Tokio sleep created from the same absolute deadline.
+- [ ] Own the Hyper connection so deadline expiry can reset/close it even when Hyper accepted
+  a frame and never polls the body again. A body-wrapper timer by itself is not
+  response-write-deadline evidence.
 - [ ] Define and test the header commit point. Conversion/deadline failure before commit may
   use the minimal fallback response; after commit it emits a body error/resets instead.
 - [ ] Mark Axum Native only after all local integration tests pass.
@@ -100,7 +107,7 @@ service handoff preserves the original request metadata.
   completion guard. Recheck deadline after every ready source/platform result.
 - [ ] Add a deployed probe covering slow client/backpressure, first-byte and midstream
   timeout, explicit disconnect, normal finish, elapsed tolerance, and runtime version.
-- [ ] Keep all four cells BestEffort until deployed evidence demonstrates the corresponding
+- [ ] Keep all four cells Unsupported until deployed evidence demonstrates the corresponding
   host behavior; a local WASM mock cannot upgrade them.
 - [ ] Run Cloudflare unit/contract/WASM checks and archive the probe artifact.
 
@@ -116,8 +123,9 @@ service handoff preserves the original request metadata.
 - [ ] Refactor collection into shared per-adapter helpers with one absolute converter
   deadline. Drop partial buffers/source on failure.
 - [ ] Keep response delivery/abort/backpressure/completion cells Unsupported. Document that
-  successful host response construction emits `HostHandoff` exactly once, never `Completed`;
-  this preserves observer cardinality without claiming an unobservable client finish.
+  successful host response construction emits `ResponseReturned` with zero bytes exactly
+  once, never `HostHandoff` or `Completed`; this preserves observer cardinality without
+  claiming host acceptance or an unobservable client finish.
 - [ ] Run Fastly and Spin unit/contract suites plus Spin's WASM build.
 
 ## Task 7: Cross-adapter lifecycle tests and documentation

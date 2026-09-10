@@ -133,7 +133,7 @@ mod tests {
     fn monotonic_instant_is_public_clock_type() {
         let start = MonotonicInstant::now();
         let deadline = Deadline::at_instant(start);
-        let _: MonotonicInstant = deadline.instant();
+        assert_eq!(deadline.instant(), start);
     }
 
     #[test]

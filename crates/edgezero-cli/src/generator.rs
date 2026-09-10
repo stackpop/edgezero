@@ -1197,6 +1197,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scaffold contract is clearest as one exhaustive generated-workspace assertion"
+    )]
     fn assert_scaffold_workspace(project_dir: &Path) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");

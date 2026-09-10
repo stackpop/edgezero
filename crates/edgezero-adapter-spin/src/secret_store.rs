@@ -4,9 +4,13 @@
 //! The `store_name` parameter is intentionally ignored; provision secrets as
 //! application variables in `spin.toml`.
 
+use std::future::Future;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use edgezero_core::config_store::BoundedStoreRead;
 use edgezero_core::secret_store::{SecretError, SecretStore};
+use edgezero_core::time::Deadline;
 
 /// Secret store backed by Spin component variables.
 ///
@@ -58,6 +62,60 @@ impl SecretStore for SpinSecretStore {
             ))),
         }
     }
+
+    #[inline]
+    async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        bounded_secret_read(
+            self.get_bytes(store_name, key),
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+        )
+        .await
+    }
+}
+
+// Spin Variables returns a complete value, so these bounds are cooperative
+// and apply immediately after host materialization rather than during allocation.
+pub(crate) async fn bounded_secret_read<F>(
+    read: F,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+) -> Result<BoundedStoreRead<Bytes>, SecretError>
+where
+    F: Future<Output = Result<Option<Bytes>, SecretError>>,
+{
+    if deadline.is_expired() {
+        return Err(SecretError::DeadlineExceeded);
+    }
+
+    let result = read.await;
+    if deadline.is_expired() {
+        drop(result);
+        return Err(SecretError::DeadlineExceeded);
+    }
+    let value = result?;
+
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+        drop(value);
+        return Err(SecretError::ValueTooLarge);
+    }
+
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value,
+    })
 }
 
 // TODO: integration tests require the Spin runtime.

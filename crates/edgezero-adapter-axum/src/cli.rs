@@ -134,21 +134,28 @@ struct EdgezeroAxumConfig {
     reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for AxumCliAdapter {
-    #[expect(
-        clippy::match_same_arms,
-        reason = "the complete-resource-accounting cell is stated explicitly while the wildcard keeps future capabilities fail-closed"
-    )]
     fn capability(&self, capability: Capability) -> CapabilitySupport {
         match capability {
-            Capability::LazyStreamedResponsePassthrough => CapabilitySupport::BestEffort,
-            Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
-            Capability::OutboundDeadlines
+            Capability::ConfigReadDeadlines | Capability::LazyStreamedResponsePassthrough => {
+                CapabilitySupport::BestEffort
+            }
+            Capability::InboundReadDeadlines
+            | Capability::IngressAdmission
+            | Capability::OutboundDeadlines
             | Capability::OutboundFlexiblePhaseBudget
             | Capability::OutboundHeaderFidelity
             | Capability::OutboundHttp
             | Capability::SendAllSlotIsolation
             | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
-            _ => CapabilitySupport::Unsupported,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
+            | _ => CapabilitySupport::Unsupported,
         }
     }
 
@@ -761,8 +768,42 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn adapter_capability_matrix_matches_outbound_spec() {
+    fn adapter_capability_matrix_matches_contracts() {
         let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::InboundReadDeadlines, CapabilitySupport::Native),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::Unsupported,
+            ),
             (Capability::OutboundHttp, CapabilitySupport::Native),
             (
                 Capability::OutboundCompleteResourceAccounting,

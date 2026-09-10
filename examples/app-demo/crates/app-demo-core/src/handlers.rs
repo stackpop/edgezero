@@ -97,7 +97,7 @@ pub async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
 pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let http_client = ctx.http_client();
-    let request = ctx.into_request();
+    let request = ctx.into_request()?;
     let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
     let target = build_proxy_target(&base, &params.rest, request.uri())?;
     let outbound_request = OutboundRequest::from_request(request, target)?;
@@ -222,7 +222,7 @@ pub async fn kv_note_put(
     let store = kv
         .named("cache")
         .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
-    let body = ctx.into_request().into_body();
+    let body = ctx.into_request()?.into_body();
     let body_bytes = body.into_bytes_bounded(MAX_BODY_SIZE).await?;
     store
         .put_bytes(&format!("note:{}", path.id), body_bytes)

@@ -14,7 +14,7 @@ use tokio::signal;
 use tower::{Service as _, service_fn};
 
 use edgezero_core::addr;
-use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
@@ -116,7 +116,7 @@ impl AxumDevServer {
         let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
 
-        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(App::new(router), listener, config.enable_ctrl_c, stores).await
     }
 
     #[cfg(test)]
@@ -126,7 +126,7 @@ impl AxumDevServer {
             config,
             stores,
         } = self;
-        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(App::new(router), listener, config.enable_ctrl_c, stores).await
     }
 
     #[must_use]
@@ -272,13 +272,13 @@ fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<KvHandle> {
 }
 
 async fn serve_with_stores(
-    router: RouterService,
+    app: App,
     listener: TokioTcpListener,
     enable_ctrl_c: bool,
     stores: Stores,
 ) -> anyhow::Result<()> {
     let service = {
-        let mut service = EdgeZeroAxumService::new(router);
+        let mut service = EdgeZeroAxumService::from_app(app);
         if let Some(registry) = stores.config_registry {
             service = service.with_config_registry(registry);
         }
@@ -350,7 +350,6 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
     }
     let addr = resolution.addr;
     let app = A::build_app();
-    let router = app.router().clone();
 
     log::info!("[edgezero] starting axum server on http://{addr}");
 
@@ -378,7 +377,7 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
             secret_registry,
             ..Stores::default()
         };
-        serve_with_stores(router, listener, true, request_stores).await
+        serve_with_stores(app, listener, true, request_stores).await
     })
 }
 
@@ -859,7 +858,6 @@ mod integration_tests {
     async fn server_forwards_headers() {
         async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let value = ctx
-                .request()
                 .headers()
                 .get("x-custom")
                 .and_then(|val| val.to_str().ok())

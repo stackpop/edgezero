@@ -84,12 +84,22 @@ impl BakedManifest {
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Capability {
+    ConfigReadAllocationBounds,
+    ConfigReadDeadlines,
+    InboundReadDeadlines,
+    IngressAdmission,
     LazyStreamedResponsePassthrough,
     OutboundCompleteResourceAccounting,
     OutboundDeadlines,
     OutboundFlexiblePhaseBudget,
     OutboundHeaderFidelity,
     OutboundHttp,
+    RawIngressFramingValidation,
+    RawIngressHeadLimits,
+    ResponseEgressAbort,
+    ResponseEgressBackpressure,
+    ResponseEgressCompletion,
+    ResponseWriteDeadlines,
     SendAllSlotIsolation,
     StreamedUploadDeadlines,
 }
@@ -107,12 +117,22 @@ impl Capability {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::ConfigReadAllocationBounds => "config-read-allocation-bounds",
+            Self::ConfigReadDeadlines => "config-read-deadlines",
+            Self::InboundReadDeadlines => "inbound-read-deadlines",
+            Self::IngressAdmission => "ingress-admission",
             Self::LazyStreamedResponsePassthrough => "lazy-streamed-response-passthrough",
             Self::OutboundCompleteResourceAccounting => "outbound-complete-resource-accounting",
             Self::OutboundDeadlines => "outbound-deadlines",
             Self::OutboundFlexiblePhaseBudget => "outbound-flexible-phase-budget",
             Self::OutboundHeaderFidelity => "outbound-header-fidelity",
             Self::OutboundHttp => "outbound-http",
+            Self::RawIngressFramingValidation => "raw-ingress-framing-validation",
+            Self::RawIngressHeadLimits => "raw-ingress-head-limits",
+            Self::ResponseEgressAbort => "response-egress-abort",
+            Self::ResponseEgressBackpressure => "response-egress-backpressure",
+            Self::ResponseEgressCompletion => "response-egress-completion",
+            Self::ResponseWriteDeadlines => "response-write-deadlines",
             Self::SendAllSlotIsolation => "send-all-slot-isolation",
             Self::StreamedUploadDeadlines => "streamed-upload-deadlines",
         }
@@ -1583,16 +1603,30 @@ env = "APP_TOKEN"
 "#;
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive capability parse-and-validation table is clearer in one test"
+    )]
     fn capability_manifest_rejects_unknown_duplicate_and_overlap() {
         let source = r#"
 [capabilities]
 required = [
+    "config-read-allocation-bounds",
+    "config-read-deadlines",
+    "inbound-read-deadlines",
+    "ingress-admission",
     "lazy-streamed-response-passthrough",
     "outbound-complete-resource-accounting",
     "outbound-deadlines",
     "outbound-flexible-phase-budget",
     "outbound-header-fidelity",
     "outbound-http",
+    "raw-ingress-framing-validation",
+    "raw-ingress-head-limits",
+    "response-egress-abort",
+    "response-egress-backpressure",
+    "response-egress-completion",
+    "response-write-deadlines",
     "send-all-slot-isolation",
     "streamed-upload-deadlines",
 ]
@@ -1603,12 +1637,22 @@ hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
 "#;
         let loader = ManifestLoader::try_load_from_str(source).expect("capability manifest");
         let expected = [
+            Capability::ConfigReadAllocationBounds,
+            Capability::ConfigReadDeadlines,
+            Capability::InboundReadDeadlines,
+            Capability::IngressAdmission,
             Capability::LazyStreamedResponsePassthrough,
             Capability::OutboundCompleteResourceAccounting,
             Capability::OutboundDeadlines,
             Capability::OutboundFlexiblePhaseBudget,
             Capability::OutboundHeaderFidelity,
             Capability::OutboundHttp,
+            Capability::RawIngressFramingValidation,
+            Capability::RawIngressHeadLimits,
+            Capability::ResponseEgressAbort,
+            Capability::ResponseEgressBackpressure,
+            Capability::ResponseEgressCompletion,
+            Capability::ResponseWriteDeadlines,
             Capability::SendAllSlotIsolation,
             Capability::StreamedUploadDeadlines,
         ];
@@ -1623,12 +1667,22 @@ hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
             )
         );
         for (capability, expected_name) in expected.iter().zip([
+            "config-read-allocation-bounds",
+            "config-read-deadlines",
+            "inbound-read-deadlines",
+            "ingress-admission",
             "lazy-streamed-response-passthrough",
             "outbound-complete-resource-accounting",
             "outbound-deadlines",
             "outbound-flexible-phase-budget",
             "outbound-header-fidelity",
             "outbound-http",
+            "raw-ingress-framing-validation",
+            "raw-ingress-head-limits",
+            "response-egress-abort",
+            "response-egress-backpressure",
+            "response-egress-completion",
+            "response-write-deadlines",
             "send-all-slot-isolation",
             "streamed-upload-deadlines",
         ]) {
@@ -3244,28 +3298,29 @@ default = "feature__flags"
             .err()
             .expect("double-underscore store id must fail validation");
     }
-}
-#[test]
-fn baked_manifest_states_are_distinct() {
-    assert!(matches!(
-        Manifest::from_baked_json("not json"),
-        BakedManifest::Malformed("baked manifest did not parse")
-    ));
-    assert!(matches!(
-        Manifest::from_baked_json(r#"{"app":{"Capabilities":{}}}"#),
-        BakedManifest::Malformed("baked manifest has misplaced capabilities")
-    ));
-    let baked = Manifest::from_baked_json(r#"{"capabilities":{"required":["outbound-http"]}}"#);
-    let BakedManifest::Present(manifest) = baked else {
-        panic!("expected present baked manifest");
-    };
-    assert_eq!(manifest.capabilities.required, [Capability::OutboundHttp]);
-    assert!(matches!(
-        BakedManifest::Absent.as_contract(),
-        ManifestContract::None
-    ));
-    assert!(matches!(
-        ManifestContract::from_opt(Some(manifest)),
-        ManifestContract::Present(_)
-    ));
+
+    #[test]
+    fn baked_manifest_states_are_distinct() {
+        assert!(matches!(
+            Manifest::from_baked_json("not json"),
+            BakedManifest::Malformed("baked manifest did not parse")
+        ));
+        assert!(matches!(
+            Manifest::from_baked_json(r#"{"app":{"Capabilities":{}}}"#),
+            BakedManifest::Malformed("baked manifest has misplaced capabilities")
+        ));
+        let baked = Manifest::from_baked_json(r#"{"capabilities":{"required":["outbound-http"]}}"#);
+        let BakedManifest::Present(manifest) = baked else {
+            panic!("expected present baked manifest");
+        };
+        assert_eq!(manifest.capabilities.required, [Capability::OutboundHttp]);
+        assert!(matches!(
+            BakedManifest::Absent.as_contract(),
+            ManifestContract::None
+        ));
+        assert!(matches!(
+            ManifestContract::from_opt(Some(manifest)),
+            ManifestContract::Present(_)
+        ));
+    }
 }

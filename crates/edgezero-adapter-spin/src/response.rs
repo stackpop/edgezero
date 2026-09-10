@@ -2,7 +2,9 @@ use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
-use edgezero_core::outbound::collect_response_stream;
+use edgezero_core::outbound::{collect_response_stream, collect_response_stream_until};
+use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
+use edgezero_core::time::{Deadline, MonotonicInstant};
 use spin_sdk::http::{FullBody, Response as SpinResponse};
 
 use crate::SpinFullResponse;
@@ -18,14 +20,33 @@ pub const SPIN_RESPONSE_STREAM_BUFFER_BYTES: u64 = 0x0100_0000;
 /// Stream bodies are capped at [`MAX_BODY_SIZE`] bytes. If the accumulated
 /// size exceeds the limit, collection stops and an error is returned.
 pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError> {
+    collect_body_bytes_with_deadline(body, None).await
+}
+
+async fn collect_body_bytes_with_deadline(
+    body: Body,
+    deadline: Option<Deadline>,
+) -> Result<Vec<u8>, EdgeError> {
+    ensure_write_deadline(deadline)?;
     match body {
-        Body::Once(bytes) => Ok(bytes.to_vec()),
-        Body::Stream(stream) => Ok(collect_response_stream(
-            stream,
-            SPIN_RESPONSE_STREAM_BUFFER_BYTES,
-        )
-        .await?
-        .to_vec()),
+        Body::Once(bytes) => {
+            ensure_write_deadline(deadline)?;
+            Ok(bytes.to_vec())
+        }
+        Body::Stream(stream) => {
+            let collected = match deadline {
+                Some(deadline) => {
+                    collect_response_stream_until(
+                        stream,
+                        SPIN_RESPONSE_STREAM_BUFFER_BYTES,
+                        deadline,
+                    )
+                    .await?
+                }
+                None => collect_response_stream(stream, SPIN_RESPONSE_STREAM_BUFFER_BYTES).await?,
+            };
+            Ok(collected.to_vec())
+        }
     }
 }
 
@@ -40,6 +61,58 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
 /// cannot be built from the collected bytes.
 #[inline]
 pub async fn from_core_response(response: Response) -> Result<SpinFullResponse, EdgeError> {
+    from_core_response_with_deadline(response, None).await
+}
+
+pub(crate) async fn from_egress_response(
+    egress: ResponseEgressEnvelope,
+) -> Result<SpinFullResponse, EdgeError> {
+    let started_at = MonotonicInstant::now();
+    let (response, policy, mut attempt) = egress
+        .begin(started_at)
+        .map_err(|_| EdgeError::internal(anyhow::anyhow!("response-egress policy failed")))?;
+    if policy.write_deadline.is_expired() {
+        attempt.terminate(
+            ResponseEgressOutcome::DeadlineExceeded,
+            MonotonicInstant::now(),
+        );
+        return deadline_response();
+    }
+
+    let converted = from_core_response_with_deadline(response, Some(policy.write_deadline)).await;
+    let observed_at = MonotonicInstant::now();
+    if policy.write_deadline.is_expired() {
+        attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, observed_at);
+        return deadline_response();
+    }
+    match converted {
+        Ok(response) => {
+            attempt.terminate(ResponseEgressOutcome::ResponseReturned, observed_at);
+            Ok(response)
+        }
+        Err(error) => {
+            let outcome = if matches!(error, EdgeError::ResponseTooLarge { .. }) {
+                ResponseEgressOutcome::ConversionError
+            } else if matches!(error, EdgeError::GatewayTimeout { .. }) {
+                ResponseEgressOutcome::DeadlineExceeded
+            } else {
+                ResponseEgressOutcome::SourceError
+            };
+            attempt.terminate(outcome, observed_at);
+            if outcome == ResponseEgressOutcome::DeadlineExceeded {
+                deadline_response()
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn from_core_response_with_deadline(
+    response: Response,
+    deadline: Option<Deadline>,
+) -> Result<SpinFullResponse, EdgeError> {
+    ensure_write_deadline(deadline)?;
     let (parts, body) = response.into_parts();
 
     let mut builder = SpinResponse::builder().status(parts.status);
@@ -48,11 +121,34 @@ pub async fn from_core_response(response: Response) -> Result<SpinFullResponse, 
         builder = builder.header(name, value);
     }
 
-    let collected = collect_body_bytes(body).await?;
+    let collected = collect_body_bytes_with_deadline(body, deadline).await?;
+    ensure_write_deadline(deadline)?;
 
     builder
         .body(FullBody::new(Bytes::from(collected)))
         .map_err(|err| EdgeError::internal(anyhow::anyhow!("failed to build response: {err}")))
+}
+
+fn deadline_response() -> Result<SpinFullResponse, EdgeError> {
+    SpinResponse::builder()
+        .status(504)
+        .body(FullBody::new(Bytes::from_static(
+            b"response write deadline exceeded",
+        )))
+        .map_err(|error| {
+            EdgeError::internal(anyhow::anyhow!(
+                "failed to build deadline response: {error}"
+            ))
+        })
+}
+
+fn ensure_write_deadline(deadline: Option<Deadline>) -> Result<(), EdgeError> {
+    if deadline.is_some_and(|deadline| deadline.is_expired()) {
+        return Err(EdgeError::gateway_timeout(
+            "response write deadline exceeded",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

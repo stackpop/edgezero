@@ -70,6 +70,7 @@ pub enum ResponseEgressOutcome {
     ConversionError,
     DeadlineExceeded,
     HostHandoff,
+    ResponseReturned,
     SourceError,
     TransportError,
     Unspecified,
@@ -106,9 +107,17 @@ platform accepted a response object/body, not delivery or finish. It still close
 attempt and triggers exactly one report, but it is not `Completed` and does not satisfy a
 Native `response-egress-completion` requirement.
 
+`ResponseReturned` is weaker: guest code constructed and returned the platform response,
+but the host-owned send begins later or is otherwise unobservable. It reports
+`bytes_written = 0`, does not imply host acceptance, and cannot satisfy any of the four
+response-egress capabilities. Fastly's `#[fastly::main]` and Spin's `#[http_service]`
+entrypoint wrappers are in this category because delivery occurs after the generated guest
+function returns.
+
 ### 2.3 Exactly-once state machine
 
-Each conversion owns one non-clone completion guard:
+Each conversion owns one public, non-clone, adapter-facing completion guard. The type may be
+`#[doc(hidden)]`, but it cannot be crate-private because adapter crates own and drive it:
 
 ```text
 Initial -> Writing -> Completed
@@ -181,23 +190,27 @@ The shared capability ladder gains four response-egress cells:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
-| `response-egress-abort` | Native after Hyper reset/drop tests | BestEffort until deployed cancel is observed | Unsupported; guest returns a response object before host delivery | Unsupported; guest returns `FullBody` before host delivery |
-| `response-egress-backpressure` | Native | BestEffort until deployed pull/cancel behavior is observed | Unsupported while converter collects the stream | Unsupported while converter collects into `FullBody` |
-| `response-egress-completion` | Native at Hyper body EOF/drop boundary | BestEffort until deployed finish/cancel probe passes | Unsupported | Unsupported |
-| `response-write-deadlines` | Native | BestEffort until deployed timer/abort probe passes | Unsupported | Unsupported |
+| `response-egress-abort` | Unsupported until connection-level reset/drop tests pass | Unsupported until deployed cancel is observed | Unsupported; guest returns before host delivery | Unsupported; guest returns before host delivery |
+| `response-egress-backpressure` | Unsupported until the non-`Send` bridge and socket-pressure tests pass | Unsupported until deployed pull/cancel behavior is observed | Unsupported while converter collects the stream | Unsupported while converter collects into `FullBody` |
+| `response-egress-completion` | Unsupported until a proved transport completion boundary exists | Unsupported until a deployed finish/cancel probe passes | Unsupported | Unsupported |
+| `response-write-deadlines` | Unsupported until a connection-level abort timer is proved | Unsupported until a deployed timer/abort probe passes | Unsupported | Unsupported |
 
-Initial capability declarations remain at these levels until their implementation and
-evidence land. An app requiring Native support fails during build/serve/deploy/demo before
+These are the initial capability declarations. A cell may move to BestEffort or Native only
+after its implementation and named evidence land. An app requiring Native support fails during build/serve/deploy/demo before
 handling traffic. A target may expose a typed report at BestEffort while clearly documenting
 that an unobservable host send can outlive guest completion.
 
 ### 4.1 Axum
 
-Replace synchronous `block_on` collection with an `http_body::Body` wrapper that races source
-polling and Hyper demand against one adapter timer, counts accepted payload bytes, observes
-body drop, and emits one terminal report. Header conversion happens before commit and retains
-the guard until Hyper owns the body. Raw-socket tests cover a slow reader, disconnect before
-first byte, disconnect mid-body, source error, deadline, empty body, and normal EOF.
+Core's `Body::Stream` is non-`Send`, while Axum's erased response body requires `Send`; a
+local-executor/channel bridge is therefore required before collection can be removed. A
+timer inside `poll_frame` observes Hyper demand, not socket acceptance or flush, and cannot
+alone prove a response-write deadline. Native deadline/abort/completion claims require
+connection-level ownership that can reset or close the connection independently when the
+absolute deadline fires. Header conversion happens before commit and retains the guard until
+that connection-owned path accepts responsibility. Raw-socket tests cover a slow reader,
+disconnect before first byte, disconnect mid-body, source error, deadline while Hyper holds a
+frame without repolling, empty body, and normal EOF.
 
 ### 4.2 Cloudflare
 
@@ -214,7 +227,9 @@ claim.
 Their current converters materialize a body before returning it to the host and cannot
 observe client delivery/finish. They enforce a finite converter collection cap and can report
 pre-return source/conversion errors. Successful platform response construction reports
-`HostHandoff` exactly once, but they remain Unsupported for the four lifecycle capabilities.
+`ResponseReturned` exactly once with zero written bytes, but they remain Unsupported for the
+four lifecycle capabilities. It must not be reported as `HostHandoff`: the generated host
+entrypoint performs delivery only after guest dispatch returns.
 Cooperative deadline checks around synchronous host work do not create a finite write bound.
 Upgrading requires a documented host streaming/abort/finish API plus a deployed probe; local
 collection tests are insufficient.

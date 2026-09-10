@@ -390,21 +390,28 @@ struct RuntimeStoreNameReconciliation {
     reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
-    #[expect(
-        clippy::match_same_arms,
-        reason = "the complete-resource-accounting cell is explicit while the wildcard keeps future capabilities fail-closed"
-    )]
     fn capability(&self, capability: Capability) -> CapabilitySupport {
         match capability {
-            Capability::OutboundHeaderFidelity => CapabilitySupport::Native,
-            Capability::LazyStreamedResponsePassthrough
+            Capability::IngressAdmission | Capability::OutboundHeaderFidelity => {
+                CapabilitySupport::Native
+            }
+            Capability::ConfigReadDeadlines
+            | Capability::InboundReadDeadlines
+            | Capability::LazyStreamedResponsePassthrough
             | Capability::OutboundDeadlines
             | Capability::OutboundFlexiblePhaseBudget
             | Capability::OutboundHttp
             | Capability::SendAllSlotIsolation
             | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
-            Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
-            _ => CapabilitySupport::Unsupported,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
+            | _ => CapabilitySupport::Unsupported,
         }
     }
 
@@ -4232,12 +4239,8 @@ fn build_compute_deploy_args(extra_args: &[String]) -> Vec<String> {
 ///
 #[inline]
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest =
-        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
-    deploy_from_dir(manifest_dir, extra_args)
+    let manifest_dir = resolve_manifest_dir(extra_args)?;
+    deploy_from_dir(&manifest_dir, extra_args)
 }
 
 fn deploy_from_dir(manifest_dir: &Path, extra_args: &[String]) -> Result<(), String> {
@@ -5648,9 +5651,51 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
+    // Logical store ids shared by setup and assertions.
+    const TEST_CONFIG_ID: &str = "app_config";
+    const TEST_KV_ID: &str = "sessions";
+    const TEST_SECRET_ID: &str = "default";
+
     #[test]
-    fn adapter_capability_matrix_matches_outbound_spec() {
+    fn adapter_capability_matrix_matches_contracts() {
         let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::InboundReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::Unsupported,
+            ),
             (Capability::OutboundHttp, CapabilitySupport::BestEffort),
             (
                 Capability::OutboundCompleteResourceAccounting,
@@ -5687,16 +5732,6 @@ mod tests {
             );
         }
     }
-
-    // Shared fixture names. Pinning these as consts (instead of
-    // inline `"sessions"` / `"app_config"` per call site) keeps the
-    // setup-vs-assertion pair in sync -- a typo in one place no
-    // longer silently divorces from the other, because both reference
-    // the same const. Also names the intent: these are the LOGICAL
-    // store ids the fastly adapter operates on, not arbitrary strings.
-    const TEST_KV_ID: &str = "sessions";
-    const TEST_CONFIG_ID: &str = "app_config";
-    const TEST_SECRET_ID: &str = "default";
 
     // `PathPrepend` (RAII $PATH guard) is the shared helper imported above from
     // `edgezero_core::test_env`; the merge with edition-2024 main replaced our

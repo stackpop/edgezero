@@ -1206,12 +1206,14 @@ mod tests {
         };
         assert_eq!(reason, ResponseLimitReason::Unspecified);
 
-        let EdgeError::ResponseTooLarge { reason, .. } =
-            EdgeError::response_too_large_with_reason("large", ResponseLimitReason::EncodedBody)
+        let EdgeError::ResponseTooLarge {
+            reason: specific_reason,
+            ..
+        } = EdgeError::response_too_large_with_reason("large", ResponseLimitReason::EncodedBody)
         else {
             panic!("expected ResponseTooLarge");
         };
-        assert_eq!(reason, ResponseLimitReason::EncodedBody);
+        assert_eq!(specific_reason, ResponseLimitReason::EncodedBody);
     }
 
     #[test]
@@ -1249,6 +1251,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive extraction-reason wire-policy table is clearer in one test"
+    )]
     fn store_extraction_reason_wire_policy_table() {
         let cases = [
             (

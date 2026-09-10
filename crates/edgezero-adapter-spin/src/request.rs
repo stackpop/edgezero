@@ -7,20 +7,25 @@ use crate::SpinFullResponse;
 use crate::config_store::SpinConfigStore;
 use crate::context::{SpinRequestContext, parse_client_addr};
 use crate::key_value_store::{DEFAULT_MAX_LIST_KEYS, SpinKvStore};
-use crate::response::from_core_response;
+use crate::response::from_egress_response;
 use crate::secret_store::SpinSecretStore;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Request, request_builder};
+use edgezero_core::http::{Request, RequestParts};
+use edgezero_core::ingress::{
+    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts,
+};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
+use edgezero_core::time::{Deadline, MonotonicInstant};
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use spin_sdk::http::Request as SpinRequest;
 use spin_sdk::http::body::IncomingBodyExt as _;
 
@@ -51,7 +56,12 @@ pub(crate) struct Stores {
 #[inline]
 pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
     let (parts, body) = req.into_parts();
+    let mut request = into_core_request_head(parts)?;
+    *request.body_mut() = Body::from_external_stream(body.stream());
+    Ok(request)
+}
 
+fn into_core_request_head(parts: RequestParts) -> Result<Request, EdgeError> {
     let client_addr = parts
         .headers
         .get("spin-client-addr")
@@ -63,23 +73,7 @@ pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let mut builder = request_builder().method(parts.method).uri(parts.uri);
-    for (name, value) in &parts.headers {
-        builder = builder.header(name, value);
-    }
-
-    // Inbound body size is not capped at the adapter level. The Spin runtime
-    // enforces its own request body limit (configurable via `spin.toml`), which
-    // is consistent with how the Fastly and Cloudflare adapters delegate inbound
-    // size enforcement to their respective platform runtimes.
-    let body_bytes = body
-        .bytes()
-        .await
-        .map_err(|err| EdgeError::bad_request(format!("failed to read request body: {err}")))?;
-
-    let mut request = builder
-        .body(Body::from(body_bytes.to_vec()))
-        .map_err(|err| EdgeError::bad_request(format!("failed to build request: {err}")))?;
+    let mut request = Request::from_parts(parts, Body::empty());
 
     SpinRequestContext::insert(
         &mut request,
@@ -93,6 +87,43 @@ pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
         .insert(HttpClient::with_client(SpinOutboundClient));
 
     Ok(request)
+}
+
+fn spin_deadline_body<Source, SourceError>(source: Source, deadline: Deadline) -> Body
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+{
+    let source = source.map_err(Into::into).boxed_local();
+    let stream =
+        futures_util::stream::unfold((source, false), move |(mut source, terminal)| async move {
+            if terminal {
+                return None;
+            }
+            if deadline.is_expired() {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    (source, true),
+                ));
+            }
+            let item = source.next().await;
+            if deadline.is_expired() {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    (source, true),
+                ));
+            }
+            match item {
+                Some(Ok(bytes)) => Some((Ok(bytes), (source, false))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (source, true))),
+                None => None,
+            }
+        });
+    Body::from_stream(stream)
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
@@ -151,7 +182,23 @@ pub(crate) async fn dispatch_with_handles(
     req: SpinRequest,
     stores: Stores,
 ) -> anyhow::Result<SpinFullResponse> {
-    let mut core_request = into_core_request(req).await?;
+    let request_start = MonotonicInstant::now();
+    let (parts, native_body) = req.into_parts();
+    let mut core_request = into_core_request_head(parts)?;
+    let head_parts = IngressHeadParts::from_request(
+        &core_request,
+        IngressHeadAccounting::HostManaged,
+        IngressFraming::HostManaged,
+    );
+    head_parts.validate_normalized(app.ingress_head_limits())?;
+    let prepared = match app.begin_ingress(head_parts, request_start)? {
+        IngressBeginOutcome::Admitted(prepared) => prepared,
+        IngressBeginOutcome::Refused(response) => {
+            return Ok(from_egress_response(response).await?);
+        }
+        _ => return Err(anyhow::anyhow!("unsupported ingress admission outcome")),
+    };
+    *core_request.body_mut() = spin_deadline_body(native_body.stream(), prepared.read_deadline());
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
@@ -166,8 +213,8 @@ pub(crate) async fn dispatch_with_handles(
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let response = app.router().oneshot(core_request).await?;
-    Ok(from_core_response(response).await?)
+    let response = app.dispatch_admitted(prepared, core_request).await?;
+    Ok(from_egress_response(response).await?)
 }
 
 /// Dispatch with per-id store registries built from baked metadata.

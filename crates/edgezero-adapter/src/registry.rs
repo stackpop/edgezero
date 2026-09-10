@@ -750,10 +750,13 @@ mod tests {
         reason = "fixture overrides only the behavior under test"
     )]
     impl Adapter for CapabilityAdapter {
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "Capability is non-exhaustive and this fixture defaults all untested capabilities to unsupported"
+        )]
         fn capability(&self, capability: Capability) -> CapabilitySupport {
             match capability {
                 Capability::LazyStreamedResponsePassthrough => CapabilitySupport::BestEffort,
-                Capability::OutboundCompleteResourceAccounting => CapabilitySupport::Unsupported,
                 Capability::OutboundDeadlines => CapabilitySupport::BoundedCooperative,
                 Capability::OutboundHttp => CapabilitySupport::Native,
                 _ => CapabilitySupport::Unsupported,

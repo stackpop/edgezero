@@ -11,7 +11,7 @@ use validator::Validate;
 use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use crate::blob_envelope::{BlobEnvelope, BlobEnvelopeError};
 use crate::config_store::{ConfigExtractionLimits, ConfigStoreError, ConfigStoreHandle};
-use crate::context::RequestContext;
+use crate::context::{DEFAULT_INBOUND_FORM_BYTES, DEFAULT_INBOUND_JSON_BYTES, RequestContext};
 use crate::error::{EdgeError, StoreExtractionReason};
 use crate::http::HeaderMap;
 use crate::secret_store::SecretError;
@@ -36,7 +36,7 @@ where
 {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.json().map(Json)
+        ctx.json_within(DEFAULT_INBOUND_JSON_BYTES).await.map(Json)
     }
 }
 
@@ -80,6 +80,47 @@ where
     }
 }
 
+/// Validated JSON extractor with a compile-time byte cap.
+pub struct ValidatedJsonWithin<T, const MAX: usize>(pub T);
+
+#[async_trait(?Send)]
+impl<T, const MAX: usize> FromRequest for ValidatedJsonWithin<T, MAX>
+where
+    T: DeserializeOwned + Validate + Send + 'static,
+{
+    #[inline]
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        let value: T = ctx.json_within(MAX).await?;
+        value
+            .validate()
+            .map_err(|err| EdgeError::validation(err.to_string()))?;
+        Ok(Self(value))
+    }
+}
+
+impl<T, const MAX: usize> Deref for ValidatedJsonWithin<T, MAX> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T, const MAX: usize> DerefMut for ValidatedJsonWithin<T, MAX> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T, const MAX: usize> ValidatedJsonWithin<T, MAX> {
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 impl<T> Deref for ValidatedJson<T> {
     type Target = T;
 
@@ -109,7 +150,7 @@ pub struct Headers(pub HeaderMap);
 impl FromRequest for Headers {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        Ok(Headers(ctx.request().headers().clone()))
+        Ok(Headers(ctx.headers().clone()))
     }
 }
 
@@ -154,7 +195,7 @@ pub struct Host(pub String);
 impl FromRequest for Host {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        let headers = ctx.request().headers();
+        let headers = ctx.headers();
         let host = headers
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
@@ -203,7 +244,7 @@ pub struct ForwardedHost(pub String);
 impl FromRequest for ForwardedHost {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        let headers = ctx.request().headers();
+        let headers = ctx.headers();
         let host = headers
             .get("x-forwarded-host")
             .or_else(|| headers.get(header::HOST))
@@ -392,7 +433,7 @@ where
 {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.form().map(Form)
+        ctx.form_within(DEFAULT_INBOUND_FORM_BYTES).await.map(Form)
     }
 }
 
@@ -459,6 +500,47 @@ impl<T> ValidatedForm<T> {
     }
 }
 
+/// Validated form extractor with a compile-time byte cap.
+pub struct ValidatedFormWithin<T, const MAX: usize>(pub T);
+
+#[async_trait(?Send)]
+impl<T, const MAX: usize> FromRequest for ValidatedFormWithin<T, MAX>
+where
+    T: DeserializeOwned + Validate + Send + 'static,
+{
+    #[inline]
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        let value: T = ctx.form_within(MAX).await?;
+        value
+            .validate()
+            .map_err(|err| EdgeError::validation(err.to_string()))?;
+        Ok(Self(value))
+    }
+}
+
+impl<T, const MAX: usize> Deref for ValidatedFormWithin<T, MAX> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T, const MAX: usize> DerefMut for ValidatedFormWithin<T, MAX> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T, const MAX: usize> ValidatedFormWithin<T, MAX> {
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 /// Extractor that yields the per-request [`KvRegistry`].
 ///
 /// Handlers pick a bound store by id at the call site:
@@ -494,8 +576,7 @@ impl FromRequest for Kv {
         // legacy bare-handle inputs to single-id registries at the
         // dispatch boundary, so this path no longer needs a
         // fallback — a missing registry is a real bug.
-        ctx.request()
-            .extensions()
+        ctx.extensions()
             .get::<KvRegistry>()
             .cloned()
             .map(Kv)
@@ -616,8 +697,7 @@ impl FromRequest for Secrets {
         // Hard-cutoff: see `impl FromRequest for Kv`. Adapter
         // dispatchers normalise legacy bare-handle inputs to
         // single-id `SecretRegistry`s at the dispatch boundary.
-        ctx.request()
-            .extensions()
+        ctx.extensions()
             .get::<SecretRegistry>()
             .cloned()
             .map(Secrets)
@@ -673,8 +753,7 @@ impl FromRequest for Config {
         // Hard-cutoff: see `impl FromRequest for Kv`. Adapter
         // dispatchers normalise legacy bare-handle inputs to
         // single-id `ConfigRegistry`s at the dispatch boundary.
-        ctx.request()
-            .extensions()
+        ctx.extensions()
             .get::<ConfigRegistry>()
             .cloned()
             .map(Config)
@@ -1436,6 +1515,11 @@ fn first_violating_field(errors: &validator::ValidationErrors) -> Option<String>
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::missing_trait_methods,
+        reason = "legacy provider stubs intentionally exercise the bounded-read compatibility default"
+    )]
+
     use super::*;
     use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
     use crate::blob_envelope::BlobEnvelope;
@@ -1713,8 +1797,7 @@ mod tests {
     #[test]
     fn headers_extractor_clones_request_headers() {
         let mut ctx = ctx(Body::empty(), PathParams::default());
-        ctx.request_mut()
-            .headers_mut()
+        ctx.headers_mut()
             .insert("x-test", HeaderValue::from_static("value"));
         let headers = block_on(Headers::from_request(&ctx)).expect("headers");
         assert_eq!(
@@ -2698,16 +2781,19 @@ mod tests {
             block_on(AppConfig::<SecretCfg>::from_request(&ctx)).expect("bounded extraction");
         assert_eq!(cfg.api_token, "secret");
 
-        let observed = observed.lock().expect("observations");
-        assert_eq!(observed.len(), 2);
-        assert_eq!(observed[0].0, observed[1].0, "deadline must not reset");
+        let locked_observations = observed.lock().expect("observations");
+        assert_eq!(locked_observations.len(), 2);
         assert_eq!(
-            observed[1].1,
-            observed[0].1 - blob_bytes,
+            locked_observations[0].0, locked_observations[1].0,
+            "deadline must not reset"
+        );
+        assert_eq!(
+            locked_observations[1].1,
+            locked_observations[0].1 - blob_bytes,
             "secret read receives the remaining backend allowance"
         );
         assert_eq!(
-            observed[1].2,
+            locked_observations[1].2,
             ConfigExtractionLimits::default().max_secret_bytes
         );
     }

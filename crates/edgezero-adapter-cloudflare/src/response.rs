@@ -1,6 +1,10 @@
-use edgezero_core::body::Body;
+use edgezero_core::body::{Body, BodyStream};
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::Response;
+use edgezero_core::http::{HeaderMap, Response, StatusCode};
+use edgezero_core::response_egress::{
+    ResponseEgressAttempt, ResponseEgressEnvelope, ResponseEgressOutcome,
+};
+use edgezero_core::time::{Deadline, MonotonicInstant};
 use futures_util::StreamExt as _;
 use worker::{Error as WorkerError, Response as CfResponse};
 
@@ -31,16 +35,216 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
         }
     };
 
-    let mut cf_response = body_response.with_status(parts.status.as_u16());
-    let headers = cf_response.headers_mut();
-    for (name, value) in &parts.headers {
-        if let Ok(value_str) = value.to_str() {
-            headers
-                .set(name.as_str(), value_str)
-                .map_err(EdgeError::internal)?;
+    apply_response_head(body_response, parts.status, &parts.headers)
+}
+
+pub(crate) fn from_egress_response(
+    egress: ResponseEgressEnvelope,
+) -> Result<CfResponse, EdgeError> {
+    let started_at = MonotonicInstant::now();
+    let (response, policy, attempt) = egress
+        .begin(started_at)
+        .map_err(|_| EdgeError::internal(anyhow::anyhow!("response-egress policy failed")))?;
+    if policy.write_deadline.is_expired() {
+        let mut attempt = attempt;
+        attempt.terminate(
+            ResponseEgressOutcome::DeadlineExceeded,
+            MonotonicInstant::now(),
+        );
+        return deadline_response();
+    }
+
+    let (parts, body) = response.into_parts();
+    match body {
+        Body::Once(bytes) => {
+            let body_response = if bytes.is_empty() {
+                CfResponse::empty().map_err(EdgeError::internal)
+            } else {
+                CfResponse::from_bytes(bytes.to_vec()).map_err(EdgeError::internal)
+            };
+            let mut attempt = attempt;
+            let body_response = match body_response {
+                Ok(response) => response,
+                Err(error) => {
+                    attempt.terminate(
+                        ResponseEgressOutcome::ConversionError,
+                        MonotonicInstant::now(),
+                    );
+                    return Err(error);
+                }
+            };
+            let response = match apply_response_head(body_response, parts.status, &parts.headers) {
+                Ok(response) => response,
+                Err(error) => {
+                    attempt.terminate(
+                        ResponseEgressOutcome::ConversionError,
+                        MonotonicInstant::now(),
+                    );
+                    return Err(error);
+                }
+            };
+            if policy.write_deadline.is_expired() {
+                attempt.terminate(
+                    ResponseEgressOutcome::DeadlineExceeded,
+                    MonotonicInstant::now(),
+                );
+                return deadline_response();
+            }
+            attempt.terminate(
+                ResponseEgressOutcome::ResponseReturned,
+                MonotonicInstant::now(),
+            );
+            Ok(response)
+        }
+        Body::Stream(stream) => {
+            let worker_stream = response_egress_stream(stream, policy.write_deadline, attempt);
+            let response = CfResponse::from_stream(worker_stream).map_err(EdgeError::internal)?;
+            apply_response_head(response, parts.status, &parts.headers)
         }
     }
-    Ok(cf_response)
+}
+
+fn apply_response_head(
+    body_response: CfResponse,
+    status: StatusCode,
+    source_headers: &HeaderMap,
+) -> Result<CfResponse, EdgeError> {
+    let mut response = body_response.with_status(status.as_u16());
+    let headers = response.headers_mut();
+    for (name, value) in source_headers {
+        let value = value.to_str().map_err(|_| {
+            EdgeError::internal(anyhow::anyhow!(
+                "response header cannot be represented by Workers"
+            ))
+        })?;
+        headers
+            .set(name.as_str(), value)
+            .map_err(EdgeError::internal)?;
+    }
+    Ok(response)
+}
+
+fn deadline_response() -> Result<CfResponse, EdgeError> {
+    CfResponse::error("response write deadline exceeded", 504).map_err(EdgeError::internal)
+}
+
+fn response_egress_stream(
+    source: BodyStream,
+    deadline: Deadline,
+    attempt: ResponseEgressAttempt,
+) -> futures_util::stream::LocalBoxStream<'static, Result<Vec<u8>, WorkerError>> {
+    futures_util::stream::unfold(
+        (source, attempt, false, false),
+        move |(mut source, mut attempt, writing, terminal)| async move {
+            if terminal {
+                return None;
+            }
+            if deadline.is_expired() {
+                attempt.terminate(
+                    ResponseEgressOutcome::DeadlineExceeded,
+                    MonotonicInstant::now(),
+                );
+                return Some((
+                    Err(WorkerError::RustError(
+                        "response write deadline exceeded".to_owned(),
+                    )),
+                    (source, attempt, writing, true),
+                ));
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            worker::Delay::from(std::time::Duration::ZERO).await;
+
+            #[cfg(target_arch = "wasm32")]
+            let item = {
+                let Some(remaining) = deadline.remaining() else {
+                    attempt.terminate(
+                        ResponseEgressOutcome::DeadlineExceeded,
+                        MonotonicInstant::now(),
+                    );
+                    return Some((
+                        Err(WorkerError::RustError(
+                            "response write deadline exceeded".to_owned(),
+                        )),
+                        (source, attempt, writing, true),
+                    ));
+                };
+                let timer = worker::Delay::from(remaining);
+                let next = source.next();
+                match futures_util::future::select(timer, next).await {
+                    futures_util::future::Either::Left(((), _)) => {
+                        attempt.terminate(
+                            ResponseEgressOutcome::DeadlineExceeded,
+                            MonotonicInstant::now(),
+                        );
+                        return Some((
+                            Err(WorkerError::RustError(
+                                "response write deadline exceeded".to_owned(),
+                            )),
+                            (source, attempt, writing, true),
+                        ));
+                    }
+                    futures_util::future::Either::Right((item, _)) => item,
+                }
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let item = source.next().await;
+
+            if deadline.is_expired() {
+                attempt.terminate(
+                    ResponseEgressOutcome::DeadlineExceeded,
+                    MonotonicInstant::now(),
+                );
+                return Some((
+                    Err(WorkerError::RustError(
+                        "response write deadline exceeded".to_owned(),
+                    )),
+                    (source, attempt, writing, true),
+                ));
+            }
+            match item {
+                Some(Ok(bytes)) => {
+                    let writing = writing || attempt.begin_writing();
+                    let Ok(len) = u64::try_from(bytes.len()) else {
+                        attempt.terminate(
+                            ResponseEgressOutcome::TransportError,
+                            MonotonicInstant::now(),
+                        );
+                        return Some((
+                            Err(WorkerError::RustError(
+                                "response byte accounting overflow".to_owned(),
+                            )),
+                            (source, attempt, writing, true),
+                        ));
+                    };
+                    if !attempt.account_bytes(len, MonotonicInstant::now()) {
+                        return Some((
+                            Err(WorkerError::RustError(
+                                "response byte accounting failed".to_owned(),
+                            )),
+                            (source, attempt, writing, true),
+                        ));
+                    }
+                    Some((Ok(bytes.to_vec()), (source, attempt, writing, false)))
+                }
+                Some(Err(_error)) => {
+                    attempt.terminate(ResponseEgressOutcome::SourceError, MonotonicInstant::now());
+                    Some((
+                        Err(WorkerError::RustError("response source failed".to_owned())),
+                        (source, attempt, writing, true),
+                    ))
+                }
+                None => {
+                    if !writing {
+                        attempt.begin_writing();
+                    }
+                    attempt.terminate(ResponseEgressOutcome::HostHandoff, MonotonicInstant::now());
+                    None
+                }
+            }
+        },
+    )
+    .boxed_local()
 }
 
 #[cfg(test)]
