@@ -17,10 +17,12 @@ outbound response decoding. Those end when the outbound adapter returns an
 body-read deadlines are owned by the
 [inbound-body design](2026-08-22-inbound-body-design.md).
 
-Current converters do not provide this lifecycle: Axum and Fastly synchronously collect a
-core stream, Spin materializes it into `FullBody`, and Cloudflare adopts a stream without an
-absolute completion deadline or terminal observer. Returning a platform response object is
-not evidence that bytes reached the client.
+Current converters do not provide this transport lifecycle: Axum and Fastly synchronously
+collect a core stream, Spin materializes it into `FullBody`, and Cloudflare adopts a stream
+without an absolute completion deadline or terminal observer. Axum emits `ResponseReturned`
+with zero written bytes after conversion but before returning the response to Hyper. Returning
+a platform response object is not evidence that Hyper accepted it or that bytes reached the
+client.
 
 ## 2. Core contract
 
@@ -202,15 +204,21 @@ that an unobservable host send can outlive guest completion.
 
 ### 4.1 Axum
 
-Core's `Body::Stream` is non-`Send`, while Axum's erased response body requires `Send`; a
-local-executor/channel bridge is therefore required before collection can be removed. A
-timer inside `poll_frame` observes Hyper demand, not socket acceptance or flush, and cannot
-alone prove a response-write deadline. Native deadline/abort/completion claims require
-connection-level ownership that can reset or close the connection independently when the
-absolute deadline fires. Header conversion happens before commit and retains the guard until
-that connection-owned path accepts responsibility. Raw-socket tests cover a slow reader,
-disconnect before first byte, disconnect mid-body, source error, deadline while Hyper holds a
-frame without repolling, empty body, and normal EOF.
+The current Axum service emits `ResponseReturned` with zero written bytes after
+`into_axum_response` finishes but before the converted response is returned to Hyper. This is
+converter completion only: it does not observe Hyper acceptance, socket transmission, client
+receipt, disconnect, or abort. It therefore provides no evidence for any of the four
+response-egress capability cells, which remain `Unsupported`.
+
+Future Axum certification work must account for core's non-`Send` `Body::Stream` while Axum's
+erased response body requires `Send`; a local-executor/channel bridge is therefore required
+before collection can be removed. A timer inside `poll_frame` observes Hyper demand, not socket
+acceptance or flush, and cannot alone prove a response-write deadline. Native
+deadline/abort/completion claims require connection-level ownership that can reset or close the
+connection independently when the absolute deadline fires. That implementation must retain
+the guard from header conversion until the connection-owned path accepts responsibility.
+Raw-socket tests must cover a slow reader, disconnect before first byte, disconnect mid-body,
+source error, deadline while Hyper holds a frame without repolling, empty body, and normal EOF.
 
 ### 4.2 Cloudflare
 

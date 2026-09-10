@@ -7,6 +7,8 @@ use edgezero_core::app::App as EdgeZeroApp;
 use edgezero_core::{AdmissionDecision, IngressGrant, RouteResolution};
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
+const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
+const FALLBACK_INGRESS_READ_BUDGET: Duration = Duration::from_secs(5);
 const OUTBOUND_INGRESS_READ_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Eq, PartialEq)]
@@ -16,22 +18,24 @@ struct AdmissionLease {
 
 /// Installs request-lifecycle policy before any adapter begins polling a body.
 fn configure_app(app: &mut EdgeZeroApp) {
-    app.set_ingress_admission_policy(|head| {
-        let route_class =
-            if let RouteResolution::Matched(metadata) = head.route_resolution().clone() {
-                metadata.class().map(str::to_owned)
+    app.set_ingress_admission_policy(|head| match head.route_resolution().clone() {
+        RouteResolution::Matched(metadata) => {
+            let route_class = metadata.class().map(str::to_owned);
+            let read_budget = if route_class.as_deref() == Some("outbound") {
+                OUTBOUND_INGRESS_READ_BUDGET
             } else {
-                None
+                DEFAULT_INGRESS_READ_BUDGET
             };
-        let read_budget = if route_class.as_deref() == Some("outbound") {
-            OUTBOUND_INGRESS_READ_BUDGET
-        } else {
-            DEFAULT_INGRESS_READ_BUDGET
-        };
-
-        AdmissionDecision::Admit {
-            grant: IngressGrant::new(AdmissionLease { route_class }),
-            read_deadline: head.read_deadline_after(read_budget),
+            AdmissionDecision::Admit {
+                grant: IngressGrant::new(AdmissionLease { route_class }),
+                read_deadline: head.read_deadline_after(read_budget),
+            }
+        }
+        RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
+            AdmissionDecision::ReadBodyBeforeFallback {
+                max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
+                read_deadline: head.read_deadline_after(FALLBACK_INGRESS_READ_BUDGET),
+            }
         }
     });
 }
@@ -77,6 +81,12 @@ mod lifecycle_tests {
             start
                 .checked_add(Duration::from_secs(30))
                 .expect("deadline")
+        );
+
+        let fallback = begin_ingress(&app, "/missing", start);
+        assert_eq!(
+            fallback.read_deadline().instant(),
+            start.checked_add(Duration::from_secs(5)).expect("deadline")
         );
     }
 

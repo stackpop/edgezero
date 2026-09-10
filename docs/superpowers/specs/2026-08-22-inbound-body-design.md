@@ -1,7 +1,8 @@
 # EdgeZero Inbound Request-Body Design
 
-> **Status:** Draft. The ingress-admission and raw-framing requirements in §1.1-§1.3 are
-> P0 implementation gates, not optional follow-ups.
+> **Status:** Draft. Core admission, deadline-bound body handling, and adapter entry seams are
+> partially implemented. The raw-parser requirements in §1.2 are future certification criteria;
+> every current raw-ingress capability cell remains `Unsupported`.
 >
 > Extracted from the
 > [outbound-HTTP design](2026-05-21-outbound-http-design.md) so that specification stays
@@ -57,20 +58,29 @@ performs this ordered protocol exactly once per platform request:
    headers, `IngressHeadAccounting`, `IngressFraming`, adapter request metadata, public
    `request_start`, and the stable route resolution. The accounting and framing values say
    whether EdgeZero validated the raw boundary or the host owns those decisions.
-5. Invoke the one admission policy stored on `App`. It returns either `Refuse(Response)` or
-   `Admit { grant: IngressGrant, read_deadline: Deadline }`. The callback is synchronous
+5. Invoke the one admission policy stored on `App`. It returns `Refuse(Response)`,
+   `Admit { grant, read_deadline }`, or
+   `ReadBodyBeforeFallback { max_body_bytes, read_deadline }`. The callback is synchronous
    and body-blind: it can inspect the head but cannot obtain or poll the body. A refusal
    bypasses resolved dispatch, terminates the unread platform body with the strongest
    target-specific primitive, drops any policy-local resources, and converts that response
    normally.
-6. On admission, wrap the still-unread platform body with the absolute deadline and native
+6. For `Admit`, wrap the still-unread platform body with the absolute deadline and native
    cancellation owner, construct the core `Request`, and call
    `RouterService::dispatch_resolved` with the exact token from step 3. For `Matched`, the
    router constructs `RequestContext` with `request_start`, route metadata, and the
-   request-owned grant before middleware. For `MethodNotAllowed`/`NotFound`, normal 405/404
-   handling runs without middleware or a handler and the grant is dropped exactly once.
-   The wrapper is installed for `Body::Once` and `Body::Stream`; a content-type path must
-   not pre-buffer before this point.
+   request-owned grant before middleware. For `MethodNotAllowed`/`NotFound`, ordinary
+   admission retains immediate 405/404 handling without polling the body; no middleware or
+   handler runs and the grant is dropped exactly once. The wrapper is installed for
+   `Body::Once` and `Body::Stream`; a content-type path must not pre-buffer before this point.
+7. `ReadBodyBeforeFallback` is valid only for the pre-resolved `MethodNotAllowed` and
+   `NotFound` outcomes. It preserves the exact resolved token, installs the same absolute
+   deadline wrapper, and drains the body to EOF while discarding its contents. Clean EOF at or
+   below `max_body_bytes` produces the canonical 405/404; the first byte over the cap produces
+   400, and deadline expiry produces 408, both before the routing response. A zero cap accepts
+   only an empty body. This path creates an empty grant and invokes no middleware, handler, or
+   `RequestContext`; it never rematches. Returning this decision for `Matched` fails closed
+   before native body construction.
 
 Route identity is stable and structural, never a registration ordinal or randomized hash:
 
@@ -162,6 +172,10 @@ pub enum AdmissionDecision {
         grant: IngressGrant,
         read_deadline: Deadline,
     },
+    ReadBodyBeforeFallback {
+        max_body_bytes: usize,
+        read_deadline: Deadline,
+    },
     Refuse(Response),
 }
 ```
@@ -169,10 +183,11 @@ pub enum AdmissionDecision {
 The matched `RequestContext` stores the grant in an unsynchronized one-shot cell because
 extractors receive `&RequestContext`. `take_ingress_grant(&self)` removes and returns it at
 most once; a second call returns `None`. If application code never takes it, context drop
-releases it. A refusal never creates a request-owned grant. An admitted 404/405 owns the
-grant only until the resolved terminal response, then drops it. The carrier exposes no
-type-id string, serializer, or platform handle API; application code knows the concrete
-lease type it inserted.
+releases it. A refusal never creates a request-owned grant. An ordinary admitted 404/405 owns
+the grant only until the resolved terminal response, then drops it. The bounded fallback path
+uses an empty grant because no request context is created. The carrier exposes no type-id
+string, serializer, or platform handle API; application code knows the concrete lease type it
+inserted.
 
 `IngressHead::request_start()` and `RequestContext::request_start()` return the captured
 `MonotonicInstant`. Both are the same value and clock domain used by `Deadline`; neither
@@ -379,8 +394,8 @@ non-outbound capability cells to the shared capability ladder:
 | --- | --- | --- | --- | --- |
 | `ingress-admission` | Native | Native | Native | Native |
 | `inbound-read-deadlines` | Native | BestEffort until a deployed cancellation probe passes | BestEffort (synchronous host reads are not guest-preemptible) | BestEffort until host-observed cancellation is bounded |
-| `raw-ingress-head-limits` | Native after the parser-boundary work lands | Unsupported | Unsupported | Unsupported |
-| `raw-ingress-framing-validation` | Native after the parser-boundary work lands | Unsupported | Unsupported | Unsupported |
+| `raw-ingress-head-limits` | Unsupported | Unsupported | Unsupported | Unsupported |
+| `raw-ingress-framing-validation` | Unsupported | Unsupported | Unsupported | Unsupported |
 
 BestEffort implementations still use pre-read/post-ready checks and release ownership when
 expiry is observed; they do not claim a finite bound around an uninterruptible or opaque host
@@ -390,6 +405,10 @@ that requires Native support fails before startup/deploy through the same capabi
 used elsewhere. Raw head limits, raw framing, and body-read deadline are separate cells: a
 platform host may impose undocumented limits or reject malformed framing without exposing
 evidence, and may expose a cancellable body while hiding raw target/field-line bytes.
+All current standard adapters pass `IngressHeadAccounting::HostManaged` and
+`IngressFraming::HostManaged`. Axum is the first planned raw-boundary implementation, but its
+two raw capability cells remain `Unsupported` until the parser-boundary implementation and
+raw-socket evidence land.
 
 Cloudflare performs one `Delay::from(Duration::ZERO).await` cooperative yield before
 selecting the body read against its host timer. A deliberately frozen injected clock means
@@ -731,8 +750,9 @@ platform runtime or network.
 | Bounded drain | `Body::Once` and multi-chunk streams succeed at and below the cap; the first byte above the cap returns `bad_request` without unchecked accounting overflow. |
 | Successful cache | The platform stream is polled only once; repeated reads clone the same bytes. A permissive read followed by a stricter cached read returns an over-cap error while leaving the cell `Cached`; a later permissive read succeeds. |
 | Failed drain | Source error and initial-drain cap overflow transition to `Poisoned`; every later buffered accessor, `take_body`, and `into_request` reconstructs the same variant, status, message, and structured fields. The source is never polled again. |
-| Parser-level head limits | Exact-limit request targets, header bytes, and header counts pass. One byte/field over rejects before route resolution, admission, request construction, or body polling with 414/431 and redacted diagnostics. Raw accounting includes duplicate field lines and framing syntax; checked overflow fails closed. Host-normalized recounts never report `RawValidated`. |
+| Parser-level head limits (future acceptance criterion) | Exact-limit request targets, header bytes, and header counts pass at a raw parser boundary. One byte/field over rejects before route resolution, admission, request construction, or body polling with 414/431 and redacted diagnostics. Raw accounting includes duplicate field lines and framing syntax; checked overflow fails closed. Current host-normalized recounts never report `RawValidated` and do not satisfy this row. |
 | Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Route class reaches matched and 405 metadata but never changes `RouteId`. Refusal polls no body, invokes no middleware/handler, terminates the native reader, and preserves the chosen response. The default policy supplies an empty grant and one finite deadline derived from `request_start`. |
+| Bounded fallback precedence | For pre-resolved 404/405 requests, ordinary `Admit` retains no-poll routing behavior. Opt-in `ReadBodyBeforeFallback` drains a lengthless or chunked body to EOF under one absolute deadline: exact cap preserves 404/405, the first byte over returns 400 first, and expiry returns 408 first. It uses no grant, rematch, middleware, handler, or `RequestContext`; selecting it for a matched route fails before body construction. |
 | Request ingress metadata | `IngressHead` and matched `RequestContext` expose the same captured `request_start`, paired app clock, and route metadata. `take_ingress_grant()` returns the non-clone grant exactly once, then `None`; untaken, refused, 404, and 405 grants each drop exactly once. The preserved low-level context constructor exposes no route and makes no admission claim. |
 | Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline and the admitted app clock; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). A manually advanced injected clock proves the tie behavior without wall-clock sleeps. Cached success is not retroactively poisoned. |
 | Cancellation | A stream held at `Pending` leaves the cell `Draining`; dropping the first `body_bytes` future transitions it to the documented cancellation poison, and the next access returns that stored internal error. |
@@ -740,14 +760,15 @@ platform runtime or network.
 | Consumption | `take_body` and `into_request` cover Initial, Cached, Draining, Poisoned, and Taken. Initial preserves a stream; Cached reassembles `Body::Once`; Taken deliberately produces an empty body only where specified. |
 | Extraction | JSON/form success, malformed input, default caps, explicit `Within` caps, and validator failures preserve their documented 400/validation behavior. Multiple extractors share the one cache. |
 | Stored errors | `StoredError::capture` exhaustively covers all end-state `EdgeError` variants. Round-trips preserve variant fields, including `BadGatewayReason`, `BudgetSource`, `ResponseLimitReason`, and `StoreExtractionReason` plus its optional field path; `RequestTimeout` remains 408; `Internal` has the one documented source-chain loss without duplicating the `internal error:` prefix. |
-| Raw HTTP/1 framing | Axum raw-socket cases cover CL+TE in both orders, duplicate equal/unequal CL, comma-list CL, overflow/signed/malformed CL, repeated/non-final/unsupported TE, valid single CL, and valid terminal chunked framing. Rejections return 400, close the connection, invoke no admission callback, and poll no body. A `HeaderMap`-only unit test is insufficient. |
+| Raw HTTP/1 framing (future acceptance criterion) | Axum raw-socket cases cover CL+TE in both orders, duplicate equal/unequal CL, comma-list CL, overflow/signed/malformed CL, repeated/non-final/unsupported TE, valid single CL, and valid terminal chunked framing. Rejections return 400, close the connection, invoke no admission callback, and poll no body. A `HeaderMap`-only unit test is insufficient, and no current adapter satisfies this row. |
 
 Each adapter contract test supplies a body stream whose first poll is observable and
 asserts that raw validation, when supported, route resolution, and admission complete before
-that poll, while middleware and handler dispatch do not begin until after admission.
-Axum passes only validated framing variants; Cloudflare, Fastly, and Spin pass
-`IngressFraming::HostManaged`, and their tests prove admission cannot accidentally upgrade
-that value to a validated claim from normalized headers. The same adapter test
+that poll, while middleware and handler dispatch do not begin until after admission. Every
+current standard adapter, including Axum, passes `IngressHeadAccounting::HostManaged` and
+`IngressFraming::HostManaged`; their tests prove admission cannot accidentally upgrade those
+values to a validated claim from normalized headers. A future Axum raw-boundary implementation
+may pass validated variants only after the parser-boundary and raw-socket suite land. The same adapter test
 then passes the converted core request through `RequestContext`, buffers it as middleware
 would, and reassembles it through `into_request`; the outbound-facing request receives the
 cached bytes unchanged and retains the original absolute read deadline. Tests must not
@@ -782,12 +803,13 @@ Fastly tests cooperative checks without asserting preemption of a synchronous ho
   context and use checked pre-append accounting if it has not already landed through the
   outbound body work.
 - `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}` request/dispatch services: stamp
-  `request_start`, run framing validation, resolve once, and run app admission before
-  middleware/handler dispatch or body polling; stop eager collection; dispatch with the
-  opaque resolved token; and wrap each platform request body with its absolute deadline and
-  strongest available read-ownership primitive. Keep `Body::Once` only when the platform already owns bounded
-  bytes and admission has already run.
-- `crates/edgezero-adapter-axum` server connection path: enforce raw request-target/header
+  `request_start`, apply normalized defense-in-depth checks while reporting the raw boundary
+  as host-managed, resolve once, and run app admission before middleware/handler dispatch or
+  body polling; stop eager collection; dispatch with the opaque resolved token; and wrap each
+  platform request body with its absolute deadline and strongest available read-ownership
+  primitive. Keep `Body::Once` only when the platform already owns bounded bytes and admission
+  has already run.
+- Future `crates/edgezero-adapter-axum` server connection work: enforce raw request-target/header
   limits and validate raw HTTP/1 field lines before Hyper can discard framing evidence;
   reject/close on overflow or ambiguity. The normalized
   `Request<Body>` conversion is not the enforcement point.

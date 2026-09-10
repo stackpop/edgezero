@@ -45,7 +45,7 @@ impl App {
     ///
     /// # Errors
     /// Returns an internal policy error if the resulting absolute deadline cannot be
-    /// normalized safely.
+    /// normalized safely or if fallback draining is selected for a matched route.
     #[inline]
     pub fn admit_ingress(&self, head: &IngressHead) -> Result<IngressAdmissionOutcome, EdgeError> {
         match apply_admission_policy(&self.ingress_policy, head, self.monotonic_clock())? {
@@ -62,7 +62,8 @@ impl App {
     /// ownership into a core [`Request`].
     ///
     /// # Errors
-    /// Returns an internal policy error if the admission deadline cannot be normalized safely.
+    /// Returns an internal policy error if the admission deadline cannot be normalized safely
+    /// or if fallback draining is selected for a matched route.
     #[inline]
     pub fn begin_ingress(
         &self,
@@ -430,7 +431,7 @@ mod tests {
     use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
     use bytes::Bytes;
     use futures::executor::block_on;
-    use futures::stream::poll_fn;
+    use futures::stream::{iter, poll_fn};
     use tower_service::Service as _;
 
     struct DefaultHooks;
@@ -813,6 +814,190 @@ mod tests {
             observed[0].route.as_ref().map(RouteMetadata::pattern),
             Some("/upload/{id}")
         );
+    }
+
+    #[test]
+    fn fallback_body_policy_rejects_matched_routes_before_body_construction() {
+        let router = RouterService::builder()
+            .post("/upload", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            max_body_bytes: 4_096,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/upload".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+
+        assert!(matches!(
+            app.begin_ingress(head, MonotonicInstant::now()),
+            Err(EdgeError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn fallback_body_exact_cap_preserves_not_found() {
+        let mut app = App::new(empty_router());
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            max_body_bytes: 4,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/missing")
+            .body(Body::stream(iter([
+                Bytes::from_static(b"ab"),
+                Bytes::from_static(b"cd"),
+            ])))
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn fallback_body_overflow_precedes_method_not_allowed() {
+        let router = RouterService::builder()
+            .get("/known", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            max_body_bytes: 4,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(Body::stream(iter([
+                Bytes::from_static(b"abcd"),
+                Bytes::from_static(b"e"),
+            ])))
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn fallback_body_zero_cap_accepts_only_empty_body() {
+        let mut app = App::new(empty_router());
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            max_body_bytes: 0,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+
+        for (body, expected) in [
+            (Body::empty(), StatusCode::NOT_FOUND),
+            (Body::from_bytes("a"), StatusCode::BAD_REQUEST),
+        ] {
+            let request = request_builder()
+                .method(Method::POST)
+                .uri("/missing")
+                .body(body)
+                .expect("request");
+            let response = block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response");
+
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[test]
+    fn fallback_body_deadline_precedes_body_poll_and_not_found() {
+        let start = MonotonicInstant::now();
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let body = Body::stream(poll_fn(move |_| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Some(Bytes::from_static(b"a")))
+        }));
+        let mut app = App::new(empty_router());
+        app.set_monotonic_clock(MonotonicClock::new(move || start));
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            max_body_bytes: 4_096,
+            read_deadline: Deadline::at_instant(head.request_start()),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/missing")
+            .body(body)
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            start,
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn ordinary_admit_does_not_poll_fallback_bodies() {
+        let router = RouterService::builder()
+            .get("/known", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let app = App::new(router);
+
+        for (path, expected) in [
+            ("/missing", StatusCode::NOT_FOUND),
+            ("/known", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let observed_polls = Arc::clone(&body_polls);
+            let body = Body::stream(poll_fn(move |_| {
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(None::<Bytes>)
+            }));
+            let request = request_builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(body)
+                .expect("request");
+
+            let response = block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response");
+
+            assert_eq!(response.status(), expected);
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

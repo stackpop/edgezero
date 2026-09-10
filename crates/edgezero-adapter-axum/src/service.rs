@@ -345,11 +345,12 @@ mod tests {
     use edgezero_core::response_egress::{ResponseEgressObserver, ResponseEgressReport};
     use edgezero_core::router::{RouteMetadata, RouteResolution};
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
-    use futures_util::stream::poll_fn;
+    use futures_util::stream::{iter, poll_fn};
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
+    use std::time::Duration;
     use tower::ServiceExt as _;
 
     struct FixedConfigStore(String);
@@ -435,6 +436,118 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
         assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    fn fallback_body_app(max_body_bytes: usize) -> App {
+        let router = RouterService::builder()
+            .get("/known", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("handler must not run")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(move |head| match head.route_resolution() {
+            RouteResolution::Matched(_) => AdmissionDecision::Admit {
+                grant: IngressGrant::empty(),
+                read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            },
+            RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
+                AdmissionDecision::ReadBodyBeforeFallback {
+                    max_body_bytes,
+                    read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+                }
+            }
+        });
+        app
+    }
+
+    fn lengthless_request(path: &str, chunks: Vec<Bytes>) -> Request<AxumBody> {
+        let stream = iter(chunks.into_iter().map(Ok::<Bytes, io::Error>));
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(AxumBody::from_stream(stream))
+            .expect("request");
+        assert!(request.headers().get("content-length").is_none());
+        request
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fallback_preserves_404_and_405_at_exact_cap() {
+        let service = EdgeZeroAxumService::from_app(fallback_body_app(4));
+        for (path, expected) in [
+            ("/missing", StatusCode::NOT_FOUND),
+            ("/known", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let request = lengthless_request(
+                path,
+                vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
+            );
+            let response = service
+                .clone()
+                .ready()
+                .await
+                .expect("ready")
+                .call(request)
+                .await
+                .expect("response");
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fallback_overflow_precedes_404_and_405() {
+        let service = EdgeZeroAxumService::from_app(fallback_body_app(4));
+        for path in ["/missing", "/known"] {
+            let request = lengthless_request(
+                path,
+                vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"e")],
+            );
+            let response = service
+                .clone()
+                .ready()
+                .await
+                .expect("ready")
+                .call(request)
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fallback_deadline_interrupts_pending_native_body() {
+        let start = MonotonicInstant::now();
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || start));
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            max_body_bytes: 4_096,
+            read_deadline: head.read_deadline_after(Duration::from_millis(10)),
+        });
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/missing")
+            .body(native_body)
+            .expect("request");
+
+        let response = timeout(
+            Duration::from_secs(1),
+            service.ready().await.expect("ready").call(request),
+        )
+        .await
+        .expect("fallback deadline must wake the pending body");
+
+        assert_eq!(
+            response.expect("response").status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert!(body_polls.load(Ordering::SeqCst) > 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

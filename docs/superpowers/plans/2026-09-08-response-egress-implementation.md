@@ -2,9 +2,14 @@
 
 > **Status:** Partially implemented in PR #275. Core policy, reports, completion guards,
 > dispatch metadata, converter-level deadlines/fallback reporting, and capability cells are
-> implemented. Transport-observable abort, backpressure, completion, write deadlines, and
-> deployed probes remain open; all four capability cells stay `Unsupported`. Source of truth:
+> implemented. Axum currently emits `ResponseReturned` after conversion but before returning
+> the response to Hyper, so it is not transport acceptance or completion evidence.
+> Transport-observable abort, backpressure, completion, write deadlines, and deployed probes
+> remain open; all four capability cells stay `Unsupported`. Source of truth:
 > [response-egress design](../specs/2026-09-08-response-egress-design.md).
+>
+> Checkboxes record implementation status. Mixed converter/transport-certification tasks stay
+> unchecked until every assertion in that task has named evidence.
 
 **Goal:** Make client-response conversion and delivery observable and deadline-bounded where
 platform APIs permit, with backpressure, native abort, and one terminal report.
@@ -34,50 +39,54 @@ service handoff preserves the original request metadata.
 
 **Files:** new `crates/edgezero-core/src/response_egress.rs`, `lib.rs`, app configuration.
 
-- [ ] Write red tests for the 30-second default, immediate expiry, checked
+- [x] Write red tests for the 30-second default, immediate expiry, checked
   `egress_started_at + DEADLINE_FAR_FUTURE` clamping, checked-add overflow failure, all
   `ResponseEgressOutcome` variants, report accessors, and observer object safety.
-- [ ] Write red state tests for `Initial -> Writing -> Completed`, every failure from both
+- [x] Write red state tests for `Initial -> Writing -> Completed`, every failure from both
   nonterminal states, terminal-signal races, guard drop, disarm, and exactly one callback.
-- [ ] Write red accounting tests for zero/exact bytes and checked `u64` overflow. Inject a
+- [x] Write red accounting tests for zero/exact bytes and checked `u64` overflow. Inject a
   backwards clock and assert zero elapsed plus `Unspecified`, one notification, and a log.
-- [ ] Add `ResponseEgressPolicy`, body-blind immutable head accessors, outcome/report,
+- [x] Add `ResponseEgressPolicy`, body-blind immutable head accessors, outcome/report,
   observer handle,
   and a public, non-clone, adapter-facing completion guard (optionally `#[doc(hidden)]`). Keep
   observer payload bounded and body/header-free.
-- [ ] Run `cargo test -p edgezero-core --lib response_egress`.
+- [x] Run `cargo test -p edgezero-core --lib response_egress`.
 
 ## Task 2: Preserve request metadata through dispatch
 
 **Files:** core router/service result, adapter request services, context tests.
 
-- [ ] Write red tests proving response policy sees the ingress-captured request start and
+- [x] Write red tests proving response policy sees the ingress-captured request start and
   canonical registered route pattern, never a dynamic path or a newly sampled start.
-- [ ] Add an internal dispatch envelope carrying `Response`, request start, optional route
+- [x] Add an internal dispatch envelope carrying `Response`, request start, optional route
   metadata, and the app's policy/observer handles to the adapter converter boundary.
-- [ ] Keep public handler return types unchanged; the envelope is service plumbing, not an
+- [x] Keep public handler return types unchanged; the envelope is service plumbing, not an
   application response type.
-- [ ] Ensure 404/405 and converted `EdgeError` responses also create one egress attempt.
-- [ ] Run core router/service tests.
+- [x] Ensure 404/405 and converted `EdgeError` responses also create one egress attempt.
+- [x] Run core router/service tests.
 
 ## Task 3: Shared converter contract and capability cells
 
 **Files:** `edgezero-adapter` registry/contracts, core manifest, CLI enforcement, docs.
 
-- [ ] Write red parse/display/round-trip tests for `response-egress-abort`,
+- [x] Write red parse/display/round-trip tests for `response-egress-abort`,
   `response-egress-backpressure`, `response-egress-completion`, and
   `response-write-deadlines`.
-- [ ] Write red build/serve/deploy/demo tests that fail closed when an app requires Native
+- [x] Write red build/serve/deploy/demo tests that fail closed when an app requires Native
   and the selected target advertises BestEffort/Unsupported.
-- [ ] Add the exact initial matrix from the spec. Keep cells separate so one target can
+- [x] Add the exact initial matrix from the spec. Keep cells separate so one target can
   expose pull backpressure without claiming observable finish.
 - [ ] Define adapter contract fixtures for source, sink, timer, commit, abort, disconnect,
   and completion observation without introducing a runtime into core.
 - [ ] Run manifest, registry, and CLI capability tests.
 
-## Task 4: Axum streaming egress
+## Task 4: Future Axum transport-egress certification
 
 **Files:** `edgezero-adapter-axum/src/response.rs`, service wiring, integration tests.
+
+Current Axum behavior stops at `ResponseReturned` after conversion and before returning the
+response to Hyper. The work below is required before any of the four capability cells can be
+promoted from `Unsupported`.
 
 - [ ] Write red body-wrapper tests: no second source poll while one chunk is pending;
   independent timer wake; first-byte/inter-chunk/finish deadline; exact byte count; source
@@ -92,7 +101,9 @@ service handoff preserves the original request metadata.
   response-write-deadline evidence.
 - [ ] Define and test the header commit point. Conversion/deadline failure before commit may
   use the minimal fallback response; after commit it emits a body error/resets instead.
-- [ ] Mark Axum Native only after all local integration tests pass.
+- [ ] Promote each Axum capability separately only after its connection-level behavior and
+  named raw-socket evidence satisfy the corresponding row in the design. Local conversion
+  tests alone cannot promote any cell.
 - [ ] Run `cargo test -p edgezero-adapter-axum --all-targets`.
 
 ## Task 5: Cloudflare stream wrapper and deployed probe
@@ -122,10 +133,11 @@ service handoff preserves the original request metadata.
   `ConversionError`, `SourceError`, or `DeadlineExceeded` as appropriate and fire once.
 - [ ] Refactor collection into shared per-adapter helpers with one absolute converter
   deadline. Drop partial buffers/source on failure.
-- [ ] Keep response delivery/abort/backpressure/completion cells Unsupported. Document that
-  successful host response construction emits `ResponseReturned` with zero bytes exactly
-  once, never `HostHandoff` or `Completed`; this preserves observer cardinality without
-  claiming host acceptance or an unobservable client finish.
+- [ ] Keep `response-egress-abort`, `response-egress-backpressure`,
+  `response-egress-completion`, and `response-write-deadlines` Unsupported. Document that
+  successful host response construction emits `ResponseReturned` with zero bytes exactly once,
+  never `HostHandoff` or `Completed`; this preserves observer cardinality without claiming host
+  acceptance or an unobservable client finish.
 - [ ] Run Fastly and Spin unit/contract suites plus Spin's WASM build.
 
 ## Task 7: Cross-adapter lifecycle tests and documentation

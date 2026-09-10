@@ -15,6 +15,8 @@ use edgezero_core::app::App as EdgeZeroApp;
 use edgezero_core::{AdmissionDecision, IngressGrant, RouteResolution};
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
+const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
+const FALLBACK_INGRESS_READ_BUDGET: Duration = Duration::from_secs(5);
 const OUTBOUND_INGRESS_READ_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Eq, PartialEq)]
@@ -32,22 +34,24 @@ pub struct DemoState {
 
 /// Installs request-lifecycle policy before any adapter begins polling a body.
 fn configure_app(app: &mut EdgeZeroApp) {
-    app.set_ingress_admission_policy(|head| {
-        let route_class =
-            if let RouteResolution::Matched(metadata) = head.route_resolution().clone() {
-                metadata.class().map(str::to_owned)
+    app.set_ingress_admission_policy(|head| match head.route_resolution().clone() {
+        RouteResolution::Matched(metadata) => {
+            let route_class = metadata.class().map(str::to_owned);
+            let read_budget = if route_class.as_deref() == Some("outbound") {
+                OUTBOUND_INGRESS_READ_BUDGET
             } else {
-                None
+                DEFAULT_INGRESS_READ_BUDGET
             };
-        let read_budget = if route_class.as_deref() == Some("outbound") {
-            OUTBOUND_INGRESS_READ_BUDGET
-        } else {
-            DEFAULT_INGRESS_READ_BUDGET
-        };
-
-        AdmissionDecision::Admit {
-            grant: IngressGrant::new(AdmissionLease { route_class }),
-            read_deadline: head.read_deadline_after(read_budget),
+            AdmissionDecision::Admit {
+                grant: IngressGrant::new(AdmissionLease { route_class }),
+                read_deadline: head.read_deadline_after(read_budget),
+            }
+        }
+        RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
+            AdmissionDecision::ReadBodyBeforeFallback {
+                max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
+                read_deadline: head.read_deadline_after(FALLBACK_INGRESS_READ_BUDGET),
+            }
         }
     });
 }
@@ -80,13 +84,15 @@ edgezero_core::app!(
 
 #[cfg(test)]
 mod lifecycle_tests {
+    use bytes::Bytes;
     use edgezero_core::app::{App as EdgeZeroApp, Hooks as _};
     use edgezero_core::body::Body;
-    use edgezero_core::http::{request_builder, HeaderMap, Method, Version};
+    use edgezero_core::http::{request_builder, HeaderMap, Method, StatusCode, Version};
     use edgezero_core::ingress::{IngressBeginOutcome, IngressHeadParts};
     use edgezero_core::router::RouteResolution;
     use edgezero_core::time::MonotonicInstant;
     use futures::executor::block_on;
+    use futures::stream::iter;
     use std::time::Duration;
 
     #[test]
@@ -118,6 +124,12 @@ mod lifecycle_tests {
                 .checked_add(Duration::from_secs(30))
                 .expect("deadline")
         );
+
+        let fallback = begin_ingress(&app, "/missing", start);
+        assert_eq!(
+            fallback.read_deadline().instant(),
+            start.checked_add(Duration::from_secs(5)).expect("deadline")
+        );
     }
 
     #[test]
@@ -137,6 +149,51 @@ mod lifecycle_tests {
         let payload: serde_json::Value = response.body().to_json().expect("json");
         assert_eq!(payload["route_class"], "diagnostic");
         assert_eq!(payload["grant_consumed_once"], true);
+    }
+
+    #[test]
+    fn configured_admission_bounds_fallback_bodies() {
+        let app = super::App::build_app();
+        for (method, path, chunks, expected) in [
+            (
+                Method::POST,
+                "/missing",
+                vec![Bytes::from(vec![b'a'; 4_096])],
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/",
+                vec![Bytes::from(vec![b'a'; 4_096])],
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::POST,
+                "/missing",
+                vec![Bytes::from(vec![b'a'; 4_096]), Bytes::from_static(b"b")],
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::POST,
+                "/",
+                vec![Bytes::from(vec![b'a'; 4_096]), Bytes::from_static(b"b")],
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let request = request_builder()
+                .method(method)
+                .uri(path)
+                .body(Body::stream(iter(chunks)))
+                .expect("request");
+            let response = block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                edgezero_core::IngressHeadAccounting::HostManaged,
+                edgezero_core::IngressFraming::HostManaged,
+            ))
+            .expect("dispatch");
+            assert_eq!(response.status(), expected);
+        }
     }
 
     fn begin_ingress(
