@@ -79,10 +79,23 @@ pub enum AdmissionDecision {
         grant: IngressGrant,
         read_deadline: Deadline,
     },
+    /// Drains an unmatched or wrong-method request body before returning the canonical
+    /// pre-resolved 404/405 response.
+    ReadBodyBeforeFallback {
+        max_body_bytes: usize,
+        read_deadline: Deadline,
+    },
     Refuse(Response),
 }
 
-/// Validated admission result consumed by an adapter.
+enum IngressDispatchDisposition {
+    Dispatch,
+    ReadBodyBeforeFallback { max_body_bytes: usize },
+}
+
+/// Validated policy outcome consumed by an adapter before native body ownership moves.
+///
+/// `Admitted` includes both normal routed dispatch and an opt-in bounded fallback drain.
 #[non_exhaustive]
 pub enum IngressAdmissionOutcome {
     Admitted(AdmittedIngress),
@@ -96,9 +109,10 @@ pub enum IngressBeginOutcome {
     Refused(ResponseEgressEnvelope),
 }
 
-/// Proof that the application admitted one request with a finite read deadline.
+/// Proof that the application selected one request disposition with a finite read deadline.
 pub struct AdmittedIngress {
     config_extraction_limits: ConfigExtractionLimits,
+    dispatch_disposition: IngressDispatchDisposition,
     grant: IngressGrant,
     monotonic_clock: MonotonicClock,
     read_deadline: Deadline,
@@ -106,6 +120,15 @@ pub struct AdmittedIngress {
 }
 
 impl AdmittedIngress {
+    pub(crate) fn fallback_body_limit(&self) -> Option<usize> {
+        match self.dispatch_disposition {
+            IngressDispatchDisposition::Dispatch => None,
+            IngressDispatchDisposition::ReadBodyBeforeFallback { max_body_bytes } => {
+                Some(max_body_bytes)
+            }
+        }
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -544,30 +567,50 @@ pub(crate) fn apply_admission_policy(
     head: &IngressHead,
     monotonic_clock: MonotonicClock,
 ) -> Result<IngressAdmissionOutcome, EdgeError> {
-    match policy(head) {
-        AdmissionDecision::Refuse(response) => Ok(IngressAdmissionOutcome::Refused(response)),
+    let (grant, read_deadline, dispatch_disposition) = match policy(head) {
+        AdmissionDecision::Refuse(response) => {
+            return Ok(IngressAdmissionOutcome::Refused(response));
+        }
         AdmissionDecision::Admit {
             grant,
             read_deadline,
+        } => (grant, read_deadline, IngressDispatchDisposition::Dispatch),
+        AdmissionDecision::ReadBodyBeforeFallback {
+            max_body_bytes,
+            read_deadline,
         } => {
-            let maximum = head
-                .request_start()
-                .checked_add(DEADLINE_FAR_FUTURE)
-                .ok_or_else(|| {
-                    EdgeError::internal(anyhow::anyhow!(
-                        "ingress admission deadline arithmetic overflow"
-                    ))
-                })?;
-            let deadline = Deadline::at_instant(read_deadline.instant().min(maximum));
-            Ok(IngressAdmissionOutcome::Admitted(AdmittedIngress {
-                config_extraction_limits: ConfigExtractionLimits::default(),
-                grant,
-                monotonic_clock,
-                read_deadline: deadline,
-                request_start: head.request_start(),
-            }))
+            match head.route_resolution() {
+                RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound => {}
+                RouteResolution::Matched(_) => {
+                    return Err(EdgeError::internal(anyhow::anyhow!(
+                        "fallback body policy requires an unmatched or wrong-method route"
+                    )));
+                }
+            }
+            (
+                IngressGrant::empty(),
+                read_deadline,
+                IngressDispatchDisposition::ReadBodyBeforeFallback { max_body_bytes },
+            )
         }
-    }
+    };
+    let maximum = head
+        .request_start()
+        .checked_add(DEADLINE_FAR_FUTURE)
+        .ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!(
+                "ingress admission deadline arithmetic overflow"
+            ))
+        })?;
+    let deadline = Deadline::at_instant(read_deadline.instant().min(maximum));
+    Ok(IngressAdmissionOutcome::Admitted(AdmittedIngress {
+        config_extraction_limits: ConfigExtractionLimits::default(),
+        dispatch_disposition,
+        grant,
+        monotonic_clock,
+        read_deadline: deadline,
+        request_start: head.request_start(),
+    }))
 }
 
 fn require_nonzero(name: &str, value: u64) -> Result<(), EdgeError> {

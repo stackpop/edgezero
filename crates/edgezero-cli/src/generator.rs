@@ -1379,6 +1379,12 @@ mod tests {
             core_lib.contains("IngressGrant::new"),
             "generated admission policy must issue an app-owned grant",
         );
+        assert!(
+            core_lib.contains("AdmissionDecision::ReadBodyBeforeFallback")
+                && core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
+                && core_lib.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES"),
+            "generated admission policy must bound bodies before 404/405 fallback",
+        );
 
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");

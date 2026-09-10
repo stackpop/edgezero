@@ -44,9 +44,33 @@ Cloudflare and Spin enforce absolute checks around host reads but require deploy
 probes before their cancellation latency can be bounded. Fastly cannot preempt a synchronous
 host body read. Those limitations keep their deadline cells at `BestEffort`.
 
-The adapters perform defensive checks on the normalized request information they receive.
-Those checks do not prove parser-boundary accounting or ambiguous HTTP/1 framing rejection,
-so neither raw-ingress capability is currently available on any adapter.
+All current adapters expose `IngressHeadAccounting::HostManaged` and
+`IngressFraming::HostManaged`. They perform defensive checks on the normalized request
+information they receive, but those checks do not prove parser-boundary accounting or
+ambiguous HTTP/1 framing rejection. Neither raw-ingress capability is currently available on
+any adapter.
+
+Admission is body-blind. An application may opt into `ReadBodyBeforeFallback` for pre-resolved
+404/405 requests when it needs body-limit precedence: clean EOF at or below the selected cap
+retains the canonical 404/405, the first byte over returns 400 first, and expiration of the one
+absolute read deadline returns 408 first. This path discards the body and invokes no route
+middleware or handler. Ordinary admission retains the immediate, no-poll 404/405 behavior.
+
+## Response Egress Matrix
+
+| Capability                     | Axum        | Cloudflare  | Fastly      | Spin        |
+| ------------------------------ | ----------- | ----------- | ----------- | ----------- |
+| `response-egress-abort`        | Unsupported | Unsupported | Unsupported | Unsupported |
+| `response-egress-backpressure` | Unsupported | Unsupported | Unsupported | Unsupported |
+| `response-egress-completion`   | Unsupported | Unsupported | Unsupported | Unsupported |
+| `response-write-deadlines`     | Unsupported | Unsupported | Unsupported | Unsupported |
+
+These cells describe transport-observable client-response delivery, not response conversion.
+Axum currently emits `ResponseReturned` with zero written bytes after conversion and before
+returning the response to Hyper. It does not observe Hyper acceptance, socket transmission,
+disconnect, abort, or client completion. The other adapters likewise expose no proved
+transport completion boundary. Converter caps and deadline checks remain useful, but they do
+not satisfy these capabilities; whole-response-lifetime certification remains blocked.
 
 ## Outbound Matrix
 

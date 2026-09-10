@@ -596,7 +596,7 @@ fn check_read_deadline(
     Ok(())
 }
 
-async fn drain_body(
+pub(crate) async fn drain_body(
     body: Body,
     max: usize,
     deadline: Option<Deadline>,
@@ -626,6 +626,43 @@ async fn drain_body(
                     return Err(EdgeError::bad_request("request body too large"));
                 }
                 buffered.extend_from_slice(&chunk);
+            }
+        }
+    }
+}
+
+pub(crate) async fn drain_body_discard(
+    body: Body,
+    max: usize,
+    deadline: Option<Deadline>,
+    monotonic_clock: &MonotonicClock,
+) -> Result<(), EdgeError> {
+    check_read_deadline(deadline, monotonic_clock)?;
+    match body {
+        Body::Once(bytes) => {
+            check_read_deadline(deadline, monotonic_clock)?;
+            if bytes.len() > max {
+                return Err(EdgeError::bad_request("request body too large"));
+            }
+            Ok(())
+        }
+        Body::Stream(mut stream) => {
+            let mut consumed = 0_usize;
+            loop {
+                check_read_deadline(deadline, monotonic_clock)?;
+                let next = stream.next().await;
+                // Deadline wins a simultaneous body/error/EOF observation.
+                check_read_deadline(deadline, monotonic_clock)?;
+                let Some(result) = next else {
+                    return Ok(());
+                };
+                let chunk = result?;
+                consumed = consumed.checked_add(chunk.len()).ok_or_else(|| {
+                    EdgeError::bad_request("request body size accounting overflow")
+                })?;
+                if consumed > max {
+                    return Err(EdgeError::bad_request("request body too large"));
+                }
             }
         }
     }

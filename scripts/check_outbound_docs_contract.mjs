@@ -69,6 +69,36 @@ const expectedOutboundRows = [
     'BestEffort',
   ],
 ]
+const expectedResponseEgressRows = [
+  [
+    'response-egress-abort',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+  ],
+  [
+    'response-egress-backpressure',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+  ],
+  [
+    'response-egress-completion',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+  ],
+  [
+    'response-write-deadlines',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+  ],
+]
 
 function fail(message) {
   process.stderr.write(`outbound docs contract: ${message}\n`)
@@ -105,13 +135,28 @@ try {
 }
 
 const lines = capabilitySource.split(/\r?\n/u)
-const headerIndices = lines
-  .map((line, index) => ({ index, row: cells(line) }))
-  .filter(({ row }) => JSON.stringify(row) === JSON.stringify(expectedHeader))
-  .map(({ index }) => index)
 
-if (headerIndices.length !== 2) {
-  fail(`expected exactly two capability matrices, found ${headerIndices.length}`)
+function findMatrixHeader(sectionTitle, name) {
+  const headingIndex = lines.findIndex(
+    (line) => line.trim() === `## ${sectionTitle}`,
+  )
+  if (headingIndex === -1) {
+    fail(`${name} capability section is missing`)
+  }
+  const nextHeadingIndex = lines.findIndex(
+    (line, index) => index > headingIndex && line.startsWith('## '),
+  )
+  const sectionEnd = nextHeadingIndex === -1 ? lines.length : nextHeadingIndex
+  const headerIndex = lines.findIndex(
+    (line, index) =>
+      index > headingIndex &&
+      index < sectionEnd &&
+      JSON.stringify(cells(line)) === JSON.stringify(expectedHeader),
+  )
+  if (headerIndex === -1) {
+    fail(`${name} capability matrix is missing`)
+  }
+  return headerIndex
 }
 
 function readMatrix(headerIndex, name) {
@@ -140,8 +185,24 @@ function readMatrix(headerIndex, name) {
 }
 
 const matrices = [
-  ['ingress', expectedIngressRows, readMatrix(headerIndices[0], 'ingress')],
-  ['outbound', expectedOutboundRows, readMatrix(headerIndices[1], 'outbound')],
+  [
+    'ingress',
+    expectedIngressRows,
+    readMatrix(findMatrixHeader('Ingress Matrix', 'ingress'), 'ingress'),
+  ],
+  [
+    'response egress',
+    expectedResponseEgressRows,
+    readMatrix(
+      findMatrixHeader('Response Egress Matrix', 'response egress'),
+      'response egress',
+    ),
+  ],
+  [
+    'outbound',
+    expectedOutboundRows,
+    readMatrix(findMatrixHeader('Outbound Matrix', 'outbound'), 'outbound'),
+  ],
 ]
 for (const [name, expectedRows, actualRows] of matrices) {
   if (JSON.stringify(actualRows) !== JSON.stringify(expectedRows)) {

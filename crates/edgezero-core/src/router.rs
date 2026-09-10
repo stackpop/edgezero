@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use matchit::Router as PathRouter;
 use tower_service::Service;
 
-use crate::context::RequestContext;
+use crate::context::{RequestContext, drain_body_discard};
 use crate::error::EdgeError;
 use crate::handler::{BoxHandler, IntoHandler, IntrospectionNeeds};
 use crate::http::{Extensions, HandlerFuture, Method, Request, Response};
@@ -494,18 +494,45 @@ impl RouterService {
 
         match resolved.target {
             ResolvedTarget::Found(entry, params) => {
+                if ingress.fallback_body_limit().is_some() {
+                    return Err(EdgeError::internal(anyhow::anyhow!(
+                        "fallback body policy cannot dispatch a matched route"
+                    )));
+                }
                 self.inner
                     .dispatch_found(request, &entry, params, Some(ingress))
                     .await
             }
             ResolvedTarget::MethodNotAllowed(allowed) => {
+                if let Some(max_body_bytes) = ingress.fallback_body_limit() {
+                    let monotonic_clock = ingress.monotonic_clock();
+                    drain_body_discard(
+                        request.into_body(),
+                        max_body_bytes,
+                        Some(ingress.read_deadline()),
+                        &monotonic_clock,
+                    )
+                    .await?;
+                }
                 let methods = allowed
                     .iter()
                     .map(|metadata| metadata.method().clone())
                     .collect::<Vec<_>>();
-                Err(EdgeError::method_not_allowed(request.method(), &methods))
+                Err(EdgeError::method_not_allowed(&resolved.method, &methods))
             }
-            ResolvedTarget::NotFound => Err(EdgeError::not_found(resolved.path)),
+            ResolvedTarget::NotFound => {
+                if let Some(max_body_bytes) = ingress.fallback_body_limit() {
+                    let monotonic_clock = ingress.monotonic_clock();
+                    drain_body_discard(
+                        request.into_body(),
+                        max_body_bytes,
+                        Some(ingress.read_deadline()),
+                        &monotonic_clock,
+                    )
+                    .await?;
+                }
+                Err(EdgeError::not_found(resolved.path))
+            }
         }
     }
 
