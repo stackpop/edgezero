@@ -541,6 +541,9 @@ pub struct ManifestHttpTrigger {
     #[serde(rename = "body-mode")]
     #[serde(default)]
     pub body_mode: Option<BodyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(length(min = 1_u64))]
+    pub class: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub description: Option<String>,
@@ -3130,6 +3133,7 @@ ids = ["default"]
         let manifest = r#"
 [[triggers.http]]
 id = "route-1"
+class = "auction"
 path = "/api/users"
 methods = ["GET", "POST"]
 handler = "handlers::users"
@@ -3140,6 +3144,7 @@ body-mode = "buffered"
         let loader = ManifestLoader::load_from_str(manifest);
         let trigger = &loader.manifest().triggers.http[0];
         assert_eq!(trigger.id.as_deref(), Some("route-1"));
+        assert_eq!(trigger.class.as_deref(), Some("auction"));
         assert_eq!(trigger.path, "/api/users");
         assert_eq!(trigger.methods(), vec!["GET", "POST"]);
         assert_eq!(trigger.handler.as_deref(), Some("handlers::users"));
@@ -3149,6 +3154,19 @@ body-mode = "buffered"
             Some("User management endpoint")
         );
         assert_eq!(trigger.body_mode, Some(BodyMode::Buffered));
+    }
+
+    #[test]
+    fn http_trigger_rejects_empty_route_class() {
+        let manifest = r#"
+[[triggers.http]]
+class = ""
+path = "/api/users"
+"#;
+        let error = ManifestLoader::try_load_from_str(manifest)
+            .err()
+            .expect("an empty route class must fail validation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     // -- Secret store config -----------------------------------------------

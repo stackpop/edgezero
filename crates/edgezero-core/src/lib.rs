@@ -90,7 +90,7 @@ pub use response_egress::{
     ResponseEgressReport, default_response_egress_policy,
 };
 pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
-pub use time::{Deadline, DispatchBudget, MonotonicInstant, dispatch_budget};
+pub use time::{Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
 
 #[cfg(test)]
 mod public_config_extraction_contract_tests {

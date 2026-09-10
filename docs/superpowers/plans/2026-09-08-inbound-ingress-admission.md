@@ -45,13 +45,15 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
 **Files:** `crates/edgezero-core/src/router.rs`, route tests, public re-exports.
 
 - [ ] Write red tests for structural `RouteId(method, registered_pattern)`, dynamic path
-  independence, deterministic 405 candidates, and `NotFound`.
+  independence, optional manifest route class on matched/405 metadata, deterministic 405
+  candidates, and `NotFound`.
 - [ ] Write red tests proving `resolve` executes no middleware/handler/body poll and captures
   exact path params.
 - [ ] Write red tests proving `dispatch_resolved` does not rematch, consumes its token, and
   rejects a foreign-router token or changed method/path as `Internal`.
-- [ ] Add `RouteId`, `RouteMetadata`, `RouteResolution`, opaque `ResolvedDispatch`,
-  `RouterService::resolve`, and `dispatch_resolved` exactly as specified.
+- [ ] Add `RouteId`, class-bearing `RouteMetadata`, `RouteResolution`, opaque
+  `ResolvedDispatch`, `RouterService::resolve`, `RouterBuilder::route_with_class`, and
+  `dispatch_resolved` exactly as specified. Route class must not enter `RouteId`.
 - [ ] Run `cargo test -p edgezero-core --lib router`.
 
 ## Task 2: App admission policy, parser limits, and normalized ingress head
@@ -65,6 +67,8 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
   middleware/handler/body polling and retains the chosen response.
 - [ ] Add the synchronous policy and immutable head-limit setters on `App`; preserve both
   through complete app-to-service construction rather than cloning only `app.router()`.
+- [ ] Add the cloneable app-owned `MonotonicClock`, its setter/snapshot accessors, and tests
+  proving admission retains that exact handle rather than resnapshotting a global clock.
 - [ ] Add the default decision: empty grant plus
   `request_start + DEFAULT_INBOUND_READ_BUDGET` (30 seconds). Clamp every policy deadline
   to `request_start + DEADLINE_FAR_FUTURE` with checked arithmetic; reject overflow or an
@@ -76,13 +80,13 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
 **Files:** `crates/edgezero-core/src/context.rs`, router/context tests.
 
 - [ ] Write red tests proving `IngressHead` and routed `RequestContext` expose the identical
-  `MonotonicInstant` and `RouteMetadata` values.
+  `MonotonicInstant`, paired `MonotonicClock`, and class-bearing `RouteMetadata` values.
 - [ ] Write red drop-count tests for taken, untaken, refused, 404, and 405 grants. A second
   `take_ingress_grant()` returns `None`; no grant type is clonable or serialized.
 - [ ] Preserve `RequestContext::new(Request, PathParams)`: snapshot start at construction,
   expose no route, return no grant, and make no admission claim.
 - [ ] Add a crate-private routed constructor consuming `AdmittedIngress`; initialize all
-  metadata before middleware starts.
+  metadata and the admitted clock before middleware starts.
 - [ ] Run `cargo test -p edgezero-core --lib context`.
 
 ## Task 4: Lazy body cell, bounded extractors, and absolute deadline
@@ -92,7 +96,8 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
 - [ ] Write red state-machine tests for `Initial`, `Draining`, `Cached`, `Poisoned`, and
   `Taken`, including reentrancy and dropped-drain poison.
 - [ ] Write red deadline races for first byte, inter-chunk waits, EOF, source error, and
-  simultaneous readiness. Expiry wins and remains sticky as `RequestTimeout` (408).
+  simultaneous readiness using the admitted clock. Expiry wins and remains sticky as
+  `RequestTimeout` (408).
 - [ ] Write red cap tests for exact limit, first byte over, checked accounting overflow, and
   stricter re-check of already cached bytes without poisoning the cache.
 - [ ] Implement private `BodyCell`/`StoredError`, no borrow across await, and fallible
@@ -139,12 +144,14 @@ setup/request conversion, raw-socket integration tests.
 **Files:** each adapter request/service entry point and contract tests.
 
 - [ ] Write per-adapter ordering tests with an observable first body poll.
-- [ ] Stamp `request_start` at earliest guest entry, pass `HostManaged` framing, attach
+- [ ] Stamp `request_start` from `App::monotonic_now()` at earliest guest entry, pass
+  `HostManaged` framing, attach
   `IngressHeadAccounting::HostManaged`, apply only documented post-materialization
   defense-in-depth limits, invoke policy once, and preserve the resolved token through
   dispatch.
-- [ ] Implement pre-read/post-ready deadline checks and the strongest available drop/abort
-  primitive. Do not claim preemption around synchronous host calls.
+- [ ] Implement pre-read/post-ready deadline checks against the admitted app clock and the
+  strongest available drop/abort primitive. Do not claim preemption around synchronous
+  host calls.
 - [ ] Prove buffered provider values enter as `Body::Once` only after admission and within a
   documented platform bound; all other paths use lazy `Body::Stream`.
 - [ ] Run each adapter's contract suite, including its WASM target where applicable.
@@ -160,8 +167,10 @@ setup/request conversion, raw-socket integration tests.
   deploy/demo behavior for Native requirements.
 - [ ] Update manifest-generated and hand-written app construction so both retain admission
   policy; keep low-level `into_router()` explicit about its lack of adapter admission.
-- [ ] Add Cloudflare and Spin deployed cancellation probes and Fastly cooperative timing
-  evidence. Store machine-readable target/runtime/version/tolerance results.
+- [ ] Keep Cloudflare's pre-select cooperative zero-delay yield, document the frozen-clock
+  caveat, add Cloudflare and Spin deployed cancellation probes, and retain Fastly
+  cooperative timing evidence. Store machine-readable target/runtime/version/tolerance
+  results.
 - [ ] Update adapter capability docs without upgrading a cell from local mocks alone.
 
 ## Task 8: Final verification and integration boundary

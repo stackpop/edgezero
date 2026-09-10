@@ -148,8 +148,8 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 
     #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
+        let request_start = self.app.monotonic_now();
         let app = Arc::clone(&self.app);
-        let request_start = MonotonicInstant::now();
         // Hard-cutoff: legacy bare `KvHandle` /
         // `ConfigStoreHandle` / `SecretHandle` entries are NO
         // LONGER inserted into request extensions. The legacy
@@ -215,11 +215,15 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
                         }
                     };
                     let read_deadline = prepared.read_deadline();
-                    let mut core_request =
-                        match into_core_request_parts(parts, native_body, Some(read_deadline)) {
-                            Ok(converted) => converted,
-                            Err(err) => return minimal_error_response(err),
-                        };
+                    let monotonic_clock = prepared.monotonic_clock();
+                    let mut core_request = match into_core_request_parts(
+                        parts,
+                        native_body,
+                        Some((read_deadline, monotonic_clock)),
+                    ) {
+                        Ok(converted) => converted,
+                        Err(err) => return minimal_error_response(err),
+                    };
 
                     if let Some(registry) = config_registry {
                         core_request.extensions_mut().insert(registry);
@@ -340,7 +344,7 @@ mod tests {
     use edgezero_core::key_value_store::KvStore;
     use edgezero_core::response_egress::{ResponseEgressObserver, ResponseEgressReport};
     use edgezero_core::router::{RouteMetadata, RouteResolution};
-    use edgezero_core::time::Deadline;
+    use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures_util::stream::poll_fn;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -472,9 +476,14 @@ mod tests {
             })
             .build();
         let mut app = App::new(router);
-        app.set_ingress_admission_policy(|head| AdmissionDecision::Admit {
-            grant: IngressGrant::empty(),
-            read_deadline: Deadline::at_instant(head.request_start()),
+        let request_start = MonotonicInstant::now();
+        app.set_monotonic_clock(MonotonicClock::new(move || request_start));
+        app.set_ingress_admission_policy(move |head| {
+            assert_eq!(head.request_start(), request_start);
+            AdmissionDecision::Admit {
+                grant: IngressGrant::empty(),
+                read_deadline: Deadline::at_instant(head.request_start()),
+            }
         });
         let mut service = EdgeZeroAxumService::from_app(app);
         let request = Request::builder()

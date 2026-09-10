@@ -1,7 +1,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+#[cfg(feature = "test-utils")]
+use std::{
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Poll,
+};
 
 use anyhow::Context as _;
+#[cfg(feature = "test-utils")]
+use bytes::Bytes;
 
 use crate::SpinFullResponse;
 use crate::config_store::SpinConfigStore;
@@ -24,7 +32,11 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use edgezero_core::time::{Deadline, MonotonicInstant};
+use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
+#[cfg(feature = "test-utils")]
+use futures::executor::block_on;
+#[cfg(feature = "test-utils")]
+use futures_util::stream::poll_fn;
 use futures_util::stream::unfold;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use spin_sdk::http::Request as SpinRequest;
@@ -46,10 +58,20 @@ pub(crate) struct Stores {
     secrets: Option<SecretHandle>,
 }
 
+#[cfg(feature = "test-utils")]
+struct DropSignal(Arc<AtomicUsize>);
+
+#[cfg(feature = "test-utils")]
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Convert a Spin `Request` into an `EdgeZero` core `Request`.
 ///
-/// Reads the full body into a buffered `Body::Once`, inserts
-/// `SpinRequestContext` and an outbound [`HttpClient`] into extensions.
+/// Preserves the body as a lazy stream, inserts `SpinRequestContext`, and adds
+/// an outbound [`HttpClient`] to extensions.
 ///
 /// # Errors
 /// Returns [`EdgeError::bad_request`] if the request body cannot be read or
@@ -94,43 +116,68 @@ fn into_core_request_head(parts: RequestParts) -> Request {
     request
 }
 
-fn spin_deadline_body<Source, SourceError>(source: Source, deadline: Deadline) -> Body
+fn spin_deadline_body<Source, SourceError>(
+    source: Source,
+    deadline: Deadline,
+    monotonic_clock: MonotonicClock,
+) -> Body
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
 {
     let boxed_stream = source.map_err(Into::into).boxed_local();
-    let stream = unfold(
-        (boxed_stream, false),
-        move |(mut body_stream, terminal)| async move {
-            if terminal {
-                return None;
-            }
-            if deadline.is_expired() {
+    let stream = unfold(Some(boxed_stream), move |stream_state| {
+        let clock = monotonic_clock.clone();
+        async move {
+            let mut body_stream = stream_state?;
+            if deadline.is_expired_at(clock.now()) {
                 return Some((
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (body_stream, true),
+                    None,
                 ));
             }
             let item = body_stream.next().await;
-            if deadline.is_expired() {
+            if deadline.is_expired_at(clock.now()) {
                 return Some((
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (body_stream, true),
+                    None,
                 ));
             }
             match item {
-                Some(Ok(bytes)) => Some((Ok(bytes), (body_stream, false))),
-                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (body_stream, true))),
+                Some(Ok(bytes)) => Some((Ok(bytes), Some(body_stream))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), None)),
                 None => None,
             }
-        },
-    );
+        }
+    });
     Body::from_stream(stream)
+}
+
+/// Runs the terminal source-release probe used by the WASM contract suite.
+#[cfg(feature = "test-utils")]
+#[must_use]
+#[inline]
+pub fn deadline_body_releases_source_for_test() -> bool {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let signal = DropSignal(Arc::clone(&dropped));
+    let source = poll_fn(move |_cx| {
+        let _keep_alive = &signal;
+        Poll::<Option<Result<Bytes, io::Error>>>::Pending
+    });
+    let start = MonotonicInstant::now();
+    let clock = MonotonicClock::new(move || start);
+    let body = spin_deadline_body(source, Deadline::at_instant(start), clock);
+    let Some(mut body_stream) = body.into_stream() else {
+        return false;
+    };
+    let Some(Err(error)) = block_on(body_stream.next()) else {
+        return false;
+    };
+    matches!(error, EdgeError::RequestTimeout { .. }) && dropped.load(Ordering::SeqCst) == 1
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
@@ -146,7 +193,8 @@ where
 /// fails.
 #[inline]
 pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
-    dispatch_with_kv_label(app, req, "default").await
+    let request_start = app.monotonic_now();
+    dispatch_with_kv_label_at(app, req, "default", request_start).await
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router and return
@@ -175,21 +223,31 @@ pub async fn dispatch_with_kv_label(
     req: SpinRequest,
     kv_label: &str,
 ) -> anyhow::Result<SpinFullResponse> {
+    let request_start = app.monotonic_now();
+    dispatch_with_kv_label_at(app, req, kv_label, request_start).await
+}
+
+async fn dispatch_with_kv_label_at(
+    app: &App,
+    req: SpinRequest,
+    kv_label: &str,
+    request_start: MonotonicInstant,
+) -> anyhow::Result<SpinFullResponse> {
     let stores = Stores {
         config_store: resolve_config_handle(kv_label).await?,
         kv: resolve_kv_handle(kv_label, false).await?,
         secrets: resolve_secret_handle(true),
         ..Default::default()
     };
-    dispatch_with_handles(app, req, stores).await
+    dispatch_with_handles(app, req, stores, request_start).await
 }
 
 pub(crate) async fn dispatch_with_handles(
     app: &App,
     req: SpinRequest,
     stores: Stores,
+    request_start: MonotonicInstant,
 ) -> anyhow::Result<SpinFullResponse> {
-    let request_start = MonotonicInstant::now();
     let (parts, native_body) = req.into_parts();
     let mut core_request = into_core_request_head(parts);
     let head_parts = IngressHeadParts::from_request(
@@ -205,7 +263,11 @@ pub(crate) async fn dispatch_with_handles(
         }
         _ => return Err(anyhow::anyhow!("unsupported ingress admission outcome")),
     };
-    *core_request.body_mut() = spin_deadline_body(native_body.stream(), prepared.read_deadline());
+    *core_request.body_mut() = spin_deadline_body(
+        native_body.stream(),
+        prepared.read_deadline(),
+        prepared.monotonic_clock(),
+    );
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
@@ -243,6 +305,7 @@ pub(crate) async fn dispatch_with_registries(
     secret_meta: Option<StoreMetadata>,
     env: &EnvConfig,
 ) -> anyhow::Result<SpinFullResponse> {
+    let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(kv_meta, env).await?;
     let config_registry = build_config_registry(config_meta, env).await?;
     let secret_registry = build_secret_registry(secret_meta, env);
@@ -255,6 +318,7 @@ pub(crate) async fn dispatch_with_registries(
             secret_registry,
             ..Default::default()
         },
+        request_start,
     )
     .await
 }

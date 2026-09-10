@@ -2,7 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+#[cfg(feature = "test-utils")]
+use std::{
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Poll,
+};
 
+#[cfg(feature = "test-utils")]
+use bytes::Bytes;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
@@ -18,8 +26,12 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use edgezero_core::time::{Deadline, MonotonicInstant};
+use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
+#[cfg(feature = "test-utils")]
+use futures::executor::block_on;
 use futures_util::future::{Either, select};
+#[cfg(feature = "test-utils")]
+use futures_util::stream::poll_fn;
 use futures_util::stream::{LocalBoxStream, once, unfold};
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use worker::{
@@ -114,6 +126,7 @@ impl<'app> CloudflareService<'app> {
         env: Env,
         ctx: Context,
     ) -> Result<CfResponse, WorkerError> {
+        let request_start = self.app.monotonic_now();
         let config_store = match self.config {
             ConfigSource::Binding(binding) => open_config_or_warn(&env, &binding),
             ConfigSource::Handle(handle) => Some(handle),
@@ -142,6 +155,7 @@ impl<'app> CloudflareService<'app> {
                 secrets,
                 ..Default::default()
             },
+            request_start,
         )
         .await
     }
@@ -241,6 +255,16 @@ pub(crate) struct RegistryInputs<'env> {
     pub secret_meta: Option<StoreMetadata>,
 }
 
+#[cfg(feature = "test-utils")]
+struct DropSignal(Arc<AtomicUsize>);
+
+#[cfg(feature = "test-utils")]
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Convert a Cloudflare Worker request into an `EdgeZero` core request.
 ///
 /// # Errors
@@ -289,7 +313,7 @@ fn into_core_request_head(req: &CfRequest, env: Env, ctx: Context) -> Result<Req
 fn attach_core_body(
     mut req: CfRequest,
     mut request: Request,
-    read_deadline: Option<Deadline>,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
 ) -> Result<Request, EdgeError> {
     let stream: LocalBoxStream<'static, Result<bytes::Bytes, WorkerError>> =
         if req.inner().body().is_some() {
@@ -303,31 +327,35 @@ fn attach_core_body(
             // until the core body is first polled so admission still runs first.
             once(async move { req.bytes().await.map(bytes::Bytes::from) }).boxed_local()
         };
-    *request.body_mut() = match read_deadline {
-        Some(deadline) => cloudflare_deadline_body(stream, deadline),
+    *request.body_mut() = match read_lifetime {
+        Some((deadline, monotonic_clock)) => {
+            cloudflare_deadline_body(stream, deadline, monotonic_clock)
+        }
         None => Body::from_external_stream(stream),
     };
     Ok(request)
 }
 
-fn cloudflare_deadline_body<Source, SourceError>(source: Source, deadline: Deadline) -> Body
+fn cloudflare_deadline_body<Source, SourceError>(
+    source: Source,
+    deadline: Deadline,
+    monotonic_clock: MonotonicClock,
+) -> Body
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
 {
     let boxed_stream = source.map_err(Into::into).boxed_local();
-    let stream = unfold(
-        (boxed_stream, false),
-        move |(mut body_stream, terminal)| async move {
-            if terminal {
-                return None;
-            }
-            if deadline.is_expired() {
+    let stream = unfold(Some(boxed_stream), move |stream_state| {
+        let clock = monotonic_clock.clone();
+        async move {
+            let mut body_stream = stream_state?;
+            if deadline.is_expired_at(clock.now()) {
                 return Some((
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (body_stream, true),
+                    None,
                 ));
             }
 
@@ -336,12 +364,12 @@ where
 
             #[cfg(target_arch = "wasm32")]
             let item = {
-                let Some(remaining) = deadline.remaining() else {
+                let Some(remaining) = deadline.remaining_at(clock.now()) else {
                     return Some((
                         Err(EdgeError::request_timeout(
                             "inbound body read deadline exceeded",
                         )),
-                        (body_stream, true),
+                        None,
                     ));
                 };
                 let timer = Delay::from(remaining);
@@ -352,7 +380,7 @@ where
                             Err(EdgeError::request_timeout(
                                 "inbound body read deadline exceeded",
                             )),
-                            (body_stream, true),
+                            None,
                         ));
                     }
                     Either::Right((item, _)) => item,
@@ -360,22 +388,45 @@ where
             };
             #[cfg(not(target_arch = "wasm32"))]
             let item = body_stream.next().await;
-            if deadline.is_expired() {
+            if deadline.is_expired_at(clock.now()) {
                 return Some((
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
-                    (body_stream, true),
+                    None,
                 ));
             }
             match item {
-                Some(Ok(bytes)) => Some((Ok(bytes), (body_stream, false))),
-                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (body_stream, true))),
+                Some(Ok(bytes)) => Some((Ok(bytes), Some(body_stream))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), None)),
                 None => None,
             }
-        },
-    );
+        }
+    });
     Body::from_stream(stream)
+}
+
+/// Runs the terminal source-release probe used by the WASM contract suite.
+#[cfg(feature = "test-utils")]
+#[must_use]
+#[inline]
+pub fn deadline_body_releases_source_for_test() -> bool {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let signal = DropSignal(Arc::clone(&dropped));
+    let source = poll_fn(move |_cx| {
+        let _keep_alive = &signal;
+        Poll::<Option<Result<Bytes, io::Error>>>::Pending
+    });
+    let start = MonotonicInstant::now();
+    let clock = MonotonicClock::new(move || start);
+    let body = cloudflare_deadline_body(source, Deadline::at_instant(start), clock);
+    let Some(mut body_stream) = body.into_stream() else {
+        return false;
+    };
+    let Some(Err(error)) = block_on(body_stream.next()) else {
+        return false;
+    };
+    matches!(error, EdgeError::RequestTimeout { .. }) && dropped.load(Ordering::SeqCst) == 1
 }
 
 pub(crate) async fn dispatch_with_handles(
@@ -384,8 +435,8 @@ pub(crate) async fn dispatch_with_handles(
     env: Env,
     ctx: Context,
     stores: Stores,
+    request_start: MonotonicInstant,
 ) -> Result<CfResponse, WorkerError> {
-    let request_start = MonotonicInstant::now();
     let head_request =
         into_core_request_head(&req, env, ctx).map_err(|error| edge_error_to_worker(&error))?;
     let head_parts = IngressHeadParts::from_request(
@@ -410,7 +461,8 @@ pub(crate) async fn dispatch_with_handles(
             ));
         }
     };
-    let core_request = attach_core_body(req, head_request, Some(prepared.read_deadline()))
+    let read_lifetime = (prepared.read_deadline(), prepared.monotonic_clock());
+    let core_request = attach_core_body(req, head_request, Some(read_lifetime))
         .map_err(|error| edge_error_to_worker(&error))?;
     dispatch_core_request(app, core_request, stores, prepared).await
 }
@@ -431,6 +483,7 @@ pub(crate) async fn dispatch_with_registries(
     ctx: Context,
     inputs: RegistryInputs<'_>,
 ) -> Result<CfResponse, WorkerError> {
+    let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(&env, inputs.kv_meta, inputs.env_config)?;
     let config_registry = build_config_registry(&env, inputs.config_meta, inputs.env_config);
     let secret_registry = build_secret_registry(&env, inputs.secret_meta, inputs.env_config);
@@ -445,6 +498,7 @@ pub(crate) async fn dispatch_with_registries(
             secret_registry,
             ..Default::default()
         },
+        request_start,
     )
     .await
 }

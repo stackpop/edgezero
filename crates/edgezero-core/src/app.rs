@@ -16,7 +16,7 @@ use crate::response_egress::{
     default_response_egress_policy,
 };
 use crate::router::{RouteMetadata, RouteResolution, RouterService};
-use crate::time::MonotonicInstant;
+use crate::time::{MonotonicClock, MonotonicInstant};
 
 /// Canonical adapter name for the Axum adapter.
 pub const AXUM_ADAPTER: &str = "axum";
@@ -33,6 +33,7 @@ pub struct App {
     config_extraction_limits: ConfigExtractionLimits,
     ingress_head_limits: IngressHeadLimits,
     ingress_policy: IngressAdmissionPolicy,
+    monotonic_clock: MonotonicClock,
     name: String,
     response_egress_observer: ResponseEgressObserverHandle,
     response_egress_policy: ResponseEgressPolicyCallback,
@@ -47,7 +48,7 @@ impl App {
     /// normalized safely.
     #[inline]
     pub fn admit_ingress(&self, head: &IngressHead) -> Result<IngressAdmissionOutcome, EdgeError> {
-        match apply_admission_policy(&self.ingress_policy, head)? {
+        match apply_admission_policy(&self.ingress_policy, head, self.monotonic_clock())? {
             IngressAdmissionOutcome::Admitted(admitted) => Ok(IngressAdmissionOutcome::Admitted(
                 admitted.with_config_extraction_limits(self.config_extraction_limits),
             )),
@@ -163,6 +164,20 @@ impl App {
         self.router
     }
 
+    /// Returns the application clock used to stamp and enforce admitted ingress lifetimes.
+    #[must_use]
+    #[inline]
+    pub fn monotonic_clock(&self) -> MonotonicClock {
+        self.monotonic_clock.clone()
+    }
+
+    /// Captures one instant from the application clock.
+    #[must_use]
+    #[inline]
+    pub fn monotonic_now(&self) -> MonotonicInstant {
+        self.monotonic_clock.now()
+    }
+
     /// Name assigned to the application.
     #[must_use]
     #[inline]
@@ -241,6 +256,12 @@ impl App {
         self.ingress_head_limits = limits;
     }
 
+    /// Installs the monotonic clock used by subsequent ingress attempts.
+    #[inline]
+    pub fn set_monotonic_clock(&mut self, clock: MonotonicClock) {
+        self.monotonic_clock = clock;
+    }
+
     /// Update the application name.
     #[inline]
     pub fn set_name<S>(&mut self, name: S)
@@ -281,6 +302,7 @@ impl App {
             config_extraction_limits: ConfigExtractionLimits::default(),
             ingress_head_limits: IngressHeadLimits::default(),
             ingress_policy: default_admission_policy(),
+            monotonic_clock: MonotonicClock::default(),
             name: name.into(),
             response_egress_observer: ResponseEgressObserverHandle::default(),
             response_egress_policy: Arc::new(default_response_egress_policy),
@@ -405,7 +427,7 @@ mod tests {
         ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressReport,
     };
     use crate::router::{RouteMetadata, RouteResolution};
-    use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicInstant};
+    use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
     use bytes::Bytes;
     use futures::executor::block_on;
     use futures::stream::poll_fn;
@@ -506,6 +528,38 @@ mod tests {
     fn default_app_uses_constant_name() {
         let app = App::new(empty_router());
         assert_eq!(app.name(), App::default_name());
+    }
+
+    #[test]
+    fn app_pairs_admitted_ingress_with_its_injected_clock() {
+        let start = MonotonicInstant::now();
+        let now = Arc::new(Mutex::new(start));
+        let observed_now = Arc::clone(&now);
+        let mut app = App::new(empty_router());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            *observed_now.lock().expect("clock lock")
+        }));
+
+        let request_start = app.monotonic_now();
+        assert_eq!(request_start, start);
+        let head = IngressHeadParts::new(
+            Method::GET,
+            "/".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let IngressBeginOutcome::Admitted(prepared) =
+            app.begin_ingress(head, request_start).expect("admission")
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(prepared.request_start(), start);
+
+        let advanced = start
+            .checked_add(Duration::from_secs(1))
+            .expect("advanced instant");
+        *now.lock().expect("clock lock") = advanced;
+        assert_eq!(prepared.monotonic_clock().now(), advanced);
     }
 
     #[test]
@@ -646,7 +700,7 @@ mod tests {
             admitted.read_deadline().instant()
                 <= start.checked_add(DEADLINE_FAR_FUTURE).expect("maximum")
         );
-        let (_, _, grant, _) = admitted.into_parts();
+        let (_, _, grant, _, _) = admitted.into_parts();
         grant.downcast::<()>().expect_err("empty grant");
     }
 

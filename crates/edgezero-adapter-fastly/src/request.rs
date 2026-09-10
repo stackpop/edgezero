@@ -20,7 +20,7 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use edgezero_core::time::{Deadline, MonotonicInstant};
+use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 use futures_util::stream;
@@ -130,6 +130,7 @@ impl<'app> FastlyService<'app> {
     /// the underlying handler returns an error.
     #[inline]
     pub fn dispatch(self, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
+        let request_start = self.app.monotonic_now();
         let config_store = match self.config {
             ConfigSource::Handle(handle) => Some(handle),
             ConfigSource::Name(name) => match FastlyConfigStore::try_open(&name) {
@@ -158,6 +159,7 @@ impl<'app> FastlyService<'app> {
                 secrets,
                 ..Default::default()
             },
+            request_start,
             |_req, _extensions| {},
         )
     }
@@ -311,13 +313,13 @@ fn dispatch_with_handles<F>(
     app: &App,
     mut req: FastlyRequest,
     stores: Stores,
+    request_start: MonotonicInstant,
     extend: F,
 ) -> Result<FastlyResponse, FastlyError>
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
     // Read raw-request signals into a scratch bag BEFORE conversion consumes `req`.
-    let request_start = MonotonicInstant::now();
     let scratch = apply_request_extend(&req, extend);
     let mut head_request = into_core_request_head(&req).map_err(|error| map_edge_error(&error))?;
     head_request.extensions_mut().extend(scratch);
@@ -339,7 +341,8 @@ where
         }
         _ => return Err(FastlyError::msg("unsupported ingress admission outcome")),
     };
-    let core_request = attach_core_body(&mut req, head_request, Some(prepared.read_deadline()));
+    let read_lifetime = (prepared.read_deadline(), prepared.monotonic_clock());
+    let core_request = attach_core_body(&mut req, head_request, Some(read_lifetime));
     dispatch_core_request(app, core_request, stores, prepared)
 }
 
@@ -372,6 +375,7 @@ pub fn dispatch_with_registries<F>(
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
+    let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(stores.kv, env)?;
     let config_registry = build_config_registry(stores.config, env);
     let secret_registry = build_secret_registry(stores.secrets, env);
@@ -384,6 +388,7 @@ where
             secret_registry,
             ..Default::default()
         },
+        request_start,
         extend,
     )
 }
@@ -546,25 +551,37 @@ fn into_core_request_head(req: &FastlyRequest) -> Result<Request, EdgeError> {
 fn attach_core_body(
     req: &mut FastlyRequest,
     mut request: Request,
-    read_deadline: Option<Deadline>,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
 ) -> Request {
-    let mut native_body = req.take_body();
+    let mut native_body = Some(req.take_body());
     let mut terminal = false;
     let stream = stream::poll_fn(move |_cx| {
         if terminal {
             return Poll::Ready(None);
         }
-        if read_deadline.is_some_and(|candidate| candidate.is_expired()) {
+        if read_lifetime
+            .as_ref()
+            .is_some_and(|(deadline, clock)| deadline.is_expired_at(clock.now()))
+        {
             terminal = true;
+            native_body.take();
             return Poll::Ready(Some(Err(EdgeError::request_timeout(
                 "inbound body read deadline exceeded",
             ))));
         }
 
-        let mut chunk = vec![0_u8; 16 * 1024];
-        let result = native_body.read(&mut chunk);
-        if read_deadline.is_some_and(|candidate| candidate.is_expired()) {
+        let Some(body) = native_body.as_mut() else {
             terminal = true;
+            return Poll::Ready(None);
+        };
+        let mut chunk = vec![0_u8; 16 * 1024];
+        let result = body.read(&mut chunk);
+        if read_lifetime
+            .as_ref()
+            .is_some_and(|(deadline, clock)| deadline.is_expired_at(clock.now()))
+        {
+            terminal = true;
+            native_body.take();
             return Poll::Ready(Some(Err(EdgeError::request_timeout(
                 "inbound body read deadline exceeded",
             ))));
@@ -572,6 +589,7 @@ fn attach_core_body(
         match result {
             Ok(0) => {
                 terminal = true;
+                native_body.take();
                 Poll::Ready(None)
             }
             Ok(read) => {
@@ -580,6 +598,7 @@ fn attach_core_body(
             }
             Err(error) => {
                 terminal = true;
+                native_body.take();
                 Poll::Ready(Some(Err(EdgeError::internal(error))))
             }
         }

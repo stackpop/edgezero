@@ -29,6 +29,25 @@ Support levels mean:
   deployment prerequisite.
 - `Unsupported`: unavailable on that adapter.
 
+## Ingress Matrix
+
+| Capability                       | Axum        | Cloudflare  | Fastly      | Spin        |
+| -------------------------------- | ----------- | ----------- | ----------- | ----------- |
+| `ingress-admission`              | Native      | Native      | Native      | Native      |
+| `inbound-read-deadlines`         | Native      | BestEffort  | BestEffort  | BestEffort  |
+| `raw-ingress-head-limits`        | Unsupported | Unsupported | Unsupported | Unsupported |
+| `raw-ingress-framing-validation` | Unsupported | Unsupported | Unsupported | Unsupported |
+
+All standard adapters resolve the route and run the application admission policy before
+middleware, handler dispatch, or body polling. Axum can preempt an asynchronous body read.
+Cloudflare and Spin enforce absolute checks around host reads but require deployed timing
+probes before their cancellation latency can be bounded. Fastly cannot preempt a synchronous
+host body read. Those limitations keep their deadline cells at `BestEffort`.
+
+The adapters perform defensive checks on the normalized request information they receive.
+Those checks do not prove parser-boundary accounting or ambiguous HTTP/1 framing rejection,
+so neither raw-ingress capability is currently available on any adapter.
+
 ## Outbound Matrix
 
 | Capability                              | Axum                              | Cloudflare                        | Fastly                            | Spin                              |

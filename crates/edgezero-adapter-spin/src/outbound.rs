@@ -203,10 +203,8 @@ mod spin_impl {
         for (name, value) in headers {
             fields
                 .append(name.as_str(), value.as_bytes())
-                .map_err(|error| {
-                    EdgeError::bad_request(format!(
-                        "Spin rejected outbound request header {name}: {error}"
-                    ))
+                .map_err(|_error| {
+                    EdgeError::bad_request("Spin rejected an outbound request header")
                 })?;
         }
         Ok(fields)

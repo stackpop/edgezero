@@ -13,6 +13,11 @@
     )
 )]
 
+#[cfg(any(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    feature = "test-utils"
+))]
+use edgezero_core::error::BadGatewayReason;
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 
@@ -414,10 +419,8 @@ mod worker_impl {
         upload_error: Rc<RefCell<Option<EdgeError>>>,
     ) -> Result<(WorkerResponse, AbortGuard), EdgeError> {
         let remaining = budget_remaining(budget)?;
-        let controller = web_sys::AbortController::new().map_err(|error| {
-            EdgeError::internal(anyhow::anyhow!(
-                "failed to construct abort controller: {error:?}"
-            ))
+        let controller = web_sys::AbortController::new().map_err(|_error| {
+            EdgeError::internal(anyhow::anyhow!("failed to construct abort controller"))
         })?;
         let signal = controller.signal();
         let abort_guard = AbortGuard::new(controller);
@@ -428,10 +431,8 @@ mod worker_impl {
             &JsValue::from_str("encodeResponseBody"),
             &JsValue::from_str("manual"),
         )
-        .map_err(|error| {
-            EdgeError::internal(anyhow::anyhow!(
-                "failed to set manual response encoding: {error:?}"
-            ))
+        .map_err(|_error| {
+            EdgeError::internal(anyhow::anyhow!("failed to set manual response encoding"))
         })?;
         if !set {
             return Err(EdgeError::internal(anyhow::anyhow!(
@@ -451,20 +452,15 @@ mod worker_impl {
         budget_remaining(budget)?;
         let value = match result {
             Ok(value) => value,
-            Err(error) => {
+            Err(_error) => {
                 if let Some(source_error) = upload_error.borrow_mut().take() {
                     return Err(source_error);
                 }
-                return Err(EdgeError::bad_gateway_with_reason(
-                    format!("outbound fetch failed: {error:?}"),
-                    BadGatewayReason::Unreachable,
-                ));
+                return Err(super::generic_fetch_failure());
             }
         };
-        let web_response: web_sys::Response = value.dyn_into().map_err(|non_response| {
-            EdgeError::internal(anyhow::anyhow!(
-                "fetch returned a non-response value: {non_response:?}"
-            ))
+        let web_response: web_sys::Response = value.dyn_into().map_err(|_non_response| {
+            EdgeError::internal(anyhow::anyhow!("fetch returned a non-response value"))
         })?;
         Ok((WorkerResponse::from(web_response), abort_guard))
     }
@@ -528,17 +524,17 @@ mod worker_impl {
     }
 
     fn response_stream(response: &mut WorkerResponse) -> Result<BodyStream, EdgeError> {
-        let source = response.stream().map_err(|error| {
+        let source = response.stream().map_err(|_error| {
             EdgeError::bad_gateway_with_reason(
-                format!("upstream response body is unavailable: {error}"),
+                "upstream response body is unavailable",
                 BadGatewayReason::Transport,
             )
         })?;
         Ok(source
             .map(|result| {
-                result.map(Bytes::from).map_err(|error| {
+                result.map(Bytes::from).map_err(|_error| {
                     EdgeError::bad_gateway_with_reason(
-                        format!("upstream response body failed: {error}"),
+                        "upstream response body failed",
                         BadGatewayReason::Transport,
                     )
                 })
@@ -630,6 +626,14 @@ mod worker_impl {
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use worker_impl::CloudflareOutboundClient;
 
+#[cfg(any(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    feature = "test-utils"
+))]
+fn generic_fetch_failure() -> EdgeError {
+    EdgeError::bad_gateway_with_reason("outbound fetch failed", BadGatewayReason::Unspecified)
+}
+
 fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_for_dispatch(request)?;
     if request.is_stream_body() {
@@ -653,4 +657,12 @@ fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
 #[inline]
 pub fn validate_batch_request_for_test(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_batch_request(request)
+}
+
+/// Returns the target-neutral classification for an opaque Workers fetch rejection.
+#[cfg(feature = "test-utils")]
+#[must_use]
+#[inline]
+pub fn generic_fetch_failure_for_test() -> EdgeError {
+    generic_fetch_failure()
 }

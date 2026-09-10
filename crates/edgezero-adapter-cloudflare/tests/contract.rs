@@ -24,7 +24,9 @@ mod tests {
 
     use bytes::Bytes;
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
-    use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
+    use edgezero_adapter_cloudflare::request::{
+        CloudflareService, deadline_body_releases_source_for_test, into_core_request,
+    };
     use edgezero_adapter_cloudflare::response::from_core_response;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
@@ -158,6 +160,11 @@ mod tests {
         let env = Object::new().unchecked_into::<Env>();
         let js_context = Object::new().unchecked_into::<WorkerSysContext>();
         (env, Context::new(js_context))
+    }
+
+    #[wasm_bindgen_test]
+    fn deadline_body_releases_source_when_timeout_is_emitted() {
+        assert!(deadline_body_releases_source_for_test());
     }
 
     #[wasm_bindgen_test]
@@ -304,9 +311,11 @@ mod native_tests {
     #[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
     mod enabled {
         use bytes::Bytes;
-        use edgezero_adapter_cloudflare::outbound::validate_batch_request_for_test;
+        use edgezero_adapter_cloudflare::outbound::{
+            generic_fetch_failure_for_test, validate_batch_request_for_test,
+        };
         use edgezero_core::body::Body;
-        use edgezero_core::error::EdgeError;
+        use edgezero_core::error::{BadGatewayReason, EdgeError};
         use edgezero_core::outbound::OutboundRequest;
         use futures_util::stream;
 
@@ -341,6 +350,18 @@ mod native_tests {
                     Some("GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream".to_owned()),
                 ]
             );
+        }
+
+        #[test]
+        fn opaque_fetch_rejection_does_not_claim_connection_phase_evidence() {
+            let error = generic_fetch_failure_for_test();
+            assert!(matches!(
+                error,
+                EdgeError::BadGateway {
+                    reason: BadGatewayReason::Unspecified,
+                    ..
+                }
+            ));
         }
     }
 }

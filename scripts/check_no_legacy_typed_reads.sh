@@ -69,6 +69,21 @@ done < <(
         2>/dev/null || true
 )
 
+# ------------------------------------------------------------------
+# Pattern 4: superseded serde extraction constructor
+# ------------------------------------------------------------------
+while IFS= read -r hit; do
+    printf '%s: violation: superseded config serde constructor — use store_deserialization_from_serde\n' "${hit}"
+    VIOLATIONS=$((VIOLATIONS + 1))
+done < <(
+    grep -rn --include="*.rs" \
+        --exclude-dir=target \
+        'config_out_of_date_from_serde' \
+        "${REPO_ROOT}/crates" \
+        "${REPO_ROOT}/examples" \
+        2>/dev/null || true
+)
+
 if [ "${VIOLATIONS}" -gt 0 ]; then
     printf '\n%d violation(s) found. Migrate to the AppConfig<C> blob-model extractor.\n' "${VIOLATIONS}" >&2
     exit 1

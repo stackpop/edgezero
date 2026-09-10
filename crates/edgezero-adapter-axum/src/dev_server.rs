@@ -1192,7 +1192,8 @@ mod integration_tests {
         );
         let body = response.text().await.unwrap();
         assert!(!body.contains("API_KEY"));
-        assert!(body.contains("required secret is not configured"));
+        assert!(body.contains("internal server error"));
+        assert!(!body.contains("required secret is not configured"));
 
         server.handle.abort();
     }
@@ -1213,7 +1214,8 @@ mod integration_tests {
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         );
         let body = response.text().await.unwrap();
-        assert!(body.contains(
+        assert!(body.contains("internal server error"));
+        assert!(!body.contains(
             "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
         ));
 

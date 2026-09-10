@@ -11,7 +11,7 @@ use crate::http::{
 };
 use crate::response_egress::ResponseEgressEnvelope;
 use crate::router::{ResolvedDispatch, RouteMetadata, RouteResolution};
-use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicInstant};
+use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
 
 pub const DEFAULT_INBOUND_READ_BUDGET: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_REQUEST_HEADER_BYTES: u64 = 0x0001_0000;
@@ -100,6 +100,7 @@ pub enum IngressBeginOutcome {
 pub struct AdmittedIngress {
     config_extraction_limits: ConfigExtractionLimits,
     grant: IngressGrant,
+    monotonic_clock: MonotonicClock,
     read_deadline: Deadline,
     request_start: MonotonicInstant,
 }
@@ -112,13 +113,21 @@ impl AdmittedIngress {
         Deadline,
         IngressGrant,
         ConfigExtractionLimits,
+        MonotonicClock,
     ) {
         (
             self.request_start,
             self.read_deadline,
             self.grant,
             self.config_extraction_limits,
+            self.monotonic_clock,
         )
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn monotonic_clock(&self) -> MonotonicClock {
+        self.monotonic_clock.clone()
     }
 
     #[must_use]
@@ -420,6 +429,21 @@ impl IngressHead {
         &self.method
     }
 
+    /// Builds a finite deadline relative to this head's captured request start.
+    ///
+    /// The duration is clamped to the configured far-future bound. Arithmetic
+    /// overflow fails closed by returning a deadline at the request start.
+    #[must_use]
+    #[inline]
+    pub fn read_deadline_after(&self, duration: Duration) -> Deadline {
+        let bounded = duration.min(DEADLINE_FAR_FUTURE);
+        Deadline::at_instant(
+            self.request_start
+                .checked_add(bounded)
+                .unwrap_or(self.request_start),
+        )
+    }
+
     #[must_use]
     #[inline]
     pub fn request_start(&self) -> MonotonicInstant {
@@ -466,6 +490,12 @@ impl PreparedIngress {
         (self.resolved, self.admitted)
     }
 
+    #[must_use]
+    #[inline]
+    pub fn monotonic_clock(&self) -> MonotonicClock {
+        self.admitted.monotonic_clock()
+    }
+
     pub(crate) fn new(resolved: ResolvedDispatch, admitted: AdmittedIngress) -> Self {
         Self { admitted, resolved }
     }
@@ -505,17 +535,14 @@ pub(crate) type IngressAdmissionPolicy =
 pub(crate) fn default_admission_policy() -> IngressAdmissionPolicy {
     Arc::new(|head| AdmissionDecision::Admit {
         grant: IngressGrant::empty(),
-        read_deadline: Deadline::at_instant(
-            head.request_start()
-                .checked_add(DEFAULT_INBOUND_READ_BUDGET)
-                .unwrap_or(head.request_start()),
-        ),
+        read_deadline: head.read_deadline_after(DEFAULT_INBOUND_READ_BUDGET),
     })
 }
 
 pub(crate) fn apply_admission_policy(
     policy: &IngressAdmissionPolicy,
     head: &IngressHead,
+    monotonic_clock: MonotonicClock,
 ) -> Result<IngressAdmissionOutcome, EdgeError> {
     match policy(head) {
         AdmissionDecision::Refuse(response) => Ok(IngressAdmissionOutcome::Refused(response)),
@@ -535,6 +562,7 @@ pub(crate) fn apply_admission_policy(
             Ok(IngressAdmissionOutcome::Admitted(AdmittedIngress {
                 config_extraction_limits: ConfigExtractionLimits::default(),
                 grant,
+                monotonic_clock,
                 read_deadline: deadline,
                 request_start: head.request_start(),
             }))
@@ -826,7 +854,8 @@ mod tests {
             read_deadline: too_late,
         });
         let IngressAdmissionOutcome::Admitted(admitted) =
-            apply_admission_policy(&admit_policy, &head).expect("admission")
+            apply_admission_policy(&admit_policy, &head, MonotonicClock::default())
+                .expect("admission")
         else {
             panic!("expected admission");
         };
@@ -844,10 +873,38 @@ mod tests {
             )
         });
         let IngressAdmissionOutcome::Refused(response) =
-            apply_admission_policy(&refuse_policy, &head).expect("refusal")
+            apply_admission_policy(&refuse_policy, &head, MonotonicClock::default())
+                .expect("refusal")
         else {
             panic!("expected refusal");
         };
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn ingress_head_builds_relative_deadlines_in_its_start_clock_domain() {
+        let global = MonotonicInstant::now();
+        let request_start = global
+            .checked_add(Duration::from_hours(24))
+            .expect("offset request start");
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        let head = IngressHead::from_request(
+            &request,
+            request_start,
+            RouteResolution::NotFound,
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        );
+
+        assert_eq!(
+            head.read_deadline_after(Duration::from_secs(2)).instant(),
+            request_start
+                .checked_add(Duration::from_secs(2))
+                .expect("relative deadline")
+        );
     }
 }

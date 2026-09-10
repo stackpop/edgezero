@@ -4,7 +4,7 @@
 
 **Goal:** Land the **additive, no-new-dependency on the current baseline** core primitives from the outbound-HTTP spec ([`2026-05-21-outbound-http-design.md`](../specs/2026-05-21-outbound-http-design.md)): `EdgeError::BadGateway { reason: BadGatewayReason }`, `GatewayTimeout { cause: BudgetSource }`, and the `edgezero-core::time` module's `Deadline` + budget constants. `BadGatewayDecodeReason`, `BadGatewayReason`, and `BudgetSource` land in `error.rs`, Task 1, because the variants name them; `dispatch_budget` remains Phase 1b. Neither task touches the `proxy → outbound` rename or `Body`, so each task keeps `cargo test --workspace` green. **Scope caveat:** per-task verification is a deliberate local subset (Task 3); generated projects, `app-demo`, and expanded adapter-specific WASM matrices remain CI backstops.
 
-**Architecture:** `edgezero-core` only. Additive: two new `EdgeError` variants, three non-exhaustive reason/provenance enums, and a new `time` module. The `EdgeError` enum is `#[non_exhaustive]`, but matches inside its defining crate remain exhaustive and must gain both arms. `BadGatewayReason` distinguishes pre-response unreachability from later transport/protocol failures, while `BadGatewayDecodeReason` preserves the EdgeZero-owned codec identity. No reason/cause field is serialized. No adapter, CLI, or app-demo change. **`DispatchBudget` and `dispatch_budget` are both deferred to Phase 1b**; Phase 1a lands `Deadline` + constants only.
+**Architecture:** `edgezero-core` only. Additive: two new `EdgeError` variants, three non-exhaustive reason/provenance enums, and a new `time` module. The `EdgeError` enum is `#[non_exhaustive]`, but matches inside its defining crate remain exhaustive and must gain both arms. `BadGatewayReason` distinguishes pre-response unreachability from later transport/protocol failures, while `BadGatewayDecodeReason` preserves the EdgeZero-owned codec identity. No reason/cause field is serialized. `message()` preserves Rust-side diagnostics, while HTTP conversion emits fixed `"bad gateway"` / `"gateway timeout"` category strings. No adapter, CLI, or app-demo change. **`DispatchBudget` and `dispatch_budget` are both deferred to Phase 1b**; Phase 1a lands `Deadline` + constants only.
 
 **Round-59 scope alignment:** the master spec's response resource limits, canonical URL
 parser, adapter scheduling/completion rules, ingress ownership, and response-egress gate are
@@ -122,31 +122,31 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
             EdgeError::bad_gateway("nope"),
             502_u16,
             "bad_gateway",
-            "nope",
+            "bad gateway",
         ),
         (
             EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Protocol),
             502_u16,
             "bad_gateway",
-            "nope",
+            "bad gateway",
         ),
         (
             EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Transport),
             502_u16,
             "bad_gateway",
-            "nope",
+            "bad gateway",
         ),
         (
             EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Unreachable),
             502_u16,
             "bad_gateway",
-            "nope",
+            "bad gateway",
         ),
         (
             EdgeError::gateway_timeout("late"),
             504_u16,
             "gateway_timeout",
-            "late",
+            "gateway timeout",
         ),
         // Every OTHER cause too — wire-isolation must hold for ALL FOUR BudgetSource
         // values, so a conditional serializer cannot leak `cause` for any of them
@@ -155,19 +155,19 @@ fn bad_gateway_and_gateway_timeout_json_shape() {
             EdgeError::gateway_timeout_caused("late", BudgetSource::PerCallTimeout),
             504_u16,
             "gateway_timeout",
-            "late",
+            "gateway timeout",
         ),
         (
             EdgeError::gateway_timeout_caused("late", BudgetSource::BatchDeadline),
             504_u16,
             "gateway_timeout",
-            "late",
+            "gateway timeout",
         ),
         (
             EdgeError::gateway_timeout_caused("late", BudgetSource::Default),
             504_u16,
             "gateway_timeout",
-            "late",
+            "gateway timeout",
         ),
     ] {
         let response = err.into_response().expect("response");
@@ -208,7 +208,7 @@ fn bad_gateway_decode_reason_is_not_serialized() {
         let body_json = parse_body(response);
         assert_eq!(body_json["error"]["status"], 502_u16);
         assert_eq!(body_json["error"]["kind"], "bad_gateway");
-        assert_eq!(body_json["error"]["message"], "nope");
+        assert_eq!(body_json["error"]["message"], "bad gateway");
         assert!(body_json["error"].get("reason").is_none());
     }
 }
@@ -387,7 +387,7 @@ pub enum BudgetSource {
 }
 ```
 
-- [ ] **Step 4: Add the constructors** in `impl EdgeError` — **also alphabetically** (the impl's fns are already ordered `bad_request, config_out_of_date, config_out_of_date_from_serde, inner, internal, kind_str, message, status, validation`): put `bad_gateway` **before** `bad_request`, and `gateway_timeout` **between** `config_out_of_date_from_serde` and `inner`.
+- [ ] **Step 4: Add the constructors** in `impl EdgeError` — **also alphabetically** (the impl's fns are already ordered `bad_request, config_out_of_date, inner, internal, kind_str, message, status, validation`): put `bad_gateway` **before** `bad_request`, and `gateway_timeout` **between** `config_out_of_date` and `inner`.
 
 ```rust
     #[inline]

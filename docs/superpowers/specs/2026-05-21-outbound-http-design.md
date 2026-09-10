@@ -2687,7 +2687,13 @@ coding without parsing a diagnostic string.
 phase) `ResponseTooLarge => 502` with `kind_str() == "response_too_large"`. Like the other
 two it carries no `Retry-After` and no `field_path`. `BadGatewayReason` and
 `ResponseLimitReason` are Rust-side fields and are not serialized; the JSON envelope stays
-`status`/`kind`/`message`. Each addition follows the same
+`status`/`kind`/`message`. The message at that HTTP boundary is category-only:
+`BadGateway` emits `"bad gateway"`, `GatewayTimeout` emits `"gateway timeout"`,
+`ResponseTooLarge` emits `"upstream response exceeded configured limits"`, and `Internal`
+emits `"internal server error"`. `EdgeError::message()` and `Display` remain internal
+diagnostic surfaces, but adapters never interpolate a provider error, URL, query, token, or
+response content into an outbound diagnostic. Tests use token-bearing fixtures to prove
+`IntoResponse` cannot serialize those values. Each addition follows the same
 exhaustive-match discipline (every `match` arm + test matrix updated, alphabetical
 insertion); Phase 1a does the first two plus `BadGatewayReason`, and the outbound work does
 the third plus `ResponseLimitReason` in the same mechanical style.
@@ -5329,10 +5335,11 @@ async fn send_all(
   which is authoritative.) A completed exchange, including any non-2xx, is `Ok`.
 
   **`BackendCreationError::Disallowed`** (dynamic backends not enabled on the
-  service) is the one creation error that gets its own diagnostic rather than a bare
-  502: map to
+  service) is the one creation error that gets its own Rust-side diagnostic: map to
   `EdgeError::bad_gateway_with_reason(DYNAMIC_BACKENDS_DISABLED_MESSAGE, BadGatewayReason::Unspecified)`,
-  so the operator gets an actionable message instead of a generic bad-gateway.
+  so application diagnostics can point at the deployment fix. Rendering that error as an
+  HTTP response still emits only `"bad gateway"`; the provider-specific text is never a
+  wire message.
   `DYNAMIC_BACKENDS_DISABLED_MESSAGE` is the one shared exact diagnostic:
   `"Fastly dynamic backends are not enabled on this service; enable them in the service configuration"`.
 
@@ -5568,7 +5575,8 @@ turn it on. EdgeZero handles the gap as:
 2. **Runtime:** if dispatch fails because dynamic backends are disabled, the adapter
    surfaces `EdgeError::bad_gateway_with_reason(DYNAMIC_BACKENDS_DISABLED_MESSAGE,
    BadGatewayReason::Unspecified)` using the exact shared constant defined in the creation
-   error mapping above. Apps see a clear 502 with a diagnostic that points at the fix.
+   error mapping above. Apps can inspect/log the Rust-side diagnostic before response
+   conversion; an HTTP response remains the fixed category-only 502 contract.
 
 Fastly can be promoted to `Native` only when a separately reviewed deploy-time prerequisite
 can prove dynamic-backend enablement for the selected service before publication. Phase 6
@@ -6479,7 +6487,9 @@ Outbound-facing changes:
 - `EdgeError` gains `BadGateway { reason: BadGatewayReason }`,
   `GatewayTimeout { cause: BudgetSource }`, and
   `ResponseTooLarge { reason: ResponseLimitReason }`. Their JSON wire shape remains the
-  existing error envelope and does not serialize any reason/provenance field.
+  existing error envelope and does not serialize any reason/provenance field. Their wire
+  messages, plus `Internal`, are fixed category strings; detailed provider diagnostics and
+  request targets are not serialized.
 - `Manifest` gains the eight outbound capabilities and
   `[capabilities.outbound].hosts`. Existing non-outbound capability and store schemas are
   unchanged. The depth-independent misplaced-`capabilities` rejection is intentionally

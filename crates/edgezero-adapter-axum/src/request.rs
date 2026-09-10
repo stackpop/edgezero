@@ -8,7 +8,7 @@ use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Request as CoreRequest;
 use edgezero_core::outbound::HttpClient;
-use edgezero_core::time::Deadline;
+use edgezero_core::time::{Deadline, MonotonicClock};
 use futures_util::{StreamExt as _, stream};
 use tokio::time::timeout;
 
@@ -33,10 +33,12 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
 pub(crate) fn into_core_request_parts(
     parts: Parts,
     axum_body: AxumBody,
-    read_deadline: Option<Deadline>,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
 ) -> Result<CoreRequest, String> {
-    let body = match read_deadline {
-        Some(deadline) => deadline_body(axum_body.into_data_stream(), deadline),
+    let body = match read_lifetime {
+        Some((deadline, monotonic_clock)) => {
+            deadline_body(axum_body.into_data_stream(), deadline, monotonic_clock)
+        }
         None => Body::from_external_stream(axum_body.into_data_stream()),
     };
 
@@ -67,44 +69,49 @@ pub(crate) fn into_core_request_parts(
     Ok(core_request)
 }
 
-fn deadline_body(body_stream: BodyDataStream, deadline: Deadline) -> Body {
+fn deadline_body(
+    body_stream: BodyDataStream,
+    deadline: Deadline,
+    monotonic_clock: MonotonicClock,
+) -> Body {
     let deadline_stream = stream::unfold(
-        (Box::pin(body_stream), false),
-        move |(mut state_stream, terminal): (Pin<Box<BodyDataStream>>, bool)| async move {
-            if terminal {
-                return None;
-            }
-            let Some(remaining) = deadline.remaining() else {
-                return Some((
-                    Err(EdgeError::request_timeout(
-                        "inbound body read deadline exceeded",
-                    )),
-                    (state_stream, true),
-                ));
-            };
-            let item = match timeout(remaining, state_stream.next()).await {
-                Ok(item) => item,
-                Err(_elapsed) => {
+        Some(Box::pin(body_stream)),
+        move |stream_state: Option<Pin<Box<BodyDataStream>>>| {
+            let clock = monotonic_clock.clone();
+            async move {
+                let mut state_stream = stream_state?;
+                let Some(remaining) = deadline.remaining_at(clock.now()) else {
                     return Some((
                         Err(EdgeError::request_timeout(
                             "inbound body read deadline exceeded",
                         )),
-                        (state_stream, true),
+                        None,
+                    ));
+                };
+                let item = match timeout(remaining, state_stream.next()).await {
+                    Ok(item) => item,
+                    Err(_elapsed) => {
+                        return Some((
+                            Err(EdgeError::request_timeout(
+                                "inbound body read deadline exceeded",
+                            )),
+                            None,
+                        ));
+                    }
+                };
+                if deadline.is_expired_at(clock.now()) {
+                    return Some((
+                        Err(EdgeError::request_timeout(
+                            "inbound body read deadline exceeded",
+                        )),
+                        None,
                     ));
                 }
-            };
-            if deadline.is_expired() {
-                return Some((
-                    Err(EdgeError::request_timeout(
-                        "inbound body read deadline exceeded",
-                    )),
-                    (state_stream, true),
-                ));
-            }
-            match item {
-                Some(Ok(bytes)) => Some((Ok(bytes), (state_stream, false))),
-                Some(Err(error)) => Some((Err(EdgeError::internal(error)), (state_stream, true))),
-                None => None,
+                match item {
+                    Some(Ok(bytes)) => Some((Ok(bytes), Some(state_stream))),
+                    Some(Err(error)) => Some((Err(EdgeError::internal(error)), None)),
+                    None => None,
+                }
             }
         },
     );
@@ -114,8 +121,48 @@ fn deadline_body(body_stream: BodyDataStream, deadline: Deadline) -> Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use edgezero_core::body::Body;
-    use edgezero_core::http::Method;
+    use edgezero_core::http::{Method, StatusCode};
+    use edgezero_core::time::MonotonicInstant;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    struct DropSignal(Arc<AtomicUsize>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_body_releases_source_when_timeout_is_emitted() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let signal = DropSignal(Arc::clone(&dropped));
+        let source = stream::poll_fn(move |_cx| {
+            let _keep_alive = &signal;
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        });
+        let start = MonotonicInstant::now();
+        let clock = MonotonicClock::new(move || start);
+        let body = deadline_body(
+            AxumBody::from_stream(source).into_data_stream(),
+            Deadline::at_instant(start),
+            clock,
+        );
+        let mut body_stream = body.into_stream().expect("stream");
+
+        let error = body_stream
+            .next()
+            .await
+            .expect("terminal timeout item")
+            .expect_err("timeout");
+        assert_eq!(error.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn converts_request_and_records_connect_info() {

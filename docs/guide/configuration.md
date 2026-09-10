@@ -98,6 +98,7 @@ handler = "my_app_core::handlers::root"
 
 [[triggers.http]]
 id = "echo"
+class = "interactive"
 path = "/echo/{name}"
 methods = ["GET", "POST"]
 handler = "my_app_core::handlers::echo"
@@ -114,6 +115,11 @@ body-mode = "buffered"
 | `adapters`    | No       | Intended adapter filter (metadata; `app!` currently ignores) |
 | `description` | No       | Human-readable description for docs or tooling               |
 | `body-mode`   | No       | `buffered` or `stream`                                       |
+| `class`       | No       | Opaque route class exposed to ingress admission policy       |
+
+`class` is application-defined metadata. It is available on matched and
+method-not-allowed route metadata, but it is not interpreted by EdgeZero and does not change the
+route's stable method-plus-pattern identity.
 
 ::: tip Adapter filters
 The `adapters` field is currently metadata for tooling; `app!` wires all triggers regardless of adapter.
