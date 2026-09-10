@@ -20,7 +20,7 @@ use edgezero_core::store_registry::{
 };
 use edgezero_core::time::{Deadline, MonotonicInstant};
 use futures_util::future::{Either, select};
-use futures_util::stream::unfold;
+use futures_util::stream::{LocalBoxStream, once, unfold};
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use worker::{
     Context, Delay, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
@@ -291,13 +291,18 @@ fn attach_core_body(
     mut request: Request,
     read_deadline: Option<Deadline>,
 ) -> Result<Request, EdgeError> {
-    if req.inner().body().is_none() {
-        return Ok(request);
-    }
-    let stream = req
-        .stream()
-        .map_err(EdgeError::internal)?
-        .map_ok(bytes::Bytes::from);
+    let stream: LocalBoxStream<'static, Result<bytes::Bytes, WorkerError>> =
+        if req.inner().body().is_some() {
+            req.stream()
+                .map_err(EdgeError::internal)?
+                .map_ok(bytes::Bytes::from)
+                .boxed_local()
+        } else {
+            // The Workers test runtime and some host-created requests expose
+            // an ArrayBuffer but no ReadableStream. Defer that fallback read
+            // until the core body is first polled so admission still runs first.
+            once(async move { req.bytes().await.map(bytes::Bytes::from) }).boxed_local()
+        };
     *request.body_mut() = match read_deadline {
         Some(deadline) => cloudflare_deadline_body(stream, deadline),
         None => Body::from_external_stream(stream),

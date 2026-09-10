@@ -249,12 +249,14 @@ mod tests {
             .and_then(|value| value.to_str().ok());
         assert_eq!(header, Some("1"));
 
-        assert_eq!(
-            core_request.body().as_bytes().expect("buffered"),
-            b"payload"
-        );
-
         assert!(CloudflareRequestContext::get(&core_request).is_some());
+
+        let body = core_request
+            .into_body()
+            .into_bytes_bounded(1024)
+            .await
+            .expect("request body");
+        assert_eq!(body.as_ref(), b"payload");
     }
 
     #[wasm_bindgen_test]

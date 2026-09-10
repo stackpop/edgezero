@@ -43,7 +43,7 @@ run scripts/run_test_nonzero.sh send_all_preflight_precedence_and_indices cargo 
 
 section "Outbound Capability Tests"
 for adapter in axum cloudflare fastly spin; do
-  run scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p "edgezero-adapter-${adapter}" --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec
+  run scripts/run_test_nonzero.sh adapter_capability_matrix_matches_contracts cargo test --offline --locked -p "edgezero-adapter-${adapter}" --no-default-features --features cli --lib adapter_capability_matrix_matches_contracts
 done
 
 section "Workspace Feature Compilation"
