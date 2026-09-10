@@ -57,6 +57,7 @@
 
 **Files:**
 - Modify: `crates/edgezero-cli/src/generator.rs`
+- Modify: `.github/workflows/test.yml`
 - Test: generated project under a temporary directory
 
 - [x] Add generator assertions for the configure callback, ingress policy/grant, route classes, independent outbound caps, and per-slot timing endpoint.
