@@ -1365,6 +1365,21 @@ mod tests {
     /// infallible `IntoResponse` test usage, and adapter host stubs that
     /// tripped `print_stderr` / `exit`.
     fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
+        let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
+            .expect("read core lib.rs");
+        assert!(
+            core_lib.contains("configure = crate::configure_app"),
+            "generated app macro must install the lifecycle configuration callback",
+        );
+        assert!(
+            core_lib.contains("set_ingress_admission_policy"),
+            "generated app must configure ingress admission",
+        );
+        assert!(
+            core_lib.contains("IngressGrant::new"),
+            "generated admission policy must issue an app-owned grant",
+        );
+
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");
         assert!(
@@ -1386,6 +1401,36 @@ mod tests {
         assert!(
             handlers.contains("fn generated_outbound_http_smoke()"),
             "generated core must contain the outbound smoke sentinel",
+        );
+        for required in [
+            ".max_request_body_bytes(",
+            ".max_encoded_response_bytes(",
+            ".max_decoded_response_bytes(",
+            ".max_response_bytes(",
+            ".max_response_header_bytes(",
+            ".max_response_header_count(",
+            ".max_brotli_window_bits(",
+            ".max_brotli_decoder_bytes(",
+            ".timeout(",
+            "send_all(",
+            "slot.elapsed",
+        ] {
+            assert!(
+                handlers.contains(required),
+                "generated outbound example must contain `{required}`",
+            );
+        }
+
+        let manifest =
+            fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
+        assert!(
+            manifest.contains("path = \"/admission\"")
+                && manifest.contains("class = \"diagnostic\""),
+            "generated manifest must wire the admission diagnostic class",
+        );
+        assert!(
+            manifest.contains("path = \"/fanout\"") && manifest.contains("class = \"outbound\""),
+            "generated manifest must wire the outbound fanout class",
         );
 
         let spin_manifest =

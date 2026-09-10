@@ -12,6 +12,7 @@ use validator::Validate as _;
 #[derive(Debug)]
 struct AppArgs {
     app_ident: Option<Ident>,
+    configure: Option<syn::Expr>,
     owns_logging: Option<bool>,
     path: LitStr,
     state: Option<syn::Expr>,
@@ -21,6 +22,7 @@ impl Parse for AppArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let path: LitStr = input.parse()?;
         let mut app_ident: Option<Ident> = None;
+        let mut configure: Option<syn::Expr> = None;
         let mut owns_logging: Option<bool> = None;
         let mut state: Option<syn::Expr> = None;
         let mut seen_keyword = false;
@@ -34,6 +36,15 @@ impl Parse for AppArgs {
                 input.parse::<Token![=]>()?;
                 seen_keyword = true;
                 match key.to_string().as_str() {
+                    "configure" => {
+                        if configure.is_some() {
+                            return Err(syn::Error::new(
+                                key.span(),
+                                "duplicate `configure` argument",
+                            ));
+                        }
+                        configure = Some(input.parse::<syn::Expr>()?);
+                    }
                     "owns_logging" => {
                         if owns_logging.is_some() {
                             return Err(syn::Error::new(
@@ -54,7 +65,7 @@ impl Parse for AppArgs {
                         return Err(syn::Error::new(
                             key.span(),
                             format!(
-                                "unknown `app!` argument `{other}`; expected `state` or `owns_logging`"
+                                "unknown `app!` argument `{other}`; expected `configure`, `state`, or `owns_logging`"
                             ),
                         ));
                     }
@@ -81,6 +92,7 @@ impl Parse for AppArgs {
         }
         Ok(Self {
             app_ident,
+            configure,
             owns_logging,
             path,
             state,
@@ -121,6 +133,19 @@ fn build_stores_tokens(manifest: &Manifest) -> TokenStream2 {
             }
         }
     }
+}
+
+fn build_configure_tokens(callback: Option<&syn::Expr>) -> TokenStream2 {
+    callback.map_or_else(
+        || quote! { fn configure(_app: &mut edgezero_core::app::App) {} },
+        |configure| {
+            quote! {
+                fn configure(app: &mut edgezero_core::app::App) {
+                    (#configure)(app);
+                }
+            }
+        },
+    )
 }
 
 fn build_middleware_tokens(manifest: &Manifest) -> Result<Vec<TokenStream2>, String> {
@@ -210,6 +235,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
     let manifest_path_lit = LitStr::new(&manifest_path.to_string_lossy(), Span::call_site());
     let owns_logging_lit = args.owns_logging.unwrap_or(false);
+    let configure_tokens = build_configure_tokens(args.configure.as_ref());
     // Emitted only when `state = <expr>` is given; `Option<TokenStream2>: ToTokens`
     // renders `None` as nothing, so an app without `state` is unchanged.
     let state_call = args.state.as_ref().map(|state_expr| {
@@ -217,10 +243,11 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     });
 
     // The emitted `Hooks` impl below explicitly defines `configure`,
-    // `owns_logging`, and `build_app` even though their bodies mirror the trait
-    // defaults. This is required because `missing_trait_methods` (restriction =
-    // deny) forbids relying on trait defaults in the impl. If those `Hooks`
-    // defaults change, update these emitted bodies to match.
+    // `owns_logging`, and `build_app`. `configure` invokes the supplied callback
+    // when present; the other bodies mirror the trait defaults. This is required
+    // because `missing_trait_methods` (restriction = deny) forbids relying on
+    // trait defaults in the impl. If those `Hooks` defaults change, update these
+    // emitted bodies to match.
     let output = quote! {
         // Force a rebuild when the manifest file changes (include_bytes tracks it as a build input).
         const _: &[u8] = include_bytes!(#manifest_path_lit);
@@ -232,7 +259,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
                 build_router()
             }
 
-            fn configure(_app: &mut edgezero_core::app::App) {}
+            #configure_tokens
 
             fn manifest() -> ::edgezero_core::manifest::BakedManifest {
                 static CACHE: ::std::sync::OnceLock<
@@ -445,6 +472,25 @@ mod tests {
     }
 
     #[test]
+    fn app_args_parses_configure_expr() {
+        let args: AppArgs =
+            parse_str(r#""edgezero.toml", configure = crate::configure_app"#).expect("parse");
+        let rendered = args.configure.map(|expr| quote::quote!(#expr).to_string());
+        assert_eq!(rendered, Some("crate :: configure_app".to_owned()));
+    }
+
+    #[test]
+    fn app_args_parses_configure_with_other_keywords() {
+        let args: AppArgs = parse_str(
+            r#""edgezero.toml", MyApp, state = crate::app_state(), configure = crate::configure_app, owns_logging = true"#,
+        )
+        .expect("parse");
+        assert!(args.configure.is_some());
+        assert!(args.state.is_some());
+        assert_eq!(args.owns_logging, Some(true));
+    }
+
+    #[test]
     fn app_args_parses_state_with_app_ident_and_owns_logging() {
         let args: AppArgs =
             parse_str(r#""edgezero.toml", MyApp, state = crate::app_state(), owns_logging = true"#)
@@ -462,6 +508,18 @@ mod tests {
         let err = parse_str::<AppArgs>(r#""edgezero.toml", state = a(), state = b()"#)
             .expect_err("duplicate state");
         assert!(err.to_string().contains("duplicate `state`"), "got: {err}");
+    }
+
+    #[test]
+    fn app_args_rejects_duplicate_configure() {
+        let err = parse_str::<AppArgs>(
+            r#""edgezero.toml", configure = crate::first, configure = crate::second"#,
+        )
+        .expect_err("duplicate configure");
+        assert!(
+            err.to_string().contains("duplicate `configure`"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -494,6 +552,7 @@ mod tests {
             err.to_string().contains("unknown `app!` argument `bogus`"),
             "got: {err}"
         );
+        assert!(err.to_string().contains("`configure`"), "got: {err}");
     }
 
     #[test]
