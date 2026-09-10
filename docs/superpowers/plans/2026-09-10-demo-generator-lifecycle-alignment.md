@@ -75,4 +75,4 @@
 - [x] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - [x] Run `cargo check --workspace --all-targets --features "fastly cloudflare spin"`.
 - [x] Run `scripts/run_tests.sh` and documentation checks.
-- [ ] Update PR metadata, commit, push, wait for all checks, and verify a clean synchronized branch.
+- [x] Update PR metadata, commit, push, wait for all checks, and verify a clean synchronized branch.
