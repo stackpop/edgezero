@@ -24,9 +24,9 @@ mod tests {
 
     use bytes::Bytes;
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
-    use edgezero_adapter_cloudflare::request::{
-        CloudflareService, deadline_body_releases_source_for_test, into_core_request,
-    };
+    #[cfg(feature = "test-utils")]
+    use edgezero_adapter_cloudflare::request::deadline_body_releases_source_for_test;
+    use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
     use edgezero_adapter_cloudflare::response::from_core_response;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
@@ -162,6 +162,7 @@ mod tests {
         (env, Context::new(js_context))
     }
 
+    #[cfg(feature = "test-utils")]
     #[wasm_bindgen_test]
     fn deadline_body_releases_source_when_timeout_is_emitted() {
         assert!(deadline_body_releases_source_for_test());

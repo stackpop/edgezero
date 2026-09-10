@@ -102,6 +102,7 @@ mod tests {
 
     use bytes::Bytes;
     use edgezero_adapter_spin::context::SpinRequestContext;
+    #[cfg(feature = "test-utils")]
     use edgezero_adapter_spin::request::deadline_body_releases_source_for_test;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
@@ -334,6 +335,7 @@ mod tests {
         let _app = build_test_app();
     }
 
+    #[cfg(feature = "test-utils")]
     #[test]
     fn deadline_body_releases_source_when_timeout_is_emitted() {
         assert!(deadline_body_releases_source_for_test());
