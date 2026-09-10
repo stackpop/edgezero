@@ -69,7 +69,7 @@ pub async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
 pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let http_client = ctx.http_client();
-    let request = ctx.into_request();
+    let request = ctx.into_request()?;
     let target = build_proxy_target(&params.rest, request.uri())?;
     let outbound_request = OutboundRequest::from_request(request, target)?;
 
