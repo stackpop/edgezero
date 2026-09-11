@@ -3,11 +3,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+
+use crate::body::Body;
 use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
 use crate::http::{
-    Extensions, HeaderMap, Method, Request, RequestParts, Response, Uri, Version,
-    header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+    Extensions, HeaderMap, HeaderValue, Method, Request, RequestParts, Response, StatusCode, Uri,
+    Version,
+    header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
 };
 use crate::response_egress::ResponseEgressEnvelope;
 use crate::router::{ResolvedDispatch, RouteMetadata, RouteResolution};
@@ -72,6 +76,75 @@ impl fmt::Debug for IngressGrant {
     }
 }
 
+/// Cloneable application response restricted to finite buffered body bytes.
+#[derive(Clone, Debug)]
+pub struct BufferedIngressResponse {
+    body: Bytes,
+    headers: HeaderMap,
+    status: StatusCode,
+}
+
+impl BufferedIngressResponse {
+    /// Returns the finite buffered response bytes.
+    #[must_use]
+    #[inline]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Returns the application-selected response headers.
+    #[must_use]
+    #[inline]
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub(crate) fn into_response(self) -> Response {
+        let mut response = Response::new(Body::from_bytes(self.body));
+        *response.status_mut() = self.status;
+        *response.headers_mut() = self.headers;
+        response
+    }
+
+    /// Constructs an exact buffered response from application-selected parts.
+    #[must_use]
+    #[inline]
+    pub fn new<B>(status: StatusCode, headers: HeaderMap, body: B) -> Self
+    where
+        B: Into<Bytes>,
+    {
+        Self {
+            body: body.into(),
+            headers,
+            status,
+        }
+    }
+
+    /// Returns the application-selected response status.
+    #[must_use]
+    #[inline]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Constructs a buffered UTF-8 plain-text response with an exact content length.
+    #[must_use]
+    #[inline]
+    pub fn text<S>(status: StatusCode, text: S) -> Self
+    where
+        S: Into<String>,
+    {
+        let body = Bytes::from(text.into());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+        Self::new(status, headers, body)
+    }
+}
+
 /// Application decision made before an inbound body can be consumed.
 #[non_exhaustive]
 pub enum AdmissionDecision {
@@ -82,15 +155,58 @@ pub enum AdmissionDecision {
     /// Drains an unmatched or wrong-method request body before returning the canonical
     /// pre-resolved 404/405 response.
     ReadBodyBeforeFallback {
+        grant: IngressGrant,
         max_body_bytes: usize,
         read_deadline: Deadline,
+        on_exceeded: BufferedIngressResponse,
+        on_timeout: BufferedIngressResponse,
     },
     Refuse(Response),
 }
 
+struct FallbackDispatch {
+    max_body_bytes: usize,
+    on_exceeded: BufferedIngressResponse,
+    on_timeout: BufferedIngressResponse,
+}
+
 enum IngressDispatchDisposition {
     Dispatch,
-    ReadBodyBeforeFallback { max_body_bytes: usize },
+    ReadBodyBeforeFallback(Box<FallbackDispatch>),
+}
+
+pub(crate) struct FallbackIngress {
+    dispatch: Box<FallbackDispatch>,
+    grant: IngressGrant,
+    monotonic_clock: MonotonicClock,
+    read_deadline: Deadline,
+}
+
+impl FallbackIngress {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        IngressGrant,
+        usize,
+        Deadline,
+        MonotonicClock,
+        BufferedIngressResponse,
+        BufferedIngressResponse,
+    ) {
+        let FallbackDispatch {
+            max_body_bytes,
+            on_exceeded,
+            on_timeout,
+        } = *self.dispatch;
+        (
+            self.grant,
+            max_body_bytes,
+            self.read_deadline,
+            self.monotonic_clock,
+            on_exceeded,
+            on_timeout,
+        )
+    }
 }
 
 /// Validated policy outcome consumed by an adapter before native body ownership moves.
@@ -120,13 +236,24 @@ pub struct AdmittedIngress {
 }
 
 impl AdmittedIngress {
-    pub(crate) fn fallback_body_limit(&self) -> Option<usize> {
-        match self.dispatch_disposition {
-            IngressDispatchDisposition::Dispatch => None,
-            IngressDispatchDisposition::ReadBodyBeforeFallback { max_body_bytes } => {
-                Some(max_body_bytes)
-            }
-        }
+    pub(crate) fn into_fallback(self) -> Option<FallbackIngress> {
+        let Self {
+            dispatch_disposition,
+            grant,
+            monotonic_clock,
+            read_deadline,
+            ..
+        } = self;
+        let IngressDispatchDisposition::ReadBodyBeforeFallback(dispatch) = dispatch_disposition
+        else {
+            return None;
+        };
+        Some(FallbackIngress {
+            dispatch,
+            grant,
+            monotonic_clock,
+            read_deadline,
+        })
     }
 
     pub(crate) fn into_parts(
@@ -144,6 +271,13 @@ impl AdmittedIngress {
             self.grant,
             self.config_extraction_limits,
             self.monotonic_clock,
+        )
+    }
+
+    pub(crate) fn is_fallback(&self) -> bool {
+        matches!(
+            self.dispatch_disposition,
+            IngressDispatchDisposition::ReadBodyBeforeFallback(_)
         )
     }
 
@@ -576,8 +710,11 @@ pub(crate) fn apply_admission_policy(
             read_deadline,
         } => (grant, read_deadline, IngressDispatchDisposition::Dispatch),
         AdmissionDecision::ReadBodyBeforeFallback {
+            grant,
             max_body_bytes,
             read_deadline,
+            on_exceeded,
+            on_timeout,
         } => {
             match head.route_resolution() {
                 RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound => {}
@@ -588,9 +725,13 @@ pub(crate) fn apply_admission_policy(
                 }
             }
             (
-                IngressGrant::empty(),
+                grant,
                 read_deadline,
-                IngressDispatchDisposition::ReadBodyBeforeFallback { max_body_bytes },
+                IngressDispatchDisposition::ReadBodyBeforeFallback(Box::new(FallbackDispatch {
+                    max_body_bytes,
+                    on_exceeded,
+                    on_timeout,
+                })),
             )
         }
     };
@@ -775,6 +916,27 @@ mod tests {
         IngressGrant::empty()
             .downcast::<String>()
             .expect_err("empty grant");
+    }
+
+    #[test]
+    fn buffered_ingress_response_is_cloneable_and_builds_exact_plain_text() {
+        let response =
+            BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "fallback body exceeded");
+        let cloned = response.clone();
+
+        assert_eq!(cloned.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            cloned.headers().get("content-type").expect("content type"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            cloned
+                .headers()
+                .get("content-length")
+                .expect("content length"),
+            "22"
+        );
+        assert_eq!(cloned.body(), b"fallback body exceeded");
     }
 
     #[test]

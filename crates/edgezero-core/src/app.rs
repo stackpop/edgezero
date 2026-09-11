@@ -410,33 +410,45 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::Poll;
+    use std::task::{Context, Poll};
     use std::time::Duration;
+    use std::{future::Future as _, str};
 
     use super::*;
     use crate::body::Body;
     use crate::config_store::ConfigExtractionLimits;
     use crate::context::RequestContext;
     use crate::error::EdgeError;
-    use crate::http::{HeaderMap, Method, StatusCode, Version, request_builder, response_builder};
+    use crate::http::{
+        HeaderMap, HeaderValue, Method, StatusCode, Version, request_builder, response_builder,
+    };
     use crate::ingress::{
-        IngressBeginOutcome, IngressFraming, IngressGrant, IngressHeadAccounting, IngressHeadParts,
+        BufferedIngressResponse, IngressBeginOutcome, IngressFraming, IngressGrant,
+        IngressHeadAccounting, IngressHeadParts,
     };
     use crate::manifest::BakedManifest;
+    use crate::middleware::{Middleware, Next};
     use crate::response_egress::{
         DEFAULT_RESPONSE_WRITE_BUDGET, ResponseEgressAttempt, ResponseEgressHead,
         ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressReport,
     };
     use crate::router::{RouteMetadata, RouteResolution};
     use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::StreamExt as _;
     use futures::executor::block_on;
     use futures::stream::{iter, poll_fn};
+    use futures::task::noop_waker_ref;
     use tower_service::Service as _;
 
     struct DefaultHooks;
 
     struct TestHooks;
+
+    struct CountingMiddleware(Arc<AtomicUsize>);
+
+    struct GrantDropProbe(Arc<AtomicUsize>);
 
     #[derive(Clone)]
     struct AppEgressObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
@@ -444,6 +456,20 @@ mod tests {
     impl ResponseEgressObserver for AppEgressObserver {
         fn complete(&self, report: &ResponseEgressReport) {
             self.0.lock().expect("reports lock").push(report.clone());
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Middleware for CountingMiddleware {
+        async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            next.run(ctx).await
+        }
+    }
+
+    impl Drop for GrantDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -497,8 +523,90 @@ mod tests {
         }
     }
 
+    fn assert_buffered_terminal_response(
+        response: &Response,
+        status: StatusCode,
+        marker: &str,
+        body: &[u8],
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-fallback-terminal")
+                .expect("terminal marker"),
+            marker
+        );
+        assert_eq!(response.body().as_bytes().expect("buffered body"), body);
+    }
+
+    fn assert_no_fallback_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn buffered_terminal(
+        status: StatusCode,
+        marker: &'static str,
+        body: &'static [u8],
+    ) -> BufferedIngressResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fallback-terminal", HeaderValue::from_static(marker));
+        BufferedIngressResponse::new(status, headers, Bytes::from_static(body))
+    }
+
+    fn configure_fallback_policy(
+        app: &mut App,
+        drops: &Arc<AtomicUsize>,
+        max_body_bytes: usize,
+        read_deadline: Deadline,
+        on_exceeded: BufferedIngressResponse,
+        on_timeout: BufferedIngressResponse,
+    ) {
+        let grant_drops = Arc::clone(drops);
+        app.set_ingress_admission_policy(move |_| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::new(GrantDropProbe(Arc::clone(&grant_drops))),
+            max_body_bytes,
+            read_deadline,
+            on_exceeded: on_exceeded.clone(),
+            on_timeout: on_timeout.clone(),
+        });
+    }
+
+    fn dispatch_fallback(app: &App, body: Body) -> Response {
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(body)
+            .expect("request");
+        block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response")
+    }
+
     fn empty_router() -> RouterService {
         RouterService::builder().build()
+    }
+
+    fn guarded_fallback_app() -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_counter = Arc::clone(&handler_calls);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .get("/known", move |_ctx: RequestContext| {
+                let call_counter = Arc::clone(&handler_counter);
+                async move {
+                    call_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("unexpected")
+                }
+            })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+            .build();
+        (App::new(router), handler_calls, middleware_calls)
     }
 
     #[test]
@@ -709,6 +817,7 @@ mod tests {
     fn ingress_refusal_skips_handler_and_body_poll() {
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let handler_counter = Arc::clone(&handler_calls);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
         let router = RouterService::builder()
             .post("/upload", move |_ctx: RequestContext| {
                 let call_counter = Arc::clone(&handler_counter);
@@ -717,6 +826,7 @@ mod tests {
                     Ok::<_, EdgeError>("unexpected")
                 }
             })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
             .build();
         let mut app = App::new(router);
         let admission_calls = Arc::new(AtomicUsize::new(0));
@@ -725,8 +835,9 @@ mod tests {
             admission_counter.fetch_add(1, Ordering::SeqCst);
             AdmissionDecision::Refuse(
                 response_builder()
-                    .status(StatusCode::TOO_MANY_REQUESTS)
-                    .body(Body::empty())
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("x-admission", "saturated")
+                    .body(Body::from("busy"))
                     .expect("response"),
             )
         });
@@ -750,9 +861,15 @@ mod tests {
         ))
         .expect("response");
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("x-admission").expect("header"),
+            "saturated"
+        );
+        assert_eq!(response.body().as_bytes().expect("body"), b"busy");
         assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
         assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
         assert_eq!(body_polls.load(Ordering::SeqCst), 0);
     }
 
@@ -825,8 +942,11 @@ mod tests {
             .build();
         let mut app = App::new(router);
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
             max_body_bytes: 4_096,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
         });
         let head = IngressHeadParts::new(
             Method::POST,
@@ -845,8 +965,11 @@ mod tests {
     fn fallback_body_exact_cap_preserves_not_found() {
         let mut app = App::new(empty_router());
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
             max_body_bytes: 4,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
         });
         let request = request_builder()
             .method(Method::POST)
@@ -877,8 +1000,11 @@ mod tests {
             .build();
         let mut app = App::new(router);
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
             max_body_bytes: 4,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
         });
         let request = request_builder()
             .method(Method::POST)
@@ -897,20 +1023,23 @@ mod tests {
         ))
         .expect("response");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn fallback_body_zero_cap_accepts_only_empty_body() {
         let mut app = App::new(empty_router());
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
             max_body_bytes: 0,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
         });
 
         for (body, expected) in [
             (Body::empty(), StatusCode::NOT_FOUND),
-            (Body::from_bytes("a"), StatusCode::BAD_REQUEST),
+            (Body::from_bytes("a"), StatusCode::PAYLOAD_TOO_LARGE),
         ] {
             let request = request_builder()
                 .method(Method::POST)
@@ -941,8 +1070,14 @@ mod tests {
         let mut app = App::new(empty_router());
         app.set_monotonic_clock(MonotonicClock::new(move || start));
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
             max_body_bytes: 4_096,
             read_deadline: Deadline::at_instant(head.request_start()),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(
+                StatusCode::GATEWAY_TIMEOUT,
+                "fallback timeout",
+            ),
         });
         let request = request_builder()
             .method(Method::POST)
@@ -958,8 +1093,253 @@ mod tests {
         ))
         .expect("response");
 
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.body().as_bytes().expect("buffered body"),
+            b"fallback timeout"
+        );
         assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fallback_grant_is_live_during_exact_cap_eof_and_drops_before_egress() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let mut poll = 0_usize;
+        let body = Body::stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            let next = match poll {
+                0 => Some(Bytes::from_static(b"ab")),
+                1 => Some(Bytes::from_static(b"cd")),
+                2 => None,
+                _ => panic!("body polled after EOF"),
+            };
+            poll += 1;
+            Poll::Ready(next)
+        }));
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/known".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let IngressBeginOutcome::Admitted(prepared) = app
+            .begin_ingress(head, MonotonicInstant::now())
+            .expect("begin ingress")
+        else {
+            panic!("expected admission");
+        };
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(body)
+            .expect("request");
+
+        let egress = block_on(app.dispatch_admitted(prepared, request)).expect("dispatch");
+
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            egress.into_response().status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_overflow_returns_exact_application_response_and_drops_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "exceeded",
+                b"limit\0exceeded",
+            ),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::stream(
+            iter([Bytes::from_static(b"abcd"), Bytes::from_static(b"e")]).inspect(move |_| {
+                assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            }),
+        );
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_buffered_terminal_response(
+            &response,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exceeded",
+            b"limit\0exceeded",
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_deadline_expiry_returns_exact_application_response_and_drops_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let start = MonotonicInstant::now();
+        let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
+        let now = Arc::new(Mutex::new(start));
+        let observed_now = Arc::clone(&now);
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            *observed_now.lock().expect("clock lock")
+        }));
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::at_instant(deadline),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"deadline\0expired"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            *now.lock().expect("clock lock") = deadline;
+            Poll::Ready(Some(Bytes::from_static(b"a")))
+        }));
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_buffered_terminal_response(
+            &response,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            b"deadline\0expired",
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_adapter_request_timeout_uses_application_timeout_response() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"adapter timeout"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::from_stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            Poll::Ready(Some(Err(EdgeError::request_timeout(
+                "adapter deadline wrapper expired",
+            ))))
+        }));
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_buffered_terminal_response(
+            &response,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            b"adapter timeout",
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_non_timeout_source_error_is_preserved_and_drops_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::from_stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            Poll::Ready(Some(Err(EdgeError::service_unavailable(
+                "source unavailable",
+            ))))
+        }));
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get("x-fallback-terminal").is_none());
+        assert!(
+            str::from_utf8(response.body().as_bytes().expect("buffered body"))
+                .expect("JSON body")
+                .contains("service_unavailable")
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn cancelling_fallback_dispatch_drops_live_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let body = Body::stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending::<Option<Bytes>>
+        }));
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/known".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let IngressBeginOutcome::Admitted(prepared) = app
+            .begin_ingress(head, MonotonicInstant::now())
+            .expect("begin ingress")
+        else {
+            panic!("expected admission");
+        };
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(body)
+            .expect("request");
+        let mut dispatch = Box::pin(app.dispatch_admitted(prepared, request));
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(dispatch.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(body_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+
+        drop(dispatch);
+
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
     }
 
     #[test]

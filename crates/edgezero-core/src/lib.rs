@@ -63,7 +63,7 @@ pub use error::{
     StoreExtractionReason,
 };
 pub use ingress::{
-    AdmissionDecision, AdmittedIngress, DEFAULT_INBOUND_READ_BUDGET,
+    AdmissionDecision, AdmittedIngress, BufferedIngressResponse, DEFAULT_INBOUND_READ_BUDGET,
     DEFAULT_MAX_REQUEST_HEADER_BYTES, DEFAULT_MAX_REQUEST_HEADER_COUNT,
     DEFAULT_MAX_REQUEST_TARGET_BYTES, IngressAdmissionOutcome, IngressBeginOutcome, IngressFraming,
     IngressGrant, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
