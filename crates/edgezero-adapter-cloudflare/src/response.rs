@@ -118,6 +118,10 @@ fn apply_response_head(
 ) -> Result<CfResponse, EdgeError> {
     let mut response = body_response.with_status(status.as_u16());
     let headers = response.headers_mut();
+    // Workers adds this default while constructing byte and stream bodies.
+    headers
+        .delete("content-type")
+        .map_err(EdgeError::internal)?;
     copy_header_values(source_headers, headers, |_name| {
         EdgeError::internal(anyhow::anyhow!(
             "response header cannot be represented by Workers"
