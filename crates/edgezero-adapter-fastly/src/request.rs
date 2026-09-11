@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Display;
-use std::io::Read as _;
+use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::Poll;
 
@@ -11,6 +11,8 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request, request_builder};
+#[cfg(feature = "test-utils")]
+use edgezero_core::http::{Method, Response, Uri};
 use edgezero_core::ingress::{
     IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
 };
@@ -553,7 +555,18 @@ fn attach_core_body(
     mut request: Request,
     read_lifetime: Option<(Deadline, MonotonicClock)>,
 ) -> Request {
-    let mut native_body = Some(req.take_body());
+    *request.body_mut() = fastly_deadline_body(req.take_body(), read_lifetime);
+    request
+}
+
+fn fastly_deadline_body<Source>(
+    source: Source,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
+) -> Body
+where
+    Source: Read + 'static,
+{
+    let mut native_body = Some(source);
     let mut terminal = false;
     let stream = stream::poll_fn(move |_cx| {
         if terminal {
@@ -603,8 +616,48 @@ fn attach_core_body(
             }
         }
     });
-    *request.body_mut() = Body::from_stream(stream);
-    request
+    Body::from_stream(stream)
+}
+
+/// Dispatches an observable reader through the production ingress body wrapper.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub fn dispatch_ingress_reader_for_test<Source>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    source: Source,
+) -> Result<Response, EdgeError>
+where
+    Source: Read + 'static,
+{
+    let request_start = app.monotonic_now();
+    let mut core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(EdgeError::internal)?;
+    let head_parts = IngressHeadParts::from_request(
+        &core_request,
+        IngressHeadAccounting::HostManaged,
+        IngressFraming::HostManaged,
+    );
+    head_parts.validate_normalized(app.ingress_head_limits())?;
+    let prepared = match app.begin_ingress(head_parts, request_start)? {
+        IngressBeginOutcome::Admitted(prepared) => prepared,
+        IngressBeginOutcome::Refused(response) => return Ok(response.into_response()),
+        _ => {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "unsupported ingress admission outcome"
+            )));
+        }
+    };
+    *core_request.body_mut() = fastly_deadline_body(
+        source,
+        Some((prepared.read_deadline(), prepared.monotonic_clock())),
+    );
+    Ok(executor::block_on(app.dispatch_admitted(prepared, core_request))?.into_response())
 }
 
 fn map_edge_error(err: &EdgeError) -> FastlyError {

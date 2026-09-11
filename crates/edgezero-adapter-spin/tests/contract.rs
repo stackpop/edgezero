@@ -18,6 +18,13 @@ mod store_trait_compile_checks {
 
 #[cfg(test)]
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg_attr(
+    feature = "test-utils",
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "ingress contracts are grouped after the provider fixture tests"
+    )
+)]
 mod tests {
     // `from_core_response` tests live in a nested module so they're grouped
     // together; the `tests_outside_test_module` lint is satisfied by the
@@ -543,6 +550,350 @@ mod tests {
             b"no-handle",
             "no secret handle yields the no-handle marker"
         );
+    }
+
+    #[cfg(feature = "test-utils")]
+    mod ingress_contract {
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::task::Poll;
+
+        use edgezero_adapter_spin::request::dispatch_ingress_stream_for_test;
+        use edgezero_core::http::{HeaderMap, HeaderValue, Method};
+        use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
+        use edgezero_core::middleware::{Middleware, Next};
+        use edgezero_core::router::RouteResolution;
+        use edgezero_core::time::{MonotonicClock, MonotonicInstant};
+        use futures::stream::poll_fn;
+
+        use super::*;
+
+        struct DropSignal(Arc<AtomicUsize>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct CountingMiddleware(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait(?Send)]
+        impl Middleware for CountingMiddleware {
+            async fn handle(
+                &self,
+                ctx: RequestContext,
+                next: Next<'_>,
+            ) -> Result<Response, EdgeError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                next.run(ctx).await
+            }
+        }
+
+        fn guarded_fallback_app() -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let handler_counter = Arc::clone(&handler_calls);
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let router = RouterService::builder()
+                .get("/known", move |_ctx: RequestContext| {
+                    let request_handler_calls = Arc::clone(&handler_counter);
+                    async move {
+                        request_handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, EdgeError>("handler must not run")
+                    }
+                })
+                .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+                .build();
+            (App::new(router), handler_calls, middleware_calls)
+        }
+
+        fn fallback_app(
+            max_body_bytes: usize,
+            read_budget: Duration,
+            grant_drops: &Arc<AtomicUsize>,
+        ) -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+            let observed_grant_drops = Arc::clone(grant_drops);
+            app.set_ingress_admission_policy(move |head| {
+                assert!(matches!(
+                    head.route_resolution(),
+                    RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
+                ));
+                AdmissionDecision::ReadBodyBeforeFallback {
+                    grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+                    max_body_bytes,
+                    read_deadline: head.read_deadline_after(read_budget),
+                    on_exceeded: terminal_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "overflow",
+                        b"spin overflow\0response",
+                    ),
+                    on_timeout: terminal_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timeout",
+                        b"spin timeout response\n",
+                    ),
+                }
+            });
+            (app, handler_calls, middleware_calls)
+        }
+
+        fn terminal_headers(marker: &'static str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "content-type",
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            headers.insert("x-ingress-terminal", HeaderValue::from_static(marker));
+            headers
+        }
+
+        fn terminal_response(
+            status: StatusCode,
+            marker: &'static str,
+            body: &'static [u8],
+        ) -> BufferedIngressResponse {
+            BufferedIngressResponse::new(status, terminal_headers(marker), Bytes::from_static(body))
+        }
+
+        fn tracked_stream(
+            chunks: Vec<Bytes>,
+            grant_drops: &Arc<AtomicUsize>,
+            source_drops: &Arc<AtomicUsize>,
+            body_polls: &Arc<AtomicUsize>,
+            expire_on_poll: Option<(Arc<Mutex<MonotonicInstant>>, MonotonicInstant)>,
+        ) -> impl futures::Stream<Item = Result<Bytes, io::Error>> + 'static {
+            let observed_grant_drops = Arc::clone(grant_drops);
+            let observed_body_polls = Arc::clone(body_polls);
+            let source_drop = DropSignal(Arc::clone(source_drops));
+            let mut pending_chunks = chunks.into_iter();
+            poll_fn(move |_cx| {
+                let _keep_source_alive = &source_drop;
+                assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
+                observed_body_polls.fetch_add(1, Ordering::SeqCst);
+                if let Some((now, deadline)) = &expire_on_poll {
+                    *now.lock().expect("clock lock") = *deadline;
+                }
+                Poll::Ready(pending_chunks.next().map(Ok))
+            })
+        }
+
+        fn assert_no_route_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+        }
+
+        fn assert_terminal_response(
+            response: &Response,
+            status: StatusCode,
+            marker: &'static str,
+            body: &[u8],
+        ) {
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers(), &terminal_headers(marker));
+            assert_eq!(response.body().as_bytes().expect("buffered body"), body);
+        }
+
+        #[test]
+        fn exact_cap_preserves_not_found_and_method_not_allowed() {
+            for (path, expected_status) in [
+                ("/missing", StatusCode::NOT_FOUND),
+                ("/known", StatusCode::METHOD_NOT_ALLOWED),
+            ] {
+                let grant_drops = Arc::new(AtomicUsize::new(0));
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let body_polls = Arc::new(AtomicUsize::new(0));
+                let (app, handler_calls, middleware_calls) =
+                    fallback_app(4, Duration::from_secs(30), &grant_drops);
+                let source = tracked_stream(
+                    vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
+                    &grant_drops,
+                    &source_drops,
+                    &body_polls,
+                    None,
+                );
+
+                let response = block_on(dispatch_ingress_stream_for_test(
+                    &app,
+                    Method::POST,
+                    path.parse().expect("URI"),
+                    source,
+                ))
+                .expect("response");
+
+                assert_eq!(response.status(), expected_status);
+                assert_eq!(body_polls.load(Ordering::SeqCst), 3);
+                assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            }
+        }
+
+        #[test]
+        fn cap_plus_one_precedes_not_found_and_method_not_allowed() {
+            for path in ["/missing", "/known"] {
+                let grant_drops = Arc::new(AtomicUsize::new(0));
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let body_polls = Arc::new(AtomicUsize::new(0));
+                let (app, handler_calls, middleware_calls) =
+                    fallback_app(4, Duration::from_secs(30), &grant_drops);
+                let source = tracked_stream(
+                    vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"e")],
+                    &grant_drops,
+                    &source_drops,
+                    &body_polls,
+                    None,
+                );
+
+                let response = block_on(dispatch_ingress_stream_for_test(
+                    &app,
+                    Method::POST,
+                    path.parse().expect("URI"),
+                    source,
+                ))
+                .expect("response");
+
+                assert_terminal_response(
+                    &response,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "overflow",
+                    b"spin overflow\0response",
+                );
+                assert_eq!(body_polls.load(Ordering::SeqCst), 2);
+                assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            }
+        }
+
+        #[test]
+        fn best_effort_pre_read_expiry_preserves_application_response() {
+            for path in ["/missing", "/known"] {
+                let grant_drops = Arc::new(AtomicUsize::new(0));
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let body_polls = Arc::new(AtomicUsize::new(0));
+                let start = MonotonicInstant::now();
+                let (mut app, handler_calls, middleware_calls) =
+                    fallback_app(4, Duration::ZERO, &grant_drops);
+                app.set_monotonic_clock(MonotonicClock::new(move || start));
+                let source = tracked_stream(
+                    vec![Bytes::from_static(b"body")],
+                    &grant_drops,
+                    &source_drops,
+                    &body_polls,
+                    None,
+                );
+
+                let response = block_on(dispatch_ingress_stream_for_test(
+                    &app,
+                    Method::POST,
+                    path.parse().expect("URI"),
+                    source,
+                ))
+                .expect("response");
+
+                assert_terminal_response(
+                    &response,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    b"spin timeout response\n",
+                );
+                assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+                assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            }
+        }
+
+        #[test]
+        fn best_effort_post_ready_expiry_preserves_application_response() {
+            for path in ["/missing", "/known"] {
+                let grant_drops = Arc::new(AtomicUsize::new(0));
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let body_polls = Arc::new(AtomicUsize::new(0));
+                let start = MonotonicInstant::now();
+                let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
+                let now = Arc::new(Mutex::new(start));
+                let observed_now = Arc::clone(&now);
+                let (mut app, handler_calls, middleware_calls) =
+                    fallback_app(4, Duration::from_secs(1), &grant_drops);
+                app.set_monotonic_clock(MonotonicClock::new(move || {
+                    *observed_now.lock().expect("clock lock")
+                }));
+                let source = tracked_stream(
+                    vec![Bytes::from_static(b"body")],
+                    &grant_drops,
+                    &source_drops,
+                    &body_polls,
+                    Some((now, deadline)),
+                );
+
+                let response = block_on(dispatch_ingress_stream_for_test(
+                    &app,
+                    Method::POST,
+                    path.parse().expect("URI"),
+                    source,
+                ))
+                .expect("response");
+
+                assert_terminal_response(
+                    &response,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    b"spin timeout response\n",
+                );
+                assert_eq!(body_polls.load(Ordering::SeqCst), 1);
+                assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            }
+        }
+
+        #[test]
+        fn saturated_fallback_refuses_without_polling_body() {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+            app.set_ingress_admission_policy(|head| {
+                assert!(matches!(head.route_resolution(), RouteResolution::NotFound));
+                AdmissionDecision::Refuse(
+                    response_builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("x-ingress-refusal", "saturated")
+                        .body(Body::from("spin unavailable\n"))
+                        .expect("refusal response"),
+                )
+            });
+            let source = tracked_stream(
+                vec![Bytes::from_static(b"body")],
+                &grant_drops,
+                &source_drops,
+                &body_polls,
+                None,
+            );
+
+            let response = block_on(dispatch_ingress_stream_for_test(
+                &app,
+                Method::POST,
+                "/missing".parse().expect("URI"),
+                source,
+            ))
+            .expect("response");
+
+            let mut expected_headers = HeaderMap::new();
+            expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers(), &expected_headers);
+            assert_eq!(
+                response.body().as_bytes().expect("buffered body"),
+                b"spin unavailable\n"
+            );
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_route_dispatch(&handler_calls, &middleware_calls);
+        }
     }
 }
 
