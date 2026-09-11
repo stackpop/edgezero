@@ -744,12 +744,13 @@ fn warn_missing_store_once(store_name: &str, detail: &str) {
 mod synthesis_tests {
     use super::*;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::context::RequestContext;
     use edgezero_core::key_value_store::{KvStore, NoopKvStore};
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
     use std::collections::BTreeMap;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct StubConfig;
@@ -799,29 +800,39 @@ mod synthesis_tests {
     }
 
     #[test]
-    fn standard_outbound_client_factory_uses_the_exact_app_clock() {
+    fn standard_service_installs_the_exact_application_outbound_clock() {
+        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+            let client = ctx
+                .http_client()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+            let request =
+                edgezero_core::OutboundRequest::get("https://example.com/")?.stream_response();
+            let results = client.send_all(vec![request]).await;
+            Ok(results[0].elapsed.as_millis().to_string())
+        }
+
         let start = MonotonicInstant::now();
         let completed = start
             .checked_add(Duration::from_millis(7))
             .expect("completed instant");
-        let observations = Arc::new(Mutex::new(VecDeque::from([start, completed])));
+        let observations = Arc::new(AtomicUsize::new(0));
         let clock_observations = Arc::clone(&observations);
-        let mut app = App::new(RouterService::builder().build());
+        let mut app = App::new(RouterService::builder().get("/clock", elapsed).build());
         app.set_monotonic_clock(MonotonicClock::new(move || {
-            clock_observations
-                .lock()
-                .expect("clock observations")
-                .pop_front()
-                .expect("clock observation")
+            if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                start
+            } else {
+                completed
+            }
         }));
-        let client = outbound_client(app.monotonic_clock());
-        let request = edgezero_core::OutboundRequest::get("https://example.com/")
-            .expect("request")
-            .stream_response();
+        let request = FastlyRequest::new(Method::GET, "http://example.test/clock");
 
-        let results = executor::block_on(client.send_all(vec![request]));
+        let mut response = FastlyService::new(&app)
+            .dispatch(request)
+            .expect("Fastly response");
 
-        assert_eq!(results[0].elapsed, Duration::from_millis(7));
+        assert_eq!(response.take_body_bytes(), b"7");
+        assert!(observations.load(Ordering::SeqCst) >= 3);
     }
 
     #[test]

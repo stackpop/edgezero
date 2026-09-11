@@ -345,6 +345,7 @@ mod tests {
     use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
     use edgezero_core::key_value_store::KvStore;
     use edgezero_core::middleware::{Middleware, Next};
+    use edgezero_core::outbound::OutboundRequest;
     use edgezero_core::response_egress::{ResponseEgressObserver, ResponseEgressReport};
     use edgezero_core::router::{RouteMetadata, RouteResolution};
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
@@ -416,6 +417,49 @@ mod tests {
         let request = Request::builder().uri("/").body(AxumBody::empty()).unwrap();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_service_installs_the_exact_application_outbound_clock() {
+        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+            let client = ctx
+                .http_client()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+            let request = OutboundRequest::get("https://example.com/")?.stream_response();
+            let results = client.send_all(vec![request]).await;
+            Ok(results[0].elapsed.as_millis().to_string())
+        }
+
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(AtomicUsize::new(0));
+        let clock_observations = Arc::clone(&observations);
+        let router = RouterService::builder().get("/clock", elapsed).build();
+        let mut app = App::new(router);
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                start
+            } else {
+                completed
+            }
+        }));
+        let request = Request::builder()
+            .uri("/clock")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = EdgeZeroAxumService::from_app(app)
+            .oneshot(request)
+            .await
+            .expect("response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+
+        assert_eq!(body, "7");
+        assert!(observations.load(Ordering::SeqCst) >= 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
