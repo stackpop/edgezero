@@ -741,6 +741,7 @@ dependencies = [
  "edgezero-adapter",
  "edgezero-core",
  "fastly",
+ "fastly-shared",
  "fern",
  "flate2",
  "futures",

@@ -1,6 +1,10 @@
 #![cfg(all(target_arch = "wasm32", feature = "test-utils"))]
 
 #[cfg(test)]
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "SDK construction checks stay before the exhaustive classifier fixture"
+)]
 mod tests {
     use std::time::Duration;
 
@@ -69,75 +73,183 @@ mod tests {
         drop((response, response_done, response_writer));
     }
 
-    fn known_error_codes() -> Vec<ErrorCode> {
+    #[derive(Clone, Copy, Debug)]
+    enum ExpectedError {
+        BadRequest,
+        Internal,
+        Protocol,
+        Timeout,
+        Transport,
+        Unknown,
+        Unreachable,
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the pinned SDK table intentionally constructs every known ErrorCode variant"
+    )]
+    fn known_error_codes() -> Vec<(ErrorCode, ExpectedError)> {
         let field = FieldSizePayload {
             field_name: Some("x-test".to_owned()),
             field_size: Some(1),
         };
         vec![
-            ErrorCode::DnsTimeout,
-            ErrorCode::DnsError(DnsErrorPayload {
-                rcode: Some("NXDOMAIN".to_owned()),
-                info_code: Some(3),
-            }),
-            ErrorCode::DestinationNotFound,
-            ErrorCode::DestinationUnavailable,
-            ErrorCode::DestinationIpProhibited,
-            ErrorCode::DestinationIpUnroutable,
-            ErrorCode::ConnectionRefused,
-            ErrorCode::ConnectionTerminated,
-            ErrorCode::ConnectionTimeout,
-            ErrorCode::ConnectionReadTimeout,
-            ErrorCode::ConnectionWriteTimeout,
-            ErrorCode::ConnectionLimitReached,
-            ErrorCode::TlsProtocolError,
-            ErrorCode::TlsCertificateError,
-            ErrorCode::TlsAlertReceived(TlsAlertReceivedPayload {
-                alert_id: Some(42),
-                alert_message: Some("fixture".to_owned()),
-            }),
-            ErrorCode::HttpRequestDenied,
-            ErrorCode::HttpRequestLengthRequired,
-            ErrorCode::HttpRequestBodySize(Some(1)),
-            ErrorCode::HttpRequestMethodInvalid,
-            ErrorCode::HttpRequestUriInvalid,
-            ErrorCode::HttpRequestUriTooLong,
-            ErrorCode::HttpRequestHeaderSectionSize(Some(1)),
-            ErrorCode::HttpRequestHeaderSize(Some(field.clone())),
-            ErrorCode::HttpRequestTrailerSectionSize(Some(1)),
-            ErrorCode::HttpRequestTrailerSize(field.clone()),
-            ErrorCode::HttpResponseIncomplete,
-            ErrorCode::HttpResponseHeaderSectionSize(Some(1)),
-            ErrorCode::HttpResponseHeaderSize(field.clone()),
-            ErrorCode::HttpResponseBodySize(Some(1)),
-            ErrorCode::HttpResponseTrailerSectionSize(Some(1)),
-            ErrorCode::HttpResponseTrailerSize(field),
-            ErrorCode::HttpResponseTransferCoding(Some("fixture".to_owned())),
-            ErrorCode::HttpResponseContentCoding(Some("fixture".to_owned())),
-            ErrorCode::HttpResponseTimeout,
-            ErrorCode::HttpUpgradeFailed,
-            ErrorCode::HttpProtocolError,
-            ErrorCode::LoopDetected,
-            ErrorCode::ConfigurationError,
-            ErrorCode::InternalError(Some("fixture".to_owned())),
+            (ErrorCode::DnsTimeout, ExpectedError::Timeout),
+            (
+                ErrorCode::DnsError(DnsErrorPayload {
+                    rcode: Some("NXDOMAIN".to_owned()),
+                    info_code: Some(3),
+                }),
+                ExpectedError::Unreachable,
+            ),
+            (ErrorCode::DestinationNotFound, ExpectedError::Unreachable),
+            (
+                ErrorCode::DestinationUnavailable,
+                ExpectedError::Unreachable,
+            ),
+            (
+                ErrorCode::DestinationIpProhibited,
+                ExpectedError::Unreachable,
+            ),
+            (
+                ErrorCode::DestinationIpUnroutable,
+                ExpectedError::Unreachable,
+            ),
+            (ErrorCode::ConnectionRefused, ExpectedError::Unreachable),
+            (ErrorCode::ConnectionTerminated, ExpectedError::Transport),
+            (ErrorCode::ConnectionTimeout, ExpectedError::Timeout),
+            (ErrorCode::ConnectionReadTimeout, ExpectedError::Timeout),
+            (ErrorCode::ConnectionWriteTimeout, ExpectedError::Timeout),
+            (
+                ErrorCode::ConnectionLimitReached,
+                ExpectedError::Unreachable,
+            ),
+            (ErrorCode::TlsProtocolError, ExpectedError::Unreachable),
+            (ErrorCode::TlsCertificateError, ExpectedError::Unreachable),
+            (
+                ErrorCode::TlsAlertReceived(TlsAlertReceivedPayload {
+                    alert_id: Some(42),
+                    alert_message: Some("fixture".to_owned()),
+                }),
+                ExpectedError::Unreachable,
+            ),
+            (ErrorCode::HttpRequestDenied, ExpectedError::BadRequest),
+            (
+                ErrorCode::HttpRequestLengthRequired,
+                ExpectedError::Internal,
+            ),
+            (
+                ErrorCode::HttpRequestBodySize(Some(1)),
+                ExpectedError::BadRequest,
+            ),
+            (ErrorCode::HttpRequestMethodInvalid, ExpectedError::Internal),
+            (ErrorCode::HttpRequestUriInvalid, ExpectedError::Internal),
+            (ErrorCode::HttpRequestUriTooLong, ExpectedError::BadRequest),
+            (
+                ErrorCode::HttpRequestHeaderSectionSize(Some(1)),
+                ExpectedError::BadRequest,
+            ),
+            (
+                ErrorCode::HttpRequestHeaderSize(Some(field.clone())),
+                ExpectedError::BadRequest,
+            ),
+            (
+                ErrorCode::HttpRequestTrailerSectionSize(Some(1)),
+                ExpectedError::Internal,
+            ),
+            (
+                ErrorCode::HttpRequestTrailerSize(field.clone()),
+                ExpectedError::Internal,
+            ),
+            (ErrorCode::HttpResponseIncomplete, ExpectedError::Protocol),
+            (
+                ErrorCode::HttpResponseHeaderSectionSize(Some(1)),
+                ExpectedError::Protocol,
+            ),
+            (
+                ErrorCode::HttpResponseHeaderSize(field.clone()),
+                ExpectedError::Protocol,
+            ),
+            (
+                ErrorCode::HttpResponseBodySize(Some(1)),
+                ExpectedError::Protocol,
+            ),
+            (
+                ErrorCode::HttpResponseTrailerSectionSize(Some(1)),
+                ExpectedError::Protocol,
+            ),
+            (
+                ErrorCode::HttpResponseTrailerSize(field),
+                ExpectedError::Protocol,
+            ),
+            (
+                ErrorCode::HttpResponseTransferCoding(Some("fixture".to_owned())),
+                ExpectedError::Protocol,
+            ),
+            (
+                ErrorCode::HttpResponseContentCoding(Some("fixture".to_owned())),
+                ExpectedError::Protocol,
+            ),
+            (ErrorCode::HttpResponseTimeout, ExpectedError::Timeout),
+            (ErrorCode::HttpUpgradeFailed, ExpectedError::Protocol),
+            (ErrorCode::HttpProtocolError, ExpectedError::Protocol),
+            (ErrorCode::LoopDetected, ExpectedError::Protocol),
+            (ErrorCode::ConfigurationError, ExpectedError::Internal),
+            (
+                ErrorCode::InternalError(Some("fixture".to_owned())),
+                ExpectedError::Unknown,
+            ),
         ]
+    }
+
+    fn assert_expected_error(error: &EdgeError, expected: ExpectedError) {
+        match expected {
+            ExpectedError::BadRequest => assert!(matches!(error, EdgeError::BadRequest { .. })),
+            ExpectedError::Internal => assert!(matches!(error, EdgeError::Internal { .. })),
+            ExpectedError::Protocol => assert!(matches!(
+                error,
+                EdgeError::BadGateway {
+                    reason: BadGatewayReason::Protocol,
+                    ..
+                }
+            )),
+            ExpectedError::Timeout => assert!(matches!(
+                error,
+                EdgeError::GatewayTimeout {
+                    cause: BudgetSource::Unspecified,
+                    ..
+                }
+            )),
+            ExpectedError::Transport => assert!(matches!(
+                error,
+                EdgeError::BadGateway {
+                    reason: BadGatewayReason::Transport,
+                    ..
+                }
+            )),
+            ExpectedError::Unknown => assert!(matches!(
+                error,
+                EdgeError::BadGateway {
+                    reason: BadGatewayReason::Unspecified,
+                    ..
+                }
+            )),
+            ExpectedError::Unreachable => assert!(matches!(
+                error,
+                EdgeError::BadGateway {
+                    reason: BadGatewayReason::Unreachable,
+                    ..
+                }
+            )),
+        }
     }
 
     #[test]
     fn spin_error_code_table_is_exhaustive() {
         let live = Deadline::after(Duration::from_secs(30));
-        for code in known_error_codes() {
+        for (code, expected) in known_error_codes() {
             let mapped = map_spin_send_error_for_test(&code, live, BudgetSource::Default);
-            assert!(
-                matches!(
-                    mapped,
-                    EdgeError::BadGateway { .. }
-                        | EdgeError::BadRequest { .. }
-                        | EdgeError::GatewayTimeout { .. }
-                        | EdgeError::Internal { .. }
-                ),
-                "unclassified SDK error: {code:?}"
-            );
+            assert_expected_error(&mapped, expected);
 
             let expired = map_spin_send_error_for_test(
                 &code,

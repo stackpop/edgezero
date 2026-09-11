@@ -16,9 +16,189 @@
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use async_stream::stream;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use edgezero_core::body::{Body, BodyStream};
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use std::future::{Future, IntoFuture};
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use std::task::Poll;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use std::time::Duration;
+
+#[cfg(feature = "spin")]
+use edgezero_core::error::{BadGatewayReason, BudgetSource};
+#[cfg(feature = "spin")]
+use edgezero_core::time::Deadline;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use futures_util::{StreamExt as _, future::poll_fn};
+#[cfg(feature = "spin")]
+use spin_sdk::wasip3::http::types::ErrorCode;
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+const READY_ITEM_YIELD_QUOTA: usize = 64;
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UploadCompletion {
+    Complete,
+    ReaderGone,
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestTimeouts {
+    between_bytes: u64,
+    connect: u64,
+    first_byte: u64,
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn request_timeouts(remaining: Duration) -> RequestTimeouts {
+    let full_remaining = duration_nanos(remaining);
+    RequestTimeouts {
+        between_bytes: full_remaining,
+        connect: full_remaining,
+        first_byte: full_remaining,
+    }
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn request_body_limit(body: &Body, configured: u64) -> u64 {
+    match body {
+        Body::Once(_) => u64::MAX,
+        Body::Stream(_) => configured,
+    }
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn cooperative_yield_once() {
+    let mut yielded = false;
+    poll_fn(move |context| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn cooperative_stream(mut source: BodyStream) -> BodyStream {
+    stream! {
+        let mut ready_items = 0_usize;
+        while let Some(item) = source.next().await {
+            yield item;
+            ready_items = ready_items.saturating_add(1);
+            if ready_items >= READY_ITEM_YIELD_QUOTA {
+                cooperative_yield_once().await;
+                ready_items = 0;
+            }
+        }
+    }
+    .boxed_local()
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn run_exchange<Send, Pump, RequestDone, Output, HostError, MapError>(
+    send_future: Send,
+    pump_future: Pump,
+    request_done_reader: RequestDone,
+    map_error: MapError,
+) -> Result<Output, EdgeError>
+where
+    Send: Future<Output = Result<Output, HostError>>,
+    Pump: Future<Output = Result<UploadCompletion, EdgeError>>,
+    RequestDone: IntoFuture<Output = Result<(), HostError>>,
+    MapError: Fn(&HostError) -> EdgeError,
+{
+    #[derive(Clone, Copy)]
+    enum State {
+        AwaitingRequestDone,
+        ReaderGone,
+        RequestComplete,
+        Uploading,
+    }
+
+    enum Outcome<Output, HostError> {
+        PumpError(EdgeError),
+        RequestDoneError(HostError),
+        Send(Result<Output, HostError>),
+    }
+
+    let mut state = State::Uploading;
+    let mut retained_send = None;
+    let mut send = Box::pin(send_future);
+    let mut pump = Box::pin(pump_future);
+    let mut request_done = Box::pin(request_done_reader.into_future());
+
+    let outcome = poll_fn(|context| {
+        loop {
+            match state {
+                State::Uploading => match pump.as_mut().poll(context) {
+                    Poll::Ready(Err(error)) => return Poll::Ready(Outcome::PumpError(error)),
+                    Poll::Ready(Ok(UploadCompletion::Complete)) => {
+                        state = State::AwaitingRequestDone;
+                    }
+                    Poll::Ready(Ok(UploadCompletion::ReaderGone)) => {
+                        state = State::ReaderGone;
+                    }
+                    Poll::Pending => match send.as_mut().poll(context) {
+                        Poll::Ready(result) => return Poll::Ready(Outcome::Send(result)),
+                        Poll::Pending => return Poll::Pending,
+                    },
+                },
+                State::AwaitingRequestDone => match request_done.as_mut().poll(context) {
+                    Poll::Ready(Err(error)) => {
+                        return Poll::Ready(Outcome::RequestDoneError(error));
+                    }
+                    Poll::Ready(Ok(())) => state = State::RequestComplete,
+                    Poll::Pending => {
+                        if retained_send.is_none()
+                            && let Poll::Ready(result) = send.as_mut().poll(context)
+                        {
+                            retained_send = Some(result);
+                        }
+                        return Poll::Pending;
+                    }
+                },
+                State::ReaderGone | State::RequestComplete => {
+                    if let Some(result) = retained_send.take() {
+                        return Poll::Ready(Outcome::Send(result));
+                    }
+                    match send.as_mut().poll(context) {
+                        Poll::Ready(result) => return Poll::Ready(Outcome::Send(result)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    drop(request_done);
+    drop(pump);
+    drop(send);
+    match outcome {
+        Outcome::PumpError(error) => Err(error),
+        Outcome::RequestDoneError(error) | Outcome::Send(Err(error)) => Err(map_error(&error)),
+        Outcome::Send(Ok(output)) => Ok(output),
+    }
+}
+
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod spin_impl {
-    use std::future::Future;
     use std::num::NonZeroU64;
     use std::time::Duration;
 
@@ -41,7 +221,7 @@ mod spin_impl {
     };
     use edgezero_core::time::{DispatchBudget, MonotonicInstant, dispatch_budget};
     use futures_util::StreamExt as _;
-    use futures_util::future::{Either, join, join_all, select};
+    use futures_util::future::{Either, join_all, select};
     use futures_util::stream::once;
     use spin_sdk::time::sleep;
     use spin_sdk::wasip3::http::client;
@@ -50,13 +230,14 @@ mod spin_impl {
         Response, Scheme,
     };
     use spin_sdk::wasip3::http_compat::BodyWriter;
-    use spin_sdk::wasip3::wit_bindgen::{FutureReader, FutureWriter, StreamResult};
+    use spin_sdk::wasip3::wit_bindgen::{FutureWriter, StreamResult};
     use spin_sdk::wasip3::wit_future;
 
-    use super::{map_spin_send_error, timeout_error};
+    use super::{
+        UploadCompletion, cooperative_yield_once, map_spin_send_error, run_exchange, timeout_error,
+    };
 
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
-    const READY_ITEM_YIELD_QUOTA: u32 = 64;
 
     /// Native outbound HTTP implementation for Spin's WASI HTTP 0.3 host.
     pub struct SpinOutboundClient;
@@ -69,11 +250,6 @@ mod spin_impl {
     enum PreparedSlot {
         Finished(OutboundSlotResult),
         Pending(Box<PreparedRequest>),
-    }
-
-    enum UploadCompletion {
-        Complete,
-        ReaderGone,
     }
 
     impl SpinOutboundClient {
@@ -134,15 +310,15 @@ mod spin_impl {
             let (request, request_done) =
                 Request::new(fields, Some(contents), trailers, Some(options));
             set_request_target(&request, &method, &uri)?;
+            let request_body_limit = super::request_body_limit(&body, max_request_body_bytes);
 
             let exchange = async move {
-                let upload =
-                    pump_request_body(body, max_request_body_bytes, writer, request_done, budget);
+                let upload = pump_request_body(body, request_body_limit, writer, budget);
                 let send = client::send(request);
-                let (upload_outcome, send_outcome) = join(upload, send).await;
-                upload_outcome?;
-                send_outcome
-                    .map_err(|error| map_spin_send_error(&error, budget.deadline, budget.cause))
+                run_exchange(send, upload, request_done, |error| {
+                    map_spin_send_error(error, budget.deadline, budget.cause)
+                })
+                .await
             };
             let response = race_deadline(exchange, budget).await??;
 
@@ -213,25 +389,20 @@ mod spin_impl {
     fn request_options(budget: DispatchBudget) -> Result<RequestOptions, EdgeError> {
         let options = RequestOptions::new();
         let remaining = budget_remaining(budget)?;
-        let total = duration_nanos(remaining);
-        let connect = duration_nanos(remaining.checked_div(4).unwrap_or(Duration::ZERO));
-        let first_byte = duration_nanos(remaining.checked_div(2).unwrap_or(Duration::ZERO));
-        set_timeout_option("connect", &options.set_connect_timeout(Some(connect)))?;
+        let timeouts = super::request_timeouts(remaining);
+        set_timeout_option(
+            "connect",
+            &options.set_connect_timeout(Some(timeouts.connect)),
+        )?;
         set_timeout_option(
             "first-byte",
-            &options.set_first_byte_timeout(Some(first_byte)),
+            &options.set_first_byte_timeout(Some(timeouts.first_byte)),
         )?;
         set_timeout_option(
             "between-bytes",
-            &options.set_between_bytes_timeout(Some(total)),
+            &options.set_between_bytes_timeout(Some(timeouts.between_bytes)),
         )?;
         Ok(options)
-    }
-
-    fn duration_nanos(duration: Duration) -> u64 {
-        u64::try_from(duration.as_nanos())
-            .unwrap_or(u64::MAX)
-            .max(1)
     }
 
     fn set_timeout_option(
@@ -300,7 +471,6 @@ mod spin_impl {
         body: Body,
         maximum: u64,
         writer: BodyWriter,
-        request_done: FutureReader<Result<(), ErrorCode>>,
         budget: DispatchBudget,
     ) -> Result<UploadCompletion, EdgeError> {
         let BodyWriter {
@@ -347,23 +517,18 @@ mod spin_impl {
             budget_remaining(budget)?;
             if !unwritten.is_empty() {
                 drop(stream_writer);
-                drop(result_writer);
-                drop(request_done);
+                drop(result_writer.write(Ok(None)).await);
                 return Ok(UploadCompletion::ReaderGone);
             }
             total = next_total;
-            sleep(Duration::ZERO).await;
+            cooperative_yield_once().await;
         }
 
         drop(stream_writer);
         if result_writer.write(Ok(None)).await.is_err() {
-            drop(request_done);
             return Ok(UploadCompletion::ReaderGone);
         }
-        match request_done.await {
-            Ok(()) => Ok(UploadCompletion::Complete),
-            Err(error) => Err(map_spin_send_error(&error, budget.deadline, budget.cause)),
-        }
+        Ok(UploadCompletion::Complete)
     }
 
     async fn signal_upload_failure(
@@ -406,7 +571,7 @@ mod spin_impl {
         let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
         headers.insert(PROXY_HEADER, HeaderValue::from_static("spin"));
 
-        let native = response_stream(response, budget);
+        let native = super::cooperative_stream(response_stream(response, budget));
         if disposition == ResponseBodyDisposition::FramingBodyless {
             drain_response(native, budget).await?;
             return Ok(OutboundResponse::new(
@@ -466,11 +631,12 @@ mod spin_impl {
             ContentEncoding::Passthrough => decoded,
         };
         let shaped = rechunk_stream(output, max_chunk_bytes);
+        let deadline_bound = deadline_stream(super::cooperative_stream(shaped), budget);
         let body = match response_mode {
             ResponseMode::Buffered { max_bytes } => {
-                Body::from(collect_response_stream(shaped, max_bytes).await?)
+                Body::from(collect_response_stream(deadline_bound, max_bytes).await?)
             }
-            ResponseMode::Streamed => Body::from_stream(shaped),
+            ResponseMode::Streamed => Body::from_stream(deadline_bound),
         };
         Ok(OutboundResponse::new(request_method, status, headers, body))
     }
@@ -506,7 +672,6 @@ mod spin_impl {
         let (completion_writer, result_reader) = wit_future::new(default_response_result);
         let (mut body_reader, trailer_reader) = Response::consume_body(response, result_reader);
         stream! {
-            let mut ready_items = 0_u32;
             loop {
                 let read = body_reader.read(Vec::with_capacity(RESPONSE_READ_BYTES));
                 let (result, chunk) = match race_deadline(read, budget).await {
@@ -519,11 +684,6 @@ mod spin_impl {
                 match result {
                     StreamResult::Complete(_length) => {
                         yield Ok(Bytes::from(chunk));
-                        ready_items = ready_items.saturating_add(1);
-                        if ready_items >= READY_ITEM_YIELD_QUOTA {
-                            sleep(Duration::ZERO).await;
-                            ready_items = 0;
-                        }
                     }
                     StreamResult::Dropped => {
                         let trailer_result = race_deadline(
@@ -569,6 +729,29 @@ mod spin_impl {
                         ));
                         return;
                     }
+                }
+            }
+        }
+        .boxed_local()
+    }
+
+    fn deadline_stream(mut source: BodyStream, budget: DispatchBudget) -> BodyStream {
+        stream! {
+            loop {
+                let next_item = match race_deadline(source.next(), budget).await {
+                    Ok(item) => item,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                match next_item {
+                    Some(Ok(bytes)) => yield Ok(bytes),
+                    Some(Err(error)) => {
+                        yield Err(error);
+                        return;
+                    }
+                    None => return,
                 }
             }
         }
@@ -626,13 +809,6 @@ mod spin_impl {
 pub use spin_impl::SpinOutboundClient;
 
 #[cfg(feature = "spin")]
-use edgezero_core::error::{BadGatewayReason, BudgetSource};
-#[cfg(feature = "spin")]
-use edgezero_core::time::Deadline;
-#[cfg(feature = "spin")]
-use spin_sdk::wasip3::http::types::ErrorCode;
-
-#[cfg(feature = "spin")]
 fn map_spin_send_error(error: &ErrorCode, deadline: Deadline, cause: BudgetSource) -> EdgeError {
     if deadline.is_expired() {
         return timeout_error(cause);
@@ -645,17 +821,20 @@ fn map_spin_send_error(error: &ErrorCode, deadline: Deadline, cause: BudgetSourc
         | ErrorCode::ConnectionWriteTimeout
         | ErrorCode::HttpResponseTimeout => timeout_error(BudgetSource::Unspecified),
         ErrorCode::HttpRequestDenied
-        | ErrorCode::HttpRequestLengthRequired
         | ErrorCode::HttpRequestBodySize(_)
-        | ErrorCode::HttpRequestMethodInvalid
-        | ErrorCode::HttpRequestUriInvalid
         | ErrorCode::HttpRequestUriTooLong
         | ErrorCode::HttpRequestHeaderSectionSize(_)
-        | ErrorCode::HttpRequestHeaderSize(_)
-        | ErrorCode::HttpRequestTrailerSectionSize(_)
-        | ErrorCode::HttpRequestTrailerSize(_) => {
+        | ErrorCode::HttpRequestHeaderSize(_) => {
             EdgeError::bad_request("outbound request was rejected by the Spin HTTP host")
         }
+        ErrorCode::HttpRequestLengthRequired
+        | ErrorCode::HttpRequestMethodInvalid
+        | ErrorCode::HttpRequestUriInvalid
+        | ErrorCode::HttpRequestTrailerSectionSize(_)
+        | ErrorCode::HttpRequestTrailerSize(_)
+        | ErrorCode::ConfigurationError => EdgeError::internal(anyhow::anyhow!(
+            "Spin rejected an adapter-owned outbound request invariant"
+        )),
         ErrorCode::DnsError(_)
         | ErrorCode::DestinationNotFound
         | ErrorCode::DestinationUnavailable
@@ -687,9 +866,6 @@ fn map_spin_send_error(error: &ErrorCode, deadline: Deadline, cause: BudgetSourc
             "upstream response violated the HTTP protocol",
             BadGatewayReason::Protocol,
         ),
-        ErrorCode::ConfigurationError => EdgeError::internal(anyhow::anyhow!(
-            "Spin outbound HTTP configuration is invalid"
-        )),
         ErrorCode::InternalError(_) => EdgeError::bad_gateway_with_reason(
             "Spin outbound HTTP host failed",
             BadGatewayReason::Unspecified,
@@ -737,4 +913,302 @@ pub fn map_spin_send_error_for_test(
     cause: BudgetSource,
 ) -> EdgeError {
     map_spin_send_error(error, deadline, cause)
+}
+
+#[cfg(test)]
+mod exchange_tests {
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use futures::executor::block_on;
+
+    use super::{
+        EdgeError, READY_ITEM_YIELD_QUOTA, UploadCompletion, cooperative_stream,
+        cooperative_yield_once, request_body_limit, request_timeouts, run_exchange,
+    };
+
+    struct ScriptedFuture<Output> {
+        drops: Rc<Cell<u32>>,
+        polls: Rc<Cell<u32>>,
+        steps: VecDeque<Poll<Output>>,
+    }
+
+    impl<Output> Unpin for ScriptedFuture<Output> {}
+
+    impl<Output> ScriptedFuture<Output> {
+        fn new(
+            steps: impl IntoIterator<Item = Poll<Output>>,
+            polls: Rc<Cell<u32>>,
+            drops: Rc<Cell<u32>>,
+        ) -> Self {
+            Self {
+                drops,
+                polls,
+                steps: steps.into_iter().collect(),
+            }
+        }
+    }
+
+    impl<Output> Future for ScriptedFuture<Output> {
+        type Output = Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.set(self.polls.get().saturating_add(1));
+            let step = self.steps.pop_front().expect("scripted future exhausted");
+            if step.is_pending() {
+                cx.waker().wake_by_ref();
+            }
+            step
+        }
+    }
+
+    impl<Output> Drop for ScriptedFuture<Output> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get().saturating_add(1));
+        }
+    }
+
+    fn counters() -> (Rc<Cell<u32>>, Rc<Cell<u32>>) {
+        (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)))
+    }
+
+    fn map_host_error(_error: &&'static str) -> EdgeError {
+        EdgeError::bad_gateway("scripted host failure")
+    }
+
+    #[test]
+    fn continuously_ready_chunks_yield_after_each_item() {
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+        use futures_util::task::noop_waker;
+
+        let processed = Rc::new(Cell::new(0_u32));
+        let observed = Rc::clone(&processed);
+        let mut source = stream::iter([(), (), ()]);
+        let mut pump = Box::pin(async move {
+            while source.next().await.is_some() {
+                observed.set(observed.get().saturating_add(1));
+                cooperative_yield_once().await;
+            }
+        });
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(pump.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), 1);
+        assert!(pump.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), 2);
+        assert!(pump.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), 3);
+        assert!(pump.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn request_timeouts_use_full_remaining_budget_for_every_phase() {
+        let timeouts = request_timeouts(Duration::from_millis(40));
+        assert_eq!(timeouts.connect, 40_000_000);
+        assert_eq!(timeouts.first_byte, 40_000_000);
+        assert_eq!(timeouts.between_bytes, 40_000_000);
+    }
+
+    #[test]
+    fn request_body_limit_only_applies_to_streamed_bodies() {
+        use bytes::Bytes;
+        use edgezero_core::body::Body;
+        use futures_util::stream;
+
+        assert_eq!(
+            request_body_limit(&Body::from(Bytes::from_static(b"buffered")), 8),
+            u64::MAX
+        );
+        assert_eq!(request_body_limit(&Body::stream(stream::empty()), 8), 8);
+    }
+
+    #[test]
+    fn cooperative_stream_forces_a_pending_boundary_at_its_quota() {
+        use std::iter::repeat_with;
+
+        use bytes::Bytes;
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+        use futures_util::task::noop_waker;
+
+        let mut source = cooperative_stream(
+            stream::iter(
+                repeat_with(|| Ok::<Bytes, EdgeError>(Bytes::new()))
+                    .take(READY_ITEM_YIELD_QUOTA.saturating_add(1)),
+            )
+            .boxed_local(),
+        );
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        for _ in 0..READY_ITEM_YIELD_QUOTA {
+            assert!(matches!(
+                source.as_mut().poll_next(&mut context),
+                Poll::Ready(Some(Ok(_)))
+            ));
+        }
+        assert!(source.as_mut().poll_next(&mut context).is_pending());
+        assert!(matches!(
+            source.as_mut().poll_next(&mut context),
+            Poll::Ready(Some(Ok(_)))
+        ));
+    }
+
+    #[test]
+    fn upload_failure_wins_over_simultaneously_ready_send() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            Rc::clone(&send_drops),
+        );
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Err(EdgeError::bad_request("upload failed")))],
+            Rc::clone(&pump_polls),
+            Rc::clone(&pump_drops),
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Ready(Ok(()))],
+            Rc::clone(&done_polls),
+            Rc::clone(&done_drops),
+        );
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert!(matches!(outcome, Err(EdgeError::BadRequest { .. })));
+        assert_eq!(pump_polls.get(), 1);
+        assert_eq!(send_polls.get(), 0);
+        assert_eq!(done_polls.get(), 0);
+        assert_eq!(send_drops.get(), 1);
+        assert_eq!(pump_drops.get(), 1);
+        assert_eq!(done_drops.get(), 1);
+    }
+
+    #[test]
+    fn ready_send_after_pending_upload_is_authoritative() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            Rc::clone(&send_drops),
+        );
+        let pump = ScriptedFuture::new(
+            [
+                Poll::Pending,
+                Poll::Ready(Err(EdgeError::bad_request("late upload failure"))),
+            ],
+            Rc::clone(&pump_polls),
+            Rc::clone(&pump_drops),
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Ready(Ok(()))],
+            Rc::clone(&done_polls),
+            Rc::clone(&done_drops),
+        );
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert_eq!(outcome.expect("send result"), 7);
+        assert_eq!(pump_polls.get(), 1);
+        assert_eq!(send_polls.get(), 1);
+        assert_eq!(done_polls.get(), 0);
+        assert_eq!(send_drops.get(), 1);
+        assert_eq!(pump_drops.get(), 1);
+        assert_eq!(done_drops.get(), 1);
+    }
+
+    #[test]
+    fn request_done_error_wins_over_retained_send() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            Rc::clone(&send_drops),
+        );
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Ok(UploadCompletion::Complete))],
+            pump_polls,
+            Rc::clone(&pump_drops),
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Pending, Poll::Ready(Err("request completion failed"))],
+            Rc::clone(&done_polls),
+            Rc::clone(&done_drops),
+        );
+
+        let observed_send_drops = Rc::clone(&send_drops);
+        let observed_pump_drops = Rc::clone(&pump_drops);
+        let observed_done_drops = Rc::clone(&done_drops);
+        let outcome = block_on(run_exchange(send, pump, done, move |_error| {
+            assert_eq!(observed_send_drops.get(), 1);
+            assert_eq!(observed_pump_drops.get(), 1);
+            assert_eq!(observed_done_drops.get(), 1);
+            EdgeError::bad_gateway("scripted host failure")
+        }));
+
+        assert!(matches!(outcome, Err(EdgeError::BadGateway { .. })));
+        assert_eq!(send_polls.get(), 1);
+        assert_eq!(done_polls.get(), 2);
+    }
+
+    #[test]
+    fn request_done_success_releases_retained_send_without_repolling_it() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new([Poll::Ready(Ok(7_u8))], Rc::clone(&send_polls), send_drops);
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Ok(UploadCompletion::Complete))],
+            pump_polls,
+            pump_drops,
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Pending, Poll::Ready(Ok(()))],
+            Rc::clone(&done_polls),
+            done_drops,
+        );
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert_eq!(outcome.expect("retained send result"), 7);
+        assert_eq!(send_polls.get(), 1);
+        assert_eq!(done_polls.get(), 2);
+    }
+
+    #[test]
+    fn reader_gone_never_polls_request_done() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Pending, Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            send_drops,
+        );
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Ok(UploadCompletion::ReaderGone))],
+            pump_polls,
+            pump_drops,
+        );
+        let done = ScriptedFuture::new([Poll::Ready(Ok(()))], Rc::clone(&done_polls), done_drops);
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert_eq!(outcome.expect("early response"), 7);
+        assert_eq!(send_polls.get(), 2);
+        assert_eq!(done_polls.get(), 0);
+    }
 }

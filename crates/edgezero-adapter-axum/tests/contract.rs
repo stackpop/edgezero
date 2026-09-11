@@ -19,8 +19,9 @@ use axum::routing::get;
 use bytes::Bytes;
 use edgezero_adapter_axum::outbound::AxumOutboundClient;
 use edgezero_core::body::Body as CoreBody;
-use edgezero_core::error::{BadGatewayReason, EdgeError, ResponseLimitReason};
+use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason};
 use edgezero_core::http::{Method, StatusCode};
+use edgezero_core::time::Deadline;
 use edgezero_core::{OutboundHttpClient as _, OutboundRequest, PROXY_HEADER};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -160,7 +161,74 @@ async fn buffered_response_deadline_covers_body_completion() {
         .await
         .expect_err("body completion must share the absolute request deadline");
 
-    assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+    assert!(matches!(
+        error,
+        EdgeError::GatewayTimeout {
+            cause: BudgetSource::PerCallTimeout,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn send_all_preserves_absolute_deadline_provenance() {
+    let origin = start_origin(Router::new().route(
+        "/",
+        get(|| async {
+            sleep(Duration::from_millis(100)).await;
+            "late"
+        }),
+    ))
+    .await;
+    let client = AxumOutboundClient::try_new().expect("client");
+    let request = OutboundRequest::get(format!("{origin}/"))
+        .expect("request")
+        .deadline(Deadline::after(Duration::from_millis(10)));
+
+    let results = client.send_all(vec![request]).await;
+
+    assert!(matches!(
+        results[0].outcome,
+        Err(EdgeError::GatewayTimeout {
+            cause: BudgetSource::BatchDeadline,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn streamed_response_deadline_preserves_timeout_provenance() {
+    let origin = start_origin(Router::new().route(
+        "/",
+        get(|| async {
+            let body = async_body_stream! {
+                sleep(Duration::from_millis(100)).await;
+                yield Ok::<_, Infallible>(Bytes::from_static(b"late"));
+            };
+            Response::new(Body::from_stream(body))
+        }),
+    ))
+    .await;
+    let client = AxumOutboundClient::try_new().expect("client");
+    let request = OutboundRequest::get(format!("{origin}/"))
+        .expect("request")
+        .stream_response()
+        .timeout(Duration::from_millis(10));
+
+    let response = client.send(request).await.expect("response headers");
+    let error = response
+        .into_body()
+        .into_bytes_bounded(1_024)
+        .await
+        .expect_err("stream body must retain the request deadline");
+
+    assert!(matches!(
+        error,
+        EdgeError::GatewayTimeout {
+            cause: BudgetSource::PerCallTimeout,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

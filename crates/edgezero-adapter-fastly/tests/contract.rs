@@ -222,14 +222,24 @@ mod tests {
 #[cfg(feature = "test-utils")]
 mod outbound_contract_tests {
     use std::cell::RefCell;
+    #[cfg(target_arch = "wasm32")]
+    use std::time::Duration;
 
     use bytes::Bytes;
+    #[cfg(target_arch = "wasm32")]
+    use edgezero_adapter_fastly::outbound::{FastlyOutboundClient, inject_dispatch_slack_for_test};
     use edgezero_adapter_fastly::outbound::{
         dispatch_all_before_wait_for_test, validate_batch_request_for_test,
     };
     use edgezero_core::body::Body;
+    #[cfg(target_arch = "wasm32")]
+    use edgezero_core::error::EdgeError;
     use edgezero_core::http::{Method, Uri};
+    #[cfg(target_arch = "wasm32")]
+    use edgezero_core::outbound::OutboundHttpClient as _;
     use edgezero_core::outbound::OutboundRequest;
+    #[cfg(target_arch = "wasm32")]
+    use futures::executor::block_on;
     use futures_util::stream;
 
     fn request() -> OutboundRequest {
@@ -282,6 +292,28 @@ mod outbound_contract_tests {
                 "wait:1",
                 "wait:2",
             ]
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn dispatch_slack_injection_reaches_real_send_all_driver() {
+        let _injection = inject_dispatch_slack_for_test(Duration::from_millis(26));
+        let request = request()
+            .body(Bytes::from_static(b"body"))
+            .timeout(Duration::from_secs(1));
+
+        let results = block_on(FastlyOutboundClient::new().send_all(vec![request]));
+
+        let Err(EdgeError::Internal { source }) = &results[0].outcome else {
+            panic!(
+                "expected dispatch-slack failure, got {:?}",
+                results[0].outcome
+            );
+        };
+        assert_eq!(
+            source.to_string(),
+            "Fastly send_all adapter overhead between batch_now and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) exceeded BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration"
         );
     }
 }

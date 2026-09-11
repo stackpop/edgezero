@@ -51,5 +51,6 @@ web-time = { workspace = true }
 
 [dev-dependencies]
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
+fastly-shared = { workspace = true }
 handlebars = { workspace = true }
 tempfile = { workspace = true }

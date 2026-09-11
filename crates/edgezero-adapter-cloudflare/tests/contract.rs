@@ -313,10 +313,10 @@ mod native_tests {
     mod enabled {
         use bytes::Bytes;
         use edgezero_adapter_cloudflare::outbound::{
-            generic_fetch_failure_for_test, validate_batch_request_for_test,
+            generic_fetch_failure_for_test, timeout_error_for_test, validate_batch_request_for_test,
         };
         use edgezero_core::body::Body;
-        use edgezero_core::error::{BadGatewayReason, EdgeError};
+        use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
         use edgezero_core::outbound::OutboundRequest;
         use futures_util::stream;
 
@@ -363,6 +363,20 @@ mod native_tests {
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn worker_budget_timeouts_preserve_every_selected_source() {
+            for selected in [
+                BudgetSource::PerCallTimeout,
+                BudgetSource::BatchDeadline,
+                BudgetSource::Default,
+            ] {
+                assert!(matches!(
+                    timeout_error_for_test(selected),
+                    EdgeError::GatewayTimeout { cause, .. } if cause == selected
+                ));
+            }
         }
     }
 }
