@@ -1364,24 +1364,65 @@ mod tests {
     /// templates shipped a production `.expect(...)` in the `stream` handler,
     /// infallible `IntoResponse` test usage, and adapter host stubs that
     /// tripped `print_stderr` / `exit`.
+    fn fallback_initializer_block(core_lib: &str) -> &str {
+        const VARIANT: &str = "AdmissionDecision::ReadBodyBeforeFallback";
+        let variant_start = core_lib
+            .find(VARIANT)
+            .expect("fallback decision initializer");
+        let after_variant = core_lib
+            .get(variant_start..)
+            .expect("fallback decision start boundary");
+        let open_brace = after_variant
+            .find('{')
+            .and_then(|offset| variant_start.checked_add(offset))
+            .expect("fallback decision opening brace");
+        let mut depth = 0_usize;
+
+        let after_open_brace = core_lib
+            .get(open_brace..)
+            .expect("fallback opening brace boundary");
+        for (offset, character) in after_open_brace.char_indices() {
+            match character {
+                '{' => depth = depth.checked_add(1).expect("fallback brace depth"),
+                '}' => {
+                    depth = depth.checked_sub(1).expect("balanced fallback braces");
+                    if depth == 0 {
+                        let block_end = open_brace
+                            .checked_add(offset)
+                            .and_then(|end| end.checked_add(character.len_utf8()))
+                            .expect("fallback initializer end");
+                        return core_lib
+                            .get(variant_start..block_end)
+                            .expect("fallback initializer boundaries");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        panic!("fallback decision closing brace");
+    }
+
+    fn normalize_source_whitespace(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     fn assert_generated_fallback_policy(core_lib: &str) {
+        let fallback = normalize_source_whitespace(fallback_initializer_block(core_lib));
         assert!(
-            core_lib.contains("AdmissionDecision::ReadBodyBeforeFallback")
-                && core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
-                && core_lib
+            core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
+                && fallback
                     .contains("grant: IngressGrant::new(AdmissionLease { route_class: None })")
-                && core_lib.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
-                && core_lib.contains(concat!(
-                    "on_exceeded: BufferedIngressResponse::text(\n",
-                    "                    StatusCode::BAD_REQUEST,\n",
-                    "                    \"request body too large\\n\",\n",
-                    "                ),",
+                && fallback.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
+                && fallback.contains(concat!(
+                    "on_exceeded: BufferedIngressResponse::text( ",
+                    "StatusCode::BAD_REQUEST, ",
+                    "\"request body too large\\n\", ),",
                 ))
-                && core_lib.contains(concat!(
-                    "on_timeout: BufferedIngressResponse::text(\n",
-                    "                    StatusCode::REQUEST_TIMEOUT,\n",
-                    "                    \"request timeout\\n\",\n",
-                    "                ),",
+                && fallback.contains(concat!(
+                    "on_timeout: BufferedIngressResponse::text( ",
+                    "StatusCode::REQUEST_TIMEOUT, ",
+                    "\"request timeout\\n\", ),",
                 )),
             "generated admission policy must own the fallback lease and exact terminal responses",
         );
@@ -1405,7 +1446,15 @@ mod tests {
                     "request body too large\n",
                 ),
             }
-            const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;"#,
+            const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
+            on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+            on_timeout: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),"#,
         );
     }
 
