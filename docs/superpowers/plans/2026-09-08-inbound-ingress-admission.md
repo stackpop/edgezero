@@ -2,7 +2,8 @@
 
 > **Status:** Partially implemented in PR #275. Core route resolution, admission, grants,
 > request timing, lazy bounded body state, adapter entry seams, and the opt-in bounded body
-> drain before canonical 404/405 responses are implemented. The Axum raw-parser boundary and
+> drain with a transferable admission grant and application-selected overflow/timeout responses
+> before canonical 404/405 responses are implemented. The Axum raw-parser boundary and
 > deployed cancellation probes remain open; raw framing/head-limit capabilities stay
 > `Unsupported`, and every current adapter reports host-managed head accounting and framing.
 > This plan is owned by the

@@ -52,9 +52,17 @@ any adapter.
 
 Admission is body-blind. An application may opt into `ReadBodyBeforeFallback` for pre-resolved
 404/405 requests when it needs body-limit precedence: clean EOF at or below the selected cap
-retains the canonical 404/405, the first byte over returns 400 first, and expiration of the one
-absolute read deadline returns 408 first. This path discards the body and invokes no route
-middleware or handler. Ordinary admission retains the immediate, no-poll 404/405 behavior.
+retains the canonical 404/405, the first byte over returns the application-selected buffered
+`on_exceeded` response first, and expiration of the one absolute read deadline returns the
+application-selected buffered `on_timeout` response first. The application-supplied ingress
+grant remains live throughout the drain and is released before response conversion, when the
+core drain future is dropped, or when the finite read deadline terminates the drain. This path
+discards the body and invokes no route middleware, handler, or request context. `Refuse` remains
+the zero-read overload path, and ordinary admission retains the immediate, no-poll 404/405
+behavior. Axum's current `block_in_place` bridge is not cancellable: aborting the outer Tower
+service future does not promptly drop the inner fallback drain. The configured absolute read
+deadline still terminates that drain and releases its grant and body source; tests pin this
+deadline-bounded, rather than cancellation-bounded, release behavior.
 
 ## Response Egress Matrix
 
@@ -194,6 +202,12 @@ contains its own `elapsed` and `outcome`; one failure does not erase sibling out
 terminal, including preflight validation, adapter setup, provider queueing, upload, headers,
 buffered body drain, and any delayed guest observation. It is not pure transport RTT.
 Preflight failures are timed from the same batch start, and a same-tick result may be zero.
+
+Standard adapter wiring clones the application's monotonic clock into its outbound client, so
+ingress timing, dispatch budgets, slot elapsed values, error precedence, and deferred body
+streams remain in one clock domain. Explicit low-level outbound constructors use the default
+clock. A backwards injected clock cannot enlarge the method-entry budget; backwards elapsed
+sampling fails closed as an internal slot outcome with zero elapsed.
 
 Axum, Cloudflare, and Spin drive complete eligible exchanges concurrently. Fastly records each
 slot when it is observed during sequential dispatch/harvest, so the value can include sibling

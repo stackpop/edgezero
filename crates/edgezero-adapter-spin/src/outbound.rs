@@ -860,6 +860,53 @@ mod spin_impl {
         }
     }
 
+    /// Runs request-option and deferred response clock checks in the hosted contract binary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[inline]
+    pub async fn deferred_clock_paths_hold_for_test() -> bool {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let start = MonotonicInstant::now();
+        let Ok(request) = OutboundRequest::get("https://example.com/") else {
+            return false;
+        };
+        let Ok(budget) = dispatch_budget(&request.timeout(Duration::from_millis(10)), start) else {
+            return false;
+        };
+        let observed = start.checked_add(Duration::from_millis(3)).unwrap_or(start);
+        let option_observations = Arc::new(AtomicUsize::new(0));
+        let observed_options = Arc::clone(&option_observations);
+        let option_clock = MonotonicClock::new(move || {
+            observed_options.fetch_add(1, Ordering::SeqCst);
+            observed
+        });
+        if request_options(budget, &option_clock).is_err()
+            || option_observations.load(Ordering::SeqCst) != 1
+        {
+            return false;
+        }
+
+        let stream_observations = Arc::new(AtomicUsize::new(0));
+        let observed_stream = Arc::clone(&stream_observations);
+        let deadline = budget.deadline.instant();
+        let stream_clock = MonotonicClock::new(move || {
+            if observed_stream.fetch_add(1, Ordering::SeqCst) == 0 {
+                start
+            } else {
+                deadline
+            }
+        });
+        let source = once(async { Ok(Bytes::from_static(b"body")) }).boxed_local();
+        let mut body = deadline_stream(source, budget, stream_clock);
+
+        matches!(
+            body.next().await,
+            Some(Err(EdgeError::GatewayTimeout { .. }))
+        )
+    }
+
     #[cfg(test)]
     mod clock_tests {
         use std::collections::VecDeque;
@@ -987,6 +1034,8 @@ mod spin_impl {
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use spin_impl::SpinOutboundClient;
+#[cfg(all(feature = "spin", target_arch = "wasm32", feature = "test-utils"))]
+pub use spin_impl::deferred_clock_paths_hold_for_test;
 
 #[cfg(feature = "spin")]
 fn map_spin_send_error(

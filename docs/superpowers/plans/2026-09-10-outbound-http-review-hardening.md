@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close the remaining current-head review gaps by preventing provider diagnostics from reaching HTTP responses, splitting typed config failure reasons, and carrying manifest route class plus one injectable monotonic clock through ingress.
+**Goal:** Close the remaining current-head review gaps by preventing provider diagnostics from reaching HTTP responses, splitting typed config failure reasons, and carrying manifest route class plus one injectable monotonic clock through ingress and outbound HTTP.
 
-**Architecture:** Keep detailed errors available inside `EdgeError`, but render fixed category-only messages at the wire boundary and stop adapters from embedding provider values where no internal diagnostic is needed. Hard-cut the ambiguous config reasons so exhaustive downstream matches must migrate to the precise taxonomy. Route identity remains method plus pattern, while route class is optional metadata. Add an `App`-owned portable clock handle backed by `web_time` by default; the same handle captures ingress start and evaluates every admitted body deadline in core and all four adapters.
+**Architecture:** Keep detailed errors available inside `EdgeError`, but render fixed category-only messages at the wire boundary and stop adapters from embedding provider values where no internal diagnostic is needed. Hard-cut the ambiguous config reasons so exhaustive downstream matches must migrate to the precise taxonomy. Route identity remains method plus pattern, while route class is optional metadata. Use one `App`-owned portable clock handle backed by `web_time` by default; the same handle captures ingress start, evaluates admitted body deadlines, and is cloned into the standard outbound client installed by every adapter.
 
 **Tech Stack:** Rust 2024, `web-time`, `http`, Axum/Tokio, Cloudflare Workers, Fastly Compute, Fermyon Spin, Cargo workspace and WASM target checks.
 
@@ -127,3 +127,26 @@
   config-plan examples; add explicit Fastly WASM concurrency and public ingress-capability checks.
 - [x] Remove the superseded serde constructor and verify no active code depends on it.
 - [x] Run focused red/green tests after each correction, then repeat every Task 5 verification gate.
+
+### Task 7: Pair outbound clients with the application clock
+
+**Files:**
+- Modify: `crates/edgezero-adapter-axum/src/outbound.rs`
+- Modify: `crates/edgezero-adapter-axum/src/request.rs`
+- Modify: `crates/edgezero-adapter-cloudflare/src/outbound.rs`
+- Modify: `crates/edgezero-adapter-cloudflare/src/request.rs`
+- Modify: `crates/edgezero-adapter-fastly/src/outbound.rs`
+- Modify: `crates/edgezero-adapter-fastly/src/request.rs`
+- Modify: `crates/edgezero-adapter-spin/src/outbound.rs`
+- Modify: `crates/edgezero-adapter-spin/src/request.rs`
+- Modify: adapter contract tests under `crates/edgezero-adapter-*/tests/contract.rs`
+- Modify: `docs/superpowers/specs/2026-05-21-outbound-http-design.md`
+- Modify: `docs/guide/capabilities.md`
+
+- [x] Add failing per-adapter tests proving method-entry anchoring, preflight elapsed timing, post-ready expiry, backwards-clock handling, and clock retention by streamed upload/response paths. Cloudflare and Spin deferred-path probes run through their hosted contract binaries rather than unexecuted library-only tests.
+- [x] Store a `MonotonicClock` on every native outbound client. Preserve default-clock constructors for low-level use and add explicit clock constructors for standard adapter wiring and tests.
+- [x] Install each standard request's outbound client with the exact `App::monotonic_clock()` clone used by ingress; keep standalone low-level request converters explicitly default-clocked.
+- [x] Replace every production outbound `MonotonicInstant::now`, `Deadline::remaining`, and `Deadline::is_expired` call with the client clock plus explicit `remaining_at` or `is_expired_at`; carry clock clones into all deferred body streams and Fastly pending slots.
+- [x] Keep `DispatchBudget` as the copyable result of pure budget selection while ensuring its start snapshot, all later deadline checks, error precedence, dispatch-slack checks, and slot completion observations use one clock domain. Fastly backend identity uses the method-entry `budget.duration`; preparation-time clock samples cannot fragment a homogeneous batch's dynamic-backend identity.
+- [x] Update the outbound specification and capability guide with constructor semantics, app-clock propagation, low-level defaults, and the full injected-clock acceptance matrix.
+- [x] Run focused outbound adapter tests, source scans for global-clock bypasses, full workspace tests, strict Clippy, feature builds, and all three WASM target checks before committing and pushing.

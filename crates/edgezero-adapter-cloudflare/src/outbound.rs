@@ -698,6 +698,64 @@ mod worker_impl {
         }
     }
 
+    /// Runs deferred upload and response stream clock checks in the hosted contract binary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[inline]
+    pub async fn deferred_clock_paths_hold_for_test() -> bool {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use futures_util::stream::once;
+
+        fn expiring_clock(start: MonotonicInstant, deadline: MonotonicInstant) -> MonotonicClock {
+            let observations = Arc::new(AtomicUsize::new(0));
+            MonotonicClock::new(move || {
+                if observations.fetch_add(1, Ordering::SeqCst) == 0 {
+                    start
+                } else {
+                    deadline
+                }
+            })
+        }
+
+        let start = MonotonicInstant::now();
+        let Ok(request) = OutboundRequest::get("https://example.com/") else {
+            return false;
+        };
+        let Ok(budget) = dispatch_budget(&request.timeout(Duration::from_millis(10)), start) else {
+            return false;
+        };
+        let upload_source = once(async { Ok(Bytes::from_static(b"body")) }).boxed_local();
+        let mut upload = upload_stream(
+            upload_source,
+            16,
+            budget,
+            expiring_clock(start, budget.deadline.instant()),
+        );
+        let upload_holds = matches!(
+            upload.next().await,
+            Some(Err(EdgeError::GatewayTimeout { .. }))
+        );
+
+        let Ok(controller) = web_sys::AbortController::new() else {
+            return false;
+        };
+        let response_source = once(async { Ok(Bytes::from_static(b"body")) }).boxed_local();
+        let mut response = deadline_stream(
+            response_source,
+            budget,
+            expiring_clock(start, budget.deadline.instant()),
+            AbortGuard::new(controller),
+        );
+        let response_holds = matches!(
+            response.next().await,
+            Some(Err(EdgeError::GatewayTimeout { .. }))
+        );
+
+        upload_holds && response_holds
+    }
+
     #[cfg(test)]
     mod clock_tests {
         use std::collections::VecDeque;
@@ -842,6 +900,8 @@ mod worker_impl {
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use worker_impl::CloudflareOutboundClient;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32", feature = "test-utils"))]
+pub use worker_impl::deferred_clock_paths_hold_for_test;
 
 #[cfg(any(
     all(feature = "cloudflare", target_arch = "wasm32"),

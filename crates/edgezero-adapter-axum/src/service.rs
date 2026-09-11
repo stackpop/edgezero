@@ -351,9 +351,9 @@ mod tests {
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures_util::stream::poll_fn;
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::Poll;
+    use std::task::{Poll, Waker};
     use std::time::Duration;
     use tower::ServiceExt as _;
 
@@ -746,50 +746,123 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fallback_refusal_returns_503_without_polling_native_body() {
+    async fn abort_requested_service_continues_until_the_fallback_drain_finishes() {
         let body_polls = Arc::new(AtomicUsize::new(0));
         let observed_polls = Arc::clone(&body_polls);
+        let body_ready = Arc::new(AtomicBool::new(false));
+        let observed_ready = Arc::clone(&body_ready);
+        let body_waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        let observed_waker = Arc::clone(&body_waker);
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let observed_grant_drops = Arc::clone(&grant_drops);
         let source_drops = Arc::new(AtomicUsize::new(0));
         let source_drop = DropSignal(Arc::clone(&source_drops));
-        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+        let native_body = AxumBody::from_stream(poll_fn(move |context| {
             let _keep_source_alive = &source_drop;
+            assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
+            if observed_ready.load(Ordering::SeqCst) {
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                return Poll::<Option<Result<Bytes, io::Error>>>::Ready(None);
+            }
+            *observed_waker.lock().expect("body waker") = Some(context.waker().clone());
             observed_polls.fetch_add(1, Ordering::SeqCst);
-            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+            if observed_ready.load(Ordering::SeqCst) {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
         }));
-        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
-        app.set_ingress_admission_policy(|head| {
-            assert!(matches!(head.route_resolution(), RouteResolution::NotFound));
-            AdmissionDecision::Refuse(
-                response_builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(Body::from("fallback unavailable\n"))
-                    .expect("refusal response"),
-            )
-        });
+        let (app, handler_calls, middleware_calls) =
+            fallback_body_app(4_096, Duration::from_secs(5), &grant_drops);
+        let mut service = EdgeZeroAxumService::from_app(app);
         let request = Request::builder()
             .method("POST")
             .uri("/missing")
             .body(native_body)
             .expect("request");
 
-        let response = EdgeZeroAxumService::from_app(app)
-            .ready()
-            .await
-            .expect("ready")
-            .call(request)
-            .await
-            .expect("response");
+        let response_task =
+            tokio::spawn(async move { service.ready().await.expect("ready").call(request).await });
+        timeout(Duration::from_secs(2), async {
+            while body_polls.load(Ordering::SeqCst) == 0 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native body must be polled before cancellation");
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body"),
-            b"fallback unavailable\n".as_slice()
-        );
-        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        response_task.abort();
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+        body_ready.store(true, Ordering::SeqCst);
+        body_waker
+            .lock()
+            .expect("body waker")
+            .take()
+            .expect("pending body waker")
+            .wake();
+
+        let response = timeout(Duration::from_secs(2), response_task)
+            .await
+            .expect("completed fallback drain must finish the blocking bridge")
+            .expect("blocking bridge completes despite the abort request")
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
         assert_eq!(source_drops.load(Ordering::SeqCst), 1);
         assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_refusal_returns_503_without_polling_native_body() {
+        for path in ["/missing", "/known"] {
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let observed_polls = Arc::clone(&body_polls);
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let source_drop = DropSignal(Arc::clone(&source_drops));
+            let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+                let _keep_source_alive = &source_drop;
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                Poll::<Option<Result<Bytes, io::Error>>>::Pending
+            }));
+            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+            app.set_ingress_admission_policy(|head| {
+                assert!(matches!(
+                    head.route_resolution(),
+                    RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
+                ));
+                AdmissionDecision::Refuse(
+                    response_builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Body::from("fallback unavailable\n"))
+                        .expect("refusal response"),
+                )
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(native_body)
+                .expect("request");
+
+            let response = EdgeZeroAxumService::from_app(app)
+                .ready()
+                .await
+                .expect("ready")
+                .call(request)
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body"),
+                b"fallback unavailable\n".as_slice()
+            );
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -554,20 +554,28 @@ mod tests {
 
     #[cfg(feature = "test-utils")]
     mod ingress_contract {
+        use std::collections::VecDeque;
         use std::io;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         use std::task::Poll;
 
-        use edgezero_adapter_spin::request::dispatch_ingress_stream_for_test;
+        use edgezero_adapter_spin::outbound::{
+            SpinOutboundClient, deferred_clock_paths_hold_for_test,
+        };
+        use edgezero_adapter_spin::request::{
+            dispatch_ingress_stream_for_test, dispatch_request_for_test,
+        };
         use edgezero_core::http::{HeaderMap, HeaderValue, Method};
         use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
         use edgezero_core::middleware::{Middleware, Next};
+        use edgezero_core::outbound::{OutboundHttpClient as _, OutboundRequest};
         use edgezero_core::router::RouteResolution;
         use edgezero_core::time::{MonotonicClock, MonotonicInstant};
         use futures::FutureExt as _;
-        use futures::stream::poll_fn;
+        use futures::stream::{empty, poll_fn};
         use http_body_util::BodyExt as _;
+        use spin_sdk::http::{FromRequest as _, IntoRequest as _, Request as SpinRequest};
 
         use super::*;
 
@@ -577,6 +585,141 @@ mod tests {
             fn drop(&mut self) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
+        }
+
+        fn scripted_clock(script: Vec<MonotonicInstant>) -> MonotonicClock {
+            let observations = Arc::new(Mutex::new(VecDeque::from(script)));
+            MonotonicClock::new(move || {
+                observations
+                    .lock()
+                    .expect("clock observations")
+                    .pop_front()
+                    .expect("clock observation")
+            })
+        }
+
+        #[test]
+        fn outbound_clock_controls_preflight_elapsed_and_backwards_failure() {
+            let start = MonotonicInstant::now();
+            let completed = start
+                .checked_add(Duration::from_millis(9))
+                .expect("completed instant");
+            let forward_client =
+                SpinOutboundClient::with_clock(scripted_clock(vec![start, completed]));
+            let forward_request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+            let forward_results = block_on(forward_client.send_all(vec![forward_request]));
+            assert_eq!(forward_results.len(), 1);
+            let forward_result = forward_results.first().expect("single forward result");
+            assert_eq!(forward_result.elapsed, Duration::from_millis(9));
+            assert!(matches!(
+                forward_result.outcome,
+                Err(EdgeError::BadRequest { .. })
+            ));
+
+            let earlier = start
+                .checked_sub(Duration::from_millis(1))
+                .expect("earlier instant");
+            let backwards_client =
+                SpinOutboundClient::with_clock(scripted_clock(vec![start, earlier]));
+            let backwards_request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+            let backwards_results = block_on(backwards_client.send_all(vec![backwards_request]));
+            assert_eq!(backwards_results.len(), 1);
+            let backwards_result = backwards_results.first().expect("single backwards result");
+            assert_eq!(backwards_result.elapsed, Duration::ZERO);
+            assert!(matches!(
+                backwards_result.outcome,
+                Err(EdgeError::Internal { .. })
+            ));
+        }
+
+        #[test]
+        fn deferred_request_and_response_paths_retain_the_injected_clock() {
+            assert!(block_on(deferred_clock_paths_hold_for_test()));
+        }
+
+        #[test]
+        fn standard_dispatch_installs_the_application_outbound_clock() {
+            async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+                let client = ctx
+                    .http_client()
+                    .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+                let request = OutboundRequest::get("https://example.com/")?.stream_response();
+                let results = client.send_all(vec![request]).await;
+                let result = results.first().ok_or_else(|| {
+                    EdgeError::internal(anyhow::anyhow!("missing outbound result"))
+                })?;
+                Ok(result.elapsed.as_millis().to_string())
+            }
+
+            let start = MonotonicInstant::now();
+            let completed = start
+                .checked_add(Duration::from_millis(7))
+                .expect("completed instant");
+            let observations = Arc::new(AtomicUsize::new(0));
+            let clock_observations = Arc::clone(&observations);
+            let mut app = App::new(RouterService::builder().get("/clock", elapsed).build());
+            app.set_monotonic_clock(MonotonicClock::new(move || {
+                if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                    start
+                } else {
+                    completed
+                }
+            }));
+            let source = empty::<Result<Bytes, io::Error>>();
+
+            let response = block_on(dispatch_ingress_stream_for_test(
+                &app,
+                Method::GET,
+                "/clock".parse().expect("URI"),
+                source,
+            ))
+            .expect("Spin response");
+
+            let bytes = block_on(response.into_body().collect())
+                .expect("provider body")
+                .to_bytes();
+            assert_eq!(bytes.as_ref(), b"7");
+            assert!(observations.load(Ordering::SeqCst) >= 3);
+        }
+
+        #[test]
+        fn standard_native_request_refuses_before_body_read() {
+            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+            app.set_ingress_admission_policy(|head| {
+                assert!(matches!(head.route_resolution(), RouteResolution::NotFound));
+                AdmissionDecision::Refuse(
+                    response_builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("x-ingress-refusal", "saturated")
+                        .body(Body::from("spin unavailable\n"))
+                        .expect("refusal response"),
+                )
+            });
+            let outgoing_request = SpinRequest::builder()
+                .method("POST")
+                .uri("http://example.test/missing")
+                .body(http_body_util::Full::new(Bytes::from_static(b"abcde")))
+                .expect("outgoing-compatible request");
+            let wasi_request = outgoing_request.into_request().expect("WASI request");
+            let incoming_request =
+                SpinRequest::from_request(wasi_request).expect("incoming Spin request");
+
+            let response =
+                block_on(dispatch_request_for_test(&app, incoming_request)).expect("Spin response");
+
+            let mut expected_headers = HeaderMap::new();
+            expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
+            assert_terminal_response(
+                response,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &expected_headers,
+                b"spin unavailable\n",
+            );
+            assert_no_route_dispatch(&handler_calls, &middleware_calls);
         }
 
         struct CountingMiddleware(Arc<AtomicUsize>);

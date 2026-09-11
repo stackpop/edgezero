@@ -698,7 +698,6 @@ dependencies = [
  "tower",
  "tracing",
  "walkdir",
- "web-time",
 ]
 
 [[package]]
@@ -723,7 +722,6 @@ dependencies = [
  "walkdir",
  "wasm-bindgen-test",
  "web-sys",
- "web-time",
  "worker",
 ]
 
@@ -756,7 +754,6 @@ dependencies = [
  "thiserror 2.0.20",
  "toml_edit",
  "walkdir",
- "web-time",
 ]
 
 [[package]]

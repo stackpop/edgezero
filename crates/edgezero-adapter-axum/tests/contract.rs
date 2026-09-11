@@ -202,7 +202,7 @@ async fn streamed_response_deadline_preserves_timeout_provenance() {
         "/",
         get(|| async {
             let body = async_body_stream! {
-                sleep(Duration::from_millis(100)).await;
+                sleep(Duration::from_secs(2)).await;
                 yield Ok::<_, Infallible>(Bytes::from_static(b"late"));
             };
             Response::new(Body::from_stream(body))
@@ -213,7 +213,7 @@ async fn streamed_response_deadline_preserves_timeout_provenance() {
     let request = OutboundRequest::get(format!("{origin}/"))
         .expect("request")
         .stream_response()
-        .timeout(Duration::from_millis(10));
+        .timeout(Duration::from_millis(500));
 
     let response = client.send(request).await.expect("response headers");
     let error = response

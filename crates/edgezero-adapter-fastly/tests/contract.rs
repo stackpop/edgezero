@@ -512,6 +512,27 @@ mod tests {
         }
 
         #[test]
+        fn standard_service_enforces_fallback_overflow() {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                fallback_app(4, Duration::from_secs(30), &grant_drops);
+            let request = fastly_request(FastlyMethod::POST, "/missing", Some(b"abcde"));
+
+            let response = FastlyService::new(&app)
+                .dispatch(request)
+                .expect("Fastly response");
+
+            assert_terminal_response(
+                response,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &terminal_headers("overflow"),
+                b"fastly overflow\0response",
+            );
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_no_route_dispatch(&handler_calls, &middleware_calls);
+        }
+
+        #[test]
         fn cooperative_pre_read_expiry_preserves_application_response() {
             for path in ["/missing", "/known"] {
                 let grant_drops = Arc::new(AtomicUsize::new(0));
