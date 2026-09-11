@@ -1,0 +1,1166 @@
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf, absolute};
+use std::process::Command;
+
+use edgezero_adapter::env_file::reject_symlink_components;
+use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
+
+use super::WRANGLER_INSTALL_HINT;
+use super::provision_cloud::{find_namespace_id, is_real_namespace_id};
+use super::provision_local::read_namespace_id;
+
+/// Absolute `--config` argument for wrangler. The commands run with
+/// `current_dir(project_dir)` (the manifest's parent), so a
+/// manifest-root-relative `wrangler_path` would be resolved a SECOND time
+/// against that cwd (`crates/cf/wrangler.toml` -> `crates/cf/crates/cf/…`).
+/// Absolutising it makes the anchor independent of the child's cwd.
+fn wrangler_config_arg(wrangler_path: &Path) -> PathBuf {
+    absolute(wrangler_path).unwrap_or_else(|_| wrangler_path.to_path_buf())
+}
+
+/// Push `entries` to the remote KV namespace bound to `store` (looked
+/// up in `wrangler.toml`) via `wrangler kv bulk put <tempfile.json>
+/// --namespace-id=<id> --remote`. **--remote** is mandatory — wrangler
+/// v4 defaults to LOCAL storage otherwise.
+///
+/// Dry-run reports the intended invocation + per-entry preview without
+/// resolving the namespace id strictly (operators can preview the
+/// keyset BEFORE running provision). Real runs err loudly on unresolved
+/// bindings.
+pub(super) fn write_entries(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    store: &ResolvedStoreId,
+    entries: &[(String, String)],
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    // Read namespace id from wrangler.toml (matched by
+    // `binding = <platform>`), then `wrangler kv bulk put
+    // <tempfile.json> --namespace-id=<id> --remote`. The
+    // CLI hands this writer one logical (root_key, envelope_json)
+    // entry; the bulk-put still works because it's one upsert
+    // per entry, and the one-entry case is degenerate.
+    //
+    // **--remote** is mandatory for the prod-push path:
+    // wrangler v4 defaults KV bulk-put to LOCAL storage when
+    // the command supports both — meaning a v4 user running
+    // `wrangler kv bulk put` without `--remote` would silently
+    // populate Miniflare state under `.wrangler/state` and
+    // report success while leaving the live Cloudflare
+    // namespace empty. Explicit `--remote` removes the
+    // ambiguity.
+    let Some(rel) = adapter_manifest_path else {
+        return Err(
+            "[adapters.cloudflare.adapter].manifest must point at wrangler.toml for config push"
+                .to_owned(),
+        );
+    };
+    let wrangler_path = manifest_root.join(rel);
+    let binding = store.platform.as_str();
+    let logical = store.logical.as_str();
+    // Dry-run is lenient about an UNPROVISIONED binding (no entry, or a
+    // scaffold placeholder id) so operators can preview the keyset BEFORE
+    // running provision. A MALFORMED wrangler.toml (unparseable, or a
+    // `kv_namespaces` of the wrong shape) is NOT suppressed: `?` propagates
+    // it so the dry-run fails loudly instead of printing a misleading
+    // `<unresolved>` preview. Real runs still err loudly so we don't
+    // silently push to a non-existent namespace.
+    if dry_run {
+        let resolved =
+            read_namespace_id(&wrangler_path, binding)?.filter(|id| is_real_namespace_id(id));
+        let header = match resolved {
+            Some(ns_id) => format!(
+                "would run `wrangler kv bulk put <tempfile.json> --namespace-id={ns_id} --remote` with {} entries for binding `{binding}` (logical id `{logical}`)",
+                entries.len()
+            ),
+            None => format!(
+                "would run `wrangler kv bulk put <tempfile.json> --namespace-id=<unresolved> --remote` with {} entries for binding `{binding}` (logical id `{logical}`, binding not yet provisioned -- run `edgezero provision --adapter cloudflare` to resolve the namespace id)",
+                entries.len()
+            ),
+        };
+        let mut out = vec![header];
+        for (key, _) in entries {
+            out.push(format!("  would create entry `{key}`"));
+        }
+        return Ok(out);
+    }
+    let namespace_id = find_namespace_id(&wrangler_path, binding)?;
+    if entries.is_empty() {
+        return Ok(vec![format!(
+            "no config entries to push to KV namespace `{binding}` (logical id `{logical}`, id={namespace_id})"
+        )]);
+    }
+    let payload = bulk_payload(entries)?;
+    let temp = tempfile::Builder::new()
+        .prefix("edgezero-cf-push-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|err| format!("failed to create temp file for wrangler bulk payload: {err}"))?;
+    fs::write(temp.path(), payload.as_bytes())
+        .map_err(|err| format!("failed to write {}: {err}", temp.path().display()))?;
+    let temp_arg = temp
+        .path()
+        .to_str()
+        .ok_or_else(|| format!("temp file path {} is not UTF-8", temp.path().display()))?;
+    let namespace_arg = format!("--namespace-id={namespace_id}");
+    // Run from the wrangler.toml's directory so wrangler picks
+    // up its `account_id` / `--env` resolution + persistence
+    // settings the same way `wrangler dev` / `wrangler deploy`
+    // do for this project.
+    let project_dir = wrangler_path.parent().unwrap_or(manifest_root);
+    let output = Command::new("wrangler")
+        .current_dir(project_dir)
+        .args([
+            "kv",
+            "bulk",
+            "put",
+            temp_arg,
+            namespace_arg.as_str(),
+            "--remote",
+        ])
+        // Anchor at the DECLARED manifest. Without `--config`, wrangler
+        // discovers the default `wrangler.toml` in `project_dir`, which for
+        // a declared `config/cloudflare.prod.toml` sitting beside a plain
+        // `wrangler.toml` would push to the WRONG account / namespace.
+        .arg("--config")
+        .arg(wrangler_config_arg(&wrangler_path))
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`wrangler` not found on PATH; {WRANGLER_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `wrangler`: {err}")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "`wrangler kv bulk put --remote` exited with status {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(vec![format!(
+        "pushed {} entries to KV namespace `{binding}` (logical id `{logical}`, id={namespace_id})",
+        entries.len()
+    )])
+}
+
+/// Push `entries` to Miniflare's local KV storage via `wrangler kv
+/// bulk put <file> --binding <BINDING> --local`.
+///
+/// Local mode does NOT resolve a namespace id — the scaffold ships
+/// with `local-dev-placeholder` ids, so operators who haven't run
+/// `edgezero provision` yet can still seed `.wrangler/state` from the
+/// manifest. Wrangler stores local entries keyed by binding, not
+/// namespace id, so `wrangler dev --local` / `edgezero serve --adapter
+/// cloudflare` reads them back through the same binding name.
+pub(super) fn write_entries_local(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    store: &ResolvedStoreId,
+    entries: &[(String, String)],
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    // Local push: address the binding directly via
+    // `wrangler kv bulk put <file> --binding <BINDING> --local`.
+    // Crucially we do NOT resolve a namespace id here — the
+    // scaffold ships with `local-dev-placeholder` ids, so an
+    // operator that hasn't run `edgezero provision` yet should
+    // still be able to seed `.wrangler/state` from the manifest
+    // (matching wrangler's own local KV docs). Wrangler stores
+    // local entries keyed by binding, not namespace id, so the
+    // follow-up `wrangler dev --local` / `edgezero serve
+    // --adapter cloudflare` reads them back through the same
+    // binding name.
+    let Some(rel) = adapter_manifest_path else {
+        return Err(
+            "[adapters.cloudflare.adapter].manifest must point at wrangler.toml for config push --local"
+                .to_owned(),
+        );
+    };
+    let wrangler_path = manifest_root.join(rel);
+    let project_dir = wrangler_path.parent().unwrap_or(manifest_root);
+    let binding = store.platform.as_str();
+    let logical = store.logical.as_str();
+    if dry_run {
+        let mut out = vec![format!(
+            "would run `wrangler kv bulk put <tempfile.json> --binding {binding} --local` with {} entries for binding `{binding}` (logical id `{logical}`)",
+            entries.len()
+        )];
+        for (key, _) in entries {
+            out.push(format!("  would create local entry `{key}`"));
+        }
+        return Ok(out);
+    }
+    if entries.is_empty() {
+        return Ok(vec![format!(
+            "no config entries to push to local KV namespace `{binding}` (logical id `{logical}`)"
+        )]);
+    }
+    // Refuse a symlinked `.wrangler` / `.wrangler/state` before shelling out:
+    // wrangler's `--local` push writes Miniflare state under
+    // `.wrangler/state`, and a checked-in symlink at either component would
+    // redirect those writes OUTSIDE the project tree. Walk from the project
+    // dir down so a symlinked intermediate `.wrangler` is caught too;
+    // components that don't exist yet (first push) pass. Only the LOCAL path
+    // needs this -- the remote push writes to Cloudflare, not `.wrangler`.
+    let wrangler_state = project_dir.join(".wrangler").join("state");
+    reject_symlink_components(project_dir, &wrangler_state)?;
+    let payload = bulk_payload(entries)?;
+    let temp = tempfile::Builder::new()
+        .prefix("edgezero-cf-push-local-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|err| format!("failed to create temp file for wrangler bulk payload: {err}"))?;
+    fs::write(temp.path(), payload.as_bytes())
+        .map_err(|err| format!("failed to write {}: {err}", temp.path().display()))?;
+    let temp_arg = temp
+        .path()
+        .to_str()
+        .ok_or_else(|| format!("temp file path {} is not UTF-8", temp.path().display()))?;
+    let output = Command::new("wrangler")
+        .current_dir(project_dir)
+        .args([
+            "kv",
+            "bulk",
+            "put",
+            temp_arg,
+            "--binding",
+            binding,
+            "--local",
+        ])
+        // Anchor at the DECLARED manifest so a non-default filename beside
+        // a plain `wrangler.toml` seeds the right local namespace.
+        .arg("--config")
+        .arg(wrangler_config_arg(&wrangler_path))
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`wrangler` not found on PATH; {WRANGLER_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `wrangler`: {err}")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "`wrangler kv bulk put --binding {binding} --local` exited with status {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(vec![format!(
+        "pushed {} entries to local KV namespace bound as `{binding}` (logical id `{logical}`); `.wrangler/state` updated",
+        entries.len()
+    )])
+}
+
+/// Render the entries as the `[{"key": "...", "value": "..."}, …]`
+/// JSON wrangler expects for `kv bulk put`. Under the blob model the
+/// CLI hands this writer one logical `(root_key, envelope_json)` entry;
+/// Cloudflare passes the value through unchanged (the envelope is an
+/// opaque string from the platform's perspective).
+fn bulk_payload(entries: &[(String, String)]) -> Result<String, String> {
+    let payload: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+        .collect();
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize wrangler bulk payload: {err}"))
+}
+
+/// Read a single key from a Cloudflare KV namespace by shelling out to
+/// `wrangler kv key get --binding <BINDING> <KEY> <locality>`.
+///
+/// `locality` is either `"--remote"` (live Cloudflare KV) or `"--local"`
+/// (Miniflare `.wrangler/state`). The two read methods on the adapter call
+/// this shared helper with the appropriate flag.
+///
+/// # Mapping to `ReadConfigEntry`
+/// - Success (exit 0) → `Present(stdout)`.
+/// - Exit non-zero, stderr is an auth/config failure → `Err` (checked FIRST,
+///   so an auth message mentioning "binding"/"not found" is never misread as
+///   a missing store/key).
+/// - Exit non-zero, stderr mentions "binding" → `MissingStore` (the KV
+///   namespace binding itself doesn't exist in `wrangler.toml`).
+/// - Exit non-zero, stderr contains "not found" / "does not exist" → `MissingKey`.
+/// - Any other non-zero exit → `Err`.
+pub(super) fn read_wrangler_kv_key(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    store: &ResolvedStoreId,
+    key: &str,
+    locality: &str,
+) -> Result<ReadConfigEntry, String> {
+    let rel = adapter_manifest_path.ok_or_else(|| {
+        "[adapters.cloudflare.adapter].manifest must point at wrangler.toml for config diff"
+            .to_owned()
+    })?;
+    let wrangler_path = manifest_root.join(rel);
+    let binding = store.platform.as_str();
+    let project_dir = wrangler_path.parent().unwrap_or(manifest_root);
+    let output = Command::new("wrangler")
+        .args(["kv", "key", "get", "--binding", binding, key, locality])
+        // Anchor at the DECLARED manifest so diff/read resolves the same
+        // account / namespace a push would target, not a sibling default
+        // `wrangler.toml`.
+        .arg("--config")
+        .arg(wrangler_config_arg(&wrangler_path))
+        .current_dir(project_dir)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`wrangler` not found on PATH; {WRANGLER_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `wrangler`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        let body = String::from_utf8(output.stdout)
+            .map_err(|err| format!("`wrangler kv key get` stdout is not UTF-8: {err}"))?;
+        // Wrangler 4.x (verified 4.64.0) returns exit 0 + stdout
+        // "Value not found" for a missing key instead of exit 1 +
+        // stderr. Detect that shape and map to MissingKey -- a
+        // missing key in the blob model is valid initial state
+        // (first push hasn't run yet), not corrupt remote state.
+        // Match the trimmed first line so trailing newlines or
+        // future variants like "Value not found.\n" still match.
+        let trimmed = body.trim();
+        if trimmed.eq_ignore_ascii_case("value not found")
+            || trimmed.eq_ignore_ascii_case("value not found.")
+        {
+            return Ok(ReadConfigEntry::MissingKey);
+        }
+        return Ok(ReadConfigEntry::Present(body));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lower = stderr.to_ascii_lowercase();
+    // An AUTH/CONFIG failure ("API token not found", "unauthorized", ...) is
+    // surfaced as an error and must be checked BEFORE any missing-store /
+    // missing-key mapping: such messages routinely mention "binding" or
+    // "not found", and misclassifying them would make a diff report the
+    // whole store as missing (everything added) instead of failing loudly.
+    if is_wrangler_auth_or_config_error(&lower) {
+        return Err(format!(
+            "`wrangler kv key get --binding {binding} {key} {locality}` failed to authenticate or resolve configuration; run `edgezero auth login --adapter cloudflare` and check `wrangler.toml`\nstderr: {}",
+            stderr.trim()
+        ));
+    }
+    // A missing BINDING / namespace (the KV store itself) is a missing store.
+    // Require an ABSENCE qualifier alongside "binding" -- a bare mention of
+    // "binding" (invalid binding syntax, a malformed-manifest diagnostic that
+    // names a binding, ...) is a real error, NOT an absent store, and mapping
+    // it to MissingStore would make a diff report the whole store as added.
+    // Current wrangler also reports a wholly unconfigured project as
+    // "No KV Namespaces configured!", which is the same missing-store case.
+    let binding_absent = lower.contains("binding")
+        && (lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("not defined")
+            || lower.contains("no such")
+            || lower.contains("could not find")
+            || lower.contains("unknown"));
+    if binding_absent || lower.contains("no kv namespaces") {
+        return Ok(ReadConfigEntry::MissingStore);
+    }
+    // A genuinely absent KEY is a not-found (with no "binding" qualifier,
+    // handled above).
+    if lower.contains("not found") || lower.contains("does not exist") {
+        return Ok(ReadConfigEntry::MissingKey);
+    }
+    Err(format!(
+        "`wrangler kv key get --binding {binding} {key} {locality}` exited with status {}\nstderr: {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
+/// Detect an AUTHENTICATION / CONFIGURATION failure in a (lowercased)
+/// wrangler error, so a message like "API token not found" is NOT misread
+/// as an absent key (which would let a diff report everything as added).
+fn is_wrangler_auth_or_config_error(lower: &str) -> bool {
+    lower.contains("api token")
+        || lower.contains("api key")
+        || lower.contains("token")
+        || lower.contains("credential")
+        || lower.contains("unauthor")
+        || lower.contains("forbidden")
+        || lower.contains("403")
+        || lower.contains("permission")
+        || lower.contains("account_id")
+        || lower.contains("account id")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::CloudflareCliAdapter;
+    #[cfg(unix)]
+    use super::super::path_mutation_guard;
+    use super::*;
+    use edgezero_adapter::registry::{
+        Adapter as _, AdapterPushContext, ReadConfigEntry, ResolvedStoreId,
+    };
+    use edgezero_core::test_env::PathPrepend;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    const TEST_CONFIG_ID: &str = "app_config";
+
+    #[cfg(unix)]
+    fn fake_wrangler_returning(
+        stdout_body: &str,
+        stderr_body: &str,
+        exit_code: i32,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("wrangler");
+        let stdout_file = dir.path().join("stdout_payload.txt");
+        let stderr_file = dir.path().join("stderr_payload.txt");
+        fs::write(&stdout_file, stdout_body).expect("write stdout payload");
+        fs::write(&stderr_file, stderr_body).expect("write stderr payload");
+        let script = format!(
+            "#!/bin/sh\ncat '{stdout}'\ncat '{stderr}' >&2\nexit {code}\n",
+            stdout = stdout_file.display(),
+            stderr = stderr_file.display(),
+            code = exit_code,
+        );
+        fs::write(&script_path, script).expect("write wrangler script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn fake_wrangler_argv_log(out_path: &Path) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("wrangler");
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{out}'; done\nprintf 'val'\n",
+            out = out_path.display(),
+        );
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    fn write_wrangler(dir: &Path, contents: &str) -> PathBuf {
+        let path = dir.join("wrangler.toml");
+        fs::write(&path, contents).expect("write wrangler.toml");
+        path
+    }
+
+    // ---------- bulk_payload ----------
+
+    #[test]
+    fn bulk_payload_emits_wrangler_array_of_key_value_objects() {
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        let raw = bulk_payload(&entries).expect("payload");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let array = parsed.as_array().expect("array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0]["key"], "greeting");
+        assert_eq!(array[0]["value"], "hello");
+        assert_eq!(array[1]["key"], "service.timeout_ms");
+        assert_eq!(array[1]["value"], "1500");
+    }
+
+    #[test]
+    fn bulk_payload_with_no_entries_is_empty_array() {
+        let raw = bulk_payload(&[]).expect("empty payload");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!([]));
+    }
+
+    // ---------- push_config_entries (dry-run + error paths) ----------
+
+    #[test]
+    fn push_dry_run_resolves_namespace_id_and_does_not_invoke_wrangler() {
+        let dir = tempdir().expect("tempdir");
+        let original = "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"00112233445566778899aabbccddeeff\"\n";
+        let path = write_wrangler(dir.path(), original);
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("feature.new_checkout".to_owned(), "false".to_owned()),
+        ];
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run succeeds");
+        // Header + per-entry preview, matching the fastly dry-run shape.
+        assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
+        assert!(
+            out[0].contains("would run `wrangler kv bulk put")
+                && out[0].contains("--namespace-id=00112233445566778899aabbccddeeff"),
+            "dry-run header names namespace id: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("`greeting`")),
+            "dry-run lists `greeting`: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("`feature.new_checkout`")),
+            "dry-run lists `feature.new_checkout`: {out:?}"
+        );
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(after, original, "dry-run must not mutate wrangler.toml");
+    }
+
+    #[test]
+    fn push_dry_run_is_lenient_when_binding_not_yet_provisioned() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run is lenient: pre-provision preview is allowed");
+        assert!(
+            out[0].contains("<unresolved>") && out[0].contains("provision"),
+            "dry-run header explains the namespace is unresolved and points at provision: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("`greeting`")),
+            "dry-run still lists the entries it would push: {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_dry_run_fails_on_malformed_kv_namespaces_shape() {
+        // A `kv_namespaces` of the wrong shape is a MALFORMED manifest, not
+        // an unprovisioned binding. Dry-run must fail loudly rather than
+        // suppress it as a lenient `<unresolved>` preview.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\nkv_namespaces = \"nope\"\n");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let err = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect_err("a malformed manifest must fail dry-run, not preview <unresolved>");
+        assert!(
+            err.contains("kv_namespaces"),
+            "error names the malformed key: {err}"
+        );
+    }
+
+    #[test]
+    fn push_dry_run_is_lenient_on_scaffold_placeholder_id() {
+        // A placeholder id means "not yet provisioned" -- still a lenient
+        // preview, distinct from a malformed manifest.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"local-dev-placeholder\"\n",
+        );
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run is lenient for a placeholder id");
+        assert!(
+            out[0].contains("<unresolved>") && out[0].contains("provision"),
+            "placeholder id previews as unresolved: {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_errors_when_adapter_manifest_path_missing() {
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![("k".to_owned(), "v".to_owned())];
+        let err = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect_err("missing adapter manifest path must error");
+        assert!(
+            err.contains("wrangler.toml") && err.contains("config push"),
+            "error explains the missing manifest pointer: {err}"
+        );
+    }
+
+    #[test]
+    fn push_real_run_errors_with_provision_hint_when_binding_absent() {
+        // dry-run is now lenient (see
+        // `push_dry_run_is_lenient_when_binding_not_yet_provisioned`),
+        // but a real run still must err so we don't silently push
+        // to a non-existent namespace.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let err = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("missing binding must error on real run");
+        assert!(
+            err.contains("provision") && err.contains(TEST_CONFIG_ID),
+            "error points at provision: {err}"
+        );
+    }
+
+    #[test]
+    fn push_with_no_entries_reports_no_op_after_resolving_namespace() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"00112233445566778899aabbccddeeff\"\n",
+        );
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("zero-entry push is fine");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("no config entries")
+                && out[0].contains("00112233445566778899aabbccddeeff"),
+            "status line names empty + namespace id: {out:?}"
+        );
+    }
+
+    /// Push-after-provision: `config push --local` seeds the local KV
+    /// store via `wrangler kv bulk put`; it must leave the
+    /// provision-written `.dev.vars` (which carries the operator's real
+    /// secret values) byte-for-byte intact.
+    #[cfg(unix)]
+    #[test]
+    fn push_after_provision_preserves_dev_vars_secret() {
+        use edgezero_adapter::registry::{ProvisionMode, TypedSecretEntry};
+
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        // 1. Provision writes the secret placeholder into `.dev.vars`.
+        CloudflareCliAdapter
+            .provision_typed(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &[TypedSecretEntry::new("default", "field", "demo_api_token")],
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed writes the placeholder");
+        let dev_vars = project_dir.path().join(".dev.vars");
+        let provisioned = fs::read_to_string(&dev_vars).expect("provision wrote .dev.vars");
+        assert!(
+            provisioned.contains("demo_api_token=\"\""),
+            "provision must write the secret placeholder: {provisioned}"
+        );
+        // 2. Operator fills in the real value.
+        fs::write(
+            &dev_vars,
+            provisioned.replace(
+                "demo_api_token=\"\"",
+                "demo_api_token=\"real-secret-value\"",
+            ),
+        )
+        .expect("operator edit");
+
+        // 3. Push (fake wrangler); the `.dev.vars` secret must survive.
+        let fake = fake_wrangler_returning("", "", 0);
+        let _path = PathPrepend::new(fake.path());
+        CloudflareCliAdapter
+            .push_config_entries_local(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "hello".to_owned())],
+                &AdapterPushContext::new().with_local(true),
+                false,
+            )
+            .expect("push --local succeeds with fake wrangler");
+
+        assert!(
+            fs::read_to_string(&dev_vars)
+                .expect("read .dev.vars")
+                .contains("demo_api_token=\"real-secret-value\""),
+            "config push --local must not touch the operator's .dev.vars secret"
+        );
+    }
+
+    // ---------- read_config_entry / read_config_entry_local (fake wrangler) ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_present_on_success() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("hello-cloudflare", "", 0);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("wrangler exit-0 must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, "hello-cloudflare");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_key_on_not_found_stderr() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: key not found", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("not-found maps to MissingKey (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "not-found stderr => MissingKey"
+        );
+    }
+
+    /// An auth failure ("API token not found") must NOT be masked as a
+    /// missing key -- it is surfaced as an error.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_auth_token_not_found() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: API token not found", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter.read_config_entry(
+            project_dir.path(),
+            Some("wrangler.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("an auth failure must be an error, not MissingKey");
+        };
+        assert!(
+            err.contains("API token"),
+            "the auth failure must surface: {err}"
+        );
+    }
+
+    /// Wrangler 4.x (verified 4.64.0) returns exit 0 + stdout
+    /// `"Value not found"` for a missing key instead of exit 1 +
+    /// stderr. The previous read path treated every exit-0 stdout
+    /// as a `Present` envelope, which made the next CLI step try
+    /// to parse `"Value not found"` as a `BlobEnvelope` and abort.
+    /// A missing key in the blob model is valid initial state --
+    /// the first push hasn't run yet -- not corrupt remote state,
+    /// so it must map to `MissingKey`.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_key_on_wrangler_4_value_not_found_stdout() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("Value not found\n", "", 0);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("Wrangler 4.x exit-0 'Value not found' must map to MissingKey");
+        if let ReadConfigEntry::Present(body) = &result {
+            panic!(
+                "expected MissingKey on Wrangler 4.x 'Value not found' stdout; \
+                 got Present({body:?})",
+            );
+        }
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "Wrangler 4.x stdout='Value not found' (exit 0) must classify as MissingKey",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_store_on_binding_stderr() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: binding APP_CONFIG is not defined", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("binding-error maps to MissingStore (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "binding stderr => MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_bare_binding_error_without_absence() {
+        // A "binding" error that is NOT an absence (invalid syntax, malformed
+        // manifest naming a binding) must surface as an error, not be
+        // misclassified as an absent store (which would report the whole
+        // store as added in a diff).
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: invalid binding name `APP CONFIG`", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter.read_config_entry(
+            project_dir.path(),
+            Some("wrangler.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("a bare binding error (no absence) must be an error, not MissingStore");
+        };
+        assert!(
+            err.contains("invalid binding"),
+            "the real binding error must surface: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_maps_no_kv_namespaces_configured_to_missing_store() {
+        // Current wrangler reports a wholly unconfigured project as
+        // "No KV Namespaces configured!" -- the same missing-store condition
+        // as a missing binding, so it must map to MissingStore (not Err).
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "No KV Namespaces configured!", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("'No KV Namespaces configured!' maps to MissingStore (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "'No KV Namespaces configured!' => MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_reports_error_on_auth_failure_that_mentions_binding() {
+        // An auth/config failure whose message ALSO contains "binding" must
+        // surface as an error -- not be misclassified as MissingStore, which
+        // would make a diff report the whole store as added.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning(
+            "",
+            "Error: Unauthorized [10000] while resolving binding APP_CONFIG",
+            1,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter.read_config_entry(
+            project_dir.path(),
+            Some("wrangler.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("an auth failure mentioning 'binding' must be an error, not MissingStore");
+        };
+        assert!(
+            err.contains("authenticate") || err.contains("Unauthorized"),
+            "the auth failure must surface: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_local_uses_local_flag() {
+        // Verify that read_config_entry_local passes `--local` (not `--remote`)
+        // to wrangler. We capture argv via a fake wrangler and check the args.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let argv_log = project_dir.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry_local(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read succeeds");
+        assert!(
+            matches!(result, ReadConfigEntry::Present(_)),
+            "expected Present from local read"
+        );
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains("--local"),
+            "read_local must pass --local to wrangler; got argv:\n{captured}"
+        );
+        assert!(
+            !captured.contains("--remote"),
+            "read_local must NOT pass --remote; got argv:\n{captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_anchors_wrangler_at_the_declared_non_default_manifest() {
+        // A declared manifest with a NON-default filename sitting beside a
+        // plain `wrangler.toml` must be targeted via `--config`, or wrangler
+        // would discover the sibling default and read the wrong project.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"decoy\"\n");
+        fs::write(
+            project_dir.path().join("cloudflare.prod.toml"),
+            "name = \"prod\"\n",
+        )
+        .expect("write declared manifest");
+        let argv_log = project_dir.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        CloudflareCliAdapter
+            .read_config_entry_local(
+                project_dir.path(),
+                Some("cloudflare.prod.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read succeeds");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains("--config"),
+            "read must anchor wrangler with --config; got argv:\n{captured}"
+        );
+        assert!(
+            captured.contains("cloudflare.prod.toml"),
+            "read must point --config at the DECLARED manifest; got argv:\n{captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_arg_is_not_doubled_for_a_nested_manifest() {
+        // The command runs with cwd = the manifest's parent, so a
+        // manifest-root-relative `--config` would be resolved AGAIN against
+        // that cwd (`crates/cf/wrangler.toml` -> `crates/cf/crates/cf/…`).
+        // The anchor must be absolute so no segment is doubled.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let root = tempdir().expect("tempdir");
+        let nested = root.path().join("crates/cf");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        write_wrangler(&nested, "name = \"prod\"\n");
+        let argv_log = root.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        CloudflareCliAdapter
+            .read_config_entry_local(
+                root.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read succeeds");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            !captured.contains("crates/cf/crates/cf"),
+            "the --config path must not be doubled under the changed cwd; got argv:\n{captured}"
+        );
+        assert!(
+            captured
+                .lines()
+                .any(|line| line.ends_with("/crates/cf/wrangler.toml")),
+            "the --config anchor must be the absolute declared manifest; got argv:\n{captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_push_anchors_wrangler_at_the_declared_non_default_manifest() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"decoy\"\n");
+        fs::write(
+            project_dir.path().join("cloudflare.prod.toml"),
+            "name = \"prod\"\n",
+        )
+        .expect("write declared manifest");
+        let argv_log = project_dir.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        CloudflareCliAdapter
+            .push_config_entries_local(
+                project_dir.path(),
+                Some("cloudflare.prod.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "hello".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("local push succeeds");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains("--config") && captured.contains("cloudflare.prod.toml"),
+            "local push must anchor --config at the DECLARED manifest; got argv:\n{captured}"
+        );
+    }
+
+    /// A symlinked `.wrangler` directory (pointing outside the project)
+    /// must be refused BEFORE `wrangler` is ever spawned, so the `--local`
+    /// push can't redirect Miniflare's `.wrangler/state` writes off the
+    /// tree. No fake wrangler is installed here: if the guard were missing,
+    /// the shell-out would fail with a "not found" error instead of the
+    /// symlink refusal this asserts.
+    #[cfg(unix)]
+    #[test]
+    fn local_push_refuses_a_symlinked_wrangler_dir() {
+        use std::os::unix::fs::symlink;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let outside = tempdir().expect("outside tempdir");
+        symlink(outside.path(), project_dir.path().join(".wrangler")).expect("symlink .wrangler");
+
+        let err = CloudflareCliAdapter
+            .push_config_entries_local(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[("greeting".to_owned(), "hello".to_owned())],
+                &AdapterPushContext::new().with_local(true),
+                false,
+            )
+            .expect_err("a symlinked .wrangler must be refused before shelling out");
+        assert!(
+            err.contains("symlink"),
+            "error must name the symlink refusal: {err}"
+        );
+        // The guard must fire before any wrangler shell-out -- the error is
+        // the symlink refusal, not a spawn/exit failure.
+        assert!(
+            !err.contains("wrangler kv bulk put") && !err.contains("not found on PATH"),
+            "refusal must precede the wrangler invocation: {err}"
+        );
+    }
+
+    #[test]
+    fn read_config_entry_requires_adapter_manifest_path() {
+        let dir = tempdir().expect("tempdir");
+        let result = CloudflareCliAdapter.read_config_entry(
+            dir.path(),
+            None,
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("[adapters.cloudflare.adapter].manifest"),
+                "error names the missing field: {err}"
+            ),
+            Ok(_) => panic!("expected Err when adapter_manifest_path is None"),
+        }
+    }
+}

@@ -25,7 +25,7 @@ while IFS= read -r hit; do
     printf '%s: violation: legacy per-leaf config read — use AppConfig<C> extractor instead\n' "${hit}"
     VIOLATIONS=$((VIOLATIONS + 1))
 done < <(
-    grep -rn --include="*.rs" \
+    grep -rn --include="*.rs" --include="*.rs.hbs" \
         'config_store_default()?\s*\.\s*get(' \
         "${REPO_ROOT}/crates" \
         "${REPO_ROOT}/examples" \
@@ -40,7 +40,7 @@ while IFS= read -r hit; do
     printf '%s: violation: legacy per-leaf secret read — use AppConfig<C> extractor instead\n' "${hit}"
     VIOLATIONS=$((VIOLATIONS + 1))
 done < <(
-    grep -rn --include="*.rs" \
+    grep -rn --include="*.rs" --include="*.rs.hbs" \
         'secret_store\.require_str(&cfg\.' \
         "${REPO_ROOT}/crates" \
         "${REPO_ROOT}/examples" \
@@ -60,7 +60,7 @@ while IFS= read -r hit; do
     printf '%s: violation: nested AppConfig extractor — AppConfig<AppConfig<…>> is illegal per spec 3.3\n' "${hit}"
     VIOLATIONS=$((VIOLATIONS + 1))
 done < <(
-    grep -rn --include="*.rs" \
+    grep -rn --include="*.rs" --include="*.rs.hbs" \
         --exclude-dir=target \
         --exclude="check_no_nested_app_config.rs" \
         'AppConfig<[^>]*AppConfig<' \

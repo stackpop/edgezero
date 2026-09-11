@@ -30,12 +30,11 @@
 //! normal workspace build does not pull in `syn` / `walkdir` / `proc-macro2`.
 
 #![cfg(feature = "nested-app-config-check")]
-// This is a CLI diagnostic binary; printing to stdout/stderr is its purpose.
-#![expect(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "CLI diagnostic binary — stdout/stderr output is intentional"
-)]
+// stdout/stderr writes go through `edgezero_cli::stream::{stdout_line,
+// info_line}` so the workspace-wide `clippy::print_stdout` /
+// `clippy::print_stderr` restrictions still catch stray `println!` /
+// `eprintln!` regressions. The stream helpers wrap the writes with the
+// `#[expect]` at their definition site.
 // Free helpers (`struct_derives_app_config`, `type_contains_app_config_struct`,
 // `rs_files_in`) are grouped with the pass they belong to, so they sit
 // between the visitor `impl` blocks rather than below them. Reads better than
@@ -53,6 +52,7 @@ use std::process;
 use std::result::Result;
 use std::string::ToString;
 
+use edgezero_cli::stream::{info_line, stdout_line};
 use proc_macro2::{Ident, Span};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -136,13 +136,13 @@ impl<'src, 'set> NestedAppConfigVisitor<'src, 'set> {
 
     fn report(&mut self, span: Span, outer: &str, field_name: &str, inner: &str) {
         let lc = span.start();
-        println!(
+        stdout_line(&format!(
             "{}:{}:{}: nested AppConfig: struct `{outer}` field `{field_name}` \
              references AppConfig-derived struct `{inner}`",
             self.source_path.display(),
             lc.line,
             lc.column.saturating_add(1),
-        );
+        ));
         self.violations = self.violations.saturating_add(1);
     }
 }
@@ -268,7 +268,7 @@ fn collect_app_config_structs(path: &Path, set: &mut HashSet<String>, parse_erro
     let source = match fs::read_to_string(path) {
         Ok(src) => src,
         Err(err) => {
-            eprintln!("{}: read error: {err}", path.display());
+            info_line(&format!("{}: read error: {err}", path.display()));
             *parse_errors = parse_errors.saturating_add(1);
             return;
         }
@@ -276,7 +276,7 @@ fn collect_app_config_structs(path: &Path, set: &mut HashSet<String>, parse_erro
     let file = match syn::parse_file(&source) {
         Ok(ff) => ff,
         Err(err) => {
-            eprintln!("{}: parse error: {err}", path.display());
+            info_line(&format!("{}: parse error: {err}", path.display()));
             *parse_errors = parse_errors.saturating_add(1);
             return;
         }
@@ -295,7 +295,7 @@ fn check_file(
     let source = match fs::read_to_string(path) {
         Ok(src) => src,
         Err(err) => {
-            eprintln!("{}: read error: {err}", path.display());
+            info_line(&format!("{}: read error: {err}", path.display()));
             *parse_errors = parse_errors.saturating_add(1);
             return;
         }
@@ -303,7 +303,7 @@ fn check_file(
     let file = match syn::parse_file(&source) {
         Ok(ff) => ff,
         Err(err) => {
-            eprintln!("{}: parse error: {err}", path.display());
+            info_line(&format!("{}: parse error: {err}", path.display()));
             *parse_errors = parse_errors.saturating_add(1);
             return;
         }
@@ -368,21 +368,21 @@ fn main() {
     }
 
     if violations > 0 {
-        eprintln!(
+        info_line(&format!(
             "\n{violations} nested-AppConfig violation(s). \
              A field whose type resolves to another #[derive(AppConfig)] struct \
              (detected even through Option/Vec/Box wrappers) must opt in with \
              #[app_config(nested)]. Opt-in supports a direct `T` or `Vec<T>` field \
              only — restructure Option/Box-wrapped nesting to one of those. \
              Otherwise nesting is rejected (spec \u{00a7}3.3)."
-        );
+        ));
         process::exit(1);
     }
     if parse_errors > 0 {
         process::exit(2);
     }
 
-    println!("check_no_nested_app_config: OK");
+    stdout_line("check_no_nested_app_config: OK");
 }
 
 #[cfg(test)]

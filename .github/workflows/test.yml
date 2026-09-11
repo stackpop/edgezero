@@ -58,12 +58,59 @@ jobs:
       - name: Nested AppConfig audit
         run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
 
+      # Enforce spec §"Adapter manifests are gitignored" + §"Migration for
+      # downstream projects". All five generated adapter manifests
+      # (`axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`,
+      # `runtime-config.toml`), Cloudflare's `.dev.vars`, AND the
+      # provision-written secret-bearing env-line files (Spin's
+      # `<crate>/.env`, Axum's `.edgezero/.env`) MUST NOT be tracked --
+      # teammates regenerate them locally via `provision --local`.
+      - name: Enforce adapter manifests and secret env files are not tracked
+        run: |
+          if git ls-files | grep -E '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$|(^|/)\.env$'; then
+            echo "::error::These adapter manifests AND secret-bearing env files (.dev.vars / .env) must be gitignored (spec §'Adapter manifests are gitignored' + §'Migration for downstream projects'). They carry operator secret values and must NEVER be committed."
+            exit 1
+          fi
+
+      # The step above only proves these files are not CURRENTLY tracked.
+      # Also prove they are actually IGNORED, so a `git add` can't slip a
+      # regenerated manifest (or a secret-bearing env file) into a commit.
+      # `git check-ignore` evaluates the ignore rules against the pathname
+      # whether or not the file exists.
+      - name: Enforce adapter manifests and secret env files are gitignored
+        run: |
+          for probe in \
+            crates/demo/axum.toml \
+            crates/demo/wrangler.toml \
+            crates/demo/fastly.toml \
+            crates/demo/spin.toml \
+            crates/demo/runtime-config.toml \
+            crates/demo/.dev.vars \
+            crates/demo/.env \
+            .edgezero/.env; do
+            if ! git check-ignore -q "$probe"; then
+              echo "::error::'$probe' is NOT gitignored. Add the pattern to .gitignore so provision-generated adapter state and secret-bearing env files can never be committed by accident."
+              exit 1
+            fi
+          done
+
       # The checker's own unit tests live behind `required-features =
       # ["nested-app-config-check"]`, so the unfeatured
       # `cargo test --workspace` step below does not compile or run them.
       # Exercise them explicitly to keep the coverage closure enforced by CI.
       - name: Nested AppConfig checker tests
         run: cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config
+
+      # Lint the smoke/helper shell scripts. `-x` follows `source`d libs;
+      # `--severity=warning` gates on warnings and errors (SC1091/SC2086-style
+      # info notes stay advisory). ubuntu-latest ships shellcheck.
+      - name: ShellCheck smoke scripts
+        run: shellcheck -x --severity=warning scripts/*.sh scripts/lib/*.sh
+
+      # Run the backup/restore helper's own unit tests -- fail-closed backup,
+      # atomic restore, symlink refusal, ownership-guarded server teardown.
+      - name: Smoke backup helper unit tests
+        run: bash scripts/lib/smoke_backup_test.sh
 
       - name: Run workspace tests
         run: cargo test --workspace --all-targets

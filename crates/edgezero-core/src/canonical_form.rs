@@ -82,31 +82,32 @@ fn write_canonical(out: &mut String, value: &Value) {
     }
 }
 
-#[expect(
-    clippy::panic,
-    reason = "unreachable branch — serde_json::Number always exposes i64/u64/f64"
-)]
 fn write_number(out: &mut String, n: &serde_json::Number) {
     if let Some(int_val) = n.as_i64() {
         // Infallible: writing to a String never fails.
         write!(out, "{int_val}").unwrap_or_default();
     } else if let Some(uint_val) = n.as_u64() {
         write!(out, "{uint_val}").unwrap_or_default();
-    } else if let Some(float_val) = n.as_f64() {
-        // Non-finite floats are loader-rejected per 4.2.
-        // If one reaches here, it's a programmer error: serialising NaN
-        // would emit `null` via serde_json's default, which would
-        // collide with real Option::None in the SHA. Panic loudly.
+    } else {
+        // f64 branch. serde_json::Number without the arbitrary_precision
+        // feature always exposes i64/u64/f64; both preceding checks
+        // failed so `.as_f64()` is guaranteed Some. Fall back to NaN
+        // when the impossible-fourth-shape case ever surfaces — the
+        // is_finite() assert below will fire the same message either
+        // way, so we lose no diagnostic signal by collapsing the two
+        // panics into one assert.
+        //
+        // Non-finite floats are loader-rejected per 4.2. If one reaches
+        // here, it's a programmer error: serialising NaN would emit
+        // `null` via serde_json's default, which would collide with
+        // real Option::None in the SHA.
+        let float_val = n.as_f64().unwrap_or(f64::NAN);
         assert!(
             float_val.is_finite(),
             "canonical_data_sha256: non-finite float {float_val} reached canonicaliser; loader must reject before this point"
         );
         let mut ryu_buf = ryu::Buffer::new();
         out.push_str(ryu_buf.format(float_val));
-    } else {
-        // serde_json::Number always exposes one of i64/u64/f64; reach
-        // here is impossible. Treat as programmer error.
-        panic!("canonical_data_sha256: unrecognised serde_json::Number shape");
     }
 }
 

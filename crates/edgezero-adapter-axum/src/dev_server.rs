@@ -262,8 +262,36 @@ fn stable_store_name_hash(store_name: &str) -> u64 {
     hash
 }
 
+/// Anchor a `.edgezero`-relative store path at the project root (the
+/// ancestor holding `edgezero.toml`), the SAME directory `config push` /
+/// provision write `.edgezero` into, so the runtime and the CLI agree
+/// regardless of launch cwd -- a registry `serve` launches this binary with
+/// cwd = the adapter crate, NOT the project root, so a bare relative
+/// `.edgezero` would land KV state in the crate dir. Falls back to the
+/// cwd-relative path in a deployed binary with no `edgezero.toml` alongside,
+/// matching [`AxumConfigStore::local_path`].
+fn anchor_at_project_root(relative: PathBuf) -> PathBuf {
+    use crate::config_store::find_project_root_dir;
+    match find_project_root_dir() {
+        Some(root) => root.join(relative),
+        None => relative,
+    }
+}
+
 fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<KvHandle> {
     if let Some(parent) = kv_path.parent() {
+        // Refuse to write THROUGH a symlinked `.edgezero`: EdgeZero-owned
+        // local state is never a symlink, and following one would drop the
+        // redb outside the project tree. Mirrors the provision-side
+        // symlink rejection.
+        if let Ok(meta) = fs::symlink_metadata(parent)
+            && meta.file_type().is_symlink()
+        {
+            anyhow::bail!(
+                "refusing to open KV store: `{}` is a symlink; EdgeZero-owned local state (`.edgezero/`) is never a symlink -- replace it with a regular directory",
+                parent.display()
+            );
+        }
         fs::create_dir_all(parent).context("failed to create KV store directory")?;
     }
     let kv_store = Arc::new(PersistentKvStore::new(kv_path).context("failed to create KV store")?);
@@ -399,7 +427,7 @@ fn build_kv_registry(
     let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
     for id in meta.ids {
         let store_name = env.store_name("kv", id);
-        let kv_path = kv_store_path(&store_name);
+        let kv_path = anchor_at_project_root(kv_store_path(&store_name));
         let handle = match kv_handle_from_path(&kv_path) {
             Ok(handle) => handle,
             Err(err) => match init {
@@ -656,6 +684,30 @@ mod tests {
         assert!(
             file_name.len() <= 64,
             "unexpected file name length: {file_name}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kv_handle_refuses_a_symlinked_dot_edgezero_dir() {
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+        // A planted symlink where `.edgezero/` is expected must be refused,
+        // so the redb is never written THROUGH a link outside the tree.
+        let temp = tempdir().expect("tempdir");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        let dot = temp.path().join(".edgezero");
+        symlink(&outside, &dot).expect("symlink .edgezero");
+        let kv_path = dot.join("kv-sessions-0000000000000000.redb");
+        let err = kv_handle_from_path(&kv_path).expect_err("a symlinked .edgezero must be refused");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error names the symlink: {err}"
+        );
+        assert!(
+            !outside.join("kv-sessions-0000000000000000.redb").exists(),
+            "the refused open must not have created the db through the link"
         );
     }
 

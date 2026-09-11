@@ -110,7 +110,7 @@ impl From<&EnvConfig> for FastlyLogging {
 /// scoping prevents two linked services that declare the same logical store id
 /// from overwriting one another's runtime mappings.
 #[cfg(any(feature = "cli", feature = "fastly", test))]
-fn service_scoped_runtime_env_key(service_id: &str, canonical_key: &str) -> String {
+pub(crate) fn service_scoped_runtime_env_key(service_id: &str, canonical_key: &str) -> String {
     let suffix = canonical_key
         .strip_prefix(RUNTIME_ENV_PREFIX)
         .unwrap_or(canonical_key);
@@ -372,8 +372,10 @@ mod fastly_logging_tests {
 
 #[cfg(test)]
 mod runtime_env_key_tests {
-    use super::runtime_env_keys;
+    use super::{runtime_env_keys, runtime_env_vars_for_service, service_scoped_runtime_env_key};
     use edgezero_core::app::{StoreMetadata, StoresMetadata};
+    use edgezero_core::env_config::EnvConfig;
+    use std::collections::BTreeMap;
 
     #[test]
     fn runtime_env_keys_name_every_store_and_key_only_config_stores() {
@@ -429,6 +431,58 @@ mod runtime_env_key_tests {
                 "EDGEZERO__LOGGING__LEVEL",
                 "EDGEZERO__LOGGING__USE_FASTLY_LOGGER",
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_dictionary_uses_only_the_current_service_namespace() {
+        let stores = StoresMetadata {
+            config: Some(StoreMetadata {
+                default: "app_config",
+                ids: &["app_config"],
+            }),
+            kv: Some(StoreMetadata {
+                default: "sessions",
+                ids: &["sessions"],
+            }),
+            secrets: None,
+        };
+        let scoped_sessions =
+            service_scoped_runtime_env_key("SVCA", "EDGEZERO__STORES__KV__SESSIONS__NAME");
+        let values = BTreeMap::from([
+            (scoped_sessions.clone(), "service_a_sessions".to_owned()),
+            (
+                service_scoped_runtime_env_key("SVCB", "EDGEZERO__STORES__KV__SESSIONS__NAME"),
+                "service_b_sessions".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
+                "legacy_config".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__KV__SESSIONS__NAME".to_owned(),
+                "legacy_sessions".to_owned(),
+            ),
+        ]);
+
+        assert_eq!(
+            scoped_sessions,
+            "EDGEZERO__SERVICES__SVCA__STORES__KV__SESSIONS__NAME"
+        );
+        let vars = runtime_env_vars_for_service(stores, "SVCA", |key| values.get(key).cloned());
+        let env = EnvConfig::from_vars(vars);
+
+        assert_eq!(env.store_name("kv", "sessions"), "service_a_sessions");
+        assert_eq!(env.store_name("config", "app_config"), "app_config");
+        assert_ne!(env.store_name("kv", "sessions"), "service_b_sessions");
+
+        let default_service_vars =
+            runtime_env_vars_for_service(stores, "SVCDEFAULT", |key| values.get(key).cloned());
+        let default_service_env = EnvConfig::from_vars(default_service_vars);
+        assert_eq!(default_service_env.store_name("kv", "sessions"), "sessions");
+        assert_eq!(
+            default_service_env.store_name("config", "app_config"),
+            "app_config"
         );
     }
 }
