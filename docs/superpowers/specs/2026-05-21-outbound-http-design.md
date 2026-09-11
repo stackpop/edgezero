@@ -351,7 +351,7 @@ pub struct OutboundRequest {
     max_chunk_bytes: Option<NonZeroU64>, // opt-in Streamed output rechunker
     max_decoded_response_bytes: Option<u64>, // identity/EdgeZero-decoded output only
     max_encoded_response_bytes: Option<u64>, // pre-decode guest-visible body cap
-    max_request_body_bytes: u64,         // cap when `body` is Body::Stream (default 8 MiB)
+    max_request_body_bytes: u64,         // cap for buffered or streamed body bytes (default 8 MiB)
     max_response_header_bytes: Option<u64>, // guest-visible names + values
     max_response_header_count: Option<u64>, // guest-visible name/value entries
     method: Method,
@@ -562,20 +562,24 @@ impl OutboundRequest {
     pub fn max_encoded_response_bytes(self, max: u64) -> Self;
     pub fn max_response_header_bytes(self, max: u64) -> Self;
     pub fn max_response_header_count(self, max: u64) -> Self;
-    pub fn max_response_bytes(self, max: u64) -> Self;        // sets Buffered { max } (u64 — see cap note)
-    pub fn stream_response(self) -> Self;                   // sets Streamed
+    pub fn max_response_bytes(self, max: u64) -> Self; // selects Buffered { max }; last mode setter wins
+    pub fn stream_response(self) -> Self;                    // selects Streamed; last mode setter wins
+
+ // These two methods select mutually exclusive `ResponseMode` variants. They do not compose:
+ // `max_response_bytes(..).stream_response()` is an uncapped streamed response, while
+ // `stream_response().max_response_bytes(..)` is a buffered response with the supplied cap.
 
  // Zero is an intentional deny-all value for every `u64` cap. It is not a malformed
  // configuration: an empty body can satisfy a zero body cap, while the first visible byte or
  // header entry fails with the cap's typed reason. `max_chunk_bytes` alone requires
  // `NonZeroU64` because a zero-sized output item cannot make stream progress.
 
- /// Cap on the **request** body when it is a `Body::Stream` — see
+ /// Cap on the **request** body for both `Body::Once` and `Body::Stream`.
  /// EdgeZero's core `Body::Stream` is `LocalBoxStream`
  /// (WASM-friendly, not `Send + 'static`), so adapters cannot hand it
  /// directly to a SDK that requires `Send` streams (notably reqwest
- /// without its `stream` feature). The contract is therefore: streamed
- /// request bodies are **bounded** by this cap on every adapter; adapters
+ /// without its `stream` feature). The contract is therefore: every request
+ /// body is **bounded** by this cap on every adapter; adapters
  /// MAY pass the stream through to the platform natively (Fastly's
  /// `send_async_streaming`, Spin's WASI outgoing body) or buffer to
  /// `Bytes` within the cap before dispatch (Axum, Cloudflare). Over-cap
@@ -787,6 +791,8 @@ pub enum ContentEncoding {
     /// Repeated, stacked, parameterized, malformed, non-UTF-8, or unknown coding.
     Passthrough,
 }
+// A direct call with bits outside 10..=30 is invalid caller policy and returns BadRequest;
+// checked accounting overflow retains ResponseLimitReason::DecoderMemory.
 pub fn brotli_decoder_memory_charge(window_bits: u8) -> Result<u64, EdgeError>;
 pub fn classify_content_encoding(headers: &HeaderMap) -> ContentEncoding;
 /// The returned state machine reads and validates the fixed-size stream prefix before it
@@ -814,6 +820,7 @@ impl ResponseHeaderLimiter {
 }
 
 /// Disassembled form of an `OutboundRequest`. Adapter-facing only.
+#[non_exhaustive]
 pub struct OutboundRequestParts {
     pub body: Body,
     pub deadline: Option<Deadline>,
@@ -823,7 +830,7 @@ pub struct OutboundRequestParts {
     pub max_chunk_bytes: Option<NonZeroU64>,
     pub max_decoded_response_bytes: Option<u64>,
     pub max_encoded_response_bytes: Option<u64>,
-    pub max_request_body_bytes: u64,      // applies when `body` is Body::Stream (u64 — see cap note)
+    pub max_request_body_bytes: u64,      // applies to Body::Once and Body::Stream (u64 — see cap note)
     pub max_response_header_bytes: Option<u64>,
     pub max_response_header_count: Option<u64>,
     pub method: Method,
@@ -908,7 +915,9 @@ impl OutboundResponse {
     ) -> Self;
 
  /// Adapter-facing destructure. Mirrors `OutboundRequest::into_parts`; the retained
- /// method is required by response converters for HEAD/bodyless normalization.
+ /// method is required by response converters for HEAD/bodyless normalization. This method
+ /// does not run the final defensive response-header normalization performed by
+ /// `into_response`; application boundaries that need that pass call `into_response`.
     pub fn into_parts(self) -> (Method, StatusCode, HeaderMap, Body);
 
  /// Adapter-facing mutation point — used during construction (e.g. to
@@ -2533,9 +2542,9 @@ wrapper.** After guest-visible header limits and bodyless disposition, payload l
 in exactly one order:
 `platform raw/completion stream → encoded-byte counter → optional Brotli prefix gate →
 EdgeError/io::Error carrier bridge → gzip/br decoder + native-EOF validation → exact carrier
-restoration → optional rechunker → absolute-deadline/cancellation wrapper → decoded-byte
-cap or consumer`. Unknown/stacked encodings bypass only the prefix/decoder/carrier stages;
-they still pass through raw counting, rechunking, and the deadline. The outer deadline sees
+restoration → decoded-byte cap → optional rechunker → absolute-deadline/cancellation wrapper →
+consumer`. Unknown/stacked encodings bypass only the prefix/decoder/carrier stages and decoded
+cap; they still pass through raw counting, rechunking, and the deadline. The outer deadline sees
 every emitted item and terminal result, while adapter-specific ready-input quotas prevent an
 inner decoder poll from monopolizing the runtime. Codec completion and native-EOF validation
 remain inside this pipeline, never in an unbounded drain after the deadline wrapper ends.
@@ -2555,10 +2564,11 @@ remain inside this pipeline, never in an unbounded drain after the deadline wrap
   this same outer boundary.
 - **Precedence at the decoded-stream boundary:** at or after the deadline, timeout wins over
   simultaneous success, EOF, raw-read failure, or decoder failure. A malformed-compression
-  502 applies only when the decoder produces that error before the deadline. A cap outside
-  this wrapper may legitimately win after the wrapper yielded a within-deadline chunk: the
-  generic streamed helper does not retain the request deadline, so it cannot reclassify a cap
-  decision merely because the clock crossed after that yield. Buffered adapter drains remain
+  502 applies only when the decoder produces that error before the deadline. A caller-owned
+  final collection cap outside this wrapper may legitimately win after the wrapper yielded a
+  within-deadline chunk: the generic streamed helper does not retain the request deadline, so it
+  cannot reclassify a cap decision merely because the clock crossed after that yield. Buffered
+  adapter drains remain
   inside the adapter's whole-exchange race, and `into_bytes_bounded_until` rechecks its own
   caller-supplied deadline before returning over-cap; those two surfaces preserve
   timeout-over-cap precedence for the deadline they actually own.
@@ -2681,7 +2691,7 @@ EdgeError::ResponseTooLarge { message: String, reason: ResponseLimitReason }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum BadGatewayDecodeReason { Brotli, Gzip, Json, Unspecified }
+pub enum BadGatewayDecodeReason { Brotli, Gzip, Json }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2737,10 +2747,9 @@ DNS resolution, connection establishment/refusal, or TLS establishment. `Transpo
 an established exchange failing during request upload, response body/trailer reads, native
 completion, or a later connection termination. If a provider does not expose enough phase
 information, use `Unspecified`; never guess from message text. EdgeZero-owned decoders always
-use `Decode(BadGatewayDecodeReason::{Brotli,Gzip,Json})` as applicable. `Decode(Unspecified)`
-is only for an EdgeZero-owned decoder whose format is genuinely unavailable at the mapping
-site; provider-native decoding remains `Unspecified` unless the adapter can establish the
-coding without parsing a diagnostic string.
+use `Decode(BadGatewayDecodeReason::{Brotli,Gzip,Json})` as applicable. Provider-native decoding
+remains `BadGatewayReason::Unspecified` unless the adapter can establish the coding without
+parsing a diagnostic string.
 
 `EdgeError::status()` gains `BadGateway => 502`, `GatewayTimeout => 504`, and (outbound
 phase) `ResponseTooLarge => 502` with `kind_str() == "response_too_large"`. Like the other
@@ -4477,10 +4486,11 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
        `fetch_with_request_and_init(request.inner(), &init)`. Await the Promise through
        `worker::wasm_bindgen_futures::JsFuture`, cast the result to
        `worker::web_sys::Response` with `JsCast`, then convert it to `worker::Response`.
-       Fetch rejection before a response head is `bad_gateway` reason `Unreachable` when
-       the platform evidence establishes DNS/connect/TLS establishment failure, otherwise
-       `Unspecified`; expiry still wins. An unexpected JS response type is an `internal`
-       binding invariant failure.
+       Fetch rejection before a response head is `bad_gateway` reason `Unreachable` only when
+       platform evidence establishes DNS/connect/TLS establishment failure. The current Workers
+       Fetch bridge exposes a generic rejected promise without a stable phase discriminator, so
+       current generic rejections are `Unspecified`; expiry still wins. An unexpected JS response
+       type is an `internal` binding invariant failure.
 
      Redirect mode remains on the already-constructed Request; the final raw
      `web_sys::RequestInit` owns only the abort signal and response-encoding override and
@@ -4524,9 +4534,10 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   Apply a fixed, nonzero adapter-private ready-item quota of at most 64 items between
   explicit host-event yields, counting empty items. The Phase 4 authoring gate must select
   a primitive that a deployed timing probe proves both yields to another host event and
-  permits the production clock to advance. `worker::Delay::from(Duration::ZERO)` is a
-  candidate, not an assumed guarantee; if the probe fails, use the smallest positive delay
-  or another proven host-task primitive. After the yield, recheck the original absolute
+  permits the production clock to advance. The adapter uses a cancellable
+  `globalThis.setTimeout(0)` future because worker 0.8.3's `Delay` binding does not execute
+  under the pinned Node WASM runner; the future owns its callback and timer handle and clears
+  the timer when dropped. After the yield, recheck the original absolute
   deadline before processing another item. Count state persists across Rust polls, stream
   yields, and `next()` calls; reset it only after the proven host-event yield completes. A
   self-wake, `Poll::Pending` round trip, microtask-only yield, or fake clock that advances
@@ -5806,21 +5817,15 @@ current matrix remains `BestEffort`.
   wasi_req.set_path_with_query(pq).map_err(bad_request_component)?;
 
  // The pump lives INSIDE the raced future — no `wit_bindgen::spawn`.
- // `max_req` gates the cap by BODY KIND, matching the portable contract
- // (`max_request_body_bytes` applies to `Body::Stream` ONLY, §3.1.3). **`parts` is the
+ // `max_req` carries the portable body cap for both body kinds. **`parts` is the
  // `OutboundRequestParts` from `req.into_parts()`** — the adapter is a SEPARATE crate and
  // cannot read `OutboundRequest`'s PRIVATE fields, so it destructures into the pub-field
  // `OutboundRequestParts` first (this also gives it `method`/`uri`/`headers`/`body` used
- // to build `wasi_req` above). `max_req` is **`u64`** (the cap type, §3.1.3): for a
- // streamed body it is `parts.max_request_body_bytes`; for a BUFFERED `Body::Once` —
- // which also rides this pump for cancellability (§4.4), re-expressed as a one-shot
- // single-chunk stream — it is **`u64::MAX`** (NOT `usize::MAX` — the field is `u64`), so
- // the cap is a no-op. A buffered payload is already a bounded in-memory `Bytes`; capping
- // it here would make >8 MiB buffered uploads fail on Spin alone, which no other adapter does.
-  let max_req: u64 = match &parts.body {
-      Body::Stream(_) => parts.max_request_body_bytes,
-      Body::Once(_) => u64::MAX,
-  };
+ // to build `wasi_req` above). `max_req` is **`u64`** (the cap type, §3.1.3) and is always
+ // `parts.max_request_body_bytes`. A buffered `Body::Once` rides this same pump for
+ // cancellability (§4.4), re-expressed as a one-shot single-chunk stream, and must fail before
+ // its first write when its known length exceeds the cap.
+  let max_req: u64 = parts.max_request_body_bytes;
   // Force one scheduler boundary after each accepted chunk, even when both the
   // source and host writer are continuously ready. Without this, an async `while`
   // loop over empty/immediately-ready chunks can monopolize one poll and prevent

@@ -75,7 +75,7 @@ implementation.
   `bad_gateway_with_reason(msg, reason)`, `gateway_timeout(msg)` with
   `cause: BudgetSource::Unspecified`, and `gateway_timeout_caused(msg, cause)`.
   `BadGatewayReason::{Decode(BadGatewayDecodeReason), Protocol, Transport, Unreachable,
-  Unspecified}`, `BadGatewayDecodeReason::{Brotli, Gzip, Json, Unspecified}`, and
+  Unspecified}`, `BadGatewayDecodeReason::{Brotli, Gzip, Json}`, and
   `BudgetSource::{BatchDeadline, Default, PerCallTimeout, Unspecified}` are
   `#[non_exhaustive]`, `Clone + Copy + Debug + Eq`. Consumers inspect fields by matching the
   variant. The JSON envelope remains `{ "error": { "status", "kind", "message" } }` with
@@ -203,7 +203,6 @@ fn bad_gateway_decode_reason_is_not_serialized() {
         BadGatewayDecodeReason::Brotli,
         BadGatewayDecodeReason::Gzip,
         BadGatewayDecodeReason::Json,
-        BadGatewayDecodeReason::Unspecified,
     ] {
         let err = EdgeError::bad_gateway_with_reason(
             "nope",
@@ -229,7 +228,6 @@ fn bad_gateway_reason_is_typed() {
         BadGatewayReason::Decode(BadGatewayDecodeReason::Brotli),
         BadGatewayReason::Decode(BadGatewayDecodeReason::Gzip),
         BadGatewayReason::Decode(BadGatewayDecodeReason::Json),
-        BadGatewayReason::Decode(BadGatewayDecodeReason::Unspecified),
         BadGatewayReason::Protocol,
         BadGatewayReason::Transport,
         BadGatewayReason::Unreachable,
@@ -366,7 +364,6 @@ pub enum BadGatewayDecodeReason {
     Brotli,
     Gzip,
     Json,
-    Unspecified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

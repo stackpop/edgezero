@@ -76,14 +76,13 @@ pub fn classify_content_encoding(headers: &HeaderMap) -> ContentEncoding {
 /// Return the conservative decoder-state charge for an advertised Brotli window.
 ///
 /// # Errors
-/// Returns a typed response-limit error when `window_bits` is outside the
-/// Brotli range accepted by `EdgeZero`.
+/// Returns [`EdgeError::BadRequest`] when `window_bits` is outside the Brotli range accepted by
+/// `EdgeZero`, or a typed response-limit error if decoder-memory accounting overflows.
 #[inline]
 pub fn brotli_decoder_memory_charge(window_bits: u8) -> Result<u64, EdgeError> {
     if !(10..=30).contains(&window_bits) {
-        return Err(EdgeError::response_too_large_with_reason(
+        return Err(EdgeError::bad_request(
             "brotli window bits must be between 10 and 30 inclusive",
-            ResponseLimitReason::BrotliWindow,
         ));
     }
     let window = 1_u64.checked_shl(u32::from(window_bits)).ok_or_else(|| {
@@ -396,8 +395,14 @@ mod tests {
             brotli_decoder_memory_charge(24_u8).unwrap(),
             BROTLI_DECODER_FIXED_CHARGE_BYTES + (1_u64 << 24_u32)
         );
-        brotli_decoder_memory_charge(9).unwrap_err();
-        brotli_decoder_memory_charge(31).unwrap_err();
+        assert!(matches!(
+            brotli_decoder_memory_charge(9),
+            Err(EdgeError::BadRequest { .. })
+        ));
+        assert!(matches!(
+            brotli_decoder_memory_charge(31),
+            Err(EdgeError::BadRequest { .. })
+        ));
     }
 
     #[test]

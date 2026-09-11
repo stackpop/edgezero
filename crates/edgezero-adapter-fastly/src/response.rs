@@ -127,6 +127,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::error::ResponseLimitReason;
     use edgezero_core::http::response_builder;
+    use edgezero_core::response::IntoResponse as _;
     use edgezero_core::time::MonotonicInstant;
     use futures_util::stream;
     use std::time::Duration;
@@ -144,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_value_set_cookie_survives_conversion() {
+    fn repeated_set_cookie_survives_response_conversion() {
         // http::response::Builder::header APPENDS, so this is two Set-Cookie values.
         let response = response_builder()
             .status(200)
@@ -196,6 +197,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn downstream_fallback_preserves_typed_error_envelope() {
+        let response = EdgeError::response_too_large_with_reason(
+            "private upstream detail",
+            ResponseLimitReason::BufferedBody,
+        )
+        .into_response()
+        .expect("error response");
+
+        let mut fastly_response = from_core_response(response).expect("Fastly response");
+        let body: serde_json::Value = serde_json::from_slice(&fastly_response.take_body_bytes())
+            .expect("JSON error envelope");
+
+        assert_eq!(fastly_response.get_status().as_u16(), 502);
+        assert_eq!(body["error"]["kind"], "response_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "upstream response exceeded configured limits"
+        );
+        assert!(body["error"].get("reason").is_none());
     }
 
     #[test]

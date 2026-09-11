@@ -22,11 +22,12 @@ use futures_util::StreamExt as _;
 use futures_util::future::join_all;
 use reqwest::header::HeaderMap as ReqwestHeaderMap;
 use reqwest::redirect::Policy;
+use std::sync::Arc;
 use tokio::time::timeout;
 
 /// Native outbound HTTP implementation used by the Axum adapter.
 pub struct AxumOutboundClient {
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     clock: MonotonicClock,
 }
 
@@ -141,12 +142,7 @@ impl AxumOutboundClient {
         Self::try_with_clock(MonotonicClock::default())
     }
 
-    /// Builds a client that evaluates every outbound lifetime against `clock`.
-    ///
-    /// # Errors
-    /// Returns the underlying client-construction error when TLS initialization fails.
-    #[inline]
-    pub fn try_with_clock(clock: MonotonicClock) -> Result<Self, reqwest::Error> {
+    pub(crate) fn try_transport() -> Result<Arc<reqwest::Client>, reqwest::Error> {
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
             .no_brotli()
@@ -154,7 +150,23 @@ impl AxumOutboundClient {
             .no_gzip()
             .no_zstd()
             .build()?;
-        Ok(Self { client, clock })
+        Ok(Arc::new(client))
+    }
+
+    /// Builds a client that evaluates every outbound lifetime against `clock`.
+    ///
+    /// # Errors
+    /// Returns the underlying client-construction error when TLS initialization fails.
+    #[inline]
+    pub fn try_with_clock(clock: MonotonicClock) -> Result<Self, reqwest::Error> {
+        Self::try_transport().map(|client| Self { client, clock })
+    }
+
+    pub(crate) fn with_transport_and_clock(
+        client: Arc<reqwest::Client>,
+        clock: MonotonicClock,
+    ) -> Self {
+        Self { client, clock }
     }
 }
 

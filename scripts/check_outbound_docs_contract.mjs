@@ -99,6 +99,54 @@ const expectedResponseEgressRows = [
     'Unsupported',
   ],
 ]
+const expectedLimitHeader = ['Control', 'Scope', 'Default']
+const expectedLimitRows = [
+  [
+    'max_request_body_bytes',
+    'Buffered or streamed request bytes',
+    '8 MiB',
+  ],
+  [
+    'max_encoded_response_bytes',
+    'Upstream transport bytes before decoding',
+    'Unset',
+  ],
+  [
+    'max_decoded_response_bytes',
+    'Identity or EdgeZero-decoded gzip/Brotli output',
+    'Unset',
+  ],
+  [
+    'max_response_bytes',
+    'Final buffered response, including raw passthrough',
+    '1 MiB',
+  ],
+  [
+    'max_response_header_bytes',
+    'Cumulative guest-visible header name/value bytes',
+    'Unset',
+  ],
+  [
+    'max_response_header_count',
+    'Cumulative guest-visible header fields',
+    'Unset',
+  ],
+  [
+    'max_brotli_window_bits',
+    'Brotli stream header checked before decoder allocation',
+    '24',
+  ],
+  [
+    'max_brotli_decoder_bytes',
+    'Pinned policy charge for Brotli decoder state',
+    '32 MiB',
+  ],
+  [
+    'max_chunk_bytes',
+    'Maximum emitted item size after decoding or passthrough',
+    'Unset',
+  ],
+]
 
 function fail(message) {
   process.stderr.write(`outbound docs contract: ${message}\n`)
@@ -210,6 +258,49 @@ for (const [name, expectedRows, actualRows] of matrices) {
       `${name} capability matrix mismatch\nexpected=${JSON.stringify(expectedRows)}\nactual=${JSON.stringify(actualRows)}`,
     )
   }
+}
+
+const limitsHeadingIndex = lines.findIndex(
+  (line) => line.trim() === '## Limits And Accounting',
+)
+if (limitsHeadingIndex === -1) {
+  fail('limits and accounting section is missing')
+}
+const limitsSectionEnd = lines.findIndex(
+  (line, index) => index > limitsHeadingIndex && line.startsWith('## '),
+)
+const limitsHeaderIndex = lines.findIndex(
+  (line, index) =>
+    index > limitsHeadingIndex &&
+    (limitsSectionEnd === -1 || index < limitsSectionEnd) &&
+    JSON.stringify(cells(line)) === JSON.stringify(expectedLimitHeader),
+)
+if (limitsHeaderIndex === -1) {
+  fail('outbound limits table is missing')
+}
+const limitsSeparator = cells(lines[limitsHeaderIndex + 1] ?? '')
+if (
+  limitsSeparator === null ||
+  limitsSeparator.length !== expectedLimitHeader.length ||
+  !limitsSeparator.every((value) => /^:?-{3,}:?$/u.test(value))
+) {
+  fail('outbound limits table is missing its three-column separator row')
+}
+const actualLimitRows = []
+for (let index = limitsHeaderIndex + 2; index < lines.length; index += 1) {
+  const row = cells(lines[index])
+  if (row === null) break
+  if (row.length !== expectedLimitHeader.length) {
+    fail(
+      `outbound limits row ${index + 1} has ${row.length} cells, expected 3`,
+    )
+  }
+  actualLimitRows.push([normalizeCapability(row[0]), row[1], row[2]])
+}
+if (JSON.stringify(actualLimitRows) !== JSON.stringify(expectedLimitRows)) {
+  fail(
+    `outbound limits mismatch\nexpected=${JSON.stringify(expectedLimitRows)}\nactual=${JSON.stringify(actualLimitRows)}`,
+  )
 }
 
 const sidebarSource = readFileSync(sidebarPath, 'utf8')
