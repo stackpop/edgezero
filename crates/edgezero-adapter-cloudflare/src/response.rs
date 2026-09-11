@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(feature = "test-utils")]
 use bytes::Bytes;
 use edgezero_core::body::{Body, BodyStream};
 use edgezero_core::error::EdgeError;
