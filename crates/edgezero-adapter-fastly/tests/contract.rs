@@ -785,7 +785,7 @@ mod outbound_contract_tests {
 
     #[cfg(target_arch = "wasm32")]
     #[test]
-    fn dispatch_slack_injection_reaches_real_send_all_driver() {
+    fn request_preparation_consumes_entry_budget() {
         let _injection = inject_dispatch_slack_for_test(Duration::from_millis(26));
         let request = request()
             .body(Bytes::from_static(b"body"))

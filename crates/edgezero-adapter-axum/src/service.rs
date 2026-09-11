@@ -26,6 +26,7 @@ use tokio::time::timeout;
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
+use crate::outbound::AxumOutboundClient;
 use crate::request::into_core_request_parts;
 use crate::response::into_axum_response;
 
@@ -37,6 +38,7 @@ pub struct EdgeZeroAxumService {
     config_store_handle: Option<ConfigStoreHandle>,
     kv_handle: Option<KvHandle>,
     kv_registry: Option<KvRegistry>,
+    outbound_transport: Option<Arc<reqwest::Client>>,
     secret_handle: Option<SecretHandle>,
     secret_registry: Option<SecretRegistry>,
 }
@@ -52,6 +54,7 @@ impl EdgeZeroAxumService {
             config_store_handle: None,
             kv_handle: None,
             kv_registry: None,
+            outbound_transport: AxumOutboundClient::try_transport().ok(),
             secret_handle: None,
             secret_registry: None,
         }
@@ -149,6 +152,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let request_start = self.app.monotonic_now();
         let app = Arc::clone(&self.app);
+        let outbound_transport_handle = self.outbound_transport.clone();
         // Hard-cutoff: legacy bare `KvHandle` /
         // `ConfigStoreHandle` / `SecretHandle` entries are NO
         // LONGER inserted into request extensions. The legacy
@@ -215,10 +219,16 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
                     };
                     let read_deadline = prepared.read_deadline();
                     let monotonic_clock = prepared.monotonic_clock();
+                    let Some(outbound_transport) = outbound_transport_handle else {
+                        return minimal_error_response(
+                            "failed to initialize outbound HTTP transport".to_owned(),
+                        );
+                    };
                     let mut core_request = match into_core_request_parts(
                         parts,
                         native_body,
                         Some((read_deadline, monotonic_clock)),
+                        Some(outbound_transport),
                     ) {
                         Ok(converted) => converted,
                         Err(err) => return minimal_error_response(err),

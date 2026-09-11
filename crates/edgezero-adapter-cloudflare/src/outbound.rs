@@ -76,9 +76,12 @@ impl HeaderSink for worker::Headers {
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod worker_impl {
-    use std::cell::RefCell;
+    use std::cell::Cell;
+    use std::future::Future;
     use std::num::NonZeroU64;
+    use std::pin::Pin;
     use std::rc::Rc;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use async_stream::stream;
@@ -105,19 +108,98 @@ mod worker_impl {
     use edgezero_core::time::{DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
     use futures_util::StreamExt as _;
     use futures_util::future::{Either, join_all, select};
-    use worker::js_sys::{Reflect, Uint8Array, global};
+    use worker::js_sys::{Function, Reflect, Uint8Array, global};
+    use worker::wasm_bindgen::closure::Closure;
     use worker::wasm_bindgen::{JsCast as _, JsValue};
     use worker::wasm_bindgen_futures::JsFuture;
     use worker::web_sys;
     use worker::{
-        Body as WorkerBody, Delay, Headers, Method as WorkerMethod, Request as WorkerRequest,
-        RequestInit, RequestRedirect, Response as WorkerResponse,
-        ResponseBody as WorkerResponseBody,
+        Delay, Headers, Method as WorkerMethod, Request as WorkerRequest, RequestInit,
+        RequestRedirect, Response as WorkerResponse, ResponseBody as WorkerResponseBody,
     };
 
     use super::{ResetContentAction, reset_content_action, timeout_error};
 
-    const READY_ITEM_YIELD_QUOTA: u32 = 1_024;
+    const READY_ITEM_YIELD_QUOTA: u32 = 64;
+
+    struct HostEventYield {
+        awoken: Rc<Cell<bool>>,
+        callback: Option<Closure<dyn FnMut()>>,
+        timeout_handle: Option<JsValue>,
+    }
+
+    impl HostEventYield {
+        fn new() -> Self {
+            Self {
+                awoken: Rc::new(Cell::new(false)),
+                callback: None,
+                timeout_handle: None,
+            }
+        }
+    }
+
+    impl Future for HostEventYield {
+        type Output = Result<(), EdgeError>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if this.awoken.get() {
+                return Poll::Ready(Ok(()));
+            }
+            if this.callback.is_some() {
+                return Poll::Pending;
+            }
+
+            let awoken = Rc::clone(&this.awoken);
+            let waker = cx.waker().clone();
+            let callback = Closure::<dyn FnMut()>::new(move || {
+                awoken.set(true);
+                waker.wake_by_ref();
+            });
+            let global_scope = global();
+            let Some(set_timeout) = Reflect::get(&global_scope, &JsValue::from_str("setTimeout"))
+                .ok()
+                .and_then(|value| value.dyn_into::<Function>().ok())
+            else {
+                return Poll::Ready(Err(host_event_schedule_error()));
+            };
+            let timeout_handle = match set_timeout.call2(
+                &global_scope,
+                callback.as_ref(),
+                &JsValue::from_f64(0.0),
+            ) {
+                Ok(handle) => handle,
+                Err(_error) => return Poll::Ready(Err(host_event_schedule_error())),
+            };
+            this.callback = Some(callback);
+            this.timeout_handle = Some(timeout_handle);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for HostEventYield {
+        fn drop(&mut self) {
+            if self.awoken.get() {
+                return;
+            }
+            let Some(timeout_handle) = self.timeout_handle.take() else {
+                return;
+            };
+            let global_scope = global();
+            let Ok(clear_timeout) = Reflect::get(&global_scope, &JsValue::from_str("clearTimeout"))
+            else {
+                return;
+            };
+            let Some(clear_timeout_function) = clear_timeout.dyn_ref::<Function>() else {
+                return;
+            };
+            let _ignored = clear_timeout_function.call1(&global_scope, &timeout_handle);
+        }
+    }
+
+    fn host_event_schedule_error() -> EdgeError {
+        EdgeError::internal(anyhow::anyhow!("Cloudflare host-event scheduling failed"))
+    }
 
     /// Native outbound HTTP implementation for Cloudflare Workers.
     pub struct CloudflareOutboundClient {
@@ -173,18 +255,11 @@ mod worker_impl {
             if !headers.contains_key(ACCEPT_ENCODING) {
                 headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
             }
-            let upload_error = Rc::new(RefCell::new(None));
-            let worker_body = request_body(
-                body,
-                max_request_body_bytes,
-                budget,
-                self.clock.clone(),
-                Rc::clone(&upload_error),
-            )?;
+            let worker_body =
+                request_body(body, max_request_body_bytes, budget, self.clock.clone()).await?;
             let url = uri.to_string();
             let request = build_worker_request(&method, &url, &headers, worker_body)?;
-            let (response, abort_guard) =
-                raw_fetch(request, budget, &self.clock, Rc::clone(&upload_error)).await?;
+            let (response, abort_guard) = raw_fetch(request, budget, &self.clock).await?;
 
             process_response(
                 response,
@@ -360,18 +435,26 @@ mod worker_impl {
                 match next_item {
                     Some(Ok(bytes)) => yield Ok(bytes),
                     Some(Err(error)) => {
-                        yield Err(error);
+                        yield Err(terminal_error_after_host_event(error, budget, &clock).await);
                         return;
                     }
                     None => {
+                        if let Err(error) = yield_host_event(budget, &clock).await {
+                            yield Err(error);
+                            return;
+                        }
                         abort_guard.disarm();
                         return;
                     }
                 }
                 ready_items = ready_items.saturating_add(1);
                 if ready_items >= READY_ITEM_YIELD_QUOTA {
-                    Delay::from(Duration::ZERO).await;
+                    let checkpoint = yield_host_event(budget, &clock).await;
                     ready_items = 0;
+                    if let Err(error) = checkpoint {
+                        yield Err(error);
+                        return;
+                    }
                 }
             }
         }
@@ -397,6 +480,7 @@ mod worker_impl {
 
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "the adapter consumes the independent request policy fields without hiding them"
     )]
     async fn process_response(
@@ -452,6 +536,7 @@ mod worker_impl {
                         Either::Right(((), _next)) => return Err(timeout_error(budget.cause)),
                     };
                     budget_remaining(budget, &clock)?;
+                    yield_host_event(budget, &clock).await?;
                     match ready {
                         (Some(item), _rest) => {
                             item?;
@@ -521,7 +606,6 @@ mod worker_impl {
         request: WorkerRequest,
         budget: DispatchBudget,
         clock: &MonotonicClock,
-        upload_error: Rc<RefCell<Option<EdgeError>>>,
     ) -> Result<(WorkerResponse, AbortGuard), EdgeError> {
         let remaining = budget_remaining(budget, clock)?;
         let controller = web_sys::AbortController::new().map_err(|_error| {
@@ -555,27 +639,18 @@ mod worker_impl {
             Either::Right(((), _fetch)) => return Err(timeout_error(budget.cause)),
         };
         budget_remaining(budget, clock)?;
-        let value = match result {
-            Ok(value) => value,
-            Err(_error) => {
-                if let Some(source_error) = upload_error.borrow_mut().take() {
-                    return Err(source_error);
-                }
-                return Err(super::generic_fetch_failure());
-            }
-        };
+        let value = result.map_err(|_error| super::generic_fetch_failure())?;
         let web_response: web_sys::Response = value.dyn_into().map_err(|_non_response| {
             EdgeError::internal(anyhow::anyhow!("fetch returned a non-response value"))
         })?;
         Ok((WorkerResponse::from(web_response), abort_guard))
     }
 
-    fn request_body(
+    async fn request_body(
         body: Body,
         maximum: u64,
         budget: DispatchBudget,
         clock: MonotonicClock,
-        upload_error: Rc<RefCell<Option<EdgeError>>>,
     ) -> Result<Option<JsValue>, EdgeError> {
         match body {
             Body::Once(bytes) => {
@@ -593,18 +668,16 @@ mod worker_impl {
                 }
             }
             Body::Stream(source) => {
-                let bounded = upload_stream(source, maximum, budget, clock);
-                let mapped = bounded
-                    .map(move |result| match result {
-                        Ok(bytes) => Ok(bytes.to_vec()),
-                        Err(error) => {
-                            *upload_error.borrow_mut() = Some(error);
-                            Err(JsValue::from_str("outbound upload source failed"))
-                        }
-                    })
-                    .boxed_local();
-                let worker_body = WorkerBody::from_stream(mapped).map_err(EdgeError::internal)?;
-                Ok(worker_body.into_inner().map(JsValue::from))
+                let mut bounded = upload_stream(source, maximum, budget, clock);
+                let mut collected = Vec::new();
+                while let Some(item) = bounded.next().await {
+                    collected.extend_from_slice(&item?);
+                }
+                if collected.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(Uint8Array::from(collected.as_slice()).into()))
+                }
             }
         }
     }
@@ -717,6 +790,22 @@ mod worker_impl {
             .ok_or_else(|| timeout_error(budget.cause))
     }
 
+    async fn yield_host_event(
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<(), EdgeError> {
+        HostEventYield::new().await?;
+        budget_remaining(budget, clock).map(drop)
+    }
+
+    async fn terminal_error_after_host_event(
+        error: EdgeError,
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> EdgeError {
+        yield_host_event(budget, clock).await.err().unwrap_or(error)
+    }
+
     fn upload_stream(
         mut source: BodyStream,
         maximum: u64,
@@ -724,59 +813,72 @@ mod worker_impl {
         clock: MonotonicClock,
     ) -> BodyStream {
         stream! {
-        let mut ready_items = 0_u32;
-        let mut total = 0_u64;
-        loop {
-            let remaining = match budget_remaining(budget, &clock) {
-                Ok(remaining) => remaining,
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-            let next = source.next();
-            let timer = Delay::from(remaining);
-            futures_util::pin_mut!(next, timer);
-            let next_item = match select(next, timer).await {
-                Either::Left((item, _timer)) => item,
-                Either::Right(((), _next)) => {
+            let mut ready_items = 0_u32;
+            let mut total = 0_u64;
+            loop {
+                let remaining = match budget_remaining(budget, &clock) {
+                    Ok(remaining) => remaining,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                let next = source.next();
+                let timer = Delay::from(remaining);
+                futures_util::pin_mut!(next, timer);
+                let next_item = match select(next, timer).await {
+                    Either::Left((item, _timer)) => item,
+                    Either::Right(((), _next)) => {
+                        yield Err(timeout_error(budget.cause));
+                        return;
+                    }
+                };
+                if budget_remaining(budget, &clock).is_err() {
                     yield Err(timeout_error(budget.cause));
                     return;
                 }
-            };
-            if budget_remaining(budget, &clock).is_err() {
-                yield Err(timeout_error(budget.cause));
-                return;
-            }
-            let Some(item) = next_item else {
-                return;
-            };
-            let bytes = match item {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    yield Err(error);
+                let Some(item) = next_item else {
+                    if let Err(error) = yield_host_event(budget, &clock).await {
+                        yield Err(error);
+                    }
+                    return;
+                };
+                let bytes = match item {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        yield Err(terminal_error_after_host_event(error, budget, &clock).await);
+                        return;
+                    }
+                };
+                let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                let Some(next_total) = total.checked_add(length) else {
+                    let error = EdgeError::bad_request(
+                        "outbound request body size accounting overflow",
+                    );
+                    yield Err(terminal_error_after_host_event(error, budget, &clock).await);
+                    return;
+                };
+                if next_total > maximum {
+                    let error = EdgeError::bad_request(
+                        "outbound request body exceeded configured limit",
+                    );
+                    yield Err(terminal_error_after_host_event(error, budget, &clock).await);
                     return;
                 }
-            };
-            let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            let Some(next_total) = total.checked_add(length) else {
-                yield Err(EdgeError::bad_request("outbound request body size accounting overflow"));
-                return;
-            };
-            if next_total > maximum {
-                yield Err(EdgeError::bad_request("outbound request body exceeded configured limit"));
-                return;
-            }
-            total = next_total;
-            yield Ok(bytes);
-            ready_items = ready_items.saturating_add(1);
-            if ready_items >= READY_ITEM_YIELD_QUOTA {
-                Delay::from(Duration::ZERO).await;
-                ready_items = 0;
+                total = next_total;
+                yield Ok(bytes);
+                ready_items = ready_items.saturating_add(1);
+                if ready_items >= READY_ITEM_YIELD_QUOTA {
+                    let checkpoint = yield_host_event(budget, &clock).await;
+                    ready_items = 0;
+                    if let Err(error) = checkpoint {
+                        yield Err(error);
+                        return;
+                    }
+                }
             }
         }
-    }
-    .boxed_local()
+        .boxed_local()
     }
 
     fn worker_method(method: &Method) -> WorkerMethod {
@@ -853,6 +955,7 @@ mod worker_impl {
     mod clock_tests {
         use std::collections::VecDeque;
         use std::sync::{Arc, Mutex};
+        use std::task::Poll;
 
         use edgezero_core::error::BudgetSource;
         use edgezero_core::time::Deadline;
@@ -957,21 +1060,46 @@ mod worker_impl {
         }
 
         #[wasm_bindgen_test]
-        fn buffered_request_preparation_reduces_the_remaining_injected_budget() {
+        async fn buffered_request_preparation_reduces_the_remaining_injected_budget() {
             let start = MonotonicInstant::now();
             let budget = test_budget(start, Duration::from_millis(10));
             let observed = start
                 .checked_add(Duration::from_millis(3))
                 .expect("observed instant");
             let clock = scripted_clock(vec![observed, observed]);
-            let upload_error = Rc::new(RefCell::new(None));
-
-            let body = request_body(Body::from("body"), 16, budget, clock.clone(), upload_error)
+            let body = request_body(Body::from("body"), 16, budget, clock.clone())
+                .await
                 .expect("prepared body");
             let remaining = budget_remaining(budget, &clock).expect("remaining budget");
 
             assert!(body.is_some());
             assert_eq!(remaining, Duration::from_millis(7));
+        }
+
+        #[wasm_bindgen_test]
+        async fn streamed_request_body_is_drained_before_fetch_construction() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed_polls = Arc::clone(&polls);
+            let source = stream::poll_fn(move |_context| {
+                let poll = observed_polls.fetch_add(1, Ordering::SeqCst);
+                if poll == 0 {
+                    Poll::Ready(Some(Bytes::from_static(b"body")))
+                } else {
+                    Poll::Ready(None)
+                }
+            })
+            .boxed_local();
+
+            let body = request_body(Body::stream(source), 16, budget, constant_clock(start))
+                .await
+                .expect("prepared body");
+
+            assert!(body.is_some());
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
         }
 
         #[wasm_bindgen_test]
@@ -987,6 +1115,62 @@ mod worker_impl {
                 .await
                 .expect("terminal item")
                 .expect_err("post-ready expiry");
+
+            assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
+
+        #[wasm_bindgen_test]
+        async fn streamed_upload_cap_error_yields_before_final_precedence() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let clock = scripted_clock(vec![start, start, budget.deadline.instant()]);
+            let source = stream::once(async { Ok(Bytes::from_static(b"too large")) }).boxed_local();
+            let mut body = upload_stream(source, 1, budget, clock);
+
+            let error = body
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("host-event deadline wins over cap error");
+
+            assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
+
+        #[wasm_bindgen_test]
+        async fn streamed_upload_eof_yields_before_final_precedence() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let clock = scripted_clock(vec![start, start, budget.deadline.instant()]);
+            let mut body = upload_stream(stream::empty().boxed_local(), 1, budget, clock);
+
+            let error = body
+                .next()
+                .await
+                .expect("deadline after host-event yield")
+                .expect_err("host-event deadline wins over EOF");
+
+            assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
+
+        #[wasm_bindgen_test]
+        fn streamed_upload_fairness_quota_is_at_most_sixty_four() {
+            const { assert!(READY_ITEM_YIELD_QUOTA <= 64) };
+        }
+
+        #[wasm_bindgen_test]
+        async fn streamed_upload_source_error_yields_before_final_precedence() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let clock = scripted_clock(vec![start, start, budget.deadline.instant()]);
+            let source =
+                stream::once(async { Err(EdgeError::bad_gateway("source failed")) }).boxed_local();
+            let mut body = upload_stream(source, 1, budget, clock);
+
+            let error = body
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("host-event deadline wins over source error");
 
             assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
         }
@@ -1085,6 +1269,9 @@ pub use worker_impl::response_abort_lifecycle_holds_for_test;
     feature = "test-utils"
 ))]
 fn generic_fetch_failure() -> EdgeError {
+    // Workers exposes a rejected Fetch promise as an opaque JS exception, without a stable phase
+    // or connection-failure discriminator. Preserve that limitation as `Unspecified` instead of
+    // guessing that every rejection happened before a response was reachable.
     EdgeError::bad_gateway_with_reason("outbound fetch failed", BadGatewayReason::Unspecified)
 }
 

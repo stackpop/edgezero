@@ -19,7 +19,6 @@ pub enum BadGatewayDecodeReason {
     Brotli,
     Gzip,
     Json,
-    Unspecified,
 }
 
 /// Stable classification for upstream failures that map to HTTP 502.
@@ -742,7 +741,6 @@ mod tests {
             BadGatewayDecodeReason::Brotli,
             BadGatewayDecodeReason::Gzip,
             BadGatewayDecodeReason::Json,
-            BadGatewayDecodeReason::Unspecified,
         ] {
             let err = EdgeError::bad_gateway_with_reason("nope", BadGatewayReason::Decode(reason));
             let response = err.into_response().expect("response");
@@ -850,7 +848,6 @@ mod tests {
             BadGatewayReason::Decode(BadGatewayDecodeReason::Brotli),
             BadGatewayReason::Decode(BadGatewayDecodeReason::Gzip),
             BadGatewayReason::Decode(BadGatewayDecodeReason::Json),
-            BadGatewayReason::Decode(BadGatewayDecodeReason::Unspecified),
             BadGatewayReason::Protocol,
             BadGatewayReason::Transport,
             BadGatewayReason::Unreachable,

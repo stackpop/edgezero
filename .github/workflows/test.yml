@@ -282,6 +282,12 @@ jobs:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: scripts/run_test_nonzero.sh spin_error_code_table_is_exhaustive cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features spin,test-utils --target wasm32-wasip2 --test sdk_resources
 
+      - name: Run Cloudflare outbound runtime unit tests
+        if: matrix.adapter == 'cloudflare'
+        env:
+          ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
+        run: scripts/run_test_nonzero.sh streamed_upload_eof_yields_before_final_precedence cargo test --offline --locked -p edgezero-adapter-cloudflare --no-default-features --features cloudflare,test-utils --target wasm32-unknown-unknown --lib
+
       # The colocated runtime unit tests (config-store resolver, chunk
       # remediation) need the `fastly` feature and only RUN under Viceroy — the
       # `--test contract` line above never exercises them. Run the lib target so

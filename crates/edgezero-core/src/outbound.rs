@@ -57,6 +57,7 @@ pub struct OutboundRequest {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct OutboundRequestParts {
     pub body: Body,
     pub deadline: Option<Deadline>,
@@ -271,6 +272,9 @@ impl OutboundResponse {
     }
 
     #[must_use]
+    /// Destructures the adapter-facing response representation without re-running response-header
+    /// normalization. Call [`Self::into_response`] at an application boundary that requires the
+    /// final defensive framing pass.
     #[inline]
     pub fn into_parts(self) -> (Method, StatusCode, HeaderMap, Body) {
         (self.request_method, self.status, self.headers, self.body)
@@ -633,6 +637,10 @@ impl OutboundRequest {
     }
 
     #[must_use]
+    /// Selects buffered response mode and sets its final collection limit.
+    ///
+    /// This is a last-write-wins mode setter: a later [`Self::stream_response`] call selects
+    /// streamed mode instead.
     #[inline]
     pub fn max_response_bytes(mut self, bytes: u64) -> Self {
         self.response_mode = ResponseMode::Buffered { max_bytes: bytes };
@@ -703,6 +711,10 @@ impl OutboundRequest {
     }
 
     #[must_use]
+    /// Selects streamed response mode.
+    ///
+    /// This is a last-write-wins mode setter: a later [`Self::max_response_bytes`] call selects
+    /// buffered mode instead.
     #[inline]
     pub fn stream_response(mut self) -> Self {
         self.response_mode = ResponseMode::Streamed;
@@ -879,11 +891,11 @@ pub fn rechunk_stream(mut source: BodyStream, optional_maximum: Option<NonZeroU6
     .boxed_local()
 }
 
-/// Validates the portable outbound method, body, and response policy contract.
+/// Validates the adapter-independent outbound method, body, and response-policy contract.
 ///
 /// # Errors
-/// Returns [`EdgeError::BadRequest`] when the request cannot be represented consistently on
-/// every adapter.
+/// Returns [`EdgeError::BadRequest`] when a common contract invariant is invalid. Individual
+/// adapters may reject additional target-specific constraints during request preparation.
 #[inline]
 pub fn validate_for_dispatch(request: &OutboundRequest) -> Result<(), EdgeError> {
     if !matches!(
@@ -1006,20 +1018,6 @@ async fn collect_response_stream_inner(
         collected.extend_from_slice(&bytes);
         total = next_total;
     }
-}
-
-/// Collects a response stream under both a byte cap and one absolute deadline.
-///
-/// # Errors
-/// Returns a typed buffered-body overflow or gateway timeout while preserving source errors.
-#[inline]
-pub async fn collect_response_stream_until(
-    stream: BodyStream,
-    max: u64,
-    deadline: Deadline,
-) -> Result<Bytes, EdgeError> {
-    let clock = MonotonicClock::default();
-    collect_response_stream_until_with_clock(stream, max, deadline, &clock).await
 }
 
 /// Collects a response stream under an absolute deadline evaluated by `clock`.

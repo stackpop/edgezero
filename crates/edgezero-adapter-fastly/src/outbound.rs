@@ -132,7 +132,7 @@ mod fastly_impl {
     #[cfg(feature = "test-utils")]
     use std::cell::Cell;
     use std::collections::HashMap;
-    use std::io::{Result as IoResult, Write as _};
+    use std::io::{Result as IoResult, Write};
     use std::mem::replace;
     use std::num::NonZeroU64;
     use std::sync::Mutex;
@@ -159,6 +159,7 @@ mod fastly_impl {
         BATCH_DISPATCH_SLACK_MAX, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
     };
     use fastly::backend::BackendCreationError;
+    use fastly::http::body::StreamingBody;
     use fastly::http::request::{PendingRequest, PollResult, SendError, SendErrorCause};
     use fastly::{
         Backend, Body as FastlyBody, Request as FastlyRequest, Response as FastlyResponse,
@@ -336,12 +337,7 @@ mod fastly_impl {
             started_at: MonotonicInstant,
         ) -> Result<PreparedRequest, EdgeError> {
             let budget = dispatch_budget(&request, started_at)?;
-            if !request.headers().contains_key(ACCEPT_ENCODING) {
-                request
-                    .headers_mut()
-                    .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-            }
-            normalize_for_dispatch(&mut request)?;
+            normalize_fastly_request(&mut request)?;
             budget_remaining(budget, &self.clock)?;
             let backend = self.ensure_backend(&request, budget)?;
             budget_remaining(budget, &self.clock)?;
@@ -522,19 +518,7 @@ mod fastly_impl {
                 }
             }
 
-            slots
-                .into_iter()
-                .map(|slot| match slot {
-                    Slot::Done(done) => done,
-                    Slot::Pending(_) | Slot::Taken => finish_slot(
-                        batch_started_at,
-                        Err(EdgeError::internal(anyhow::anyhow!(
-                            "Fastly batch harvest left an unresolved slot"
-                        ))),
-                        &self.clock,
-                    ),
-                })
-                .collect()
+            resolve_slots(slots, batch_started_at, &self.clock)
         }
     }
 
@@ -619,6 +603,16 @@ mod fastly_impl {
         request
     }
 
+    fn normalize_fastly_request(request: &mut OutboundRequest) -> Result<(), EdgeError> {
+        normalize_for_dispatch(request)?;
+        if !request.headers().contains_key(ACCEPT_ENCODING) {
+            request
+                .headers_mut()
+                .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        }
+        Ok(())
+    }
+
     fn ceil_millis(duration: Duration) -> u64 {
         let rounded = duration
             .checked_add(Duration::from_micros(999))
@@ -678,6 +672,26 @@ mod fastly_impl {
                 ))),
             ),
         }
+    }
+
+    fn resolve_slots(
+        slots: Vec<Slot>,
+        started_at: MonotonicInstant,
+        clock: &MonotonicClock,
+    ) -> Vec<OutboundSlotResult> {
+        slots
+            .into_iter()
+            .map(|slot| match slot {
+                Slot::Done(done) => done,
+                Slot::Pending(_) | Slot::Taken => finish_slot(
+                    started_at,
+                    Err(EdgeError::internal(anyhow::anyhow!(
+                        "Fastly batch harvest left an unresolved slot"
+                    ))),
+                    clock,
+                ),
+            })
+            .collect()
     }
 
     fn map_backend_creation_error(error: &BackendCreationError) -> EdgeError {
@@ -886,7 +900,7 @@ mod fastly_impl {
                 declared_body: true
             }
         );
-        let native = fastly_body_stream(response.take_body(), budget, clock);
+        let native = fastly_body_stream(response.take_body(), budget, clock.clone());
         if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
             if !declared_reset_body {
                 let mut reset_stream = native;
@@ -934,11 +948,12 @@ mod fastly_impl {
             ContentEncoding::Passthrough => decoded,
         };
         let shaped = rechunk_stream(output, max_chunk_bytes);
+        let deadline_bound = deadline_stream(shaped, budget, clock);
         let body = match response_mode {
             ResponseMode::Buffered { max_bytes } => {
-                Body::from(collect_response_stream(shaped, max_bytes).await?)
+                Body::from(collect_response_stream(deadline_bound, max_bytes).await?)
             }
-            ResponseMode::Streamed => Body::from_stream(shaped),
+            ResponseMode::Streamed => Body::from_stream(deadline_bound),
         };
         Ok(OutboundResponse::new_with_monotonic_clock(
             request_method,
@@ -959,24 +974,43 @@ mod fastly_impl {
         headers
     }
 
-    async fn send_streamed(
-        request: FastlyRequest,
-        backend: Backend,
+    trait StreamedUploadWriter {
+        fn finish(self) -> IoResult<()>;
+        fn flush(&mut self) -> IoResult<()>;
+        fn write_all(&mut self, bytes: &[u8]) -> IoResult<()>;
+    }
+
+    impl StreamedUploadWriter for StreamingBody {
+        fn finish(self) -> IoResult<()> {
+            StreamingBody::finish(self)
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Write::flush(self)
+        }
+
+        fn write_all(&mut self, bytes: &[u8]) -> IoResult<()> {
+            Write::write_all(self, bytes)
+        }
+    }
+
+    async fn complete_streamed_exchange<Writer, Wait, Output>(
+        mut writer: Writer,
         mut source: BodyStream,
         maximum: u64,
         budget: DispatchBudget,
-        started_at: MonotonicInstant,
-        clock: MonotonicClock,
-    ) -> Result<FastlyResponse, EdgeError> {
-        dispatch_guard(started_at, budget, &clock)?;
-        let (mut writer, pending) = request
-            .send_async_streaming(backend)
-            .map_err(|error| map_send_error(&error, budget, &clock))?;
+        clock: &MonotonicClock,
+        wait: Wait,
+    ) -> Result<Output, EdgeError>
+    where
+        Writer: StreamedUploadWriter,
+        Wait: FnOnce() -> Result<Output, EdgeError>,
+    {
         let mut total = 0_u64;
         loop {
-            budget_remaining(budget, &clock)?;
+            budget_remaining(budget, clock)?;
             let next_item = source.next().await;
-            budget_remaining(budget, &clock)?;
+            budget_remaining(budget, clock)?;
             let Some(item) = next_item else {
                 break;
             };
@@ -992,30 +1026,46 @@ mod fastly_impl {
                     "outbound request body exceeded configured limit",
                 ));
             }
-            let write_result = writer.write_all(&bytes);
             resolve_stream_io_result(
-                write_result,
+                writer.write_all(&bytes),
                 budget,
                 clock.now(),
                 "Fastly outbound request body write failed",
             )?;
-            let flush_result = writer.flush();
             resolve_stream_io_result(
-                flush_result,
+                writer.flush(),
                 budget,
                 clock.now(),
                 "Fastly outbound request body flush failed",
             )?;
             total = next_total;
         }
-        let finish_result = writer.finish();
         resolve_stream_io_result(
-            finish_result,
+            writer.finish(),
             budget,
             clock.now(),
             "Fastly outbound request completion failed",
         )?;
-        wait_pending(pending, budget, &clock)
+        wait()
+    }
+
+    async fn send_streamed(
+        request: FastlyRequest,
+        backend: Backend,
+        source: BodyStream,
+        maximum: u64,
+        budget: DispatchBudget,
+        started_at: MonotonicInstant,
+        clock: MonotonicClock,
+    ) -> Result<FastlyResponse, EdgeError> {
+        dispatch_guard(started_at, budget, &clock)?;
+        let (writer, pending) = request
+            .send_async_streaming(backend)
+            .map_err(|error| map_send_error(&error, budget, &clock))?;
+        complete_streamed_exchange(writer, source, maximum, budget, &clock, || {
+            wait_pending(pending, budget, &clock)
+        })
+        .await
     }
 
     fn resolve_stream_io_result(
@@ -1063,6 +1113,35 @@ mod fastly_impl {
                         budget_remaining(budget, &clock)?;
                         return;
                     }
+                }
+            }
+        }
+        .boxed_local()
+    }
+
+    fn deadline_stream(
+        mut source: BodyStream,
+        budget: DispatchBudget,
+        clock: MonotonicClock,
+    ) -> BodyStream {
+        stream! {
+            loop {
+                if let Err(error) = budget_remaining(budget, &clock) {
+                    yield Err(error);
+                    return;
+                }
+                let next_item = source.next().await;
+                if let Err(error) = budget_remaining(budget, &clock) {
+                    yield Err(error);
+                    return;
+                }
+                match next_item {
+                    Some(Ok(bytes)) => yield Ok(bytes),
+                    Some(Err(error)) => {
+                        yield Err(error);
+                        return;
+                    }
+                    None => return,
                 }
             }
         }
@@ -1163,12 +1242,17 @@ mod fastly_impl {
     mod tests {
         use std::cell::Cell;
         use std::collections::VecDeque;
-        use std::io::Error;
+        use std::io::{Error, Write as _};
+        use std::num::NonZeroU64;
         use std::sync::{Arc, Mutex};
+        use std::thread;
 
-        use edgezero_core::error::BudgetSource;
+        use edgezero_core::error::{BudgetSource, ResponseLimitReason};
+        use edgezero_core::http::header::CONNECTION;
         use edgezero_core::time::Deadline;
+        use flate2::{Compression, write::GzEncoder};
         use futures::executor::block_on;
+        use futures_util::stream;
 
         use super::*;
 
@@ -1213,6 +1297,56 @@ mod fastly_impl {
                 results[0].outcome,
                 Err(EdgeError::BadRequest { .. })
             ));
+        }
+
+        #[test]
+        fn send_all_reports_per_slot_elapsed() {
+            let start = MonotonicInstant::now();
+            let first = start
+                .checked_add(Duration::from_millis(3))
+                .expect("first completion");
+            let second = start
+                .checked_add(Duration::from_millis(8))
+                .expect("second completion");
+            let client =
+                FastlyOutboundClient::with_clock(scripted_clock(vec![start, first, second]));
+            let requests = vec![
+                OutboundRequest::get("https://example.com/")
+                    .expect("request")
+                    .body("invalid GET body"),
+                OutboundRequest::get("https://example.com/")
+                    .expect("request")
+                    .stream_response(),
+            ];
+
+            let results = block_on(client.send_all(requests));
+
+            assert_eq!(results[0].elapsed, Duration::from_millis(3));
+            assert_eq!(results[1].elapsed, Duration::from_millis(8));
+            assert!(
+                results
+                    .iter()
+                    .all(|slot| matches!(slot.outcome, Err(EdgeError::BadRequest { .. })))
+            );
+        }
+
+        #[test]
+        fn one_slot_send_all_matches_send() {
+            let now = MonotonicInstant::now();
+            let invalid = || {
+                OutboundRequest::get("https://example.com/")
+                    .expect("request")
+                    .body("invalid GET body")
+            };
+            let single =
+                block_on(FastlyOutboundClient::with_clock(constant_clock(now)).send(invalid()));
+            let mut batch = block_on(
+                FastlyOutboundClient::with_clock(constant_clock(now)).send_all(vec![invalid()]),
+            );
+            let batched = batch.remove(0).outcome;
+
+            assert!(matches!(single, Err(EdgeError::BadRequest { .. })));
+            assert!(matches!(batched, Err(EdgeError::BadRequest { .. })));
         }
 
         #[test]
@@ -1262,6 +1396,63 @@ mod fastly_impl {
         }
 
         #[test]
+        fn adapter_final_dispatch_reapplies_request_normalization() {
+            let mut request = OutboundRequest::get("https://example.com/").expect("request");
+            request
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("accept-encoding"));
+            request
+                .headers_mut()
+                .insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+
+            normalize_fastly_request(&mut request).expect("normalized request");
+
+            assert!(!request.headers().contains_key(CONNECTION));
+            assert_eq!(
+                request.headers().get(ACCEPT_ENCODING),
+                Some(&HeaderValue::from_static("identity"))
+            );
+        }
+
+        #[test]
+        fn canonical_uri_wire_serialization_table() {
+            for raw in [
+                "https://example.com",
+                "https://example.com/a/../b?x=%2F",
+                "http://127.0.0.1:8080/path?empty=",
+                "https://[::1]:8443/",
+                "https://xn--bcher-kva.example/catalog",
+            ] {
+                let request = OutboundRequest::get(raw).expect("canonical request");
+                let native =
+                    build_fastly_request(request.method(), request.uri(), request.headers());
+
+                assert_eq!(native.get_url_str(), request.uri().to_string(), "{raw}");
+            }
+        }
+
+        #[test]
+        fn backend_builder_keeps_pooling_for_identical_identity_and_settings() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_millis(100));
+            let first = OutboundRequest::get("https://example.com/path").expect("first request");
+            let second = OutboundRequest::get("https://example.com/other").expect("second request");
+            let first_identity = backend_identity(&first, budget).expect("first identity");
+            let second_identity = backend_identity(&second, budget).expect("second identity");
+
+            assert_eq!(first_identity, second_identity);
+            assert_eq!(
+                backend_name(&first_identity),
+                backend_name(&second_identity)
+            );
+            let first_timers = backend_timers(first_identity.budget_ms);
+            let second_timers = backend_timers(second_identity.budget_ms);
+            assert_eq!(first_timers.connect, second_timers.connect);
+            assert_eq!(first_timers.first_byte, second_timers.first_byte);
+            assert_eq!(first_timers.between_bytes, second_timers.between_bytes);
+        }
+
+        #[test]
         fn ceil_millis_floors_and_saturates_without_wrapping() {
             assert_eq!(ceil_millis(Duration::ZERO), 1);
             assert_eq!(ceil_millis(Duration::from_nanos(1)), 1);
@@ -1292,6 +1483,318 @@ mod fastly_impl {
                 .expect_err("post-ready expiry");
 
             assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
+
+        #[test]
+        fn response_read_checks_deadline_after_eof() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_millis(10));
+            let clock = scripted_clock(vec![start, budget.deadline.instant()]);
+            let mut body = fastly_body_stream(FastlyBody::new(), budget, clock);
+
+            assert!(matches!(
+                block_on(body.next()),
+                Some(Err(EdgeError::GatewayTimeout {
+                    cause: BudgetSource::PerCallTimeout,
+                    ..
+                }))
+            ));
+        }
+
+        #[test]
+        fn decoder_stalls_timeout_at_all_completion_boundaries() {
+            let started_at = MonotonicInstant::now();
+            let budget = clock_budget(started_at, Duration::from_millis(100));
+            let mut gzip_encoder = GzEncoder::new(Vec::new(), Compression::default());
+            gzip_encoder.write_all(b"ab").expect("gzip input");
+            let gzip_bytes = gzip_encoder.finish().expect("gzip output");
+            let mut native = FastlyResponse::from_status(StatusCode::OK.as_u16());
+            native.set_header(CONTENT_ENCODING, "gzip");
+            native.set_body(gzip_bytes);
+
+            let response = block_on(process_response(
+                native,
+                Method::GET,
+                ResponseMode::Streamed,
+                budget,
+                32 * 1024 * 1024,
+                24,
+                NonZeroU64::new(1),
+                None,
+                None,
+                None,
+                None,
+                MonotonicClock::default(),
+            ))
+            .expect("response head");
+            let mut body = response.into_body().into_stream().expect("streamed body");
+
+            assert_eq!(
+                block_on(body.next())
+                    .expect("first item")
+                    .expect("first byte"),
+                Bytes::from_static(b"a")
+            );
+            thread::sleep(Duration::from_millis(125));
+            assert!(matches!(
+                block_on(body.next()),
+                Some(Err(EdgeError::GatewayTimeout {
+                    cause: BudgetSource::PerCallTimeout,
+                    ..
+                }))
+            ));
+        }
+
+        #[test]
+        fn response_content_length_rejects_before_body_poll() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_secs(1));
+            let mut native = FastlyResponse::from_status(StatusCode::OK.as_u16());
+            native.set_header(CONTENT_LENGTH, "2");
+            native.set_body("xx");
+
+            let error = block_on(process_response(
+                native,
+                Method::GET,
+                ResponseMode::Buffered { max_bytes: 1 },
+                budget,
+                32 * 1024 * 1024,
+                24,
+                None,
+                None,
+                None,
+                None,
+                None,
+                constant_clock(start),
+            ))
+            .expect_err("content length exceeds final buffer cap");
+
+            assert!(matches!(
+                error,
+                EdgeError::ResponseTooLarge {
+                    reason: ResponseLimitReason::BufferedBody,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn response_content_length_explicit_identity_rejects_before_body_poll() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_secs(1));
+            let mut native = FastlyResponse::from_status(StatusCode::OK.as_u16());
+            native.set_header(CONTENT_ENCODING, "identity");
+            native.set_header(CONTENT_LENGTH, "2");
+            native.set_body("xx");
+
+            let error = block_on(process_response(
+                native,
+                Method::GET,
+                ResponseMode::Buffered { max_bytes: 16 },
+                budget,
+                32 * 1024 * 1024,
+                24,
+                None,
+                Some(1),
+                None,
+                None,
+                None,
+                constant_clock(start),
+            ))
+            .expect_err("content length exceeds decoded cap");
+
+            assert!(matches!(
+                error,
+                EdgeError::ResponseTooLarge {
+                    reason: ResponseLimitReason::DecodedBody,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn send_all_reverse_completion_preserves_order() {
+            let started_at = MonotonicInstant::now();
+            let clock = constant_clock(started_at);
+            let mut slots = vec![Slot::Taken, Slot::Taken];
+            slots[1] = Slot::Done(OutboundSlotResult::new(
+                Duration::from_millis(2),
+                Ok(OutboundResponse::new(
+                    Method::GET,
+                    StatusCode::ACCEPTED,
+                    HeaderMap::new(),
+                    Body::empty(),
+                )),
+            ));
+            slots[0] = Slot::Done(OutboundSlotResult::new(
+                Duration::from_millis(5),
+                Ok(OutboundResponse::new(
+                    Method::GET,
+                    StatusCode::CREATED,
+                    HeaderMap::new(),
+                    Body::empty(),
+                )),
+            ));
+
+            let results = resolve_slots(slots, started_at, &clock);
+
+            assert_eq!(
+                results[0].outcome.as_ref().expect("slot 0").status(),
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                results[1].outcome.as_ref().expect("slot 1").status(),
+                StatusCode::ACCEPTED
+            );
+            assert_eq!(results[0].elapsed, Duration::from_millis(5));
+            assert_eq!(results[1].elapsed, Duration::from_millis(2));
+        }
+
+        #[test]
+        fn done_error_survives_poll_sweep() {
+            let started_at = MonotonicInstant::now();
+            let clock = constant_clock(started_at);
+            let mut slot = Slot::Done(OutboundSlotResult::new(
+                Duration::from_millis(4),
+                Err(EdgeError::bad_gateway_with_reason(
+                    "retained error",
+                    BadGatewayReason::Transport,
+                )),
+            ));
+
+            block_on(poll_slot(&mut slot, started_at, &clock));
+            let mut results = resolve_slots(vec![slot], started_at, &clock);
+            let retained = results.remove(0);
+
+            assert_eq!(retained.elapsed, Duration::from_millis(4));
+            assert!(matches!(
+                retained.outcome,
+                Err(EdgeError::BadGateway {
+                    reason: BadGatewayReason::Transport,
+                    ..
+                })
+            ));
+        }
+
+        #[derive(Default)]
+        struct UploadEvents {
+            finishes: usize,
+            flushes: usize,
+            waits: usize,
+            writes: Vec<Bytes>,
+        }
+
+        struct TestUploadWriter {
+            events: Arc<Mutex<UploadEvents>>,
+        }
+
+        impl StreamedUploadWriter for TestUploadWriter {
+            fn finish(self) -> IoResult<()> {
+                let mut events = self
+                    .events
+                    .lock()
+                    .map_err(|_poisoned| Error::other("upload events lock poisoned"))?;
+                events.finishes = events.finishes.saturating_add(1);
+                Ok(())
+            }
+
+            fn flush(&mut self) -> IoResult<()> {
+                let mut events = self
+                    .events
+                    .lock()
+                    .map_err(|_poisoned| Error::other("upload events lock poisoned"))?;
+                events.flushes = events.flushes.saturating_add(1);
+                Ok(())
+            }
+
+            fn write_all(&mut self, bytes: &[u8]) -> IoResult<()> {
+                self.events
+                    .lock()
+                    .map_err(|_poisoned| Error::other("upload events lock poisoned"))?
+                    .writes
+                    .push(Bytes::copy_from_slice(bytes));
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn streamed_upload_finishes_exactly_once() {
+            let started_at = MonotonicInstant::now();
+            let budget = clock_budget(started_at, Duration::from_secs(1));
+            let clock = constant_clock(started_at);
+            let events = Arc::new(Mutex::new(UploadEvents::default()));
+            let writer = TestUploadWriter {
+                events: Arc::clone(&events),
+            };
+            let source = stream::iter([
+                Ok(Bytes::from_static(b"first")),
+                Ok(Bytes::from_static(b"second")),
+            ])
+            .boxed_local();
+            let wait_events = Arc::clone(&events);
+
+            let outcome = block_on(complete_streamed_exchange(
+                writer,
+                source,
+                32,
+                budget,
+                &clock,
+                move || {
+                    wait_events.lock().expect("upload events").waits += 1;
+                    Ok(7_u8)
+                },
+            ));
+            let observed = events.lock().expect("upload events");
+
+            assert_eq!(outcome.expect("exchange"), 7);
+            assert_eq!(
+                observed.writes,
+                [Bytes::from_static(b"first"), Bytes::from_static(b"second")]
+            );
+            assert_eq!(observed.flushes, 2);
+            assert_eq!(observed.finishes, 1);
+            assert_eq!(observed.waits, 1);
+        }
+
+        #[test]
+        fn streamed_upload_failure_never_waits() {
+            let started_at = MonotonicInstant::now();
+            let budget = clock_budget(started_at, Duration::from_secs(1));
+            let clock = constant_clock(started_at);
+            let events = Arc::new(Mutex::new(UploadEvents::default()));
+            let writer = TestUploadWriter {
+                events: Arc::clone(&events),
+            };
+            let source = stream::iter([Err(EdgeError::bad_gateway_with_reason(
+                "source failed",
+                BadGatewayReason::Transport,
+            ))])
+            .boxed_local();
+            let wait_events = Arc::clone(&events);
+
+            let outcome = block_on(complete_streamed_exchange(
+                writer,
+                source,
+                32,
+                budget,
+                &clock,
+                move || {
+                    wait_events.lock().expect("upload events").waits += 1;
+                    Ok(7_u8)
+                },
+            ));
+            let observed = events.lock().expect("upload events");
+
+            assert!(matches!(
+                outcome,
+                Err(EdgeError::BadGateway {
+                    reason: BadGatewayReason::Transport,
+                    ..
+                })
+            ));
+            assert!(observed.writes.is_empty());
+            assert_eq!(observed.finishes, 0);
+            assert_eq!(observed.waits, 0);
         }
 
         #[test]
@@ -1488,7 +1991,7 @@ mod fastly_impl {
         }
 
         #[test]
-        fn dispatch_guard_enforces_slack_after_deadline_precedence() {
+        fn dispatch_guard_checks_expiry_before_slack() {
             use edgezero_core::time::{BATCH_DISPATCH_SLACK_MAX, Deadline};
 
             let started_at = MonotonicInstant::now();
@@ -1532,7 +2035,7 @@ mod fastly_impl {
             clippy::too_many_lines,
             reason = "the pinned SDK cause table intentionally constructs every known variant"
         )]
-        fn send_error_cause_table_is_exhaustive() {
+        fn send_error_cause_table_preserves_timeout_source() {
             let cases = [
                 (
                     SendErrorCause::DnsTimeout,

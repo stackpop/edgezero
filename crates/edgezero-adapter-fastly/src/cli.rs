@@ -5658,6 +5658,11 @@ mod tests {
 
     #[test]
     fn adapter_capability_matrix_matches_contracts() {
+        adapter_capability_matrix_matches_outbound_spec();
+    }
+
+    #[test]
+    fn adapter_capability_matrix_matches_outbound_spec() {
         let expected = [
             (
                 Capability::ConfigReadAllocationBounds,

@@ -79,9 +79,9 @@ pub use outbound::{
     DEFAULT_OUTBOUND_REQUEST_BODY_BYTES, HttpClient, OutboundHttpClient, OutboundRequest,
     OutboundRequestParts, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
     ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-    collect_response_stream_until, collect_response_stream_until_with_clock,
-    enforce_payload_content_length, limit_decoded_stream, limit_encoded_stream,
-    normalize_for_dispatch, normalize_response_headers, rechunk_stream, validate_for_dispatch,
+    collect_response_stream_until_with_clock, enforce_payload_content_length, limit_decoded_stream,
+    limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
+    validate_for_dispatch,
 };
 pub use response_egress::{
     DEFAULT_RESPONSE_WRITE_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
@@ -90,10 +90,15 @@ pub use response_egress::{
     ResponseEgressReport, default_response_egress_policy,
 };
 pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
-pub use time::{Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
+pub use time::{
+    BATCH_DISPATCH_SLACK_MAX, DEADLINE_FAR_FUTURE, DEFAULT_NO_DEADLINE_BUDGET, Deadline,
+    DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
+};
 
 #[cfg(test)]
 mod public_config_extraction_contract_tests {
+    use std::time::Duration;
+
     #[test]
     fn bounded_config_types_and_defaults_are_root_exports() {
         let limits = crate::ConfigExtractionLimits::default();
@@ -112,5 +117,8 @@ mod public_config_extraction_contract_tests {
             crate::DEFAULT_CONFIG_EXTRACTION_BYTES
         );
         assert_eq!(limits.timeout, crate::DEFAULT_CONFIG_EXTRACTION_TIMEOUT);
+        assert_eq!(crate::BATCH_DISPATCH_SLACK_MAX, Duration::from_millis(25));
+        assert_eq!(crate::DEADLINE_FAR_FUTURE, Duration::from_hours(168));
+        assert_eq!(crate::DEFAULT_NO_DEADLINE_BUDGET, Duration::from_secs(30));
     }
 }

@@ -65,11 +65,13 @@ fn request_timeouts(remaining: Duration) -> RequestTimeouts {
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn request_body_limit(body: &Body, configured: u64) -> u64 {
-    match body {
-        Body::Once(_) => u64::MAX,
-        Body::Stream(_) => configured,
-    }
+fn request_body_limit(_body: &Body, configured: u64) -> u64 {
+    configured
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn should_emit_response_chunk(length: usize) -> bool {
+    length != 0
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -95,11 +97,24 @@ async fn cooperative_yield_once() {
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn cooperate_after_response_read(ready_reads: &mut usize) {
+    *ready_reads = ready_reads.saturating_add(1);
+    if *ready_reads >= READY_ITEM_YIELD_QUOTA {
+        *ready_reads = 0;
+        cooperative_yield_once().await;
+    }
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn cooperative_stream(mut source: BodyStream) -> BodyStream {
     stream! {
         let mut ready_items = 0_usize;
         while let Some(item) = source.next().await {
+            let terminal = item.is_err();
             yield item;
+            if terminal {
+                return;
+            }
             ready_items = ready_items.saturating_add(1);
             if ready_items >= READY_ITEM_YIELD_QUOTA {
                 cooperative_yield_once().await;
@@ -234,7 +249,8 @@ mod spin_impl {
     use spin_sdk::wasip3::wit_future;
 
     use super::{
-        UploadCompletion, cooperative_yield_once, map_spin_send_error, run_exchange, timeout_error,
+        UploadCompletion, cooperate_after_response_read, cooperative_yield_once,
+        map_spin_send_error, run_exchange, should_emit_response_chunk, timeout_error,
     };
 
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
@@ -610,7 +626,7 @@ mod spin_impl {
         let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
         headers.insert(PROXY_HEADER, HeaderValue::from_static("spin"));
 
-        let native = super::cooperative_stream(response_stream(response, budget, clock.clone()));
+        let native = response_stream(response, budget, clock.clone());
         if disposition == ResponseBodyDisposition::FramingBodyless {
             drain_response(native, budget, &clock).await?;
             return Ok(OutboundResponse::new_with_monotonic_clock(
@@ -723,6 +739,7 @@ mod spin_impl {
         let (completion_writer, result_reader) = wit_future::new(default_response_result);
         let (mut body_reader, trailer_reader) = Response::consume_body(response, result_reader);
         stream! {
+            let mut ready_reads = 0_usize;
             loop {
                 let read = body_reader.read(Vec::with_capacity(RESPONSE_READ_BYTES));
                 let (result, chunk) = match race_deadline(read, budget, &clock).await {
@@ -733,8 +750,11 @@ mod spin_impl {
                     }
                 };
                 match result {
-                    StreamResult::Complete(_length) => {
-                        yield Ok(Bytes::from(chunk));
+                    StreamResult::Complete(length) => {
+                        if should_emit_response_chunk(length) {
+                            yield Ok(Bytes::from(chunk));
+                        }
+                        cooperate_after_response_read(&mut ready_reads).await;
                     }
                     StreamResult::Dropped => {
                         let trailer_result = race_deadline(
@@ -871,7 +891,7 @@ mod spin_impl {
         }
     }
 
-    /// Runs request-option and deferred response clock checks in the hosted contract binary.
+    /// Runs request-option, response-clock, and fairness checks in the hosted contract binary.
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     #[inline]
@@ -896,6 +916,14 @@ mod spin_impl {
         if request_options(budget, &option_clock).is_err()
             || option_observations.load(Ordering::SeqCst) != 1
         {
+            return false;
+        }
+
+        let mut ready_reads = 0_usize;
+        for _ in 0..super::READY_ITEM_YIELD_QUOTA {
+            cooperate_after_response_read(&mut ready_reads).await;
+        }
+        if ready_reads != 0 {
             return false;
         }
 
@@ -1174,8 +1202,9 @@ mod exchange_tests {
     use futures::executor::block_on;
 
     use super::{
-        EdgeError, READY_ITEM_YIELD_QUOTA, UploadCompletion, cooperative_stream,
-        cooperative_yield_once, duration_nanos, request_body_limit, request_timeouts, run_exchange,
+        EdgeError, READY_ITEM_YIELD_QUOTA, UploadCompletion, cooperate_after_response_read,
+        cooperative_stream, cooperative_yield_once, duration_nanos, request_body_limit,
+        request_timeouts, run_exchange, should_emit_response_chunk,
     };
 
     struct ScriptedFuture<Output> {
@@ -1271,16 +1300,64 @@ mod exchange_tests {
     }
 
     #[test]
-    fn request_body_limit_only_applies_to_streamed_bodies() {
+    fn request_body_limit_applies_to_buffered_and_streamed_bodies() {
         use bytes::Bytes;
         use edgezero_core::body::Body;
         use futures_util::stream;
 
         assert_eq!(
             request_body_limit(&Body::from(Bytes::from_static(b"buffered")), 8),
-            u64::MAX
+            8
         );
         assert_eq!(request_body_limit(&Body::stream(stream::empty()), 8), 8);
+    }
+
+    #[test]
+    fn cooperative_stream_stops_after_the_first_error() {
+        use bytes::Bytes;
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+
+        let source = stream::iter([
+            Err(EdgeError::bad_gateway("terminal")),
+            Ok(Bytes::from_static(b"must not escape")),
+        ])
+        .boxed_local();
+        let mut cooperative = cooperative_stream(source);
+
+        assert!(matches!(
+            block_on(cooperative.next()),
+            Some(Err(EdgeError::BadGateway { .. }))
+        ));
+        assert!(block_on(cooperative.next()).is_none());
+    }
+
+    #[test]
+    fn zero_length_complete_does_not_emit_an_empty_response_chunk() {
+        assert!(!should_emit_response_chunk(0));
+        assert!(should_emit_response_chunk(1));
+    }
+
+    #[test]
+    fn zero_length_response_reads_force_a_pending_boundary_at_the_quota() {
+        use futures_util::task::noop_waker;
+
+        let processed = Rc::new(Cell::new(0_usize));
+        let observed = Rc::clone(&processed);
+        let mut task = Box::pin(async move {
+            let mut ready_reads = 0_usize;
+            for _ in 0..READY_ITEM_YIELD_QUOTA.saturating_add(1) {
+                observed.set(observed.get().saturating_add(1));
+                cooperate_after_response_read(&mut ready_reads).await;
+            }
+        });
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(task.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), READY_ITEM_YIELD_QUOTA);
+        assert!(task.as_mut().poll(&mut context).is_ready());
+        assert_eq!(processed.get(), READY_ITEM_YIELD_QUOTA.saturating_add(1));
     }
 
     #[test]
