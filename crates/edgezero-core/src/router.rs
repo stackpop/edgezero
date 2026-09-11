@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use matchit::Router as PathRouter;
 use tower_service::Service;
 
-use crate::context::{RequestContext, drain_body_discard};
+use crate::context::{FallbackDrainOutcome, RequestContext, drain_body_discard};
 use crate::error::EdgeError;
 use crate::handler::{BoxHandler, IntoHandler, IntrospectionNeeds};
 use crate::http::{Extensions, HandlerFuture, Method, Request, Response};
@@ -494,7 +494,7 @@ impl RouterService {
 
         match resolved.target {
             ResolvedTarget::Found(entry, params) => {
-                if ingress.fallback_body_limit().is_some() {
+                if ingress.is_fallback() {
                     return Err(EdgeError::internal(anyhow::anyhow!(
                         "fallback body policy cannot dispatch a matched route"
                     )));
@@ -504,15 +504,8 @@ impl RouterService {
                     .await
             }
             ResolvedTarget::MethodNotAllowed(allowed) => {
-                if let Some(max_body_bytes) = ingress.fallback_body_limit() {
-                    let monotonic_clock = ingress.monotonic_clock();
-                    drain_body_discard(
-                        request.into_body(),
-                        max_body_bytes,
-                        Some(ingress.read_deadline()),
-                        &monotonic_clock,
-                    )
-                    .await?;
+                if let Some(response) = fallback_terminal_response(request, ingress).await? {
+                    return Ok(response);
                 }
                 let methods = allowed
                     .iter()
@@ -521,15 +514,8 @@ impl RouterService {
                 Err(EdgeError::method_not_allowed(&resolved.method, &methods))
             }
             ResolvedTarget::NotFound => {
-                if let Some(max_body_bytes) = ingress.fallback_body_limit() {
-                    let monotonic_clock = ingress.monotonic_clock();
-                    drain_body_discard(
-                        request.into_body(),
-                        max_body_bytes,
-                        Some(ingress.read_deadline()),
-                        &monotonic_clock,
-                    )
-                    .await?;
+                if let Some(response) = fallback_terminal_response(request, ingress).await? {
+                    return Ok(response);
                 }
                 Err(EdgeError::not_found(resolved.path))
             }
@@ -597,6 +583,31 @@ impl RouterService {
     #[inline]
     pub fn routes(&self) -> Vec<RouteInfo> {
         self.inner.route_index.to_vec()
+    }
+}
+
+async fn fallback_terminal_response(
+    request: Request,
+    ingress: AdmittedIngress,
+) -> Result<Option<Response>, EdgeError> {
+    let Some(fallback) = ingress.into_fallback() else {
+        return Ok(None);
+    };
+    let (grant, max_body_bytes, read_deadline, monotonic_clock, on_exceeded, on_timeout) =
+        fallback.into_parts();
+    let outcome = drain_body_discard(
+        request.into_body(),
+        max_body_bytes,
+        read_deadline,
+        &monotonic_clock,
+    )
+    .await;
+    drop(grant);
+
+    match outcome? {
+        FallbackDrainOutcome::Complete => Ok(None),
+        FallbackDrainOutcome::Exceeded => Ok(Some(on_exceeded.into_response())),
+        FallbackDrainOutcome::TimedOut => Ok(Some(on_timeout.into_response())),
     }
 }
 

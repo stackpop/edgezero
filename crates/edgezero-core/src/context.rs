@@ -42,6 +42,12 @@ enum BodyState {
     Taken,
 }
 
+pub(crate) enum FallbackDrainOutcome {
+    Complete,
+    Exceeded,
+    TimedOut,
+}
+
 enum StoredError {
     BadGateway(String, BadGatewayReason),
     BadRequest(String),
@@ -631,37 +637,61 @@ pub(crate) async fn drain_body(
     }
 }
 
+fn fallback_deadline_outcome(
+    deadline: Deadline,
+    monotonic_clock: &MonotonicClock,
+) -> Option<FallbackDrainOutcome> {
+    deadline
+        .is_expired_at(monotonic_clock.now())
+        .then_some(FallbackDrainOutcome::TimedOut)
+}
+
 pub(crate) async fn drain_body_discard(
     body: Body,
     max: usize,
-    deadline: Option<Deadline>,
+    deadline: Deadline,
     monotonic_clock: &MonotonicClock,
-) -> Result<(), EdgeError> {
-    check_read_deadline(deadline, monotonic_clock)?;
+) -> Result<FallbackDrainOutcome, EdgeError> {
+    if let Some(outcome) = fallback_deadline_outcome(deadline, monotonic_clock) {
+        return Ok(outcome);
+    }
     match body {
         Body::Once(bytes) => {
-            check_read_deadline(deadline, monotonic_clock)?;
-            if bytes.len() > max {
-                return Err(EdgeError::bad_request("request body too large"));
+            if let Some(outcome) = fallback_deadline_outcome(deadline, monotonic_clock) {
+                return Ok(outcome);
             }
-            Ok(())
+            if bytes.len() > max {
+                return Ok(FallbackDrainOutcome::Exceeded);
+            }
+            Ok(FallbackDrainOutcome::Complete)
         }
         Body::Stream(mut stream) => {
             let mut consumed = 0_usize;
             loop {
-                check_read_deadline(deadline, monotonic_clock)?;
+                if let Some(outcome) = fallback_deadline_outcome(deadline, monotonic_clock) {
+                    return Ok(outcome);
+                }
                 let next = stream.next().await;
                 // Deadline wins a simultaneous body/error/EOF observation.
-                check_read_deadline(deadline, monotonic_clock)?;
+                if let Some(outcome) = fallback_deadline_outcome(deadline, monotonic_clock) {
+                    return Ok(outcome);
+                }
                 let Some(result) = next else {
-                    return Ok(());
+                    return Ok(FallbackDrainOutcome::Complete);
                 };
-                let chunk = result?;
-                consumed = consumed.checked_add(chunk.len()).ok_or_else(|| {
-                    EdgeError::bad_request("request body size accounting overflow")
-                })?;
+                let chunk = match result {
+                    Ok(chunk) => chunk,
+                    Err(EdgeError::RequestTimeout { .. }) => {
+                        return Ok(FallbackDrainOutcome::TimedOut);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let Some(next_consumed) = consumed.checked_add(chunk.len()) else {
+                    return Ok(FallbackDrainOutcome::Exceeded);
+                };
+                consumed = next_consumed;
                 if consumed > max {
-                    return Err(EdgeError::bad_request("request body too large"));
+                    return Ok(FallbackDrainOutcome::Exceeded);
                 }
             }
         }
