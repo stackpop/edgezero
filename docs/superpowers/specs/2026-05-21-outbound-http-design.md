@@ -1,6 +1,6 @@
 # EdgeZero Outbound HTTP — Design Spec
 
-> **Status:** Normative design complete; implementation plans are authored through Phase 7. Phase 0 and Phases 1b-4 are executable; Phase 0 must land before Phase 4 starts. Phase 5 is executable only through its mandatory Task 0 SDK-resource runner proof, and the rest of Phases 5-7 remain blocked until that proof records a nonzero passing runtime/harness · **Date:** 2026-09-08
+> **Status:** Normative design complete; Phases 1a-7 and review hardening are implemented on PR 275. Transport-observed response-egress certification remains explicitly unsupported as described in §1.3 and the response-egress design. · **Date:** 2026-09-11
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). Relevant baseline changes are the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, expanded runtime `AdapterAction` variants, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the app-demo integration crate. Non-outbound store/config lifecycle changes remain outside this design.
@@ -37,6 +37,9 @@ Applications today proxy a single outbound request through the current
 - No consumer-specific target logic in EdgeZero.
 - EdgeZero does not own application target policy or allowlists. It exposes
   `OutboundRequest::uri()` so apps enforce their own policy; it never blocks a request itself.
+- EdgeZero does not add an application loop counter, `Via` policy, or self-reference rejection.
+  Those depend on deployment identity and trust boundaries and remain application policy; the
+  reference proxy example must not imply that `PROXY_HEADER` is a loop-prevention mechanism.
 - No new direct dependency on `tokio`, `reqwest`, `fastly`, `worker`, or `spin-sdk` in
   application/library crates or in `edgezero-core`. Those stay inside adapter crates.
 - No general-purpose "timeout any future" combinator in this spec — see §3.3.5.
@@ -562,6 +565,11 @@ impl OutboundRequest {
     pub fn max_response_bytes(self, max: u64) -> Self;        // sets Buffered { max } (u64 — see cap note)
     pub fn stream_response(self) -> Self;                   // sets Streamed
 
+ // Zero is an intentional deny-all value for every `u64` cap. It is not a malformed
+ // configuration: an empty body can satisfy a zero body cap, while the first visible byte or
+ // header entry fails with the cap's typed reason. `max_chunk_bytes` alone requires
+ // `NonZeroU64` because a zero-sized output item cannot make stream progress.
+
  /// Cap on the **request** body when it is a `Body::Stream` — see
  /// EdgeZero's core `Body::Stream` is `LocalBoxStream`
  /// (WASM-friendly, not `Send + 'static`), so adapters cannot hand it
@@ -867,6 +875,7 @@ pub fn normalize_response_headers(
 pub struct OutboundResponse {
     body: Body,                     // Once in Buffered mode, Stream in Streamed mode
     headers: HeaderMap,
+    monotonic_clock: MonotonicClock, // paired app/client clock for bounded-until helpers
     request_method: Method,          // retained for HEAD/bodyless response semantics
     status: StatusCode,
 }
@@ -880,11 +889,22 @@ impl OutboundResponse {
  /// `content-encoding` / `content-length`; and lossy UTF-8 handling has run. `Body::Once` is
  /// used in Buffered mode after the adapter has drained and capped; `Body::Stream` is wrapped
  /// with the decoded-output deadline guard in Streamed mode.
+ /// Low-level constructor using `MonotonicClock::default()`. Standard adapters instead pair the
+ /// response with the outbound client's retained application clock.
     pub fn new(
         request_method: Method,
         status: StatusCode,
         headers: HeaderMap,
         body: Body,
+    ) -> Self;
+
+    #[doc(hidden)]
+    pub fn new_with_monotonic_clock(
+        request_method: Method,
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Body,
+        monotonic_clock: MonotonicClock,
     ) -> Self;
 
  /// Adapter-facing destructure. Mirrors `OutboundRequest::into_parts`; the retained
@@ -952,7 +972,7 @@ impl OutboundResponse {
  /// As `into_bytes_bounded`, but additionally bounded by a `Deadline`
  /// that the caller passes per drain. **The helper is a *cooperative*
  /// post-read / EOF validator, not a timer-backed race.** The bound it
- /// provides is *exactly* "the first `is_expired` check that observes
+ /// provides is *exactly* "the first paired-clock expiry check that observes
  /// expiry returns `gateway_timeout`," where the check sites are
  /// enumerated below. A read that is already blocked when the deadline
  /// passes does **not** get preempted by this helper — it returns when
@@ -978,7 +998,7 @@ impl OutboundResponse {
  /// Works on both `Body::Once` and `Body::Stream`:
  ///
  /// - **`Body::Once` (already buffered)**: the helper checks
- /// `until_deadline.is_expired()` **at entry**, before doing anything
+ /// `until_deadline.is_expired_at(monotonic_clock.now())` **at entry**, before doing anything
  /// else, and returns `gateway_timeout` if expired. Otherwise it
  /// checks the buffered length against `max` — under cap → `Ok(bytes)`;
  /// over cap → `response_too_large` (distinct kind, 502; NOT `bad_gateway`
@@ -989,8 +1009,8 @@ impl OutboundResponse {
  /// makes single `send` + `Body::Once` callers see consistent
  /// `gateway_timeout` semantics whether their response arrived
  /// already-buffered or streamed.
- /// - **`Body::Stream`**: the helper checks `until_deadline.is_expired()`
- /// **both before issuing each blocking body read and again after it
+ /// - **`Body::Stream`**: the helper checks
+ /// `until_deadline.is_expired_at(monotonic_clock.now())` **both before issuing each blocking body read and again after it
  /// returns** — including the EOF read. Returns
  /// `Err(EdgeError::gateway_timeout(..))` (504) on the first expired
  /// check.
@@ -1012,9 +1032,9 @@ impl OutboundResponse {
  /// read blocks past `until` but within the wrapper's budget, the helper
  /// still fires (post-read check) and the helper's bound is "read
  /// latency + at most one extra check," not zero. There is no shared
- /// "effective deadline" stored on `OutboundResponse` (which carries
- /// request method / status / headers / body), and no `min(..)` computation in the
- /// helper. Apps that need a single combined check with **timer-backed
+ /// "effective deadline" stored on `OutboundResponse`; it retains only the paired clock,
+ /// request method, status, headers, and body. There is no `min(..)` computation in the helper.
+ /// Apps that need a single combined check with **timer-backed
  /// preemption** of the tighter deadline pass
  /// `min(req_deadline, app_inner_deadline)` to `.deadline(..)` on the
  /// `OutboundRequest` builder instead of layering here — that pushes
@@ -1621,7 +1641,9 @@ Once `send` or `send_all` begins, every EdgeZero-owned outbound observation uses
 clock: method-entry and terminal slot samples, dispatch budget selection, preparation and
 provider error precedence, pre/post-ready checks, and streamed upload/response checks. A
 deferred body stream owns a clock clone; it never falls back to process-global time after
-`send` returns. Provider timers still supply target-specific preemption, but the duration
+`send` returns. Each returned `OutboundResponse` also owns that clock clone, so
+`into_bytes_bounded_until` and `json_bounded_until` remain in the same time domain after adapter
+return. Provider timers still supply target-specific preemption, but the duration
 armed into them comes from the same paired clock snapshot. Later remaining-budget reads use
 `min(budget.deadline.remaining_at(clock.now()), budget.duration)`, so a backwards injected
 clock cannot enlarge the budget selected at method entry. Checked elapsed subtraction maps a
@@ -2250,7 +2272,10 @@ representation's metadata). For these:
 - **Framing headers are status-dependent (RFC 9110 §8.6 / RFC 9112 §6.2).** For a
   **`HEAD` response and `304`**, `content-encoding` and a *representation* `content-length`
   are legitimate metadata the client needs (a `304` or `HEAD` with them stripped breaks
-  cache validation) — **preserve them unchanged**. For **`1xx` and `204`**,
+  cache validation). Validate every visible `content-length` as one consistent `u64` first:
+  malformed values, comma lists, conflicting duplicates, and values above `u64::MAX` are protocol
+  502 before any body poll; valid values, including values above 4 GiB, are preserved unchanged.
+  For **`1xx` and `204`**,
   `content-length` is prohibited and is removed. This framing normalization is centralized
   in the same response helper as hop-by-hop stripping so every adapter applies it
   identically.
@@ -6260,10 +6285,10 @@ Each adapter crate tests its shipped conversion and classification seams.
 | --- | --- |
 | Capability metadata | All four adapters return the exact eight **outbound** cells in §3.5.2, including complete resource accounting = Unsupported everywhere, Fastly outbound HTTP = BestEffort, Cloudflare header fidelity = BestEffort, and Spin deadline/upload/flexible-phase-budget = BestEffort. Tests do not assert that the shared enum has only eight global variants; non-outbound cells belong to their own specs. A fixture adapter that relies on the trait default returns Unsupported. Because each adapter crate matches core's non-exhaustive `Capability` enum across a crate boundary, normal adapter compilation requires a wildcard; review asserts that its result is `_ => Unsupported`. A hypothetical future variant is a structural fail-closed invariant, not a value current Rust code can safely construct at runtime. |
 | Request conversion | Method/body/headers/full canonical URI survive conversion; normalized hop-by-hop fields cannot reappear; buffered and streamed request caps map to 400. Dot-segment/percent/numeric-host/IDNA cases use the exact core serialization rather than adapter reconstruction. Typed `EdgeError` request chunks survive adapter conversion; in-tree paths never route them through `from_external_stream`. |
-| Deadline anchoring and clock propagation | Every standard adapter installs its outbound client with the exact `App::monotonic_clock()` clone used by ingress; explicit low-level constructors use a documented default clock. Every adapter captures one stored-clock snapshot as the first operation in `send`/`send_all`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors or bypasses the client clock. Preflight slot elapsed, provider-error precedence, post-ready expiry, and deferred upload/response streams use that same handle. A backwards clock cannot enlarge `budget.duration`; a backwards terminal sample produces zero elapsed plus an internal invariant outcome. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
+| Deadline anchoring and clock propagation | Every standard adapter installs its outbound client with the exact `App::monotonic_clock()` clone used by ingress; explicit low-level constructors use a documented default clock. Every adapter captures one stored-clock snapshot as the first operation in `send`/`send_all`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors or bypasses the client clock. Preflight slot elapsed, provider-error precedence, post-ready expiry, deferred upload/response streams, returned `OutboundResponse` bounded-until collection, and response-converter egress checks use that same handle. A backwards clock cannot enlarge `budget.duration`; a backwards terminal sample produces zero elapsed plus an internal invariant outcome. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
 | `send_all` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Assert every slot carries its own elapsed time from the one method-entry snapshot through that slot's terminal point; advance the injected clock during preflight to prove that time is included. A same-tick terminal result may legitimately report zero. A slow sibling's later completion must not overwrite an earlier slot's elapsed value. Valid one-slot buffered batches match single-send outcome semantics while elapsed is asserted independently. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Fastly tests dispatch-before-harvest ordering, samples elapsed immediately after each harvest/preflight/dispatch terminal result, and retains its documented serial timing caveats without claiming Native slot isolation. Backwards injected time produces zero plus an internal outcome, distinguishable from legitimate zero by outcome. |
 | Streamed fan-out usage | On Axum/Cloudflare/Spin, join per-request tasks containing both `send` and body consumption. Script a fast response whose body can finish before its deadline while a sibling's headers remain pending beyond it. Assert the fast body is consumed and succeeds before those sibling headers arrive. Joining only sends and delaying all body consumption must fail this regression. Fastly is excluded from this non-portable usage pattern. |
-| Response conversion | Every adapter enforces guest-visible header limits before normalization, then normalizes before body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
+| Response conversion | Every adapter enforces guest-visible header limits before normalization, then normalizes before body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method and retained clock into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. HEAD/304 malformed, conflicting, comma-list, and `u64`-overflow `Content-Length` fail as protocol 502 before body polling while valid representation lengths are retained; 1xx/204 remove the field. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
 | 205 settlement | Test declared-body immediate abort, one in-budget clean EOF, observed non-empty bytes, read failure, and deadline precedence. Where the SDK exposes empty items, one empty item aborts without another read; on Fastly a non-empty read buffer returning zero is EOF. Cloudflare additionally tests null-body host suppression with absent/zero and positive visible lengths without claiming hidden-byte visibility. Assert native-handle cleanup and Spin completion signalling using observable results, never synthetic wire-frame visibility. |
 | Header fidelity | Axum/Fastly/Spin preserve repeated outbound request field lines and exercise raw malformed response nomination/encoding lines. Cloudflare tests request list semantics and the visible response-string baseline without asserting unavailable octets/line boundaries. Cloudflare encoded passthrough uses `EncodeBody::Manual`; its streamed downstream `Content-Length` is asserted only to the documented BestEffort scope. |
 | Decoder integration | Each adapter uses the shared decoder/carrier/deadline pipeline; gzip/br stalls before output, midstream, and after codec completion but before native EOF produce attributed 504 rather than hanging or degrading to 502/500. Exercise both Buffered and Streamed modes, multi-member gzip/cumulative caps, trailing data, and late typed source/completion errors. No guard disarm or Spin caller-result success occurs solely because a decoder reached its end marker. |

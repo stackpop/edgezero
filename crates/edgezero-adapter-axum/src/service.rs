@@ -22,7 +22,6 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry,
 };
-use edgezero_core::time::MonotonicInstant;
 use tokio::time::timeout;
 use tokio::{runtime::Handle, task};
 use tower::Service;
@@ -253,15 +252,11 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 }
 
 async fn convert_egress_envelope(egress: ResponseEgressEnvelope) -> Response<AxumBody> {
-    let started_at = MonotonicInstant::now();
-    let Ok((response, policy, mut attempt)) = egress.begin(started_at) else {
+    let Ok((response, policy, mut attempt, clock)) = egress.begin() else {
         return minimal_error_response("response-egress policy failed".to_owned());
     };
-    let Some(remaining) = policy.write_deadline.remaining() else {
-        attempt.terminate(
-            ResponseEgressOutcome::DeadlineExceeded,
-            MonotonicInstant::now(),
-        );
+    let Some(remaining) = policy.write_deadline.remaining_at(clock.now()) else {
+        attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, clock.now());
         return minimal_status_response(
             StatusCode::GATEWAY_TIMEOUT,
             "response write deadline exceeded".to_owned(),
@@ -271,18 +266,15 @@ async fn convert_egress_envelope(egress: ResponseEgressEnvelope) -> Response<Axu
     let result = match timeout(remaining, into_axum_response(response)).await {
         Ok(result) => result,
         Err(_elapsed) => {
-            attempt.terminate(
-                ResponseEgressOutcome::DeadlineExceeded,
-                MonotonicInstant::now(),
-            );
+            attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, clock.now());
             return minimal_status_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "response write deadline exceeded".to_owned(),
             );
         }
     };
-    let observed_at = MonotonicInstant::now();
-    if policy.write_deadline.is_expired() {
+    let observed_at = clock.now();
+    if policy.write_deadline.is_expired_at(observed_at) {
         attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, observed_at);
         return minimal_status_response(
             StatusCode::GATEWAY_TIMEOUT,
@@ -346,7 +338,9 @@ mod tests {
     use edgezero_core::key_value_store::KvStore;
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::outbound::OutboundRequest;
-    use edgezero_core::response_egress::{ResponseEgressObserver, ResponseEgressReport};
+    use edgezero_core::response_egress::{
+        ResponseEgressObserver, ResponseEgressPolicy, ResponseEgressReport,
+    };
     use edgezero_core::router::{RouteMetadata, RouteResolution};
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures_util::stream::poll_fn;
@@ -893,6 +887,53 @@ mod tests {
             observed[0].route.as_ref().map(RouteMetadata::pattern),
             Some("/observed")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_clock_controls_response_write_deadline() {
+        let router = RouterService::builder()
+            .get("/deadline", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("too late")
+            })
+            .build();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let start = MonotonicInstant::now();
+        let observed_now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&observed_now);
+        let policy_now = Arc::clone(&observed_now);
+        let mut app = App::new(router);
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            *clock_now.lock().expect("clock lock")
+        }));
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        app.set_response_egress_policy(move |_head, started_at| {
+            let deadline = started_at
+                .checked_add(Duration::from_secs(1))
+                .expect("write deadline");
+            *policy_now.lock().expect("clock lock") = deadline;
+            ResponseEgressPolicy {
+                write_deadline: Deadline::at_instant(deadline),
+            }
+        });
+        let request = Request::builder()
+            .method("GET")
+            .uri("/deadline")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = EdgeZeroAxumService::from_app(app)
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let observed = reports.lock().expect("reports lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].outcome, ResponseEgressOutcome::DeadlineExceeded);
+        assert_eq!(observed[0].elapsed, Duration::from_secs(1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1504,6 +1504,7 @@ mod tests {
             ".max_response_bytes(",
             ".max_response_header_bytes(",
             ".max_response_header_count(",
+            ".max_chunk_bytes(",
             ".max_brotli_window_bits(",
             ".max_brotli_decoder_bytes(",
             ".timeout(",

@@ -26,6 +26,14 @@ use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 use std::str;
 
 #[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResetContentAction {
+    Abort,
+    Disarm,
+    InspectStream,
+}
+
+#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
 pub(crate) trait HeaderSink {
     fn append(&mut self, name: &str, value: &str) -> Result<(), EdgeError>;
 }
@@ -46,6 +54,17 @@ where
         sink.append(name.as_str(), header_value)?;
     }
     Ok(())
+}
+
+#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
+fn reset_content_action(declared_body: bool, native_body_is_empty: bool) -> ResetContentAction {
+    if declared_body {
+        ResetContentAction::Abort
+    } else if native_body_is_empty {
+        ResetContentAction::Disarm
+    } else {
+        ResetContentAction::InspectStream
+    }
 }
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
@@ -69,6 +88,8 @@ mod worker_impl {
     use edgezero_core::compression::{
         ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
     };
+    #[cfg(feature = "test-utils")]
+    use edgezero_core::error::BudgetSource;
     use edgezero_core::error::{BadGatewayReason, EdgeError};
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -79,6 +100,8 @@ mod worker_impl {
         limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
+    #[cfg(feature = "test-utils")]
+    use edgezero_core::time::Deadline;
     use edgezero_core::time::{DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
     use futures_util::StreamExt as _;
     use futures_util::future::{Either, join_all, select};
@@ -89,9 +112,10 @@ mod worker_impl {
     use worker::{
         Body as WorkerBody, Delay, Headers, Method as WorkerMethod, Request as WorkerRequest,
         RequestInit, RequestRedirect, Response as WorkerResponse,
+        ResponseBody as WorkerResponseBody,
     };
 
-    use super::timeout_error;
+    use super::{ResetContentAction, reset_content_action, timeout_error};
 
     const READY_ITEM_YIELD_QUOTA: u32 = 1_024;
 
@@ -391,6 +415,7 @@ mod worker_impl {
         clock: MonotonicClock,
     ) -> Result<OutboundResponse, EdgeError> {
         budget_remaining(budget, &clock)?;
+        let response_clock = clock.clone();
         let status = StatusCode::from_u16(response.status_code()).map_err(EdgeError::internal)?;
         let mut headers = response_headers(&response)?;
         let mut header_limiter =
@@ -400,47 +425,51 @@ mod worker_impl {
         headers.insert(PROXY_HEADER, HeaderValue::from_static("cloudflare"));
 
         if disposition == ResponseBodyDisposition::FramingBodyless {
-            return Ok(OutboundResponse::new(
+            return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
                 headers,
                 Body::empty(),
+                response_clock,
             ));
         }
 
-        let declared_reset_body = matches!(
-            disposition,
-            ResponseBodyDisposition::ResetContent {
-                declared_body: true
-            }
-        );
-        let native = response_stream(&mut response)?;
-        if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
-            if !declared_reset_body {
-                let remaining = budget_remaining(budget, &clock)?;
-                let next = native.into_future();
-                let timer = Delay::from(remaining);
-                futures_util::pin_mut!(next, timer);
-                let ready = match select(next, timer).await {
-                    Either::Left((ready, _timer)) => ready,
-                    Either::Right(((), _next)) => return Err(timeout_error(budget.cause)),
-                };
-                budget_remaining(budget, &clock)?;
-                match ready {
-                    (Some(item), _rest) => {
-                        item?;
+        if let ResponseBodyDisposition::ResetContent { declared_body } = disposition {
+            match reset_content_action(
+                declared_body,
+                matches!(response.body(), WorkerResponseBody::Empty),
+            ) {
+                ResetContentAction::Abort => {}
+                ResetContentAction::Disarm => abort_guard.disarm(),
+                ResetContentAction::InspectStream => {
+                    let native = response_stream(&mut response)?;
+                    let remaining = budget_remaining(budget, &clock)?;
+                    let next = native.into_future();
+                    let timer = Delay::from(remaining);
+                    futures_util::pin_mut!(next, timer);
+                    let ready = match select(next, timer).await {
+                        Either::Left((ready, _timer)) => ready,
+                        Either::Right(((), _next)) => return Err(timeout_error(budget.cause)),
+                    };
+                    budget_remaining(budget, &clock)?;
+                    match ready {
+                        (Some(item), _rest) => {
+                            item?;
+                        }
+                        (None, _rest) => abort_guard.disarm(),
                     }
-                    (None, _rest) => abort_guard.disarm(),
                 }
             }
-            return Ok(OutboundResponse::new(
+            return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
                 headers,
                 Body::empty(),
+                response_clock,
             ));
         }
 
+        let native = response_stream(&mut response)?;
         let encoding = classify_content_encoding(&headers);
         let max_buffered = match response_mode {
             ResponseMode::Buffered { max_bytes } => Some(max_bytes),
@@ -479,7 +508,13 @@ mod worker_impl {
             }
             ResponseMode::Streamed => Body::from_stream(deadline_bound),
         };
-        Ok(OutboundResponse::new(request_method, status, headers, body))
+        Ok(OutboundResponse::new_with_monotonic_clock(
+            request_method,
+            status,
+            headers,
+            body,
+            response_clock,
+        ))
     }
 
     async fn raw_fetch(
@@ -572,6 +607,64 @@ mod worker_impl {
                 Ok(worker_body.into_inner().map(JsValue::from))
             }
         }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[inline]
+    pub async fn response_abort_lifecycle_holds_for_test() -> bool {
+        async fn run_case(
+            status: StatusCode,
+            content_length: Option<&str>,
+            start: MonotonicInstant,
+        ) -> Option<bool> {
+            let headers = Headers::new();
+            if let Some(value) = content_length {
+                headers.set("content-length", value).ok()?;
+            }
+            let response = WorkerResponse::empty()
+                .ok()?
+                .with_status(status.as_u16())
+                .with_headers(headers);
+            let controller = web_sys::AbortController::new().ok()?;
+            let signal = controller.signal();
+            let deadline = start.checked_add(Duration::from_secs(1))?;
+            let clock = MonotonicClock::new(move || start);
+            process_response(
+                response,
+                AbortGuard::new(controller),
+                Method::GET,
+                ResponseMode::Buffered { max_bytes: 64 },
+                DispatchBudget {
+                    cause: BudgetSource::PerCallTimeout,
+                    deadline: Deadline::at_instant(deadline),
+                    duration: Duration::from_secs(1),
+                },
+                1024,
+                24,
+                None,
+                None,
+                None,
+                None,
+                None,
+                clock,
+            )
+            .await
+            .ok()?;
+            Some(signal.aborted())
+        }
+
+        let start = MonotonicInstant::now();
+        matches!(
+            run_case(StatusCode::RESET_CONTENT, None, start).await,
+            Some(false)
+        ) && matches!(
+            run_case(StatusCode::RESET_CONTENT, Some("7"), start).await,
+            Some(true)
+        ) && matches!(
+            run_case(StatusCode::NO_CONTENT, None, start).await,
+            Some(true)
+        )
     }
 
     fn response_headers(response: &WorkerResponse) -> Result<HeaderMap, EdgeError> {
@@ -779,6 +872,26 @@ mod worker_impl {
             })
         }
 
+        fn constant_clock(now: MonotonicInstant) -> MonotonicClock {
+            MonotonicClock::new(move || now)
+        }
+
+        fn empty_worker_response(
+            status: StatusCode,
+            content_length: Option<&str>,
+        ) -> WorkerResponse {
+            let headers = Headers::new();
+            if let Some(value) = content_length {
+                headers
+                    .set("content-length", value)
+                    .expect("content-length");
+            }
+            WorkerResponse::empty()
+                .expect("empty response")
+                .with_status(status.as_u16())
+                .with_headers(headers)
+        }
+
         fn test_budget(start: MonotonicInstant, duration: Duration) -> DispatchBudget {
             DispatchBudget {
                 cause: BudgetSource::PerCallTimeout,
@@ -895,6 +1008,68 @@ mod worker_impl {
 
             assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
         }
+
+        #[wasm_bindgen_test]
+        async fn null_reset_content_disarms_only_without_a_declared_body() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_secs(1));
+            for (content_length, expected_aborted) in
+                [(None, false), (Some("0"), false), (Some("7"), true)]
+            {
+                let controller = web_sys::AbortController::new().expect("abort controller");
+                let signal = controller.signal();
+                let response = process_response(
+                    empty_worker_response(StatusCode::RESET_CONTENT, content_length),
+                    AbortGuard::new(controller),
+                    Method::GET,
+                    ResponseMode::Buffered { max_bytes: 64 },
+                    budget,
+                    1024,
+                    24,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    constant_clock(start),
+                )
+                .await
+                .expect("empty reset response");
+
+                assert_eq!(response.status(), StatusCode::RESET_CONTENT);
+                assert_eq!(response.body().as_bytes(), Some(&[][..]));
+                assert_eq!(signal.aborted(), expected_aborted);
+            }
+        }
+
+        #[wasm_bindgen_test]
+        async fn framing_bodyless_response_aborts_its_unread_native_body() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_secs(1));
+            let controller = web_sys::AbortController::new().expect("abort controller");
+            let signal = controller.signal();
+
+            let response = process_response(
+                empty_worker_response(StatusCode::NO_CONTENT, None),
+                AbortGuard::new(controller),
+                Method::GET,
+                ResponseMode::Buffered { max_bytes: 64 },
+                budget,
+                1024,
+                24,
+                None,
+                None,
+                None,
+                None,
+                None,
+                constant_clock(start),
+            )
+            .await
+            .expect("bodyless response");
+
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(signal.aborted());
+        }
     }
 }
 
@@ -902,6 +1077,8 @@ mod worker_impl {
 pub use worker_impl::CloudflareOutboundClient;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32", feature = "test-utils"))]
 pub use worker_impl::deferred_clock_paths_hold_for_test;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32", feature = "test-utils"))]
+pub use worker_impl::response_abort_lifecycle_holds_for_test;
 
 #[cfg(any(
     all(feature = "cloudflare", target_arch = "wasm32"),
@@ -1014,5 +1191,19 @@ mod header_bridge_tests {
         .expect("copy UTF-8 response header");
 
         assert_eq!(sink.0.get("x-label"), Some(&vec!["caf\u{e9}".to_owned()]));
+    }
+
+    #[test]
+    fn reset_content_null_body_selects_abort_or_disarm_without_streaming() {
+        assert_eq!(
+            reset_content_action(false, true),
+            ResetContentAction::Disarm
+        );
+        assert_eq!(reset_content_action(true, true), ResetContentAction::Abort);
+        assert_eq!(
+            reset_content_action(false, false),
+            ResetContentAction::InspectStream
+        );
+        assert_eq!(reset_content_action(true, false), ResetContentAction::Abort);
     }
 }

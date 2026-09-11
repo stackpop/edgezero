@@ -16,6 +16,11 @@ change `Body`, `proxy`, or an adapter while landing the error/time primitives.
 
 **Tech Stack:** Rust 1.95 (edition 2024), `thiserror`, `serde_json`, `web-time` (behind the public `MonotonicInstant` alias), `futures::executor::block_on` for async tests.
 
+> **Post-Phase 1a note:** later ingress/outbound hardening added the EdgeZero-owned
+> `MonotonicClock` handle and made `Deadline::{is_expired_at,remaining_at}` public so one
+> application clock can be paired across deferred work. The implementation excerpt below records
+> the smaller Phase 1a landing shape; the current API is normative in the outbound design.
+
 ## Global Constraints (from the master design and phase index)
 
 - **WASM-first:** no `tokio`/runtime deps; public APIs use

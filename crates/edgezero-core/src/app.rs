@@ -205,6 +205,7 @@ impl App {
             route,
             self.response_egress_policy(),
             self.response_egress_observer(),
+            self.monotonic_clock(),
         )
     }
 
@@ -892,6 +893,10 @@ mod tests {
         });
         app.set_response_egress_observer(AppEgressObserver(Arc::clone(&reports)));
         let request_start = MonotonicInstant::now();
+        let started_at = request_start
+            .checked_add(Duration::from_millis(5))
+            .expect("egress start");
+        app.set_monotonic_clock(MonotonicClock::new(move || started_at));
         app.set_response_egress_policy(move |head, egress_started_at| {
             assert_eq!(head.request_start(), request_start);
             assert_eq!(
@@ -918,9 +923,9 @@ mod tests {
         else {
             panic!("expected refusal");
         };
-        let started_at = MonotonicInstant::now();
-        let (response, _, mut attempt) = egress.begin(started_at).expect("begin egress");
+        let (response, _, mut attempt, egress_clock) = egress.begin().expect("begin egress");
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(egress_clock.now(), started_at);
         assert!(attempt.begin_writing());
         assert!(attempt.complete(started_at));
 

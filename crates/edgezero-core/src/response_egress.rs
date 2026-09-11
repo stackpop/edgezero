@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::http::{HeaderMap, Response, StatusCode, Version};
 use crate::router::RouteMetadata;
-use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicInstant};
+use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
 
 /// Portable response-write budget used when an application installs no policy.
 pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
@@ -157,6 +157,7 @@ pub struct ResponseEgressObserverHandle {
 /// Adapter-facing response plus immutable ingress metadata and app-owned egress hooks.
 #[doc(hidden)]
 pub struct ResponseEgressEnvelope {
+    clock: MonotonicClock,
     observer: ResponseEgressObserverHandle,
     policy: ResponseEgressPolicyCallback,
     request_start: MonotonicInstant,
@@ -173,9 +174,16 @@ impl ResponseEgressEnvelope {
     #[inline]
     pub fn begin(
         self,
-        egress_started_at: MonotonicInstant,
-    ) -> Result<(Response, ResponseEgressPolicy, ResponseEgressAttempt), ResponseEgressOutcome>
-    {
+    ) -> Result<
+        (
+            Response,
+            ResponseEgressPolicy,
+            ResponseEgressAttempt,
+            MonotonicClock,
+        ),
+        ResponseEgressOutcome,
+    > {
+        let egress_started_at = self.clock.now();
         let head = ResponseEgressHead::new(
             self.response.status(),
             self.response.version(),
@@ -183,7 +191,12 @@ impl ResponseEgressEnvelope {
             self.request_start,
             self.route.as_ref(),
         );
-        let mut attempt = ResponseEgressAttempt::new(&head, egress_started_at, self.observer);
+        let mut attempt = ResponseEgressAttempt::new_with_clock(
+            &head,
+            egress_started_at,
+            self.observer,
+            self.clock.clone(),
+        );
         let Ok(selected_policy) =
             catch_unwind(AssertUnwindSafe(|| (self.policy)(&head, egress_started_at)))
         else {
@@ -198,7 +211,7 @@ impl ResponseEgressEnvelope {
                 return Err(outcome);
             }
         };
-        Ok((self.response, normalized_policy, attempt))
+        Ok((self.response, normalized_policy, attempt, self.clock))
     }
 
     /// Extracts the response for low-level callers that do not own a platform converter.
@@ -214,8 +227,10 @@ impl ResponseEgressEnvelope {
         route: Option<RouteMetadata>,
         policy: ResponseEgressPolicyCallback,
         observer: ResponseEgressObserverHandle,
+        clock: MonotonicClock,
     ) -> Self {
         Self {
+            clock,
             observer,
             policy,
             request_start,
@@ -265,6 +280,7 @@ enum AttemptState {
 #[doc(hidden)]
 pub struct ResponseEgressAttempt {
     bytes_written: u64,
+    clock: MonotonicClock,
     egress_started_at: MonotonicInstant,
     observer: ResponseEgressObserverHandle,
     request_start: MonotonicInstant,
@@ -324,8 +340,18 @@ impl ResponseEgressAttempt {
         egress_started_at: MonotonicInstant,
         observer: ResponseEgressObserverHandle,
     ) -> Self {
+        Self::new_with_clock(head, egress_started_at, observer, MonotonicClock::default())
+    }
+
+    fn new_with_clock(
+        head: &ResponseEgressHead<'_>,
+        egress_started_at: MonotonicInstant,
+        observer: ResponseEgressObserverHandle,
+        clock: MonotonicClock,
+    ) -> Self {
         Self {
             bytes_written: 0,
+            clock,
             egress_started_at,
             observer,
             request_start: head.request_start(),
@@ -398,7 +424,7 @@ impl Drop for ResponseEgressAttempt {
             AttemptState::Writing => ResponseEgressOutcome::TransportError,
             AttemptState::Terminal(_) => return,
         };
-        self.transition(outcome, MonotonicInstant::now());
+        self.transition(outcome, self.clock.now());
     }
 }
 
@@ -426,7 +452,7 @@ mod tests {
     use super::*;
     use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, Version};
     use crate::router::RouteMetadata;
-    use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicInstant};
+    use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
 
     #[derive(Clone, Default)]
     struct RecordingObserver {
@@ -662,6 +688,27 @@ mod tests {
         assert!(disconnected.terminate(ResponseEgressOutcome::ClientDisconnected, started_at));
         drop(disconnected);
         assert_eq!(disconnected_observer.reports().len(), 1);
+    }
+
+    #[test]
+    fn dropped_attempt_uses_its_injected_clock() {
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let completed_at = started_at
+            .checked_add(Duration::from_millis(17))
+            .expect("completed instant");
+        let clock = MonotonicClock::new(move || completed_at);
+        let headers = HeaderMap::new();
+        let head = head(&headers, started_at, None);
+
+        drop(ResponseEgressAttempt::new_with_clock(
+            &head,
+            started_at,
+            ResponseEgressObserverHandle::new(observer.clone()),
+            clock,
+        ));
+
+        assert_eq!(observer.reports()[0].elapsed, Duration::from_millis(17));
     }
 
     #[test]

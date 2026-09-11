@@ -1,5 +1,6 @@
 use std::env;
 use std::io::Error as IoError;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ const MAX_FANOUT_INPUT_BYTES: usize = 0x4000;
 const MAX_FANOUT_REQUESTS: usize = 8;
 const MAX_FINAL_RESPONSE_BYTES: u64 = 0x0020_0000;
 const MAX_OUTBOUND_REQUEST_BODY_BYTES: u64 = 0x0010_0000;
+const MAX_RESPONSE_CHUNK_BYTES: u64 = 0x0001_0000;
 const MAX_RESPONSE_HEADER_BYTES: u64 = 0x0001_0000;
 const MAX_RESPONSE_HEADER_COUNT: u64 = 100;
 // 512 (KV key limit) - 5 (len of "note:") = 507
@@ -243,6 +245,7 @@ fn outbound_policy(request: OutboundRequest) -> OutboundRequest {
         .max_encoded_response_bytes(MAX_ENCODED_RESPONSE_BYTES)
         .max_request_body_bytes(MAX_OUTBOUND_REQUEST_BODY_BYTES)
         .max_response_bytes(MAX_FINAL_RESPONSE_BYTES)
+        .max_chunk_bytes(NonZeroU64::new(MAX_RESPONSE_CHUNK_BYTES).unwrap_or(NonZeroU64::MIN))
         .max_response_header_bytes(MAX_RESPONSE_HEADER_BYTES)
         .max_response_header_count(MAX_RESPONSE_HEADER_COUNT)
         .timeout(OUTBOUND_REQUEST_TIMEOUT)
@@ -655,6 +658,10 @@ mod tests {
         assert_eq!(
             parts.max_response_header_count,
             Some(MAX_RESPONSE_HEADER_COUNT)
+        );
+        assert_eq!(
+            parts.max_chunk_bytes,
+            Some(NonZeroU64::new(MAX_RESPONSE_CHUNK_BYTES).unwrap_or(NonZeroU64::MIN))
         );
         assert_eq!(parts.max_brotli_window_bits, MAX_BROTLI_WINDOW_BITS);
         assert_eq!(parts.max_brotli_decoder_bytes, MAX_BROTLI_DECODER_BYTES);

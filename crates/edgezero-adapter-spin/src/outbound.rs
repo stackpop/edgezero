@@ -519,6 +519,8 @@ mod spin_impl {
             Body::Stream(source) => source,
         };
 
+        // `BodyWriter` configures `result_writer` to publish a typed host error on drop.
+        // Deadline returns can therefore signal failure without awaiting after budget expiry.
         while let Some(item) = source.next().await {
             budget_remaining(budget, &clock)?;
             let bytes = match item {
@@ -594,6 +596,7 @@ mod spin_impl {
         clock: MonotonicClock,
     ) -> Result<OutboundResponse, EdgeError> {
         budget_remaining(budget, &clock)?;
+        let response_clock = clock.clone();
         let status = StatusCode::from_u16(response.get_status_code()).map_err(|_error| {
             EdgeError::bad_gateway_with_reason(
                 "Spin returned an invalid upstream status code",
@@ -610,11 +613,12 @@ mod spin_impl {
         let native = super::cooperative_stream(response_stream(response, budget, clock.clone()));
         if disposition == ResponseBodyDisposition::FramingBodyless {
             drain_response(native, budget, &clock).await?;
-            return Ok(OutboundResponse::new(
+            return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
                 headers,
                 Body::empty(),
+                response_clock,
             ));
         }
 
@@ -628,11 +632,12 @@ mod spin_impl {
             if !declared_reset_body {
                 drain_response(native, budget, &clock).await?;
             }
-            return Ok(OutboundResponse::new(
+            return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
                 headers,
                 Body::empty(),
+                response_clock,
             ));
         }
 
@@ -674,7 +679,13 @@ mod spin_impl {
             }
             ResponseMode::Streamed => Body::from_stream(deadline_bound),
         };
-        Ok(OutboundResponse::new(request_method, status, headers, body))
+        Ok(OutboundResponse::new_with_monotonic_clock(
+            request_method,
+            status,
+            headers,
+            body,
+            response_clock,
+        ))
     }
 
     fn response_headers(response: &Response) -> Result<HeaderMap, EdgeError> {
@@ -1164,7 +1175,7 @@ mod exchange_tests {
 
     use super::{
         EdgeError, READY_ITEM_YIELD_QUOTA, UploadCompletion, cooperative_stream,
-        cooperative_yield_once, request_body_limit, request_timeouts, run_exchange,
+        cooperative_yield_once, duration_nanos, request_body_limit, request_timeouts, run_exchange,
     };
 
     struct ScriptedFuture<Output> {
@@ -1249,6 +1260,14 @@ mod exchange_tests {
         assert_eq!(timeouts.connect, 40_000_000);
         assert_eq!(timeouts.first_byte, 40_000_000);
         assert_eq!(timeouts.between_bytes, 40_000_000);
+    }
+
+    #[test]
+    fn duration_nanos_floors_and_saturates_without_wrapping() {
+        assert_eq!(duration_nanos(Duration::ZERO), 1);
+        assert_eq!(duration_nanos(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_nanos(Duration::from_nanos(999)), 999);
+        assert_eq!(duration_nanos(Duration::MAX), u64::MAX);
     }
 
     #[test]

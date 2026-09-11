@@ -566,6 +566,7 @@ mod tests {
         use edgezero_adapter_spin::request::{
             dispatch_ingress_stream_for_test, dispatch_request_for_test,
         };
+        use edgezero_adapter_spin::response::response_write_deadline_uses_injected_clock_for_test;
         use edgezero_core::http::{HeaderMap, HeaderValue, Method};
         use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
         use edgezero_core::middleware::{Middleware, Next};
@@ -637,8 +638,50 @@ mod tests {
         }
 
         #[test]
+        fn send_all_preserves_three_preflight_slots_in_input_order() {
+            let now = MonotonicInstant::now();
+            let client = SpinOutboundClient::with_clock(MonotonicClock::new(move || now));
+            let streamed_upload = OutboundRequest::post("https://example.com/upload")
+                .expect("upload request")
+                .body(Body::stream(stream::iter([Bytes::from_static(b"body")])));
+            let streamed_response = OutboundRequest::get("https://example.com/stream")
+                .expect("stream request")
+                .stream_response();
+            let method_error = OutboundRequest::get("https://example.com/get")
+                .expect("GET request")
+                .body(Body::stream(stream::iter([Bytes::new()])));
+
+            let results =
+                block_on(client.send_all(vec![streamed_upload, streamed_response, method_error]));
+            let messages: Vec<_> = results
+                .iter()
+                .map(|slot| match &slot.outcome {
+                    Err(EdgeError::BadRequest { message }) => message.as_str(),
+                    other => panic!("expected preflight rejection, got {other:?}"),
+                })
+                .collect();
+
+            assert_eq!(
+                messages,
+                [
+                    "send_all requires buffered request bodies; use send for a streamed upload",
+                    "send_all requires buffered responses; use send for a streamed response",
+                    "GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream",
+                ]
+            );
+            assert!(results.iter().all(|slot| slot.elapsed == Duration::ZERO));
+        }
+
+        #[test]
         fn deferred_request_and_response_paths_retain_the_injected_clock() {
             assert!(block_on(deferred_clock_paths_hold_for_test()));
+        }
+
+        #[test]
+        fn response_write_deadline_uses_the_injected_clock() {
+            assert!(block_on(
+                response_write_deadline_uses_injected_clock_for_test()
+            ));
         }
 
         #[test]
