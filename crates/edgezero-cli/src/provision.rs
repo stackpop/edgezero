@@ -2948,8 +2948,15 @@ ids = ["default"]
         // When TMPDIR points into a `crate = "."` project, the staging tempdir
         // would be a DESCENDANT of the project, so copying the crate (== the
         // project) into it recurses without bound. It must be refused.
-        use edgezero_core::test_env::{EnvOverride, env_lock};
-        let _lock = env_lock().lock().expect("env lock");
+        // `TMPDIR` is process-global AND `TempDir::new()` reads it, so an
+        // unsynchronised override here silently redirects every CONCURRENT
+        // test's tempdir into `inside` -- which this test then deletes,
+        // making their `fs::write` fail with ENOENT. `env_lock()` is a
+        // DIFFERENT mutex from the `manifest_guard()` the other env-mutating
+        // tests in this binary hold, so it provides no exclusion against
+        // them. Take `manifest_guard()` to actually serialise.
+        use edgezero_core::test_env::EnvOverride;
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let project = tempfile::TempDir::new().unwrap();
         fs::write(project.path().join("edgezero.toml"), "x").unwrap();
         let inside = project.path().join("inside-tmp");
