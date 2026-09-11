@@ -1364,6 +1364,51 @@ mod tests {
     /// templates shipped a production `.expect(...)` in the `stream` handler,
     /// infallible `IntoResponse` test usage, and adapter host stubs that
     /// tripped `print_stderr` / `exit`.
+    fn assert_generated_fallback_policy(core_lib: &str) {
+        assert!(
+            core_lib.contains("AdmissionDecision::ReadBodyBeforeFallback")
+                && core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
+                && core_lib
+                    .contains("grant: IngressGrant::new(AdmissionLease { route_class: None })")
+                && core_lib.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
+                && core_lib.contains(concat!(
+                    "on_exceeded: BufferedIngressResponse::text(\n",
+                    "                    StatusCode::BAD_REQUEST,\n",
+                    "                    \"request body too large\\n\",\n",
+                    "                ),",
+                ))
+                && core_lib.contains(concat!(
+                    "on_timeout: BufferedIngressResponse::text(\n",
+                    "                    StatusCode::REQUEST_TIMEOUT,\n",
+                    "                    \"request timeout\\n\",\n",
+                    "                ),",
+                )),
+            "generated admission policy must own the fallback lease and exact terminal responses",
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "generated admission policy must own the fallback lease and exact terminal responses"
+    )]
+    fn generated_fallback_policy_rejects_swapped_terminal_mappings() {
+        assert_generated_fallback_policy(
+            r#"AdmissionDecision::ReadBodyBeforeFallback {
+                grant: IngressGrant::new(AdmissionLease { route_class: None }),
+                max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
+                on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),
+                on_timeout: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+            }
+            const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;"#,
+        );
+    }
+
     fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
         let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
             .expect("read core lib.rs");
@@ -1379,20 +1424,7 @@ mod tests {
             core_lib.contains("IngressGrant::new"),
             "generated admission policy must issue an app-owned grant",
         );
-        assert!(
-            core_lib.contains("AdmissionDecision::ReadBodyBeforeFallback")
-                && core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
-                && core_lib
-                    .contains("grant: IngressGrant::new(AdmissionLease { route_class: None })")
-                && core_lib.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
-                && core_lib.contains("on_exceeded: BufferedIngressResponse::text(")
-                && core_lib.contains("StatusCode::BAD_REQUEST")
-                && core_lib.contains("\"request body too large\\n\"")
-                && core_lib.contains("on_timeout: BufferedIngressResponse::text(")
-                && core_lib.contains("StatusCode::REQUEST_TIMEOUT")
-                && core_lib.contains("\"request timeout\\n\""),
-            "generated admission policy must own the fallback lease and exact terminal responses",
-        );
+        assert_generated_fallback_policy(&core_lib);
 
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");
