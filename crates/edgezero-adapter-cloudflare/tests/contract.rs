@@ -315,6 +315,7 @@ mod tests {
 
     #[cfg(feature = "test-utils")]
     mod ingress_contract {
+        use std::future::Future as _;
         use std::io;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::task::Poll;
@@ -325,7 +326,9 @@ mod tests {
         use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
         use edgezero_core::middleware::{Middleware, Next};
         use edgezero_core::router::RouteResolution;
+        use futures::future::poll_fn as poll_future;
         use futures::stream::poll_fn;
+        use worker::{Delay, Response as CfResponse};
 
         use super::*;
 
@@ -417,6 +420,13 @@ mod tests {
             BufferedIngressResponse::new(status, terminal_headers(marker), Bytes::from_static(body))
         }
 
+        fn internal_error_headers() -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-length", HeaderValue::from_static("76"));
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers
+        }
+
         fn tracked_stream(
             chunks: Vec<Bytes>,
             grant_drops: &Arc<AtomicUsize>,
@@ -451,20 +461,56 @@ mod tests {
             })
         }
 
+        fn error_stream(
+            grant_drops: &Arc<AtomicUsize>,
+            source_drops: &Arc<AtomicUsize>,
+            body_polls: &Arc<AtomicUsize>,
+        ) -> impl futures::Stream<Item = Result<Bytes, io::Error>> + 'static {
+            let observed_grant_drops = Arc::clone(grant_drops);
+            let observed_body_polls = Arc::clone(body_polls);
+            let source_drop = DropSignal(Arc::clone(source_drops));
+            let mut emitted = false;
+            poll_fn(move |_cx| {
+                let _keep_source_alive = &source_drop;
+                assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
+                observed_body_polls.fetch_add(1, Ordering::SeqCst);
+                if emitted {
+                    Poll::Ready(None)
+                } else {
+                    emitted = true;
+                    Poll::Ready(Some(Err(io::Error::other(
+                        "cloudflare ingress source failure",
+                    ))))
+                }
+            })
+        }
+
         fn assert_no_route_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
             assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
             assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
         }
 
-        fn assert_terminal_response(
-            response: &Response,
+        async fn assert_terminal_response(
+            mut response: CfResponse,
             status: StatusCode,
-            marker: &'static str,
+            expected_headers: HeaderMap,
             body: &[u8],
         ) {
-            assert_eq!(response.status(), status);
-            assert_eq!(response.headers(), &terminal_headers(marker));
-            assert_eq!(response.body().as_bytes().expect("buffered body"), body);
+            assert_eq!(response.status_code(), status.as_u16());
+            let mut actual_headers = response.headers().entries().collect::<Vec<_>>();
+            actual_headers.sort_unstable();
+            let mut expected_provider_headers = expected_headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_owned(),
+                        value.to_str().expect("UTF-8 test header").to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            expected_provider_headers.sort_unstable();
+            assert_eq!(actual_headers, expected_provider_headers);
+            assert_eq!(response.bytes().await.expect("provider body"), body);
         }
 
         #[wasm_bindgen_test]
@@ -494,7 +540,7 @@ mod tests {
                 .await
                 .expect("response");
 
-                assert_eq!(response.status(), expected_status);
+                assert_eq!(response.status_code(), expected_status.as_u16());
                 assert_eq!(body_polls.load(Ordering::SeqCst), 3);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
@@ -527,11 +573,12 @@ mod tests {
                 .expect("response");
 
                 assert_terminal_response(
-                    &response,
+                    response,
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    "overflow",
+                    terminal_headers("overflow"),
                     b"cloudflare overflow\0response",
-                );
+                )
+                .await;
                 assert_eq!(body_polls.load(Ordering::SeqCst), 2);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
@@ -540,7 +587,7 @@ mod tests {
         }
 
         #[wasm_bindgen_test]
-        async fn deployed_timer_timeout_preserves_application_response() {
+        async fn wasm_timer_timeout_preserves_application_response() {
             for path in ["/missing", "/known"] {
                 let grant_drops = Arc::new(AtomicUsize::new(0));
                 let source_drops = Arc::new(AtomicUsize::new(0));
@@ -559,11 +606,12 @@ mod tests {
                 .expect("response");
 
                 assert_terminal_response(
-                    &response,
+                    response,
                     StatusCode::GATEWAY_TIMEOUT,
-                    "timeout",
+                    terminal_headers("timeout"),
                     b"cloudflare timeout response\n",
-                );
+                )
+                .await;
                 assert!(body_polls.load(Ordering::SeqCst) > 0);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
@@ -573,21 +621,61 @@ mod tests {
 
         #[wasm_bindgen_test]
         async fn saturated_fallback_refuses_without_polling_body() {
+            for path in ["/missing", "/known"] {
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let body_polls = Arc::new(AtomicUsize::new(0));
+                let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+                app.set_ingress_admission_policy(|head| {
+                    assert!(matches!(
+                        head.route_resolution(),
+                        RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
+                    ));
+                    AdmissionDecision::Refuse(
+                        response_builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("x-ingress-refusal", "saturated")
+                            .body(Body::from("cloudflare unavailable\n"))
+                            .expect("refusal response"),
+                    )
+                });
+                let unobserved_grant = Arc::new(AtomicUsize::new(0));
+                let source = pending_stream(&unobserved_grant, &source_drops, &body_polls);
+
+                let response = dispatch_ingress_stream_for_test(
+                    &app,
+                    Method::POST,
+                    path.parse().expect("URI"),
+                    source,
+                )
+                .await
+                .expect("response");
+
+                assert_terminal_response(
+                    response,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    {
+                        let mut headers = HeaderMap::new();
+                        headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
+                        headers
+                    },
+                    b"cloudflare unavailable\n",
+                )
+                .await;
+                assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+                assert_eq!(unobserved_grant.load(Ordering::SeqCst), 0);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            }
+        }
+
+        #[wasm_bindgen_test]
+        async fn source_error_uses_worker_response_boundary_and_releases_lifecycle() {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
             let source_drops = Arc::new(AtomicUsize::new(0));
             let body_polls = Arc::new(AtomicUsize::new(0));
-            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
-            app.set_ingress_admission_policy(|head| {
-                assert!(matches!(head.route_resolution(), RouteResolution::NotFound));
-                AdmissionDecision::Refuse(
-                    response_builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .header("x-ingress-refusal", "saturated")
-                        .body(Body::from("cloudflare unavailable\n"))
-                        .expect("refusal response"),
-                )
-            });
-            let unobserved_grant = Arc::new(AtomicUsize::new(0));
-            let source = pending_stream(&unobserved_grant, &source_drops, &body_polls);
+            let (app, handler_calls, middleware_calls) =
+                fallback_app(4, Duration::from_secs(30), &grant_drops);
+            let source = error_stream(&grant_drops, &source_drops, &body_polls);
 
             let response = dispatch_ingress_stream_for_test(
                 &app,
@@ -596,17 +684,48 @@ mod tests {
                 source,
             )
             .await
-            .expect("response");
+            .expect("standard error response");
 
-            let mut expected_headers = HeaderMap::new();
-            expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(response.headers(), &expected_headers);
-            assert_eq!(
-                response.body().as_bytes().expect("buffered body"),
-                b"cloudflare unavailable\n"
-            );
-            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+            assert_terminal_response(
+                response,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                internal_error_headers(),
+                br#"{"error":{"kind":"internal","message":"internal server error","status":500}}"#,
+            )
+            .await;
+            assert_eq!(body_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_route_dispatch(&handler_calls, &middleware_calls);
+        }
+
+        #[wasm_bindgen_test]
+        async fn poll_then_drop_releases_pending_source_and_grant() {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                fallback_app(4, Duration::from_secs(30), &grant_drops);
+            let source = pending_stream(&grant_drops, &source_drops, &body_polls);
+            let mut dispatch = Box::pin(dispatch_ingress_stream_for_test(
+                &app,
+                Method::POST,
+                "/missing".parse().expect("URI"),
+                source,
+            ));
+
+            let first_poll = poll_future(|cx| Poll::Ready(dispatch.as_mut().poll(cx))).await;
+            assert!(first_poll.is_pending());
+            Delay::from(Duration::ZERO).await;
+            let source_poll = poll_future(|cx| Poll::Ready(dispatch.as_mut().poll(cx))).await;
+            assert!(source_poll.is_pending());
+            assert!(body_polls.load(Ordering::SeqCst) > 0);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+
+            drop(dispatch);
+
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             assert_eq!(source_drops.load(Ordering::SeqCst), 1);
             assert_no_route_dispatch(&handler_calls, &middleware_calls);
         }

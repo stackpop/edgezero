@@ -271,6 +271,26 @@ mod tests {
             _source_drop: DropSignal,
         }
 
+        struct ErrorReader {
+            body_reads: Arc<AtomicUsize>,
+            grant_drops: Arc<AtomicUsize>,
+            _source_drop: DropSignal,
+        }
+
+        #[expect(
+            clippy::missing_trait_methods,
+            reason = "the test source only needs the production wrapper's read method"
+        )]
+        impl Read for ErrorReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                if self.grant_drops.load(Ordering::SeqCst) != 0 {
+                    return Err(io::Error::other("ingress grant dropped during body read"));
+                }
+                self.body_reads.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("fastly ingress source failure"))
+            }
+        }
+
         #[expect(
             clippy::missing_trait_methods,
             reason = "the test source only needs the production wrapper's read method"
@@ -307,6 +327,18 @@ mod tests {
                 body_reads: Arc::clone(body_reads),
                 chunks: chunks.into(),
                 expire_on_read,
+                grant_drops: Arc::clone(grant_drops),
+                _source_drop: DropSignal(Arc::clone(source_drops)),
+            }
+        }
+
+        fn error_reader(
+            grant_drops: &Arc<AtomicUsize>,
+            source_drops: &Arc<AtomicUsize>,
+            body_reads: &Arc<AtomicUsize>,
+        ) -> ErrorReader {
+            ErrorReader {
+                body_reads: Arc::clone(body_reads),
                 grant_drops: Arc::clone(grant_drops),
                 _source_drop: DropSignal(Arc::clone(source_drops)),
             }
@@ -378,20 +410,33 @@ mod tests {
             BufferedIngressResponse::new(status, terminal_headers(marker), Bytes::from_static(body))
         }
 
+        fn internal_error_headers() -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-length", HeaderValue::from_static("76"));
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers
+        }
+
         fn assert_no_route_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
             assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
             assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
         }
 
         fn assert_terminal_response(
-            response: &Response,
+            mut response: fastly::Response,
             status: StatusCode,
-            marker: &'static str,
+            expected_headers: &HeaderMap,
             body: &[u8],
         ) {
-            assert_eq!(response.status(), status);
-            assert_eq!(response.headers(), &terminal_headers(marker));
-            assert_eq!(response.body().as_bytes().expect("buffered body"), body);
+            assert_eq!(response.get_status().as_u16(), status.as_u16());
+            let mut actual_headers = HeaderMap::new();
+            for name in response.get_header_names() {
+                for value in response.get_header_all(name) {
+                    actual_headers.append(name.clone(), value.clone());
+                }
+            }
+            assert_eq!(&actual_headers, expected_headers);
+            assert_eq!(response.take_body_bytes(), body);
         }
 
         #[test]
@@ -421,7 +466,7 @@ mod tests {
                 )
                 .expect("response");
 
-                assert_eq!(response.status(), expected_status);
+                assert_eq!(response.get_status().as_u16(), expected_status.as_u16());
                 assert_eq!(body_reads.load(Ordering::SeqCst), 3);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
@@ -454,9 +499,9 @@ mod tests {
                 .expect("response");
 
                 assert_terminal_response(
-                    &response,
+                    response,
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    "overflow",
+                    &terminal_headers("overflow"),
                     b"fastly overflow\0response",
                 );
                 assert_eq!(body_reads.load(Ordering::SeqCst), 2);
@@ -493,9 +538,9 @@ mod tests {
                 .expect("response");
 
                 assert_terminal_response(
-                    &response,
+                    response,
                     StatusCode::GATEWAY_TIMEOUT,
-                    "timeout",
+                    &terminal_headers("timeout"),
                     b"fastly timeout response\n",
                 );
                 assert_eq!(body_reads.load(Ordering::SeqCst), 0);
@@ -537,9 +582,9 @@ mod tests {
                 .expect("response");
 
                 assert_terminal_response(
-                    &response,
+                    response,
                     StatusCode::GATEWAY_TIMEOUT,
-                    "timeout",
+                    &terminal_headers("timeout"),
                     b"fastly timeout response\n",
                 );
                 assert_eq!(body_reads.load(Ordering::SeqCst), 1);
@@ -551,27 +596,72 @@ mod tests {
 
         #[test]
         fn saturated_fallback_refuses_without_reading_body() {
+            for path in ["/missing", "/known"] {
+                let grant_drops = Arc::new(AtomicUsize::new(0));
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let body_reads = Arc::new(AtomicUsize::new(0));
+                let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+                app.set_ingress_admission_policy(|head| {
+                    assert!(matches!(
+                        head.route_resolution(),
+                        RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
+                    ));
+                    AdmissionDecision::Refuse(
+                        response_builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("x-ingress-refusal", "saturated")
+                            .body(Body::from("fastly unavailable\n"))
+                            .expect("refusal response"),
+                    )
+                });
+                let reader = tracked_reader(
+                    vec![Bytes::from_static(b"body")],
+                    &grant_drops,
+                    &source_drops,
+                    &body_reads,
+                    None,
+                );
+
+                let mut response = dispatch_ingress_reader_for_test(
+                    &app,
+                    Method::POST,
+                    path.parse().expect("URI"),
+                    reader,
+                )
+                .expect("response");
+
+                let mut expected_headers = HeaderMap::new();
+                expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
+                assert_eq!(
+                    response.get_status().as_u16(),
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16()
+                );
+                let mut actual_headers = HeaderMap::new();
+                for name in response.get_header_names() {
+                    for value in response.get_header_all(name) {
+                        actual_headers.append(name.clone(), value.clone());
+                    }
+                }
+                assert_eq!(actual_headers, expected_headers);
+                assert_eq!(response.take_body_bytes(), b"fastly unavailable\n");
+                assert_eq!(body_reads.load(Ordering::SeqCst), 0);
+                assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            }
+        }
+
+        // Fastly exposes the inbound body as synchronous `Read`; there is no
+        // pending future boundary at which a poll-then-drop cancellation can be
+        // represented. Source-error termination is the available lifecycle seam.
+        #[test]
+        fn synchronous_source_error_uses_fastly_response_boundary_and_releases_lifecycle() {
             let grant_drops = Arc::new(AtomicUsize::new(0));
             let source_drops = Arc::new(AtomicUsize::new(0));
             let body_reads = Arc::new(AtomicUsize::new(0));
-            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
-            app.set_ingress_admission_policy(|head| {
-                assert!(matches!(head.route_resolution(), RouteResolution::NotFound));
-                AdmissionDecision::Refuse(
-                    response_builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .header("x-ingress-refusal", "saturated")
-                        .body(Body::from("fastly unavailable\n"))
-                        .expect("refusal response"),
-                )
-            });
-            let reader = tracked_reader(
-                vec![Bytes::from_static(b"body")],
-                &grant_drops,
-                &source_drops,
-                &body_reads,
-                None,
-            );
+            let (app, handler_calls, middleware_calls) =
+                fallback_app(4, Duration::from_secs(30), &grant_drops);
+            let reader = error_reader(&grant_drops, &source_drops, &body_reads);
 
             let response = dispatch_ingress_reader_for_test(
                 &app,
@@ -579,17 +669,16 @@ mod tests {
                 "/missing".parse().expect("URI"),
                 reader,
             )
-            .expect("response");
+            .expect("standard error response");
 
-            let mut expected_headers = HeaderMap::new();
-            expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(response.headers(), &expected_headers);
-            assert_eq!(
-                response.body().as_bytes().expect("buffered body"),
-                b"fastly unavailable\n"
+            assert_terminal_response(
+                response,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &internal_error_headers(),
+                br#"{"error":{"status":500,"kind":"internal","message":"internal server error"}}"#,
             );
-            assert_eq!(body_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(body_reads.load(Ordering::SeqCst), 1);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             assert_eq!(source_drops.load(Ordering::SeqCst), 1);
             assert_no_route_dispatch(&handler_calls, &middleware_calls);
         }
