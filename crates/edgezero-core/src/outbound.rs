@@ -23,7 +23,7 @@ use crate::http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
     response_builder,
 };
-use crate::time::Deadline;
+use crate::time::{Deadline, MonotonicClock};
 
 pub const DEFAULT_MAX_BROTLI_DECODER_BYTES: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -101,6 +101,7 @@ pub trait OutboundHttpClient: Send + Sync {
 pub struct OutboundResponse {
     body: Body,
     headers: HeaderMap,
+    monotonic_clock: MonotonicClock,
     request_method: Method,
     status: StatusCode,
 }
@@ -255,14 +256,17 @@ impl OutboundResponse {
         max: u64,
         deadline: Deadline,
     ) -> Result<Bytes, EdgeError> {
-        ensure_deadline_live(deadline)?;
+        let clock = self.monotonic_clock.clone();
+        ensure_deadline_live(deadline, &clock)?;
         match self.body {
             Body::Once(bytes) => {
                 let outcome = validate_buffered_response_bytes(bytes, max);
-                ensure_deadline_live(deadline)?;
+                ensure_deadline_live(deadline, &clock)?;
                 outcome
             }
-            Body::Stream(stream) => collect_response_stream_until(stream, max, deadline).await,
+            Body::Stream(stream) => {
+                collect_response_stream_until_with_clock(stream, max, deadline, &clock).await
+            }
         }
     }
 
@@ -338,17 +342,39 @@ impl OutboundResponse {
     where
         Value: DeserializeOwned,
     {
+        let clock = self.monotonic_clock.clone();
         let bytes = self.into_bytes_bounded_until(max, deadline).await?;
-        ensure_deadline_live(deadline)?;
+        ensure_deadline_live(deadline, &clock)?;
         decode_json(&bytes)
     }
 
     #[must_use]
     #[inline]
     pub fn new(request_method: Method, status: StatusCode, headers: HeaderMap, body: Body) -> Self {
+        Self::new_with_monotonic_clock(
+            request_method,
+            status,
+            headers,
+            body,
+            MonotonicClock::default(),
+        )
+    }
+
+    /// Constructs an adapter response paired with its application clock.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn new_with_monotonic_clock(
+        request_method: Method,
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Body,
+        monotonic_clock: MonotonicClock,
+    ) -> Self {
         Self {
             body,
             headers,
+            monotonic_clock,
             request_method,
             status,
         }
@@ -801,14 +827,13 @@ pub fn normalize_response_headers(
     retain_utf8_header_values(headers, true);
     strip_hop_by_hop(headers, nominated, false);
 
-    if request_method == Method::HEAD
-        || status.is_informational()
-        || status == StatusCode::NO_CONTENT
-        || status == StatusCode::NOT_MODIFIED
-    {
-        if status.is_informational() || status == StatusCode::NO_CONTENT {
-            headers.remove(CONTENT_LENGTH);
-        }
+    if status.is_informational() || status == StatusCode::NO_CONTENT {
+        headers.remove(CONTENT_LENGTH);
+        return Ok(ResponseBodyDisposition::FramingBodyless);
+    }
+
+    if request_method == Method::HEAD || status == StatusCode::NOT_MODIFIED {
+        parse_content_length(headers)?;
         return Ok(ResponseBodyDisposition::FramingBodyless);
     }
 
@@ -951,17 +976,17 @@ fn canonicalize_url(raw: &str) -> Result<Uri, EdgeError> {
 async fn collect_response_stream_inner(
     mut source: BodyStream,
     max: u64,
-    optional_deadline: Option<Deadline>,
+    optional_deadline: Option<(Deadline, &MonotonicClock)>,
 ) -> Result<Bytes, EdgeError> {
     let mut collected = Vec::new();
     let mut total = 0_u64;
     loop {
-        if let Some(active_deadline) = optional_deadline {
-            ensure_deadline_live(active_deadline)?;
+        if let Some((active_deadline, clock)) = optional_deadline {
+            ensure_deadline_live(active_deadline, clock)?;
         }
         let next_item = source.next().await;
-        if let Some(active_deadline) = optional_deadline {
-            ensure_deadline_live(active_deadline)?;
+        if let Some((active_deadline, clock)) = optional_deadline {
+            ensure_deadline_live(active_deadline, clock)?;
         }
         let Some(item) = next_item else {
             return Ok(Bytes::from(collected));
@@ -973,8 +998,8 @@ async fn collect_response_stream_inner(
             .checked_add(chunk_len)
             .ok_or_else(|| response_limit_error(ResponseLimitReason::BufferedBody))?;
         if next_total > max {
-            if let Some(active_deadline) = optional_deadline {
-                ensure_deadline_live(active_deadline)?;
+            if let Some((active_deadline, clock)) = optional_deadline {
+                ensure_deadline_live(active_deadline, clock)?;
             }
             return Err(response_limit_error(ResponseLimitReason::BufferedBody));
         }
@@ -993,7 +1018,23 @@ pub async fn collect_response_stream_until(
     max: u64,
     deadline: Deadline,
 ) -> Result<Bytes, EdgeError> {
-    collect_response_stream_inner(stream, max, Some(deadline)).await
+    let clock = MonotonicClock::default();
+    collect_response_stream_until_with_clock(stream, max, deadline, &clock).await
+}
+
+/// Collects a response stream under an absolute deadline evaluated by `clock`.
+///
+/// # Errors
+/// Returns a typed buffered-body overflow or gateway timeout while preserving source errors.
+#[doc(hidden)]
+#[inline]
+pub async fn collect_response_stream_until_with_clock(
+    stream: BodyStream,
+    max: u64,
+    deadline: Deadline,
+    clock: &MonotonicClock,
+) -> Result<Bytes, EdgeError> {
+    collect_response_stream_inner(stream, max, Some((deadline, clock))).await
 }
 
 fn decode_json<Value>(bytes: &[u8]) -> Result<Value, EdgeError>
@@ -1008,8 +1049,8 @@ where
     })
 }
 
-fn ensure_deadline_live(deadline: Deadline) -> Result<(), EdgeError> {
-    if deadline.is_expired() {
+fn ensure_deadline_live(deadline: Deadline, clock: &MonotonicClock) -> Result<(), EdgeError> {
+    if deadline.is_expired_at(clock.now()) {
         Err(EdgeError::gateway_timeout("response body deadline expired"))
     } else {
         Ok(())
@@ -1228,6 +1269,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1242,8 +1284,8 @@ mod tests {
     };
     use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, request_builder};
     use crate::time::{
-        DEADLINE_FAR_FUTURE, DEFAULT_NO_DEADLINE_BUDGET, Deadline, MonotonicInstant,
-        dispatch_budget,
+        DEADLINE_FAR_FUTURE, DEFAULT_NO_DEADLINE_BUDGET, Deadline, MonotonicClock,
+        MonotonicInstant, dispatch_budget,
     };
 
     use super::{
@@ -1825,10 +1867,29 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one precedence table documents all response-normalization interactions"
-    )]
+    fn outbound_response_deadline_uses_its_injected_clock() {
+        let start = MonotonicInstant::now();
+        let observed = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&observed);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
+        let response = OutboundResponse::new_with_monotonic_clock(
+            Method::GET,
+            StatusCode::OK,
+            HeaderMap::new(),
+            Body::from("ready"),
+            clock,
+        );
+        *observed.lock().expect("clock lock") = deadline;
+
+        let error =
+            block_on(response.into_bytes_bounded_until(100, Deadline::at_instant(deadline)))
+                .expect_err("injected clock reached deadline");
+
+        assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+    }
+
+    #[test]
     fn response_normalization_precedence_table() {
         let mut nominated = HeaderMap::new();
         nominated.append(
@@ -1884,16 +1945,6 @@ mod tests {
             ));
         }
 
-        let mut head = HeaderMap::new();
-        head.append("content-length", HeaderValue::from_static("not-a-number"));
-        head.append("content-encoding", HeaderValue::from_static("gzip"));
-        assert_eq!(
-            normalize_response_headers(&Method::HEAD, StatusCode::OK, &mut head)
-                .expect("HEAD metadata"),
-            ResponseBodyDisposition::FramingBodyless
-        );
-        assert_eq!(head.get("content-length").expect("length"), "not-a-number");
-
         for status in [
             StatusCode::CONTINUE,
             StatusCode::NO_CONTENT,
@@ -1940,6 +1991,53 @@ mod tests {
         let once = idempotent.clone();
         normalize_response_headers(&Method::GET, StatusCode::OK, &mut idempotent).expect("second");
         assert_eq!(idempotent, once);
+    }
+
+    #[test]
+    fn head_and_not_modified_validate_and_retain_representation_length() {
+        for (method, status) in [
+            (Method::HEAD, StatusCode::OK),
+            (Method::GET, StatusCode::NOT_MODIFIED),
+        ] {
+            for invalid in ["not-a-number", "18446744073709551616"] {
+                let mut headers = HeaderMap::new();
+                headers.append(
+                    "content-length",
+                    HeaderValue::from_bytes(invalid.as_bytes()).expect("header value"),
+                );
+                let error = normalize_response_headers(&method, status, &mut headers)
+                    .expect_err("invalid bodyless content-length");
+                assert!(matches!(
+                    error,
+                    EdgeError::BadGateway {
+                        reason: BadGatewayReason::Protocol,
+                        ..
+                    }
+                ));
+            }
+
+            let mut conflicting = HeaderMap::new();
+            conflicting.append("content-length", HeaderValue::from_static("7"));
+            conflicting.append("content-length", HeaderValue::from_static("8"));
+            let error = normalize_response_headers(&method, status, &mut conflicting)
+                .expect_err("conflicting bodyless content-length");
+            assert!(matches!(
+                error,
+                EdgeError::BadGateway {
+                    reason: BadGatewayReason::Protocol,
+                    ..
+                }
+            ));
+
+            let mut valid = HeaderMap::new();
+            valid.append("content-length", HeaderValue::from_static("4294967296"));
+            assert_eq!(
+                normalize_response_headers(&method, status, &mut valid)
+                    .expect("valid bodyless metadata"),
+                ResponseBodyDisposition::FramingBodyless
+            );
+            assert_eq!(valid.get("content-length").expect("length"), "4294967296");
+        }
     }
 
     #[test]

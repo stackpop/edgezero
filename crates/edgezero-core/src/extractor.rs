@@ -19,7 +19,7 @@ use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
     KvRegistry, SecretRegistry,
 };
-use crate::time::{Deadline, MonotonicInstant};
+use crate::time::{Deadline, MonotonicClock};
 use serde::de::IntoDeserializer as _;
 
 #[async_trait(?Send)]
@@ -900,6 +900,7 @@ where
 /// Extraction-scoped accounting. One instance is created for each public
 /// `AppConfig` call and shared by the root blob and all secret reads.
 struct ConfigExtractionBudget {
+    clock: MonotonicClock,
     deadline: Deadline,
     max_blob_bytes: u64,
     max_secret_bytes: u64,
@@ -914,7 +915,7 @@ impl ConfigExtractionBudget {
         value_length: Option<usize>,
         max_value_bytes: u64,
     ) -> Result<(), EdgeError> {
-        if self.deadline.is_expired() {
+        if self.deadline.is_expired_at(self.clock.now()) {
             return Err(store_extraction_error(
                 StoreExtractionReason::DeadlineExceeded,
                 "typed app-config extraction deadline exceeded",
@@ -968,9 +969,12 @@ impl ConfigExtractionBudget {
         self.remaining_backend_bytes
     }
 
-    fn start(configured_limits: ConfigExtractionLimits) -> Result<Self, EdgeError> {
+    fn start(
+        configured_limits: ConfigExtractionLimits,
+        clock: MonotonicClock,
+    ) -> Result<Self, EdgeError> {
         let validated_limits = configured_limits.validate()?;
-        let started_at = MonotonicInstant::now();
+        let started_at = clock.now();
         let deadline = started_at
             .checked_add(validated_limits.timeout)
             .ok_or_else(|| {
@@ -981,6 +985,7 @@ impl ConfigExtractionBudget {
                 )
             })?;
         Ok(Self {
+            clock,
             deadline: Deadline::at_instant(deadline),
             max_blob_bytes: validated_limits.max_blob_bytes,
             max_secret_bytes: validated_limits.max_secret_bytes,
@@ -1060,7 +1065,8 @@ async fn extract_from_handle<C>(
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
-    let mut budget = ConfigExtractionBudget::start(ctx.config_extraction_limits())?;
+    let mut budget =
+        ConfigExtractionBudget::start(ctx.config_extraction_limits(), ctx.monotonic_clock())?;
     let read = handle
         .get_bounded(
             key,
@@ -1524,11 +1530,12 @@ mod tests {
     use crate::params::PathParams;
     use crate::secret_store::{InMemorySecretStore, NoopSecretStore, SecretHandle, SecretStore};
     use crate::store_registry::StoreRegistry;
+    use crate::time::{MonotonicClock, MonotonicInstant};
     use futures::executor::block_on;
     use serde::{Deserialize, Serialize};
     use std::borrow::Cow;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use validator::Validate;
 
     #[derive(Clone, Debug, PartialEq)]
@@ -2600,8 +2607,33 @@ mod tests {
         C: AppConfigMeta,
     {
         let mut budget =
-            ConfigExtractionBudget::start(ConfigExtractionLimits::default()).expect("test budget");
+            ConfigExtractionBudget::start(ConfigExtractionLimits::default(), ctx.monotonic_clock())
+                .expect("test budget");
         secret_walk::<C>(ctx, &mut budget, data).await
+    }
+
+    #[test]
+    fn config_extraction_budget_uses_the_request_clock() {
+        let start = MonotonicInstant::now();
+        let observed = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&observed);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let limits = ConfigExtractionLimits::default();
+        let deadline = start.checked_add(limits.timeout).expect("deadline");
+        let mut budget = ConfigExtractionBudget::start(limits, clock).expect("test budget");
+        *observed.lock().expect("clock lock") = deadline;
+
+        let error = budget
+            .accept_read(0, Some(0), 1)
+            .expect_err("injected clock reached deadline");
+
+        assert!(matches!(
+            error,
+            EdgeError::StoreExtraction {
+                reason: StoreExtractionReason::DeadlineExceeded,
+                ..
+            }
+        ));
     }
 
     #[test]

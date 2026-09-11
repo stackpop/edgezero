@@ -1,10 +1,17 @@
+#[cfg(feature = "test-utils")]
+use std::time::Duration;
+
 use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
-use edgezero_core::outbound::{collect_response_stream, collect_response_stream_until};
+#[cfg(feature = "test-utils")]
+use edgezero_core::http::{StatusCode, response_builder};
+use edgezero_core::outbound::{collect_response_stream, collect_response_stream_until_with_clock};
 use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
-use edgezero_core::time::{Deadline, MonotonicInstant};
+#[cfg(feature = "test-utils")]
+use edgezero_core::time::MonotonicInstant;
+use edgezero_core::time::{Deadline, MonotonicClock};
 use spin_sdk::http::{FullBody, Response as SpinResponse};
 
 use crate::SpinFullResponse;
@@ -21,26 +28,28 @@ pub const SPIN_RESPONSE_STREAM_BUFFER_BYTES: u64 = 0x0100_0000;
 /// size exceeds the limit, collection stops and an error is returned.
 #[cfg(test)]
 pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError> {
-    collect_body_bytes_with_deadline(body, None).await
+    collect_body_bytes_with_deadline(body, None, &MonotonicClock::default()).await
 }
 
 async fn collect_body_bytes_with_deadline(
     body: Body,
     deadline: Option<Deadline>,
+    clock: &MonotonicClock,
 ) -> Result<Vec<u8>, EdgeError> {
-    ensure_write_deadline(deadline)?;
+    ensure_write_deadline(deadline, clock)?;
     match body {
         Body::Once(bytes) => {
-            ensure_write_deadline(deadline)?;
+            ensure_write_deadline(deadline, clock)?;
             Ok(bytes.to_vec())
         }
         Body::Stream(stream) => {
             let collected = match deadline {
                 Some(write_deadline) => {
-                    collect_response_stream_until(
+                    collect_response_stream_until_with_clock(
                         stream,
                         SPIN_RESPONSE_STREAM_BUFFER_BYTES,
                         write_deadline,
+                        clock,
                     )
                     .await?
                 }
@@ -62,29 +71,24 @@ async fn collect_body_bytes_with_deadline(
 /// cannot be built from the collected bytes.
 #[inline]
 pub async fn from_core_response(response: Response) -> Result<SpinFullResponse, EdgeError> {
-    from_core_response_with_deadline(response, None).await
+    from_core_response_with_deadline(response, None, &MonotonicClock::default()).await
 }
 
 pub(crate) async fn from_egress_response(
     egress: ResponseEgressEnvelope,
 ) -> Result<SpinFullResponse, EdgeError> {
-    let started_at = MonotonicInstant::now();
-    let (core_response, policy, mut attempt) =
-        egress.begin(started_at).map_err(|_policy_error| {
-            EdgeError::internal(anyhow::anyhow!("response-egress policy failed"))
-        })?;
-    if policy.write_deadline.is_expired() {
-        attempt.terminate(
-            ResponseEgressOutcome::DeadlineExceeded,
-            MonotonicInstant::now(),
-        );
+    let (core_response, policy, mut attempt, clock) = egress.begin().map_err(|_policy_error| {
+        EdgeError::internal(anyhow::anyhow!("response-egress policy failed"))
+    })?;
+    if policy.write_deadline.is_expired_at(clock.now()) {
+        attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, clock.now());
         return deadline_response();
     }
 
     let converted =
-        from_core_response_with_deadline(core_response, Some(policy.write_deadline)).await;
-    let observed_at = MonotonicInstant::now();
-    if policy.write_deadline.is_expired() {
+        from_core_response_with_deadline(core_response, Some(policy.write_deadline), &clock).await;
+    let observed_at = clock.now();
+    if policy.write_deadline.is_expired_at(observed_at) {
         attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, observed_at);
         return deadline_response();
     }
@@ -114,8 +118,9 @@ pub(crate) async fn from_egress_response(
 async fn from_core_response_with_deadline(
     response: Response,
     deadline: Option<Deadline>,
+    clock: &MonotonicClock,
 ) -> Result<SpinFullResponse, EdgeError> {
-    ensure_write_deadline(deadline)?;
+    ensure_write_deadline(deadline, clock)?;
     let (parts, body) = response.into_parts();
 
     let mut builder = SpinResponse::builder().status(parts.status);
@@ -124,8 +129,8 @@ async fn from_core_response_with_deadline(
         builder = builder.header(name, value);
     }
 
-    let collected = collect_body_bytes_with_deadline(body, deadline).await?;
-    ensure_write_deadline(deadline)?;
+    let collected = collect_body_bytes_with_deadline(body, deadline, clock).await?;
+    ensure_write_deadline(deadline, clock)?;
 
     builder
         .body(FullBody::new(Bytes::from(collected)))
@@ -145,13 +150,39 @@ fn deadline_response() -> Result<SpinFullResponse, EdgeError> {
         })
 }
 
-fn ensure_write_deadline(deadline: Option<Deadline>) -> Result<(), EdgeError> {
-    if deadline.is_some_and(|write_deadline| write_deadline.is_expired()) {
+fn ensure_write_deadline(
+    deadline: Option<Deadline>,
+    clock: &MonotonicClock,
+) -> Result<(), EdgeError> {
+    if deadline.is_some_and(|write_deadline| write_deadline.is_expired_at(clock.now())) {
         return Err(EdgeError::gateway_timeout(
             "response write deadline exceeded",
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn response_write_deadline_uses_injected_clock_for_test() -> bool {
+    let start = MonotonicInstant::now();
+    let Some(deadline) = start.checked_add(Duration::from_secs(1)) else {
+        return false;
+    };
+    let clock = MonotonicClock::new(move || deadline);
+    let Ok(response) = response_builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+    else {
+        return false;
+    };
+
+    matches!(
+        from_core_response_with_deadline(response, Some(Deadline::at_instant(deadline)), &clock,)
+            .await,
+        Err(EdgeError::GatewayTimeout { .. })
+    )
 }
 
 #[cfg(test)]

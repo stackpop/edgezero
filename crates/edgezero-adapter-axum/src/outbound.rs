@@ -321,6 +321,7 @@ async fn process_response(
     clock: MonotonicClock,
 ) -> Result<OutboundResponse, EdgeError> {
     budget_remaining(budget, &clock)?;
+    let response_clock = clock.clone();
     let status = StatusCode::from_u16(response.status().as_u16()).map_err(EdgeError::internal)?;
     let mut headers = copy_headers(response.headers());
     let mut header_limiter =
@@ -330,11 +331,12 @@ async fn process_response(
     headers.insert(PROXY_HEADER, HeaderValue::from_static("axum"));
 
     if disposition == ResponseBodyDisposition::FramingBodyless {
-        return Ok(OutboundResponse::new(
+        return Ok(OutboundResponse::new_with_monotonic_clock(
             request_method,
             status,
             headers,
             Body::empty(),
+            response_clock,
         ));
     }
 
@@ -352,11 +354,12 @@ async fn process_response(
                 item?;
             }
         }
-        return Ok(OutboundResponse::new(
+        return Ok(OutboundResponse::new_with_monotonic_clock(
             request_method,
             status,
             headers,
             Body::empty(),
+            response_clock,
         ));
     }
 
@@ -398,7 +401,13 @@ async fn process_response(
         }
         ResponseMode::Streamed => Body::from_stream(deadline_bound),
     };
-    Ok(OutboundResponse::new(request_method, status, headers, body))
+    Ok(OutboundResponse::new_with_monotonic_clock(
+        request_method,
+        status,
+        headers,
+        body,
+        response_clock,
+    ))
 }
 
 fn budget_remaining(budget: DispatchBudget, clock: &MonotonicClock) -> Result<Duration, EdgeError> {

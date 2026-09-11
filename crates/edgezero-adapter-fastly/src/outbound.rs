@@ -857,6 +857,7 @@ mod fastly_impl {
         clock: MonotonicClock,
     ) -> Result<OutboundResponse, EdgeError> {
         budget_remaining(budget, &clock)?;
+        let response_clock = clock.clone();
         let status = StatusCode::from_u16(response.get_status().as_u16()).map_err(|_error| {
             EdgeError::bad_gateway_with_reason(
                 "Fastly returned an invalid upstream status code",
@@ -870,11 +871,12 @@ mod fastly_impl {
         let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
         headers.insert(PROXY_HEADER, HeaderValue::from_static("fastly"));
         if disposition == ResponseBodyDisposition::FramingBodyless {
-            return Ok(OutboundResponse::new(
+            return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
                 headers,
                 Body::empty(),
+                response_clock,
             ));
         }
 
@@ -892,11 +894,12 @@ mod fastly_impl {
                     item?;
                 }
             }
-            return Ok(OutboundResponse::new(
+            return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
                 headers,
                 Body::empty(),
+                response_clock,
             ));
         }
 
@@ -937,7 +940,13 @@ mod fastly_impl {
             }
             ResponseMode::Streamed => Body::from_stream(shaped),
         };
-        Ok(OutboundResponse::new(request_method, status, headers, body))
+        Ok(OutboundResponse::new_with_monotonic_clock(
+            request_method,
+            status,
+            headers,
+            body,
+            response_clock,
+        ))
     }
 
     fn response_headers(response: &FastlyResponse) -> HeaderMap {
@@ -1174,6 +1183,10 @@ mod fastly_impl {
             })
         }
 
+        fn constant_clock(now: MonotonicInstant) -> MonotonicClock {
+            MonotonicClock::new(move || now)
+        }
+
         fn clock_budget(start: MonotonicInstant, duration: Duration) -> DispatchBudget {
             DispatchBudget {
                 cause: BudgetSource::PerCallTimeout,
@@ -1246,6 +1259,25 @@ mod fastly_impl {
             let identity = backend_identity(&request, budget).expect("backend identity");
 
             assert_eq!(identity.budget_ms, 10);
+        }
+
+        #[test]
+        fn ceil_millis_floors_and_saturates_without_wrapping() {
+            assert_eq!(ceil_millis(Duration::ZERO), 1);
+            assert_eq!(ceil_millis(Duration::from_nanos(1)), 1);
+            assert_eq!(ceil_millis(Duration::from_micros(999)), 1);
+            assert_eq!(ceil_millis(Duration::from_micros(1_001)), 2);
+            assert_eq!(ceil_millis(Duration::MAX), u64::MAX);
+        }
+
+        #[test]
+        fn constant_clock_can_be_sampled_without_exhaustion() {
+            let now = MonotonicInstant::now();
+            let clock = constant_clock(now);
+
+            assert_eq!(clock.now(), now);
+            assert_eq!(clock.now(), now);
+            assert_eq!(clock.now(), now);
         }
 
         #[test]

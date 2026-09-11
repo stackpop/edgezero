@@ -35,11 +35,15 @@ mod tests {
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
     use edgezero_adapter_cloudflare::outbound::CloudflareOutboundClient;
     #[cfg(feature = "test-utils")]
-    use edgezero_adapter_cloudflare::outbound::deferred_clock_paths_hold_for_test;
+    use edgezero_adapter_cloudflare::outbound::{
+        deferred_clock_paths_hold_for_test, response_abort_lifecycle_holds_for_test,
+    };
     #[cfg(feature = "test-utils")]
     use edgezero_adapter_cloudflare::request::deadline_body_releases_source_for_test;
     use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
     use edgezero_adapter_cloudflare::response::from_core_response;
+    #[cfg(feature = "test-utils")]
+    use edgezero_adapter_cloudflare::response::response_write_deadline_uses_injected_clock_for_test;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
@@ -373,6 +377,44 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    async fn send_all_preserves_three_preflight_slots_in_input_order() {
+        let now = MonotonicInstant::now();
+        let client = CloudflareOutboundClient::with_clock(MonotonicClock::new(move || now));
+        let streamed_upload = OutboundRequest::post("https://example.com/upload")
+            .expect("upload request")
+            .body(Body::stream(stream::iter([Bytes::from_static(b"body")])));
+        let streamed_response = OutboundRequest::get("https://example.com/stream")
+            .expect("stream request")
+            .stream_response();
+        let method_error = OutboundRequest::get("https://example.com/get")
+            .expect("GET request")
+            .body(Body::stream(stream::iter([Bytes::new()])));
+
+        let results = client
+            .send_all(vec![streamed_upload, streamed_response, method_error])
+            .await;
+        let messages: Vec<_> = results
+            .iter()
+            .map(|slot| match &slot.outcome {
+                Err(EdgeError::BadRequest { message }) => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            messages,
+            [
+                Some("send_all requires buffered request bodies; use send for a streamed upload"),
+                Some("send_all requires buffered responses; use send for a streamed response"),
+                Some(
+                    "GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream"
+                ),
+            ]
+        );
+        assert!(results.iter().all(|slot| slot.elapsed == Duration::ZERO));
+    }
+
+    #[wasm_bindgen_test]
     async fn standard_service_installs_the_application_outbound_clock() {
         async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
             let client = ctx
@@ -416,6 +458,13 @@ mod tests {
     #[wasm_bindgen_test]
     async fn deferred_upload_and_response_paths_retain_the_injected_clock() {
         assert!(deferred_clock_paths_hold_for_test().await);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[wasm_bindgen_test]
+    async fn response_abort_and_write_deadline_lifecycles_are_enforced() {
+        assert!(response_abort_lifecycle_holds_for_test().await);
+        assert!(response_write_deadline_uses_injected_clock_for_test().await);
     }
 
     #[cfg(feature = "test-utils")]

@@ -17,9 +17,10 @@ outbound response decoding. Those end when the outbound adapter returns an
 body-read deadlines are owned by the
 [inbound-body design](2026-08-22-inbound-body-design.md).
 
-Current converters do not provide this transport lifecycle: Axum and Fastly synchronously
-collect a core stream, Spin materializes it into `FullBody`, and Cloudflare adopts a stream
-without an absolute completion deadline or terminal observer. Axum emits `ResponseReturned`
+Current converters implement the core policy/observer guard and converter-level absolute deadline,
+but they do not provide the full transport lifecycle: Axum and Fastly synchronously collect a core
+stream, Spin materializes it into `FullBody`, and Cloudflare adopts a stream without a certified
+transport completion boundary. Axum emits `ResponseReturned`
 with zero written bytes after conversion but before returning the response to Hyper. Returning
 a platform response object is not evidence that Hyper accepted it or that bytes reached the
 client.
@@ -28,8 +29,10 @@ client.
 
 ### 2.1 Policy and timing
 
-Every adapter snapshots `egress_started_at` from `MonotonicInstant` immediately before its
-first response-conversion operation. It then obtains one finite absolute deadline:
+`ResponseEgressEnvelope` retains the exact `App::monotonic_clock()` clone used for ingress and
+standard outbound dispatch. `begin()` snapshots `egress_started_at` from that clock immediately
+before its first response-conversion operation and returns the same clock with the response,
+policy, and attempt. The adapter then obtains one finite absolute deadline:
 
 ```rust
 pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
@@ -56,7 +59,9 @@ The deadline is absolute and never reset by response conversion, first-byte wait
 backpressure, chunk boundaries, flushes, trailers, or platform finish. Before every source
 poll/platform write and immediately after either side becomes ready, the adapter compares
 the same deadline. Equality is expired; deadline expiry wins simultaneous readiness.
-Adapters use the same monotonic clock domain as core `Deadline`. Wall-clock time is not used.
+Every callback sample, deadline comparison, body-collection check, and terminal report uses the
+returned clock. Low-level converters that bypass `App` explicitly use `MonotonicClock::default()`;
+they are not app-clock propagation paths. Wall-clock time is not used.
 
 ### 2.2 Terminal report
 

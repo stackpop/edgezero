@@ -15,6 +15,7 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response, Uri};
 use edgezero_core::outbound::OutboundRequest;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 #[action]
@@ -33,7 +34,10 @@ async fn forward_with_auth(
         .max_request_body_bytes(256 * 1024)
         .max_encoded_response_bytes(2 * 1024 * 1024)
         .max_decoded_response_bytes(4 * 1024 * 1024)
-        .max_response_bytes(4 * 1024 * 1024);
+        .max_response_bytes(4 * 1024 * 1024)
+        .max_response_header_bytes(64 * 1024)
+        .max_response_header_count(100)
+        .max_chunk_bytes(NonZeroU64::new(64 * 1024).unwrap_or(NonZeroU64::MIN));
     request.headers_mut().insert(
         "authorization",
         HeaderValue::from_static("Bearer secret-token"),
@@ -60,8 +64,20 @@ normalization immediately.
 
 ```rust
 use edgezero_core::outbound::OutboundRequest;
+use std::num::NonZeroU64;
+use std::time::Duration;
 
 let request = OutboundRequest::post("https://api.example.com/events")?
+    .timeout(Duration::from_secs(2))
+    .max_request_body_bytes(256 * 1024)
+    .max_encoded_response_bytes(2 * 1024 * 1024)
+    .max_decoded_response_bytes(4 * 1024 * 1024)
+    .max_response_bytes(4 * 1024 * 1024)
+    .max_response_header_bytes(64 * 1024)
+    .max_response_header_count(100)
+    .max_chunk_bytes(NonZeroU64::new(64 * 1024).unwrap_or(NonZeroU64::MIN))
+    .max_brotli_window_bits(24)
+    .max_brotli_decoder_bytes(32 * 1024 * 1024)
     .header("accept", "application/json")?
     .json(&payload)?;
 let response = client.send(request).await?;
@@ -72,6 +88,10 @@ Buffered response mode is the default. Call `stream_response()` for a streamed r
 consume `response.into_body()` while its absolute request deadline is still active. Use
 `into_bytes_bounded`, `into_bytes_bounded_until`, or `json_bounded_until` when application code
 performs an additional collection step.
+
+`max_chunk_bytes` opt-in rechunks guest-visible response items before they reach the application.
+It bounds item shape and downstream per-item allocation; it does not bound a provider SDK's
+source-chunk allocation before EdgeZero receives that chunk.
 
 ## Batch Requests
 

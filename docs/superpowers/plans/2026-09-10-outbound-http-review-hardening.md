@@ -150,3 +150,22 @@
 - [x] Keep `DispatchBudget` as the copyable result of pure budget selection while ensuring its start snapshot, all later deadline checks, error precedence, dispatch-slack checks, and slot completion observations use one clock domain. Fastly backend identity uses the method-entry `budget.duration`; preparation-time clock samples cannot fragment a homogeneous batch's dynamic-backend identity.
 - [x] Update the outbound specification and capability guide with constructor semantics, app-clock propagation, low-level defaults, and the full injected-clock acceptance matrix.
 - [x] Run focused outbound adapter tests, source scans for global-clock bypasses, full workspace tests, strict Clippy, feature builds, and all three WASM target checks before committing and pushing.
+
+### Task 8: Final implementation-review corrections
+
+**Files:**
+- Modify: `crates/edgezero-core/src/{app,extractor,lib,outbound,response_egress}.rs`
+- Modify: `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/{outbound,response}.rs`
+- Modify: `examples/app-demo/crates/app-demo-core/src/handlers.rs`
+- Modify: `crates/edgezero-cli/src/templates/core/src/handlers.rs.hbs`
+- Modify: `docs/guide/proxying.md`
+- Modify: outbound and response-egress specifications
+
+- [x] Validate HEAD/304 representation `Content-Length` as one consistent `u64`, reject malformed/conflicting/overflow values before body polling, retain valid metadata, and continue stripping the field on 1xx/204.
+- [x] Carry the application clock through `OutboundResponse`, cooperative bounded-until collection, typed config extraction, `ResponseEgressEnvelope`, and every adapter response converter.
+- [x] Preserve Cloudflare's intentional abort-on-drop for framing-bodyless responses; handle a null-body 205 without calling `stream()`, disarm only clean absent/zero-length suppression, and keep positive declared length on the abort path.
+- [x] Pin Spin's `BodyWriter` default-on-drop host-error contract in source and retain nonblocking deadline exits instead of awaiting after budget expiry.
+- [x] Add `max_chunk_bytes` to the demo, generated template, generator sentinel, and both copyable proxy-guide examples; document that rechunking bounds emitted item shape, not provider allocation.
+- [x] Add Cloudflare/Spin three-slot preflight-order coverage, executable adapter write-deadline probes, Cloudflare abort lifecycle coverage, and host-duration floor/saturation tests.
+- [x] Document intentional zero-cap deny-all behavior and keep loop/self-reference policy explicitly application-owned.
+- [x] Run every workspace, strict lint, documentation, generated-project, demo, and target-specific WASM gate.

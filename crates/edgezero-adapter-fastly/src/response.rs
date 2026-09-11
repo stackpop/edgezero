@@ -1,9 +1,9 @@
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Response, Uri};
-use edgezero_core::outbound::{collect_response_stream, collect_response_stream_until};
+use edgezero_core::outbound::{collect_response_stream, collect_response_stream_until_with_clock};
 use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
-use edgezero_core::time::{Deadline, MonotonicInstant};
+use edgezero_core::time::{Deadline, MonotonicClock};
 use fastly::Response as FastlyResponse;
 use futures::executor;
 
@@ -13,27 +13,23 @@ pub const FASTLY_RESPONSE_STREAM_BUFFER_BYTES: u64 = 0x0100_0000;
 /// Returns [`EdgeError::Internal`] if the response body cannot be streamed to the Fastly send-channel.
 #[inline]
 pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeError> {
-    from_core_response_with_deadline(response, None)
+    from_core_response_with_deadline(response, None, &MonotonicClock::default())
 }
 
 pub(crate) fn from_egress_response(
     egress: ResponseEgressEnvelope,
 ) -> Result<FastlyResponse, EdgeError> {
-    let started_at = MonotonicInstant::now();
-    let (response, policy, mut attempt) = egress.begin(started_at).map_err(|_outcome| {
+    let (response, policy, mut attempt, clock) = egress.begin().map_err(|_outcome| {
         EdgeError::internal(anyhow::anyhow!("response-egress policy failed"))
     })?;
-    if policy.write_deadline.is_expired() {
-        attempt.terminate(
-            ResponseEgressOutcome::DeadlineExceeded,
-            MonotonicInstant::now(),
-        );
+    if policy.write_deadline.is_expired_at(clock.now()) {
+        attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, clock.now());
         return Ok(deadline_response());
     }
 
-    let converted = from_core_response_with_deadline(response, Some(policy.write_deadline));
-    let observed_at = MonotonicInstant::now();
-    if policy.write_deadline.is_expired() {
+    let converted = from_core_response_with_deadline(response, Some(policy.write_deadline), &clock);
+    let observed_at = clock.now();
+    if policy.write_deadline.is_expired_at(observed_at) {
         attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, observed_at);
         return Ok(deadline_response());
     }
@@ -63,8 +59,9 @@ pub(crate) fn from_egress_response(
 fn from_core_response_with_deadline(
     response: Response,
     deadline: Option<Deadline>,
+    clock: &MonotonicClock,
 ) -> Result<FastlyResponse, EdgeError> {
-    ensure_write_deadline(deadline)?;
+    ensure_write_deadline(deadline, clock)?;
     let (parts, body) = response.into_parts();
     let mut fastly_response = FastlyResponse::from_status(parts.status.as_u16());
 
@@ -72,11 +69,14 @@ fn from_core_response_with_deadline(
         Body::Once(bytes) => fastly_response.set_body(bytes.to_vec()),
         Body::Stream(stream) => {
             let collected = match deadline {
-                Some(write_deadline) => executor::block_on(collect_response_stream_until(
-                    stream,
-                    FASTLY_RESPONSE_STREAM_BUFFER_BYTES,
-                    write_deadline,
-                ))?,
+                Some(write_deadline) => {
+                    executor::block_on(collect_response_stream_until_with_clock(
+                        stream,
+                        FASTLY_RESPONSE_STREAM_BUFFER_BYTES,
+                        write_deadline,
+                        clock,
+                    ))?
+                }
                 None => executor::block_on(collect_response_stream(
                     stream,
                     FASTLY_RESPONSE_STREAM_BUFFER_BYTES,
@@ -93,7 +93,7 @@ fn from_core_response_with_deadline(
         fastly_response.append_header(name.as_str(), value.as_bytes());
     }
 
-    ensure_write_deadline(deadline)?;
+    ensure_write_deadline(deadline, clock)?;
     Ok(fastly_response)
 }
 
@@ -103,8 +103,11 @@ fn deadline_response() -> FastlyResponse {
     response
 }
 
-fn ensure_write_deadline(deadline: Option<Deadline>) -> Result<(), EdgeError> {
-    if deadline.is_some_and(|candidate| candidate.is_expired()) {
+fn ensure_write_deadline(
+    deadline: Option<Deadline>,
+    clock: &MonotonicClock,
+) -> Result<(), EdgeError> {
+    if deadline.is_some_and(|candidate| candidate.is_expired_at(clock.now())) {
         return Err(EdgeError::gateway_timeout(
             "response write deadline exceeded",
         ));
@@ -124,7 +127,9 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::error::ResponseLimitReason;
     use edgezero_core::http::response_builder;
+    use edgezero_core::time::MonotonicInstant;
     use futures_util::stream;
+    use std::time::Duration;
 
     #[test]
     fn parse_valid_uri() {
@@ -191,5 +196,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn injected_clock_controls_response_write_deadline() {
+        let start = MonotonicInstant::now();
+        let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
+        let clock = MonotonicClock::new(move || deadline);
+        let response = response_builder()
+            .status(200)
+            .body(Body::empty())
+            .expect("response");
+
+        let error = from_core_response_with_deadline(
+            response,
+            Some(Deadline::at_instant(deadline)),
+            &clock,
+        )
+        .expect_err("deadline must win");
+
+        assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
     }
 }
