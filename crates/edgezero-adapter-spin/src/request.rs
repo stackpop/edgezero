@@ -22,6 +22,8 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
+#[cfg(feature = "test-utils")]
+use edgezero_core::http::{Method, Response, Uri, request_builder};
 use edgezero_core::http::{Request, RequestParts};
 use edgezero_core::ingress::{
     IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts,
@@ -178,6 +180,49 @@ pub fn deadline_body_releases_source_for_test() -> bool {
         return false;
     };
     matches!(error, EdgeError::RequestTimeout { .. }) && dropped.load(Ordering::SeqCst) == 1
+}
+
+/// Dispatches an observable source through the production ingress body wrapper.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_stream_for_test<Source, SourceError>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    source: Source,
+) -> Result<Response, EdgeError>
+where
+    Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+{
+    let request_start = app.monotonic_now();
+    let mut core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(EdgeError::internal)?;
+    let head_parts = IngressHeadParts::from_request(
+        &core_request,
+        IngressHeadAccounting::HostManaged,
+        IngressFraming::HostManaged,
+    );
+    head_parts.validate_normalized(app.ingress_head_limits())?;
+    let prepared = match app.begin_ingress(head_parts, request_start)? {
+        IngressBeginOutcome::Admitted(prepared) => prepared,
+        IngressBeginOutcome::Refused(response) => return Ok(response.into_response()),
+        _ => {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "unsupported ingress admission outcome"
+            )));
+        }
+    };
+    *core_request.body_mut() =
+        spin_deadline_body(source, prepared.read_deadline(), prepared.monotonic_clock());
+    Ok(app
+        .dispatch_admitted(prepared, core_request)
+        .await?
+        .into_response())
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
