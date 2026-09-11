@@ -13,13 +13,47 @@
     )
 )]
 
+use edgezero_core::error::EdgeError;
 #[cfg(any(
     all(feature = "cloudflare", target_arch = "wasm32"),
     feature = "test-utils"
 ))]
-use edgezero_core::error::BadGatewayReason;
-use edgezero_core::error::EdgeError;
+use edgezero_core::error::{BadGatewayReason, BudgetSource};
+#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
+use edgezero_core::http::{HeaderMap, HeaderName};
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
+#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
+use std::str;
+
+#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
+pub(crate) trait HeaderSink {
+    fn append(&mut self, name: &str, value: &str) -> Result<(), EdgeError>;
+}
+
+#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
+pub(crate) fn copy_header_values<Sink, InvalidValue>(
+    source: &HeaderMap,
+    sink: &mut Sink,
+    invalid_value: InvalidValue,
+) -> Result<(), EdgeError>
+where
+    Sink: HeaderSink,
+    InvalidValue: Fn(&HeaderName) -> EdgeError,
+{
+    for (name, value) in source {
+        let header_value =
+            str::from_utf8(value.as_bytes()).map_err(|_encoding_error| invalid_value(name))?;
+        sink.append(name.as_str(), header_value)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+impl HeaderSink for worker::Headers {
+    fn append(&mut self, name: &str, value: &str) -> Result<(), EdgeError> {
+        worker::Headers::append(self, name, value).map_err(EdgeError::internal)
+    }
+}
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod worker_impl {
@@ -35,7 +69,7 @@ mod worker_impl {
     use edgezero_core::compression::{
         ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
     };
-    use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
     use edgezero_core::outbound::{
@@ -56,6 +90,8 @@ mod worker_impl {
         Body as WorkerBody, Delay, Headers, Method as WorkerMethod, Request as WorkerRequest,
         RequestInit, RequestRedirect, Response as WorkerResponse,
     };
+
+    use super::timeout_error;
 
     const READY_ITEM_YIELD_QUOTA: u32 = 1_024;
 
@@ -213,15 +249,10 @@ mod worker_impl {
     }
 
     fn build_headers(headers: &HeaderMap) -> Result<Headers, EdgeError> {
-        let worker_headers = Headers::new();
-        for (name, header_value) in headers {
-            let header_value_str = header_value.to_str().map_err(|_error| {
-                EdgeError::bad_request(format!("header value is not valid UTF-8: {name}"))
-            })?;
-            worker_headers
-                .append(name.as_str(), header_value_str)
-                .map_err(EdgeError::internal)?;
-        }
+        let mut worker_headers = Headers::new();
+        super::copy_header_values(headers, &mut worker_headers, |name| {
+            EdgeError::bad_request(format!("header value is not valid UTF-8: {name}"))
+        })?;
         Ok(worker_headers)
     }
 
@@ -542,10 +573,6 @@ mod worker_impl {
             .boxed_local())
     }
 
-    fn timeout_error(cause: BudgetSource) -> EdgeError {
-        EdgeError::gateway_timeout_caused("outbound request deadline expired", cause)
-    }
-
     fn budget_remaining(budget: DispatchBudget) -> Result<Duration, EdgeError> {
         budget
             .deadline
@@ -634,6 +661,14 @@ fn generic_fetch_failure() -> EdgeError {
     EdgeError::bad_gateway_with_reason("outbound fetch failed", BadGatewayReason::Unspecified)
 }
 
+#[cfg(any(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    feature = "test-utils"
+))]
+fn timeout_error(cause: BudgetSource) -> EdgeError {
+    EdgeError::gateway_timeout_caused("outbound request deadline expired", cause)
+}
+
 fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_for_dispatch(request)?;
     if request.is_stream_body() {
@@ -665,4 +700,69 @@ pub fn validate_batch_request_for_test(request: &OutboundRequest) -> Result<(), 
 #[inline]
 pub fn generic_fetch_failure_for_test() -> EdgeError {
     generic_fetch_failure()
+}
+
+/// Returns the same attributed timeout emitted by Workers budget timers.
+#[cfg(feature = "test-utils")]
+#[must_use]
+#[inline]
+pub fn timeout_error_for_test(cause: BudgetSource) -> EdgeError {
+    timeout_error(cause)
+}
+
+#[cfg(test)]
+mod header_bridge_tests {
+    use std::collections::BTreeMap;
+
+    use edgezero_core::http::HeaderValue;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct AppendSink(BTreeMap<String, Vec<String>>);
+
+    impl HeaderSink for AppendSink {
+        fn append(&mut self, name: &str, value: &str) -> Result<(), EdgeError> {
+            self.0
+                .entry(name.to_owned())
+                .or_default()
+                .push(value.to_owned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn response_header_copy_preserves_duplicate_set_cookie_values() {
+        let mut source = HeaderMap::new();
+        source.append("set-cookie", HeaderValue::from_static("first=1"));
+        source.append("set-cookie", HeaderValue::from_static("second=2"));
+        let mut sink = AppendSink::default();
+
+        copy_header_values(&source, &mut sink, |_name| {
+            EdgeError::internal(anyhow::anyhow!("invalid response header"))
+        })
+        .expect("copy response headers");
+
+        assert_eq!(
+            sink.0.get("set-cookie"),
+            Some(&vec!["first=1".to_owned(), "second=2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn response_header_copy_accepts_non_ascii_utf8() {
+        let mut source = HeaderMap::new();
+        source.append(
+            "x-label",
+            HeaderValue::from_bytes("caf\u{e9}".as_bytes()).expect("valid header bytes"),
+        );
+        let mut sink = AppendSink::default();
+
+        copy_header_values(&source, &mut sink, |_name| {
+            EdgeError::internal(anyhow::anyhow!("invalid response header"))
+        })
+        .expect("copy UTF-8 response header");
+
+        assert_eq!(sink.0.get("x-label"), Some(&vec!["caf\u{e9}".to_owned()]));
+    }
 }

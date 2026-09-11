@@ -12,6 +12,8 @@ use futures_util::future::{Either, select};
 use futures_util::stream::{LocalBoxStream, unfold};
 use worker::{Delay, Error as WorkerError, Response as CfResponse};
 
+use crate::outbound::copy_header_values;
+
 /// Convert an `EdgeZero` `Response` into a Cloudflare Worker `Response`.
 ///
 /// # Errors
@@ -116,16 +118,11 @@ fn apply_response_head(
 ) -> Result<CfResponse, EdgeError> {
     let mut response = body_response.with_status(status.as_u16());
     let headers = response.headers_mut();
-    for (name, header_value) in source_headers {
-        let header_value_str = header_value.to_str().map_err(|_encoding_error| {
-            EdgeError::internal(anyhow::anyhow!(
-                "response header cannot be represented by Workers"
-            ))
-        })?;
-        headers
-            .set(name.as_str(), header_value_str)
-            .map_err(EdgeError::internal)?;
-    }
+    copy_header_values(source_headers, headers, |_name| {
+        EdgeError::internal(anyhow::anyhow!(
+            "response header cannot be represented by Workers"
+        ))
+    })?;
     Ok(response)
 }
 

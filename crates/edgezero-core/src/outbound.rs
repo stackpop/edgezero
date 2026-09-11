@@ -1132,7 +1132,7 @@ fn retain_utf8_header_values(headers: &mut HeaderMap, response: bool) {
     let mut retained = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers.iter() {
         if name != CONNECTION
-            && name != CONTENT_ENCODING
+            && !(response && name == CONTENT_ENCODING)
             && str::from_utf8(value.as_bytes()).is_err()
         {
             if response {
@@ -2110,6 +2110,19 @@ mod tests {
             HeaderValue::from_bytes(b"x-private,\xff").expect("opaque header"),
         );
         normalize_for_dispatch(&mut request).expect_err("opaque connection nomination");
+    }
+
+    #[test]
+    fn request_normalization_drops_non_utf8_content_encoding() {
+        let mut request = OutboundRequest::post("https://example.com").expect("request");
+        request.headers_mut().append(
+            "content-encoding",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header value"),
+        );
+
+        normalize_for_dispatch(&mut request).expect("normalize");
+
+        assert!(request.headers().get("content-encoding").is_none());
     }
 
     #[test]
