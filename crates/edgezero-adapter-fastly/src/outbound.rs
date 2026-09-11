@@ -156,7 +156,7 @@ mod fastly_impl {
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
     use edgezero_core::time::{
-        BATCH_DISPATCH_SLACK_MAX, DispatchBudget, MonotonicInstant, dispatch_budget,
+        BATCH_DISPATCH_SLACK_MAX, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
     };
     use fastly::backend::BackendCreationError;
     use fastly::http::request::{PendingRequest, PollResult, SendError, SendErrorCause};
@@ -237,14 +237,23 @@ mod fastly_impl {
     /// Native outbound HTTP implementation for Fastly Compute.
     pub struct FastlyOutboundClient {
         backends: Mutex<HashMap<String, (BackendIdentity, Backend)>>,
+        clock: MonotonicClock,
     }
 
     impl FastlyOutboundClient {
         #[must_use]
         #[inline]
         pub fn new() -> Self {
+            Self::with_clock(MonotonicClock::default())
+        }
+
+        /// Builds a client that evaluates every outbound lifetime against `clock`.
+        #[must_use]
+        #[inline]
+        pub fn with_clock(clock: MonotonicClock) -> Self {
             Self {
                 backends: Mutex::new(HashMap::new()),
+                clock,
             }
         }
 
@@ -253,7 +262,7 @@ mod fastly_impl {
             request: &OutboundRequest,
             budget: DispatchBudget,
         ) -> Result<Backend, EdgeError> {
-            let identity = backend_identity(request, budget)?;
+            let identity = backend_identity(request, budget, &self.clock)?;
             let name = backend_name(&identity);
             {
                 let cache = self.backends.lock().map_err(|_poisoned| {
@@ -286,26 +295,21 @@ mod fastly_impl {
                     builder = builder.check_certificate(cert_host);
                 }
             }
-            finish_backend_creation(
-                builder.finish(),
-                budget,
-                MonotonicInstant::now(),
-                |backend| {
-                    let mut cache = self.backends.lock().map_err(|_poisoned| {
-                        EdgeError::internal(anyhow::anyhow!("Fastly backend cache was poisoned"))
-                    })?;
-                    if let Some((cached_identity, cached_backend)) = cache.get(&name) {
-                        if cached_identity != &identity {
-                            return Err(EdgeError::internal(anyhow::anyhow!(
-                                "dynamic backend name collision; refusing to reuse"
-                            )));
-                        }
-                        return Ok(cached_backend.clone());
+            finish_backend_creation(builder.finish(), budget, self.clock.now(), |backend| {
+                let mut cache = self.backends.lock().map_err(|_poisoned| {
+                    EdgeError::internal(anyhow::anyhow!("Fastly backend cache was poisoned"))
+                })?;
+                if let Some((cached_identity, cached_backend)) = cache.get(&name) {
+                    if cached_identity != &identity {
+                        return Err(EdgeError::internal(anyhow::anyhow!(
+                            "dynamic backend name collision; refusing to reuse"
+                        )));
                     }
-                    cache.insert(name, (identity, backend.clone()));
-                    Ok(backend)
-                },
-            )
+                    return Ok(cached_backend.clone());
+                }
+                cache.insert(name, (identity, backend.clone()));
+                Ok(backend)
+            })
         }
 
         fn prepare(
@@ -338,9 +342,9 @@ mod fastly_impl {
                     .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
             }
             normalize_for_dispatch(&mut request)?;
-            budget_remaining(budget)?;
+            budget_remaining(budget, &self.clock)?;
             let backend = self.ensure_backend(&request, budget)?;
-            budget_remaining(budget)?;
+            budget_remaining(budget, &self.clock)?;
             Ok(PreparedRequest {
                 backend,
                 budget,
@@ -378,11 +382,11 @@ mod fastly_impl {
                     validate_request_body_length(&bytes, max_request_body_bytes)?;
                     let mut buffered_request = fastly_request;
                     buffered_request.set_body(bytes.to_vec());
-                    dispatch_guard(started_at, budget)?;
+                    dispatch_guard(started_at, budget, &self.clock)?;
                     let pending = buffered_request
                         .send_async(backend)
-                        .map_err(|error| map_send_error(&error, budget))?;
-                    wait_pending(pending, budget)?
+                        .map_err(|error| map_send_error(&error, budget, &self.clock))?;
+                    wait_pending(pending, budget, &self.clock)?
                 }
                 Body::Stream(source) => {
                     send_streamed(
@@ -392,6 +396,7 @@ mod fastly_impl {
                         max_request_body_bytes,
                         budget,
                         started_at,
+                        self.clock.clone(),
                     )
                     .await?
                 }
@@ -408,11 +413,12 @@ mod fastly_impl {
                 max_encoded_response_bytes,
                 max_response_header_bytes,
                 max_response_header_count,
+                self.clock.clone(),
             )
             .await
         }
 
-        fn dispatch_batch_slot(prepared: PreparedRequest) -> Result<PendingSlot, EdgeError> {
+        fn dispatch_batch_slot(&self, prepared: PreparedRequest) -> Result<PendingSlot, EdgeError> {
             let PreparedRequest {
                 backend,
                 budget,
@@ -443,10 +449,10 @@ mod fastly_impl {
             validate_request_body_length(&bytes, max_request_body_bytes)?;
             let mut request = build_fastly_request(&method, &uri, &headers);
             request.set_body(bytes.to_vec());
-            dispatch_guard(started_at, budget)?;
+            dispatch_guard(started_at, budget, &self.clock)?;
             let pending = request
                 .send_async(backend)
-                .map_err(|error| map_send_error(&error, budget))?;
+                .map_err(|error| map_send_error(&error, budget, &self.clock))?;
             Ok(PendingSlot {
                 budget,
                 max_brotli_decoder_bytes,
@@ -478,22 +484,22 @@ mod fastly_impl {
     impl OutboundHttpClient for FastlyOutboundClient {
         #[inline]
         async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
-            let started_at = MonotonicInstant::now();
+            let started_at = self.clock.now();
             let prepared = self.prepare(request, started_at)?;
             self.execute(prepared).await
         }
 
         #[inline]
         async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
-            let batch_started_at = MonotonicInstant::now();
+            let batch_started_at = self.clock.now();
             let mut slots: Vec<Slot> = dispatch_all_before_wait(requests, |request| {
-                self.prepare_batch(request, batch_started_at)
-                    .and_then(Self::dispatch_batch_slot)
+                let prepared = self.prepare_batch(request, batch_started_at)?;
+                self.dispatch_batch_slot(prepared)
             })
             .into_iter()
             .map(|result| {
                 result.map_or_else(
-                    |error| Slot::Done(finish_slot(batch_started_at, Err(error))),
+                    |error| Slot::Done(finish_slot(batch_started_at, Err(error), &self.clock)),
                     |pending| Slot::Pending(Box::new(pending)),
                 )
             })
@@ -505,14 +511,14 @@ mod fastly_impl {
                 };
                 let current = replace(slot, Slot::Taken);
                 *slot = if let Slot::Pending(pending) = current {
-                    let outcome = finish_pending(*pending).await;
-                    Slot::Done(finish_slot(batch_started_at, outcome))
+                    let outcome = finish_pending(*pending, &self.clock).await;
+                    Slot::Done(finish_slot(batch_started_at, outcome, &self.clock))
                 } else {
                     current
                 };
 
                 for later in slots.iter_mut().skip(index.saturating_add(1)) {
-                    poll_slot(later, batch_started_at).await;
+                    poll_slot(later, batch_started_at, &self.clock).await;
                 }
             }
 
@@ -525,6 +531,7 @@ mod fastly_impl {
                         Err(EdgeError::internal(anyhow::anyhow!(
                             "Fastly batch harvest left an unresolved slot"
                         ))),
+                        &self.clock,
                     ),
                 })
                 .collect()
@@ -541,8 +548,9 @@ mod fastly_impl {
     fn backend_identity(
         request: &OutboundRequest,
         budget: DispatchBudget,
+        clock: &MonotonicClock,
     ) -> Result<BackendIdentity, EdgeError> {
-        let remaining = budget_remaining(budget)?;
+        let remaining = budget_remaining(budget, clock)?;
         let budget_ms = ceil_millis(remaining);
         let scheme = request
             .uri()
@@ -622,7 +630,10 @@ mod fastly_impl {
             .max(1)
     }
 
-    async fn finish_pending(slot: PendingSlot) -> Result<OutboundResponse, EdgeError> {
+    async fn finish_pending(
+        slot: PendingSlot,
+        clock: &MonotonicClock,
+    ) -> Result<OutboundResponse, EdgeError> {
         let PendingSlot {
             budget,
             max_brotli_decoder_bytes,
@@ -636,7 +647,7 @@ mod fastly_impl {
             request_method,
             response_mode,
         } = slot;
-        let response = wait_pending(pending, budget)?;
+        let response = wait_pending(pending, budget, clock)?;
         process_response(
             response,
             request_method,
@@ -649,6 +660,7 @@ mod fastly_impl {
             max_encoded_response_bytes,
             max_response_header_bytes,
             max_response_header_count,
+            clock.clone(),
         )
         .await
     }
@@ -656,8 +668,9 @@ mod fastly_impl {
     fn finish_slot(
         started_at: MonotonicInstant,
         outcome: Result<OutboundResponse, EdgeError>,
+        clock: &MonotonicClock,
     ) -> OutboundSlotResult {
-        let completed_at = MonotonicInstant::now();
+        let completed_at = clock.now();
         match completed_at.checked_duration_since(started_at) {
             Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
             None => OutboundSlotResult::new(
@@ -758,15 +771,15 @@ mod fastly_impl {
         }
     }
 
-    fn map_send_error(error: &SendError, budget: DispatchBudget) -> EdgeError {
-        super::classify_send_failure(
-            cause_to_failure(error.root_cause()),
-            budget,
-            MonotonicInstant::now(),
-        )
+    fn map_send_error(
+        error: &SendError,
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> EdgeError {
+        super::classify_send_failure(cause_to_failure(error.root_cause()), budget, clock.now())
     }
 
-    async fn poll_slot(slot: &mut Slot, started_at: MonotonicInstant) {
+    async fn poll_slot(slot: &mut Slot, started_at: MonotonicInstant, clock: &MonotonicClock) {
         let current = replace(slot, Slot::Taken);
         let Slot::Pending(pending_slot) = current else {
             *slot = current;
@@ -816,12 +829,13 @@ mod fastly_impl {
                             max_encoded_response_bytes,
                             max_response_header_bytes,
                             max_response_header_count,
+                            clock.clone(),
                         )
                         .await
                     }
-                    Err(error) => Err(map_send_error(&error, budget)),
+                    Err(error) => Err(map_send_error(&error, budget, clock)),
                 };
-                *slot = Slot::Done(finish_slot(started_at, outcome));
+                *slot = Slot::Done(finish_slot(started_at, outcome, clock));
             }
         }
     }
@@ -842,8 +856,9 @@ mod fastly_impl {
         max_encoded_response_bytes: Option<u64>,
         max_response_header_bytes: Option<u64>,
         max_response_header_count: Option<u64>,
+        clock: MonotonicClock,
     ) -> Result<OutboundResponse, EdgeError> {
-        budget_remaining(budget)?;
+        budget_remaining(budget, &clock)?;
         let status = StatusCode::from_u16(response.get_status().as_u16()).map_err(|_error| {
             EdgeError::bad_gateway_with_reason(
                 "Fastly returned an invalid upstream status code",
@@ -871,7 +886,7 @@ mod fastly_impl {
                 declared_body: true
             }
         );
-        let native = fastly_body_stream(response.take_body(), budget);
+        let native = fastly_body_stream(response.take_body(), budget, clock);
         if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
             if !declared_reset_body {
                 let mut reset_stream = native;
@@ -944,16 +959,17 @@ mod fastly_impl {
         maximum: u64,
         budget: DispatchBudget,
         started_at: MonotonicInstant,
+        clock: MonotonicClock,
     ) -> Result<FastlyResponse, EdgeError> {
-        dispatch_guard(started_at, budget)?;
+        dispatch_guard(started_at, budget, &clock)?;
         let (mut writer, pending) = request
             .send_async_streaming(backend)
-            .map_err(|error| map_send_error(&error, budget))?;
+            .map_err(|error| map_send_error(&error, budget, &clock))?;
         let mut total = 0_u64;
         loop {
-            budget_remaining(budget)?;
+            budget_remaining(budget, &clock)?;
             let next_item = source.next().await;
-            budget_remaining(budget)?;
+            budget_remaining(budget, &clock)?;
             let Some(item) = next_item else {
                 break;
             };
@@ -973,14 +989,14 @@ mod fastly_impl {
             resolve_stream_io_result(
                 write_result,
                 budget,
-                MonotonicInstant::now(),
+                clock.now(),
                 "Fastly outbound request body write failed",
             )?;
             let flush_result = writer.flush();
             resolve_stream_io_result(
                 flush_result,
                 budget,
-                MonotonicInstant::now(),
+                clock.now(),
                 "Fastly outbound request body flush failed",
             )?;
             total = next_total;
@@ -989,10 +1005,10 @@ mod fastly_impl {
         resolve_stream_io_result(
             finish_result,
             budget,
-            MonotonicInstant::now(),
+            clock.now(),
             "Fastly outbound request completion failed",
         )?;
-        wait_pending(pending, budget)
+        wait_pending(pending, budget, &clock)
     }
 
     fn resolve_stream_io_result(
@@ -1009,20 +1025,24 @@ mod fastly_impl {
         })
     }
 
-    fn fastly_body_stream(mut body: FastlyBody, budget: DispatchBudget) -> BodyStream {
+    fn fastly_body_stream(
+        mut body: FastlyBody,
+        budget: DispatchBudget,
+        clock: MonotonicClock,
+    ) -> BodyStream {
         stream! {
             loop {
-                budget_remaining(budget)?;
+                budget_remaining(budget, &clock)?;
                 let mut chunks = body.read_chunks(RESPONSE_READ_BYTES);
                 let item = chunks.next();
                 drop(chunks);
                 match item {
                     Some(Ok(chunk)) => {
-                        budget_remaining(budget)?;
+                        budget_remaining(budget, &clock)?;
                         yield Ok(Bytes::from(chunk));
                     }
                     Some(Err(_error)) => {
-                        if budget.deadline.is_expired() {
+                        if budget.deadline.is_expired_at(clock.now()) {
                             yield Err(timeout_error(budget.cause));
                         } else {
                             yield Err(EdgeError::bad_gateway_with_reason(
@@ -1033,7 +1053,7 @@ mod fastly_impl {
                         return;
                     }
                     None => {
-                        budget_remaining(budget)?;
+                        budget_remaining(budget, &clock)?;
                         return;
                     }
                 }
@@ -1055,31 +1075,40 @@ mod fastly_impl {
     fn wait_pending(
         pending: PendingRequest,
         budget: DispatchBudget,
+        clock: &MonotonicClock,
     ) -> Result<FastlyResponse, EdgeError> {
-        budget_remaining(budget)?;
+        budget_remaining(budget, clock)?;
         let outcome = pending
             .wait()
-            .map_err(|error| map_send_error(&error, budget));
-        budget_remaining(budget)?;
+            .map_err(|error| map_send_error(&error, budget, clock));
+        budget_remaining(budget, clock)?;
         outcome
     }
 
-    fn budget_remaining(budget: DispatchBudget) -> Result<Duration, EdgeError> {
+    fn budget_remaining(
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<Duration, EdgeError> {
         budget
             .deadline
-            .remaining()
+            .remaining_at(clock.now())
+            .map(|remaining| remaining.min(budget.duration))
             .ok_or_else(|| timeout_error(budget.cause))
     }
 
     fn dispatch_guard(
         started_at: MonotonicInstant,
         budget: DispatchBudget,
+        clock: &MonotonicClock,
     ) -> Result<(), EdgeError> {
-        dispatch_guard_at(started_at, budget, dispatch_observed_at(started_at)?)
+        dispatch_guard_at(started_at, budget, dispatch_observed_at(started_at, clock)?)
     }
 
     #[cfg(feature = "test-utils")]
-    fn dispatch_observed_at(started_at: MonotonicInstant) -> Result<MonotonicInstant, EdgeError> {
+    fn dispatch_observed_at(
+        started_at: MonotonicInstant,
+        clock: &MonotonicClock,
+    ) -> Result<MonotonicInstant, EdgeError> {
         if let Some(delay) = DISPATCH_SLACK_INJECTION.get() {
             return started_at.checked_add(delay).ok_or_else(|| {
                 EdgeError::internal(anyhow::anyhow!(
@@ -1087,7 +1116,7 @@ mod fastly_impl {
                 ))
             });
         }
-        Ok(MonotonicInstant::now())
+        Ok(clock.now())
     }
 
     #[cfg(not(feature = "test-utils"))]
@@ -1095,8 +1124,11 @@ mod fastly_impl {
         clippy::unnecessary_wraps,
         reason = "the test-utils build can reject an injected monotonic overflow"
     )]
-    fn dispatch_observed_at(_started_at: MonotonicInstant) -> Result<MonotonicInstant, EdgeError> {
-        Ok(MonotonicInstant::now())
+    fn dispatch_observed_at(
+        _started_at: MonotonicInstant,
+        clock: &MonotonicClock,
+    ) -> Result<MonotonicInstant, EdgeError> {
+        Ok(clock.now())
     }
 
     fn dispatch_guard_at(
@@ -1123,11 +1155,118 @@ mod fastly_impl {
     #[cfg(test)]
     mod tests {
         use std::cell::Cell;
+        use std::collections::VecDeque;
         use std::io::Error;
+        use std::sync::{Arc, Mutex};
 
         use edgezero_core::error::BudgetSource;
+        use edgezero_core::time::Deadline;
+        use futures::executor::block_on;
 
         use super::*;
+
+        fn scripted_clock(script: Vec<MonotonicInstant>) -> MonotonicClock {
+            let observations = Arc::new(Mutex::new(VecDeque::from(script)));
+            MonotonicClock::new(move || {
+                observations
+                    .lock()
+                    .expect("clock observations")
+                    .pop_front()
+                    .expect("clock observation")
+            })
+        }
+
+        fn clock_budget(start: MonotonicInstant, duration: Duration) -> DispatchBudget {
+            DispatchBudget {
+                cause: BudgetSource::PerCallTimeout,
+                deadline: Deadline::at_instant(start.checked_add(duration).expect("deadline")),
+                duration,
+            }
+        }
+
+        #[test]
+        fn method_entry_and_preflight_elapsed_use_the_injected_clock() {
+            let start = MonotonicInstant::now();
+            let completed = start
+                .checked_add(Duration::from_millis(9))
+                .expect("completed instant");
+            let client = FastlyOutboundClient::with_clock(scripted_clock(vec![start, completed]));
+            let request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+
+            let results = block_on(client.send_all(vec![request]));
+
+            assert_eq!(results[0].elapsed, Duration::from_millis(9));
+            assert!(matches!(
+                results[0].outcome,
+                Err(EdgeError::BadRequest { .. })
+            ));
+        }
+
+        #[test]
+        fn backwards_clock_fails_slot_without_invalid_elapsed() {
+            let start = MonotonicInstant::now();
+            let earlier = start
+                .checked_sub(Duration::from_millis(1))
+                .expect("earlier instant");
+            let client = FastlyOutboundClient::with_clock(scripted_clock(vec![start, earlier]));
+            let request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+
+            let results = block_on(client.send_all(vec![request]));
+
+            assert_eq!(results[0].elapsed, Duration::ZERO);
+            assert!(matches!(
+                results[0].outcome,
+                Err(EdgeError::Internal { .. })
+            ));
+        }
+
+        #[test]
+        fn backwards_clock_cannot_expand_the_selected_budget() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_millis(10));
+            let earlier = start
+                .checked_sub(Duration::from_millis(5))
+                .expect("earlier instant");
+            let clock = scripted_clock(vec![earlier]);
+
+            assert_eq!(
+                budget_remaining(budget, &clock).expect("remaining budget"),
+                budget.duration
+            );
+        }
+
+        #[test]
+        fn backend_preparation_consumes_budget_in_the_injected_clock_domain() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_millis(10));
+            let observed = start
+                .checked_add(Duration::from_millis(3))
+                .expect("observed instant");
+            let clock = scripted_clock(vec![observed]);
+            let request = OutboundRequest::get("https://example.com/").expect("request");
+
+            let identity = backend_identity(&request, budget, &clock).expect("backend identity");
+
+            assert_eq!(identity.budget_ms, 7);
+        }
+
+        #[test]
+        fn response_stream_retains_clock_for_post_ready_expiry() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_millis(10));
+            let clock = scripted_clock(vec![start, budget.deadline.instant()]);
+            let mut body = fastly_body_stream(FastlyBody::from("body"), budget, clock);
+
+            let error = block_on(body.next())
+                .expect("terminal item")
+                .expect_err("post-ready expiry");
+
+            assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
 
         #[test]
         fn backend_creation_error_table_is_exhaustive() {

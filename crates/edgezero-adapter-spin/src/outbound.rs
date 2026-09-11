@@ -219,7 +219,7 @@ mod spin_impl {
         limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
-    use edgezero_core::time::{DispatchBudget, MonotonicInstant, dispatch_budget};
+    use edgezero_core::time::{DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
     use futures_util::StreamExt as _;
     use futures_util::future::{Either, join_all, select};
     use futures_util::stream::once;
@@ -240,7 +240,9 @@ mod spin_impl {
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
 
     /// Native outbound HTTP implementation for Spin's WASI HTTP 0.3 host.
-    pub struct SpinOutboundClient;
+    pub struct SpinOutboundClient {
+        clock: MonotonicClock,
+    }
 
     struct PreparedRequest {
         budget: DispatchBudget,
@@ -253,6 +255,20 @@ mod spin_impl {
     }
 
     impl SpinOutboundClient {
+        /// Builds a client using the process-default monotonic clock.
+        #[must_use]
+        #[inline]
+        pub fn new() -> Self {
+            Self::with_clock(MonotonicClock::default())
+        }
+
+        /// Builds a client that evaluates every outbound lifetime against `clock`.
+        #[must_use]
+        #[inline]
+        pub fn with_clock(clock: MonotonicClock) -> Self {
+            Self { clock }
+        }
+
         fn prepare(
             request: OutboundRequest,
             started_at: MonotonicInstant,
@@ -281,7 +297,7 @@ mod spin_impl {
             })
         }
 
-        async fn execute(prepared: PreparedRequest) -> Result<OutboundResponse, EdgeError> {
+        async fn execute(&self, prepared: PreparedRequest) -> Result<OutboundResponse, EdgeError> {
             let PreparedRequest { budget, parts } = prepared;
             let OutboundRequestParts {
                 body,
@@ -305,7 +321,7 @@ mod spin_impl {
             }
 
             let fields = request_fields(&headers)?;
-            let options = request_options(budget)?;
+            let options = request_options(budget, &self.clock)?;
             let (writer, contents, trailers) = BodyWriter::new();
             let (request, request_done) =
                 Request::new(fields, Some(contents), trailers, Some(options));
@@ -313,14 +329,15 @@ mod spin_impl {
             let request_body_limit = super::request_body_limit(&body, max_request_body_bytes);
 
             let exchange = async move {
-                let upload = pump_request_body(body, request_body_limit, writer, budget);
+                let upload =
+                    pump_request_body(body, request_body_limit, writer, budget, self.clock.clone());
                 let send = client::send(request);
                 run_exchange(send, upload, request_done, |error| {
-                    map_spin_send_error(error, budget.deadline, budget.cause)
+                    map_spin_send_error(error, budget.deadline, budget.cause, self.clock.now())
                 })
                 .await
             };
-            let response = race_deadline(exchange, budget).await??;
+            let response = race_deadline(exchange, budget, &self.clock).await??;
 
             process_response(
                 response,
@@ -334,8 +351,16 @@ mod spin_impl {
                 max_encoded_response_bytes,
                 max_response_header_bytes,
                 max_response_header_count,
+                self.clock.clone(),
             )
             .await
+        }
+    }
+
+    impl Default for SpinOutboundClient {
+        #[inline]
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -343,19 +368,25 @@ mod spin_impl {
     impl OutboundHttpClient for SpinOutboundClient {
         #[inline]
         async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
-            let started_at = MonotonicInstant::now();
+            let started_at = self.clock.now();
             let prepared = Self::prepare(request, started_at)?;
-            Self::execute(prepared).await
+            self.execute(prepared).await
         }
 
         #[inline]
         async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
-            let batch_started_at = MonotonicInstant::now();
+            let batch_started_at = self.clock.now();
             let preflight: Vec<PreparedSlot> = requests
                 .into_iter()
                 .map(|request| {
                     Self::prepare_batch(request, batch_started_at).map_or_else(
-                        |error| PreparedSlot::Finished(finish_slot(batch_started_at, Err(error))),
+                        |error| {
+                            PreparedSlot::Finished(finish_slot(
+                                batch_started_at,
+                                Err(error),
+                                &self.clock,
+                            ))
+                        },
                         |prepared| PreparedSlot::Pending(Box::new(prepared)),
                     )
                 })
@@ -364,8 +395,8 @@ mod spin_impl {
             join_all(preflight.into_iter().map(|slot| async move {
                 match slot {
                     PreparedSlot::Pending(prepared) => {
-                        let outcome = Self::execute(*prepared).await;
-                        finish_slot(batch_started_at, outcome)
+                        let outcome = self.execute(*prepared).await;
+                        finish_slot(batch_started_at, outcome, &self.clock)
                     }
                     PreparedSlot::Finished(done) => done,
                 }
@@ -386,9 +417,12 @@ mod spin_impl {
         Ok(fields)
     }
 
-    fn request_options(budget: DispatchBudget) -> Result<RequestOptions, EdgeError> {
+    fn request_options(
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<RequestOptions, EdgeError> {
         let options = RequestOptions::new();
-        let remaining = budget_remaining(budget)?;
+        let remaining = budget_remaining(budget, clock)?;
         let timeouts = super::request_timeouts(remaining);
         set_timeout_option(
             "connect",
@@ -472,6 +506,7 @@ mod spin_impl {
         maximum: u64,
         writer: BodyWriter,
         budget: DispatchBudget,
+        clock: MonotonicClock,
     ) -> Result<UploadCompletion, EdgeError> {
         let BodyWriter {
             mut stream_writer,
@@ -485,7 +520,7 @@ mod spin_impl {
         };
 
         while let Some(item) = source.next().await {
-            budget_remaining(budget)?;
+            budget_remaining(budget, &clock)?;
             let bytes = match item {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -514,7 +549,7 @@ mod spin_impl {
                 ));
             }
             let unwritten = stream_writer.write_all(bytes.to_vec()).await;
-            budget_remaining(budget)?;
+            budget_remaining(budget, &clock)?;
             if !unwritten.is_empty() {
                 drop(stream_writer);
                 drop(result_writer.write(Ok(None)).await);
@@ -556,8 +591,9 @@ mod spin_impl {
         max_encoded_response_bytes: Option<u64>,
         max_response_header_bytes: Option<u64>,
         max_response_header_count: Option<u64>,
+        clock: MonotonicClock,
     ) -> Result<OutboundResponse, EdgeError> {
-        budget_remaining(budget)?;
+        budget_remaining(budget, &clock)?;
         let status = StatusCode::from_u16(response.get_status_code()).map_err(|_error| {
             EdgeError::bad_gateway_with_reason(
                 "Spin returned an invalid upstream status code",
@@ -571,9 +607,9 @@ mod spin_impl {
         let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
         headers.insert(PROXY_HEADER, HeaderValue::from_static("spin"));
 
-        let native = super::cooperative_stream(response_stream(response, budget));
+        let native = super::cooperative_stream(response_stream(response, budget, clock.clone()));
         if disposition == ResponseBodyDisposition::FramingBodyless {
-            drain_response(native, budget).await?;
+            drain_response(native, budget, &clock).await?;
             return Ok(OutboundResponse::new(
                 request_method,
                 status,
@@ -590,7 +626,7 @@ mod spin_impl {
         );
         if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
             if !declared_reset_body {
-                drain_response(native, budget).await?;
+                drain_response(native, budget, &clock).await?;
             }
             return Ok(OutboundResponse::new(
                 request_method,
@@ -631,7 +667,7 @@ mod spin_impl {
             ContentEncoding::Passthrough => decoded,
         };
         let shaped = rechunk_stream(output, max_chunk_bytes);
-        let deadline_bound = deadline_stream(super::cooperative_stream(shaped), budget);
+        let deadline_bound = deadline_stream(super::cooperative_stream(shaped), budget, clock);
         let body = match response_mode {
             ResponseMode::Buffered { max_bytes } => {
                 Body::from(collect_response_stream(deadline_bound, max_bytes).await?)
@@ -668,13 +704,17 @@ mod spin_impl {
         )))
     }
 
-    fn response_stream(response: Response, budget: DispatchBudget) -> BodyStream {
+    fn response_stream(
+        response: Response,
+        budget: DispatchBudget,
+        clock: MonotonicClock,
+    ) -> BodyStream {
         let (completion_writer, result_reader) = wit_future::new(default_response_result);
         let (mut body_reader, trailer_reader) = Response::consume_body(response, result_reader);
         stream! {
             loop {
                 let read = body_reader.read(Vec::with_capacity(RESPONSE_READ_BYTES));
-                let (result, chunk) = match race_deadline(read, budget).await {
+                let (result, chunk) = match race_deadline(read, budget, &clock).await {
                     Ok(value) => value,
                     Err(error) => {
                         yield Err(error);
@@ -689,6 +729,7 @@ mod spin_impl {
                         let trailer_result = race_deadline(
                             async move { trailer_reader.await },
                             budget,
+                            &clock,
                         )
                         .await;
                         match trailer_result {
@@ -698,6 +739,7 @@ mod spin_impl {
                                     &error,
                                     budget.deadline,
                                     budget.cause,
+                                    clock.now(),
                                 ));
                                 return;
                             }
@@ -707,7 +749,7 @@ mod spin_impl {
                             }
                         }
                         let completion = completion_writer.write(Ok(()));
-                        match race_deadline(completion, budget).await {
+                        match race_deadline(completion, budget, &clock).await {
                             Ok(Ok(())) => return,
                             Ok(Err(_closed)) => {
                                 yield Err(EdgeError::bad_gateway_with_reason(
@@ -735,10 +777,14 @@ mod spin_impl {
         .boxed_local()
     }
 
-    fn deadline_stream(mut source: BodyStream, budget: DispatchBudget) -> BodyStream {
+    fn deadline_stream(
+        mut source: BodyStream,
+        budget: DispatchBudget,
+        clock: MonotonicClock,
+    ) -> BodyStream {
         stream! {
             loop {
-                let next_item = match race_deadline(source.next(), budget).await {
+                let next_item = match race_deadline(source.next(), budget, &clock).await {
                     Ok(item) => item,
                     Err(error) => {
                         yield Err(error);
@@ -758,10 +804,14 @@ mod spin_impl {
         .boxed_local()
     }
 
-    async fn drain_response(mut body: BodyStream, budget: DispatchBudget) -> Result<(), EdgeError> {
+    async fn drain_response(
+        mut body: BodyStream,
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<(), EdgeError> {
         while let Some(item) = body.next().await {
             item?;
-            budget_remaining(budget)?;
+            budget_remaining(budget, clock)?;
         }
         Ok(())
     }
@@ -769,30 +819,36 @@ mod spin_impl {
     async fn race_deadline<Output>(
         future: impl Future<Output = Output>,
         budget: DispatchBudget,
+        clock: &MonotonicClock,
     ) -> Result<Output, EdgeError> {
-        let remaining = budget_remaining(budget)?;
+        let remaining = budget_remaining(budget, clock)?;
         let timer = sleep(remaining);
         futures_util::pin_mut!(future, timer);
         let output = match select(future, timer).await {
             Either::Left((output, _timer)) => output,
             Either::Right(((), _future)) => return Err(timeout_error(budget.cause)),
         };
-        budget_remaining(budget)?;
+        budget_remaining(budget, clock)?;
         Ok(output)
     }
 
-    fn budget_remaining(budget: DispatchBudget) -> Result<Duration, EdgeError> {
+    fn budget_remaining(
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<Duration, EdgeError> {
         budget
             .deadline
-            .remaining()
+            .remaining_at(clock.now())
+            .map(|remaining| remaining.min(budget.duration))
             .ok_or_else(|| timeout_error(budget.cause))
     }
 
     fn finish_slot(
         started_at: MonotonicInstant,
         outcome: Result<OutboundResponse, EdgeError>,
+        clock: &MonotonicClock,
     ) -> OutboundSlotResult {
-        let completed_at = MonotonicInstant::now();
+        let completed_at = clock.now();
         match completed_at.checked_duration_since(started_at) {
             Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
             None => OutboundSlotResult::new(
@@ -803,14 +859,143 @@ mod spin_impl {
             ),
         }
     }
+
+    #[cfg(test)]
+    mod clock_tests {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        use edgezero_core::error::BudgetSource;
+        use edgezero_core::time::Deadline;
+        use futures::executor::block_on;
+        use futures_util::stream;
+
+        use super::*;
+
+        fn scripted_clock(script: Vec<MonotonicInstant>) -> MonotonicClock {
+            let observations = Arc::new(Mutex::new(VecDeque::from(script)));
+            MonotonicClock::new(move || {
+                observations
+                    .lock()
+                    .expect("clock observations")
+                    .pop_front()
+                    .expect("clock observation")
+            })
+        }
+
+        fn test_budget(start: MonotonicInstant, duration: Duration) -> DispatchBudget {
+            DispatchBudget {
+                cause: BudgetSource::PerCallTimeout,
+                deadline: Deadline::at_instant(start.checked_add(duration).expect("deadline")),
+                duration,
+            }
+        }
+
+        #[test]
+        fn method_entry_and_preflight_elapsed_use_the_injected_clock() {
+            let start = MonotonicInstant::now();
+            let completed = start
+                .checked_add(Duration::from_millis(9))
+                .expect("completed instant");
+            let client = SpinOutboundClient::with_clock(scripted_clock(vec![start, completed]));
+            let request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+
+            let results = block_on(client.send_all(vec![request]));
+
+            assert_eq!(results[0].elapsed, Duration::from_millis(9));
+            assert!(matches!(
+                results[0].outcome,
+                Err(EdgeError::BadRequest { .. })
+            ));
+        }
+
+        #[test]
+        fn backwards_clock_fails_slot_without_invalid_elapsed() {
+            let start = MonotonicInstant::now();
+            let earlier = start
+                .checked_sub(Duration::from_millis(1))
+                .expect("earlier instant");
+            let client = SpinOutboundClient::with_clock(scripted_clock(vec![start, earlier]));
+            let request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+
+            let results = block_on(client.send_all(vec![request]));
+
+            assert_eq!(results[0].elapsed, Duration::ZERO);
+            assert!(matches!(
+                results[0].outcome,
+                Err(EdgeError::Internal { .. })
+            ));
+        }
+
+        #[test]
+        fn backwards_clock_cannot_expand_the_selected_budget() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let earlier = start
+                .checked_sub(Duration::from_millis(5))
+                .expect("earlier instant");
+            let clock = scripted_clock(vec![earlier]);
+
+            assert_eq!(
+                budget_remaining(budget, &clock).expect("remaining budget"),
+                budget.duration
+            );
+        }
+
+        #[test]
+        fn request_option_preparation_consumes_injected_budget() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let observed = start
+                .checked_add(Duration::from_millis(3))
+                .expect("observed instant");
+            let observations = Arc::new(Mutex::new(VecDeque::from([observed])));
+            let clock_observations = Arc::clone(&observations);
+            let clock = MonotonicClock::new(move || {
+                clock_observations
+                    .lock()
+                    .expect("clock observations")
+                    .pop_front()
+                    .expect("clock observation")
+            });
+
+            let _options = request_options(budget, &clock).expect("request options");
+
+            assert!(observations.lock().expect("clock observations").is_empty());
+        }
+
+        #[test]
+        fn response_stream_retains_clock_for_post_ready_expiry() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let clock = scripted_clock(vec![start, budget.deadline.instant()]);
+            let source = stream::once(async { Ok(Bytes::from_static(b"body")) }).boxed_local();
+            let mut body = deadline_stream(source, budget, clock);
+
+            let error = block_on(body.next())
+                .expect("terminal item")
+                .expect_err("post-ready expiry");
+
+            assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
+    }
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use spin_impl::SpinOutboundClient;
 
 #[cfg(feature = "spin")]
-fn map_spin_send_error(error: &ErrorCode, deadline: Deadline, cause: BudgetSource) -> EdgeError {
-    if deadline.is_expired() {
+fn map_spin_send_error(
+    error: &ErrorCode,
+    deadline: Deadline,
+    cause: BudgetSource,
+    observed_at: edgezero_core::MonotonicInstant,
+) -> EdgeError {
+    if deadline.is_expired_at(observed_at) {
         return timeout_error(cause);
     }
 
@@ -911,8 +1096,9 @@ pub fn map_spin_send_error_for_test(
     error: &ErrorCode,
     deadline: Deadline,
     cause: BudgetSource,
+    observed_at: edgezero_core::MonotonicInstant,
 ) -> EdgeError {
-    map_spin_send_error(error, deadline, cause)
+    map_spin_send_error(error, deadline, cause, observed_at)
 }
 
 #[cfg(test)]

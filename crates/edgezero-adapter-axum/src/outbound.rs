@@ -17,7 +17,7 @@ use edgezero_core::outbound::{
     limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
     validate_for_dispatch,
 };
-use edgezero_core::time::{DispatchBudget, MonotonicInstant, dispatch_budget};
+use edgezero_core::time::{DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
 use futures_util::StreamExt as _;
 use futures_util::future::join_all;
 use reqwest::header::HeaderMap as ReqwestHeaderMap;
@@ -27,6 +27,7 @@ use tokio::time::timeout;
 /// Native outbound HTTP implementation used by the Axum adapter.
 pub struct AxumOutboundClient {
     client: reqwest::Client,
+    clock: MonotonicClock,
 }
 
 struct PreparedRequest {
@@ -62,8 +63,9 @@ impl AxumOutboundClient {
         if !headers.contains_key(ACCEPT_ENCODING) {
             headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
         }
-        let request_body = collect_request_body(body, max_request_body_bytes, budget).await?;
-        let remaining = budget_remaining(budget)?;
+        let request_body =
+            collect_request_body(body, max_request_body_bytes, budget, &self.clock).await?;
+        let remaining = budget_remaining(budget, &self.clock)?;
         let request = self
             .client
             .request(reqwest_method(&method)?, uri.to_string())
@@ -73,7 +75,7 @@ impl AxumOutboundClient {
         let response = request
             .send()
             .await
-            .map_err(|error| classify_send_error(&error, budget.cause))?;
+            .map_err(|error| classify_send_error(&error, budget, &self.clock))?;
 
         process_response(
             response,
@@ -87,6 +89,7 @@ impl AxumOutboundClient {
             max_encoded_response_bytes,
             max_response_header_bytes,
             max_response_header_count,
+            self.clock.clone(),
         )
         .await
     }
@@ -135,6 +138,15 @@ impl AxumOutboundClient {
     /// Returns the underlying client-construction error when TLS initialization fails.
     #[inline]
     pub fn try_new() -> Result<Self, reqwest::Error> {
+        Self::try_with_clock(MonotonicClock::default())
+    }
+
+    /// Builds a client that evaluates every outbound lifetime against `clock`.
+    ///
+    /// # Errors
+    /// Returns the underlying client-construction error when TLS initialization fails.
+    #[inline]
+    pub fn try_with_clock(clock: MonotonicClock) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
             .no_brotli()
@@ -142,7 +154,7 @@ impl AxumOutboundClient {
             .no_gzip()
             .no_zstd()
             .build()?;
-        Ok(Self { client })
+        Ok(Self { client, clock })
     }
 }
 
@@ -150,19 +162,25 @@ impl AxumOutboundClient {
 impl OutboundHttpClient for AxumOutboundClient {
     #[inline]
     async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
-        let started_at = MonotonicInstant::now();
+        let started_at = self.clock.now();
         let prepared = Self::prepare(request, started_at)?;
         self.execute(prepared).await
     }
 
     #[inline]
     async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
-        let batch_started_at = MonotonicInstant::now();
+        let batch_started_at = self.clock.now();
         let preflight: Vec<PreparedSlot> = requests
             .into_iter()
             .map(|request| {
                 Self::prepare_batch(request, batch_started_at).map_or_else(
-                    |error| PreparedSlot::Finished(finish_slot(batch_started_at, Err(error))),
+                    |error| {
+                        PreparedSlot::Finished(finish_slot(
+                            batch_started_at,
+                            Err(error),
+                            &self.clock,
+                        ))
+                    },
                     |prepared| PreparedSlot::Pending(Box::new(prepared)),
                 )
             })
@@ -172,7 +190,7 @@ impl OutboundHttpClient for AxumOutboundClient {
             match slot {
                 PreparedSlot::Pending(prepared) => {
                     let outcome = self.execute(*prepared).await;
-                    finish_slot(batch_started_at, outcome)
+                    finish_slot(batch_started_at, outcome, &self.clock)
                 }
                 PreparedSlot::Finished(done) => done,
             }
@@ -185,6 +203,7 @@ async fn collect_request_body(
     body: Body,
     maximum: u64,
     budget: DispatchBudget,
+    clock: &MonotonicClock,
 ) -> Result<Bytes, EdgeError> {
     match body {
         Body::Once(bytes) => {
@@ -194,18 +213,18 @@ async fn collect_request_body(
                     "outbound request body exceeded configured limit",
                 ));
             }
-            budget_remaining(budget)?;
+            budget_remaining(budget, clock)?;
             Ok(bytes)
         }
         Body::Stream(mut source) => {
             let mut collected = Vec::new();
             let mut total = 0_u64;
             loop {
-                let remaining = budget_remaining(budget)?;
+                let remaining = budget_remaining(budget, clock)?;
                 let next_item = timeout(remaining, source.next())
                     .await
                     .map_err(|_elapsed| timeout_error(budget.cause))?;
-                budget_remaining(budget)?;
+                budget_remaining(budget, clock)?;
                 let Some(item) = next_item else {
                     return Ok(Bytes::from(collected));
                 };
@@ -228,10 +247,14 @@ async fn collect_request_body(
     }
 }
 
-fn deadline_stream(mut source: BodyStream, budget: DispatchBudget) -> BodyStream {
+fn deadline_stream(
+    mut source: BodyStream,
+    budget: DispatchBudget,
+    clock: MonotonicClock,
+) -> BodyStream {
     stream! {
         loop {
-            let remaining = match budget_remaining(budget) {
+            let remaining = match budget_remaining(budget, &clock) {
                 Ok(remaining) => remaining,
                 Err(error) => {
                     yield Err(error);
@@ -245,7 +268,7 @@ fn deadline_stream(mut source: BodyStream, budget: DispatchBudget) -> BodyStream
                     return;
                 }
             };
-            if budget_remaining(budget).is_err() {
+            if budget_remaining(budget, &clock).is_err() {
                 yield Err(timeout_error(budget.cause));
                 return;
             }
@@ -265,8 +288,9 @@ fn deadline_stream(mut source: BodyStream, budget: DispatchBudget) -> BodyStream
 fn finish_slot(
     started_at: MonotonicInstant,
     outcome: Result<OutboundResponse, EdgeError>,
+    clock: &MonotonicClock,
 ) -> OutboundSlotResult {
-    let completed_at = MonotonicInstant::now();
+    let completed_at = clock.now();
     match completed_at.checked_duration_since(started_at) {
         Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
         None => OutboundSlotResult::new(
@@ -294,8 +318,9 @@ async fn process_response(
     max_encoded_response_bytes: Option<u64>,
     max_response_header_bytes: Option<u64>,
     max_response_header_count: Option<u64>,
+    clock: MonotonicClock,
 ) -> Result<OutboundResponse, EdgeError> {
-    budget_remaining(budget)?;
+    budget_remaining(budget, &clock)?;
     let status = StatusCode::from_u16(response.status().as_u16()).map_err(EdgeError::internal)?;
     let mut headers = copy_headers(response.headers());
     let mut header_limiter =
@@ -319,10 +344,10 @@ async fn process_response(
             declared_body: true
         }
     );
-    let native = response_stream(response, budget.cause);
+    let native = response_stream(response, budget, clock.clone());
     if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
         if !declared_reset_body {
-            let mut reset_stream = deadline_stream(native, budget);
+            let mut reset_stream = deadline_stream(native, budget, clock);
             if let Some(item) = reset_stream.next().await {
                 item?;
             }
@@ -366,7 +391,7 @@ async fn process_response(
         ContentEncoding::Passthrough => decoded,
     };
     let shaped = rechunk_stream(output, max_chunk_bytes);
-    let deadline_bound = deadline_stream(shaped, budget);
+    let deadline_bound = deadline_stream(shaped, budget, clock);
     let body = match response_mode {
         ResponseMode::Buffered { max_bytes } => {
             Body::from(collect_response_stream(deadline_bound, max_bytes).await?)
@@ -376,16 +401,24 @@ async fn process_response(
     Ok(OutboundResponse::new(request_method, status, headers, body))
 }
 
-fn budget_remaining(budget: DispatchBudget) -> Result<Duration, EdgeError> {
+fn budget_remaining(budget: DispatchBudget, clock: &MonotonicClock) -> Result<Duration, EdgeError> {
     budget
         .deadline
-        .remaining()
+        .remaining_at(clock.now())
+        .map(|remaining| remaining.min(budget.duration))
         .ok_or_else(|| timeout_error(budget.cause))
 }
 
-fn classify_send_error(error: &reqwest::Error, cause: BudgetSource) -> EdgeError {
+fn classify_send_error(
+    error: &reqwest::Error,
+    budget: DispatchBudget,
+    clock: &MonotonicClock,
+) -> EdgeError {
+    if budget.deadline.is_expired_at(clock.now()) {
+        return timeout_error(budget.cause);
+    }
     if error.is_timeout() {
-        return timeout_error(cause);
+        return timeout_error(budget.cause);
     }
     let reason = if error.is_connect() {
         BadGatewayReason::Unreachable
@@ -409,15 +442,19 @@ fn reqwest_method(method: &Method) -> Result<reqwest::Method, EdgeError> {
     reqwest::Method::from_bytes(method.as_str().as_bytes()).map_err(EdgeError::internal)
 }
 
-fn response_stream(mut response: reqwest::Response, cause: BudgetSource) -> BodyStream {
+fn response_stream(
+    mut response: reqwest::Response,
+    budget: DispatchBudget,
+    clock: MonotonicClock,
+) -> BodyStream {
     stream! {
         loop {
             match response.chunk().await {
                 Ok(Some(bytes)) => yield Ok(bytes),
                 Ok(None) => return,
                 Err(error) => {
-                    let mapped = if error.is_timeout() {
-                        timeout_error(cause)
+                    let mapped = if budget.deadline.is_expired_at(clock.now()) || error.is_timeout() {
+                        timeout_error(budget.cause)
                     } else {
                         EdgeError::bad_gateway_with_reason(
                             "upstream response body failed",
@@ -435,4 +472,122 @@ fn response_stream(mut response: reqwest::Response, cause: BudgetSource) -> Body
 
 fn timeout_error(cause: BudgetSource) -> EdgeError {
     EdgeError::gateway_timeout_caused("outbound request deadline expired", cause)
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use edgezero_core::time::Deadline;
+    use futures_util::stream;
+
+    use super::*;
+
+    fn scripted_clock(script: Vec<MonotonicInstant>) -> MonotonicClock {
+        let observations = Arc::new(Mutex::new(VecDeque::from(script)));
+        MonotonicClock::new(move || {
+            observations
+                .lock()
+                .expect("clock observations")
+                .pop_front()
+                .expect("clock observation")
+        })
+    }
+
+    fn test_budget(start: MonotonicInstant, duration: Duration) -> DispatchBudget {
+        DispatchBudget {
+            cause: BudgetSource::PerCallTimeout,
+            deadline: Deadline::at_instant(start.checked_add(duration).expect("deadline")),
+            duration,
+        }
+    }
+
+    #[tokio::test]
+    async fn method_entry_and_preflight_elapsed_use_the_injected_clock() {
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(9))
+            .expect("completed instant");
+        let client = AxumOutboundClient::try_with_clock(scripted_clock(vec![start, completed]))
+            .expect("client");
+        let request = OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = client.send_all(vec![request]).await;
+
+        assert_eq!(results[0].elapsed, Duration::from_millis(9));
+        assert!(matches!(
+            results[0].outcome,
+            Err(EdgeError::BadRequest { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn backwards_clock_fails_slot_without_invalid_elapsed() {
+        let start = MonotonicInstant::now();
+        let earlier = start
+            .checked_sub(Duration::from_millis(1))
+            .expect("earlier instant");
+        let client = AxumOutboundClient::try_with_clock(scripted_clock(vec![start, earlier]))
+            .expect("client");
+        let request = OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = client.send_all(vec![request]).await;
+
+        assert_eq!(results[0].elapsed, Duration::ZERO);
+        assert!(matches!(
+            results[0].outcome,
+            Err(EdgeError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn backwards_clock_cannot_expand_the_selected_budget() {
+        let start = MonotonicInstant::now();
+        let budget = test_budget(start, Duration::from_millis(10));
+        let earlier = start
+            .checked_sub(Duration::from_millis(5))
+            .expect("earlier instant");
+        let clock = scripted_clock(vec![earlier]);
+
+        assert_eq!(
+            budget_remaining(budget, &clock).expect("remaining budget"),
+            budget.duration
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_checks_injected_clock_after_ready_item() {
+        let start = MonotonicInstant::now();
+        let budget = test_budget(start, Duration::from_millis(10));
+        let clock = scripted_clock(vec![start, budget.deadline.instant()]);
+        let body = Body::from_stream(stream::once(async { Ok(Bytes::from_static(b"body")) }));
+
+        let error = collect_request_body(body, 16, budget, &clock)
+            .await
+            .expect_err("post-ready expiry");
+
+        assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+    }
+
+    #[tokio::test]
+    async fn response_stream_retains_clock_for_post_ready_expiry() {
+        let start = MonotonicInstant::now();
+        let budget = test_budget(start, Duration::from_millis(10));
+        let clock = scripted_clock(vec![start, budget.deadline.instant()]);
+        let source = stream::once(async { Ok(Bytes::from_static(b"body")) }).boxed_local();
+        let mut body = deadline_stream(source, budget, clock);
+
+        let error = body
+            .next()
+            .await
+            .expect("terminal item")
+            .expect_err("post-ready expiry");
+
+        assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+    }
 }

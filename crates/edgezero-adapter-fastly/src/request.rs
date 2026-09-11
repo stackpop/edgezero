@@ -323,7 +323,8 @@ where
 {
     // Read raw-request signals into a scratch bag BEFORE conversion consumes `req`.
     let scratch = apply_request_extend(&req, extend);
-    let mut head_request = into_core_request_head(&req).map_err(|error| map_edge_error(&error))?;
+    let mut head_request = into_core_request_head(&req, app.monotonic_clock())
+        .map_err(|error| map_edge_error(&error))?;
     head_request.extensions_mut().extend(scratch);
     let head_parts = IngressHeadParts::from_request(
         &head_request,
@@ -524,11 +525,14 @@ fn build_secret_registry(
 /// Returns [`EdgeError::Internal`] if the Fastly request cannot be reconstituted into a core request (e.g., method or URI conversion failure).
 #[inline]
 pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
-    let request = into_core_request_head(&req)?;
+    let request = into_core_request_head(&req, MonotonicClock::default())?;
     Ok(attach_core_body(&mut req, request, None))
 }
 
-fn into_core_request_head(req: &FastlyRequest) -> Result<Request, EdgeError> {
+fn into_core_request_head(
+    req: &FastlyRequest,
+    outbound_clock: MonotonicClock,
+) -> Result<Request, EdgeError> {
     let method = req.get_method().clone();
     let uri = parse_uri(req.get_url_str())?;
 
@@ -545,9 +549,13 @@ fn into_core_request_head(req: &FastlyRequest) -> Result<Request, EdgeError> {
     FastlyRequestContext::insert(&mut request, context);
     request
         .extensions_mut()
-        .insert(HttpClient::with_client(FastlyOutboundClient::new()));
+        .insert(outbound_client(outbound_clock));
 
     Ok(request)
+}
+
+fn outbound_client(clock: MonotonicClock) -> HttpClient {
+    HttpClient::with_client(FastlyOutboundClient::with_clock(clock))
 }
 
 fn attach_core_body(
@@ -737,9 +745,12 @@ mod synthesis_tests {
     use super::*;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::key_value_store::{KvStore, NoopKvStore};
+    use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
@@ -785,6 +796,32 @@ mod synthesis_tests {
             scratch.get::<Ja4>(),
             Some(&Ja4("http://example.test/".to_owned()))
         );
+    }
+
+    #[test]
+    fn standard_outbound_client_factory_uses_the_exact_app_clock() {
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(Mutex::new(VecDeque::from([start, completed])));
+        let clock_observations = Arc::clone(&observations);
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            clock_observations
+                .lock()
+                .expect("clock observations")
+                .pop_front()
+                .expect("clock observation")
+        }));
+        let client = outbound_client(app.monotonic_clock());
+        let request = edgezero_core::OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = executor::block_on(client.send_all(vec![request]));
+
+        assert_eq!(results[0].elapsed, Duration::from_millis(7));
     }
 
     #[test]

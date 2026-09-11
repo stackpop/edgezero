@@ -35,6 +35,9 @@ pub(crate) fn into_core_request_parts(
     axum_body: AxumBody,
     read_lifetime: Option<(Deadline, MonotonicClock)>,
 ) -> Result<CoreRequest, String> {
+    let outbound_clock = read_lifetime
+        .as_ref()
+        .map_or_else(MonotonicClock::default, |(_, clock)| clock.clone());
     let body = match read_lifetime {
         Some((deadline, monotonic_clock)) => {
             deadline_body(axum_body.into_data_stream(), deadline, monotonic_clock)
@@ -60,7 +63,7 @@ pub(crate) fn into_core_request_parts(
         );
     }
 
-    let outbound_client = AxumOutboundClient::try_new()
+    let outbound_client = AxumOutboundClient::try_with_clock(outbound_clock)
         .map_err(|err| format!("failed to build outbound HTTP client: {err}"))?;
     core_request
         .extensions_mut()
@@ -127,8 +130,10 @@ mod tests {
     use edgezero_core::time::MonotonicInstant;
     use std::io;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Poll;
+    use std::time::Duration;
 
     struct DropSignal(Arc<AtomicUsize>);
 
@@ -162,6 +167,60 @@ mod tests {
             .expect_err("timeout");
         assert_eq!(error.status(), StatusCode::REQUEST_TIMEOUT);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn admitted_request_installs_outbound_client_with_the_ingress_clock() {
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(Mutex::new(vec![completed, start]));
+        let clock_observations = Arc::clone(&observations);
+        let clock = MonotonicClock::new(move || {
+            clock_observations
+                .lock()
+                .expect("clock observations")
+                .pop()
+                .expect("clock observation")
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/demo")
+            .body(AxumBody::empty())
+            .expect("request");
+        let (parts, body) = request.into_parts();
+        let core_request = into_core_request_parts(
+            parts,
+            body,
+            Some((
+                Deadline::at_instant(
+                    start
+                        .checked_add(Duration::from_secs(1))
+                        .expect("read deadline"),
+                ),
+                clock,
+            )),
+        )
+        .expect("request conversion");
+        let client = core_request
+            .extensions()
+            .get::<HttpClient>()
+            .expect("outbound client")
+            .clone();
+        let invalid_batch_request = edgezero_core::OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = client.send_all(vec![invalid_batch_request]).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].elapsed, Duration::from_millis(7));
+        assert!(matches!(
+            results[0].outcome,
+            Err(EdgeError::BadRequest { .. })
+        ));
+        assert!(observations.lock().expect("clock observations").is_empty());
     }
 
     #[tokio::test]
