@@ -283,11 +283,16 @@ pub async fn into_core_request(
     env: Env,
     ctx: Context,
 ) -> Result<Request, EdgeError> {
-    let request = into_core_request_head(&req, env, ctx)?;
+    let request = into_core_request_head(&req, env, ctx, MonotonicClock::default())?;
     attach_core_body(req, request, None)
 }
 
-fn into_core_request_head(req: &CfRequest, env: Env, ctx: Context) -> Result<Request, EdgeError> {
+fn into_core_request_head(
+    req: &CfRequest,
+    env: Env,
+    ctx: Context,
+    outbound_clock: MonotonicClock,
+) -> Result<Request, EdgeError> {
     let method = into_core_method(&req.method());
     let url = req
         .url()
@@ -308,8 +313,12 @@ fn into_core_request_head(req: &CfRequest, env: Env, ctx: Context) -> Result<Req
     CloudflareRequestContext::insert(&mut request, env, ctx);
     request
         .extensions_mut()
-        .insert(HttpClient::with_client(CloudflareOutboundClient));
+        .insert(outbound_client(outbound_clock));
     Ok(request)
+}
+
+fn outbound_client(clock: MonotonicClock) -> HttpClient {
+    HttpClient::with_client(CloudflareOutboundClient::with_clock(clock))
 }
 
 fn attach_core_body(
@@ -482,8 +491,8 @@ pub(crate) async fn dispatch_with_handles(
     stores: Stores,
     request_start: MonotonicInstant,
 ) -> Result<CfResponse, WorkerError> {
-    let head_request =
-        into_core_request_head(&req, env, ctx).map_err(|error| edge_error_to_worker(&error))?;
+    let head_request = into_core_request_head(&req, env, ctx, app.monotonic_clock())
+        .map_err(|error| edge_error_to_worker(&error))?;
     let head_parts = IngressHeadParts::from_request(
         &head_request,
         IngressHeadAccounting::HostManaged,
@@ -798,7 +807,13 @@ fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl Display) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
     use super::*;
+    use edgezero_core::outbound::OutboundRequest;
+    use edgezero_core::router::RouterService;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     #[wasm_bindgen_test]
@@ -813,6 +828,32 @@ mod tests {
         assert_eq!(into_core_method(&Method::Post), CoreMethod::POST);
         assert_eq!(into_core_method(&Method::Put), CoreMethod::PUT);
         assert_eq!(into_core_method(&Method::Delete), CoreMethod::DELETE);
+    }
+
+    #[wasm_bindgen_test]
+    async fn standard_outbound_client_factory_uses_the_exact_app_clock() {
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(Mutex::new(VecDeque::from([start, completed])));
+        let clock_observations = Arc::clone(&observations);
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            clock_observations
+                .lock()
+                .expect("clock observations")
+                .pop_front()
+                .expect("clock observation")
+        }));
+        let client = outbound_client(app.monotonic_clock());
+        let request = OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = client.send_all(vec![request]).await;
+
+        assert_eq!(results[0].elapsed, Duration::from_millis(7));
     }
 }
 

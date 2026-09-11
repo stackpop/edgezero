@@ -6,12 +6,15 @@
     reason = "SDK construction checks stay before the exhaustive classifier fixture"
 )]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use edgezero_adapter_spin::outbound::{SpinOutboundClient, map_spin_send_error_for_test};
     use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
-    use edgezero_core::outbound::OutboundHttpClient;
-    use edgezero_core::time::Deadline;
+    use edgezero_core::outbound::{OutboundHttpClient, OutboundRequest};
+    use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
+    use futures::executor::block_on;
     use spin_sdk::wasip3::http::types::{
         DnsErrorPayload, ErrorCode, FieldSizePayload, Fields, Request, RequestOptions, Response,
         TlsAlertReceivedPayload,
@@ -23,6 +26,34 @@ mod tests {
     #[test]
     fn spin_outbound_client_implements_portable_contract() {
         assert_outbound_client::<SpinOutboundClient>();
+    }
+
+    #[test]
+    fn injected_clock_controls_method_entry_and_preflight_elapsed() {
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(Mutex::new(VecDeque::from([start, completed])));
+        let clock_observations = Arc::clone(&observations);
+        let client = SpinOutboundClient::with_clock(MonotonicClock::new(move || {
+            clock_observations
+                .lock()
+                .expect("clock observations")
+                .pop_front()
+                .expect("clock observation")
+        }));
+        let request = OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = block_on(client.send_all(vec![request]));
+
+        assert_eq!(results[0].elapsed, Duration::from_millis(7));
+        assert!(matches!(
+            results[0].outcome,
+            Err(EdgeError::BadRequest { .. })
+        ));
     }
 
     #[test]
@@ -246,15 +277,20 @@ mod tests {
 
     #[test]
     fn spin_error_code_table_is_exhaustive() {
-        let live = Deadline::after(Duration::from_secs(30));
+        let now = MonotonicInstant::now();
+        let live = Deadline::at_instant(
+            now.checked_add(Duration::from_secs(30))
+                .expect("live deadline"),
+        );
         for (code, expected) in known_error_codes() {
-            let mapped = map_spin_send_error_for_test(&code, live, BudgetSource::Default);
+            let mapped = map_spin_send_error_for_test(&code, live, BudgetSource::Default, now);
             assert_expected_error(&mapped, expected);
 
             let expired = map_spin_send_error_for_test(
                 &code,
-                Deadline::after(Duration::ZERO),
+                Deadline::at_instant(now),
                 BudgetSource::BatchDeadline,
+                now,
             );
             assert!(matches!(
                 expired,
@@ -268,10 +304,16 @@ mod tests {
 
     #[test]
     fn spin_timeout_provenance_before_and_after_deadline() {
+        let now = MonotonicInstant::now();
+        let live = Deadline::at_instant(
+            now.checked_add(Duration::from_secs(30))
+                .expect("live deadline"),
+        );
         let early = map_spin_send_error_for_test(
             &ErrorCode::DnsTimeout,
-            Deadline::after(Duration::from_secs(30)),
+            live,
             BudgetSource::PerCallTimeout,
+            now,
         );
         assert!(matches!(
             early,
@@ -283,8 +325,9 @@ mod tests {
 
         let unreachable = map_spin_send_error_for_test(
             &ErrorCode::ConnectionRefused,
-            Deadline::after(Duration::from_secs(30)),
+            live,
             BudgetSource::Default,
+            now,
         );
         assert!(matches!(
             unreachable,

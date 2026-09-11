@@ -85,12 +85,12 @@ impl Drop for DropSignal {
 )]
 pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
     let (parts, body) = req.into_parts();
-    let mut request = into_core_request_head(parts);
+    let mut request = into_core_request_head(parts, MonotonicClock::default());
     *request.body_mut() = Body::from_external_stream(body.stream());
     Ok(request)
 }
 
-fn into_core_request_head(parts: RequestParts) -> Request {
+fn into_core_request_head(parts: RequestParts, outbound_clock: MonotonicClock) -> Request {
     let client_addr = parts
         .headers
         .get("spin-client-addr")
@@ -113,9 +113,13 @@ fn into_core_request_head(parts: RequestParts) -> Request {
     );
     request
         .extensions_mut()
-        .insert(HttpClient::with_client(SpinOutboundClient));
+        .insert(outbound_client(outbound_clock));
 
     request
+}
+
+fn outbound_client(clock: MonotonicClock) -> HttpClient {
+    HttpClient::with_client(SpinOutboundClient::with_clock(clock))
 }
 
 fn spin_deadline_body<Source, SourceError>(
@@ -294,7 +298,7 @@ pub(crate) async fn dispatch_with_handles(
     request_start: MonotonicInstant,
 ) -> anyhow::Result<SpinFullResponse> {
     let (parts, native_body) = req.into_parts();
-    let mut core_request = into_core_request_head(parts);
+    let mut core_request = into_core_request_head(parts, app.monotonic_clock());
     let head_parts = IngressHeadParts::from_request(
         &core_request,
         IngressHeadAccounting::HostManaged,
@@ -542,9 +546,12 @@ mod synthesis_tests {
     use super::*;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::key_value_store::{KvStore, NoopKvStore};
+    use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
@@ -590,6 +597,32 @@ mod synthesis_tests {
             kv_registry.named("other").is_none(),
             "no other id synthesised"
         );
+    }
+
+    #[test]
+    fn standard_outbound_client_factory_uses_the_exact_app_clock() {
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(Mutex::new(VecDeque::from([start, completed])));
+        let clock_observations = Arc::clone(&observations);
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            clock_observations
+                .lock()
+                .expect("clock observations")
+                .pop_front()
+                .expect("clock observation")
+        }));
+        let client = outbound_client(app.monotonic_clock());
+        let request = edgezero_core::OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = block_on(client.send_all(vec![request]));
+
+        assert_eq!(results[0].elapsed, Duration::from_millis(7));
     }
 
     #[test]
