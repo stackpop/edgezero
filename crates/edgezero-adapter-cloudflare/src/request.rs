@@ -807,14 +807,18 @@ fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl Display) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::outbound::OutboundRequest;
     use edgezero_core::router::RouterService;
     use wasm_bindgen_test::wasm_bindgen_test;
+    use worker::js_sys::Object;
+    use worker::wasm_bindgen::JsCast as _;
+    use worker::worker_sys::Context as WorkerSysContext;
 
     #[wasm_bindgen_test]
     fn into_http_method_defaults_unknown_to_get() {
@@ -831,29 +835,43 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn standard_outbound_client_factory_uses_the_exact_app_clock() {
+    async fn standard_service_installs_the_exact_application_outbound_clock() {
+        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+            let client = ctx
+                .http_client()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+            let request = OutboundRequest::get("https://example.com/")?.stream_response();
+            let results = client.send_all(vec![request]).await;
+            Ok(results[0].elapsed.as_millis().to_string())
+        }
+
         let start = MonotonicInstant::now();
         let completed = start
             .checked_add(Duration::from_millis(7))
             .expect("completed instant");
-        let observations = Arc::new(Mutex::new(VecDeque::from([start, completed])));
+        let observations = Arc::new(AtomicUsize::new(0));
         let clock_observations = Arc::clone(&observations);
-        let mut app = App::new(RouterService::builder().build());
+        let mut app = App::new(RouterService::builder().get("/clock", elapsed).build());
         app.set_monotonic_clock(MonotonicClock::new(move || {
-            clock_observations
-                .lock()
-                .expect("clock observations")
-                .pop_front()
-                .expect("clock observation")
+            if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                start
+            } else {
+                completed
+            }
         }));
-        let client = outbound_client(app.monotonic_clock());
-        let request = OutboundRequest::get("https://example.com/")
-            .expect("request")
-            .stream_response();
+        let init = worker::RequestInit::new();
+        let request = CfRequest::new_with_init("https://example.com/clock", &init)
+            .expect("Cloudflare request");
+        let env = Object::new().unchecked_into::<Env>();
+        let js_context = Object::new().unchecked_into::<WorkerSysContext>();
 
-        let results = client.send_all(vec![request]).await;
+        let mut response = CloudflareService::new(&app)
+            .dispatch(request, env, Context::new(js_context))
+            .await
+            .expect("Cloudflare response");
 
-        assert_eq!(results[0].elapsed, Duration::from_millis(7));
+        assert_eq!(response.text().await.expect("response body"), "7");
+        assert!(observations.load(Ordering::SeqCst) >= 3);
     }
 }
 

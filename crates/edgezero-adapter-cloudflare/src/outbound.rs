@@ -786,6 +786,24 @@ mod worker_impl {
         }
 
         #[wasm_bindgen_test]
+        fn buffered_request_preparation_reduces_the_remaining_injected_budget() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let observed = start
+                .checked_add(Duration::from_millis(3))
+                .expect("observed instant");
+            let clock = scripted_clock(vec![observed, observed]);
+            let upload_error = Rc::new(RefCell::new(None));
+
+            let body = request_body(Body::from("body"), 16, budget, clock.clone(), upload_error)
+                .expect("prepared body");
+            let remaining = budget_remaining(budget, &clock).expect("remaining budget");
+
+            assert!(body.is_some());
+            assert_eq!(remaining, Duration::from_millis(7));
+        }
+
+        #[wasm_bindgen_test]
         async fn streamed_upload_checks_injected_clock_after_ready_item() {
             let start = MonotonicInstant::now();
             let budget = test_budget(start, Duration::from_millis(10));

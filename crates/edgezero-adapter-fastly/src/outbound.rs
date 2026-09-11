@@ -295,7 +295,7 @@ mod fastly_impl {
                     builder = builder.check_certificate(cert_host);
                 }
             }
-            finish_backend_creation(builder.finish(), budget, self.clock.now(), |backend| {
+            finish_backend_creation(builder.finish(), budget, &self.clock, |backend| {
                 let mut cache = self.backends.lock().map_err(|_poisoned| {
                     EdgeError::internal(anyhow::anyhow!("Fastly backend cache was poisoned"))
                 })?;
@@ -708,7 +708,7 @@ mod fastly_impl {
     fn finish_backend_creation<BackendValue, RetainSuccess>(
         result: Result<BackendValue, BackendCreationError>,
         budget: DispatchBudget,
-        observed_at: MonotonicInstant,
+        clock: &MonotonicClock,
         retain_success: RetainSuccess,
     ) -> Result<BackendValue, EdgeError>
     where
@@ -717,14 +717,14 @@ mod fastly_impl {
         match result {
             Ok(backend) => {
                 let retained = retain_success(backend);
-                if budget.deadline.is_expired_at(observed_at) {
+                if budget.deadline.is_expired_at(clock.now()) {
                     Err(timeout_error(budget.cause))
                 } else {
                     retained
                 }
             }
             Err(error) => {
-                if budget.deadline.is_expired_at(observed_at) {
+                if budget.deadline.is_expired_at(clock.now()) {
                     Err(timeout_error(budget.cause))
                 } else {
                     Err(map_backend_creation_error(&error))
@@ -1312,11 +1312,12 @@ mod fastly_impl {
             let started_at = MonotonicInstant::now();
             let budget = super::super::test_budget(started_at, BudgetSource::BatchDeadline);
             let retained = Cell::new(false);
+            let clock = scripted_clock(vec![budget.deadline.instant()]);
 
             let error = finish_backend_creation::<(), _>(
                 Err(BackendCreationError::Disallowed),
                 budget,
-                budget.deadline.instant(),
+                &clock,
                 |_backend| {
                     retained.set(true);
                     Ok(())
@@ -1339,13 +1340,44 @@ mod fastly_impl {
             let started_at = MonotonicInstant::now();
             let budget = super::super::test_budget(started_at, BudgetSource::BatchDeadline);
             let retained = Cell::new(false);
+            let observed_at = Arc::new(Mutex::new(started_at));
+            let clock_observation = Arc::clone(&observed_at);
+            let clock =
+                MonotonicClock::new(move || *clock_observation.lock().expect("clock observation"));
 
-            let error =
-                finish_backend_creation(Ok(7_u8), budget, budget.deadline.instant(), |backend| {
-                    retained.set(true);
-                    Ok(backend)
-                })
-                .expect_err("late success must still return the attributed timeout");
+            let error = finish_backend_creation(Ok(7_u8), budget, &clock, |backend| {
+                retained.set(true);
+                *observed_at.lock().expect("clock observation") = budget.deadline.instant();
+                Ok(backend)
+            })
+            .expect_err("late success must still return the attributed timeout");
+
+            assert!(retained.get());
+            assert!(matches!(
+                error,
+                EdgeError::GatewayTimeout {
+                    cause: BudgetSource::BatchDeadline,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn late_timeout_outranks_retention_error_after_success_is_retained() {
+            let started_at = MonotonicInstant::now();
+            let budget = super::super::test_budget(started_at, BudgetSource::BatchDeadline);
+            let retained = Cell::new(false);
+            let observed_at = Arc::new(Mutex::new(started_at));
+            let clock_observation = Arc::clone(&observed_at);
+            let clock =
+                MonotonicClock::new(move || *clock_observation.lock().expect("clock observation"));
+
+            let error = finish_backend_creation(Ok(7_u8), budget, &clock, |_backend| {
+                retained.set(true);
+                *observed_at.lock().expect("clock observation") = budget.deadline.instant();
+                Err(EdgeError::internal(anyhow::anyhow!("retention failed")))
+            })
+            .expect_err("late timeout must outrank retention failure");
 
             assert!(retained.get());
             assert!(matches!(

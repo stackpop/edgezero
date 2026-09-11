@@ -561,6 +561,24 @@ mod clock_tests {
     }
 
     #[tokio::test]
+    async fn buffered_request_preparation_reduces_the_remaining_injected_budget() {
+        let start = MonotonicInstant::now();
+        let budget = test_budget(start, Duration::from_millis(10));
+        let observed = start
+            .checked_add(Duration::from_millis(3))
+            .expect("observed instant");
+        let clock = scripted_clock(vec![observed, observed]);
+
+        let body = collect_request_body(Body::from("body"), 16, budget, &clock)
+            .await
+            .expect("prepared body");
+        let remaining = budget_remaining(budget, &clock).expect("remaining budget");
+
+        assert_eq!(body, Bytes::from_static(b"body"));
+        assert_eq!(remaining, Duration::from_millis(7));
+    }
+
+    #[tokio::test]
     async fn streamed_upload_checks_injected_clock_after_ready_item() {
         let start = MonotonicInstant::now();
         let budget = test_budget(start, Duration::from_millis(10));

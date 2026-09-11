@@ -118,6 +118,10 @@ fn into_core_request_head(parts: RequestParts, outbound_clock: MonotonicClock) -
     request
 }
 
+fn into_core_request_head_for_app(parts: RequestParts, app: &App) -> Request {
+    into_core_request_head(parts, app.monotonic_clock())
+}
+
 fn outbound_client(clock: MonotonicClock) -> HttpClient {
     HttpClient::with_client(SpinOutboundClient::with_clock(clock))
 }
@@ -298,7 +302,7 @@ pub(crate) async fn dispatch_with_handles(
     request_start: MonotonicInstant,
 ) -> anyhow::Result<SpinFullResponse> {
     let (parts, native_body) = req.into_parts();
-    let mut core_request = into_core_request_head(parts, app.monotonic_clock());
+    let mut core_request = into_core_request_head_for_app(parts, app);
     let head_parts = IngressHeadParts::from_request(
         &core_request,
         IngressHeadAccounting::HostManaged,
@@ -600,7 +604,7 @@ mod synthesis_tests {
     }
 
     #[test]
-    fn standard_outbound_client_factory_uses_the_exact_app_clock() {
+    fn production_head_conversion_installs_the_exact_application_outbound_clock() {
         let start = MonotonicInstant::now();
         let completed = start
             .checked_add(Duration::from_millis(7))
@@ -615,7 +619,18 @@ mod synthesis_tests {
                 .pop_front()
                 .expect("clock observation")
         }));
-        let client = outbound_client(app.monotonic_clock());
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("http://example.test/clock")
+            .body(Body::empty())
+            .expect("request");
+        let (parts, _body) = request.into_parts();
+        let core_request = into_core_request_head_for_app(parts, &app);
+        let client = core_request
+            .extensions()
+            .get::<HttpClient>()
+            .cloned()
+            .expect("HTTP client");
         let request = edgezero_core::OutboundRequest::get("https://example.com/")
             .expect("request")
             .stream_response();
