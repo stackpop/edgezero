@@ -518,9 +518,17 @@ mod tests {
         marker: &'static str,
         body: &'static [u8],
     ) -> BufferedIngressResponse {
+        BufferedIngressResponse::new(
+            status,
+            terminal_response_headers(marker),
+            Bytes::from_static(body),
+        )
+    }
+
+    fn terminal_response_headers(marker: &'static str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("x-fallback-terminal", HeaderValue::from_static(marker));
-        BufferedIngressResponse::new(status, headers, Bytes::from_static(body))
+        headers
     }
 
     fn tracked_lengthless_request(
@@ -528,12 +536,15 @@ mod tests {
         body_chunks: Vec<Bytes>,
         grant_drops: &Arc<AtomicUsize>,
         source_drops: &Arc<AtomicUsize>,
+        body_polls: &Arc<AtomicUsize>,
     ) -> Request<AxumBody> {
         let observed_grant_drops = Arc::clone(grant_drops);
         let source_drop = DropSignal(Arc::clone(source_drops));
+        let observed_body_polls = Arc::clone(body_polls);
         let mut pending_chunks = body_chunks.into_iter();
         let stream = poll_fn(move |_cx| {
             let _keep_source_alive = &source_drop;
+            observed_body_polls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
             Poll::Ready(pending_chunks.next().map(Ok::<Bytes, io::Error>))
         });
@@ -554,17 +565,11 @@ mod tests {
     async fn assert_terminal_response(
         response: Response<AxumBody>,
         status: StatusCode,
-        marker: &str,
+        marker: &'static str,
         body: &[u8],
     ) {
         assert_eq!(response.status(), status);
-        assert_eq!(
-            response
-                .headers()
-                .get("x-fallback-terminal")
-                .expect("terminal response marker"),
-            marker
-        );
+        assert_eq!(response.headers(), &terminal_response_headers(marker));
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -581,6 +586,7 @@ mod tests {
         ] {
             let grant_drops = Arc::new(AtomicUsize::new(0));
             let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
             let (app, handler_calls, middleware_calls) =
                 fallback_body_app(4, Duration::from_secs(1), &grant_drops);
             let request = tracked_lengthless_request(
@@ -588,6 +594,7 @@ mod tests {
                 vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
                 &grant_drops,
                 &source_drops,
+                &body_polls,
             );
             let response = EdgeZeroAxumService::from_app(app)
                 .ready()
@@ -597,6 +604,7 @@ mod tests {
                 .await
                 .expect("response");
             assert_eq!(response.status(), expected);
+            assert_eq!(body_polls.load(Ordering::SeqCst), 3);
             assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             assert_eq!(source_drops.load(Ordering::SeqCst), 1);
             assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
@@ -608,6 +616,7 @@ mod tests {
         for path in ["/missing", "/known"] {
             let grant_drops = Arc::new(AtomicUsize::new(0));
             let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
             let (app, handler_calls, middleware_calls) =
                 fallback_body_app(4, Duration::from_secs(1), &grant_drops);
             let request = tracked_lengthless_request(
@@ -615,6 +624,7 @@ mod tests {
                 vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"e")],
                 &grant_drops,
                 &source_drops,
+                &body_polls,
             );
             let response = EdgeZeroAxumService::from_app(app)
                 .ready()
@@ -630,6 +640,7 @@ mod tests {
                 b"configured overflow\0response",
             )
             .await;
+            assert_eq!(body_polls.load(Ordering::SeqCst), 2);
             assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             assert_eq!(source_drops.load(Ordering::SeqCst), 1);
             assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
@@ -651,7 +662,7 @@ mod tests {
             Poll::<Option<Result<Bytes, io::Error>>>::Pending
         }));
         let (app, handler_calls, middleware_calls) =
-            fallback_body_app(4_096, Duration::from_millis(10), &grant_drops);
+            fallback_body_app(4_096, Duration::from_millis(500), &grant_drops);
         let mut service = EdgeZeroAxumService::from_app(app);
         let request = Request::builder()
             .method("POST")
@@ -659,15 +670,26 @@ mod tests {
             .body(native_body)
             .expect("request");
 
-        let response = timeout(
-            Duration::from_secs(1),
-            service.ready().await.expect("ready").call(request),
-        )
+        let response_task =
+            tokio::spawn(async move { service.ready().await.expect("ready").call(request).await });
+        timeout(Duration::from_secs(2), async {
+            while body_polls.load(Ordering::SeqCst) == 0 {
+                task::yield_now().await;
+            }
+        })
         .await
-        .expect("fallback deadline must wake the pending body");
+        .expect("native body must be polled before its read deadline");
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+
+        let response = timeout(Duration::from_secs(5), response_task)
+            .await
+            .expect("fallback deadline must preempt the pending native body")
+            .expect("service task")
+            .expect("response");
 
         assert_terminal_response(
-            response.expect("response"),
+            response,
             StatusCode::GATEWAY_TIMEOUT,
             "timeout",
             b"configured timeout\0response",
