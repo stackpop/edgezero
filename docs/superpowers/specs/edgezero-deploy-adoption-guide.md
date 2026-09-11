@@ -91,8 +91,8 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           repository: stackpop/my-edgezero-app
-          # MUST be a trusted, immutable ref (a full commit SHA, or a protected tag)
-          # — never an arbitrary branch. Fastly's default `build-mode: never` means
+          # MUST be a trusted full commit SHA, never a branch or tag. Fastly's
+          # default `build-mode: never` means
           # `fastly compute deploy` COMPILES the application while the API token is
           # in scope, so untrusted code would run with your credentials (spec §10.1).
           ref: ${{ inputs.ref }}

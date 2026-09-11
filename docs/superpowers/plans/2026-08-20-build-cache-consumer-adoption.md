@@ -9,7 +9,7 @@
 full-SHA app identity and explicit inputs, publish exact stable action version `V`, then activate
 synchronized runnable documentation at revision `R` without ever merging an unpublished version ref.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.39 Sections
 3.3, 5.1, 5.2, 5.4, 7, 9, and 10, plus the parent deploy lifecycle contract.
 
 ## 1. Release structure
@@ -236,7 +236,7 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Run every protocol, cache, image, launcher, source-freeze, provider, workflow, fixture, docs/pin,
       actionlint, zizmor, shellcheck, Rust, and local integration suite at one clean candidate descended
       from `B`. Confirm `image.json` remains reviewed `{D,S,protocol}`.
-- [ ] Run independent contract and release-adversary reviews against design v6.31, including exact-tag
+- [ ] Run independent contract and release-adversary reviews against design v6.39, including exact-tag
       policy, third-party tag movement risk, EdgeZero immutable releases, action-version mixing,
       substitution, identity replay, malformed artifacts, host/container races, source mutation,
       generated-output escape, credential flow, cache disclosure, rollback, and cancellation.
@@ -247,7 +247,11 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 
 - [ ] From a clean detached checkout at exact `H`, rerun the complete local suite from Section 7,
       including the bootstrap-state docs/pin scanner, exact staged container build, Docker-backed
-      provider tests, and repository CI commands. Preserve logs and digests bound to `H`.
+      provider tests, and repository CI commands. Require
+      `git status --short --untracked-files=all --ignore-submodules=none` to be empty before and after
+      qualification, and verify the running Node version equals the exact `nodejs` value in
+      `.tool-versions` before `npm --prefix docs ci --ignore-scripts`. Preserve logs and digests bound
+      to `H`.
 - [ ] Select the release operator before `C` exists. Use a short-lived fine-grained PAT selected only
       for `stackpop/edgezero`, expiring within 24 hours, with exactly repository `Contents:write` and
       `Workflows:write`, implicit metadata read, organization `Members:read`, and no other grant. Keep
@@ -259,8 +263,10 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] For each action release, create a draft with exact `tag_name`, full target commit, no assets,
       and required `prerelease` boolean; publish only by a PATCH that changes `draft` to false. Record
       requests/responses, authenticated login, release `author.login`, team membership, release id/
-      URL, remote peeled ref, exact state, and generated attestation. A different actor, broader token,
-      or direct unrecorded tag creation fails release.
+      URL, remote peeled ref, exact state, and generated attestation. The approved release POST must
+      return 201 plus one complete JSON value, and the release-id PATCH must return 200 plus one
+      complete JSON value. A different actor, broader token, wrong status/body, or direct unrecorded
+      tag creation fails release.
 - [ ] Reconfirm the immutable-releases endpoint returns HTTP 200 with `enabled:true` and boolean
       `enforced_by_owner`, and both action-version tag rulesets are exact. Publish candidate `C` as an
       immutable release targeting exact `H` with API field `prerelease:true`; require its exact

@@ -457,8 +457,11 @@ unset FAKE_PROCESS_MUTATE_ID FAKE_PROCESS_EXTRA_ARG
 
 reset_state
 run_verify >/dev/null
-[[ "$(cat "$STATE/create-count")" -gt 8 ]] && ok "the verifier exercises every baked archive fixture" ||
+if [[ "$(cat "$STATE/create-count")" -gt 8 ]]; then
+  ok "the verifier exercises every baked archive fixture"
+else
   no "the verifier exercises every baked archive fixture"
+fi
 gnu_compile_count=$(grep -lFx -- /usr/local/share/edgezero/gnu-smoke.rs "$STATE"/create-*.args | wc -l | tr -d ' ')
 smoke_create_count=$(grep -lFx -- /lib64/ld-linux-x86-64.so.2 "$STATE"/create-*.args | wc -l | tr -d ' ')
 if [[ "$gnu_compile_count" == 1 && "$smoke_create_count" == 1 ]]; then

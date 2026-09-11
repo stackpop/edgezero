@@ -5,7 +5,8 @@ DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 TOOLS="$DIR/../../../docker/build-app-cli"
 WRITE="$TOOLS/write-image-release-record.sh"
 CHECK="$TOOLS/check-image-pin.sh"
-WORK=$(mktemp -d)
+WORK_RAW=$(mktemp -d)
+WORK=$(cd -- "$WORK_RAW" && pwd -P)
 trap 'rm -rf "$WORK"' EXIT
 
 REPO="ghcr.io/stackpop/edgezero-build-app-cli"
@@ -42,6 +43,15 @@ assert_bytes() {
   local description=$1 expected=$2 path=$3 expected_file="$WORK/expected"
   printf '%s' "$expected" >"$expected_file"
   if cmp -s "$expected_file" "$path"; then ok "$description"; else no "$description"; fi
+}
+assert_silent_success() {
+  local description=$1 image_path=$2 evidence_path=$3 stdout_file="$WORK/stdout" stderr_file="$WORK/stderr"
+  if run_writer "$image_path" "$evidence_path" >"$stdout_file" 2>"$stderr_file" &&
+    [[ ! -s "$stdout_file" && ! -s "$stderr_file" ]]; then
+    ok "$description"
+  else
+    no "$description"
+  fi
 }
 
 writer_args() {
@@ -126,6 +136,40 @@ assert_fail "a normalized protocol spelling is rejected" \
 mkdir "$WORK/other-parent"
 assert_fail "the writer cannot split the record pair across directories" \
   run_writer "$WORK/split-image.json" "$WORK/other-parent/split-evidence.json"
+
+mkdir "$WORK/silent"
+chmod 0700 "$WORK/silent"
+assert_silent_success "writer success is silent" \
+  "$WORK/silent/image.json" "$WORK/silent/evidence.json"
+
+mkdir "$WORK/public-parent"
+chmod 0755 "$WORK/public-parent"
+assert_fail "writer rejects a non-private output parent" \
+  run_writer "$WORK/public-parent/image.json" "$WORK/public-parent/evidence.json"
+
+mkdir -p "$WORK/nested/child"
+chmod 0700 "$WORK/nested" "$WORK/nested/child"
+assert_fail "writer outputs must be direct children of the canonical parent path" \
+  run_writer "$WORK/nested/child/../image.json" "$WORK/nested/evidence.json"
+
+mkdir "$WORK/repository"
+git -C "$WORK/repository" init -q
+mkdir "$WORK/repository/private"
+chmod 0700 "$WORK/repository/private"
+assert_fail "writer rejects an output parent inside a Git repository" \
+  run_writer "$WORK/repository/private/image.json" "$WORK/repository/private/evidence.json"
+
+mkdir "$WORK/relative"
+chmod 0700 "$WORK/relative"
+# The child shell expands its positional parameters (intentional SC2016).
+# shellcheck disable=SC2016
+assert_fail "writer rejects relative output paths" \
+  bash -c 'cd "$1" && shift && "$@"' _ "$WORK" \
+  bash "$WRITE" --image-path relative/image.json --evidence-path relative/evidence.json \
+  --repository "$REPO" --release-tag "$TAG" --image-digest "$DIGEST" \
+  --source-revision "$SOURCE" --provenance-protocol 1 --approval-challenge "$CHALLENGE" \
+  --approver-login release-reviewer --reviewed-at "$NOW" --run-attempt "$RUN_ATTEMPT" \
+  --run-id "$RUN_ID" --screenshot-sha256 "$SCREENSHOT"
 
 args=()
 while IFS= read -r -d '' arg; do args+=("$arg"); done < <(writer_args)
@@ -231,10 +275,14 @@ for field_and_value in \
     bash "$CHECK" validate-pair "$bad_image" "$bad_evidence"
 done
 for reviewed_at in '2026-02-30T12:00:00Z' '2026-01-01T12:00:00+00:00' \
-  '2026-01-01T12:00:00.000Z' '2026-01-01T25:00:00Z' \
-  '2000-01-01T00:00:00Z' '2099-01-01T00:00:00Z'; do
+  '2026-01-01T12:00:00.000Z' '2026-01-01T25:00:00Z'; do
   printf '%s' "${expected_evidence/\"reviewed-at\":\"$NOW\"/\"reviewed-at\":\"$reviewed_at\"}" >"$bad_evidence"
   assert_fail "review time '$reviewed_at' is rejected" bash "$CHECK" validate-pair "$bad_image" "$bad_evidence"
+done
+for reviewed_at in '2000-01-01T00:00:00Z' '2099-01-01T00:00:00Z'; do
+  printf '%s' "${expected_evidence/\"reviewed-at\":\"$NOW\"/\"reviewed-at\":\"$reviewed_at\"}" >"$bad_evidence"
+  assert_pass "archived review time '$reviewed_at' is not re-aged" \
+    bash "$CHECK" validate-pair "$bad_image" "$bad_evidence"
 done
 
 for field in approval-challenge image-digest screenshot-sha256 source-revision release-tag; do

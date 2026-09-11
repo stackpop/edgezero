@@ -2013,6 +2013,29 @@ YML
   assert_fails "malformed YAML is rejected (fail-closed, not passed unchecked)" \
     bash "$checker" "$dir/malformed.yml"
 
+  cat >"$dir/duplicate.yml" <<'YML'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+        uses: actions/checkout@v4.3.0
+YML
+  assert_fails "duplicate action-reference keys are rejected before policy evaluation" \
+    bash "$checker" "$dir/duplicate.yml"
+
+  cat >"$dir/alias.yml" <<'YML'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - &checkout
+        uses: actions/checkout@v4.3.0
+      - *checkout
+YML
+  assert_fails "YAML aliases are rejected before policy evaluation" \
+    bash "$checker" "$dir/alias.yml"
+
   wrap '      - uses: >-
           actions/checkout@v4.3.0' "$dir/folded-valid.yml"
   assert_succeeds "a folded scalar resolving to one exact ref passes" bash "$checker" "$dir/folded-valid.yml"
@@ -2044,6 +2067,15 @@ YML
   printf '#!/bin/sh\ncase "$1" in --version) echo "yq (https://github.com/mikefarah/yq/) version v4.53.3";; esac\n' >"$dir/parser-bin/yq"
   chmod +x "$dir/parser-bin/yq"
   assert_fails "a broken parser emitting no records cannot pass" env PATH="$dir/parser-bin:$PATH" bash "$sandbox_checker"
+  local wrong_version_bin="$dir/wrong-version-bin" real_yq
+  real_yq=$(command -v yq)
+  mkdir -p "$wrong_version_bin"
+  # shellcheck disable=SC2016 # The fake parser expands its own arguments.
+  printf '#!/bin/sh\nif [ "$1" = --version ]; then echo "yq (https://github.com/mikefarah/yq/) version v4.99.0"; exit 0; fi\nexec %q "$@"\n' \
+    "$real_yq" >"$wrong_version_bin/yq"
+  chmod +x "$wrong_version_bin/yq"
+  assert_fails "the action pin gate rejects a non-pinned yq v4 release" \
+    env PATH="$wrong_version_bin:$PATH" bash "$checker" "$dir/valid.yml"
 }
 
 # ---------------------------------------------------------------------------
@@ -2544,11 +2576,26 @@ main() {
   test_action_pin_gate
   assert_succeeds "build-container image pin contract" bash "$ACTIONS_DIR/deploy-core/tests/check-image-pin.test.sh"
   assert_succeeds "build-container release record contract" bash "$ACTIONS_DIR/deploy-core/tests/write-image-release-record.test.sh"
+  assert_succeeds "build-container release approval contract" bash "$ACTIONS_DIR/deploy-core/tests/release-approval-gate.test.sh"
+  assert_succeeds "build-container release prerequisite audit contract" bash "$ACTIONS_DIR/deploy-core/tests/verify-release-prerequisites.test.sh"
+  assert_succeeds "build-container publisher prerequisite writer contract" bash "$ACTIONS_DIR/deploy-core/tests/write-publisher-prerequisite.test.sh"
+  assert_succeeds "build-container pin updater contract" bash "$ACTIONS_DIR/deploy-core/tests/update-image-pin-pr.test.sh"
   assert_succeeds "build-container staged context contract" bash "$ACTIONS_DIR/deploy-core/tests/stage-build-context.test.sh"
   assert_succeeds "build-container input contract" bash "$ACTIONS_DIR/deploy-core/tests/assert-build-container-context.test.sh"
+  assert_succeeds "build-container change classifier contract" bash "$ACTIONS_DIR/deploy-core/tests/classify-build-container-change.test.sh"
+  assert_succeeds "build-container event range contract" bash "$ACTIONS_DIR/deploy-core/tests/select-build-container-range.test.sh"
+  assert_succeeds "build-container gate driver contract" bash "$ACTIONS_DIR/deploy-core/tests/run-build-container-gate.test.sh"
+  assert_succeeds "build-container completion marker contract" bash "$ACTIONS_DIR/deploy-core/tests/assert-build-container-completion.test.sh"
+  assert_succeeds "build-container dispatch context contract" bash "$ACTIONS_DIR/deploy-core/tests/assert-build-container-dispatch-context.test.sh"
+  assert_succeeds "build-container App-token boundary contract" bash "$ACTIONS_DIR/deploy-core/tests/assert-build-container-app-token.test.sh"
+  assert_succeeds "build-container workflow structure contract" bash "$ACTIONS_DIR/deploy-core/tests/build-container-workflows.test.sh"
+  assert_succeeds "build-container publisher topology contract" bash "$ACTIONS_DIR/deploy-core/tests/check-build-container-publisher.test.sh"
+  assert_succeeds "build-container publication evidence contract" bash "$ACTIONS_DIR/deploy-core/tests/verify-build-container-publication.test.sh"
+  assert_succeeds "build-container rotation lock contract" bash "$ACTIONS_DIR/deploy-core/tests/verify-gate-rotation-lock.test.sh"
   assert_succeeds "build-container toolchain contract" bash "$ACTIONS_DIR/deploy-core/tests/verify-toolchain.test.sh"
   assert_succeeds "published build-container verification contract" bash "$ACTIONS_DIR/deploy-core/tests/verify-published-image.test.sh"
   assert_succeeds "actionlint installer contract" bash "$ACTIONS_DIR/deploy-core/tests/install-actionlint.test.sh"
+  assert_succeeds "yq installer contract" bash "$ACTIONS_DIR/deploy-core/tests/install-yq.test.sh"
   assert_succeeds "documentation reference and release-state contracts" node --test "$ACTIONS_DIR/deploy-core/tests/check-doc-action-pins.test.mjs"
   if command -v actionlint >/dev/null 2>&1 && [[ "$(actionlint -version | sed -n '1p')" == 1.7.12 ]]; then
     assert_succeeds "actionlint compatibility contract" bash "$ACTIONS_DIR/deploy-core/tests/run-actionlint.test.sh"

@@ -131,6 +131,7 @@ trap cleanup_expected EXIT
     .dockerignore \
     .github/actions/deploy-fastly/versions.json \
     .github/docker/build-app-cli/Dockerfile \
+    .github/docker/build-app-cli/fixtures/gnu-smoke.rs \
     .github/docker/build-app-cli/fixtures/wasm-smoke.rs \
     .github/docker/build-app-cli/image-context-paths.txt \
     .github/docker/build-app-cli/provenance.schema.json \

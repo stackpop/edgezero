@@ -1,0 +1,162 @@
+name: Rotate build container gate
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: edgezero-build-container-publication
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  acquire:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      old-gate-sha: ${{ steps.capture.outputs.old-gate-sha }}
+      dispatch-sha: ${{ steps.capture.outputs.dispatch-sha }}
+      run-actor-login: ${{ steps.capture.outputs.run-actor-login }}
+    steps:
+      - name: assert-hosted-runner-context
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          EDGEZERO_RUNNER_OS: ${{ runner.os }}
+          EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$EDGEZERO_RUNNER_OS" == Linux ]]
+          [[ "$EDGEZERO_RUNNER_ARCH" == X64 ]]
+          [[ "$EDGEZERO_REPOSITORY" == stackpop/edgezero ]]
+
+      - name: checkout-captured-old-gate
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          path: .edgezero-gate
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: capture-protected-dispatch
+        id: capture
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_RELEASE_STATE: ${{ vars.EDGEZERO_BUILD_CONTAINER_RELEASE_STATE }}
+          EDGEZERO_RUN_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$EDGEZERO_REF" == refs/heads/main ]]
+          [[ "$EDGEZERO_REF_PROTECTED" == true ]]
+          [[ "$EDGEZERO_SHA" == "$EDGEZERO_WORKFLOW_SHA" ]]
+          [[ "$EDGEZERO_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_GATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_RELEASE_STATE" == enabled ]]
+          gate_root="$GITHUB_WORKSPACE/.edgezero-gate"
+          [[ "$(git --no-replace-objects -C "$gate_root" rev-parse --verify HEAD)" == "$EDGEZERO_GATE_SHA" ]]
+          [[ "$(git --no-replace-objects -C "$gate_root" rev-parse --is-shallow-repository)" == false ]]
+          [[ -z "$(git --no-replace-objects -C "$gate_root" status --porcelain=v1 --untracked-files=all)" ]]
+          git --no-replace-objects -C "$gate_root" merge-base --is-ancestor \
+            "$EDGEZERO_GATE_SHA" "$EDGEZERO_SHA"
+
+          manifest="$gate_root/.github/docker/build-app-cli/gate-paths.txt"
+          [[ -f "$manifest" && ! -L "$manifest" ]]
+          [[ "$(tail -c 1 "$manifest" | od -An -tx1 | tr -d '[:space:]')" == 0a ]]
+          previous=
+          count=0
+          while IFS= read -r path; do
+            [[ "$path" =~ ^[A-Za-z0-9._/+-]+$ ]]
+            [[ -n "$path" && "$path" != /* && "$path" != -* && "$path" != */ &&
+              "$path" != . && "$path" != .. && "$path" != ../* &&
+              "$path" != */../* && "$path" != */.. && "$path" != */./* &&
+              "$path" != */. && "$path" != *//* && "$path" != *\\* ]]
+            [[ -z "$previous" || "$previous" < "$path" ]]
+            previous=$path
+            gate_entry=$(git --no-replace-objects -C "$gate_root" ls-tree "$EDGEZERO_GATE_SHA" -- "$path")
+            dispatch_entry=$(git --no-replace-objects -C "$gate_root" ls-tree "$EDGEZERO_SHA" -- "$path")
+            [[ -n "$gate_entry" && "$gate_entry" != *$'\n'* && "$gate_entry" == *$'\t'* ]]
+            [[ "${gate_entry#*$'\t'}" == "$path" ]]
+            gate_metadata=${gate_entry%%$'\t'*}
+            read -r gate_mode gate_type gate_oid <<<"$gate_metadata"
+            [[ "$gate_mode" =~ ^100(644|755)$ && "$gate_type" == blob &&
+              "$gate_oid" =~ ^[0-9a-f]{40,64}$ ]]
+            [[ "$dispatch_entry" == "$gate_entry" ]]
+            count=$((count + 1))
+          done <"$manifest"
+          ((count > 0))
+          printf 'old-gate-sha=%s\n' "$EDGEZERO_GATE_SHA" >>"$GITHUB_OUTPUT"
+          printf 'dispatch-sha=%s\n' "$EDGEZERO_SHA" >>"$GITHUB_OUTPUT"
+          printf 'run-actor-login=%s\n' "$EDGEZERO_RUN_ACTOR" >>"$GITHUB_OUTPUT"
+
+  wait:
+    needs: acquire
+    runs-on: ubuntu-24.04
+    environment:
+      name: build-container-gate-rotation-lock
+      deployment: false
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: assert-hosted-runner-context
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          EDGEZERO_RUNNER_OS: ${{ runner.os }}
+          EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$EDGEZERO_RUNNER_OS" == Linux ]]
+          [[ "$EDGEZERO_RUNNER_ARCH" == X64 ]]
+          [[ "$EDGEZERO_REPOSITORY" == stackpop/edgezero ]]
+
+      - name: checkout-captured-old-gate
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ needs.acquire.outputs.old-gate-sha }}
+          path: .edgezero-gate
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: assert-exact-rotation-context
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_OLD_GATE_SHA: ${{ needs.acquire.outputs.old-gate-sha }}
+          EDGEZERO_DISPATCH_SHA: ${{ needs.acquire.outputs.dispatch-sha }}
+          EDGEZERO_RUN_ID: ${{ github.run_id }}
+          EDGEZERO_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EDGEZERO_RUN_ACTOR_LOGIN: ${{ needs.acquire.outputs.run-actor-login }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/verify-gate-rotation-lock.sh" \
+            waiting \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --old-gate-sha "$EDGEZERO_OLD_GATE_SHA" \
+            --dispatch-sha "$EDGEZERO_DISPATCH_SHA" \
+            --run-id "$EDGEZERO_RUN_ID" \
+            --run-attempt "$EDGEZERO_RUN_ATTEMPT" \
+            --run-actor-login "$EDGEZERO_RUN_ACTOR_LOGIN"

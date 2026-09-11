@@ -312,6 +312,8 @@ export function verifyRelease(record) {
       "--disable",
       "--silent",
       "--show-error",
+      "--connect-timeout",
+      "10",
       "--max-time",
       "30",
       "--max-redirs",
@@ -412,9 +414,15 @@ export function verifyRelease(record) {
 }
 
 function main(args) {
+  const explicitRange = args.length === 6;
   requireThat(
-    args.length === 0 || (args.length === 2 && args[0] === "--subject-root"),
-    "usage: check-doc-action-pins.sh [--subject-root PATH]",
+    args.length === 0 ||
+      (args.length === 2 && args[0] === "--subject-root") ||
+      (explicitRange &&
+        args[0] === "--subject-root" &&
+        args[2] === "--base" &&
+        args[4] === "--candidate"),
+    "usage: check-doc-action-pins.sh [--subject-root PATH [--base SHA --candidate SHA]]",
   );
   const subject = realpathSync(args[1] ?? root);
   const gitEnv = {
@@ -456,7 +464,32 @@ function main(args) {
     "repository grafts are not allowed",
   );
   let range = { base: git("rev-parse", "HEAD").trim(), candidate: null };
-  if (process.env.GITHUB_ACTIONS === "true" || process.env.CI === "true") {
+  if (explicitRange) {
+    const base = args[3];
+    const candidate = args[5];
+    requireThat(
+      isSha(base) && isSha(candidate),
+      "explicit range requires full nonzero SHAs",
+    );
+    requireThat(
+      git("rev-parse", "--verify", "HEAD").trim() === candidate,
+      "explicit candidate must equal subject HEAD",
+    );
+    for (const revision of [base, candidate])
+      requireThat(
+        git("cat-file", "-t", revision).trim() === "commit",
+        "explicit range object is not a commit",
+      );
+    try {
+      git("merge-base", "--is-ancestor", base, candidate);
+    } catch {
+      throw Error("explicit base is not an ancestor of candidate");
+    }
+    range = { base, candidate };
+  } else if (
+    process.env.GITHUB_ACTIONS === "true" ||
+    process.env.CI === "true"
+  ) {
     requireThat(
       process.env.GITHUB_ACTIONS === "true" && process.env.GITHUB_EVENT_PATH,
       "hosted GitHub event context is required in CI",

@@ -86,16 +86,43 @@ done
 [[ -n "$image_path" && -n "$evidence_path" ]] || die "record paths must not be empty"
 [[ "$image_path" != "$evidence_path" ]] || die "image and evidence paths must differ"
 command -v jq >/dev/null 2>&1 || die "write-image-release-record.sh requires jq"
+command -v git >/dev/null 2>&1 || die "write-image-release-record.sh requires git"
 
-image_parent=$(cd -- "$(dirname -- "$image_path")" 2>/dev/null && pwd -P) ||
+[[ "$image_path" == /* && "$evidence_path" == /* ]] ||
+  die "record paths must be absolute"
+
+image_parent_arg=$(dirname -- "$image_path")
+evidence_parent_arg=$(dirname -- "$evidence_path")
+[[ ! -L "$image_parent_arg" && ! -L "$evidence_parent_arg" ]] ||
+  die "record output parent must not be a symlink"
+image_parent=$(cd -- "$image_parent_arg" 2>/dev/null && pwd -P) ||
   die "image output parent must already exist"
-evidence_parent=$(cd -- "$(dirname -- "$evidence_path")" 2>/dev/null && pwd -P) ||
+evidence_parent=$(cd -- "$evidence_parent_arg" 2>/dev/null && pwd -P) ||
   die "evidence output parent must already exist"
-[[ -d "$image_parent" && ! -L "$(dirname -- "$image_path")" ]] ||
+[[ -d "$image_parent" ]] ||
   die "image output parent must be a non-symlink directory"
-[[ -d "$evidence_parent" && ! -L "$(dirname -- "$evidence_path")" ]] ||
+[[ -d "$evidence_parent" ]] ||
   die "evidence output parent must be a non-symlink directory"
 [[ "$image_parent" == "$evidence_parent" ]] || die "image and evidence outputs must share one parent"
+[[ "$image_path" == "$image_parent/$(basename -- "$image_path")" &&
+  "$evidence_path" == "$evidence_parent/$(basename -- "$evidence_path")" ]] ||
+  die "record paths must be direct children of their canonical parent"
+
+if stat -f '%Lp' "$image_parent" >/dev/null 2>&1; then
+  parent_mode=$(stat -f '%Lp' "$image_parent")
+else
+  parent_mode=$(stat -c '%a' "$image_parent")
+fi
+[[ "$parent_mode" == 700 ]] || die "record output parent must have mode 0700"
+
+inside_work_tree=$(env -i HOME="${HOME:-/}" PATH="$PATH" LC_ALL=C \
+  git -C "$image_parent" rev-parse --is-inside-work-tree 2>/dev/null || true)
+inside_git_dir=$(env -i HOME="${HOME:-/}" PATH="$PATH" LC_ALL=C \
+  git -C "$image_parent" rev-parse --is-inside-git-dir 2>/dev/null || true)
+if [[ "$inside_work_tree" == true || "$inside_git_dir" == true ]]; then
+  die "record output parent must be outside every Git repository"
+fi
+
 [[ ! -e "$image_path" && ! -L "$image_path" ]] || die "image output already exists"
 [[ ! -e "$evidence_path" && ! -L "$evidence_path" ]] || die "evidence output already exists"
 [[ "$provenance_protocol" == 1 ]] || die "provenance protocol must be the exact integer spelling 1"
@@ -156,5 +183,3 @@ ln "$image_tmp" "$image_path" || die "image output appeared before publication"
 image_published=true
 ln "$evidence_tmp" "$evidence_path" || die "evidence output appeared before publication"
 evidence_published=true
-
-printf 'image release record pair written\n'

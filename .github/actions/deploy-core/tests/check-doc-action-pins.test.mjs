@@ -471,6 +471,10 @@ test("release proof rejects API/ref substitution and redirects without leaking a
       .split("\n")
       .some((arg) => arg === "-L" || arg === "--location"),
   );
+  const curlArgs = readFileSync(resolve(temp, "args"), "utf8").split("\n");
+  const connectTimeout = curlArgs.indexOf("--connect-timeout");
+  assert.notEqual(connectTimeout, -1);
+  assert.equal(curlArgs[connectTimeout + 1], "10");
   setReply(
     reply(release, "200", "2026-03-10", "Application/JSON; Charset=UTF-8"),
   );
@@ -570,6 +574,45 @@ test("hosted scanner reads committed snapshots and fails inconsistent events", (
   const result = run();
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /1 external references; bootstrap/);
+
+  const explicit = spawnSync(
+    process.execPath,
+    [
+      checker,
+      "--subject-root",
+      subject,
+      "--base",
+      base,
+      "--candidate",
+      head,
+    ],
+    {
+      env: {
+        ...process.env,
+        CI: "false",
+        GITHUB_ACTIONS: "false",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+      },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(explicit.status, 0, explicit.stderr);
+  assert.match(explicit.stdout, /1 external references; bootstrap/);
+  const wrongExplicit = spawnSync(
+    process.execPath,
+    [
+      checker,
+      "--subject-root",
+      subject,
+      "--base",
+      base,
+      "--candidate",
+      base,
+    ],
+    { env: process.env, encoding: "utf8" },
+  );
+  assert.notEqual(wrongExplicit.status, 0);
+  assert.match(wrongExplicit.stderr, /candidate.*HEAD/i);
 
   const proxyBin = resolve(temp, "bin");
   mkdirSync(proxyBin);

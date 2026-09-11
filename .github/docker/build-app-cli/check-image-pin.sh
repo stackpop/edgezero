@@ -9,7 +9,6 @@ readonly ZERO_SHA256
 ZERO_SHA1="$(printf '0%.0s' {1..40})"
 readonly ZERO_SHA1
 readonly MAX_RECORD_BYTES=4096
-readonly MAX_REVIEW_AGE_SECONDS=900
 
 usage() {
   cat >&2 <<'EOF'
@@ -136,7 +135,7 @@ validate_image() {
 }
 
 validate_review_time() {
-  local value=$1 epoch round_trip now age
+  local value=$1 epoch round_trip
   [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
     die "reviewed-at must use exact YYYY-MM-DDTHH:MM:SSZ UTC form"
   epoch=$(jq -nr --arg value "$value" '$value | fromdateiso8601' 2>/dev/null) ||
@@ -144,11 +143,6 @@ validate_review_time() {
   round_trip=$(jq -nr --argjson epoch "$epoch" '$epoch | strftime("%Y-%m-%dT%H:%M:%SZ")') ||
     die "reviewed-at cannot be normalized"
   [[ "$round_trip" == "$value" ]] || die "reviewed-at is not a valid calendar instant"
-  now=$(date -u '+%s') || die "cannot read the current UTC clock"
-  [[ "$now" =~ ^[0-9]+$ ]] || die "current UTC clock is invalid"
-  ((epoch <= now)) || die "reviewed-at is in the future"
-  age=$((now - epoch))
-  ((age <= MAX_REVIEW_AGE_SECONDS)) || die "reviewed-at is more than 15 minutes old"
 }
 
 validate_evidence() {

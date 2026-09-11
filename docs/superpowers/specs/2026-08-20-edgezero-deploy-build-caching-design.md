@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions - Build Caching Spec
 
-**Status:** Design (proposed) - v6.31
+**Status:** Design (proposed) - v6.39
 
 **Related:** `docs/superpowers/specs/edgezero-deploy-github-action.md`,
 `docs/superpowers/plans/edgezero-deploy-action-implementation-plan.md`,
@@ -37,8 +37,11 @@ contracts. It must not expose provider credentials to app CLI compilation or to 
   of scope.
 - Repository administrators can mutate Actions variables and remain trusted administrative actors.
   Publication nevertheless consumes `EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE` only through
-  the closed, independently reviewed record and update protocol in Section 8. A malformed, stale,
-  unreviewed, or cross-release value fails before registry authentication or image build.
+  the closed record and update protocol in Section 8. A malformed, stale, or cross-release value fails
+  before registry authentication or image build. Before the first verified rotation, independent review
+  of bootstrap-history evidence is a manual administrative trust-root procedure and is not
+  distinguishable from arbitrary canonical evidence by the publisher. After rotation, the
+  authenticated rotation receipt makes the selected rotation review machine-verifiable.
 - Caching has an accepted correctness risk: sccache can miss undeclared filesystem or environment
   inputs, including changed `app-env` values, read by `build.rs` or proc macros. A stale object can
   pass digest, ELF, and smoke checks.
@@ -188,6 +191,10 @@ It is generic: during this rollout it may be a gate candidate `G'`, release sour
 `B`, an implementation commit, or final action revision `P`. The generic main-push assertion proves
 workflow/context identity at `Q`; a release check separately proves that `Q=S` when qualifying the
 image source. `H` is reserved for the final action candidate defined in Section 8.
+
+`T` denotes the exact subject-head commit selected by the protected event-to-range contract in Section 8. For `pull_request`, `T=M`, the authenticated synthetic merge commit. For `merge_group`, `T` is the
+payload head SHA, which equals `github.sha`. For protected-main `push`, `T=Q`. `T` is an execution-local
+identity and does not rename any rollout commit; in particular, only the final action candidate is `H`.
 
 After that bootstrap passes, the reusable job uses `actions/checkout@v7.0.1` only to place repository
 `stackpop/edgezero` at `ref: job.workflow_sha` in a fixed private action-source directory with
@@ -1354,13 +1361,34 @@ the following single data line; the Markdown fence line break is not file conten
 Its values equal the current approval record and `image.json`; run identifiers are strings to avoid
 JSON number precision loss. A gate-owned typed writer is the sole producer. Unknown/duplicate/missing
 keys, wrong types/order/JCS bytes, invalid bounds, or cross-file mismatch fail. Runtime actions do not
-read this evidence file.
+read this evidence file. Archival pin validation requires exact timestamp grammar and a valid calendar
+instant but does not compare `reviewed-at` with its later wall clock. The successful publisher approval
+step is the durable proof that the review was fresh when it authorized mutation.
+
+The typed pair writer is invoked exactly as:
+
+```text
+write-image-release-record.sh --image-path <new-image-file> --evidence-path <new-evidence-file> --repository ghcr.io/stackpop/edgezero-build-app-cli --release-tag <tag> --image-digest <D> --source-revision <S> --provenance-protocol 1 --approval-challenge <64-lowercase-hex> --approver-login <login> --reviewed-at <RFC3339-UTC> --run-attempt <canonical-positive-u32> --run-id <canonical-positive-u64> --screenshot-sha256 <sha256:digest>
+```
+
+The two absent output paths are distinct direct children of one canonical mode-0700 private directory
+outside every Git repository. The writer accepts only the typed scalars above, invokes the gate-owned
+pair validator, publishes both mode-0644 files atomically without replacement, emits no stdout on
+success, and removes a partial pair on failure. `image.json` has exactly these compact bytes:
+
+```text
+{"digest":"<D>","image-source-revision":"<S>","provenance-protocol":1,"repository":"ghcr.io/stackpop/edgezero-build-app-cli","tag":"<tag>"}
+```
+
+The evidence output has exactly the ten-field JCS bytes shown above. The updater copies those verified
+bytes into its private Git worktree; the pair writer itself never writes inside a repository.
 
 The rollout has five relevant commits and two action-release tags:
 
 - `G` is the protected gate and image-source baseline. It contains the protocol validator, schema,
   golden/malformed fixtures, image verifier, fail-closed classifier, release-policy verifier,
-  approval gate, pin-PR updater, publisher contract checker, exact Dockerfile, root `.dockerignore`,
+  approval gate, pin-PR updater, publisher contract checker, publisher evidence verifier, exact
+  Dockerfile, root `.dockerignore`,
   canonical image-context manifest, and both `.github/workflows/build-container-ci.yml` and
   `.github/workflows/publish-build-container.yml`, plus the gate-rotation lock workflow and verifier.
   Repository variable
@@ -1642,9 +1670,11 @@ Publication order is:
    `{repository_id:<edgezero-id>,path:".github/workflows/build-container-ci.yml",sha:G}`
    and an active default-branch ruleset that requires the merge queue with no bypass actor. Configure
    the protected release and rotation-lock environments, split tag-creation/immutability rulesets,
-   dedicated GitHub App, exact release-state `enabled` and publisher App/bot identity repository
-   variables, and repository permissions. Prove the
-   rotation workflow holds publication concurrency before the first gate update. The one-time
+   dedicated GitHub App, publisher App/bot identity repository variables, and repository permissions
+   while release state is absent or not `enabled`. After every control and descriptor readback passes,
+   manually create and read back the inert bootstrap prerequisite record, then set release state to
+   exact `enabled` last. Prove the rotation workflow holds publication concurrency before the first
+   gate update. The one-time
    bootstrap of `G` is explicitly a human-reviewed trust-root operation;
    candidate-controlled checks are not represented as independent proof of `G`.
 2. Open the isolated `release-request.json` candidate, run it through the organization-required
@@ -1742,17 +1772,64 @@ explicit no-op behavior. The existing path-filtered
 on unrelated changes, and no later syntactically valid pin can bypass image, platform, label,
 protocol, public-access, target, validator, or exact-version checks.
 
-For a pin candidate, the trusted `G` helper reads `image-release-evidence.json` and uses only the
-required job's read-only `GITHUB_TOKEN`. It polls the identified same-repository workflow run at most
-30 times with a fixed 10-second delay, then requires completion/success, event `push`, workflow path
-`.github/workflows/publish-build-container.yml`, `head_sha=S`, `head_branch=<release-tag>`, and exact
-run attempt. The run has successful `build-and-verify` and `update-pin` jobs, each with exactly one
-successful `assert-exact-publisher-context` step; that trusted `G` step internally proves the protected
-tag ref, `github.sha==github.workflow_sha==S`, active gate, release state enabled, run id/attempt, and
-tag. The helper also reads the run's non-paginated approvals, requires exactly one current-attempt
-release protocol record, and compares every comment field and API reviewer login with the evidence
-file. Missing, pending, duplicate, stale, foreign, or contradictory evidence fails before image pull.
-The pin check never accepts a candidate-provided check name or PR body as publisher evidence.
+Before classification, each stable job enumerates `T`'s complete tree from the full subject repository
+and selects every direct child of `.github/workflows/` whose name ends in `.yml` or `.yaml`, plus every
+file anywhere in the tree whose basename is exactly `action.yml` or `action.yaml`. The trusted driver
+requires each selected entry to be a regular blob with an unambiguous path using only
+`[A-Za-z0-9._/+-]`, extracts its
+exact bytes into a fresh directory outside both repositories, and invokes only `G`'s
+`.github/actions/deploy-core/tests/check-action-pins.sh` with that complete explicit file list. The
+scanner parses candidate YAML as inert data, accepts external GitHub refs only at exact stable patch
+versions and Docker actions only by digest, and must emit exactly
+`action reference policy passed (<canonical-positive-decimal> external references)` followed by one
+LF. The count must be positive. The driver consumes that line only to reject a vacuous/malformed scan and never
+threads it to a later step. The scanner never
+executes or resolves a candidate local action. Enumeration, extraction, parser, or policy failure stops
+both required jobs even when the container change itself is not relevant. Candidate-controlled
+`deploy-action.yml` checks are defense in depth, not the protected authority for this policy.
+
+For a pin candidate, trusted `G` invokes its runtime verifier exactly as:
+
+```text
+verify-build-container-publication.sh --gate-root <canonical-G-root> --subject-root <canonical-subject-root> --gate-sha <G> --candidate-sha <T> --image-json <extracted-image-record> --evidence-json <extracted-evidence-record>
+```
+
+The verifier requires both clean, full, separate repositories at their exact top levels. A full
+repository is non-shallow and non-sparse, has no promisor or partial-clone configuration, has no
+on-disk or environment-provided object alternates, and runs all Git reads with lazy object fetching
+disabled. The two repositories have distinct Git common directories and object stores. The verifier requires
+the gate checkout at `G` and subject checkout at `T`, and requires the two regular, non-symlink input
+files to be the exact blobs extracted from `T`. It reads `GITHUB_TOKEN` only from its environment,
+emits no stdout on success, and performs no mutation. It validates the canonical records and their
+cross-file identities before any request.
+
+The verifier polls the evidence-selected same-repository workflow run immediately and at most 30
+times. Every response must be an exact successful GET response under the gate REST contract and must
+retain the immutable run, source, tag, workflow, and attempt identity. A non-completed response
+consumes one poll; the verifier waits exactly 10 seconds before the next poll, never after the final
+poll. Every request uses exact curl connection timeout 10 seconds and total timeout 30 seconds; curl
+timeout is an immediate terminal failure. HTTP, header, media-type, JSON, or identity failures are not
+retried. The selected run must complete successfully with event `push`, raw API `path` exactly
+`.github/workflows/publish-build-container.yml@<release-tag>`, `head_sha=S`,
+`head_branch=<release-tag>`, and the exact attempt. The verifier does not strip, normalize, or accept a
+branch/ref spelling in that `path` field.
+
+After completion, the verifier fetches exactly
+`GET /repos/stackpop/edgezero/actions/runs/<run-id>/attempts/<run-attempt>/jobs?per_page=100&page=1`
+once. The response has `total_count:2`, a two-element `jobs` array, and exactly the successful
+`build-and-verify` and `update-pin` jobs; no second page can exist under that count. Each job contains exactly one
+successful `assert-exact-publisher-context` step; that trusted `G` step internally proves the
+protected tag ref, `github.sha==github.workflow_sha==S`, active gate, release state enabled, run
+id/attempt, and tag. The verifier then fetches the run's non-paginated approvals once. It parses every
+protocol-prefixed review claiming the current run id and attempt, requires exactly one, requires that
+review to be approved for `build-container-release`, and compares every comment field and API reviewer
+login with the evidence file. It then repeats the exact run-detail GET and requires byte-identical
+immutable identity fields plus the same completed/successful current `run_attempt`. This final read is
+the publication verifier's linearization point: a rerun that starts before it completes changes the
+attempt or state and fails; a rerun started after it completes is later work and cannot retroactively
+invalidate the already authenticated pin candidate. Earlier-attempt reviews remain inert history. Missing, pending,
+duplicate, malformed, foreign, or contradictory evidence fails before image pull. The pin check never
+accepts a candidate-provided check name or PR body as publisher evidence.
 
 For ordinary image or pin candidates, each job also compares every path in the active gate manifest
 between the protected base and its `G` checkout and fails on any mismatch. Gate-update and the exact
@@ -1821,7 +1898,9 @@ tag-only policy is restored, an independent maintainer who is not the preflight 
 repository's `build-container-release` environment settings and captures a PNG showing the repository,
 environment name, disabled administrator-bypass control, and final deployment-policy list.
 The verifier supplies that file plus the reviewer's login and RFC 3339 review time to the preflight.
-The helper rejects a non-PNG file, a reviewer equal to the verifier, a future review time, or evidence
+The file must be a canonical absolute-path regular non-symlink file of 8 through 10,485,760 bytes and
+begin with exact PNG signature bytes `89 50 4e 47 0d 0a 1a 0a`. The helper rejects a non-PNG file, a
+reviewer equal to the verifier, a future review time, or evidence
 whose recorded candidate head SHA differs from the current PR head; it records that SHA, the literal
 basename, and `sha256:<64-lowercase-hex>` file digest under `environment.administrator-bypass` with
 `allowed:false`, `verification:"manual-ui"`, `reviewer`, and `reviewed-at`. A separately
@@ -1879,17 +1958,238 @@ expected verifier login and uses the policy token only through one wrapper whose
 /repos/stackpop/edgezero/git/ref/heads/main
 ```
 
+Queries are a closed byte-level contract. Scalar-object GETs, selected run and approval GETs, selected
+pull-request GETs, exact-ref GETs, and release-id GETs have no query. The only list query forms are:
+
+```text
+/orgs/stackpop/rulesets?per_page=100&page=<page>
+/repos/stackpop/edgezero/rulesets?per_page=100&page=<page>
+/repos/stackpop/edgezero/environments/build-container-release/deployment-branch-policies?per_page=100&page=<page>
+/repos/stackpop/edgezero/actions/runs/<run-id>/jobs?per_page=100&page=<page>
+/repos/stackpop/edgezero/actions/runs/<run-id>/attempts/<run-attempt>/jobs?per_page=100&page=<page>
+/repos/stackpop/edgezero/actions/workflows/rotate-build-container-gate.yml/runs?event=workflow_dispatch&per_page=100&page=<page>
+/repos/stackpop/edgezero/commits/<candidate-sha>/check-runs?check_name=<approved-check-name>&filter=latest&app_id=15368&per_page=100&page=<page>
+/orgs/stackpop/packages?package_type=container&per_page=100&page=<page>
+/installation/repositories?per_page=100&page=<page>
+/repos/stackpop/edgezero/pulls?state=all&base=main&sort=created&direction=asc&per_page=100&page=<page>
+```
+
+The deployment-protection-rules route is a scalar no-query GET whose one response must contain
+`total_count:0` and an empty `custom_deployment_protection_rules` array. `<approved-check-name>` is
+exactly one of `build-container-release-preflight`,
+`build-container-local`, or `build-container-pin`. Query order and spelling are exact; duplicate keys,
+encoding aliases, fragments, response-supplied continuation URLs, and every unlisted key or value fail.
+Pagination starts at canonical page `1`, synthesizes only the next exact URL, advances by one, and is
+bounded to 100 pages and 10,000 unique items. An optional RFC 8288 `Link` header may contain only
+same-origin URLs whose path and non-page query bytes equal the current list contract; every relation
+target must have the mathematically correct canonical page, no relation may repeat, and a `next`
+relation must equal the synthesized next URL. Duplicate item IDs, repeated page payloads, inconsistent
+`total_count`, a `next` relation after a short or count-complete page, a missing `next` before an
+incomplete declared count, or 100 items on page 100 fails as truncation. Endpoint-specific one-page
+contracts, including the publisher's exact-attempt two-job query, remain exactly page 1 and reject any
+continuation.
+
 Every GitHub REST request made by a gate helper, including the approval gate and bounded App-token
-test, sets exact non-authorization headers `Accept: application/vnd.github+json`,
+test, invokes curl with exact transport controls `--disable --silent --show-error --connect-timeout 10
+--max-time 30 --max-redirs 0` and sets exact non-authorization headers
+`Accept: application/vnd.github+json`,
 `X-GitHub-Api-Version: 2026-03-10`, and `User-Agent: edgezero-build-container-gate/1`. A missing or
 different value fails before network access. Authorization is added only by the credential-specific
 wrapper. Responses must report the selected API version, use the expected JSON media type, and obey
 the endpoint's exact success status; a redirect or silent fallback is failure. Specifically, every
 response must contain `X-GitHub-Api-Version-Selected: 2026-03-10`. A response with a body must parse
 its `Content-Type` to media type exactly `application/json`, with no charset or charset `utf-8`, and
-must contain exactly one complete JSON value. GET succeeds only with 200, either approved local test-token creation
-only with 201, and token revocation only with 204 and an empty body; the 204 response has no JSON
-media-type requirement.
+must contain exactly one complete JSON value. GET succeeds only with 200. Approved token, release, and
+pull-request POSTs succeed only with 201 and one JSON value. Approved release and pull-request PATCHes
+succeed only with 200 and one JSON value. Token revocation and the publisher-prerequisite variable
+PATCH succeed only with 204 and an empty body. A 204 response has no JSON media-type requirement and
+must omit a nonempty response body.
+
+Trusted release helpers use the following common CLI contract. Nonsecret scalars are explicit flags;
+credentials are read only through the named environment variables; structured inputs and outputs are
+regular, non-symlink files at already canonical absolute paths. Unknown, missing, empty, or duplicate
+flags fail before credential access. Exit status is 0 for success, 1 for a failed contract, and 2 for
+usage or unavailable required tooling. Success emits no stdout. Diagnostics on stderr never contain a
+credential, authorization header, JWT, token response, private key, API body containing a token, or a
+secret-derived hash. Every output path must be absent, lie directly beneath a canonical private output
+directory outside every repository, and is published atomically without replacement. Canonical JSON
+outputs have no trailing LF; the explicitly two-line rotation comment has one separating LF and no
+trailing LF. Failure removes unpublished temporary output.
+
+The local prerequisite auditor has exactly these modes and interfaces:
+
+```text
+verify-release-prerequisites.sh configuration --gate-root <canonical-G-root> --gate-sha <G> --smoke-run-id <u64> --smoke-run-attempt <u32> --expected-app-id <u64> --expected-installation-id <u64> --expected-team-id <u64> --expected-bot-id <u64> --expected-bot-login <login> --policy-token-review-json <canonical-review> --policy-token-review-png <png> --administrator-bypass-png <png> --administrator-bypass-reviewer <login> --administrator-bypass-reviewed-at <RFC3339-UTC> --evidence-out <new-file>
+
+verify-release-prerequisites.sh release --gate-root <canonical-G-root> --gate-sha <G> --candidate-pr <u64> --evidence-url <exact-candidate-PR-comment-URL> --source-revision <S> --merge-group-sha <sha> --merge-group-run-id <u64> --merge-group-run-attempt <u32> --smoke-run-id <u64> --smoke-run-attempt <u32> --push-run-id <u64> --push-run-attempt <u32> --expected-app-id <u64> --expected-installation-id <u64> --expected-team-id <u64> --expected-bot-id <u64> --expected-bot-login <login> --package-auditor-login <login> --package-state <absent|public-linked> --policy-token-review-json <canonical-review> --policy-token-review-png <png> --administrator-bypass-png <png> --administrator-bypass-reviewer <login> --administrator-bypass-reviewed-at <RFC3339-UTC> --evidence-out <new-file> --publisher-prerequisite-out <new-file>
+
+verify-release-prerequisites.sh rotation-review --gate-root <canonical-old-G-root> --old-gate-sha <G> --new-gate-sha <G-prime> --dispatch-sha <Q_d> --final-head-sha <Q_f> --lock-run-id <u64> --lock-run-attempt <u32> --operator-login <login> --result <activated|rolled-back> --policy-token-review-json <canonical-review> --policy-token-review-png <png> --evidence-out <new-file> --approval-comment-out <new-file>
+
+verify-release-prerequisites.sh rotation-complete --gate-root <canonical-active-G-root> --gate-sha <final-G> --lock-run-id <u64> --lock-run-attempt <u32> --policy-token-review-json <canonical-review> --policy-token-review-png <png> --evidence-out <new-file> --publisher-prerequisite-out <new-file>
+```
+
+The auditor reads `EDGEZERO_RELEASE_POLICY_AUDIT_TOKEN` in every mode,
+`EDGEZERO_RELEASE_PACKAGE_AUDIT_TOKEN` only in `release`, and
+`EDGEZERO_RELEASE_APP_PRIVATE_KEY_FILE` only in `configuration` and `release`. The last value names an
+owner-only mode-0600 regular local file; key bytes never enter argv or the environment. The canonical
+policy-token review is UTF-8 RFC 8785 JCS with no BOM, surrounding whitespace, or trailing LF and has
+exactly these bytes apart from placeholder substitution:
+
+```text
+{"expires-at":"<RFC3339-UTC>","organization-grants":{"administration":"write","members":"read","other-displayed":"none"},"repository-grants":{"actions":"read","administration":"write","checks":"read","contents":"read","environments":"read","metadata":"read","other-displayed":"none","pull-requests":"read","variables":"read"},"resource-owner":"stackpop","reviewed-at":"<RFC3339-UTC>","reviewer-login":"<login>","schema-version":1,"screenshot-sha256":"sha256:<64-lowercase-hex>","selected-repositories":["stackpop/edgezero"],"subject-login":"<policy-auditor-login>","token-id":"<canonical-positive-u64>"}
+```
+
+`other-displayed:"none"` means every grant displayed by GitHub other than the named keys is shown as
+no access; an omitted, additional, renamed, or differently valued displayed grant fails. The review
+instant and expiration are valid UTC calendar instants, the reviewer differs from the subject, the
+review is not future, and the token remains unexpired at verification. The auditor requires the
+policy-token review PNG to be a canonical absolute-path regular non-symlink file of 8 through
+10,485,760 bytes, to begin with the exact PNG signature bytes
+`89 50 4e 47 0d 0a 1a 0a`, and recomputes its digest against `screenshot-sha256`. The administrator-
+bypass PNG is a distinct input and cannot satisfy the policy-token review.
+
+`evidence-out` is the complete human-review attachment produced only by the trusted auditor. It is a
+nonempty UTF-8 JSON object of at most 1,048,576 bytes, serialized by that gate revision as RFC 8785 JCS
+with no BOM, surrounding whitespace, or trailing LF. Its members are gate-versioned audit detail, not
+a wire protocol consumed by another helper: after publication, downstream code treats the exact file
+as opaque bytes and validates only its SHA-256. The exact small `publisher-prerequisite-out` record is
+the machine transition protocol. It contains the evidence digest and prior-variable digest defined
+below and is excluded from its own evidence digest. A rotation approval-comment output is the exact
+two-line rotation protocol defined above. `configuration` emits no release-bound prerequisite;
+`release` is used for both first-`S` and same-`S` package recovery.
+Before invoking `release`, the separately authenticated operator creates one inert placeholder comment
+on the candidate PR and supplies its stable URL. The URL must be exactly
+`https://github.com/stackpop/edgezero/pull/<candidate-pr>#issuecomment-<canonical-positive-u64>`.
+The auditor includes that URL in its evidence and release-bound prerequisite output but never creates
+or edits a comment. After the auditor succeeds, the operator edits that same comment to attach the
+exact evidence and review PNG; the independent final reviewer verifies the attachment bytes and URL
+before invoking the writer. The placeholder has no protocol authority and tag creation remains blocked
+until the reviewed record is written. This two-step procedure gives the tag-triggered publisher an
+authenticated source for the updater link without an ambient variable or an unbounded commit-to-PR
+lookup.
+
+The separately controlled variable writer is invoked exactly as:
+
+```text
+write-publisher-prerequisite.sh --gate-root <canonical-G-root> --gate-sha <G> --evidence-json <opaque-audit-attachment> --publisher-prerequisite-json <canonical-derived-record> --writer-token-review-json <canonical-review> --writer-token-review-png <png>
+```
+
+It reads only `EDGEZERO_PUBLISHER_PREREQUISITE_WRITE_TOKEN`, emits no file, and authenticates the
+expected active organization member from a UTF-8 RFC 8785 JCS writer-token review with no BOM,
+surrounding whitespace, or trailing LF. That input has exactly these bytes apart from placeholder
+substitution:
+
+```text
+{"expires-at":"<RFC3339-UTC>","organization-grants":{"members":"read","other-displayed":"none"},"repository-grants":{"metadata":"read","other-displayed":"none","variables":"write"},"resource-owner":"stackpop","reviewed-at":"<RFC3339-UTC>","reviewer-login":"<login>","schema-version":1,"screenshot-sha256":"sha256:<64-lowercase-hex>","selected-repositories":["stackpop/edgezero"],"subject-login":"<writer-login>","token-id":"<canonical-positive-u64>"}
+```
+
+`other-displayed:"none"` has the same closed-world meaning as in the policy-token review. The review
+instant, expiration, reviewer separation, and current validity checks are identical. The writer
+records `token-id` as the positive numeric fine-grained-token inventory identifier visible in the
+reviewed GitHub UI. It is screenshot-bound review evidence, not `/user.id`; `/user.id` identifies the
+subject account and must not be compared with `token-id`.
+The writer
+requires the writer-token review PNG to satisfy the same canonical path, regular-file, size, signature,
+and digest checks; no other screenshot input is interchangeable. The
+writer treats `evidence-json` as nonempty opaque bytes of at most 1,048,576 bytes, recomputes the outer
+evidence digest, validates the closed prerequisite record, GETs and validates the current variable,
+and requires its exact-byte SHA-256 to equal the record's `previous-value-sha256`. It does not parse audit
+members or derive machine state from prose evidence. Its network allowlist is exactly user GET,
+membership GET, active-gate variable GET, prerequisite-variable GET, exact prerequisite-variable
+PATCH, and post-write prerequisite-variable GET.
+
+The publisher approval helper is invoked exactly as:
+
+```text
+release-approval-gate.sh --gate-root <canonical-G-root> --gate-sha <G> --run-id <u64> --run-attempt <u32> --build-attempt <u32> --source-revision <S> --release-tag <tag> --image-digest <D> --approval-challenge <64-lowercase-hex> --approval-out <new-file>
+```
+
+It reads only `GITHUB_TOKEN`, permits only the current-run and non-paginated approvals GETs, and writes
+the exact ten-field `image-release-evidence.json` JCS record using the authenticated reviewer login and
+unique current-attempt approval comment. That file is the updater's only approval input. It applies the
+15-minute freshness test immediately before App-token minting; later readers do not re-age the record.
+
+The pin updater is invoked exactly as:
+
+```text
+update-image-pin-pr.sh --gate-root <canonical-G-root> --gate-sha <G> --repository-root <clean-full-S-repository> --source-revision <S> --release-tag <tag> --image-digest <D> --provenance-protocol 1 --approval-json <gate-produced-file> --source-pr <u64> --evidence-url <exact-PR-comment-URL> --expected-bot-id <u64> --expected-bot-login <login>
+```
+
+It reads only `EDGEZERO_BUILD_CONTAINER_APP_TOKEN`, accepts no caller-produced image/evidence JSON,
+validates the gate-produced approval file, and invokes `G`'s typed record writer. The evidence URL is
+exactly `https://github.com/stackpop/edgezero/pull/<source-pr>#issuecomment-<positive-u64>`. Git access is
+limited to `https://github.com/stackpop/edgezero.git`; the token travels through a private askpass file,
+never argv or a URL. Every branch push uses the recorded remote OID, including an empty expected OID
+for creation, with exact force-with-lease and remote readback. The helper emits no file or stdout;
+created, updated, already-current, already-merged, and mutation-free superseded outcomes are proved by
+the final remote/API state.
+
+The updater's App-token REST allowlist is exactly `GET /users/<expected-publisher-bot-login>`,
+`GET /repos/stackpop/edgezero`, the fully paginated pull-list query above, selected
+`GET /repos/stackpop/edgezero/pulls/<pull-number>`, `POST /repos/stackpop/edgezero/pulls`, and selected
+`PATCH /repos/stackpop/edgezero/pulls/<pull-number>`. GET and PATCH require 200 with one complete JSON
+value; POST requires 201 with one complete JSON value. The branch is exactly
+`edgezero-build-container-pin/<S>`, the title is exactly
+`chore(actions): pin build container for <S>`, and the
+body is this single line with no trailing LF:
+
+```text
+edgezero-build-container-pin-v1 {"evidence-url":"<exact-PR-comment-URL>","image-digest":"<D>","release-tag":"<tag>","source-pr":"<canonical-positive-u64>","source-revision":"<S>"}
+```
+
+Create uses exactly
+`{"base":"main","body":"<JSON-escaped-exact-body>","draft":false,"head":"edgezero-build-container-pin/<S>","title":"chore(actions): pin build container for <S>"}`.
+Close uses exactly `{"state":"closed"}`. Reopen or metadata reconciliation uses exactly
+`{"base":"main","body":"<JSON-escaped-exact-body>","state":"open","title":"chore(actions): pin build container for <S>"}`.
+No other request body, PR mutation, issue/comment endpoint, or GraphQL call is permitted.
+The expected publisher bot login has exact `<app-slug>[bot]` form; the public user response must have
+that login, the expected numeric bot id, and `type:"Bot"`. An installation token is not treated as a
+user token and the updater never calls `GET /user`. The protected workflow first requires the token
+action's installation-ID output to equal the reviewed installation variable, and the updater then
+requires every selected or mutated PR's final author to equal the resolved bot identity. Together with
+the exact repository response, this binds the token use without inventing an unsupported installation-
+token user endpoint.
+
+After authenticating the App bot and repository identities, the updater records the remote `main` and
+target pin-branch OIDs, fully classifies every matching PR/branch and source ancestry, and performs no
+remote mutation if any state is malformed, ambiguous, incomparable, or supersedes `S`. It creates a
+mode-0700 private temporary clone from the supplied clean full repository, sets origin to the one exact
+HTTPS URL, always fetches named `main` without tags or submodules, and fetches the named pin branch only
+when its recorded OID is nonempty. It requires every fetched OID to equal the recorded value and, for
+creation, repeats the exact ref lookup and requires absence immediately before the empty-lease push. A
+private detached worktree starts at recorded main. The updater invokes the typed
+pair writer into a separate private output directory, installs exactly those two mode-0644 files at
+`.github/docker/build-app-cli/{image.json,image-release-evidence.json}`, stages exactly those paths,
+and creates at most one unsigned, hook-free commit with message equal to the PR title and fixed bot
+name/email derived from the authenticated login. It rejects any other staged or worktree change.
+An existing pin commit may be based on an earlier main commit only when that parent is an ancestor of
+the newly recorded main; reconciliation rebuilds the proposed commit on current recorded main. Existing
+pin and evidence entries must be regular mode-0644 blobs. For same-source digest replacement, pushing
+the replacement branch necessarily advances the old PR's live head; the updater closes and verifies
+that PR at the new branch OID before creating and verifying the replacement PR.
+
+The only push is `HEAD:refs/heads/edgezero-build-container-pin/<S>` with
+`--force-with-lease=refs/heads/edgezero-build-container-pin/<S>:<recorded-oid>`; `<recorded-oid>` is
+empty only when the ref was absent. Push uses `--porcelain --no-verify`, no tags or submodules, and a
+mode-0700 askpass helper with terminal prompting disabled. The updater immediately reads the remote ref
+back and requires the new commit OID before creating, reopening/reconciling, or closing PRs. It then
+GETs every mutated or selected PR and requires exact final author, repository, base, head, title, body,
+state, merge, and commit identities. An already-current remote/API state is a mutation-free success.
+
+The rotation verifier has exactly two modes:
+
+```text
+verify-gate-rotation-lock.sh waiting --gate-root <canonical-old-G-root> --old-gate-sha <G> --dispatch-sha <Q_d> --run-id <u64> --run-attempt <u32> --run-actor-login <login>
+
+verify-gate-rotation-lock.sh publisher --gate-root <canonical-G-root> --gate-sha <G> --source-revision <S> --publisher-prerequisite-json <canonical-record>
+```
+
+Both modes read only `GITHUB_TOKEN` and emit no file or stdout. `waiting` permits only current-run,
+non-paginated approvals, and exact-main-ref GETs; it derives `Q_f`, `G-prime`, result, receipt digests,
+and final gate from the unique authenticated approval rather than caller flags. `publisher` permits
+only the fully paginated rotation-run history, selected current run, selected non-paginated approvals,
+selected exact-attempt jobs, and exact-main-ref GETs; it enforces the supplied prerequisite record and
+the latest completed rotation contract before registry authentication.
 
 `{approved-variable-name}` is exactly one of `EDGEZERO_BUILD_CONTAINER_APP_ID`,
 `EDGEZERO_BUILD_CONTAINER_APP_INSTALLATION_ID`, or
@@ -2023,43 +2323,93 @@ The publisher's authenticated ingress is repository variable
 surrounding whitespace, or trailing newline and has exactly this closed shape:
 
 ```text
-{"evidence-sha256":"sha256:<64-lowercase-hex>","gate-sha":"<40-lowercase-hex>","required-workflow-sha":"<40-lowercase-hex>","rotation-history":{"state":"bootstrap-no-rotation"},"schema-version":1,"source-revision":"<40-lowercase-hex>"}
+{"evidence-sha256":"sha256:<64-lowercase-hex>","evidence-url":null,"gate-sha":"<40-lowercase-hex>","previous-value-sha256":null,"rotation-history":{"state":"bootstrap-no-rotation"},"schema-version":2,"source-pr":null,"source-revision":null}
 ```
 
-`source-revision` may instead be JSON null only for an inert record that cannot authorize a tag.
-When rotation history is nonempty, `rotation-history` is exactly
-`{"created-at":"<RFC3339-UTC>","evidence-sha256":"sha256:<64-lowercase-hex>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","state":"verified"}`.
+The initial bootstrap record is created manually through the separately reviewed repository-variable
+creation procedure; this PATCH-only writer never observes or creates an absent variable. In every
+record submitted to the writer, `previous-value-sha256` is exactly
+`sha256:<64-lowercase-hex>` over the prior variable's exact UTF-8 bytes. `source-revision` is either a
+full lowercase source SHA or JSON null for an inert record that cannot authorize a tag. When rotation
+history is nonempty, `rotation-history` is exactly
+`{"created-at":"<RFC3339-UTC>","evidence-sha256":"sha256:<64-lowercase-hex>","history-sha256":"sha256:<64-lowercase-hex>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","run-number":"<canonical-positive-u64>","state":"verified"}`.
 Unknown, duplicate, missing, reordered, mistyped, noncanonical, zero, or out-of-range values fail.
-The outer evidence digest covers the complete canonical prerequisite-evidence file reviewed for that
-record. That file does not contain the derived publisher-prerequisite record or its digest, avoiding a
-self-reference. A release-bound record's byte-identical evidence file is attached to the source PR,
-while an inert post-rotation record covers the completed-lock audit. The nested digest covers the
-approved rotation receipt. The gate and required-workflow SHAs must be equal. A non-null source
-revision must equal the exact isolated release source `S` whose post-merge push and prerequisite audit
-the outer evidence records.
+For every inert record, `source-revision`, `source-pr`, and `evidence-url` are all null. For every
+release-bound record, `source-revision` is non-null, `source-pr` is a canonical positive-u64 decimal
+string, and `evidence-url` is the exact URL above with the same PR number. Those three fields change
+together; a partial tuple fails. The publisher passes the authenticated non-null pair directly to the
+pin updater. A same-source package-recovery refresh may replace the evidence digest and comment URL but
+must preserve the source PR number.
+The outer evidence digest covers the complete opaque prerequisite-evidence attachment reviewed for
+that record. That file does not contain the derived publisher-prerequisite record or its digest,
+avoiding a self-reference. A release-bound record's byte-identical evidence file is attached to the
+source PR, while an inert post-rotation record covers the completed-lock audit. The nested digest is
+exactly the `evidence-sha256` value from the first approval line and therefore hashes only the second
+line's exact compact JSON object bytes, excluding its prefix and every newline. It lets the publisher
+bind the record to the latest completed rotation using live API evidence. When producing the opaque
+audit, the trusted local auditor requires the record gate SHA to equal both the live active-gate
+variable and the live required-workflow descriptor SHA. The writer independently requires the record
+gate SHA to equal the live active-gate variable, but it neither parses that audit nor reads organization
+rulesets. For verified rotation history, the publisher requires the authenticated rotation receipt's
+`required-workflow-sha` and `gate-sha` to equal the record and active-gate SHA. In bootstrap history the
+publisher relies on the manual administrative trust-root procedure for descriptor equality; neither
+the evidence's review status nor the descriptor snapshot is machine-authenticated to the publisher.
+The bootstrap writer remains a trusted administrative actor. A non-null source revision must equal the
+exact isolated release source `S` whose post-merge push and prerequisite audit the outer evidence
+records.
 
 The variable is provisioned before release in inert form. A successful gate rotation leaves the old
 value stale while the lock runs; after the lock completes successfully, the local auditor emits a
-reviewed replacement with the new active gate, exact latest rotation, and null source revision. It
+reviewed replacement with the new active gate, exact latest rotation attempt, and null source revision. It
 never carries an old `S` across a gate change. A later successful post-merge release audit emits a
 replacement bound to its exact `S`. First-package visibility recovery repeats the audit and replaces
-the same-`S` record with the new evidence digest before the tag run is retried. Failed, canceled,
-waiting, or unreviewed audits never update the variable.
+the same-`S` record with the new evidence digest before the tag run is retried. Under the manual review
+procedure, failed, canceled, waiting, or unreviewed audits are never submitted to the writer.
 
-A separate local writer runs from clean detached active `G` and receives
+A separate local writer runs from a clean detached active `G` full repository with the same
+non-shallow, non-sparse, no-promisor, no-partial-clone, no-alternates, no-lazy-fetch requirements
+defined for the publication verifier. It receives
 `EDGEZERO_PUBLISHER_PREREQUISITE_WRITE_TOKEN` only through its process environment. The token is a
 short-lived fine-grained PAT selected only for `stackpop/edgezero`, with repository
 `Variables:write`, implicit `Metadata:read`, organization `Members:read`, and no other grant. A second
 operator records its selection, displayed grants, expiration, and screenshot digest. The writer
-authenticates the expected active organization-member login, validates the canonical evidence and
-record locally, GETs the existing exact variable, and permits only PATCH of
+authenticates the expected active organization-member login, validates the opaque evidence digest and
+canonical record locally, GETs the active-gate and existing prerequisite variables, and permits only
+PATCH of
 `/repos/stackpop/edgezero/actions/variables/EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE` with a
-body containing that exact name and JCS value. It cannot create/delete a variable, write another
+body exactly `{"name":"EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE","value":"<JSON-escaped-exact-JCS-record>"}`.
+The PATCH succeeds only with 204 and an empty body; the final GET must return the exact new value. It
+cannot create/delete a variable, write another
 name, or call a repository, workflow, ref, release, package, pull-request, comment, ruleset, or
 environment mutation endpoint. The independent final reviewer, distinct from the verifier, controls
 the writer invocation after recomputing the outer evidence digest and, only for verified nonempty
 rotation history, the nested receipt digest. Missing review, token/grant mismatch,
 unexpected prior state, API failure, or post-write readback mismatch blocks tagging or rerun.
+
+The writer is an operator-serialized single-writer procedure: no second writer invocation may overlap
+the interval from its first prerequisite-variable GET through its final readback. GitHub's variable
+PATCH endpoint provides no atomic compare-and-set primitive, so `previous-value-sha256` is a
+predecessor check, not an enforceable CAS. A concurrent privileged writer can still race and overwrite
+state; that operational violation is accepted and must be investigated from audit logs. The final
+readback detects an overwrite that wins before readback but cannot prove that no later write occurred.
+
+The writer permits only these transitions. It first validates both records and, if the requested record
+is byte-identical to the current value, returns success without applying the new record's predecessor
+hash and without PATCH. Otherwise, `previous-value-sha256` must hash the exact
+current value.
+A gate change may produce only an inert record for the current active gate with verified nonempty
+rotation history. If the prior record is verified, a gate change also requires the selected
+`run-number` to increase. At one gate, an inert record may become release-bound, a release-bound record
+may refresh evidence for the same source, and it may advance only to a source for which the old source
+is a Git ancestor; every such transition preserves byte-identical rotation history and every non-null
+source must descend from the current gate. A same-gate post-rollback transition may clear the source or
+refresh an inert record. If the prior history is bootstrap, the first such transition must be to an
+inert verified record for the first successfully completed rollback and makes no comparison to absent
+predecessor rotation fields. If the prior history is verified, the selected `run-number` must increase,
+the `run-id` must differ, and both the receipt and complete-history digests must differ. The writer never
+orders by run id. Every other same-gate removal of a source, source regression, incomparable source,
+stale or same-selected-run rotation identity, and carrying a source across a gate change fails before
+PATCH.
 
 API failure, pagination truncation, ambiguity, extra bypass actor, extra repository or write
 permission, credential failure, or evidence-post failure blocks release designation or publication.
@@ -2086,6 +2436,16 @@ shared group, and literal `cancel-in-progress:false`. It also permits only
 in the exact checked expressions/checkout ref locations of `.github/workflows/build-app-cli.yml`; a
 misspelling, extra property, other workflow/location, alias, duplicate, or dynamic expression fails.
 
+The yq installer downloads only
+`https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_<os>_<arch>` and accepts exactly these
+platform/digest pairs: `linux/amd64` =
+`fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4`, `linux/arm64` =
+`578648e463a11c1b6db6010cbf41eafed6bee79466fcffa1bb446672cf7945ea`, `darwin/amd64` =
+`b4ba1ecce3c47f00803f4f964de38394326c7a32eb6540616e04fb2935a0f08d`, and `darwin/arm64` =
+`877de31753a4dd2401aa048937aa9a7fc4d5f6ce858cf31508c5802954297213`. Every other version, OS,
+architecture, URL, asset spelling, or digest fails before installation. The scanner requires exact
+`yq --version` output identifying 4.53.3; accepting an arbitrary yq v4 is not sufficient.
+
 After structural validation, the wrapper creates line-count-preserving temporary copies: it replaces
 only those exact approved `job.workflow_*` scalar expressions with same-type constants and replaces
 only the two approved `queue` lines with blank lines. It runs unfiltered actionlint 1.7.12 over those
@@ -2099,8 +2459,11 @@ After acquiring that group, every publisher requires
 `EDGEZERO_BUILD_CONTAINER_RELEASE_STATE==enabled` and parses the exact step-local
 `vars.EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE` value only after the pending workflow has
 acquired concurrency and its job is sent to a runner. The record's non-null source revision must equal
-tag source `S`; its gate SHA must equal both the active gate variable and recorded organization
-descriptor SHA. A required hosted fixture queues a publisher behind a rotation, changes all three
+tag source `S`; its gate SHA must equal the active-gate variable. With verified rotation history, the
+authenticated receipt's `gate-sha` and `required-workflow-sha` must also equal that same `G`; with
+bootstrap history, descriptor equality remains a manual administrative trust-root assertion rather
+than a machine-authenticated or live publisher read. A required hosted fixture queues a publisher
+behind a rotation, changes all three
 variables while it waits, and proves the publisher receives the post-rotation values or fails before
 build. If GitHub does not preserve that evaluated-after-concurrency behavior, release is blocked and
 the variable channel must be redesigned; a queued-run snapshot is not accepted.
@@ -2109,31 +2472,56 @@ The same unconditional guard proves no rotation lock is active before image buil
 authentication and verifies successful completion of the latest rotation, not merely absence of an
 active run. With
 `actions:read`, enumerate the rotation workflow's complete run history using only `per_page=100`
-and positive `page`, without status/conclusion filters. Parse every run's `created_at` as an RFC 3339
-instant and select the unique run at the greatest instant; two distinct runs at that instant are
-ambiguous and fail closed. Run id is identity only and is never treated as a chronological ordering
-contract. Incomplete pagination, duplicate run ids, invalid/future timestamps, ambiguous identity, or
-malformed responses fail; historical reruns are checked through the selected run's current API
-attempt, not a cached successful older attempt. The prerequisite variable records `rotation-history`
+and positive `page`, without status/conclusion filters. Parse every run's `run_number` as a positive
+u64 JSON integer, `run_attempt` as a positive u32 JSON integer, `id` as a positive u64 JSON integer,
+and `created_at` as an RFC 3339 instant. GitHub documents `run_number` as increasing with each new run
+of a workflow and unchanged by reruns; select the unique greatest `run_number` and never order by run
+id or `updated_at`. Duplicate run ids or numbers, invalid/future creation times, incomplete pagination,
+or malformed values fail.
+
+Serialize the complete snapshot in ascending numeric `run_number` order as RFC 8785 JCS with exact
+entries `{"run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","run-number":"<canonical-positive-u64>"}`
+and no whitespace or trailing newline. `history-sha256` is SHA-256 over those exact array bytes. The
+selected run-detail response must reproduce the listed id, run number, creation instant, and current
+attempt. After validating its detail, jobs, approval, receipt, and main tree, enumerate the complete
+history a second time and require byte-identical canonical snapshot bytes and digest, then GET selected
+run detail again and require the same validated identity, attempt, status, conclusion, path, event,
+head, and creation instant. Any change fails; no retry accepts mixed observations. The successful second
+snapshot is the guard's linearization point. A new run or rerun observed before it changes the snapshot
+and blocks. A rotation that enters the same FIFO concurrency group only after that point is ordered
+behind the already-running publisher and is evaluated by the next publisher; the contract does not
+claim that a later concurrent dispatch atomically blocks the current one. The prerequisite variable
+records `rotation-history`
 as exactly
 `{"state":"bootstrap-no-rotation"}` when the history is empty, or
-`{"created-at":"<RFC3339-UTC>","evidence-sha256":"sha256:<64-lowercase-hex>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","state":"verified"}`
+`{"created-at":"<RFC3339-UTC>","evidence-sha256":"sha256:<64-lowercase-hex>","history-sha256":"sha256:<64-lowercase-hex>","run-attempt":"<canonical-positive-u32>","run-id":"<canonical-positive-u64>","run-number":"<canonical-positive-u64>","state":"verified"}`
 for the selected rotation. Empty current history is accepted only with the independently reviewed
 bootstrap record; any existing rotation requires the verified form and exact matching current
-creation instant/run/attempt/receipt digest. A deleted or changed previously recorded run is not
-bootstrap.
+creation instant/run number/run id/attempt/receipt digest and complete-history digest. A rerun of any
+older id changes the complete-history digest even though its run number does not change. The writer may
+not refresh the same selected rotation identity with that changed digest; recovery requires a fresh
+successful dispatch with a greater run number. A deleted or changed previously recorded run is not
+bootstrap. Automatic retention pruning of any snapshotted run likewise changes the digest and blocks
+until a fresh successful rotation produces a greater selected run number and a new reviewed record.
 
 Require the selected rotation run to be the exact protected-main rotation workflow at its receipt's
 `Q_d`, status `completed`, conclusion `success`, with exactly one successful
 `assert-exact-rotation-context` step in its exact-attempt jobs and the matching approved receipt.
 Validate the receipt's original time ordering/freshness against that step's completion time, not the
-later publisher's clock; its gate/descriptor values must equal the publisher's active `G`. The
+later publisher's clock; its `gate-sha` and `required-workflow-sha` values must equal the publisher's
+active `G`. This authenticates the descriptor snapshot recorded by the rotation review but does not
+claim a live publisher read of the organization ruleset. The
 receipt's final `Q_f` must be an ancestor of or equal to current protected main with complete
 gate-owned presence/mode/byte equality. A queued, waiting, failed, canceled, skipped, timed-out,
 wrong-attempt, or mismatched rotation blocks before build or registry login even if state remains
 `enabled`. Recovery requires a fresh successful rotation dispatch and refreshed prerequisite
-evidence, not deletion of the failed run or a successful older rotation. While the publisher holds
-concurrency no newer rotation can execute; a newly queued rotation conservatively blocks this guard.
+evidence. Repository administrators can delete workflow runs; deleting a newer unrecorded failed run
+can make an older successful run appear latest and revive its otherwise matching record. No repository
+workflow receives run-deletion authority, and this privileged administrative action is an explicitly
+accepted risk rather than a machine-enforced invariant. While the publisher holds concurrency no newer
+rotation can execute. Runs or reruns present by the guard's second snapshot block unless already bound
+by the exact record; work entering the FIFO group after that linearization point is later work and does
+not invalidate the current publisher.
 The read-only history wrapper permits only GETs for the fixed rotation-workflow runs route, the
 selected current run and approvals, its exact `/attempts/{run-attempt}/jobs` route (fully paginated),
 and the exact main ref. It uses the fixed REST headers and validated ids above, never a response URL
@@ -2169,6 +2557,20 @@ validators, context files, and post-install replacement steps are unreachable. T
 the approval gate and pin updater only from the same `G` root. The protected gate's structural
 publisher checker rejects any candidate that changes this topology, permissions, ordering, action
 pin, checkout source, context-construction source, or helper invocation.
+
+For gate-update and gate-rollback subject-data validation, old `G` invokes the network-free structural
+checker exactly as:
+
+```text
+check-build-container-publisher.sh --gate-root <canonical-G-root> --subject-root <canonical-subject-root> --gate-sha <G> --candidate-sha <T>
+```
+
+The checker executes only from the clean, detached gate checkout at `G`. It reads the candidate's
+workflow files and complete workflow-name set as Git blobs from the full subject checkout at `T`; it
+never sources or executes candidate content. It validates `publish-build-container.yml`,
+`rotate-build-container-gate.yml`, and the absence of any third workflow claiming their shared
+concurrency group. It emits no stdout on success and makes no network request. Runtime publisher-run
+and approval evidence is a separate responsibility of `verify-build-container-publication.sh`.
 
 Pin branches and PRs use a short-lived, protected-environment GitHub App installation token requested
 for repository `edgezero` with explicit `contents:write` and `pull_requests:write`. The publisher
@@ -2208,8 +2610,12 @@ edgezero-release-evidence-v1 {"challenge":"<64-lowercase-hex>","image-digest":"<
 
 The JSON is compact, uses the shown key order and string types with no extra key or whitespace, and every
 placeholder obeys its already defined syntax. `RFC3339-UTC` here is exactly a valid calendar instant
-in `YYYY-MM-DDTHH:MM:SSZ` form, with no fractional seconds or offset spelling. The exact `reviewed-at` instant is neither future nor
-more than 15 minutes before the machine check. `update-pin` initially has only `actions:read` and
+in `YYYY-MM-DDTHH:MM:SSZ` form, with no fractional seconds or offset spelling. In
+`release-approval-gate.sh`, the exact `reviewed-at` instant is neither future nor more than 15 minutes
+before the machine check performed immediately before App-token minting. Later typed-record, pin, and
+publication verifiers check grammar, calendar validity, exact comment equality, and the successful
+publisher context step but do not apply a new wall-clock age test to archived evidence. `update-pin`
+initially has only `actions:read` and
 `contents:read`. After checking out exact gate SHA `G` without persisted credentials and before
 App-token minting, its trusted gate helper uses the current `GITHUB_TOKEN` only for exact no-redirect
 `GET /repos/stackpop/edgezero/actions/runs/{github.run_id}` and
@@ -2381,8 +2787,10 @@ Required automated coverage includes:
   reviewer/self-review/deployment-policy checks, per-attempt approval comment and token-ordering checks,
   policy-API method/path/header/version allowlisting, canonical publisher-prerequisite record parsing,
   writer credential/method/path/body confinement, inert/`S`-bound transition truth tables, post-write
-  readback, queued publisher observing post-concurrency variable values, unique latest-`created_at`
-  rotation selection and equal-time ambiguity, App installation/repository/permission/token-
+  readback, queued publisher observing post-concurrency variable values, documented greatest
+  `run_number` selection, complete run/attempt-history digest, two-pass snapshot stability, and old-run
+  rerun invalidation, App
+  installation/repository/permission/token-
   scope checks, actionlint queue-compatibility isolation, publication concurrency and queue-overflow
   cancellation, gate-rotation failure recovery, and release rerun/idempotency;
 - post-`B` dispatch/activation/rollback using distinct gate, dispatch, and final-head identities;
@@ -2545,6 +2953,44 @@ Caching remains off by default. Container execution and provenance validation ar
   consumer copy required when Copy A/Copy B is unavailable; and assigned the corresponding
   ownership and adversarial tests across the five plans. Exact stable patch-version `uses:` refs and
   their accepted third-party tag-movement risk are unchanged.
+- **v6.32:** separated the network-free publisher-workflow structural checker from the pin job's
+  read-only publisher-run and approval verifier; fixed both CLIs, the exact-attempt jobs endpoint,
+  bounded polling behavior, and current-attempt approval interpretation; and added the runtime
+  verifier plus the workflow-executed yq installer to the protected gate inventory.
+- **v6.33:** reserved `H` for the final action candidate and bound protected helpers to generic
+  event-selected subject head `T`; added trusted candidate-blob action-reference enforcement; fixed
+  publisher run-path matching, jobs pagination/count closure, and request timeouts; and completed the
+  helper interfaces, gate inventory, dependency order, and reproducible verification commands.
+- **v6.34:** separated opaque bounded prerequisite-audit attachments from the exact machine transition
+  record; added explicit independently hashed policy- and writer-token screenshots and prior-variable
+  binding; froze request status, pagination, check-filter, pin-updater REST/Git, release-record writer,
+  scanner-output, and yq asset contracts; and required complete untracked-file and Node-version checks
+  in final qualification. The small transition record retains latest rotation identity so an old
+  same-gate source cannot survive a rollback and authorize a queued publisher.
+- **v6.35:** selects the latest rotation by unique greatest `updated_at` and binds both creation and
+  update instants so a rerun of an older run id cannot hide behind a newer run's creation time. It also
+  distinguishes the trusted local auditor's live organization-ruleset check from the publisher's
+  authenticated receipt check and removes the unimplementable claim that the Actions publisher reads
+  the live organization descriptor.
+- **v6.36:** replaces undocumented `updated_at` ordering with documented monotonic-per-workflow
+  `run_number`, binds a digest of every current run attempt, and requires a stable two-pass history plus
+  final selected-detail read. The post-concurrency guard now has an explicit linearization point;
+  rotations entering the FIFO group later are checked by the next publisher. Bootstrap evidence review
+  is explicitly a manual administrative trust-root assertion rather than a machine-verifiable claim.
+- **v6.37:** closes the publisher-verifier rerun race with a final run-detail linearization read;
+  defines full repositories to exclude partial/promisor clones and object alternates with lazy fetch
+  disabled; distinguishes reviewed fine-grained-token inventory ids from authenticated account ids;
+  and states the local prerequisite writer's operator-serialization requirement and accepted lack of
+  an atomic GitHub variable compare-and-set primitive.
+- **v6.38:** binds the source PR number and stable evidence-comment URL into the versioned publisher
+  prerequisite record so a tag-triggered publisher can supply the pin updater without ambient state or
+  an unbounded lookup. Release audit now consumes a pre-created inert candidate-PR comment URL; the
+  operator attaches the exact generated evidence to that stable comment before independent review and
+  writer invocation. The incompatible prerequisite wire shape advances to schema version 2.
+- **v6.39:** replaces the unsupported installation-token `GET /user` assumption with exact public
+  lookup of the reviewed `<app-slug>[bot]` identity, retaining the workflow's installation-ID guard and
+  final PR-author proof. It also defines same-source replacement head movement, permits reconciliation
+  from an older ancestor base, and requires existing pin records to be mode-0644 blobs.
 
 ## 13. Deferred implementation mechanics
 

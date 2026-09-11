@@ -7,7 +7,7 @@
 can reach a credentialed provider command, and preserve the parent deploy lifecycle without ambient
 host state or the legacy `--stage` spelling.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.31 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.39 Sections
 2, 5, 6.1, 6.6, 7.2, and 9. The parent deploy spec remains normative where the addendum does not
 expressly replace it.
 
@@ -88,7 +88,7 @@ rollback-fastly,config-push-fastly}` and their shared `.github/actions/deploy-co
       SHA-256, size, mode 0755, and link count one. Dynamic binaries run only by direct argv through
       the fixed environment launcher, which directly executes
       `/lib64/ld-linux-x86-64.so.2 --inhibit-cache --glibc-hwcaps-mask '' --library-path
-      /opt/edgezero/runtime-lib <binary>`; for static binaries it directly executes the binary. Never use a shell,
+/opt/edgezero/runtime-lib <binary>`; for static binaries it directly executes the binary. Never use a shell,
       `PATH` lookup, implicit kernel interpreter launch, `ld.so.cache`, default library directory,
       preload file, or hardware-capability substitution.
 - [ ] Cover static/dynamic success, wrong interpreter, dependency replacement, hwcaps/default/cache/

@@ -1,0 +1,486 @@
+name: Build container gate
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('build-container-release-preflight pr={0} repo={1} sha={2}', inputs.candidate-pr-number, inputs.candidate-head-repository, inputs.candidate-head-sha) || 'Build container gate' }}
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      candidate-pr-number:
+        description: Candidate pull request number
+        required: true
+        type: number
+      candidate-head-repository:
+        description: Candidate head repository
+        required: true
+        type: string
+      candidate-head-sha:
+        description: Candidate full head SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  build-container-local:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    env:
+      BASH_ENV: ""
+      ENV: ""
+    steps:
+      - name: assert-hosted-runner-context
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          EDGEZERO_RUNNER_OS: ${{ runner.os }}
+          EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_WORKFLOW_REF: ${{ github.workflow_ref }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_GITHUB_SHA: ${{ github.sha }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$EDGEZERO_RUNNER_OS" == Linux ]]
+          [[ "$EDGEZERO_RUNNER_ARCH" == X64 ]]
+          [[ "$EDGEZERO_REPOSITORY" == stackpop/edgezero ]]
+          [[ "$EDGEZERO_WORKFLOW_REF" == stackpop/edgezero/.github/workflows/build-container-ci.yml@* ]]
+          [[ "$EDGEZERO_GATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_GATE_SHA" != 0000000000000000000000000000000000000000 ]]
+          [[ "$EDGEZERO_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: checkout-active-gate
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          path: .edgezero-gate
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: checkout-subject
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ github.sha }}
+          path: .edgezero-subject
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: setup-trusted-node
+        if: ${{ success() }}
+        uses: actions/setup-node@v6.5.0
+        with:
+          node-version-file: .edgezero-gate/.tool-versions
+          cache: npm
+          cache-dependency-path: .edgezero-gate/docs/package-lock.json
+
+      - name: prepare-trusted-documentation-tools
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/edgezero-build-container-tools/bin"
+          mkdir -p "$bin"
+          INSTALL_DIR="$bin" bash "$GITHUB_WORKSPACE/.edgezero-gate/scripts/install-yq.sh" 4.53.3
+          [[ "$("$bin/yq" --version)" == 'yq (https://github.com/mikefarah/yq/) version v4.53.3' ]]
+          INSTALL_DIR="$bin" bash "$GITHUB_WORKSPACE/.edgezero-gate/scripts/install-actionlint.sh" 1.7.12
+          [[ "$("$bin/actionlint" -version | sed -n '1p')" == 1.7.12 ]]
+          printf '%s\n' "$bin" >>"$GITHUB_PATH"
+          npm --prefix "$GITHUB_WORKSPACE/.edgezero-gate/docs" ci --ignore-scripts
+
+      - name: run-protected-gate-tests
+        if: ${{ success() }}
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/.edgezero-gate"
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/actions/deploy-core/tests/run.sh"
+
+      - name: select-candidate-range
+        id: candidate_range
+        if: ${{ success() && github.event_name != 'push' }}
+        shell: bash
+        env:
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/select-build-container-range.sh" \
+            --event-name "$EDGEZERO_EVENT_NAME" \
+            --github-repository "$EDGEZERO_REPOSITORY" \
+            --github-sha "$EDGEZERO_SHA" \
+            --github-workflow-sha "$EDGEZERO_WORKFLOW_SHA" \
+            --github-ref "$EDGEZERO_REF" \
+            --github-ref-protected "$EDGEZERO_REF_PROTECTED" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            >>"$GITHUB_OUTPUT"
+
+      - name: assert-exact-main-push-context
+        id: push_range
+        if: ${{ success() && github.event_name == 'push' }}
+        shell: bash
+        env:
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/select-build-container-range.sh" \
+            --event-name "$EDGEZERO_EVENT_NAME" \
+            --github-repository "$EDGEZERO_REPOSITORY" \
+            --github-sha "$EDGEZERO_SHA" \
+            --github-workflow-sha "$EDGEZERO_WORKFLOW_SHA" \
+            --github-ref "$EDGEZERO_REF" \
+            --github-ref-protected "$EDGEZERO_REF_PROTECTED" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            >>"$GITHUB_OUTPUT"
+
+      - name: check-documentation-references
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_BASE: ${{ steps.candidate_range.outputs.base || steps.push_range.outputs.base }}
+          EDGEZERO_HEAD: ${{ steps.candidate_range.outputs.head || steps.push_range.outputs.head }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/actions/deploy-core/tests/check-doc-action-pins.sh" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            --base "$EDGEZERO_BASE" \
+            --candidate "$EDGEZERO_HEAD"
+
+      - name: run-build-container-gate
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_KIND: local
+          EDGEZERO_BASE: ${{ steps.candidate_range.outputs.base || steps.push_range.outputs.base }}
+          EDGEZERO_HEAD: ${{ steps.candidate_range.outputs.head || steps.push_range.outputs.head }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_RELEASE_STATE: ${{ vars.EDGEZERO_BUILD_CONTAINER_RELEASE_STATE }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/run-build-container-gate.sh" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --base "$EDGEZERO_BASE" \
+            --head "$EDGEZERO_HEAD" \
+            --kind "$EDGEZERO_KIND" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --release-state "$EDGEZERO_RELEASE_STATE" \
+            --work-root "$RUNNER_TEMP" \
+            --completion-file "$RUNNER_TEMP/edgezero-build-container-local-completion"
+
+      - name: assert-terminal-completion
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/assert-build-container-completion.sh" \
+            --file "$RUNNER_TEMP/edgezero-build-container-local-completion" \
+            --kind local
+
+  build-container-pin:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    env:
+      BASH_ENV: ""
+      ENV: ""
+    steps:
+      - name: assert-hosted-runner-context
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          EDGEZERO_RUNNER_OS: ${{ runner.os }}
+          EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_WORKFLOW_REF: ${{ github.workflow_ref }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_GITHUB_SHA: ${{ github.sha }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$EDGEZERO_RUNNER_OS" == Linux ]]
+          [[ "$EDGEZERO_RUNNER_ARCH" == X64 ]]
+          [[ "$EDGEZERO_REPOSITORY" == stackpop/edgezero ]]
+          [[ "$EDGEZERO_WORKFLOW_REF" == stackpop/edgezero/.github/workflows/build-container-ci.yml@* ]]
+          [[ "$EDGEZERO_GATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_GATE_SHA" != 0000000000000000000000000000000000000000 ]]
+          [[ "$EDGEZERO_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: checkout-active-gate
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          path: .edgezero-gate
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: checkout-subject
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ github.sha }}
+          path: .edgezero-subject
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: setup-trusted-node
+        if: ${{ success() }}
+        uses: actions/setup-node@v6.5.0
+        with:
+          node-version-file: .edgezero-gate/.tool-versions
+          cache: npm
+          cache-dependency-path: .edgezero-gate/docs/package-lock.json
+
+      - name: prepare-trusted-documentation-tools
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/edgezero-build-container-tools/bin"
+          mkdir -p "$bin"
+          INSTALL_DIR="$bin" bash "$GITHUB_WORKSPACE/.edgezero-gate/scripts/install-yq.sh" 4.53.3
+          [[ "$("$bin/yq" --version)" == 'yq (https://github.com/mikefarah/yq/) version v4.53.3' ]]
+          INSTALL_DIR="$bin" bash "$GITHUB_WORKSPACE/.edgezero-gate/scripts/install-actionlint.sh" 1.7.12
+          [[ "$("$bin/actionlint" -version | sed -n '1p')" == 1.7.12 ]]
+          printf '%s\n' "$bin" >>"$GITHUB_PATH"
+          npm --prefix "$GITHUB_WORKSPACE/.edgezero-gate/docs" ci --ignore-scripts
+
+      - name: run-protected-gate-tests
+        if: ${{ success() }}
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/.edgezero-gate"
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/actions/deploy-core/tests/run.sh"
+
+      - name: select-candidate-range
+        id: candidate_range
+        if: ${{ success() && github.event_name != 'push' }}
+        shell: bash
+        env:
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/select-build-container-range.sh" \
+            --event-name "$EDGEZERO_EVENT_NAME" \
+            --github-repository "$EDGEZERO_REPOSITORY" \
+            --github-sha "$EDGEZERO_SHA" \
+            --github-workflow-sha "$EDGEZERO_WORKFLOW_SHA" \
+            --github-ref "$EDGEZERO_REF" \
+            --github-ref-protected "$EDGEZERO_REF_PROTECTED" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            >>"$GITHUB_OUTPUT"
+
+      - name: assert-exact-main-push-context
+        id: push_range
+        if: ${{ success() && github.event_name == 'push' }}
+        shell: bash
+        env:
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/select-build-container-range.sh" \
+            --event-name "$EDGEZERO_EVENT_NAME" \
+            --github-repository "$EDGEZERO_REPOSITORY" \
+            --github-sha "$EDGEZERO_SHA" \
+            --github-workflow-sha "$EDGEZERO_WORKFLOW_SHA" \
+            --github-ref "$EDGEZERO_REF" \
+            --github-ref-protected "$EDGEZERO_REF_PROTECTED" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            >>"$GITHUB_OUTPUT"
+
+      - name: check-documentation-references
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_BASE: ${{ steps.candidate_range.outputs.base || steps.push_range.outputs.base }}
+          EDGEZERO_HEAD: ${{ steps.candidate_range.outputs.head || steps.push_range.outputs.head }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/actions/deploy-core/tests/check-doc-action-pins.sh" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            --base "$EDGEZERO_BASE" \
+            --candidate "$EDGEZERO_HEAD"
+
+      - name: run-build-container-gate
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_KIND: pin
+          EDGEZERO_BASE: ${{ steps.candidate_range.outputs.base || steps.push_range.outputs.base }}
+          EDGEZERO_HEAD: ${{ steps.candidate_range.outputs.head || steps.push_range.outputs.head }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_RELEASE_STATE: ${{ vars.EDGEZERO_BUILD_CONTAINER_RELEASE_STATE }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/run-build-container-gate.sh" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-subject" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --base "$EDGEZERO_BASE" \
+            --head "$EDGEZERO_HEAD" \
+            --kind "$EDGEZERO_KIND" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --release-state "$EDGEZERO_RELEASE_STATE" \
+            --work-root "$RUNNER_TEMP" \
+            --completion-file "$RUNNER_TEMP/edgezero-build-container-pin-completion"
+
+      - name: assert-terminal-completion
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/assert-build-container-completion.sh" \
+            --file "$RUNNER_TEMP/edgezero-build-container-pin-completion" \
+            --kind pin
+
+  build-container-release-preflight:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    environment:
+      name: build-container-release
+      deployment: false
+    env:
+      BASH_ENV: ""
+      ENV: ""
+    steps:
+      - name: assert-hosted-runner-context
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          EDGEZERO_RUNNER_OS: ${{ runner.os }}
+          EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_WORKFLOW_REF: ${{ github.workflow_ref }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_GITHUB_SHA: ${{ github.sha }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$EDGEZERO_RUNNER_OS" == Linux ]]
+          [[ "$EDGEZERO_RUNNER_ARCH" == X64 ]]
+          [[ "$EDGEZERO_REPOSITORY" == stackpop/edgezero ]]
+          [[ "$EDGEZERO_WORKFLOW_REF" == stackpop/edgezero/.github/workflows/build-container-ci.yml@refs/heads/main ]]
+          [[ "$EDGEZERO_GATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_GATE_SHA" != 0000000000000000000000000000000000000000 ]]
+          [[ "$EDGEZERO_WORKFLOW_SHA" == "$EDGEZERO_GITHUB_SHA" ]]
+
+      - name: checkout-active-gate
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          path: .edgezero-gate
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: assert-exact-g-dispatch-context
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_WORKFLOW_REF: ${{ github.workflow_ref }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_RELEASE_STATE: ${{ vars.EDGEZERO_BUILD_CONTAINER_RELEASE_STATE }}
+          EDGEZERO_CANDIDATE_PR_NUMBER: ${{ inputs.candidate-pr-number }}
+          EDGEZERO_CANDIDATE_HEAD_REPOSITORY: ${{ inputs.candidate-head-repository }}
+          EDGEZERO_CANDIDATE_HEAD_SHA: ${{ inputs.candidate-head-sha }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/assert-build-container-dispatch-context.sh" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate"
+
+      - name: mint-publisher-probe-token
+        id: publisher_probe
+        if: ${{ success() }}
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ vars.EDGEZERO_BUILD_CONTAINER_APP_ID }}
+          private-key: ${{ secrets.EDGEZERO_BUILD_CONTAINER_APP_PRIVATE_KEY }}
+          owner: stackpop
+          repositories: edgezero
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: verify-publisher-probe-token
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_APP_TOKEN: ${{ steps.publisher_probe.outputs.token }}
+          EDGEZERO_INSTALLATION_ID: ${{ steps.publisher_probe.outputs.installation-id }}
+          EDGEZERO_EXPECTED_INSTALLATION_ID: ${{ vars.EDGEZERO_BUILD_CONTAINER_APP_INSTALLATION_ID }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/assert-build-container-app-token.sh"

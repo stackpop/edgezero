@@ -32,6 +32,7 @@ context_paths() {
 .dockerignore
 .github/actions/deploy-fastly/versions.json
 .github/docker/build-app-cli/Dockerfile
+.github/docker/build-app-cli/fixtures/gnu-smoke.rs
 .github/docker/build-app-cli/fixtures/provenance/valid/archive.tar
 .github/docker/build-app-cli/fixtures/wasm-smoke.rs
 .github/docker/build-app-cli/image-context-paths.txt
@@ -55,6 +56,7 @@ make_repo() {
   printf 'rust 1.95.0\nfastly 15.1.0\n' >"$root/.tool-versions"
   printf '{"fastly":{"version":"15.1.0"}}\n' >"$root/.github/actions/deploy-fastly/versions.json"
   printf 'FROM scratch\nCOPY .tool-versions /image/.tool-versions\n' >"$root/.github/docker/build-app-cli/Dockerfile"
+  printf 'fn main() {}\n' >"$root/.github/docker/build-app-cli/fixtures/gnu-smoke.rs"
   printf 'fixture' >"$root/.github/docker/build-app-cli/fixtures/provenance/valid/archive.tar"
   printf 'pub fn smoke() {}\n' >"$root/.github/docker/build-app-cli/fixtures/wasm-smoke.rs"
   printf '{}\n' >"$root/.github/docker/build-app-cli/provenance.schema.json"

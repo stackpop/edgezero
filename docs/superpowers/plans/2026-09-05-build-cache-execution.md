@@ -2,7 +2,8 @@
 
 Implementation branch: `feature/build-app-cli-cache` in the existing
 `edgezero-actions-improve` worktree. The implementation recorded below follows design v6.29;
-the subsequent v6.30 and v6.31 design reconciliations are recorded separately at the end.
+the subsequent v6.30, v6.31, v6.34, v6.35, v6.36, v6.37, v6.38, and v6.39 design reconciliations are recorded separately at
+the end.
 
 ## Version Reference Review
 
@@ -409,3 +410,117 @@ No image has been published and no gate SHA, release tag, digest pin, release ev
 workflow, or cache-enabled action is claimed by this tranche. Section 6.3 and later Task 2 work remain
 open, and the same image verification must run again against the eventual protected/published
 identities.
+
+## v6.34 Design Reconciliation
+
+Plan-only reconciliation recorded on 2026-09-10. **Implementation status: pending.** This section does
+not claim that any v6.34 helper, test, workflow, hosted proof, or release operation has been
+implemented or rerun, and it does not supersede the historical v6.30/v6.31 evidence above.
+
+- At this reconciliation, normative plan references and completion reviews targeted design v6.34 while
+  preserving historical reconciliation references.
+- The four prerequisite-auditor CLIs now require `--policy-token-review-png`; the separate variable
+  writer requires `--writer-token-review-png`. Policy-token, writer-token, and administrator-bypass
+  screenshots require canonical absolute regular non-symlink PNGs, the exact signature, and the
+  8..10,485,760-byte bound; each digest is recomputed and bound to its canonical review/evidence.
+- Auditor evidence is canonical bounded JSON, but the downstream writer treats its 1..1,048,576 raw
+  bytes as opaque and binds only their SHA-256 in the separate small JCS transition record.
+- The prerequisite record now has exactly the v6.34 six-field shape without
+  `required-workflow-sha`, retains exact rotation history, requires live gate/descriptor equality,
+  and binds verified history to the exact second approval-line JSON object bytes using the digest from
+  the first line. Bootstrap is a separate manually reviewed repository-variable POST; the writer is
+  PATCH-only, requires an existing-variable GET 200, performs exact-byte idempotence before predecessor
+  CAS, and permits same-gate source clear/inert refresh only when verified history advances for rollback.
+- API plans now freeze GET/POST/PATCH/DELETE status and body contracts, literal ordered list queries,
+  bounded synthesized pagination, Link/count/duplicate/truncation failures, exact check names, and
+  `app_id=15368`. The deployment-protection-rules endpoint is a scalar no-query GET.
+- The pin updater now carries the exact v6.34 CLI, App-token REST allowlist, PR bodies, evidence URL,
+  exact `chore(actions): pin build container for <S>` title, private Git/askpass/worktree flow,
+  conditional absent-target fetch, immediate pre-create absence recheck, force-with-lease push, and
+  final remote/API readback contract.
+- Repository-administrator workflow-run deletion is an accepted privileged risk. The plan does not
+  claim a newer unrecorded failed run remains detectable after deletion, and no repository workflow
+  receives run-deletion authority.
+- The typed image/release-record writer plan now includes its exact CLI and current bytes, private
+  mode-0700 outside-repository output parent, mode-0644 atomic pair, silence, cleanup, and focused tests.
+- The yq plan now pins 4.53.3's exact release URL and four platform hashes and includes
+  `install-yq.test.sh` in the planned and gate-manifest surfaces.
+- Final qualification now checks all untracked files without ignoring submodules and verifies Node
+  exactly against `.tool-versions` before `npm ci`.
+- The literal gate manifest remains unfrozen until every helper and test exists; only then is its exact
+  sorted list copied as a fenced block into the plan and required byte-equal to `gate-paths.txt`. No
+  final list is invented by this reconciliation.
+
+## v6.35 Design Reconciliation
+
+Plan-only reconciliation recorded on 2026-09-10. **Implementation status: pending.** This section does
+not claim that the v6.35 rotation-history or descriptor-flow changes are implemented or verified.
+
+- At this reconciliation, normative plan references and completion reviews targeted design v6.35.
+- Verified rotation history binds exact `created-at` and `updated-at` values. Auditors and publishers
+  enumerate complete unfiltered history, select the unique greatest `updated_at`, and require selected
+  run detail to reproduce the listed identity, timestamps, and current attempt. Tests include rerunning
+  an older run id after a newer successful run and list/detail read races.
+- The trusted local auditor, not the Actions publisher or opaque-record writer, verifies the live
+  organization required-workflow descriptor. The writer independently checks only the live active-gate
+  variable. For verified history, the publisher authenticates descriptor equality through the exact
+  approved rotation receipt; bootstrap descriptor equality remains an independently reviewed auditor
+  snapshot.
+
+## v6.36 Design Reconciliation
+
+Plan-only reconciliation recorded on 2026-09-10. **Implementation status: pending.** This section does
+not claim that the v6.36 history snapshot or trust-boundary changes are implemented or verified.
+
+## v6.37 Design Reconciliation
+
+The publication verifier now requires a final exact run-detail reread after jobs and approvals, which
+is its explicit current-attempt linearization point. Full repository checks exclude partial/promisor
+clones and object alternates and disable lazy object fetching. The writer review's `token-id` is the
+screenshot-bound credential inventory id rather than `/user.id`, and the local variable writer is an
+operator-serialized procedure whose predecessor digest is explicitly not an atomic GitHub API CAS.
+Implementation and focused adversarial verification of these corrections remain part of Task 2.
+
+## v6.38 Design Reconciliation
+
+The tag-triggered publisher lacked an authenticated ingress for the pin updater's required source PR
+and exact evidence-comment URL. The release procedure now pre-creates an inert stable candidate-PR
+comment, passes that URL to release audit, attaches the resulting evidence to the same comment, and
+binds both PR and URL into an incompatible schema-version-2 prerequisite record. Inert records carry
+nulls for the source revision, source PR, and evidence URL; release-bound records carry all three.
+
+## v6.39 Design Reconciliation
+
+The pin updater now resolves the reviewed real GitHub App bot identity through
+`GET /users/<app-slug>[bot]`; installation tokens do not call the user-token-only `/user` endpoint.
+The workflow installation-ID guard and final PR-author checks remain mandatory. Existing proposal
+commits may be reconciled from an ancestor main parent, record blobs must be mode 0644, and a
+same-source digest replacement verifies the closed old PR at the post-push branch OID.
+
+- The publisher now selects the greatest documented per-workflow `run_number`, never `updated_at`, and
+  binds a canonical digest of every current `{run-attempt,run-id,run-number}` tuple. Any rerun, including
+  an older run id, invalidates the record; the writer cannot refresh a changed snapshot for the same
+  selected run, so recovery requires a fresh successful dispatch.
+- Two byte-identical complete history reads plus a repeated selected-run detail establish the guard's
+  explicit post-concurrency linearization point. Work entering FIFO concurrency afterward is later work
+  for the next publisher; the plan no longer claims ordinary REST reads atomically block it.
+- Bootstrap review and descriptor evidence are explicitly a manual administrative trust-root procedure.
+  Machine rejection covers malformed, stale, and cross-release records; authenticated rotation review
+  starts with the first verified rotation receipt.
+
+## v6.39 Protected Gate Implementation
+
+The local Task 2 Sections 6.3 and 6.4 implementation is complete. This supersedes the historical
+"implementation pending" status in the v6.34-v6.37 reconciliation notes without changing their design
+history. The implementation includes the frozen gate manifest and exact CODEOWNERS expansion, protected
+classifier and event-range selection, required CI workflow, release-prerequisite auditor, prerequisite
+writer, approval gate, App-token boundary, pin updater, publisher structural checker, publication
+verifier, rotation-lock verifier, publisher workflow, rotation workflow, and their adversarial fixture
+suites.
+
+Local completion does not activate the trust root or publish an image. Task 2 Section 6.5 and later
+hosted steps remain open: merge and record `G`, configure repository rules, variables, environments,
+and required workflows, obtain live queue-capacity and post-concurrency freshness evidence, execute the
+credential smoke, publish and anonymously verify the image, merge the pin PR, and record `{G,S,D,B}`.
+The cache primitive, producer/consumer provenance integration, provider lifecycle integration, and
+application-repository adoption remain the separate follow-on plans 2 through 5.

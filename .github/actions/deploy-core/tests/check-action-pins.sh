@@ -13,11 +13,11 @@ set -euo pipefail
 
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)
 
-# Require mikefarah yq v4: its expression syntax below is version-specific, and the
-# alternative (kislyuk's python yq) is a different tool. Fail closed if it is absent
-# so a gate that silently checked nothing can never pass.
-if ! command -v yq >/dev/null 2>&1 || ! yq --version 2>&1 | grep -qE 'mikefarah/yq.*version v?4\.'; then
-  echo "::error::check-action-pins.sh requires mikefarah yq v4 for structural YAML parsing" >&2
+# Require the reviewed yq binary exactly. Its parser is part of the gate's policy,
+# so accepting an arbitrary future v4 would silently change the language accepted.
+if ! command -v yq >/dev/null 2>&1 ||
+  [[ "$(yq --version 2>&1)" != 'yq (https://github.com/mikefarah/yq/) version v4.53.3' ]]; then
+  echo "::error::check-action-pins.sh requires mikefarah yq v4.53.3 for structural YAML parsing" >&2
   exit 2
 fi
 if ! command -v jq >/dev/null 2>&1; then
@@ -31,6 +31,7 @@ fi
 # `jobs.<job>.env.uses`.
 # has() preserves explicit nulls. JSON keeps multiline scalars in one record.
 uses_query='[(.jobs[]? | select(has("uses")) | .uses), (.jobs[]? | .steps[]? | select(has("uses")) | .uses), (.runs.steps[]? | select(has("uses")) | .uses)]'
+parse_query='{"document": ., "aliases": [... | select(kind == "alias")], "duplicates": [.. | select(kind == "map") | to_entries | group_by(.key) | .[] | select(length > 1)]}'
 
 files=()
 if [[ "$#" -gt 0 ]]; then
@@ -70,7 +71,10 @@ for file in ${files[@]+"${files[@]}"}; do
   # FAIL CLOSED on a parse/tool failure: if yq cannot read the file, a `2>/dev/null`
   # process substitution would yield no refs and the gate would silently pass a file
   # it never checked. Capture the output and the exit status instead.
-  if ! uses_list=$(yq -o=json -I=0 "$uses_query" "$file" | jq -cse 'if length == 1 and (.[0] | type == "array") then .[0] else error("expected one YAML document") end'); then
+  if ! parsed=$(yq -o=json -I=0 "$parse_query" "$file" |
+    jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("expected one YAML document") end') ||
+    ! jq -e '.aliases == [] and .duplicates == [] and (.document | type) == "object"' <<<"$parsed" >/dev/null ||
+    ! uses_list=$(jq -c ".document | $uses_query" <<<"$parsed"); then
     echo "::error::could not parse '$file' as YAML — refusing to pass a file the pin gate cannot read" >&2
     status=1
     continue

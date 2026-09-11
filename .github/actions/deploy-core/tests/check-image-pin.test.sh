@@ -88,6 +88,16 @@ assert_eq "provenance-protocol exposes the validated integer" "1" \
 assert_fail "there is no runtime tag accessor" run_check tag "$image"
 assert_pass "the coherent image/evidence pair passes" run_check validate-pair "$image" "$evidence"
 
+write_evidence "$WORK/stale-evidence.json" '2020-01-01T00:00:00Z'
+assert_pass "archived evidence does not expire against a later wall clock" \
+  run_check validate-pair "$image" "$WORK/stale-evidence.json"
+write_evidence "$WORK/future-evidence.json" '2099-01-01T00:00:00Z'
+assert_pass "archival validation leaves freshness to the successful publisher gate" \
+  run_check validate-pair "$image" "$WORK/future-evidence.json"
+write_evidence "$WORK/invalid-calendar-evidence.json" '2026-02-30T00:00:00Z'
+assert_fail "an invalid evidence calendar instant is rejected" \
+  run_check validate-pair "$image" "$WORK/invalid-calendar-evidence.json"
+
 printf 'not json' >"$WORK/bad.json"
 assert_fail "malformed JSON fails closed" run_check "$WORK/bad.json"
 write_image "$WORK/duplicate.json" \
