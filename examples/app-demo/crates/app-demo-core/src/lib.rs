@@ -12,7 +12,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use edgezero_core::app::App as EdgeZeroApp;
-use edgezero_core::{AdmissionDecision, IngressGrant, RouteResolution};
+use edgezero_core::http::StatusCode;
+use edgezero_core::{AdmissionDecision, BufferedIngressResponse, IngressGrant, RouteResolution};
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
 const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
@@ -49,8 +50,17 @@ fn configure_app(app: &mut EdgeZeroApp) {
         }
         RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
             AdmissionDecision::ReadBodyBeforeFallback {
+                grant: IngressGrant::new(AdmissionLease { route_class: None }),
                 max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
                 read_deadline: head.read_deadline_after(FALLBACK_INGRESS_READ_BUDGET),
+                on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+                on_timeout: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),
             }
         }
     });
@@ -87,7 +97,8 @@ mod lifecycle_tests {
     use bytes::Bytes;
     use edgezero_core::app::{App as EdgeZeroApp, Hooks as _};
     use edgezero_core::body::Body;
-    use edgezero_core::http::{request_builder, HeaderMap, Method, StatusCode, Version};
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::{request_builder, HeaderMap, Method, Response, StatusCode, Version};
     use edgezero_core::ingress::{IngressBeginOutcome, IngressHeadParts};
     use edgezero_core::router::RouteResolution;
     use edgezero_core::time::MonotonicInstant;
@@ -152,38 +163,16 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn configured_admission_bounds_fallback_bodies() {
+    fn configured_admission_preserves_fallback_status_at_exact_cap() {
         let app = super::App::build_app();
-        for (method, path, chunks, expected) in [
-            (
-                Method::POST,
-                "/missing",
-                vec![Bytes::from(vec![b'a'; 4_096])],
-                StatusCode::NOT_FOUND,
-            ),
-            (
-                Method::POST,
-                "/",
-                vec![Bytes::from(vec![b'a'; 4_096])],
-                StatusCode::METHOD_NOT_ALLOWED,
-            ),
-            (
-                Method::POST,
-                "/missing",
-                vec![Bytes::from(vec![b'a'; 4_096]), Bytes::from_static(b"b")],
-                StatusCode::BAD_REQUEST,
-            ),
-            (
-                Method::POST,
-                "/",
-                vec![Bytes::from(vec![b'a'; 4_096]), Bytes::from_static(b"b")],
-                StatusCode::BAD_REQUEST,
-            ),
+        for (method, path, expected) in [
+            (Method::POST, "/missing", StatusCode::NOT_FOUND),
+            (Method::POST, "/", StatusCode::METHOD_NOT_ALLOWED),
         ] {
             let request = request_builder()
                 .method(method)
                 .uri(path)
-                .body(Body::stream(iter(chunks)))
+                .body(Body::stream(iter([Bytes::from(vec![b'a'; 4_096])])))
                 .expect("request");
             let response = block_on(app.dispatch_ingress(
                 request,
@@ -194,6 +183,77 @@ mod lifecycle_tests {
             .expect("dispatch");
             assert_eq!(response.status(), expected);
         }
+    }
+
+    #[test]
+    fn configured_admission_returns_exact_overflow_response_for_both_fallbacks() {
+        let app = super::App::build_app();
+        for (method, path) in [(Method::POST, "/missing"), (Method::POST, "/")] {
+            let request = request_builder()
+                .method(method)
+                .uri(path)
+                .body(Body::stream(iter([
+                    Bytes::from(vec![b'a'; 4_096]),
+                    Bytes::from_static(b"b"),
+                ])))
+                .expect("request");
+            let response = block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                edgezero_core::IngressHeadAccounting::HostManaged,
+                edgezero_core::IngressFraming::HostManaged,
+            ))
+            .expect("dispatch");
+
+            assert_plain_text_response(
+                &response,
+                StatusCode::BAD_REQUEST,
+                b"request body too large\n",
+            );
+        }
+    }
+
+    #[test]
+    fn configured_admission_returns_exact_timeout_response() {
+        let app = super::App::build_app();
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/missing")
+            .body(Body::from_stream(iter([Err::<Bytes, _>(
+                EdgeError::request_timeout("adapter read deadline exceeded"),
+            )])))
+            .expect("request");
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            edgezero_core::IngressHeadAccounting::HostManaged,
+            edgezero_core::IngressFraming::HostManaged,
+        ))
+        .expect("dispatch");
+
+        assert_plain_text_response(&response, StatusCode::REQUEST_TIMEOUT, b"request timeout\n");
+    }
+
+    fn assert_plain_text_response(response: &Response, status: StatusCode, body: &[u8]) {
+        let expected_length = body.len().to_string();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .expect("content type"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-length")
+                .expect("content length")
+                .to_str()
+                .expect("ASCII content length"),
+            expected_length
+        );
+        assert_eq!(response.body().as_bytes().expect("buffered body"), body);
     }
 
     fn begin_ingress(
