@@ -28,9 +28,14 @@ mod secret_store_compile_check {
 )]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
+    use edgezero_adapter_cloudflare::outbound::CloudflareOutboundClient;
+    #[cfg(feature = "test-utils")]
+    use edgezero_adapter_cloudflare::outbound::deferred_clock_paths_hold_for_test;
     #[cfg(feature = "test-utils")]
     use edgezero_adapter_cloudflare::request::deadline_body_releases_source_for_test;
     use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
@@ -41,7 +46,9 @@ mod tests {
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{Method, Response, StatusCode, response_builder};
+    use edgezero_core::outbound::{OutboundHttpClient as _, OutboundRequest};
     use edgezero_core::router::RouterService;
+    use edgezero_core::time::{MonotonicClock, MonotonicInstant};
     use futures::stream;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
     use worker::js_sys::Object;
@@ -311,6 +318,104 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::OK.as_u16());
         let body = response.text().await.expect("text");
         assert_eq!(body, "no");
+    }
+
+    #[wasm_bindgen_test]
+    async fn outbound_clock_controls_preflight_elapsed_and_backwards_failure() {
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        fn scripted_clock(script: Vec<MonotonicInstant>) -> MonotonicClock {
+            let observations = Arc::new(Mutex::new(VecDeque::from(script)));
+            MonotonicClock::new(move || {
+                observations
+                    .lock()
+                    .expect("clock observations")
+                    .pop_front()
+                    .expect("clock observation")
+            })
+        }
+
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(9))
+            .expect("completed instant");
+        let forward_client =
+            CloudflareOutboundClient::with_clock(scripted_clock(vec![start, completed]));
+        let forward_request = OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+        let forward_results = forward_client.send_all(vec![forward_request]).await;
+        assert_eq!(forward_results.len(), 1);
+        let forward_result = forward_results.first().expect("single forward result");
+        assert_eq!(forward_result.elapsed, Duration::from_millis(9));
+        assert!(matches!(
+            forward_result.outcome,
+            Err(EdgeError::BadRequest { .. })
+        ));
+
+        let earlier = start
+            .checked_sub(Duration::from_millis(1))
+            .expect("earlier instant");
+        let backwards_client =
+            CloudflareOutboundClient::with_clock(scripted_clock(vec![start, earlier]));
+        let backwards_request = OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+        let backwards_results = backwards_client.send_all(vec![backwards_request]).await;
+        assert_eq!(backwards_results.len(), 1);
+        let backwards_result = backwards_results.first().expect("single backwards result");
+        assert_eq!(backwards_result.elapsed, Duration::ZERO);
+        assert!(matches!(
+            backwards_result.outcome,
+            Err(EdgeError::Internal { .. })
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    async fn standard_service_installs_the_application_outbound_clock() {
+        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+            let client = ctx
+                .http_client()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+            let request = OutboundRequest::get("https://example.com/")?.stream_response();
+            let results = client.send_all(vec![request]).await;
+            let result = results
+                .first()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing outbound result")))?;
+            Ok(result.elapsed.as_millis().to_string())
+        }
+
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(AtomicUsize::new(0));
+        let clock_observations = Arc::clone(&observations);
+        let mut app = App::new(RouterService::builder().get("/clock", elapsed).build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                start
+            } else {
+                completed
+            }
+        }));
+        let req = cf_request(CfMethod::Get, "/clock", None);
+        let (env, ctx) = test_env_ctx();
+
+        let mut response = CloudflareService::new(&app)
+            .dispatch(req, env, ctx)
+            .await
+            .expect("Cloudflare response");
+
+        assert_eq!(response.text().await.expect("response body"), "7");
+        assert!(observations.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[wasm_bindgen_test]
+    async fn deferred_upload_and_response_paths_retain_the_injected_clock() {
+        assert!(deferred_clock_paths_hold_for_test().await);
     }
 
     #[cfg(feature = "test-utils")]
@@ -584,6 +689,30 @@ mod tests {
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
                 assert_no_route_dispatch(&handler_calls, &middleware_calls);
             }
+        }
+
+        #[wasm_bindgen_test]
+        async fn standard_service_enforces_fallback_overflow() {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                fallback_app(4, Duration::from_secs(30), &grant_drops);
+            let req = cf_request(CfMethod::Post, "/missing", Some(b"abcde"));
+            let (env, ctx) = test_env_ctx();
+
+            let response = CloudflareService::new(&app)
+                .dispatch(req, env, ctx)
+                .await
+                .expect("Cloudflare response");
+
+            assert_terminal_response(
+                response,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                terminal_headers("overflow"),
+                b"cloudflare overflow\0response",
+            )
+            .await;
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_no_route_dispatch(&handler_calls, &middleware_calls);
         }
 
         #[wasm_bindgen_test]

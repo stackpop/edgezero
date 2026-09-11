@@ -733,7 +733,6 @@ dependencies = [
  "tower",
  "tracing",
  "walkdir",
- "web-time",
 ]
 
 [[package]]
@@ -756,7 +755,6 @@ dependencies = [
  "tempfile",
  "toml_edit",
  "walkdir",
- "web-time",
  "worker",
 ]
 
@@ -786,7 +784,6 @@ dependencies = [
  "thiserror 2.0.18",
  "toml_edit",
  "walkdir",
- "web-time",
 ]
 
 [[package]]

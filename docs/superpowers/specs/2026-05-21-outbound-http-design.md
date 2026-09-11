@@ -1553,6 +1553,19 @@ and serial response harvest delay observation. The deviation is not response-bod
 /// crates do not need a direct `web-time` dependency to name or construct this value.
 pub type MonotonicInstant = web_time::Instant;
 
+/// Cloneable clock source shared by one application, its admitted requests, and the
+/// standard outbound clients installed by adapters.
+#[derive(Clone)]
+pub struct MonotonicClock { /* Arc<dyn Fn() -> MonotonicInstant + Send + Sync> */ }
+
+impl MonotonicClock {
+    pub fn new<Now>(now: Now) -> Self
+    where Now: Fn() -> MonotonicInstant + Send + Sync + 'static;
+    pub fn now(&self) -> MonotonicInstant;
+}
+
+impl Default for MonotonicClock { /* web_time-backed production source */ }
+
 /// An absolute monotonic instant after which work should stop. A pure value type
 /// — arithmetic over `MonotonicInstant`, identical on every target, with no
 /// runtime dependency. `time.rs` contains `Deadline`, `DispatchBudget`,
@@ -1579,7 +1592,9 @@ impl Deadline {
     pub fn at_instant(instant: MonotonicInstant) -> Self;  // construct from absolute instant
     pub fn instant(&self) -> MonotonicInstant;    // accessor for the absolute instant
     pub fn is_expired(&self) -> bool;
+    pub fn is_expired_at(&self, now: MonotonicInstant) -> bool;
     pub fn remaining(&self) -> Option<Duration>;   // None once passed
+    pub fn remaining_at(&self, now: MonotonicInstant) -> Option<Duration>;
 }
 
 /// Hard upper bound on any caller-supplied duration. The clamp exists so
@@ -1593,11 +1608,30 @@ impl Deadline {
 pub const DEADLINE_FAR_FUTURE: Duration = Duration::from_hours(168); // 7 days; from_hours, not from_secs(7*24*60*60), which trips clippy::duration_suboptimal_units
 ```
 
+Every standard adapter entry clones the exact `App::monotonic_clock()` used to capture
+ingress timing into the outbound client inserted in request extensions. Axum exposes
+`try_with_clock`; Cloudflare, Fastly, and Spin expose `with_clock`. Default low-level
+constructors remain convenient and explicitly use `MonotonicClock::default()`.
+They are not app-clock propagation paths. Cloudflare and Spin's former unit-struct literal
+construction is intentionally removed by this hard cut; low-level callers migrate to
+`CloudflareOutboundClient::new()` / `SpinOutboundClient::new()` or `Default` so every client
+has an explicit clock source.
+
+Once `send` or `send_all` begins, every EdgeZero-owned outbound observation uses that stored
+clock: method-entry and terminal slot samples, dispatch budget selection, preparation and
+provider error precedence, pre/post-ready checks, and streamed upload/response checks. A
+deferred body stream owns a clock clone; it never falls back to process-global time after
+`send` returns. Provider timers still supply target-specific preemption, but the duration
+armed into them comes from the same paired clock snapshot. Later remaining-budget reads use
+`min(budget.deadline.remaining_at(clock.now()), budget.duration)`, so a backwards injected
+clock cannot enlarge the budget selected at method entry. Checked elapsed subtraction maps a
+backwards terminal sample to the existing zero-elapsed internal invariant outcome.
+
 #### 3.3.2 Mapping an external batch deadline to EdgeZero deadlines
 
 | External concept | EdgeZero mechanism |
 | --- | --- |
-| External batch deadline (whole fan-out) | Compute `let batch_deadline = Deadline::after(Duration::from_millis(batch_deadline_ms))` **once** at handler entry, then pass that absolute value into every target request via `.deadline(batch_deadline)`. `Deadline` is `Copy` and absolute, so all targets share the same wall-clock cap. Do **not** call `Deadline::after(..)` per target — that re-anchors `now` per call and lets later targets drift past the batch deadline. |
+| External batch deadline (whole fan-out) | Compute one absolute `batch_deadline` at handler entry, then pass it into every target request via `.deadline(batch_deadline)`. A default-clock app may call `Deadline::after(..)` once. Code using an injected application clock constructs the absolute deadline with `Deadline::at_instant(..)` from one `RequestContext::monotonic_clock().now()` sample, checked arithmetic, and the `DEADLINE_FAR_FUTURE` clamp. `Deadline` is `Copy` and absolute, so all targets share the same cap. Do **not** construct it per target or mix the process-global helper with an injected clock. |
 | Per-target request timeout | `OutboundRequest::timeout(per_target)` |
 | Effective per-request budget | computed by `dispatch_budget` — see below |
 
@@ -1655,11 +1689,11 @@ pub enum BudgetSource {
 
 /// `now` is passed in (not snapshotted internally) so a single `send_all` can use
 /// **one** `now` snapshot across every slot. Without that, sequential per-slot
-/// `MonotonicInstant::now` calls produce slightly different `duration` values for the same
+/// stored-clock calls produce slightly different `duration` values for the same
 /// shared `Deadline`, which on Fastly would produce different `budget_ms` values
 /// and therefore different dynamic-backend identities for the same host under one
-/// batch deadline. `send` (single request) just passes
-/// `MonotonicInstant::now`.
+/// batch deadline. `send` (single request) passes its outbound client's first
+/// `clock.now()` sample.
 // PRIVACY + NAME-COLLISION CONTRACT (both verified by compiling a skeleton).
 // `time.rs` is a sibling module of `outbound.rs` and cannot read `OutboundRequest`'s
 // private fields directly — earlier pseudocode did, which does not compile.
@@ -1957,7 +1991,7 @@ fn fastly_timeout_ms(budget: &DispatchBudget) -> u64 {
 // entry before preflight; `send_all` snapshots once into `batch_now` at method entry and reuses it
 // across slots so the dynamic-backend identity stays consistent for a shared
 // caller Deadline.
-let now = MonotonicInstant::now();             // single `send`; `send_all` passes batch_now
+let now = self.clock.now();                    // single `send`; `send_all` passes batch_now
 let budget = dispatch_budget(req, now)?;
 
 // Fastly 0.12.1 exposes the timeout setters on BackendBuilder, NOT on Request — see
@@ -4279,7 +4313,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   addition to the manifest's disabled default features. This makes the raw-byte boundary
   explicit even if Reqwest feature selection changes later; only the shared EdgeZero
   classifier/decoder may transform a response body.
-- `send_all` first snapshots `let batch_now = MonotonicInstant::now()` once, then runs a
+- `send_all` first snapshots `let batch_now = self.clock.now()` once, then runs a
   **preflight** per slot: call `validate_for_dispatch(&request)` first; only a request that
   passes that portable validator reaches the batch-only checks. Then any request whose `body` is
   `Body::Stream` OR whose `response_mode` is `Streamed` is converted in place to
@@ -4289,7 +4323,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   alignment is preserved by tracking the original positions while building the
   future set. It passes that entry snapshot to every per-slot
   `dispatch_budget(req, batch_now)` — see §3.3.2 / §4.3 for why a per-slot
-  `MonotonicInstant::now()` would drift the shared-deadline `duration` and (on Fastly) the
+  second clock sample would drift the shared-deadline `duration` and (on Fastly) the
   backend identity.
 - A public single `send` takes its monotonic snapshot first, calls
   `validate_for_dispatch(&req)` exactly once immediately afterward, then invokes the same
@@ -4299,7 +4333,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
      never an adapter-local formula, so `DEFAULT_NO_DEADLINE_BUDGET = 30 s` is
      applied uniformly when no deadline is set). On expiry-before-dispatch this
      returns `Err(gateway_timeout)` for the slot immediately. For a single `send`,
-     `now = MonotonicInstant::now()` is taken inline.
+     `now = self.clock.now()` is taken inline.
   2. **If the request body is `Body::Stream`, drain it to `Bytes` first.** Core
      `Body::Stream` is `LocalBoxStream` (not the `Send + 'static` stream
      `reqwest::Body::wrap_stream` requires), so Axum drains a streamed request body
@@ -6226,7 +6260,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 | --- | --- |
 | Capability metadata | All four adapters return the exact eight **outbound** cells in §3.5.2, including complete resource accounting = Unsupported everywhere, Fastly outbound HTTP = BestEffort, Cloudflare header fidelity = BestEffort, and Spin deadline/upload/flexible-phase-budget = BestEffort. Tests do not assert that the shared enum has only eight global variants; non-outbound cells belong to their own specs. A fixture adapter that relies on the trait default returns Unsupported. Because each adapter crate matches core's non-exhaustive `Capability` enum across a crate boundary, normal adapter compilation requires a wildcard; review asserts that its result is `_ => Unsupported`. A hypothetical future variant is a structural fail-closed invariant, not a value current Rust code can safely construct at runtime. |
 | Request conversion | Method/body/headers/full canonical URI survive conversion; normalized hop-by-hop fields cannot reappear; buffered and streamed request caps map to 400. Dot-segment/percent/numeric-host/IDNA cases use the exact core serialization rather than adapter reconstruction. Typed `EdgeError` request chunks survive adapter conversion; in-tree paths never route them through `from_external_stream`. |
-| Deadline anchoring | Every adapter captures one monotonic snapshot as the first operation in `send`/`send_all`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
+| Deadline anchoring and clock propagation | Every standard adapter installs its outbound client with the exact `App::monotonic_clock()` clone used by ingress; explicit low-level constructors use a documented default clock. Every adapter captures one stored-clock snapshot as the first operation in `send`/`send_all`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors or bypasses the client clock. Preflight slot elapsed, provider-error precedence, post-ready expiry, and deferred upload/response streams use that same handle. A backwards clock cannot enlarge `budget.duration`; a backwards terminal sample produces zero elapsed plus an internal invariant outcome. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
 | `send_all` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Assert every slot carries its own elapsed time from the one method-entry snapshot through that slot's terminal point; advance the injected clock during preflight to prove that time is included. A same-tick terminal result may legitimately report zero. A slow sibling's later completion must not overwrite an earlier slot's elapsed value. Valid one-slot buffered batches match single-send outcome semantics while elapsed is asserted independently. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Fastly tests dispatch-before-harvest ordering, samples elapsed immediately after each harvest/preflight/dispatch terminal result, and retains its documented serial timing caveats without claiming Native slot isolation. Backwards injected time produces zero plus an internal outcome, distinguishable from legitimate zero by outcome. |
 | Streamed fan-out usage | On Axum/Cloudflare/Spin, join per-request tasks containing both `send` and body consumption. Script a fast response whose body can finish before its deadline while a sibling's headers remain pending beyond it. Assert the fast body is consumed and succeeds before those sibling headers arrive. Joining only sends and delaying all body consumption must fail this regression. Fastly is excluded from this non-portable usage pattern. |
 | Response conversion | Every adapter enforces guest-visible header limits before normalization, then normalizes before body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
@@ -6608,11 +6642,11 @@ the durable anchors.
 
 **`crates/edgezero-adapter-{axum,cloudflare,fastly,spin}`**
 
-- Each `Cargo.toml` adds `web-time = { workspace = true }` to `[dependencies]` for
-  direct `MonotonicInstant::now()` snapshots and `test-utils = []` to `[features]`.
-  Core's existing `web-time` dependency and dev-dependency `test-utils` feature do not
-  declare either surface for an adapter. Keep the adapter test feature independent of
-  runtime/CLI features and preserve current defaults (§5.5).
+- Each adapter imports EdgeZero-owned `MonotonicClock`/`MonotonicInstant` timing types from
+  core and adds `test-utils = []` to `[features]`. Production outbound code does not take
+  direct process-global snapshots; only explicit default-clock constructors may select the
+  default source. Keep the adapter test feature independent of runtime/CLI features and
+  preserve current defaults (§5.5).
 - `tests/contract.rs` gains the native adapter-driver cases and SDK-specific test modules
   described in §5.5. `.github/workflows/test.yml` explicitly executes the native commands
   and enables `test-utils` in the existing WASM contract matrix in the same adapter phase.

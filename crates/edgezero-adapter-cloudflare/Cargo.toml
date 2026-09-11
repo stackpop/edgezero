@@ -42,7 +42,6 @@ ctor = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 toml_edit = { workspace = true, optional = true }
-web-time = { workspace = true }
 worker = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 

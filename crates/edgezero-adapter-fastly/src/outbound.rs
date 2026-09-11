@@ -262,7 +262,7 @@ mod fastly_impl {
             request: &OutboundRequest,
             budget: DispatchBudget,
         ) -> Result<Backend, EdgeError> {
-            let identity = backend_identity(request, budget, &self.clock)?;
+            let identity = backend_identity(request, budget)?;
             let name = backend_name(&identity);
             {
                 let cache = self.backends.lock().map_err(|_poisoned| {
@@ -548,10 +548,8 @@ mod fastly_impl {
     fn backend_identity(
         request: &OutboundRequest,
         budget: DispatchBudget,
-        clock: &MonotonicClock,
     ) -> Result<BackendIdentity, EdgeError> {
-        let remaining = budget_remaining(budget, clock)?;
-        let budget_ms = ceil_millis(remaining);
+        let budget_ms = ceil_millis(budget.duration);
         let scheme = request
             .uri()
             .scheme_str()
@@ -1240,18 +1238,14 @@ mod fastly_impl {
         }
 
         #[test]
-        fn backend_preparation_consumes_budget_in_the_injected_clock_domain() {
+        fn backend_identity_uses_the_method_entry_budget_snapshot() {
             let start = MonotonicInstant::now();
             let budget = clock_budget(start, Duration::from_millis(10));
-            let observed = start
-                .checked_add(Duration::from_millis(3))
-                .expect("observed instant");
-            let clock = scripted_clock(vec![observed]);
             let request = OutboundRequest::get("https://example.com/").expect("request");
 
-            let identity = backend_identity(&request, budget, &clock).expect("backend identity");
+            let identity = backend_identity(&request, budget).expect("backend identity");
 
-            assert_eq!(identity.budget_ms, 7);
+            assert_eq!(identity.budget_ms, 10);
         }
 
         #[test]

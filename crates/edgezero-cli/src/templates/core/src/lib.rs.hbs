@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use edgezero_core::app::App as EdgeZeroApp;
 use edgezero_core::http::StatusCode;
-use edgezero_core::{
-    AdmissionDecision, BufferedIngressResponse, IngressGrant, RouteResolution,
-};
+use edgezero_core::{AdmissionDecision, BufferedIngressResponse, IngressGrant, RouteResolution};
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
 const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;

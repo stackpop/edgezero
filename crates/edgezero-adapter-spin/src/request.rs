@@ -23,7 +23,9 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 #[cfg(feature = "test-utils")]
-use edgezero_core::http::{Method, Uri, request_builder};
+use edgezero_core::http::Uri;
+#[cfg(any(test, feature = "test-utils"))]
+use edgezero_core::http::{Method, request_builder};
 use edgezero_core::http::{Request, RequestParts};
 use edgezero_core::ingress::{
     IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
@@ -35,7 +37,7 @@ use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 use futures::executor::block_on;
 #[cfg(feature = "test-utils")]
 use futures_util::stream::poll_fn;
@@ -205,14 +207,11 @@ where
     SourceError: Into<anyhow::Error> + 'static,
 {
     let request_start = app.monotonic_now();
-    let mut core_request = request_builder()
+    let core_request = request_builder()
         .method(method)
         .uri(uri)
         .body(Body::empty())
         .map_err(EdgeError::internal)?;
-    core_request
-        .extensions_mut()
-        .insert(outbound_client(app.monotonic_clock()));
     dispatch_ingress_stream(
         app,
         core_request,
@@ -221,6 +220,20 @@ where
         move || source,
     )
     .await
+}
+
+/// Dispatches a native Spin request through the production outer request seam.
+///
+/// # Errors
+/// Returns the same request-conversion, routing, or response-conversion error as standard dispatch.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_request_for_test(
+    app: &App,
+    req: SpinRequest,
+) -> anyhow::Result<SpinFullResponse> {
+    dispatch_with_handles(app, req, Stores::default(), app.monotonic_now()).await
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
@@ -311,6 +324,9 @@ where
     SourceError: Into<anyhow::Error> + 'static,
     MakeSource: FnOnce() -> Source,
 {
+    head_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
     let head_parts = IngressHeadParts::from_request(
         &head_request,
         IngressHeadAccounting::HostManaged,
