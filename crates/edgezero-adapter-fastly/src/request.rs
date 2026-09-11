@@ -11,8 +11,8 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request, request_builder};
-#[cfg(feature = "test-utils")]
-use edgezero_core::http::{Method, Response, Uri};
+#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
+use edgezero_core::http::{Method, Uri};
 use edgezero_core::ingress::{
     IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
 };
@@ -326,6 +326,22 @@ where
     let mut head_request = into_core_request_head(&req, app.monotonic_clock())
         .map_err(|error| map_edge_error(&error))?;
     head_request.extensions_mut().extend(scratch);
+    dispatch_ingress_reader(app, head_request, stores, request_start, move || {
+        req.take_body()
+    })
+}
+
+fn dispatch_ingress_reader<Source, MakeSource>(
+    app: &App,
+    mut head_request: Request,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    make_source: MakeSource,
+) -> Result<FastlyResponse, FastlyError>
+where
+    Source: Read + 'static,
+    MakeSource: FnOnce() -> Source,
+{
     let head_parts = IngressHeadParts::from_request(
         &head_request,
         IngressHeadAccounting::HostManaged,
@@ -344,9 +360,11 @@ where
         }
         _ => return Err(FastlyError::msg("unsupported ingress admission outcome")),
     };
-    let read_lifetime = (prepared.read_deadline(), prepared.monotonic_clock());
-    let core_request = attach_core_body(&mut req, head_request, Some(read_lifetime));
-    dispatch_core_request(app, core_request, stores, prepared)
+    *head_request.body_mut() = fastly_deadline_body(
+        make_source(),
+        Some((prepared.read_deadline(), prepared.monotonic_clock())),
+    );
+    dispatch_core_request(app, head_request, stores, prepared)
 }
 
 /// Dispatch with per-id store registries built from baked metadata — the same
@@ -628,7 +646,7 @@ where
 }
 
 /// Dispatches an observable reader through the production ingress body wrapper.
-#[cfg(feature = "test-utils")]
+#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
 #[doc(hidden)]
 #[inline]
 pub fn dispatch_ingress_reader_for_test<Source>(
@@ -636,7 +654,7 @@ pub fn dispatch_ingress_reader_for_test<Source>(
     method: Method,
     uri: Uri,
     source: Source,
-) -> Result<Response, EdgeError>
+) -> Result<FastlyResponse, FastlyError>
 where
     Source: Read + 'static,
 {
@@ -645,27 +663,17 @@ where
         .method(method)
         .uri(uri)
         .body(Body::empty())
-        .map_err(EdgeError::internal)?;
-    let head_parts = IngressHeadParts::from_request(
-        &core_request,
-        IngressHeadAccounting::HostManaged,
-        IngressFraming::HostManaged,
-    );
-    head_parts.validate_normalized(app.ingress_head_limits())?;
-    let prepared = match app.begin_ingress(head_parts, request_start)? {
-        IngressBeginOutcome::Admitted(prepared) => prepared,
-        IngressBeginOutcome::Refused(response) => return Ok(response.into_response()),
-        _ => {
-            return Err(EdgeError::internal(anyhow::anyhow!(
-                "unsupported ingress admission outcome"
-            )));
-        }
-    };
-    *core_request.body_mut() = fastly_deadline_body(
-        source,
-        Some((prepared.read_deadline(), prepared.monotonic_clock())),
-    );
-    Ok(executor::block_on(app.dispatch_admitted(prepared, core_request))?.into_response())
+        .map_err(|error| map_edge_error(&EdgeError::internal(error)))?;
+    core_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
+    dispatch_ingress_reader(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        move || source,
+    )
 }
 
 fn map_edge_error(err: &EdgeError) -> FastlyError {
@@ -801,6 +809,8 @@ mod synthesis_tests {
 
     #[test]
     fn standard_service_installs_the_exact_application_outbound_clock() {
+        use edgezero_core::http::Method;
+
         async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
             let client = ctx
                 .http_client()

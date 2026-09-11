@@ -16,8 +16,6 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-#[cfg(feature = "test-utils")]
-use edgezero_core::http::Response;
 use edgezero_core::http::{Method as CoreMethod, Request, Uri, request_builder};
 use edgezero_core::ingress::{
     IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
@@ -322,22 +320,11 @@ fn outbound_client(clock: MonotonicClock) -> HttpClient {
 }
 
 fn attach_core_body(
-    mut req: CfRequest,
+    req: CfRequest,
     mut request: Request,
     read_lifetime: Option<(Deadline, MonotonicClock)>,
 ) -> Result<Request, EdgeError> {
-    let stream: LocalBoxStream<'static, Result<bytes::Bytes, WorkerError>> =
-        if req.inner().body().is_some() {
-            req.stream()
-                .map_err(EdgeError::internal)?
-                .map_ok(bytes::Bytes::from)
-                .boxed_local()
-        } else {
-            // The Workers test runtime and some host-created requests expose
-            // an ArrayBuffer but no ReadableStream. Defer that fallback read
-            // until the core body is first polled so admission still runs first.
-            once(async move { req.bytes().await.map(bytes::Bytes::from) }).boxed_local()
-        };
+    let stream = cloudflare_body_stream(req)?;
     *request.body_mut() = match read_lifetime {
         Some((deadline, monotonic_clock)) => {
             cloudflare_deadline_body(stream, deadline, monotonic_clock)
@@ -345,6 +332,23 @@ fn attach_core_body(
         None => Body::from_external_stream(stream),
     };
     Ok(request)
+}
+
+fn cloudflare_body_stream(
+    mut req: CfRequest,
+) -> Result<LocalBoxStream<'static, Result<bytes::Bytes, WorkerError>>, EdgeError> {
+    if req.inner().body().is_some() {
+        return Ok(req
+            .stream()
+            .map_err(EdgeError::internal)?
+            .map_ok(bytes::Bytes::from)
+            .boxed_local());
+    }
+
+    // The Workers test runtime and some host-created requests expose an
+    // ArrayBuffer but no ReadableStream. Keep the fallback read lazy so
+    // admission still runs before the first body byte is requested.
+    Ok(once(async move { req.bytes().await.map(bytes::Bytes::from) }).boxed_local())
 }
 
 fn cloudflare_deadline_body<Source, SourceError>(
@@ -449,7 +453,7 @@ pub async fn dispatch_ingress_stream_for_test<Source, SourceError>(
     method: CoreMethod,
     uri: Uri,
     source: Source,
-) -> Result<Response, EdgeError>
+) -> Result<CfResponse, WorkerError>
 where
     Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
@@ -459,28 +463,18 @@ where
         .method(method)
         .uri(uri)
         .body(Body::empty())
-        .map_err(EdgeError::internal)?;
-    let head_parts = IngressHeadParts::from_request(
-        &core_request,
-        IngressHeadAccounting::HostManaged,
-        IngressFraming::HostManaged,
-    );
-    head_parts.validate_normalized(app.ingress_head_limits())?;
-    let prepared = match app.begin_ingress(head_parts, request_start)? {
-        IngressBeginOutcome::Admitted(prepared) => prepared,
-        IngressBeginOutcome::Refused(response) => return Ok(response.into_response()),
-        _ => {
-            return Err(EdgeError::internal(anyhow::anyhow!(
-                "unsupported ingress admission outcome"
-            )));
-        }
-    };
-    *core_request.body_mut() =
-        cloudflare_deadline_body(source, prepared.read_deadline(), prepared.monotonic_clock());
-    Ok(app
-        .dispatch_admitted(prepared, core_request)
-        .await?
-        .into_response())
+        .map_err(|error| edge_error_to_worker(&EdgeError::internal(error)))?;
+    core_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
+    dispatch_ingress_stream(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        move || Ok(source),
+    )
+    .await
 }
 
 pub(crate) async fn dispatch_with_handles(
@@ -493,6 +487,24 @@ pub(crate) async fn dispatch_with_handles(
 ) -> Result<CfResponse, WorkerError> {
     let head_request = into_core_request_head(&req, env, ctx, app.monotonic_clock())
         .map_err(|error| edge_error_to_worker(&error))?;
+    dispatch_ingress_stream(app, head_request, stores, request_start, move || {
+        cloudflare_body_stream(req)
+    })
+    .await
+}
+
+async fn dispatch_ingress_stream<Source, SourceError, MakeSource>(
+    app: &App,
+    mut head_request: Request,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    make_source: MakeSource,
+) -> Result<CfResponse, WorkerError>
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
+{
     let head_parts = IngressHeadParts::from_request(
         &head_request,
         IngressHeadAccounting::HostManaged,
@@ -515,10 +527,10 @@ pub(crate) async fn dispatch_with_handles(
             ));
         }
     };
-    let read_lifetime = (prepared.read_deadline(), prepared.monotonic_clock());
-    let core_request = attach_core_body(req, head_request, Some(read_lifetime))
-        .map_err(|error| edge_error_to_worker(&error))?;
-    dispatch_core_request(app, core_request, stores, prepared).await
+    let source = make_source().map_err(|error| edge_error_to_worker(&error))?;
+    *head_request.body_mut() =
+        cloudflare_deadline_body(source, prepared.read_deadline(), prepared.monotonic_clock());
+    dispatch_core_request(app, head_request, stores, prepared).await
 }
 
 /// Dispatch with per-id store registries built from baked metadata.
