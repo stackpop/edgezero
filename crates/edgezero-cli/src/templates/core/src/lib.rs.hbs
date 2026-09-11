@@ -4,7 +4,10 @@ mod handlers;
 use std::time::Duration;
 
 use edgezero_core::app::App as EdgeZeroApp;
-use edgezero_core::{AdmissionDecision, IngressGrant, RouteResolution};
+use edgezero_core::http::StatusCode;
+use edgezero_core::{
+    AdmissionDecision, BufferedIngressResponse, IngressGrant, RouteResolution,
+};
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
 const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
@@ -33,8 +36,17 @@ fn configure_app(app: &mut EdgeZeroApp) {
         }
         RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
             AdmissionDecision::ReadBodyBeforeFallback {
+                grant: IngressGrant::new(AdmissionLease { route_class: None }),
                 max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
                 read_deadline: head.read_deadline_after(FALLBACK_INGRESS_READ_BUDGET),
+                on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+                on_timeout: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),
             }
         }
     });

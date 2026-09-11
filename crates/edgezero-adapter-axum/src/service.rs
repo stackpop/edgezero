@@ -339,13 +339,16 @@ mod tests {
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{StatusCode, response_builder};
-    use edgezero_core::ingress::{AdmissionDecision, IngressGrant};
+    use edgezero_core::http::{
+        HeaderMap, HeaderValue, Response as CoreResponse, StatusCode, response_builder,
+    };
+    use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
     use edgezero_core::key_value_store::KvStore;
+    use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::response_egress::{ResponseEgressObserver, ResponseEgressReport};
     use edgezero_core::router::{RouteMetadata, RouteResolution};
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
-    use futures_util::stream::{iter, poll_fn};
+    use futures_util::stream::poll_fn;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -355,12 +358,34 @@ mod tests {
 
     struct FixedConfigStore(String);
 
+    struct CountingMiddleware(Arc<AtomicUsize>);
+
+    struct DropSignal(Arc<AtomicUsize>);
+
     #[derive(Clone)]
     struct RecordingEgressObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
 
     impl ResponseEgressObserver for RecordingEgressObserver {
         fn complete(&self, report: &ResponseEgressReport) {
             self.0.lock().expect("reports lock").push(report.clone());
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Middleware for CountingMiddleware {
+        async fn handle(
+            &self,
+            ctx: RequestContext,
+            next: Next<'_>,
+        ) -> Result<CoreResponse, EdgeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            next.run(ctx).await
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -438,30 +463,80 @@ mod tests {
         assert_eq!(body_polls.load(Ordering::SeqCst), 0);
     }
 
-    fn fallback_body_app(max_body_bytes: usize) -> App {
+    fn guarded_fallback_app() -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let handler_call_count = Arc::new(AtomicUsize::new(0));
+        let observed_handler_calls = Arc::clone(&handler_call_count);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
         let router = RouterService::builder()
-            .get("/known", |_ctx: RequestContext| async move {
-                Ok::<_, EdgeError>("handler must not run")
+            .get("/known", move |_ctx: RequestContext| {
+                let request_handler_calls = Arc::clone(&observed_handler_calls);
+                async move {
+                    request_handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("handler must not run")
+                }
             })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
             .build();
-        let mut app = App::new(router);
+        (App::new(router), handler_call_count, middleware_calls)
+    }
+
+    fn fallback_body_app(
+        max_body_bytes: usize,
+        read_budget: Duration,
+        grant_drop_count: &Arc<AtomicUsize>,
+    ) -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let observed_grant_drops = Arc::clone(grant_drop_count);
         app.set_ingress_admission_policy(move |head| match head.route_resolution() {
             RouteResolution::Matched(_) => AdmissionDecision::Admit {
                 grant: IngressGrant::empty(),
-                read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+                read_deadline: head.read_deadline_after(read_budget),
             },
             RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
                 AdmissionDecision::ReadBodyBeforeFallback {
+                    grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
                     max_body_bytes,
-                    read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+                    read_deadline: head.read_deadline_after(read_budget),
+                    on_exceeded: buffered_terminal_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "exceeded",
+                        b"configured overflow\0response",
+                    ),
+                    on_timeout: buffered_terminal_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timeout",
+                        b"configured timeout\0response",
+                    ),
                 }
             }
         });
-        app
+        (app, handler_calls, middleware_calls)
     }
 
-    fn lengthless_request(path: &str, chunks: Vec<Bytes>) -> Request<AxumBody> {
-        let stream = iter(chunks.into_iter().map(Ok::<Bytes, io::Error>));
+    fn buffered_terminal_response(
+        status: StatusCode,
+        marker: &'static str,
+        body: &'static [u8],
+    ) -> BufferedIngressResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fallback-terminal", HeaderValue::from_static(marker));
+        BufferedIngressResponse::new(status, headers, Bytes::from_static(body))
+    }
+
+    fn tracked_lengthless_request(
+        path: &str,
+        body_chunks: Vec<Bytes>,
+        grant_drops: &Arc<AtomicUsize>,
+        source_drops: &Arc<AtomicUsize>,
+    ) -> Request<AxumBody> {
+        let observed_grant_drops = Arc::clone(grant_drops);
+        let source_drop = DropSignal(Arc::clone(source_drops));
+        let mut pending_chunks = body_chunks.into_iter();
+        let stream = poll_fn(move |_cx| {
+            let _keep_source_alive = &source_drop;
+            assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
+            Poll::Ready(pending_chunks.next().map(Ok::<Bytes, io::Error>))
+        });
         let request = Request::builder()
             .method("POST")
             .uri(path)
@@ -471,19 +546,50 @@ mod tests {
         request
     }
 
+    fn assert_no_fallback_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn assert_terminal_response(
+        response: Response<AxumBody>,
+        status: StatusCode,
+        marker: &str,
+        body: &[u8],
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-fallback-terminal")
+                .expect("terminal response marker"),
+            marker
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body"),
+            body
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_fallback_preserves_404_and_405_at_exact_cap() {
-        let service = EdgeZeroAxumService::from_app(fallback_body_app(4));
         for (path, expected) in [
             ("/missing", StatusCode::NOT_FOUND),
             ("/known", StatusCode::METHOD_NOT_ALLOWED),
         ] {
-            let request = lengthless_request(
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                fallback_body_app(4, Duration::from_secs(1), &grant_drops);
+            let request = tracked_lengthless_request(
                 path,
                 vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
+                &grant_drops,
+                &source_drops,
             );
-            let response = service
-                .clone()
+            let response = EdgeZeroAxumService::from_app(app)
                 .ready()
                 .await
                 .expect("ready")
@@ -491,44 +597,61 @@ mod tests {
                 .await
                 .expect("response");
             assert_eq!(response.status(), expected);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_fallback_overflow_precedes_404_and_405() {
-        let service = EdgeZeroAxumService::from_app(fallback_body_app(4));
         for path in ["/missing", "/known"] {
-            let request = lengthless_request(
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                fallback_body_app(4, Duration::from_secs(1), &grant_drops);
+            let request = tracked_lengthless_request(
                 path,
                 vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"e")],
+                &grant_drops,
+                &source_drops,
             );
-            let response = service
-                .clone()
+            let response = EdgeZeroAxumService::from_app(app)
                 .ready()
                 .await
                 .expect("ready")
                 .call(request)
                 .await
                 .expect("response");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_terminal_response(
+                response,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "exceeded",
+                b"configured overflow\0response",
+            )
+            .await;
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_fallback_deadline_interrupts_pending_native_body() {
-        let start = MonotonicInstant::now();
         let body_polls = Arc::new(AtomicUsize::new(0));
         let observed_polls = Arc::clone(&body_polls);
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let observed_grant_drops = Arc::clone(&grant_drops);
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let source_drop = DropSignal(Arc::clone(&source_drops));
         let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            let _keep_source_alive = &source_drop;
+            assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
             observed_polls.fetch_add(1, Ordering::SeqCst);
             Poll::<Option<Result<Bytes, io::Error>>>::Pending
         }));
-        let mut app = App::new(RouterService::builder().build());
-        app.set_monotonic_clock(MonotonicClock::new(move || start));
-        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
-            max_body_bytes: 4_096,
-            read_deadline: head.read_deadline_after(Duration::from_millis(10)),
-        });
+        let (app, handler_calls, middleware_calls) =
+            fallback_body_app(4_096, Duration::from_millis(10), &grant_drops);
         let mut service = EdgeZeroAxumService::from_app(app);
         let request = Request::builder()
             .method("POST")
@@ -543,11 +666,64 @@ mod tests {
         .await
         .expect("fallback deadline must wake the pending body");
 
-        assert_eq!(
-            response.expect("response").status(),
-            StatusCode::REQUEST_TIMEOUT
-        );
+        assert_terminal_response(
+            response.expect("response"),
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            b"configured timeout\0response",
+        )
+        .await;
         assert!(body_polls.load(Ordering::SeqCst) > 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_refusal_returns_503_without_polling_native_body() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let source_drop = DropSignal(Arc::clone(&source_drops));
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            let _keep_source_alive = &source_drop;
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        app.set_ingress_admission_policy(|head| {
+            assert!(matches!(head.route_resolution(), RouteResolution::NotFound));
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::from("fallback unavailable\n"))
+                    .expect("refusal response"),
+            )
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/missing")
+            .body(native_body)
+            .expect("request");
+
+        let response = EdgeZeroAxumService::from_app(app)
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body"),
+            b"fallback unavailable\n".as_slice()
+        );
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
