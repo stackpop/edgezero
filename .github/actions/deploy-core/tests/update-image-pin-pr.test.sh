@@ -767,10 +767,10 @@ else
   cat "$LOG_ROOT/environment-leaks" >&2
   no 'ordinary execution exports no credential alias and disables lazy Git fetching'
 fi
-if tr '\0' '\n' <"$LOG_ROOT/git.argv" | rg -q -- "--force-with-lease=refs/heads/edgezero-build-container-pin/$S:" &&
-  tr '\0' '\n' <"$LOG_ROOT/git.argv" | rg -q -x -- '--porcelain' &&
-  tr '\0' '\n' <"$LOG_ROOT/git.argv" | rg -q -x -- '--no-verify' &&
-  ! tr '\0' '\n' <"$LOG_ROOT/git.argv" | rg -Fq "$TOKEN"; then
+if tr '\0' '\n' <"$LOG_ROOT/git.argv" | grep -q -- "--force-with-lease=refs/heads/edgezero-build-container-pin/$S:" &&
+  tr '\0' '\n' <"$LOG_ROOT/git.argv" | grep -qx -- '--porcelain' &&
+  tr '\0' '\n' <"$LOG_ROOT/git.argv" | grep -qx -- '--no-verify' &&
+  ! tr '\0' '\n' <"$LOG_ROOT/git.argv" | grep -Fq "$TOKEN"; then
   ok 'creation uses the empty exact lease, porcelain/no-verify, and no token argv'
 else
   no 'creation uses the empty exact lease, porcelain/no-verify, and no token argv'
@@ -780,7 +780,7 @@ if [[ $(sort -u "$LOG_ROOT/git-auth") == $'0\t700' ]]; then
 else
   no 'every remote Git command disables prompts and uses only the mode-0700 askpass helper'
 fi
-if ! tr '\0' '\n' <"$LOG_ROOT/git.argv" | rg -q -F "refs/heads/edgezero-build-container-pin/$S:refs/remotes/origin/pin-target"; then
+if ! tr '\0' '\n' <"$LOG_ROOT/git.argv" | grep -q -F "refs/heads/edgezero-build-container-pin/$S:refs/remotes/origin/pin-target"; then
   ok 'an absent target branch omits the conditional target fetch'
 else
   no 'an absent target branch omits the conditional target fetch'
@@ -845,7 +845,7 @@ if [[ $(jq -r .state "$API_ROOT/pull-41.json") == open ]]; then
 else
   no 'closed-unmerged reconciliation leaves the PR open'
 fi
-if tr '\0' '\n' <"$LOG_ROOT/git.argv" | rg -q -F \
+if tr '\0' '\n' <"$LOG_ROOT/git.argv" | grep -q -F \
   "refs/heads/edgezero-build-container-pin/$S:refs/remotes/origin/pin-target"; then
   ok 'an existing target fetch records and verifies its exact remote OID'
 else
@@ -887,7 +887,7 @@ if [[ $(<"$LOG_ROOT/curl-5/method") == PATCH && $(<"$LOG_ROOT/curl-5/body") == '
 else
   no 'close uses the exact JSON body'
 fi
-if tr '\0' '\n' <"$LOG_ROOT/git.argv" | rg -q -- \
+if tr '\0' '\n' <"$LOG_ROOT/git.argv" | grep -q -- \
   "--force-with-lease=refs/heads/edgezero-build-container-pin/$S:$old_recorded"; then
   ok 'an existing target update uses its exact recorded OID lease'
 else
@@ -1172,7 +1172,7 @@ new_case "$G"
 unsafe_token='unsafe"token'
 assert_status 1 'a token that cannot be encoded in curl config is rejected before REST access' run_updater "$unsafe_token"
 assert_no_network 'unsafe token bytes never reach curl'
-if ! rg -Fq "$unsafe_token" "$CASE_ROOT/stdout" "$CASE_ROOT/stderr"; then ok 'unsafe token diagnostics are redacted'; else no 'unsafe token diagnostics are redacted'; fi
+if ! grep -Fq "$unsafe_token" "$CASE_ROOT/stdout" "$CASE_ROOT/stderr"; then ok 'unsafe token diagnostics are redacted'; else no 'unsafe token diagnostics are redacted'; fi
 
 new_case "$G"
 create_pin_branch "$S" "$DIGEST"
@@ -1210,8 +1210,8 @@ new_case "$G"
 status=$(env -i PATH="$FAKE_BIN:$PATH" LC_ALL=C bash "$GATE_ROOT/.github/docker/build-app-cli/update-image-pin-pr.sh" --unknown value >"$CASE_ROOT/stdout" 2>"$CASE_ROOT/stderr"; printf '%s' "$?") || true
 if [[ "$status" == 2 && ! -f "$LOG_ROOT/curl-count" ]]; then ok 'strict CLI errors take precedence over missing credentials'; else no 'strict CLI errors take precedence over missing credentials'; fi
 
-token_read_match=$(rg -n -m1 -F '${EDGEZERO_BUILD_CONTAINER_APP_TOKEN:-}' "$SOURCE_UPDATER" || true)
-approval_compare_match=$(rg -n -m1 -F 'cmp -s "$EVIDENCE_OUTPUT" "$APPROVAL_JSON"' "$SOURCE_UPDATER" || true)
+token_read_match=$(grep -n -m1 -F '${EDGEZERO_BUILD_CONTAINER_APP_TOKEN:-}' "$SOURCE_UPDATER" || true)
+approval_compare_match=$(grep -n -m1 -F 'cmp -s "$EVIDENCE_OUTPUT" "$APPROVAL_JSON"' "$SOURCE_UPDATER" || true)
 token_read_line=${token_read_match%%:*}
 approval_compare_line=${approval_compare_match%%:*}
 if [[ "$token_read_line" =~ ^[1-9][0-9]*$ && "$approval_compare_line" =~ ^[1-9][0-9]*$ &&

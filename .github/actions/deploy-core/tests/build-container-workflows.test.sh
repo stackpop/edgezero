@@ -188,7 +188,7 @@ validate() {
     def stable($name; $kind):
       .jobs[$name] as $job |
       $job["runs-on"] == "ubuntu-24.04" and
-      $job.if == "${{ github.event_name != '\''workflow_dispatch'\'' }}" and
+      $job.if == "${{ github.event_name != '\''workflow_dispatch'\'' && vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA != '\'''\'' }}" and
       ($job | has("environment") | not) and
       ($job | has("permissions") | not) and
       $job.env == {BASH_ENV:"", ENV:""} and
@@ -265,7 +265,7 @@ validate() {
     ($w | stable("build-container-local"; "local")) and
     ($w | stable("build-container-pin"; "pin")) and
     ($w.jobs["build-container-release-preflight"] as $preflight |
-      $preflight.if == "${{ github.event_name == '\''workflow_dispatch'\'' }}" and
+      $preflight.if == "${{ github.event_name == '\''workflow_dispatch'\'' && vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA != '\'''\'' }}" and
       $preflight["runs-on"] == "ubuntu-24.04" and
       $preflight.environment == {name:"build-container-release",deployment:false} and
       $preflight.env == {BASH_ENV:"",ENV:""} and
@@ -309,6 +309,7 @@ for mutation in \
   '.on.pull_request.paths = [".github/**"]' \
   '.permissions.contents = "write"' \
   '.jobs.build-container-local.runs-on = "ubuntu-latest"' \
+  '.jobs.build-container-local.if = "${{ github.event_name != '\''workflow_dispatch'\'' }}"' \
   '.jobs.build-container-local.steps[0].if = "${{ success() }}"' \
   '.jobs.build-container-local.steps[0].env.EDGEZERO_RUNNER_OS = "Linux"' \
   '.jobs.build-container-local.steps[1].uses = "actions/checkout@v7"' \
@@ -323,6 +324,7 @@ for mutation in \
   '.jobs.build-container-pin.steps[6].env.EDGEZERO_WORKFLOW_SHA = "${{ github.sha }}"' \
   '.jobs.build-container-pin.steps[9].run |= sub(".edgezero-gate"; ".edgezero-subject")' \
   '.jobs.build-container-release-preflight.permissions.contents = "write"' \
+  '.jobs.build-container-release-preflight.if = "${{ github.event_name == '\''workflow_dispatch'\'' }}"' \
   '.jobs.build-container-release-preflight.steps[2].env.EDGEZERO_WORKFLOW_REF = "${{ github.ref }}"' \
   'del(.jobs.build-container-release-preflight.steps[] | select(.name == "assert-exact-g-dispatch-context"))'; do
   reject_mutation "$mutation"

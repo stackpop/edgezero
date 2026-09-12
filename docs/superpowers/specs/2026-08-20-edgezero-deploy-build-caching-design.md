@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions - Build Caching Spec
 
-**Status:** Design (proposed) - v6.40
+**Status:** Design (proposed) - v6.41
 
 **Related:** `docs/superpowers/specs/edgezero-deploy-github-action.md`,
 `docs/superpowers/plans/edgezero-deploy-action-implementation-plan.md`,
@@ -1760,13 +1760,28 @@ Publication order is:
    Merge `R` through the queue, run the final documentation build/pin scan on protected main, and
    record `R`; no action release or action revision changes at this step.
 
-Gate baseline `G` contains `.github/workflows/build-container-ci.yml`. The active organization ruleset
+Gate baseline `G` contains `.github/workflows/build-container-ci.yml`. Before the one-time bootstrap
+records `G`, repository variable `EDGEZERO_BUILD_CONTAINER_GATE_SHA` is absent. In that state the two
+stable jobs use exact job-level guard
+`${{ github.event_name != 'workflow_dispatch' && vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA != '' }}` and
+the release preflight uses exact job-level guard
+`${{ github.event_name == 'workflow_dispatch' && vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA != '' }}`.
+The jobs therefore materialize as skipped and cannot fail by attempting an empty-ref checkout while
+the gate-only PR is reviewed and merged. A skipped bootstrap job is not evidence for `G` and the
+organization required-workflow rule is not activated until after `G` is recorded. Any nonempty value,
+including a malformed or stale value, causes the event-appropriate jobs to run and fail closed through
+their first-step full-SHA, workflow-identity, and runner assertions. Structural tests freeze both exact
+guards and reject omission or weakening. After the variable is set to `G`, no supported active state
+permits those jobs to skip on their applicable event.
+
+The active organization ruleset
 uses its exact repository id, path, and SHA `G`; it uses neither a branch nor a candidate-controlled
 ref. A repository PR cannot substitute its own workflow or helper implementation. The workflow
 supports `pull_request`, `merge_group`, protected-default-branch `push`, and a manual
 `workflow_dispatch` credential-smoke mode, with no workflow-level path filter. It exposes two stable
-required job names on every candidate and grants only workflow-level `contents:read`, `actions:read`,
-and `pull-requests:read`; neither job references an environment or mutation credential:
+required job names on every candidate after gate activation and grants only workflow-level
+`contents:read`, `actions:read`, and `pull-requests:read`; neither job references an environment or
+mutation credential:
 
 - `build-container-local` computes the documented image-input path set. It builds and smokes the local
   image when relevant and otherwise runs an explicit successful not-applicable step.
@@ -3030,6 +3045,11 @@ Caching remains off by default. Container execution and provenance validation ar
   references in every candidate. It also makes exact-validator evolution explicit: protected workflow,
   image-context, and hard-coded toolchain changes use a bounded preparatory gate followed by a second
   fully evidenced rotation that removes temporary dual acceptance.
+- **v6.41:** defines the pre-`G` workflow bootstrap state. Event-appropriate jobs run only when the
+  repository-owned active-gate variable is nonempty, so the gate-only PR can land before that variable
+  has a valid value. Skipped bootstrap jobs are explicitly not trust evidence; any nonempty value runs
+  the existing fail-closed identity and full-SHA assertions, and exact structural tests prevent the
+  guard from being weakened after activation.
 
 ## 13. Deferred implementation mechanics
 

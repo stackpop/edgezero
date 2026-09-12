@@ -437,7 +437,7 @@ fi
 reset_case
 invoke_with_hostile_shell_options
 assert_status "inherited xtrace and allexport do not change success" 0
-if ! rg -F -q "$TOKEN_VALUE" "$WORK/stdout" "$WORK/stderr" &&
+if ! grep -F -q "$TOKEN_VALUE" "$WORK/stdout" "$WORK/stderr" &&
   [[ ! -e "$FAKE_BIN/credential-env-leak" ]]; then
   ok "inherited xtrace and allexport cannot expose the token"
 else
@@ -943,7 +943,7 @@ assert_status "a protocol comment for a different run is rejected" 1
 reset_case
 : >"$FAKE_BIN/run.transport-failure"
 invoke_default
-if ! rg -F -q -e "$TOKEN_VALUE" -e secret-response-body -e "$IMAGE_CONTENT" \
+if ! grep -F -q -e "$TOKEN_VALUE" -e secret-response-body -e "$IMAGE_CONTENT" \
   -e "$EVIDENCE_CONTENT" "$WORK/stdout" "$WORK/stderr"; then
   ok "curl errors, response bodies, records, and tokens are redacted"
 else
@@ -953,7 +953,7 @@ fi
 reset_case
 invoke_default
 if [[ -f "$FAKE_BIN/args-1" ]] &&
-  ! rg -q '^POST$|^PATCH$|^PUT$|^DELETE$|--data|--upload-file' "$FAKE_BIN"/args-*; then
+  ! grep -Eq '^POST$|^PATCH$|^PUT$|^DELETE$|--data|--upload-file' "$FAKE_BIN"/args-*; then
   ok "the verifier performs no mutation requests"
 else
   no "the verifier performs no mutation requests"

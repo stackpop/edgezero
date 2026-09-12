@@ -654,7 +654,7 @@ for endpoint in run approvals main; do
   : >"$FAKE_BIN/$endpoint.transport-failure"
   invoke_waiting
   assert_status 1 "waiting fails closed on $endpoint transport failure"
-  if ! rg -q "$TOKEN_VALUE|secret-response-body" "$WORK/stderr"; then
+  if ! grep -Eq "$TOKEN_VALUE|secret-response-body" "$WORK/stderr"; then
     ok "waiting redacts $endpoint transport diagnostics"
   else
     no "waiting redacts $endpoint transport diagnostics"
@@ -1095,7 +1095,7 @@ $API_BASE/git/ref/heads/main
 $HISTORY_URL
 $API_BASE/actions/runs/$RUN_ID"
 assert_eq "$expected_publisher" "$publisher_urls" 'publisher uses the exact ordered read-only route allowlist'
-if rg -q '^GET$' "$FAKE_BIN"/args-* && ! rg -q '^POST$|^PATCH$|^PUT$|^DELETE$' "$FAKE_BIN"/args-*; then
+if grep -q '^GET$' "$FAKE_BIN"/args-* && ! grep -Eq '^POST$|^PATCH$|^PUT$|^DELETE$' "$FAKE_BIN"/args-*; then
   ok 'both modes issue explicit GET requests only'
 else
   no 'both modes issue explicit GET requests only'

@@ -83,6 +83,8 @@ clone_pair() {
   OUTPUT="$WORK/$name-output"
   make_repo "$GATE"
   git clone -q --no-hardlinks "$GATE" "$SOURCE"
+  git -C "$SOURCE" config user.email test@example.com
+  git -C "$SOURCE" config user.name Test
   printf 'ordinary source change\n' >"$SOURCE/app.txt"
   git -C "$SOURCE" add app.txt
   git -C "$SOURCE" commit -qm source

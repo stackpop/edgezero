@@ -17,7 +17,7 @@ contains the unchanged `{D, S, protocol}` record and prepublication adoption doc
 placeholder. After `P` qualifies, immutable stable release `V` is published at `P`; documentation
 revision `R` replaces the placeholders, and consumers pin `V`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.40.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.41.
 
 **Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
 `shellcheck`, and `zizmor`.
@@ -212,7 +212,7 @@ Modify:
 ## 4. Task 0: Enforce exact-version external references repository-wide
 
 The current pin gate permits major/minor tags, prereleases, and commit SHAs. That is broader than
-v6.40 and must be narrowed before adding the write-privileged publisher.
+v6.41 and must be narrowed before adding the write-privileged publisher.
 
 **Files:**
 
@@ -891,7 +891,10 @@ scripts/run-actionlint.sh
       protected-main push assertions for event, ref, `event.after`, current head `Q`, workflow SHA,
       active gate SHA, and both latest-attempt job conclusions; literal `runs-on: ubuntu-24.04` and an
       unconditional context-derived `github-hosted`/`Linux`/`X64` bootstrap as the first executable
-      step of every job before either checkout; no bootstrap `if`, `continue-on-error`, or masked
+      step of every running job before either checkout; exact job guards requiring the repository-owned
+      active-gate variable to be nonempty in addition to the applicable dispatch/non-dispatch event;
+      mutation fixtures that reject removing or weakening either guard; no bootstrap step `if`,
+      `continue-on-error`, or masked
       failure; success-gated later non-cleanup steps; and separate release-request identity when
       `Q=S`. Negative fixtures cover absent/dynamic/wrong labels, missing/late/skipped/continued
       guards, failure masking, arbitrary non-cleanup always-run steps, and required recovery/
@@ -899,7 +902,9 @@ scripts/run-actionlint.sh
 - [x] Implement `build-container-ci.yml`. For organization-required runs,
       `github.workflow_ref` must identify `stackpop/edgezero` and the exact path, and
       `github.workflow_sha` must equal repository variable `EDGEZERO_BUILD_CONTAINER_GATE_SHA`, whose
-      value is `G`. Push runs use local workflow SHA equal to current protected head `Q` while still
+      value is `G`. Before `G` is landed and that variable is set, all event-appropriate jobs
+      materialize as skipped and provide no trust evidence. A nonempty malformed or stale value starts
+      the jobs and fails closed in their first assertion. Push runs use local workflow SHA equal to current protected head `Q` while still
       executing gate code from that variable. Every job uses the literal runner label and fixed
       first-step bootstrap above. Each stable push job invokes the trusted context helper in exactly
       one named `assert-exact-main-push-context` step. Keep the existing path-filtered
@@ -913,7 +918,7 @@ scripts/run-actionlint.sh
       environment-only named credentials, canonical regular-file structured inputs, absent create-new
       output paths, atomic no-replace publication, silent success, sanitized stderr, and exact exit
       statuses 0/1/2 for success/contract/usage-tooling failure.
-- [x] Implement only these four prerequisite-auditor command shapes from design v6.40; reject every
+- [x] Implement only these four prerequisite-auditor command shapes from design v6.41; reject every
       cross-mode, missing, duplicate, or extra flag before reading a credential:
 
 ```text
@@ -1447,7 +1452,9 @@ edgezero-build-container-pin-v1 {"evidence-url":"<exact-PR-comment-URL>","image-
       API allowlists, App-token ordering, and fail-closed/no-op markers.
 - [ ] Merge the gate-only PR through the repository's existing protected process. Record the exact
       default-branch commit as `G`. This bootstrap is a human-reviewed trust-root operation;
-      candidate-controlled checks are not evidence for it.
+      candidate-controlled checks are not evidence for it. Until the active-gate variable is set, the
+      build-container workflow's exact job guards make all event-appropriate jobs materialize as
+      skipped. Confirm those skipped conclusions; do not report them as successful validation of `G`.
 
 **Gate checkpoint:** stop before opening the source candidate.
 
@@ -1786,7 +1793,7 @@ a digest from the mutable tag.
 
 Before declaring this plan complete, run two independent reviews:
 
-1. **Contract review:** compare every file and test with design v6.40 Sections 2 through 10. Verify one
+1. **Contract review:** compare every file and test with design v6.41 Sections 2 through 10. Verify one
    expected/package/validate wire authority, protected gate and image source `G`, isolated release
    request `S`, staged gate-only Docker context, API-visible exact post-merge `S` proof, forward-only
    pin ancestry, no tag runtime pull, no placeholder image digest/checksum, no `/work/package`
