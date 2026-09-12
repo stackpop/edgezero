@@ -65,6 +65,24 @@ service future does not promptly drop the inner fallback drain. The configured a
 deadline still terminates that drain and releases its grant and body source; tests pin this
 deadline-bounded, rather than cancellation-bounded, release behavior.
 
+## Config Matrix
+
+| Capability                      | Axum        | Cloudflare  | Fastly      | Spin        |
+| ------------------------------- | ----------- | ----------- | ----------- | ----------- |
+| `config-read-allocation-bounds` | Unsupported | Unsupported | Unsupported | Unsupported |
+| `config-read-deadlines`         | BestEffort  | BestEffort  | BestEffort  | BestEffort  |
+
+Every adapter enforces per-value and cumulative guest-visible config byte caps before EdgeZero
+retains or processes a returned value. That does not bound provider-side materialization,
+parser allocation, SDK copies, or other work performed before the value reaches guest code, so
+`config-read-allocation-bounds` remains `Unsupported` everywhere.
+
+Config reads use one absolute extraction deadline with pre-read and post-ready checks, but
+current provider operations are not proved cancellable within a finite wall-clock interval.
+They therefore report `BestEffort` for `config-read-deadlines`. The
+[configuration design](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/2026-06-16-blob-app-config.md#632-bounded-cancellable-extraction-reads)
+defines the normative accounting, cancellation, error, and promotion requirements.
+
 ## Response Egress Matrix
 
 | Capability                     | Axum        | Cloudflare  | Fastly      | Spin        |

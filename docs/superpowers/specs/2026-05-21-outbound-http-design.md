@@ -22,11 +22,11 @@ It does **not** mean EdgeZero imposes a global allocation ceiling.
 
 ### 1.2 Context
 
-Applications today proxy a single outbound request through the current
-`ProxyClient` / `ProxyHandle`. What is missing:
+At the historical implementation baseline, applications proxied a single outbound request
+through `ProxyClient` / `ProxyHandle`. The gaps this design set out to close were:
 
 - A first-class, **independently constructed** outbound request type.
-- **True concurrent fan-out.** Today's Fastly client calls `pending_request.wait()`
+- **True concurrent fan-out.** The baseline Fastly client called `pending_request.wait()`
   inside a single `send()`, so any `join_all` of `send()` calls runs strictly serially.
 - A **portable deadline** primitive.
 - **Bounded buffering** helpers with clean error mapping.
@@ -81,12 +81,17 @@ Applications today proxy a single outbound request through the current
 - **Unified body.** Outbound request and response bodies use the existing core `Body`
   type and may be **buffered (default)** or **streamed (opt-in)**. Streaming
   proxy-forwarding is preserved — it is not dropped (review finding / residual risk).
-- **Deliverables:** this design plus phased implementation plans. Code changes are
-  follow-ups executed from those plans.
+- **Deliverables:** this design plus phased implementation plans. Phases 1a-7 and review
+  hardening were subsequently implemented on PR 275; the status block above names the
+  remaining response-egress certification boundary.
 
-## 2. Current state (summary)
+## 2. Historical implementation baseline
 
-| Concern | Today | File |
+This table records the code state from which the outbound implementation began. It is retained
+for design provenance and does not describe the current PR head; the status block above is the
+current implementation summary.
+
+| Concern | Baseline | File |
 | --- | --- | --- |
 | Outbound trait | `ProxyClient::send(ProxyRequest) -> Result<ProxyResponse, EdgeError>` | `crates/edgezero-core/src/proxy.rs:16` |
 | Handle | `ProxyHandle` (`Arc<dyn ProxyClient>`), `RequestContext::proxy_handle()` | `proxy.rs:21`, `context.rs:97` |
