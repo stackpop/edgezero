@@ -555,6 +555,7 @@ mod tests {
     #[cfg(feature = "test-utils")]
     mod ingress_contract {
         use std::collections::VecDeque;
+        use std::future::{Future, poll_fn as poll_future, ready};
         use std::io;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -564,7 +565,8 @@ mod tests {
             SpinOutboundClient, deferred_clock_paths_hold_for_test,
         };
         use edgezero_adapter_spin::request::{
-            dispatch_ingress_stream_for_test, dispatch_request_for_test,
+            dispatch_ingress_stream_for_test, dispatch_ingress_stream_with_timer_for_test,
+            dispatch_request_for_test,
         };
         use edgezero_adapter_spin::response::response_write_deadline_uses_injected_clock_for_test;
         use edgezero_core::http::{HeaderMap, HeaderValue, Method};
@@ -827,6 +829,52 @@ mod tests {
             (app, handler_calls, middleware_calls)
         }
 
+        fn matched_body_app(
+            read_budget: Duration,
+            grant_drops: &Arc<AtomicUsize>,
+        ) -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let handler_counter = Arc::clone(&handler_calls);
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let router = RouterService::builder()
+                .post("/body", move |ctx: RequestContext| {
+                    let request_handler_calls = Arc::clone(&handler_counter);
+                    async move {
+                        request_handler_calls.fetch_add(1, Ordering::SeqCst);
+                        let _bytes = ctx.body_bytes(4).await?;
+                        Ok::<_, EdgeError>("body read completed unexpectedly")
+                    }
+                })
+                .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+                .build();
+            let mut app = App::new(router);
+            let observed_grant_drops = Arc::clone(grant_drops);
+            app.set_ingress_admission_policy(move |head| {
+                assert!(matches!(
+                    head.route_resolution(),
+                    RouteResolution::Matched(metadata) if metadata.pattern() == "/body"
+                ));
+                AdmissionDecision::Admit {
+                    grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+                    read_deadline: head.read_deadline_after(read_budget),
+                }
+            });
+            (app, handler_calls, middleware_calls)
+        }
+
+        fn deadline_timer() -> impl Future<Output = ()> {
+            let mut first_poll = true;
+            poll_future(move |cx| {
+                if first_poll {
+                    first_poll = false;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+        }
+
         fn terminal_headers(marker: &'static str) -> HeaderMap {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -1080,6 +1128,107 @@ mod tests {
                     b"spin timeout response\n",
                 );
                 assert_eq!(body_polls.load(Ordering::SeqCst), 1);
+                assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            }
+        }
+
+        #[test]
+        fn pending_matched_body_read_returns_408_and_releases_lifecycle() {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                matched_body_app(Duration::from_millis(100), &grant_drops);
+            let source = pending_stream(&grant_drops, &source_drops, &body_polls);
+
+            let response = block_on(dispatch_ingress_stream_with_timer_for_test(
+                &app,
+                Method::POST,
+                "/body".parse().expect("URI"),
+                source,
+                |_remaining| deadline_timer(),
+            ))
+            .expect("Spin response");
+
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            assert_eq!(
+                response.headers().get("content-type"),
+                Some(&HeaderValue::from_static("application/json"))
+            );
+            let bytes = block_on(response.into_body().collect())
+                .expect("provider body")
+                .to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                br#"{"error":{"kind":"request_timeout","message":"inbound body read deadline exceeded","status":408}}"#
+            );
+            assert!(body_polls.load(Ordering::SeqCst) > 0);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(middleware_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn simultaneously_ready_timer_precedes_matched_body() {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                matched_body_app(Duration::from_millis(100), &grant_drops);
+            let source = tracked_stream(
+                vec![Bytes::from_static(b"body")],
+                &grant_drops,
+                &source_drops,
+                &body_polls,
+                None,
+            );
+
+            let response = block_on(dispatch_ingress_stream_with_timer_for_test(
+                &app,
+                Method::POST,
+                "/body".parse().expect("URI"),
+                source,
+                |_remaining| ready(()),
+            ))
+            .expect("Spin response");
+
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(middleware_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn pending_fallback_body_read_preserves_timeout_response_and_releases_lifecycle() {
+            for path in ["/missing", "/known"] {
+                let grant_drops = Arc::new(AtomicUsize::new(0));
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let body_polls = Arc::new(AtomicUsize::new(0));
+                let (app, handler_calls, middleware_calls) =
+                    fallback_app(4, Duration::from_millis(100), &grant_drops);
+                let source = pending_stream(&grant_drops, &source_drops, &body_polls);
+
+                let response = block_on(dispatch_ingress_stream_with_timer_for_test(
+                    &app,
+                    Method::POST,
+                    path.parse().expect("URI"),
+                    source,
+                    |_remaining| deadline_timer(),
+                ))
+                .expect("Spin response");
+
+                assert_terminal_response(
+                    response,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &terminal_headers("timeout"),
+                    b"spin timeout response\n",
+                );
+                assert!(body_polls.load(Ordering::SeqCst) > 0);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
                 assert_no_route_dispatch(&handler_calls, &middleware_calls);

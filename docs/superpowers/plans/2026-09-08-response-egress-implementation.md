@@ -114,31 +114,47 @@ promoted from `Unsupported`.
   deadline, exact byte count, and exactly-once finish/drop behavior.
 - [ ] Add a frozen-clock fixture where the source continuously returns ready chunks. Assert
   the wrapper cooperatively yields and its independent Worker timer can win.
-- [ ] Replace simple stream mapping with a wrapper owning source, timer, cancellation, and
-  completion guard. Recheck deadline after every ready source/platform result.
+- [x] Replace simple stream mapping with a pull-driven wrapper that owns the source, timer,
+  completion guard, and injected clock; cooperatively yield and recheck the deadline around
+  every ready source result.
+- [ ] Move to a custom JavaScript `ReadableStream` source with explicit `pull` and `cancel`
+  callbacks. Keep the attempt live when no pull occurs, count bytes only after successful
+  `controller.enqueue`, and classify downstream cancellation instead of relying on Rust stream
+  drop.
 - [ ] Add a deployed probe covering slow client/backpressure, first-byte and midstream
   timeout, explicit disconnect, normal finish, elapsed tolerance, and runtime version.
 - [ ] Keep all four cells Unsupported until deployed evidence demonstrates the corresponding
   host behavior; a local WASM mock cannot upgrade them.
 - [ ] Run Cloudflare unit/contract/WASM checks and archive the probe artifact.
 
-## Task 6: Fastly and Spin bounded converter fallback
+## Task 6: Fastly and Spin send-owning egress integration
 
-**Files:** Fastly/Spin response converters and tests, capability docs.
+**Files:** Fastly/Spin response converters, generated entrypoints, tests, capability docs, and
+deployed probes.
 
-- [ ] Write red exact-cap and one-byte-over tests for both `Body::Once` and streamed bodies.
-  The same finite collection cap applies before conversion; checked accounting prevents
-  overflow.
-- [ ] Write red tests for source errors and pre-return deadline checks. Assert reports use
+- [ ] Complete exact-cap and one-byte-over tests for streamed bodies on both adapters. Preserve
+  the design's separate rule that `Body::Once` is already materialized and does not enter the
+  converter collection cap; checked accounting prevents streamed collection overflow.
+- [ ] Complete source-error and pre-return deadline tests. Assert reports use
   `ConversionError`, `SourceError`, or `DeadlineExceeded` as appropriate and fire once.
-- [ ] Refactor collection into shared per-adapter helpers with one absolute converter
+- [x] Refactor collection into bounded helpers with one absolute converter
   deadline. Drop partial buffers/source on failure.
-- [ ] Keep `response-egress-abort`, `response-egress-backpressure`,
+- [x] Keep `response-egress-abort`, `response-egress-backpressure`,
   `response-egress-completion`, and `response-write-deadlines` Unsupported. Document that
   successful host response construction emits `ResponseReturned` with zero bytes exactly once,
   never `HostHandoff` or `Completed`; this preserves observer cardinality without claiming host
   acceptance or an unobservable client finish.
-- [ ] Run Fastly and Spin unit/contract suites plus Spin's WASM build.
+- [ ] Add a Fastly send-owning entrypoint that uses `Response::stream_to_client`, retains the
+  attempt across `write`/`flush`, calls `finish` only on clean EOF, and calls `abandon` on every
+  post-commit failure. Replace the generated `#[fastly::main]` return-response path atomically.
+  Treat synchronous blocked writes as BestEffort and characterize them in Viceroy/deployed
+  probes.
+- [ ] Add a Spin raw-WASI response path that constructs and owns `BodyWriter` rather than
+  returning `SpinFullResponse` through `http_into_wasi_response`. Retain the attempt through
+  the body pump, observe stream/result reader closure, and race source/writer progress against
+  an independent timer.
+- [ ] Run Fastly and Spin unit/contract suites, both WASM builds, generated-project tests, and
+  deployed slow-reader/disconnect/finish probes before promoting any cell.
 
 ## Task 7: Cross-adapter lifecycle tests and documentation
 

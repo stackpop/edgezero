@@ -40,9 +40,10 @@ Support levels mean:
 
 All standard adapters resolve the route and run the application admission policy before
 middleware, handler dispatch, or body polling. Axum can preempt an asynchronous body read.
-Cloudflare and Spin enforce absolute checks around host reads but require deployed timing
-probes before their cancellation latency can be bounded. Fastly cannot preempt a synchronous
-host body read. Those limitations keep their deadline cells at `BestEffort`.
+Cloudflare and Spin race pending reads against platform timers and enforce absolute checks
+around ready results; both require deployed probes before host-side teardown latency can be
+bounded. Fastly cannot preempt a synchronous host body read. Those limitations keep the three
+deadline cells at `BestEffort`.
 
 All current adapters expose `IngressHeadAccounting::HostManaged` and
 `IngressFraming::HostManaged`. They perform defensive checks on the normalized request
@@ -77,8 +78,10 @@ These cells describe transport-observable client-response delivery, not response
 Axum currently emits `ResponseReturned` with zero written bytes after conversion and before
 returning the response to Hyper. It does not observe Hyper acceptance, socket transmission,
 disconnect, abort, or client completion. The other adapters likewise expose no proved
-transport completion boundary. Converter caps and deadline checks remain useful, but they do
-not satisfy these capabilities; whole-response-lifetime certification remains blocked.
+transport completion boundary. Fastly's `StreamingBody` and Spin/WASI's `BodyWriter` provide
+lower-level send APIs, but the current EdgeZero entrypoints do not own those lifetimes.
+Converter caps and deadline checks remain useful, but they do not satisfy these capabilities;
+whole-response-lifetime certification remains blocked.
 
 ## Outbound Matrix
 

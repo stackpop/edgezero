@@ -197,10 +197,10 @@ The shared capability ladder gains four response-egress cells:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
-| `response-egress-abort` | Unsupported until connection-level reset/drop tests pass | Unsupported until deployed cancel is observed | Unsupported; guest returns before host delivery | Unsupported; guest returns before host delivery |
-| `response-egress-backpressure` | Unsupported until the non-`Send` bridge and socket-pressure tests pass | Unsupported until deployed pull/cancel behavior is observed | Unsupported while converter collects the stream | Unsupported while converter collects into `FullBody` |
-| `response-egress-completion` | Unsupported until a proved transport completion boundary exists | Unsupported until a deployed finish/cancel probe passes | Unsupported | Unsupported |
-| `response-write-deadlines` | Unsupported until a connection-level abort timer is proved | Unsupported until a deployed timer/abort probe passes | Unsupported | Unsupported |
+| `response-egress-abort` | Unsupported until connection-level reset/drop tests pass | Unsupported until the stream cancel boundary and deployed cancel are observed | Unsupported until EdgeZero owns `StreamingBody::abandon` at the send boundary | Unsupported until EdgeZero owns and observes the WASI response body pump |
+| `response-egress-backpressure` | Unsupported until the non-`Send` bridge and socket-pressure tests pass | Unsupported until deployed pull/enqueue behavior is observed | Unsupported while the standard converter collects the stream | Unsupported while the standard converter collects into `FullBody` |
+| `response-egress-completion` | Unsupported until a proved transport completion boundary exists | Unsupported until a deployed finish/cancel probe passes | Unsupported until EdgeZero observes `StreamingBody::finish` | Unsupported until EdgeZero observes the WASI stream/result writer boundary |
+| `response-write-deadlines` | Unsupported until a connection-level abort timer is proved | Unsupported until a deployed timer/abort probe passes | Unsupported until the send-owning path enforces and characterizes its best-effort timer | Unsupported until the owned body pump races an independent timer and a deployed probe passes |
 
 These are the initial capability declarations. A cell may move to BestEffort or Native only
 after its implementation and named evidence land. An app requiring Native support fails during build/serve/deploy/demo before
@@ -237,15 +237,27 @@ claim.
 
 ### 4.3 Fastly and Spin
 
-Their current converters materialize a body before returning it to the host and cannot
-observe client delivery/finish. They enforce a finite converter collection cap and can report
-pre-return source/conversion errors. Successful platform response construction reports
-`ResponseReturned` exactly once with zero written bytes, but they remain Unsupported for the
-four lifecycle capabilities. It must not be reported as `HostHandoff`: the generated host
-entrypoint performs delivery only after guest dispatch returns.
-Cooperative deadline checks around synchronous host work do not create a finite write bound.
-Upgrading requires a documented host streaming/abort/finish API plus a deployed probe; local
-collection tests are insufficient.
+Their current standard converters materialize a body before returning it to generated host
+entrypoint code and therefore cannot observe client delivery/finish. They enforce a finite
+converter collection cap and can report pre-return source/conversion errors. Successful
+platform response construction reports `ResponseReturned` exactly once with zero written
+bytes, but it remains Unsupported for the four lifecycle capabilities. It must not be reported
+as `HostHandoff`: delivery begins after EdgeZero dispatch returns.
+
+This is an EdgeZero integration gap, not an absence of provider APIs. Fastly exposes
+`Response::stream_to_client` and a `StreamingBody` with `write`, `flush`, `finish`, and
+`abandon`; dropping its underlying handle also abandons it. Certification requires an
+EdgeZero-owned send entrypoint that retains the attempt through that lifecycle and a generated
+entrypoint hard cut to use it. Fastly writes are synchronous, so a timer cannot preempt a
+blocked host write and any write-deadline claim must remain BestEffort unless a stronger host
+primitive appears.
+
+Spin's pinned WASI HTTP stack exposes `BodyWriter`, its stream/result channels, and reader-close
+errors. The current `http_into_wasi_response` helper spawns a body pump and discards its result;
+certification therefore requires EdgeZero to construct the raw WASI response, own the pump,
+retain the attempt until stream/result termination, and classify reader closure. An independent
+timer must race source and writer progress. Neither target may promote a capability until
+scripted lifecycle tests and deployed slow-reader/disconnect probes support that exact cell.
 
 ## 5. Test and evidence matrix
 
@@ -259,7 +271,7 @@ collection tests are insufficient.
 | Teardown | Source drop and native abort/reset/close are observed for every failure path supported by the adapter. |
 | Capability | Parse/display/round-trip and fail-closed Native requirements match the four-row matrix. |
 | Cloudflare timing | Frozen-clock test, cooperative yield, and one deployed timing/cancel/finish artifact. |
-| Unsupported hosts | Fastly/Spin tests prove only bounded pre-return collection and never label response-object creation as client completion. |
+| Buffered standard entrypoints | Fastly/Spin tests prove only bounded pre-return collection and never label response-object creation as client completion. Separate send-owning paths must exercise the existing Fastly `StreamingBody` and Spin/WASI `BodyWriter` APIs before capability promotion. |
 
 ## 6. Security and observability
 
