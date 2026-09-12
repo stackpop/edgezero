@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+#[cfg(feature = "test-utils")]
+use std::future::pending;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "test-utils")]
 use std::{
     io,
@@ -39,12 +43,14 @@ use edgezero_core::store_registry::{
 use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
 #[cfg(any(test, feature = "test-utils"))]
 use futures::executor::block_on;
+use futures_util::future::{Either, select};
 #[cfg(feature = "test-utils")]
 use futures_util::stream::poll_fn;
 use futures_util::stream::unfold;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use spin_sdk::http::Request as SpinRequest;
 use spin_sdk::http::body::IncomingBodyExt as _;
+use spin_sdk::time::sleep;
 
 use crate::outbound::SpinOutboundClient;
 
@@ -128,29 +134,46 @@ fn outbound_client(clock: MonotonicClock) -> HttpClient {
     HttpClient::with_client(SpinOutboundClient::with_clock(clock))
 }
 
-fn spin_deadline_body<Source, SourceError>(
+fn deadline_body_with_timer<Source, SourceError, Timer, MakeTimer>(
     source: Source,
     deadline: Deadline,
     monotonic_clock: MonotonicClock,
+    make_timer: MakeTimer,
 ) -> Body
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
+    Timer: Future<Output = ()> + 'static,
+    MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
 {
     let boxed_stream = source.map_err(Into::into).boxed_local();
     let stream = unfold(Some(boxed_stream), move |stream_state| {
         let clock = monotonic_clock.clone();
+        let timer_factory = make_timer.clone();
         async move {
             let mut body_stream = stream_state?;
-            if deadline.is_expired_at(clock.now()) {
+            let Some(remaining) = deadline.remaining_at(clock.now()) else {
                 return Some((
                     Err(EdgeError::request_timeout(
                         "inbound body read deadline exceeded",
                     )),
                     None,
                 ));
-            }
-            let item = body_stream.next().await;
+            };
+            let timer = timer_factory(remaining);
+            let next_item = body_stream.next();
+            futures_util::pin_mut!(timer, next_item);
+            let item = match select(timer, next_item).await {
+                Either::Left(((), _next_item)) => {
+                    return Some((
+                        Err(EdgeError::request_timeout(
+                            "inbound body read deadline exceeded",
+                        )),
+                        None,
+                    ));
+                }
+                Either::Right((item, _timer)) => item,
+            };
             if deadline.is_expired_at(clock.now()) {
                 return Some((
                     Err(EdgeError::request_timeout(
@@ -182,7 +205,9 @@ pub fn deadline_body_releases_source_for_test() -> bool {
     });
     let start = MonotonicInstant::now();
     let clock = MonotonicClock::new(move || start);
-    let body = spin_deadline_body(source, Deadline::at_instant(start), clock);
+    let body = deadline_body_with_timer(source, Deadline::at_instant(start), clock, |_| {
+        pending::<()>()
+    });
     let Some(mut body_stream) = body.into_stream() else {
         return false;
     };
@@ -192,7 +217,9 @@ pub fn deadline_body_releases_source_for_test() -> bool {
     matches!(error, EdgeError::RequestTimeout { .. }) && dropped.load(Ordering::SeqCst) == 1
 }
 
-/// Dispatches an observable source through the production ingress body wrapper.
+/// Dispatches an observable source through the production ingress body wrapper without a
+/// provider timer. Tests that exercise timer expiry use
+/// [`dispatch_ingress_stream_with_timer_for_test`] instead.
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 #[inline]
@@ -212,12 +239,47 @@ where
         .uri(uri)
         .body(Body::empty())
         .map_err(EdgeError::internal)?;
-    dispatch_ingress_stream(
+    dispatch_ingress_stream_with_timer(
         app,
         core_request,
         Stores::default(),
         request_start,
         move || source,
+        |_| pending::<()>(),
+    )
+    .await
+}
+
+/// Dispatches an observable source through the production ingress deadline race.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_stream_with_timer_for_test<Source, SourceError, Timer, MakeTimer>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    source: Source,
+    make_timer: MakeTimer,
+) -> anyhow::Result<SpinFullResponse>
+where
+    Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    Timer: Future<Output = ()> + 'static,
+    MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
+{
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(EdgeError::internal)?;
+    dispatch_ingress_stream_with_timer(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        move || source,
+        make_timer,
     )
     .await
 }
@@ -314,7 +376,7 @@ pub(crate) async fn dispatch_with_handles(
 
 async fn dispatch_ingress_stream<Source, SourceError, MakeSource>(
     app: &App,
-    mut head_request: Request,
+    head_request: Request,
     stores: Stores,
     request_start: MonotonicInstant,
     make_source: MakeSource,
@@ -323,6 +385,25 @@ where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
     MakeSource: FnOnce() -> Source,
+{
+    dispatch_ingress_stream_with_timer(app, head_request, stores, request_start, make_source, sleep)
+        .await
+}
+
+async fn dispatch_ingress_stream_with_timer<Source, SourceError, MakeSource, Timer, MakeTimer>(
+    app: &App,
+    mut head_request: Request,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    make_source: MakeSource,
+    make_timer: MakeTimer,
+) -> anyhow::Result<SpinFullResponse>
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Source,
+    Timer: Future<Output = ()> + 'static,
+    MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
 {
     head_request
         .extensions_mut()
@@ -340,10 +421,11 @@ where
         }
         _ => return Err(anyhow::anyhow!("unsupported ingress admission outcome")),
     };
-    *head_request.body_mut() = spin_deadline_body(
+    *head_request.body_mut() = deadline_body_with_timer(
         make_source(),
         prepared.read_deadline(),
         prepared.monotonic_clock(),
+        make_timer,
     );
     dispatch_core_request(app, head_request, stores, prepared).await
 }

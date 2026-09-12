@@ -132,6 +132,11 @@ claim about the current adapter.
 - [ ] Characterize pinned Hyper 1.10.1 first: preserve source references and tests proving a
   `Content-Length` after `Transfer-Encoding` is skipped and equal duplicate lengths are
   accepted. These are the red cases the patch must change.
+- [ ] Replace `axum::serve` with a connection-owning Hyper accept path while preserving
+  connect metadata, HTTP/1 keepalive and pipelining, HTTP/2 behavior, upgrades, graceful
+  shutdown, and the existing service contract. Configure `max_headers`, `max_buf_size`, and
+  `header_read_timeout` as defense in depth, but do not treat those coarse controls as exact
+  target/header accounting or framing evidence.
 - [ ] Add the smallest audited parser patch (or consume an upstream equivalent) in Hyper's
   existing request-line/ordered `httparse` header path. Bound parser reads so the raw head is
   rejected rather than accumulated past the installed target/header policy; count duplicate
@@ -162,9 +167,12 @@ equivalent baseline and target-specific deadline behavior for the other three ad
   `IngressHeadAccounting::HostManaged`, apply only documented post-materialization
   defense-in-depth limits, invoke policy once, and preserve the resolved token through
   dispatch.
-- [ ] Implement pre-read/post-ready deadline checks against the admitted app clock and the
-  strongest available drop/abort primitive. Do not claim preemption around synchronous
-  host calls.
+- [x] Implement pre-read/post-ready deadline checks against the admitted app clock and the
+  strongest available drop/abort primitive. Cloudflare and Spin also race pending reads
+  against a platform timer; Fastly does not claim preemption around synchronous host calls.
+- [x] Add Spin WASI regressions with a permanently pending source for matched dispatch and
+  both fallback resolutions. Prove timer-first timeout, exact 408/application-selected
+  response behavior, and exactly-once source/grant release with a deterministic timer seam.
 - [ ] Prove buffered provider values enter as `Body::Once` only after admission and within a
   documented platform bound; all other paths use lazy `Body::Stream`.
 - [ ] Run each adapter's contract suite, including its WASM target where applicable.
@@ -180,10 +188,11 @@ equivalent baseline and target-specific deadline behavior for the other three ad
   deploy/demo behavior for Native requirements.
 - [ ] Update manifest-generated and hand-written app construction so both retain admission
   policy; keep low-level `into_router()` explicit about its lack of adapter admission.
-- [ ] Keep Cloudflare's pre-select cooperative zero-delay yield, document the frozen-clock
-  caveat, add Cloudflare and Spin deployed cancellation probes, and retain Fastly
-  cooperative timing evidence. Store machine-readable target/runtime/version/tolerance
-  results.
+- [x] Keep Cloudflare's pre-select cooperative zero-delay yield and document the frozen-clock
+  caveat. Spin uses the last positive app-clock snapshot to arm its provider timer and keeps
+  its post-ready app-clock check.
+- [ ] Add Cloudflare and Spin deployed cancellation probes and retain Fastly cooperative
+  timing evidence. Store machine-readable target/runtime/version/tolerance results.
 - [ ] Update adapter capability docs without upgrading a cell from local mocks alone.
 
 ## Task 8: Final verification and integration boundary

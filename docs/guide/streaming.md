@@ -1,6 +1,8 @@
 # Streaming
 
-EdgeZero supports streaming responses for large payloads, real-time data, and server-sent events.
+EdgeZero accepts streaming response bodies on every adapter. The current standard Cloudflare
+path preserves lazy downstream delivery; Axum, Fastly, and Spin collect a stream under a finite
+16 MiB converter cap before returning the platform response.
 
 ## Streaming Responses
 
@@ -33,12 +35,16 @@ async fn stream_data() -> Response {
 
 ## How Streaming Works
 
-The router keeps streams intact through the adapter layer:
+The router keeps `Body::Stream` intact until the adapter response boundary:
 
 1. Your handler returns `Body::stream(...)` with a `Stream` of chunks
-2. The adapter writes chunks sequentially to the provider's output API
-3. Fastly uses `stream_to_client`, Cloudflare uses `ReadableStream`
-4. The client receives data as it becomes available
+2. Cloudflare adopts the source into a pull-driven `ReadableStream`
+3. Axum, Fastly, and Spin currently collect it before their generated/host response boundary
+4. The capability matrix records whether lazy delivery, backpressure, and completion are proved
+
+Fastly exposes `stream_to_client` and Spin exposes a WASI `BodyWriter`, but EdgeZero's standard
+entrypoints do not yet own those send lifetimes. See [Capabilities](/guide/capabilities) for the
+current target-specific contract.
 
 ## Server-Sent Events
 
@@ -67,6 +73,12 @@ async fn events() -> Response {
         .unwrap()
 }
 ```
+
+::: warning Adapter support
+Progressive SSE delivery currently requires the Cloudflare adapter. Axum, Fastly, and Spin
+buffer the response stream and therefore cannot deliver an unbounded SSE stream through their
+standard entrypoints.
+:::
 
 ## Body Modes
 
@@ -107,20 +119,22 @@ against the configured policy limit.
 
 ## Memory Considerations
 
-Streaming is essential for:
+Lazy streaming is useful for:
 
 - Large file downloads
 - Video/audio content
 - Real-time data feeds
 - Responses larger than available memory
 
-::: warning Platform Limits
-Edge platforms have memory constraints. A Fastly Compute instance has ~128MB by default. Always stream large responses rather than buffering.
+::: warning Platform limits
+Edge platforms have finite memory. A `Body::Stream` does not guarantee downstream streaming on
+every adapter: Axum, Fastly, and Spin currently enforce a 16 MiB converter cap. Choose payload
+limits from the capability matrix and do not use those standard paths for unbounded responses.
 :::
 
 ## Chunked Transfer
 
-When the response size is unknown, EdgeZero uses chunked transfer encoding:
+Applications may omit `Content-Length` when the response size is unknown:
 
 ```rust
 #[action]
@@ -135,6 +149,9 @@ async fn dynamic_content() -> Response {
         .unwrap()
 }
 ```
+
+The provider owns the final wire framing. EdgeZero does not guarantee HTTP/1 chunked transfer,
+especially on adapters that collect the stream before returning the response.
 
 ## Next Steps
 

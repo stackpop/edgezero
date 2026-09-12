@@ -384,6 +384,12 @@ Axum is the first required raw-boundary implementation. Hyper 1.10.1 can discard
 `Request<Body>`/`HeaderMap` is insufficient and must not be described as smuggling
 protection. The Axum adapter needs an audited pinned Hyper parser patch or an upstream parser
 hook that rejects the strict policy while Hyper still has ordered `httparse` field lines.
+The current `axum::serve` boundary hands EdgeZero an already-parsed request, so this also
+requires a connection-owning accept path based on Hyper's lower-level connection builders.
+`http1::Builder::{max_headers,max_buf_size,header_read_timeout}` may provide defense in depth,
+but they do not expose exact request-target/raw-header accounting and do not preserve every
+ambiguous field shape required by this contract; configuring those knobs alone cannot promote
+either raw capability.
 After that parser has rejected ambiguity, the adapter may derive `IngressFraming` from the
 surviving normalized headers plus HTTP version; the derivation is trusted only because the
 raw parser decision preceded it. A second independent socket pre-parser is not accepted: it
@@ -423,8 +429,11 @@ non-outbound capability cells to the shared capability ladder:
 
 BestEffort implementations still use pre-read/post-ready checks and release ownership when
 expiry is observed; they do not claim a finite bound around an uninterruptible or opaque host
-call. Fastly cannot preempt its synchronous read, and Spin cannot race its opaque body stream
-against a guest-owned cancellation primitive. A manifest
+call. Fastly cannot preempt its synchronous read. Spin races each pending body read against
+`spin_sdk::time::sleep(remaining)` and selects the timer first, so guest code can promptly emit
+408 and release its source/grant ownership even when the body stream never wakes. Spin remains
+BestEffort because dropping that guest reader does not prove that host-side teardown completed
+within a bounded interval. A manifest
 that requires Native support fails before startup/deploy through the same capability ladder
 used elsewhere. Raw head limits, raw framing, and body-read deadline are separate cells: a
 platform host may impose undocumented limits or reject malformed framing without exposing
@@ -450,6 +459,14 @@ still uses the last positive `remaining_at` snapshot. This is deterministic test
 not a claim that production time can freeze. Native promotion requires one deployed timing
 probe that records runtime version, configured deadline, observed cancellation latency, and
 tolerance; local mocked timers are insufficient.
+
+Spin likewise creates its platform timer from the last positive `remaining_at` snapshot and
+keeps the post-ready check against the admitted app clock. Its WASI contract suite injects a
+deterministic pending-then-ready timer to prove timer-first selection for permanently pending
+matched and fallback sources, exact 408/application timeout responses, and exactly-once source
+and grant release. The standard WASI test harness cannot poll the provider clock import outside
+an exported component task, so the production `spin_sdk::time::sleep` wiring is compile-checked
+locally and still requires the deployed host-observed timing probe before Native promotion.
 
 ## 2. Bounded Context Helpers
 
@@ -787,7 +804,7 @@ platform runtime or network.
 | Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Route class reaches matched and 405 metadata but never changes `RouteId`. Refusal polls no body, invokes no middleware/handler, terminates the native reader, and preserves the chosen response. The default policy supplies an empty grant and one finite deadline derived from `request_start`. |
 | Bounded fallback precedence | For pre-resolved 404/405 requests, ordinary `Admit` retains no-poll routing behavior. Opt-in `ReadBodyBeforeFallback` holds the application grant while draining a lengthless or chunked body to EOF under one absolute deadline: exact cap preserves the canonical 404/405, the first byte over returns the exact `on_exceeded` status/header/body response first, and expiry returns the exact `on_timeout` response first. The grant is live during every poll and drops exactly once before response conversion, when the core drain future is dropped, or when the finite deadline terminates it. No path rematches or invokes middleware, a handler, or `RequestContext`; `Refuse` remains zero-read; selecting fallback drain for a matched route fails before body construction. Every adapter suite covers both 404 and 405 exact-cap cases plus exact custom terminal responses at its honestly reported deadline capability. Axum additionally proves that an outer abort request cannot cancel its blocking bridge but that the read deadline still releases the source and grant exactly once. |
 | Request ingress metadata | `IngressHead` and matched `RequestContext` expose the same captured `request_start`, paired app clock, and route metadata. `take_ingress_grant()` returns the non-clone grant exactly once, then `None`; untaken, refused, 404, and 405 grants each drop exactly once. The preserved low-level context constructor exposes no route and makes no admission claim. |
-| Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline and the admitted app clock; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). A manually advanced injected clock proves the tie behavior without wall-clock sleeps. Cached success is not retroactively poisoned. |
+| Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline and the admitted app clock; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). A manually advanced injected clock proves the tie behavior without wall-clock sleeps. Spin additionally proves that a timer wake interrupts a permanently pending matched or fallback source, preserves the correct terminal response, and releases source/grant ownership exactly once. Cached success is not retroactively poisoned. |
 | Cancellation | A stream held at `Pending` leaves the cell `Draining`; dropping the first `body_bytes` future transitions it to the documented cancellation poison, and the next access returns that stored internal error. |
 | Reentrancy | While the first scripted drain is pending, a second body accessor returns `internal("body read already in progress")` without a `RefCell` panic. Resuming the first future can still complete and cache bytes. |
 | Consumption | `take_body` and `into_request` cover Initial, Cached, Draining, Poisoned, and Taken. Initial preserves a stream; Cached reassembles `Body::Once`; Taken deliberately produces an empty body only where specified. |
@@ -847,7 +864,9 @@ eventual release.
   has already run.
 - Future `crates/edgezero-adapter-axum` server connection work: enforce raw request-target/header
   limits and validate raw HTTP/1 field lines before Hyper can discard framing evidence;
-  reject/close on overflow or ambiguity. The normalized
+  replace the current `axum::serve` ownership boundary, preserve HTTP/1 keepalive/pipelining,
+  HTTP/2, upgrades, connect metadata, and graceful shutdown, and reject/close on overflow or
+  ambiguity. Hyper builder limits are defense in depth, not the exact enforcement seam. The normalized
   `Request<Body>` conversion is not the enforcement point.
 - `crates/edgezero-core` call sites and tests: migrate `request()` / `request_mut()` users
   to parts or body-specific accessors and update the now-fallible `into_request()` calls.
