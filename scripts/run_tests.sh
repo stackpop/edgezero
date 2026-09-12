@@ -49,6 +49,16 @@ done
 section "Workspace Feature Compilation"
 run cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
+section "Adapter Native Feature Matrices"
+for adapter in axum cloudflare fastly spin; do
+  run bash scripts/check_adapter_feature_matrix.sh "${adapter}" native
+done
+
+section "Adapter Wasm Feature Matrices"
+run bash scripts/check_adapter_feature_matrix.sh cloudflare wasm32-unknown-unknown
+run bash scripts/check_adapter_feature_matrix.sh fastly wasm32-wasip1
+run bash scripts/check_adapter_feature_matrix.sh spin wasm32-wasip2
+
 section "Fastly CLI Tests"
 run cargo test -p edgezero-adapter-fastly --no-default-features --features cli
 

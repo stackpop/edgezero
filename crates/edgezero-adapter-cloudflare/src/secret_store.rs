@@ -11,27 +11,22 @@
 
 use std::future::Future;
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::config_store::BoundedStoreRead;
 use edgezero_core::secret_store::SecretError;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::secret_store::SecretStore;
 use edgezero_core::time::Deadline;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::Error as WorkerError;
 
 /// Secret store backed by Cloudflare Workers `Env`.
 ///
 /// Reads secrets via `env.secret(name)`. Clones the `Env` handle at dispatch
 /// time so secrets remain accessible throughout the request lifetime.
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub struct CloudflareSecretStore {
     env: worker::Env,
 }
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 impl CloudflareSecretStore {
     /// Create a secret store from a cloned `Env`.
     #[inline]
@@ -41,7 +36,6 @@ impl CloudflareSecretStore {
     }
 }
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl SecretStore for CloudflareSecretStore {
     #[inline]

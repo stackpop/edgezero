@@ -1,6 +1,10 @@
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(all(feature = "cloudflare", not(target_arch = "wasm32")))]
 
 #[path = "../src/secret_store.rs"]
+#[expect(
+    dead_code,
+    reason = "the source harness exercises the private bounded-read helper without constructing a worker Env"
+)]
 mod secret_store;
 
 #[cfg(test)]

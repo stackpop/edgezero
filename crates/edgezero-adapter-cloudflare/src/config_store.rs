@@ -23,8 +23,6 @@ use edgezero_core::config_store::{BoundedStoreRead, ConfigStore, ConfigStoreErro
 use edgezero_core::time::Deadline;
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(not(any(all(feature = "cloudflare", target_arch = "wasm32"), test)))]
-use std::convert::Infallible;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::Env;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
@@ -43,9 +41,6 @@ enum CloudflareConfigBackend {
     InMemory(HashMap<String, String>),
     #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
     Kv(WorkerKvStore),
-    /// Never constructed; keeps the enum inhabited off production/test cfgs.
-    #[cfg(not(any(all(feature = "cloudflare", target_arch = "wasm32"), test)))]
-    _Uninhabited(Infallible),
 }
 
 impl CloudflareConfigStore {
@@ -86,11 +81,6 @@ impl ConfigStore for CloudflareConfigStore {
             }),
             #[cfg(test)]
             CloudflareConfigBackend::InMemory(data) => Ok(data.get(key).cloned()),
-            #[cfg(not(any(all(feature = "cloudflare", target_arch = "wasm32"), test)))]
-            CloudflareConfigBackend::_Uninhabited(never) => {
-                let _: &str = key;
-                match *never {}
-            }
         }
     }
 
