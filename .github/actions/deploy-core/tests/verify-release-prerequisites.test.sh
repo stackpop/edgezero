@@ -172,7 +172,8 @@ case "$authorization" in
   eyJ*) credential=app-jwt ;;
 esac
 case "$path" in
-  /user|/orgs/stackpop/memberships/*|/orgs/stackpop/teams/*|/orgs/stackpop/actions/permissions|/orgs/stackpop/rulesets*|/repos/stackpop/edgezero/actions/permissions|/repos/stackpop/edgezero/immutable-releases|/users/*|/repos/stackpop/edgezero/pulls/*|/repos/stackpop/edgezero/rulesets*|/repos/stackpop/edgezero/actions/variables/*|/repos/stackpop/edgezero/environments/*|/repos/stackpop/edgezero/commits/*|/repos/stackpop/edgezero/actions/runs/*|/repos/stackpop/edgezero/actions/workflows/*|/repos/stackpop/edgezero/git/ref/heads/main|/repos/stackpop/edgezero)
+  /repos/stackpop/edgezero) [[ "$credential" == policy || "$credential" == publisher-probe ]] || exit 94 ;;
+  /user|/orgs/stackpop/memberships/*|/orgs/stackpop/teams/*|/orgs/stackpop/actions/permissions|/orgs/stackpop/rulesets*|/repos/stackpop/edgezero/actions/permissions|/repos/stackpop/edgezero/immutable-releases|/users/*|/repos/stackpop/edgezero/pulls/*|/repos/stackpop/edgezero/rulesets*|/repos/stackpop/edgezero/actions/variables/*|/repos/stackpop/edgezero/environments/*|/repos/stackpop/edgezero/commits/*|/repos/stackpop/edgezero/actions/runs/*|/repos/stackpop/edgezero/actions/workflows/*|/repos/stackpop/edgezero/git/ref/heads/main)
     if [[ "$path" == /user || "$path" == /orgs/stackpop/memberships/* ]]; then [[ "$credential" == policy || "$credential" == package ]]; else [[ "$credential" == policy ]]; fi
     ;;
   /orgs/stackpop/packages*) [[ "$credential" == package ]] ;;
