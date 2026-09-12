@@ -8,10 +8,10 @@
 #
 # Usage:
 #   scripts/install-actionlint.sh <version>
-#   ACTIONLINT_VERSION=1.7.7 scripts/install-actionlint.sh
+#   ACTIONLINT_VERSION=1.7.12 scripts/install-actionlint.sh
 #
 # Env overrides:
-#   ACTIONLINT_VERSION   release version, e.g. 1.7.7 (no leading "v")
+#   ACTIONLINT_VERSION   release version, e.g. 1.7.12 (no leading "v")
 #   INSTALL_DIR          install target (default: /usr/local/bin)
 #   OS / ARCH            override auto-detection (e.g. linux / amd64)
 set -euo pipefail
@@ -48,10 +48,10 @@ archive="actionlint_${ACTIONLINT_VERSION}_${OS}_${ARCH}.tar.gz"
 # version/platform fails CLOSED rather than trusting the runtime origin.
 expected=""
 case "${ACTIONLINT_VERSION}:${archive}" in
-  1.7.7:actionlint_1.7.7_linux_amd64.tar.gz) expected=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757 ;;
-  1.7.7:actionlint_1.7.7_linux_arm64.tar.gz) expected=401942f9c24ed71e4fe71b76c7d638f66d8633575c4016efd2977ce7c28317d0 ;;
-  1.7.7:actionlint_1.7.7_darwin_amd64.tar.gz) expected=28e5de5a05fc558474f638323d736d822fff183d2d492f0aecb2b73cc44584f5 ;;
-  1.7.7:actionlint_1.7.7_darwin_arm64.tar.gz) expected=2693315b9093aeacb4ebd91a993fea54fc215057bf0da2659056b4bc033873db ;;
+  1.7.12:actionlint_1.7.12_linux_amd64.tar.gz) expected=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;;
+  1.7.12:actionlint_1.7.12_linux_arm64.tar.gz) expected=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;;
+  1.7.12:actionlint_1.7.12_darwin_amd64.tar.gz) expected=5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644 ;;
+  1.7.12:actionlint_1.7.12_darwin_arm64.tar.gz) expected=aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f ;;
 esac
 if [ -z "$expected" ]; then
   echo "error: no repo-pinned SHA-256 for $archive at actionlint ${ACTIONLINT_VERSION}; add its digest to install-actionlint.sh from the release checksums rather than trusting the origin" >&2
