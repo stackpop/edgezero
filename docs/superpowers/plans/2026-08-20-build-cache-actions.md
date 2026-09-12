@@ -8,7 +8,7 @@
 restore/compile/save primitive that later plans consume, without making cache availability part of
 build correctness or exposing credentials to compilation.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.39 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.40 Sections
 2 through 5 and 9.
 
 ## 1. Fixed decisions

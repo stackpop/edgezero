@@ -7,7 +7,7 @@
 can reach a credentialed provider command, and preserve the parent deploy lifecycle without ambient
 host state or the legacy `--stage` spelling.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.39 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.40 Sections
 2, 5, 6.1, 6.6, 7.2, and 9. The parent deploy spec remains normative where the addendum does not
 expressly replace it.
 

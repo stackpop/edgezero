@@ -2,7 +2,7 @@
 
 Implementation branch: `feature/build-app-cli-cache` in the existing
 `edgezero-actions-improve` worktree. The implementation recorded below follows design v6.29;
-the subsequent v6.30, v6.31, v6.34, v6.35, v6.36, v6.37, v6.38, and v6.39 design reconciliations are recorded separately at
+the subsequent v6.30, v6.31, v6.34, v6.35, v6.36, v6.37, v6.38, v6.39, and v6.40 design reconciliations are recorded separately at
 the end.
 
 ## Version Reference Review
@@ -512,7 +512,8 @@ same-source digest replacement verifies the closed old PR at the post-push branc
 
 The local Task 2 Sections 6.3 and 6.4 implementation is complete. This supersedes the historical
 "implementation pending" status in the v6.34-v6.37 reconciliation notes without changing their design
-history. The implementation includes the frozen gate manifest and exact CODEOWNERS expansion, protected
+history. The implementation includes the frozen gate manifest, its exact CODEOWNERS expansion plus
+directory-wide workflow ownership, protected
 classifier and event-range selection, required CI workflow, release-prerequisite auditor, prerequisite
 writer, approval gate, App-token boundary, pin updater, publisher structural checker, publication
 verifier, rotation-lock verifier, publisher workflow, rotation workflow, and their adversarial fixture
@@ -524,3 +525,12 @@ and required workflows, obtain live queue-capacity and post-concurrency freshnes
 credential smoke, publish and anonymously verify the image, merge the pin PR, and record `{G,S,D,B}`.
 The cache primitive, producer/consumer provenance integration, provider lifecycle integration, and
 application-repository adoption remain the separate follow-on plans 2 through 5.
+
+## v6.40 Design Reconciliation
+
+The protected checker now runs for every candidate and treats the required CI workflow as an exact
+active-gate graph alongside publisher and rotation. Every other workflow must use literal environment
+names and cannot select `build-container-release` or reference the publisher private-key name. The
+complete workflow namespace is gate-reviewer-owned. Future changes to an exact protected workflow,
+image-context contract, or hard-coded toolchain value use the design's bounded preparatory gate `G_p`
+and two separately evidenced rotations; direct changes remain intentionally rejected.

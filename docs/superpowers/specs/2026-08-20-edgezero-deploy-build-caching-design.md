@@ -1,6 +1,6 @@
 # EdgeZero Deploy Actions - Build Caching Spec
 
-**Status:** Design (proposed) - v6.39
+**Status:** Design (proposed) - v6.40
 
 **Related:** `docs/superpowers/specs/edgezero-deploy-github-action.md`,
 `docs/superpowers/plans/edgezero-deploy-action-implementation-plan.md`,
@@ -1471,7 +1471,9 @@ enforced by digest, image labels, and exact `provenance-protocol`. Changing the 
 contract requires a protocol bump and a new image before the actions using that protocol are pinned.
 
 The gate owns a canonical path manifest and `.github/CODEOWNERS`; the latter assigns every manifested
-path and itself to `@stackpop/edgezero-build-container-gate-reviewers`. The no-bypass default-branch
+path, itself, and the complete `/.github/workflows/` namespace to
+`@stackpop/edgezero-build-container-gate-reviewers`. The namespace rule ensures a newly added workflow
+cannot avoid gate-owner review merely because its path is not yet in the manifest. The no-bypass default-branch
 ruleset requires code-owner review, at least two approving reviews, dismissal of stale approvals, and
 the merge queue. A gate-update PR changes only paths in the union of the old and candidate canonical
 manifests. Old `G` validates the candidate manifest's canonical sorted form, validates candidate
@@ -1480,6 +1482,35 @@ subject-data checks, and never runs candidate gate code. A mixed gate/non-gate c
 passes the old gate and required human reviews, merging it creates candidate `G'`, not `S`. Until
 activation, the protected base's manifested bytes differ from active `G`, so every ordinary candidate
 and release preflight fails.
+
+Every candidate, including an ordinary not-applicable candidate, is also subject to old `G`'s
+network-free workflow namespace check. Candidate `build-container-ci.yml`,
+`publish-build-container.yml`, and `rotate-build-container-gate.yml` execution graphs must be
+semantically equal after strict YAML parsing to their active-`G` graphs, except for the single exact
+next graph temporarily admitted by an active preparatory gate `G_p` under the bounded protocol below.
+Every other workflow may
+name only a literal environment; dynamic environment selectors fail because the gate cannot prove
+that they do not resolve to `build-container-release`. No other workflow may name that environment,
+case-insensitively, or contain the protected secret name
+`EDGEZERO_BUILD_CONTAINER_APP_PRIVATE_KEY`. Thus the only candidate jobs capable of receiving the
+release environment are the exact protected preflight and publisher update jobs already fixed by
+`G`; a newly added workflow cannot turn a later legitimate release tag into a second credential-bearing
+run.
+
+Exact old-`G` validation deliberately means some gate changes cannot land in one rotation. A change to
+one of the three protected workflow graphs, the exact image-context closure, the Dockerfile contract,
+or a hard-coded tool version/checksum uses two sequential gate rotations. First land and activate a
+**preparatory gate `G_p`** whose only relevant behavioral change is to old-`G` validators, checker,
+tests, and manifests. `G_p` leaves the current protected workflows and image-context bytes unchanged,
+and its trusted checks accept exactly both the current shape and one fully reviewed proposed next
+shape; open-ended ranges or generic weakening are forbidden. Do not open a release request or create a
+release tag while `G_p` is active. Then land the proposed gate `G_n`, which exactly matches the
+pre-reviewed next shape and collapses its validators back to that single shape, and activate `G_n`
+through a second complete lock, policy-audit, approval, and prerequisite-record rotation. Each
+rotation has distinct `{old-G,Q_d,new-G,Q_f}` evidence and the second names `G_p` as its old gate. If
+the second change is abandoned, use the ordinary rollback protocol to restore the gate preceding
+`G_p`; never leave indefinite dual acceptance. Changes that satisfy the active exact contracts need
+only the normal single rotation.
 
 Protected-main dispatches distinguish workflow snapshot `Q` from active gate `G`. Dispatch uses only
 `ref:"main"` in `stackpop/edgezero`, never a raw SHA or caller-selected branch. Require the exact
@@ -2565,10 +2596,13 @@ checker exactly as:
 check-build-container-publisher.sh --gate-root <canonical-G-root> --subject-root <canonical-subject-root> --gate-sha <G> --candidate-sha <T>
 ```
 
-The checker executes only from the clean, detached gate checkout at `G`. It reads the candidate's
+The checker executes for every candidate only from the clean, detached gate checkout at `G`. It reads the candidate's
 workflow files and complete workflow-name set as Git blobs from the full subject checkout at `T`; it
-never sources or executes candidate content. It validates `publish-build-container.yml`,
-`rotate-build-container-gate.yml`, and the absence of any third workflow claiming their shared
+never sources or executes candidate content. It normally requires the candidate protected CI,
+publisher, and rotation workflow execution graphs to equal active `G`; an active preparatory `G_p`
+may additionally admit only its one exact reviewed next graph. The checker validates publisher and rotation
+contracts; rejects dynamic environment selectors, any unapproved `build-container-release` consumer,
+any case-variant unapproved publisher-private-key reference, and any third workflow claiming the shared
 concurrency group. It emits no stdout on success and makes no network request. Runtime publisher-run
 and approval evidence is a separate responsibility of `verify-build-container-publication.sh`.
 
@@ -2991,6 +3025,11 @@ Caching remains off by default. Container execution and provenance validation ar
   lookup of the reviewed `<app-slug>[bot]` identity, retaining the workflow's installation-ID guard and
   final PR-author proof. It also defines same-source replacement head movement, permits reconciliation
   from an older ancestor base, and requires existing pin records to be mode-0644 blobs.
+- **v6.40:** closes the workflow-namespace credential gap by protecting every workflow path and
+  rejecting unapproved or dynamically selected release environments and publisher-private-key
+  references in every candidate. It also makes exact-validator evolution explicit: protected workflow,
+  image-context, and hard-coded toolchain changes use a bounded preparatory gate followed by a second
+  fully evidenced rotation that removes temporary dual acceptance.
 
 ## 13. Deferred implementation mechanics
 

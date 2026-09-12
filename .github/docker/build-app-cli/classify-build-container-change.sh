@@ -18,6 +18,7 @@ readonly RELEASE_REQUEST=.github/docker/build-app-cli/release-request.json
 readonly IMAGE_RECORD=.github/docker/build-app-cli/image.json
 readonly EVIDENCE_RECORD=.github/docker/build-app-cli/image-release-evidence.json
 readonly GATE_TEAM=@stackpop/edgezero-build-container-gate-reviewers
+readonly WORKFLOW_OWNER_PATTERN=/.github/workflows/
 readonly MAX_MANIFEST_BYTES=65536
 readonly MAX_RELEASE_REQUEST_BYTES=4096
 
@@ -191,9 +192,10 @@ validate_codeowners() {
   while IFS= read -r path; do
     printf '/%s %s\n' "$path" "$GATE_TEAM" >>"$expected"
   done <"$manifest"
+  printf '%s %s\n' "$WORKFLOW_OWNER_PATTERN" "$GATE_TEAM" >>"$expected"
   extract_tree_file "$root" "$revision" "$CODEOWNERS" "$actual" "CODEOWNERS"
   cmp -s "$expected" "$actual" ||
-    die "CODEOWNERS must assign every manifested path exactly to $GATE_TEAM"
+    die "CODEOWNERS must assign every manifested path and the workflow namespace exactly to $GATE_TEAM"
 }
 
 validate_manifest_at() {

@@ -17,7 +17,7 @@ contains the unchanged `{D, S, protocol}` record and prepublication adoption doc
 placeholder. After `P` qualifies, immutable stable release `V` is published at `P`; documentation
 revision `R` replaces the placeholders, and consumers pin `V`.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.39.
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.40.
 
 **Tooling:** Rust, Docker BuildKit/buildx, GHCR, GitHub Actions, Bash 3.2, `jq`, `gh`, `actionlint`,
 `shellcheck`, and `zizmor`.
@@ -212,7 +212,7 @@ Modify:
 ## 4. Task 0: Enforce exact-version external references repository-wide
 
 The current pin gate permits major/minor tags, prereleases, and commit SHAs. That is broader than
-v6.39 and must be narrowed before adding the write-privileged publisher.
+v6.40 and must be narrowed before adding the write-privileged publisher.
 
 **Files:**
 
@@ -702,7 +702,8 @@ write-image-release-record.sh --image-path <new-image-file> --evidence-path <new
       all classifier/verifier/policy/approval/updater/publisher-checker helpers,
       context manifest/Dockerfile/`.dockerignore`, their focused tests and `run.sh` wiring,
       `scripts/{install-actionlint,install-yq,run-actionlint}.sh`, the installer tests including
-      `install-yq.test.sh`, `.github/CODEOWNERS`,
+      `install-yq.test.sh`, `.github/CODEOWNERS` with exact manifest expansion plus directory-wide
+      `/.github/workflows/` ownership,
       `.github/zizmor.yml`, and
       all three container workflows (`build-container-ci.yml`, `publish-build-container.yml`, and
       `rotate-build-container-gate.yml`). Include exact `docs/package.json` and
@@ -867,7 +868,9 @@ scripts/run-actionlint.sh
 - [x] Implement the driver so all authority comes from its own canonical gate root. The subject root is
       read/build input only. It never sources, executes, or resolves a helper from the subject. A
       relevant pin invokes `verify-build-container-publication.sh`; the network-free structural
-      `check-build-container-publisher.sh` is reserved for inert gate-update/rollback workflow checks.
+      `check-build-container-publisher.sh` runs for every candidate, including ordinary
+      not-applicable candidates, so workflow-namespace credential ownership cannot be bypassed by
+      classification. Gate-update/rollback additionally run the inert candidate-context checks.
 - [x] Before classification in every stable job, have the trusted driver enumerate the complete tree
       at event-selected subject head `T`; select every direct `.github/workflows/*.{yml,yaml}` and every
       `action.{yml,yaml}` basename anywhere; require paths to use only `[A-Za-z0-9._/+-]`; reject
@@ -910,7 +913,7 @@ scripts/run-actionlint.sh
       environment-only named credentials, canonical regular-file structured inputs, absent create-new
       output paths, atomic no-replace publication, silent success, sanitized stderr, and exact exit
       statuses 0/1/2 for success/contract/usage-tooling failure.
-- [x] Implement only these four prerequisite-auditor command shapes from design v6.39; reject every
+- [x] Implement only these four prerequisite-auditor command shapes from design v6.40; reject every
       cross-mode, missing, duplicate, or extra flag before reading a credential:
 
 ```text
@@ -1272,7 +1275,12 @@ edgezero-build-container-pin-v1 {"evidence-url":"<exact-PR-comment-URL>","image-
       Its exact CLI is `check-build-container-publisher.sh --gate-root <canonical-G-root>
 --subject-root <canonical-subject-root> --gate-sha <G> --candidate-sha <T>`. It runs only from
       clean detached `G`, reads candidate workflows and the complete workflow-name set as Git blobs at
-      `T`, emits no stdout, and never executes candidate content. It rejects
+      `T`, emits no stdout, and never executes candidate content. Require candidate
+      `build-container-ci.yml`, publisher, and rotation execution graphs to equal active `G`, except
+      for the one exact next graph admitted by an active preparatory `G_p`. Every
+      other workflow must use only literal environment names; reject dynamic environment selectors,
+      case-insensitive use of `build-container-release`, and any case-variant occurrence of
+      `EDGEZERO_BUILD_CONTAINER_APP_PRIVATE_KEY`. It rejects
       changes to the gate-owned publisher topology, permissions, concurrency group, action versions,
       gate checkout, helper paths, output set, token ordering, package deletion/admin scope, build secret
       exposure, missing/late release-state and rotation checks, predictable/hard-coded/pre-verification
@@ -1493,6 +1501,15 @@ edgezero-build-container-pin-v1 {"evidence-url":"<exact-PR-comment-URL>","image-
 
 ### 6.6 Prove gate rotation and recovery before release
 
+- [ ] Exercise the required two-rotation evolution path for any protected workflow, exact
+      image-context/Dockerfile contract, or hard-coded tool version/checksum change. First land and
+      activate a preparatory gate `G_p` that leaves current protected workflows and image-context
+      bytes unchanged while its trusted validators accept exactly the current shape and one reviewed
+      next shape. Do not open a release request or create a release tag from `G_p`. Then land exact
+      `G_n`, collapse validation to only the new shape, and perform a second complete rotation whose
+      old gate is `G_p`. Preserve separate evidence and prerequisite transitions for both rotations;
+      reject generic ranges, unbounded dual acceptance, combining preparation and payload, publishing
+      between rotations, or abandoning `G_p` without the ordinary rollback protocol.
 - [ ] Add fixture/integration tests for a gate-update PR. Old `G` must require the protected base tree
       to match old `G` only on manifested paths, classify exactly `mode=gate-update`, accept changes only in the union of old and
       candidate manifests, validate canonical candidate manifest and CODEOWNERS coverage as inert data,
@@ -1769,7 +1786,7 @@ a digest from the mutable tag.
 
 Before declaring this plan complete, run two independent reviews:
 
-1. **Contract review:** compare every file and test with design v6.39 Sections 2 through 10. Verify one
+1. **Contract review:** compare every file and test with design v6.40 Sections 2 through 10. Verify one
    expected/package/validate wire authority, protected gate and image source `G`, isolated release
    request `S`, staged gate-only Docker context, API-visible exact post-merge `S` proof, forward-only
    pin ancestry, no tag runtime pull, no placeholder image digest/checksum, no `/work/package`

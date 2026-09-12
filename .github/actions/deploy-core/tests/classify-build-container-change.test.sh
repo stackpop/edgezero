@@ -97,6 +97,8 @@ write_codeowners() {
   while IFS= read -r path; do
     printf '/%s @stackpop/edgezero-build-container-gate-reviewers\n' "$path"
   done <"$manifest" >>.github/CODEOWNERS
+  printf '/.github/workflows/ @stackpop/edgezero-build-container-gate-reviewers\n' \
+    >>.github/CODEOWNERS
 }
 
 new_case() {
@@ -376,7 +378,7 @@ assert_fail 'a manifested symlink is not a gate file' classify local
 new_case
 printf 'owner drift\n' >>"$SUBJECT/.github/CODEOWNERS"
 commit_subject codeowners-drift
-assert_fail 'candidate CODEOWNERS must be the exact manifest expansion' classify local
+assert_fail 'candidate CODEOWNERS must be the exact manifest expansion plus workflow namespace' classify local
 
 new_case
 printf 'bad\n' >"$SUBJECT"/$'ambiguous\npath'

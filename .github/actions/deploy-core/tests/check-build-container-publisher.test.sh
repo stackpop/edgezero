@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd -P)
 CHECKER_REL=.github/docker/build-app-cli/check-build-container-publisher.sh
+CI_REL=.github/workflows/build-container-ci.yml
 PUBLISH_REL=.github/workflows/publish-build-container.yml
 ROTATE_REL=.github/workflows/rotate-build-container-gate.yml
 CHECKER="$ROOT/$CHECKER_REL"
@@ -19,7 +20,7 @@ no() { fail=$((fail + 1)); printf '  FAIL %s\n' "$1" >&2; }
 
 printf '== build container publisher structural checker ==\n'
 
-for required in "$CHECKER" "$ROOT/$PUBLISH_REL" "$ROOT/$ROTATE_REL"; do
+for required in "$CHECKER" "$ROOT/$CI_REL" "$ROOT/$PUBLISH_REL" "$ROOT/$ROTATE_REL"; do
   [[ -f "$required" && ! -L "$required" ]] || {
     printf 'missing required implementation file: %s\n' "$required" >&2
     exit 1
@@ -97,6 +98,7 @@ init_repo() {
   mkdir -p "$repo/.github/docker/build-app-cli" "$repo/.github/workflows" "$WORK/home"
   cp "$CHECKER" "$repo/$CHECKER_REL"
   chmod 0755 "$repo/$CHECKER_REL"
+  cp "$ROOT/$CI_REL" "$repo/$CI_REL"
   cp "$ROOT/$PUBLISH_REL" "$repo/$PUBLISH_REL"
   cp "$ROOT/$ROTATE_REL" "$repo/$ROTATE_REL"
   printf '%s\n' 'name: Unrelated' 'on: {push: null}' 'jobs: {}' >"$repo/.github/workflows/unrelated.yml"
@@ -130,6 +132,45 @@ else
   no 'accepts the reviewed publisher and rotation topology without stdout'
   sed -n '1,20p' "$WORK/stderr" >&2
 fi
+
+printf '%s\n' \
+  'name: Benign job' \
+  'on: {workflow_dispatch: null}' \
+  'jobs:' \
+  '  inspect:' \
+  '    runs-on: ubuntu-24.04' \
+  '    steps:' \
+  '      - run: echo ok' >"$SUBJECT/.github/workflows/benign.yml"
+git_env -C "$SUBJECT" add .github/workflows/benign.yml
+git_env -C "$SUBJECT" commit -qm benign-workflow
+BENIGN=$(git_env -C "$SUBJECT" rev-parse HEAD)
+if run_checker "$BENIGN" && [[ ! -s "$WORK/stdout" ]]; then
+  ok 'accepts an unrelated workflow with no environment'
+else
+  no 'accepts an unrelated workflow with no environment'
+  sed -n '1,5p' "$WORK/stderr" >&2
+fi
+git_env -C "$SUBJECT" reset --hard -q "$T"
+
+printf '%s\n' \
+  'name: Ordinary environment consumer' \
+  'on: {workflow_dispatch: null}' \
+  'jobs:' \
+  '  inspect:' \
+  '    runs-on: ubuntu-24.04' \
+  '    environment: integration' \
+  '    steps:' \
+  '      - run: echo ok' >"$SUBJECT/.github/workflows/ordinary-environment.yml"
+git_env -C "$SUBJECT" add .github/workflows/ordinary-environment.yml
+git_env -C "$SUBJECT" commit -qm ordinary-environment-workflow
+ORDINARY_ENVIRONMENT=$(git_env -C "$SUBJECT" rev-parse HEAD)
+if run_checker "$ORDINARY_ENVIRONMENT" && [[ ! -s "$WORK/stdout" ]]; then
+  ok 'accepts an unrelated workflow with a literal ordinary environment'
+else
+  no 'accepts an unrelated workflow with a literal ordinary environment'
+  sed -n '1,5p' "$WORK/stderr" >&2
+fi
+git_env -C "$SUBJECT" reset --hard -q "$T"
 
 if run_checker "$T" --gate-sha "$G"; then
   no 'rejects duplicate flags'
@@ -186,6 +227,8 @@ reject_mutation 'rejects updater execution from the subject checkout' "$PUBLISH_
 reject_mutation 'rejects token minting before approval verification' "$PUBLISH_REL" '.jobs.update-pin.steps |= ([.[0], .[1], .[2], .[3], .[4], .[6], .[5]] + .[7:])'
 reject_mutation 'rejects an always-run non-cleanup publisher step' "$PUBLISH_REL" '.jobs.update-pin.steps += [{"name":"masked","if":"${{ always() }}","run":"true"}]'
 
+reject_mutation 'rejects a changed protected preflight workflow' "$CI_REL" '.jobs.build-container-release-preflight.steps += [{"name":"extra","run":"true"}]'
+
 reject_mutation 'rejects a rotation push trigger' "$ROTATE_REL" '.on.push = null'
 reject_mutation 'rejects a different rotation concurrency group' "$ROTATE_REL" '.concurrency.group = "other"'
 reject_mutation 'rejects a late rotation guard' "$ROTATE_REL" '.jobs.acquire.steps |= [.[1], .[0]]'
@@ -234,6 +277,94 @@ git_env -C "$SUBJECT" add .github/workflows/collision.yml
 git_env -C "$SUBJECT" commit -qm dynamic-collision
 DYNAMIC_COLLISION=$(git_env -C "$SUBJECT" rev-parse HEAD)
 if run_checker "$DYNAMIC_COLLISION"; then no 'rejects a dynamically equivalent concurrency collision'; else ok 'rejects a dynamically equivalent concurrency collision'; fi
+restore_subject
+
+printf '%s\n' \
+  'name: Unexpected release consumer' \
+  'on:' \
+  '  push:' \
+  '    tags: [build-container-v*]' \
+  'jobs:' \
+  '  consume:' \
+  '    runs-on: ubuntu-24.04' \
+  '    environment:' \
+  '      name: build-container-release' \
+  '      deployment: false' \
+  '    steps:' \
+  '      - run: true' >"$SUBJECT/.github/workflows/release-consumer.yml"
+git_env -C "$SUBJECT" add .github/workflows/release-consumer.yml
+git_env -C "$SUBJECT" commit -qm release-consumer
+RELEASE_CONSUMER=$(git_env -C "$SUBJECT" rev-parse HEAD)
+if run_checker "$RELEASE_CONSUMER"; then no 'rejects a third workflow using the release environment'; else ok 'rejects a third workflow using the release environment'; fi
+restore_subject
+
+printf '%s\n' \
+  'name: Case-variant release consumer' \
+  'on: {workflow_dispatch: null}' \
+  'jobs:' \
+  '  consume:' \
+  '    runs-on: ubuntu-24.04' \
+  '    environment: BUILD-CONTAINER-RELEASE' \
+  '    steps:' \
+  '      - run: true' >"$SUBJECT/.github/workflows/release-consumer.yml"
+git_env -C "$SUBJECT" add .github/workflows/release-consumer.yml
+git_env -C "$SUBJECT" commit -qm case-variant-release-consumer
+CASE_RELEASE_CONSUMER=$(git_env -C "$SUBJECT" rev-parse HEAD)
+if run_checker "$CASE_RELEASE_CONSUMER"; then no 'rejects a case-variant release environment'; else ok 'rejects a case-variant release environment'; fi
+restore_subject
+
+printf '%s\n' \
+  'name: Dynamic environment consumer' \
+  'on: {workflow_dispatch: null}' \
+  'jobs:' \
+  '  consume:' \
+  '    runs-on: ubuntu-24.04' \
+  '    environment: ${{ inputs.environment }}' \
+  '    steps:' \
+  '      - run: true' >"$SUBJECT/.github/workflows/release-consumer.yml"
+git_env -C "$SUBJECT" add .github/workflows/release-consumer.yml
+git_env -C "$SUBJECT" commit -qm dynamic-environment-consumer
+DYNAMIC_ENVIRONMENT=$(git_env -C "$SUBJECT" rev-parse HEAD)
+if run_checker "$DYNAMIC_ENVIRONMENT"; then no 'rejects a third workflow with an unprovable environment'; else ok 'rejects a third workflow with an unprovable environment'; fi
+restore_subject
+
+printf '%s\n' \
+  'name: Private key consumer' \
+  'on: {workflow_dispatch: null}' \
+  'jobs:' \
+  '  consume:' \
+  '    runs-on: ubuntu-24.04' \
+  '    steps:' \
+  '      - env:' \
+  '          PRIVATE_KEY: ${{ secrets.EDGEZERO_BUILD_CONTAINER_APP_PRIVATE_KEY }}' \
+  '        run: true' >"$SUBJECT/.github/workflows/release-consumer.yml"
+git_env -C "$SUBJECT" add .github/workflows/release-consumer.yml
+git_env -C "$SUBJECT" commit -qm private-key-consumer
+PRIVATE_KEY_CONSUMER=$(git_env -C "$SUBJECT" rev-parse HEAD)
+if run_checker "$PRIVATE_KEY_CONSUMER"; then no 'rejects a third workflow referencing the publisher private key'; else ok 'rejects a third workflow referencing the publisher private key'; fi
+restore_subject
+
+printf '%s\n' \
+  'name: Case-variant private key consumer' \
+  'on: {workflow_dispatch: null}' \
+  'jobs:' \
+  '  consume:' \
+  '    runs-on: ubuntu-24.04' \
+  '    steps:' \
+  '      - env:' \
+  '          PRIVATE_KEY: ${{ secrets.edgezero_build_container_app_private_key }}' \
+  '        run: true' >"$SUBJECT/.github/workflows/release-consumer.yml"
+git_env -C "$SUBJECT" add .github/workflows/release-consumer.yml
+git_env -C "$SUBJECT" commit -qm case-variant-private-key-consumer
+CASE_PRIVATE_KEY_CONSUMER=$(git_env -C "$SUBJECT" rev-parse HEAD)
+if run_checker "$CASE_PRIVATE_KEY_CONSUMER"; then
+  no 'rejects a case-variant publisher private-key reference'
+elif grep -Fq 'release environment or publisher private key' "$WORK/stderr"; then
+  ok 'rejects a case-variant publisher private-key reference'
+else
+  sed -n '1,5p' "$WORK/stderr" >&2
+  no 'rejects a case-variant publisher private-key reference'
+fi
 restore_subject
 
 printf '%s\n' \

@@ -9,7 +9,7 @@
 full-SHA app identity and explicit inputs, publish exact stable action version `V`, then activate
 synchronized runnable documentation at revision `R` without ever merging an unpublished version ref.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.39 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.40 Sections
 3.3, 5.1, 5.2, 5.4, 7, 9, and 10, plus the parent deploy lifecycle contract.
 
 ## 1. Release structure
@@ -236,7 +236,7 @@ synchronized runnable documentation at revision `R` without ever merging an unpu
 - [ ] Run every protocol, cache, image, launcher, source-freeze, provider, workflow, fixture, docs/pin,
       actionlint, zizmor, shellcheck, Rust, and local integration suite at one clean candidate descended
       from `B`. Confirm `image.json` remains reviewed `{D,S,protocol}`.
-- [ ] Run independent contract and release-adversary reviews against design v6.39, including exact-tag
+- [ ] Run independent contract and release-adversary reviews against design v6.40, including exact-tag
       policy, third-party tag movement risk, EdgeZero immutable releases, action-version mixing,
       substitution, identity replay, malformed artifacts, host/container races, source mutation,
       generated-output escape, credential flow, cache disclosure, rollback, and cancellation.

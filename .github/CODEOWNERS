@@ -106,3 +106,4 @@
 /scripts/install-actionlint.sh @stackpop/edgezero-build-container-gate-reviewers
 /scripts/install-yq.sh @stackpop/edgezero-build-container-gate-reviewers
 /scripts/run-actionlint.sh @stackpop/edgezero-build-container-gate-reviewers
+/.github/workflows/ @stackpop/edgezero-build-container-gate-reviewers

@@ -10,6 +10,7 @@ GATE_MANIFEST="$ROOT/.github/docker/build-app-cli/gate-paths.txt"
 IMAGE_MANIFEST="$ROOT/.github/docker/build-app-cli/image-context-paths.txt"
 CODEOWNERS="$ROOT/.github/CODEOWNERS"
 PLAN="$ROOT/docs/superpowers/plans/2026-08-20-build-cache-container.md"
+SPEC="$ROOT/docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -18,12 +19,23 @@ trap 'rm -rf "$WORK"' EXIT
   exit 1
 }
 
-for required in "$GATE_MANIFEST" "$IMAGE_MANIFEST" "$CODEOWNERS" "$PLAN"; do
+for required in "$GATE_MANIFEST" "$IMAGE_MANIFEST" "$CODEOWNERS" "$PLAN" "$SPEC"; do
   [[ -f "$required" && ! -L "$required" ]] || {
     printf 'missing regular gate contract file: %s\n' "$required" >&2
     exit 1
   }
 done
+
+for contract in "$PLAN" "$SPEC"; do
+  grep -Fq 'preparatory gate `G_p`' "$contract" || {
+    printf 'gate contract omits the preparatory-rotation protocol: %s\n' "$contract" >&2
+    exit 1
+  }
+done
+grep -Fq 'dynamic environment selectors' "$SPEC" || {
+  printf 'spec omits the protected environment namespace contract\n' >&2
+  exit 1
+}
 
 LC_ALL=C sort -cu "$GATE_MANIFEST"
 LC_ALL=C sort -cu "$IMAGE_MANIFEST"
@@ -34,8 +46,9 @@ EXPECTED_CODEOWNERS="$WORK/CODEOWNERS.expected"
 while IFS= read -r path; do
   printf '/%s @stackpop/edgezero-build-container-gate-reviewers\n' "$path"
 done <"$GATE_MANIFEST" >"$EXPECTED_CODEOWNERS"
+printf '/.github/workflows/ @stackpop/edgezero-build-container-gate-reviewers\n' >>"$EXPECTED_CODEOWNERS"
 cmp -s "$EXPECTED_CODEOWNERS" "$CODEOWNERS" || {
-  printf 'CODEOWNERS is not the exact gate-manifest expansion\n' >&2
+  printf 'CODEOWNERS is not the exact gate-manifest expansion plus workflow namespace\n' >&2
   exit 1
 }
 
@@ -77,8 +90,9 @@ while IFS= read -r path; do
   }
   printf '/%s @stackpop/edgezero-build-container-gate-reviewers\n' "$path"
 done <"$GATE_MANIFEST" >"$WORK/codeowners.expected"
+printf '/.github/workflows/ @stackpop/edgezero-build-container-gate-reviewers\n' >>"$WORK/codeowners.expected"
 cmp -s "$WORK/codeowners.expected" "$CODEOWNERS" || {
-  printf 'CODEOWNERS is not the exact gate-manifest expansion\n' >&2
+  printf 'CODEOWNERS is not the exact gate-manifest expansion plus workflow namespace\n' >&2
   exit 1
 }
 

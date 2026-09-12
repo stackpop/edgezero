@@ -7,7 +7,7 @@
 CLI artifact and make every consumer independently validate exact caller and platform identity before
 the binary can execute.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.39 Sections
+**Spec:** `docs/superpowers/specs/2026-08-20-edgezero-deploy-build-caching-design.md` v6.40 Sections
 3, 5.1, 5.3, 5.4, 6, 7, and 9.
 
 ## 1. Fixed actions and boundaries

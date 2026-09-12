@@ -9,6 +9,7 @@ export ENV=
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CEILING_DIRECTORIES
 
+readonly CI=.github/workflows/build-container-ci.yml
 readonly PUBLISH=.github/workflows/publish-build-container.yml
 readonly ROTATE=.github/workflows/rotate-build-container-gate.yml
 readonly GROUP=edgezero-build-container-publication
@@ -166,6 +167,7 @@ WORKFLOW_LIST="$WORK/workflows"
 repo_git "$SUBJECT_ROOT" ls-tree -r --name-only "$CANDIDATE_SHA" -- .github/workflows >"$WORKFLOW_LIST" ||
   die "cannot enumerate candidate workflows"
 
+CI_FILE=
 PUBLISH_FILE=
 ROTATE_FILE=
 workflow_count=0
@@ -185,6 +187,7 @@ while IFS= read -r path; do
     "$output" >"$parsed" 2>/dev/null || die "candidate workflow is not valid YAML"
   jq -e '.aliases == [] and .duplicates == [] and (.document | type) == "object"' "$parsed" >/dev/null ||
     die "candidate workflow has aliases, duplicate keys, or wrong shape"
+  if [[ "$path" == "$CI" ]]; then CI_FILE=$parsed; fi
   if [[ "$path" == "$PUBLISH" ]]; then PUBLISH_FILE=$parsed; fi
   if [[ "$path" == "$ROTATE" ]]; then ROTATE_FILE=$parsed; fi
   groups="$WORK/workflow-$workflow_count.groups"
@@ -197,7 +200,21 @@ while IFS= read -r path; do
     (.document.concurrency.group? // empty),
     (.document.jobs[]?.concurrency.group? // empty)
   ][]' "$parsed" >"$groups"
-  if [[ "$path" != "$PUBLISH" && "$path" != "$ROTATE" ]]; then
+  if [[ "$path" != "$CI" && "$path" != "$PUBLISH" && "$path" != "$ROTATE" ]]; then
+    jq -e '
+      def environment_name:
+        if type == "string" then .
+        elif type == "object" and (.name | type) == "string" then .name
+        else null
+        end;
+      ([.document.jobs[]? | select(has("environment")) | .environment |
+        environment_name as $name |
+        select($name == null or ($name | contains("${{")) or
+          ($name | ascii_downcase) == "build-container-release")] | length) == 0 and
+      ([.document | .. | strings |
+        select(ascii_downcase | contains("edgezero_build_container_app_private_key"))] | length) == 0
+    ' "$parsed" >/dev/null ||
+      die "a third workflow can select the release environment or publisher private key"
     while IFS= read -r group; do
       if [[ "$group" == *"\${{"* ]]; then
         [[ "$group" == "\${{ github.workflow }}-\${{ github.ref }}" ]] ||
@@ -209,7 +226,8 @@ while IFS= read -r path; do
   fi
   workflow_count=$((workflow_count + 1))
 done <"$WORKFLOW_LIST"
-[[ -n "$PUBLISH_FILE" && -n "$ROTATE_FILE" ]] || die "publisher or rotation workflow is absent"
+[[ -n "$CI_FILE" && -n "$PUBLISH_FILE" && -n "$ROTATE_FILE" ]] ||
+  die "gate, publisher, or rotation workflow is absent"
 
 parse_gate_workflow() {
   local path=$1 name=$2 destination_name=$3 entry output parsed
@@ -229,10 +247,14 @@ parse_gate_workflow() {
   printf -v "$destination_name" '%s' "$parsed"
 }
 
+GATE_CI_FILE=
 GATE_PUBLISH_FILE=
 GATE_ROTATE_FILE=
+parse_gate_workflow "$CI" gate GATE_CI_FILE
 parse_gate_workflow "$PUBLISH" publisher GATE_PUBLISH_FILE
 parse_gate_workflow "$ROTATE" rotation GATE_ROTATE_FILE
+jq -e --slurpfile gate "$GATE_CI_FILE" '.document == $gate[0].document' "$CI_FILE" >/dev/null ||
+  die "gate workflow execution graph differs from the active gate"
 jq -e --slurpfile gate "$GATE_PUBLISH_FILE" '.document == $gate[0].document' "$PUBLISH_FILE" >/dev/null ||
   die "publisher workflow execution graph differs from the active gate"
 jq -e --slurpfile gate "$GATE_ROTATE_FILE" '.document == $gate[0].document' "$ROTATE_FILE" >/dev/null ||
