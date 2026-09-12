@@ -1,10 +1,16 @@
-#![expect(
-    clippy::arbitrary_source_item_ordering,
-    reason = "the target-gated implementation module is kept before shared test seams"
+#![cfg_attr(
+    feature = "fastly",
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "the target-gated implementation module is kept before shared test seams"
+    )
 )]
-#![expect(
-    clippy::pub_use,
-    reason = "the target-gated implementation keeps Fastly imports out of native builds"
+#![cfg_attr(
+    feature = "fastly",
+    expect(
+        clippy::pub_use,
+        reason = "the target-gated implementation keeps Fastly imports out of native builds"
+    )
 )]
 
 #[cfg(test)]
