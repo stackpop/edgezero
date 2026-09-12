@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs'
 
 const capabilityPath = 'docs/guide/capabilities.md'
+const outboundSpecPath =
+  'docs/superpowers/specs/2026-05-21-outbound-http-design.md'
 const sidebarPath = 'docs/.vitepress/config.mts'
 const expectedHeader = [
   'Capability',
@@ -33,6 +35,22 @@ const expectedIngressRows = [
     'Unsupported',
     'Unsupported',
     'Unsupported',
+  ],
+]
+const expectedConfigRows = [
+  [
+    'config-read-allocation-bounds',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+    'Unsupported',
+  ],
+  [
+    'config-read-deadlines',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
   ],
 ]
 const expectedOutboundRows = [
@@ -239,6 +257,11 @@ const matrices = [
     readMatrix(findMatrixHeader('Ingress Matrix', 'ingress'), 'ingress'),
   ],
   [
+    'config',
+    expectedConfigRows,
+    readMatrix(findMatrixHeader('Config Matrix', 'config'), 'config'),
+  ],
+  [
     'response egress',
     expectedResponseEgressRows,
     readMatrix(
@@ -258,6 +281,29 @@ for (const [name, expectedRows, actualRows] of matrices) {
       `${name} capability matrix mismatch\nexpected=${JSON.stringify(expectedRows)}\nactual=${JSON.stringify(actualRows)}`,
     )
   }
+}
+
+let outboundSpecSource
+try {
+  outboundSpecSource = readFileSync(outboundSpecPath, 'utf8')
+} catch (error) {
+  fail(`cannot read ${outboundSpecPath}: ${error.message}`)
+}
+
+if (!outboundSpecSource.includes('## 2. Historical implementation baseline')) {
+  fail(
+    'outbound specification must label section 2 as a historical implementation baseline',
+  )
+}
+if (outboundSpecSource.includes('## 2. Current state (summary)')) {
+  fail(
+    'outbound specification still labels its historical baseline as current state',
+  )
+}
+if (outboundSpecSource.includes("Today's Fastly client")) {
+  fail(
+    'outbound specification still describes the historical Fastly client as current',
+  )
 }
 
 const limitsHeadingIndex = lines.findIndex(
