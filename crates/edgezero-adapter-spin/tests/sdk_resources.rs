@@ -1,4 +1,4 @@
-#![cfg(all(target_arch = "wasm32", feature = "test-utils"))]
+#![cfg(all(feature = "spin", feature = "test-utils", target_arch = "wasm32"))]
 
 #[cfg(test)]
 #[expect(

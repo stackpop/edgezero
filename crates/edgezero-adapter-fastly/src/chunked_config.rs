@@ -139,7 +139,11 @@ impl ResolveFailure {
 
     /// Is this a newer format this build must not overwrite (vs. repairable
     /// corruption)?
-    #[cfg(any(feature = "cli", feature = "fastly", test))]
+    #[cfg(any(
+        feature = "fastly",
+        test,
+        all(feature = "cli", not(target_arch = "wasm32"))
+    ))]
     pub(crate) fn is_future_format(&self) -> bool {
         matches!(self, Self::FutureFormat(_))
     }
@@ -153,7 +157,7 @@ struct FastlyChunkRef {
 }
 
 /// A chunk reference from a validated pointer, for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) struct GcChunkRef {
     pub key: String,
     pub len: usize,
@@ -161,7 +165,7 @@ pub(crate) struct GcChunkRef {
 }
 
 /// A validated v1 pointer's contents, for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) struct GcPointer {
     /// Validated: non-empty, one generation, dense `0..n-1` in order.
     pub chunks: Vec<GcChunkRef>,
@@ -170,7 +174,7 @@ pub(crate) struct GcPointer {
 }
 
 /// What a root's value IS, once classified for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) enum GcRootValue {
     /// A valid v1 chunk pointer. Its METADATA is validated; its CONTENT must
     /// still be verified against the store -- see [`gc_verify_generation`].
@@ -259,7 +263,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// characters (extremely unlikely in practice; recommends restructuring).
 /// Reject a physical Config Store key that exceeds the store's key limit,
 /// before any write is attempted.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 fn check_config_key_len(key: &str) -> Result<(), String> {
     // CHARACTERS, not bytes: Fastly's limit is a character count, so a non-ASCII
     // `--key` must be measured by `chars().count()`, not `len()` (UTF-8 bytes).
@@ -276,7 +280,7 @@ fn check_config_key_len(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
@@ -470,7 +474,7 @@ pub(crate) fn verify_writer_split_layout(
 /// Only the GC path (`cli.rs`) needs it; the runtime resolver inlines the same
 /// mapping, so this is gated to the `cli` feature to stay dead-code-free in the
 /// guest build.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub(crate) fn chunk_lengths(chunks: &[GcChunkRef]) -> Vec<usize> {
     chunks.iter().map(|chunk| chunk.len).collect()
 }
@@ -837,7 +841,7 @@ where
 ///   but fails validation: malformed, unsupported `version`, or a
 ///   referenced key falls outside this root's chunk prefix. Callers log
 ///   `msg` as a warning and skip GC for this root (delete nothing).
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>, String> {
     // 1. Parse loosely. Not-JSON, or not our pointer kind => silent.
     let value: serde_json::Value = match serde_json::from_str(raw) {
@@ -1075,7 +1079,7 @@ pub(crate) fn value_is_pointer_kind(raw: &str) -> bool {
 /// a malformed object (a possible truncated/corrupt pointer whose chunk
 /// references we cannot read), an unknown-kind value, and a pointer: those must
 /// fail closed, because assuming they reference no chunks could orphan live ones.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
     matches!(classify_root_value(raw), RootValueKind::Foreign)
 }
@@ -1088,7 +1092,7 @@ pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
 /// envelope fragment that announces nothing, so anything that DOES announce is
 /// suspicious (a parked pointer, a future-format value) and must be classified,
 /// not blindly treated as a deletable fragment.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn value_announces_our_kind(raw: &str) -> bool {
     matches!(
         classify_root_value(raw),
@@ -1170,7 +1174,7 @@ pub(crate) fn value_is_future_format(raw: &str) -> bool {
 /// every metadata check still passes while the dropped chunk silently leaves the
 /// live set. Callers MUST reconstruct the referenced chunks and put them through
 /// [`gc_verify_generation`] before trusting the live set.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue, String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -1268,7 +1272,7 @@ pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue,
 ///   chunk list is not the true live set);
 /// - a delete candidate's generation must reconstruct a real envelope (a
 ///   necessary, but not sufficient, condition for reclaiming it).
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Result<(), String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -1309,7 +1313,7 @@ pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Res
 /// This is how reclamation groups the store's ACTUAL keys into generations. It
 /// validates the shape (`<root>.__edgezero_chunks.<hex-sha>.<index>`) rather
 /// than trusting it: a hand-edited or foreign key never becomes a delete target.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> {
     chunk_key_parts(root_key, key).map(|(generation, _)| generation)
 }
@@ -1320,7 +1324,7 @@ pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> 
 /// `config gc` uses this to order a proven generation's chunks by writer index
 /// before deleting, so preview and failure-recovery order do not depend on the
 /// remote listing order.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn chunk_key_index(root_key: &str, key: &str) -> Option<usize> {
     chunk_key_parts(root_key, key).map(|(_, index)| index)
 }

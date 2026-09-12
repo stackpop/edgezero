@@ -177,3 +177,4 @@ std_instead_of_core = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = "deny"

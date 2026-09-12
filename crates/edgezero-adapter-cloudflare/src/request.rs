@@ -374,10 +374,8 @@ where
                 ));
             }
 
-            #[cfg(target_arch = "wasm32")]
             Delay::from(Duration::ZERO).await;
 
-            #[cfg(target_arch = "wasm32")]
             let item = {
                 let Some(remaining) = deadline.remaining_at(clock.now()) else {
                     return Some((
@@ -401,8 +399,6 @@ where
                     Either::Right((item, _)) => item,
                 }
             };
-            #[cfg(not(target_arch = "wasm32"))]
-            let item = body_stream.next().await;
             if deadline.is_expired_at(clock.now()) {
                 return Some((
                     Err(EdgeError::request_timeout(

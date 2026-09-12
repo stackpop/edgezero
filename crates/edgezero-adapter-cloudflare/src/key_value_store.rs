@@ -7,26 +7,19 @@
 //! This module is only compiled when the `cloudflare` feature is enabled
 //! and the target is `wasm32`.
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use async_trait::async_trait;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use bytes::Bytes;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use std::time::Duration;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::kv::KvStore as WorkerKvStore;
 
 /// KV store backed by Cloudflare Workers KV.
 ///
 /// Wraps a `worker::kv::KvStore` handle obtained via the environment binding.
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub struct CloudflareKvStore {
     store: WorkerKvStore,
 }
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 impl CloudflareKvStore {
     /// Create a new Cloudflare KV store from the environment binding name.
     ///
@@ -45,7 +38,6 @@ impl CloudflareKvStore {
     }
 }
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl KvStore for CloudflareKvStore {
     #[inline]

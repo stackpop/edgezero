@@ -19,7 +19,7 @@ pub mod secret_store;
 #[cfg(feature = "axum")]
 pub mod service;
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 
 #[cfg(test)]

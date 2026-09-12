@@ -1,8 +1,8 @@
 #![cfg_attr(
-    all(feature = "cloudflare", target_arch = "wasm32"),
+    any(test, all(feature = "cloudflare", target_arch = "wasm32")),
     expect(
         clippy::arbitrary_source_item_ordering,
-        reason = "the target-gated implementation module is kept before shared test seams"
+        reason = "target and test helper modules stay adjacent to the imports that define their boundaries"
     )
 )]
 #![cfg_attr(
@@ -19,53 +19,65 @@ use edgezero_core::error::EdgeError;
     feature = "test-utils"
 ))]
 use edgezero_core::error::{BadGatewayReason, BudgetSource};
-#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
-use edgezero_core::http::{HeaderMap, HeaderName};
+#[cfg(any(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    feature = "test-utils"
+))]
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
-#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
-use std::str;
 
 #[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResetContentAction {
-    Abort,
-    Disarm,
-    InspectStream,
-}
+mod header_bridge {
+    use std::str;
 
-#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
-pub(crate) trait HeaderSink {
-    fn append(&mut self, name: &str, value: &str) -> Result<(), EdgeError>;
-}
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::{HeaderMap, HeaderName};
 
-#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
-pub(crate) fn copy_header_values<Sink, InvalidValue>(
-    source: &HeaderMap,
-    sink: &mut Sink,
-    invalid_value: InvalidValue,
-) -> Result<(), EdgeError>
-where
-    Sink: HeaderSink,
-    InvalidValue: Fn(&HeaderName) -> EdgeError,
-{
-    for (name, value) in source {
-        let header_value =
-            str::from_utf8(value.as_bytes()).map_err(|_encoding_error| invalid_value(name))?;
-        sink.append(name.as_str(), header_value)?;
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum ResetContentAction {
+        Abort,
+        Disarm,
+        InspectStream,
     }
-    Ok(())
+
+    pub(crate) trait HeaderSink {
+        fn append(&mut self, name: &str, value: &str) -> Result<(), EdgeError>;
+    }
+
+    pub(crate) fn copy_header_values<Sink, InvalidValue>(
+        source: &HeaderMap,
+        sink: &mut Sink,
+        invalid_value: InvalidValue,
+    ) -> Result<(), EdgeError>
+    where
+        Sink: HeaderSink,
+        InvalidValue: Fn(&HeaderName) -> EdgeError,
+    {
+        for (name, value) in source {
+            let header_value =
+                str::from_utf8(value.as_bytes()).map_err(|_encoding_error| invalid_value(name))?;
+            sink.append(name.as_str(), header_value)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn reset_content_action(
+        declared_body: bool,
+        native_body_is_empty: bool,
+    ) -> ResetContentAction {
+        if declared_body {
+            ResetContentAction::Abort
+        } else if native_body_is_empty {
+            ResetContentAction::Disarm
+        } else {
+            ResetContentAction::InspectStream
+        }
+    }
 }
 
 #[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
-fn reset_content_action(declared_body: bool, native_body_is_empty: bool) -> ResetContentAction {
-    if declared_body {
-        ResetContentAction::Abort
-    } else if native_body_is_empty {
-        ResetContentAction::Disarm
-    } else {
-        ResetContentAction::InspectStream
-    }
-}
+pub(crate) use header_bridge::copy_header_values;
+#[cfg(any(all(feature = "cloudflare", target_arch = "wasm32"), test))]
+use header_bridge::{HeaderSink, ResetContentAction, reset_content_action};
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 impl HeaderSink for worker::Headers {
@@ -1283,6 +1295,10 @@ fn timeout_error(cause: BudgetSource) -> EdgeError {
     EdgeError::gateway_timeout_caused("outbound request deadline expired", cause)
 }
 
+#[cfg(any(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    feature = "test-utils"
+))]
 fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_for_dispatch(request)?;
     if request.is_stream_body() {
@@ -1328,7 +1344,7 @@ pub fn timeout_error_for_test(cause: BudgetSource) -> EdgeError {
 mod header_bridge_tests {
     use std::collections::BTreeMap;
 
-    use edgezero_core::http::HeaderValue;
+    use edgezero_core::http::{HeaderMap, HeaderValue};
 
     use super::*;
 

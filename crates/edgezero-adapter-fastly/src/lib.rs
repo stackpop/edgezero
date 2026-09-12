@@ -4,9 +4,13 @@
 // Only compiled where it is actually used (the CLI push/GC path and the Fastly
 // runtime resolver). Gating it keeps a `--no-default-features` build dead-code
 // clean instead of dragging in helpers no feature references.
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(
+    feature = "fastly",
+    test,
+    all(feature = "cli", not(target_arch = "wasm32"))
+))]
 pub(crate) mod chunked_config;
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 #[cfg(feature = "fastly")]
 pub mod config_store;
@@ -15,7 +19,7 @@ pub mod context;
 pub mod key_value_store;
 #[cfg(feature = "fastly")]
 pub mod logger;
-#[cfg(any(feature = "test-utils", feature = "fastly"))]
+#[cfg(any(test, feature = "test-utils", feature = "fastly"))]
 pub mod outbound;
 #[cfg(feature = "fastly")]
 pub mod request;
@@ -37,7 +41,7 @@ use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use fastly::compute_runtime::service_id;
 
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
@@ -109,7 +113,7 @@ impl From<&EnvConfig> for FastlyLogging {
 /// The shared `edgezero_runtime_env` Config Store is account-wide. Service
 /// scoping prevents two linked services that declare the same logical store id
 /// from overwriting one another's runtime mappings.
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 fn service_scoped_runtime_env_key(service_id: &str, canonical_key: &str) -> String {
     let suffix = canonical_key
         .strip_prefix(RUNTIME_ENV_PREFIX)
@@ -239,7 +243,10 @@ pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
     EnvConfig::from_vars(vars)
 }
 
-#[cfg(any(feature = "fastly", test))]
+#[cfg(any(
+    feature = "fastly",
+    all(feature = "cli", test, not(target_arch = "wasm32"))
+))]
 fn runtime_env_vars_for_service<F>(
     stores: StoresMetadata,
     service_id: &str,

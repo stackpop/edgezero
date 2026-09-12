@@ -4,28 +4,19 @@
 //! `FastlySecretStore`, which opens a named Fastly `SecretStore` on
 //! each lookup.
 
-#[cfg(feature = "fastly")]
 use crate::chunked_config::{SyncHostCallError, exact_fastly_read, run_sync_host_call};
-#[cfg(feature = "fastly")]
 use async_trait::async_trait;
-#[cfg(feature = "fastly")]
 use bytes::Bytes;
-#[cfg(feature = "fastly")]
 use edgezero_core::Deadline;
-#[cfg(feature = "fastly")]
 use edgezero_core::config_store::BoundedStoreRead;
-#[cfg(feature = "fastly")]
 use edgezero_core::secret_store::{SecretError, SecretStore};
-#[cfg(feature = "fastly")]
 use fastly::secret_store::SecretStore as FastlyNativeSecretStore;
 
 /// Internal helper that opens a single named Fastly `SecretStore`.
-#[cfg(feature = "fastly")]
 pub struct FastlyNamedStore {
     store: FastlyNativeSecretStore,
 }
 
-#[cfg(feature = "fastly")]
 impl FastlyNamedStore {
     fn get_bytes_bounded_sync(
         &self,
@@ -100,10 +91,8 @@ impl FastlyNamedStore {
 ///
 /// Opens the named store per call — `FastlyNamedStore::open` is cheap
 /// (no network; just a handle) so there is no caching.
-#[cfg(feature = "fastly")]
 pub struct FastlySecretStore;
 
-#[cfg(feature = "fastly")]
 #[async_trait(?Send)]
 impl SecretStore for FastlySecretStore {
     #[inline]
@@ -126,7 +115,6 @@ impl SecretStore for FastlySecretStore {
     }
 }
 
-#[cfg(feature = "fastly")]
 fn map_sync_secret_error(call_error: SyncHostCallError<SecretError>) -> SecretError {
     match call_error {
         SyncHostCallError::Backend(backend_error) => backend_error,

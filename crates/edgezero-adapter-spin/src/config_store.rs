@@ -30,9 +30,6 @@ enum SpinConfigBackend {
         label: String,
         store: SpinSdkKvStore,
     },
-    /// Never constructed; keeps the enum inhabited outside production Spin and tests.
-    #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
-    _Uninhabited(std::convert::Infallible),
 }
 
 impl SpinConfigStore {
@@ -103,11 +100,6 @@ impl ConfigStore for SpinConfigStore {
                     "store `{label}`: {err}"
                 ))),
             },
-            #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
-            SpinConfigBackend::_Uninhabited(never) => {
-                let _: &str = key;
-                match *never {}
-            }
         }
     }
 

@@ -13,6 +13,7 @@ use std::time::Duration;
 use edgezero_core::error::EdgeError;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::error::{BadGatewayReason, BudgetSource};
+#[cfg(any(feature = "fastly", feature = "test-utils"))]
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 #[cfg(test)]
 use edgezero_core::time::Deadline;
@@ -2182,6 +2183,7 @@ pub use fastly_impl::inject_dispatch_slack_for_test;
 #[cfg(feature = "fastly")]
 pub use fastly_impl::{DYNAMIC_BACKENDS_DISABLED_MESSAGE, FastlyOutboundClient};
 
+#[cfg(any(feature = "fastly", feature = "test-utils"))]
 fn dispatch_all_before_wait<Item, Pending, Failure>(
     items: impl IntoIterator<Item = Item>,
     dispatch: impl FnMut(Item) -> Result<Pending, Failure>,
@@ -2189,6 +2191,7 @@ fn dispatch_all_before_wait<Item, Pending, Failure>(
     items.into_iter().map(dispatch).collect()
 }
 
+#[cfg(any(feature = "fastly", feature = "test-utils"))]
 fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_for_dispatch(request)?;
     if request.is_stream_body() {

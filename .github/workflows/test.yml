@@ -101,6 +101,12 @@ jobs:
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
+      - name: Check native adapter feature matrices
+        run: |
+          for adapter in axum cloudflare fastly spin; do
+            bash scripts/check_adapter_feature_matrix.sh "${adapter}" native
+          done
+
       - name: Verify a generated project compiles
         run: scripts/run_test_nonzero.sh --ignored generated_workspace_compiles cargo test --offline --locked -p edgezero-cli --test generated_project_builds
 
@@ -299,5 +305,5 @@ jobs:
         working-directory: crates/edgezero-adapter-fastly
         run: ../../scripts/run_test_nonzero.sh backend_creation_error_table_is_exhaustive cargo test --offline --locked --no-default-features --features fastly,test-utils --lib
 
-      - name: Check ${{ matrix.adapter }} wasm target
-        run: cargo check --offline --locked -p edgezero-adapter-${{ matrix.adapter }} --no-default-features --features ${{ matrix.adapter }} --target ${{ matrix.target }}
+      - name: Check ${{ matrix.adapter }} wasm feature matrix
+        run: bash scripts/check_adapter_feature_matrix.sh ${{ matrix.adapter }} ${{ matrix.target }}
