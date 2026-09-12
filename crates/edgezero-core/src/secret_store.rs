@@ -26,7 +26,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use crate::config_store::BoundedStoreRead;
 use crate::error::EdgeError;
+use crate::time::Deadline;
 
 // ---------------------------------------------------------------------------
 // Contract test macro
@@ -111,6 +113,10 @@ pub const MAX_NAME_LEN: usize = 512;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SecretError {
+    /// The absolute read deadline expired before a complete value was available.
+    #[error("secret store read deadline exceeded")]
+    DeadlineExceeded,
+
     /// A general internal error.
     #[error("secret store error: {0}")]
     Internal(#[from] anyhow::Error),
@@ -126,18 +132,28 @@ pub enum SecretError {
     /// A validation error (e.g., invalid secret name).
     #[error("validation error: {0}")]
     Validation(String),
+
+    /// The value or guest-visible backend read exceeded its supplied allowance.
+    #[error("secret value exceeds configured byte limit")]
+    ValueTooLarge,
 }
 
 impl From<SecretError> for EdgeError {
     #[inline]
     fn from(err: SecretError) -> Self {
         match err {
+            SecretError::DeadlineExceeded => {
+                EdgeError::service_unavailable("secret store read deadline exceeded")
+            }
             SecretError::NotFound { .. } => {
                 EdgeError::internal(anyhow::anyhow!("required secret is not configured"))
             }
             SecretError::Unavailable => EdgeError::service_unavailable("secret store unavailable"),
             SecretError::Validation(..) => {
                 EdgeError::internal(anyhow::anyhow!("secret lookup failed"))
+            }
+            SecretError::ValueTooLarge => {
+                EdgeError::internal(anyhow::anyhow!("secret value too large"))
             }
             SecretError::Internal(..) => {
                 EdgeError::internal(anyhow::anyhow!("secret store operation failed"))
@@ -186,6 +202,31 @@ impl SecretStore for InMemorySecretStore {
         let compound = format!("{store_name}/{key}");
         Ok(self.secrets.get(&compound).cloned())
     }
+
+    #[inline]
+    async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        if deadline.is_expired() {
+            return Err(SecretError::DeadlineExceeded);
+        }
+        let value = self.get_bytes(store_name, key).await?;
+        let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+            u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
+        })?;
+        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+            return Err(SecretError::ValueTooLarge);
+        }
+        Ok(BoundedStoreRead {
+            backend_bytes,
+            value,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +245,24 @@ impl SecretStore for NoopSecretStore {
     #[inline]
     async fn get_bytes(&self, _store_name: &str, _key: &str) -> Result<Option<Bytes>, SecretError> {
         Ok(None)
+    }
+
+    #[inline]
+    async fn get_bytes_bounded(
+        &self,
+        _store_name: &str,
+        _key: &str,
+        deadline: Deadline,
+        _max_backend_bytes: u64,
+        _max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        if deadline.is_expired() {
+            return Err(SecretError::DeadlineExceeded);
+        }
+        Ok(BoundedStoreRead {
+            backend_bytes: 0,
+            value: None,
+        })
     }
 }
 
@@ -240,6 +299,32 @@ impl SecretHandle {
         validate_name(store_name)?;
         validate_name(key)?;
         self.provider.get_bytes(store_name, key).await
+    }
+
+    /// Retrieve a secret under one absolute deadline and two byte limits.
+    ///
+    /// # Errors
+    /// Preserves validation and the provider's typed bounded-read errors.
+    #[inline]
+    pub async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        validate_name(store_name)?;
+        validate_name(key)?;
+        self.provider
+            .get_bytes_bounded(
+                store_name,
+                key,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
+            .await
     }
 
     /// Create a new handle wrapping a multi-store provider.
@@ -292,6 +377,38 @@ impl SecretHandle {
 pub trait SecretStore: Send + Sync {
     /// Retrieve a secret from a named store. Returns `Ok(None)` if not found.
     async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError>;
+
+    /// Retrieves one value under an absolute deadline and independent backend/value caps.
+    ///
+    /// The default checks cooperatively around the existing provider call and discards an
+    /// oversized materialized value. Providers must override it before claiming native bounds.
+    #[inline]
+    async fn get_bytes_bounded(
+        &self,
+        store_name: &str,
+        key: &str,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+        if deadline.is_expired() {
+            return Err(SecretError::DeadlineExceeded);
+        }
+        let value = self.get_bytes(store_name, key).await?;
+        if deadline.is_expired() {
+            return Err(SecretError::DeadlineExceeded);
+        }
+        let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+            u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
+        })?;
+        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+            return Err(SecretError::ValueTooLarge);
+        }
+        Ok(BoundedStoreRead {
+            backend_bytes,
+            value,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +488,35 @@ mod tests {
             let result = handle.get_bytes("signing-keys", "current").await.unwrap();
             assert_eq!(result, Some(Bytes::from("abc123")));
         });
+    }
+
+    #[test]
+    fn bounded_secret_exact_cap_succeeds_and_over_cap_discards_value() {
+        use std::time::Duration;
+
+        use crate::time::Deadline;
+
+        let handle = provider_handle_with(&[("signing-keys/current", "abc123")]);
+        let exact = block_on(handle.get_bytes_bounded(
+            "signing-keys",
+            "current",
+            Deadline::after(Duration::from_secs(1)),
+            6,
+            6,
+        ))
+        .expect("exact bounded read");
+        assert_eq!(exact.backend_bytes, 6);
+        assert_eq!(exact.value, Some(Bytes::from_static(b"abc123")));
+
+        let error = block_on(handle.get_bytes_bounded(
+            "signing-keys",
+            "current",
+            Deadline::after(Duration::from_secs(1)),
+            6,
+            5,
+        ))
+        .expect_err("value cap");
+        assert!(matches!(error, SecretError::ValueTooLarge));
     }
 
     #[test]

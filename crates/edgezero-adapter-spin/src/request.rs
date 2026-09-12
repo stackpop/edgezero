@@ -1,29 +1,58 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+#[cfg(feature = "test-utils")]
+use std::future::pending;
 use std::sync::Arc;
+use std::time::Duration;
+#[cfg(feature = "test-utils")]
+use std::{
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Poll,
+};
 
 use anyhow::Context as _;
+#[cfg(feature = "test-utils")]
+use bytes::Bytes;
 
 use crate::SpinFullResponse;
 use crate::config_store::SpinConfigStore;
 use crate::context::{SpinRequestContext, parse_client_addr};
 use crate::key_value_store::{DEFAULT_MAX_LIST_KEYS, SpinKvStore};
-use crate::proxy::SpinProxyClient;
-use crate::response::from_core_response;
+use crate::response::from_egress_response;
 use crate::secret_store::SpinSecretStore;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Request, request_builder};
+#[cfg(feature = "test-utils")]
+use edgezero_core::http::Uri;
+#[cfg(any(test, feature = "test-utils"))]
+use edgezero_core::http::{Method, request_builder};
+use edgezero_core::http::{Request, RequestParts};
+use edgezero_core::ingress::{
+    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
+};
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::outbound::HttpClient;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
+use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
+#[cfg(any(test, feature = "test-utils"))]
+use futures::executor::block_on;
+use futures_util::future::{Either, select};
+#[cfg(feature = "test-utils")]
+use futures_util::stream::poll_fn;
+use futures_util::stream::unfold;
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use spin_sdk::http::Request as SpinRequest;
 use spin_sdk::http::body::IncomingBodyExt as _;
+use spin_sdk::time::sleep;
+
+use crate::outbound::SpinOutboundClient;
 
 /// Per-dispatch store wiring assembled before the request enters the router.
 /// The struct itself is `pub(crate)` because `dispatch_with_handles` takes it
@@ -39,18 +68,37 @@ pub(crate) struct Stores {
     secrets: Option<SecretHandle>,
 }
 
+#[cfg(feature = "test-utils")]
+struct DropSignal(Arc<AtomicUsize>);
+
+#[cfg(feature = "test-utils")]
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Convert a Spin `Request` into an `EdgeZero` core `Request`.
 ///
-/// Reads the full body into a buffered `Body::Once`, inserts
-/// `SpinRequestContext` and a `ProxyHandle` into extensions.
+/// Preserves the body as a lazy stream, inserts `SpinRequestContext`, and adds
+/// an outbound [`HttpClient`] to extensions.
 ///
 /// # Errors
 /// Returns [`EdgeError::bad_request`] if the request body cannot be read or
 /// the core `Request` cannot be built from the resulting parts.
 #[inline]
+#[expect(
+    clippy::unused_async,
+    reason = "the public converter retains its established async API while request bodies remain lazy"
+)]
 pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
     let (parts, body) = req.into_parts();
+    let mut request = into_core_request_head(parts, MonotonicClock::default());
+    *request.body_mut() = Body::from_external_stream(body.stream());
+    Ok(request)
+}
 
+fn into_core_request_head(parts: RequestParts, outbound_clock: MonotonicClock) -> Request {
     let client_addr = parts
         .headers
         .get("spin-client-addr")
@@ -62,23 +110,7 @@ pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let mut builder = request_builder().method(parts.method).uri(parts.uri);
-    for (name, value) in &parts.headers {
-        builder = builder.header(name, value);
-    }
-
-    // Inbound body size is not capped at the adapter level. The Spin runtime
-    // enforces its own request body limit (configurable via `spin.toml`), which
-    // is consistent with how the Fastly and Cloudflare adapters delegate inbound
-    // size enforcement to their respective platform runtimes.
-    let body_bytes = body
-        .bytes()
-        .await
-        .map_err(|err| EdgeError::bad_request(format!("failed to read request body: {err}")))?;
-
-    let mut request = builder
-        .body(Body::from(body_bytes.to_vec()))
-        .map_err(|err| EdgeError::bad_request(format!("failed to build request: {err}")))?;
+    let mut request = Request::from_parts(parts, Body::empty());
 
     SpinRequestContext::insert(
         &mut request,
@@ -89,9 +121,181 @@ pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
     );
     request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(SpinProxyClient));
+        .insert(outbound_client(outbound_clock));
 
-    Ok(request)
+    request
+}
+
+fn into_core_request_head_for_app(parts: RequestParts, app: &App) -> Request {
+    into_core_request_head(parts, app.monotonic_clock())
+}
+
+fn outbound_client(clock: MonotonicClock) -> HttpClient {
+    HttpClient::with_client(SpinOutboundClient::with_clock(clock))
+}
+
+fn deadline_body_with_timer<Source, SourceError, Timer, MakeTimer>(
+    source: Source,
+    deadline: Deadline,
+    monotonic_clock: MonotonicClock,
+    make_timer: MakeTimer,
+) -> Body
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    Timer: Future<Output = ()> + 'static,
+    MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
+{
+    let boxed_stream = source.map_err(Into::into).boxed_local();
+    let stream = unfold(Some(boxed_stream), move |stream_state| {
+        let clock = monotonic_clock.clone();
+        let timer_factory = make_timer.clone();
+        async move {
+            let mut body_stream = stream_state?;
+            let Some(remaining) = deadline.remaining_at(clock.now()) else {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    None,
+                ));
+            };
+            let timer = timer_factory(remaining);
+            let next_item = body_stream.next();
+            futures_util::pin_mut!(timer, next_item);
+            let item = match select(timer, next_item).await {
+                Either::Left(((), _next_item)) => {
+                    return Some((
+                        Err(EdgeError::request_timeout(
+                            "inbound body read deadline exceeded",
+                        )),
+                        None,
+                    ));
+                }
+                Either::Right((item, _timer)) => item,
+            };
+            if deadline.is_expired_at(clock.now()) {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    None,
+                ));
+            }
+            match item {
+                Some(Ok(bytes)) => Some((Ok(bytes), Some(body_stream))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), None)),
+                None => None,
+            }
+        }
+    });
+    Body::from_stream(stream)
+}
+
+/// Runs the terminal source-release probe used by the WASM contract suite.
+#[cfg(feature = "test-utils")]
+#[must_use]
+#[inline]
+pub fn deadline_body_releases_source_for_test() -> bool {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let signal = DropSignal(Arc::clone(&dropped));
+    let source = poll_fn(move |_cx| {
+        let _keep_alive = &signal;
+        Poll::<Option<Result<Bytes, io::Error>>>::Pending
+    });
+    let start = MonotonicInstant::now();
+    let clock = MonotonicClock::new(move || start);
+    let body = deadline_body_with_timer(source, Deadline::at_instant(start), clock, |_| {
+        pending::<()>()
+    });
+    let Some(mut body_stream) = body.into_stream() else {
+        return false;
+    };
+    let Some(Err(error)) = block_on(body_stream.next()) else {
+        return false;
+    };
+    matches!(error, EdgeError::RequestTimeout { .. }) && dropped.load(Ordering::SeqCst) == 1
+}
+
+/// Dispatches an observable source through the production ingress body wrapper without a
+/// provider timer. Tests that exercise timer expiry use
+/// [`dispatch_ingress_stream_with_timer_for_test`] instead.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_stream_for_test<Source, SourceError>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    source: Source,
+) -> anyhow::Result<SpinFullResponse>
+where
+    Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+{
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(EdgeError::internal)?;
+    dispatch_ingress_stream_with_timer(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        move || source,
+        |_| pending::<()>(),
+    )
+    .await
+}
+
+/// Dispatches an observable source through the production ingress deadline race.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_stream_with_timer_for_test<Source, SourceError, Timer, MakeTimer>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    source: Source,
+    make_timer: MakeTimer,
+) -> anyhow::Result<SpinFullResponse>
+where
+    Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    Timer: Future<Output = ()> + 'static,
+    MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
+{
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(EdgeError::internal)?;
+    dispatch_ingress_stream_with_timer(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        move || source,
+        make_timer,
+    )
+    .await
+}
+
+/// Dispatches a native Spin request through the production outer request seam.
+///
+/// # Errors
+/// Returns the same request-conversion, routing, or response-conversion error as standard dispatch.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_request_for_test(
+    app: &App,
+    req: SpinRequest,
+) -> anyhow::Result<SpinFullResponse> {
+    dispatch_with_handles(app, req, Stores::default(), app.monotonic_now()).await
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
@@ -107,7 +311,8 @@ pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
 /// fails.
 #[inline]
 pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
-    dispatch_with_kv_label(app, req, "default").await
+    let request_start = app.monotonic_now();
+    dispatch_with_kv_label_at(app, req, "default", request_start).await
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router and return
@@ -136,21 +341,101 @@ pub async fn dispatch_with_kv_label(
     req: SpinRequest,
     kv_label: &str,
 ) -> anyhow::Result<SpinFullResponse> {
+    let request_start = app.monotonic_now();
+    dispatch_with_kv_label_at(app, req, kv_label, request_start).await
+}
+
+async fn dispatch_with_kv_label_at(
+    app: &App,
+    req: SpinRequest,
+    kv_label: &str,
+    request_start: MonotonicInstant,
+) -> anyhow::Result<SpinFullResponse> {
     let stores = Stores {
         config_store: resolve_config_handle(kv_label).await?,
         kv: resolve_kv_handle(kv_label, false).await?,
         secrets: resolve_secret_handle(true),
         ..Default::default()
     };
-    dispatch_with_handles(app, req, stores).await
+    dispatch_with_handles(app, req, stores, request_start).await
 }
 
 pub(crate) async fn dispatch_with_handles(
     app: &App,
     req: SpinRequest,
     stores: Stores,
+    request_start: MonotonicInstant,
 ) -> anyhow::Result<SpinFullResponse> {
-    let mut core_request = into_core_request(req).await?;
+    let (parts, native_body) = req.into_parts();
+    let core_request = into_core_request_head_for_app(parts, app);
+    dispatch_ingress_stream(app, core_request, stores, request_start, move || {
+        native_body.stream()
+    })
+    .await
+}
+
+async fn dispatch_ingress_stream<Source, SourceError, MakeSource>(
+    app: &App,
+    head_request: Request,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    make_source: MakeSource,
+) -> anyhow::Result<SpinFullResponse>
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Source,
+{
+    dispatch_ingress_stream_with_timer(app, head_request, stores, request_start, make_source, sleep)
+        .await
+}
+
+async fn dispatch_ingress_stream_with_timer<Source, SourceError, MakeSource, Timer, MakeTimer>(
+    app: &App,
+    mut head_request: Request,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    make_source: MakeSource,
+    make_timer: MakeTimer,
+) -> anyhow::Result<SpinFullResponse>
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Source,
+    Timer: Future<Output = ()> + 'static,
+    MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
+{
+    head_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
+    let head_parts = IngressHeadParts::from_request(
+        &head_request,
+        IngressHeadAccounting::HostManaged,
+        IngressFraming::HostManaged,
+    );
+    head_parts.validate_normalized(app.ingress_head_limits())?;
+    let prepared = match app.begin_ingress(head_parts, request_start)? {
+        IngressBeginOutcome::Admitted(prepared) => prepared,
+        IngressBeginOutcome::Refused(response) => {
+            return Ok(from_egress_response(response).await?);
+        }
+        _ => return Err(anyhow::anyhow!("unsupported ingress admission outcome")),
+    };
+    *head_request.body_mut() = deadline_body_with_timer(
+        make_source(),
+        prepared.read_deadline(),
+        prepared.monotonic_clock(),
+        make_timer,
+    );
+    dispatch_core_request(app, head_request, stores, prepared).await
+}
+
+async fn dispatch_core_request(
+    app: &App,
+    mut core_request: Request,
+    stores: Stores,
+    prepared: PreparedIngress,
+) -> anyhow::Result<SpinFullResponse> {
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
@@ -165,8 +450,8 @@ pub(crate) async fn dispatch_with_handles(
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let response = app.router().oneshot(core_request).await?;
-    Ok(from_core_response(response).await?)
+    let response = app.dispatch_admitted(prepared, core_request).await?;
+    Ok(from_egress_response(response).await?)
 }
 
 /// Dispatch with per-id store registries built from baked metadata.
@@ -188,6 +473,7 @@ pub(crate) async fn dispatch_with_registries(
     secret_meta: Option<StoreMetadata>,
     env: &EnvConfig,
 ) -> anyhow::Result<SpinFullResponse> {
+    let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(kv_meta, env).await?;
     let config_registry = build_config_registry(config_meta, env).await?;
     let secret_registry = build_secret_registry(secret_meta, env);
@@ -200,6 +486,7 @@ pub(crate) async fn dispatch_with_registries(
             secret_registry,
             ..Default::default()
         },
+        request_start,
     )
     .await
 }
@@ -378,12 +665,19 @@ mod synthesis_tests {
     use super::*;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::key_value_store::{KvStore, NoopKvStore};
+    use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for StubConfig {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(None)
@@ -422,6 +716,43 @@ mod synthesis_tests {
             kv_registry.named("other").is_none(),
             "no other id synthesised"
         );
+    }
+
+    #[test]
+    fn production_head_conversion_installs_the_exact_application_outbound_clock() {
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(Mutex::new(VecDeque::from([start, completed])));
+        let clock_observations = Arc::clone(&observations);
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            clock_observations
+                .lock()
+                .expect("clock observations")
+                .pop_front()
+                .expect("clock observation")
+        }));
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("http://example.test/clock")
+            .body(Body::empty())
+            .expect("request");
+        let (parts, _body) = request.into_parts();
+        let core_request = into_core_request_head_for_app(parts, &app);
+        let client = core_request
+            .extensions()
+            .get::<HttpClient>()
+            .cloned()
+            .expect("HTTP client");
+        let outbound_request = edgezero_core::OutboundRequest::get("https://example.com/")
+            .expect("request")
+            .stream_response();
+
+        let results = block_on(client.send_all(vec![outbound_request]));
+
+        assert_eq!(results[0].elapsed, Duration::from_millis(7));
     }
 
     #[test]

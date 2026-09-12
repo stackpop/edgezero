@@ -2,10 +2,246 @@ use log::LevelFilter;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::{env, fs, io};
 use validator::{Validate, ValidationError};
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AtomicHost {
+    pub host: HostPat,
+    pub port: Port,
+    pub scheme: Scheme,
+}
+
+impl AtomicHost {
+    fn render_host_and_port(&self, scheme: &str, host: &str) -> String {
+        let mut rendered = format!("{scheme}://{host}");
+        match self.port {
+            Port::Any => rendered.push_str(":*"),
+            Port::Exact(port) if port != self.scheme.default_port() => {
+                rendered.push(':');
+                rendered.push_str(&port.to_string());
+            }
+            Port::Exact(_) => {}
+        }
+        rendered
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn render_spin_host(&self) -> String {
+        let scheme = match self.scheme {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        };
+        let host = match &self.host {
+            HostPat::Any => "*",
+            HostPat::Exact(host) => host,
+            HostPat::WildcardSubdomain(host) => return self.render_wildcard_host(scheme, host),
+        };
+        self.render_host_and_port(scheme, host)
+    }
+
+    fn render_wildcard_host(&self, scheme: &str, host: &str) -> String {
+        self.render_host_and_port(scheme, &format!("*.{host}"))
+    }
+}
+
+/// Compile-time manifest state exposed by macro-generated application hooks.
+///
+/// This distinguishes an application without a baked manifest from a corrupt
+/// baked contract so capability enforcement cannot fail open.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum BakedManifest {
+    /// No manifest was baked into this application.
+    Absent,
+    /// A baked manifest was present but could not be reconstructed safely.
+    Malformed(&'static str),
+    /// A parsed, validated, and finalized baked manifest.
+    Present(&'static Manifest),
+}
+
+impl BakedManifest {
+    /// Borrow this baked state as the lifetime-neutral capability-gate input.
+    #[must_use]
+    #[inline]
+    pub fn as_contract(&self) -> ManifestContract<'_> {
+        match self {
+            Self::Absent => ManifestContract::None,
+            Self::Malformed(reason) => ManifestContract::Malformed(reason),
+            Self::Present(manifest) => ManifestContract::Present(manifest),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Capability {
+    ConfigReadAllocationBounds,
+    ConfigReadDeadlines,
+    InboundReadDeadlines,
+    IngressAdmission,
+    LazyStreamedResponsePassthrough,
+    OutboundCompleteResourceAccounting,
+    OutboundDeadlines,
+    OutboundFlexiblePhaseBudget,
+    OutboundHeaderFidelity,
+    OutboundHttp,
+    RawIngressFramingValidation,
+    RawIngressHeadLimits,
+    ResponseEgressAbort,
+    ResponseEgressBackpressure,
+    ResponseEgressCompletion,
+    ResponseWriteDeadlines,
+    SendAllSlotIsolation,
+    StreamedUploadDeadlines,
+}
+
+impl Capability {
+    #[expect(
+        clippy::allow_attributes,
+        reason = "the included macro copy is private while the core API is public"
+    )]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "the public capability contract specifies as_str(&self)"
+    )]
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ConfigReadAllocationBounds => "config-read-allocation-bounds",
+            Self::ConfigReadDeadlines => "config-read-deadlines",
+            Self::InboundReadDeadlines => "inbound-read-deadlines",
+            Self::IngressAdmission => "ingress-admission",
+            Self::LazyStreamedResponsePassthrough => "lazy-streamed-response-passthrough",
+            Self::OutboundCompleteResourceAccounting => "outbound-complete-resource-accounting",
+            Self::OutboundDeadlines => "outbound-deadlines",
+            Self::OutboundFlexiblePhaseBudget => "outbound-flexible-phase-budget",
+            Self::OutboundHeaderFidelity => "outbound-header-fidelity",
+            Self::OutboundHttp => "outbound-http",
+            Self::RawIngressFramingValidation => "raw-ingress-framing-validation",
+            Self::RawIngressHeadLimits => "raw-ingress-head-limits",
+            Self::ResponseEgressAbort => "response-egress-abort",
+            Self::ResponseEgressBackpressure => "response-egress-backpressure",
+            Self::ResponseEgressCompletion => "response-egress-completion",
+            Self::ResponseWriteDeadlines => "response-write-deadlines",
+            Self::SendAllSlotIsolation => "send-all-slot-isolation",
+            Self::StreamedUploadDeadlines => "streamed-upload-deadlines",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CapabilitySupport {
+    BestEffort,
+    BoundedCooperative,
+    Native,
+    Unsupported,
+}
+
+/// Manifest input accepted by runtime capability gates.
+///
+/// File-backed manifests may be borrowed for any lifetime, while a baked
+/// manifest converts through [`BakedManifest::as_contract`].
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum ManifestContract<'manifest> {
+    /// A manifest contract exists but cannot be verified.
+    Malformed(&'static str),
+    /// No capability contract exists.
+    None,
+    /// A parsed and validated manifest contract.
+    Present(&'manifest Manifest),
+}
+
+impl<'manifest> ManifestContract<'manifest> {
+    /// Convert an optional file-backed manifest reference into a contract.
+    #[must_use]
+    #[inline]
+    pub fn from_opt(manifest: Option<&'manifest Manifest>) -> Self {
+        manifest.map_or(Self::None, Self::Present)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HostParseError {
+    Empty,
+    FragmentNotAllowed,
+    InvalidHost,
+    InvalidPort,
+    InvalidScheme,
+    InvalidWildcard,
+    MissingAuthority,
+    NonAsciiHost,
+    PathNotAllowed,
+    QueryNotAllowed,
+    UserinfoNotAllowed,
+    Whitespace,
+}
+
+impl fmt::Display for HostParseError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "host entry is empty",
+            Self::FragmentNotAllowed => "fragment is not allowed",
+            Self::InvalidHost => "host is invalid",
+            Self::InvalidPort => "port must be * or 1..=65535",
+            Self::InvalidScheme => "scheme must be http or https",
+            Self::InvalidWildcard => "wildcard is invalid",
+            Self::MissingAuthority => "authority is required",
+            Self::NonAsciiHost => "host must be ASCII",
+            Self::PathNotAllowed => "path is not allowed",
+            Self::QueryNotAllowed => "query is not allowed",
+            Self::UserinfoNotAllowed => "userinfo is not allowed",
+            Self::Whitespace => "whitespace is not allowed",
+        })
+    }
+}
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "HostParseError has no source or backtrace data beyond Display"
+)]
+impl Error for HostParseError {}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum HostPat {
+    Any,
+    Exact(String),
+    WildcardSubdomain(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Port {
+    Any,
+    Exact(u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Scheme {
+    Http,
+    Https,
+}
+
+impl Scheme {
+    const fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
+}
 
 pub struct ManifestLoader {
     manifest: Arc<Manifest>,
@@ -17,8 +253,7 @@ impl ManifestLoader {
     #[inline]
     pub fn from_path(path: &Path) -> Result<Self, io::Error> {
         let contents = fs::read_to_string(path)?;
-        let mut manifest: Manifest = toml::from_str(&contents)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let mut manifest = deserialize_manifest(&contents)?;
         let cwd = env::current_dir()?;
         let root_path = resolve_root_path(path, &cwd);
         manifest.root = Some(root_path);
@@ -71,8 +306,7 @@ impl ManifestLoader {
     /// Returns an [`io::Error`] if `contents` is not valid TOML or fails manifest validation.
     #[inline]
     pub fn try_load_from_str(contents: &str) -> Result<Self, io::Error> {
-        let mut manifest: Manifest = toml::from_str(contents)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let mut manifest = deserialize_manifest(contents)?;
         manifest
             .validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -84,6 +318,7 @@ impl ManifestLoader {
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_manifest_adapter_keys_case_unique"))]
 #[expect(
     clippy::partial_pub_fields,
@@ -96,6 +331,9 @@ pub struct Manifest {
     #[serde(default)]
     #[validate(nested)]
     pub app: ManifestApp,
+    #[serde(default)]
+    #[validate(nested)]
+    pub capabilities: ManifestCapabilities,
     #[serde(default)]
     #[validate(nested)]
     pub environment: ManifestEnvironment,
@@ -112,6 +350,29 @@ pub struct Manifest {
     #[serde(default)]
     #[validate(nested)]
     pub triggers: ManifestTriggers,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = "validate_capabilities_disjoint"))]
+#[non_exhaustive]
+pub struct ManifestCapabilities {
+    #[serde(default)]
+    pub optional: Vec<Capability>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub outbound: ManifestOutboundCapability,
+    #[serde(default)]
+    pub required: Vec<Capability>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ManifestOutboundCapability {
+    #[serde(default)]
+    #[validate(length(min = 1_u64), custom(function = "validate_outbound_hosts"))]
+    pub hosts: Option<Vec<String>>,
 }
 
 impl Manifest {
@@ -186,6 +447,37 @@ impl Manifest {
         self.logging_resolved = resolved;
     }
 
+    /// Parse, validate, and finalize JSON emitted by the `app!` macro.
+    ///
+    /// This is macro-support API. Call it at most once per application process;
+    /// a successful call intentionally leaks one manifest so generated hooks can
+    /// expose it for the process lifetime.
+    #[doc(hidden)]
+    #[inline]
+    #[must_use]
+    pub fn from_baked_json(json: &'static str) -> BakedManifest {
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(value) => value,
+            Err(_error) => {
+                return BakedManifest::Malformed("baked manifest did not parse");
+            }
+        };
+        if reject_misplaced_capabilities_json(&value).is_err() {
+            return BakedManifest::Malformed("baked manifest has misplaced capabilities");
+        }
+        let mut manifest: Self = match serde_json::from_value(value) {
+            Ok(manifest) => manifest,
+            Err(_error) => {
+                return BakedManifest::Malformed("baked manifest did not parse");
+            }
+        };
+        if manifest.validate().is_err() {
+            return BakedManifest::Malformed("baked manifest failed validation");
+        }
+        manifest.finalize();
+        BakedManifest::Present(Box::leak(Box::new(manifest)))
+    }
+
     #[must_use]
     #[inline]
     pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
@@ -249,6 +541,9 @@ pub struct ManifestHttpTrigger {
     #[serde(rename = "body-mode")]
     #[serde(default)]
     pub body_mode: Option<BodyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(length(min = 1_u64))]
+    pub class: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub description: Option<String>,
@@ -764,6 +1059,57 @@ impl serde::Serialize for LogLevel {
     }
 }
 
+/// Canonicalizes one outbound host declaration into atomic scheme/host/port entries.
+///
+/// # Errors
+/// Returns [`HostParseError`] when `entry` is outside the manifest host grammar.
+#[inline]
+pub fn canonicalize_outbound_host(entry: &str) -> Result<Vec<AtomicHost>, HostParseError> {
+    if entry.is_empty() {
+        return Err(HostParseError::Empty);
+    }
+    if entry.chars().any(char::is_whitespace) {
+        return Err(HostParseError::Whitespace);
+    }
+    if entry == "*" {
+        return Ok(vec![
+            AtomicHost {
+                host: HostPat::Any,
+                port: Port::Any,
+                scheme: Scheme::Http,
+            },
+            AtomicHost {
+                host: HostPat::Any,
+                port: Port::Any,
+                scheme: Scheme::Https,
+            },
+        ]);
+    }
+
+    let (scheme, authority) = parse_scheme(entry)?;
+    if authority.is_empty() {
+        return Err(HostParseError::MissingAuthority);
+    }
+    if authority.contains('@') {
+        return Err(HostParseError::UserinfoNotAllowed);
+    }
+    if authority.contains('/') {
+        return Err(HostParseError::PathNotAllowed);
+    }
+    if authority.contains('?') {
+        return Err(HostParseError::QueryNotAllowed);
+    }
+    if authority.contains('#') {
+        return Err(HostParseError::FragmentNotAllowed);
+    }
+    if !authority.is_ascii() {
+        return Err(HostParseError::NonAsciiHost);
+    }
+
+    let (host, port) = parse_authority(authority, scheme)?;
+    Ok(vec![AtomicHost { host, port, scheme }])
+}
+
 /// Serialize a `[[environment.secrets]]` list without exposing `value`.
 /// Secret bindings share `ManifestBinding` with variables, whose `value`
 /// is safe to emit; secret values must never appear in manifest output.
@@ -804,6 +1150,214 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
         Some(parent) => parent.to_path_buf(),
         None => cwd.to_path_buf(),
     }
+}
+
+fn deserialize_manifest(contents: &str) -> Result<Manifest, io::Error> {
+    let value: toml::Value = toml::from_str(contents)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    reject_misplaced_capabilities(&value)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    value
+        .try_into()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[must_use]
+pub(crate) fn is_reserved_capabilities_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("capabilities")
+}
+
+fn parse_authority(authority: &str, scheme: Scheme) -> Result<(HostPat, Port), HostParseError> {
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((address, remainder)) = bracketed.split_once(']') else {
+            return Err(HostParseError::InvalidHost);
+        };
+        let ipv6 = Ipv6Addr::from_str(address).map_err(|_error| HostParseError::InvalidHost)?;
+        let port = if remainder.is_empty() {
+            Port::Exact(scheme.default_port())
+        } else if let Some(raw_port) = remainder.strip_prefix(':') {
+            parse_port(raw_port)?
+        } else {
+            return Err(HostParseError::InvalidHost);
+        };
+        return Ok((HostPat::Exact(format!("[{ipv6}]")), port));
+    }
+
+    if authority.contains(['[', ']']) || authority.matches(':').count() > 1 {
+        return Err(HostParseError::InvalidHost);
+    }
+    let (raw_host, raw_port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let host = parse_host_pattern(raw_host)?;
+    let port = raw_port.map_or(Ok(Port::Exact(scheme.default_port())), parse_port)?;
+    Ok((host, port))
+}
+
+fn parse_host_pattern(host: &str) -> Result<HostPat, HostParseError> {
+    if host == "*" {
+        return Ok(HostPat::Any);
+    }
+    if host.contains('*') {
+        let Some(suffix) = host.strip_prefix("*.") else {
+            return Err(HostParseError::InvalidWildcard);
+        };
+        if suffix.contains('*') || !is_valid_dns_name(suffix) {
+            return Err(if suffix.contains('*') {
+                HostParseError::InvalidWildcard
+            } else {
+                HostParseError::InvalidHost
+            });
+        }
+        return Ok(HostPat::WildcardSubdomain(suffix.to_ascii_lowercase()));
+    }
+    if !is_valid_dns_name(host) {
+        return Err(HostParseError::InvalidHost);
+    }
+    Ok(HostPat::Exact(host.to_ascii_lowercase()))
+}
+
+fn parse_port(port: &str) -> Result<Port, HostParseError> {
+    if port == "*" {
+        return Ok(Port::Any);
+    }
+    if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(HostParseError::InvalidPort);
+    }
+    let parsed_port = port
+        .parse::<u16>()
+        .map_err(|_error| HostParseError::InvalidPort)?;
+    if parsed_port == 0 {
+        return Err(HostParseError::InvalidPort);
+    }
+    Ok(Port::Exact(parsed_port))
+}
+
+fn parse_scheme(entry: &str) -> Result<(Scheme, &str), HostParseError> {
+    let Some((raw_scheme, authority)) = entry.split_once("://") else {
+        return Ok((Scheme::Https, entry));
+    };
+    let parsed_scheme = if raw_scheme.eq_ignore_ascii_case("http") {
+        Scheme::Http
+    } else if raw_scheme.eq_ignore_ascii_case("https") {
+        Scheme::Https
+    } else {
+        return Err(HostParseError::InvalidScheme);
+    };
+    Ok((parsed_scheme, authority))
+}
+
+fn is_valid_dns_name(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn validate_capabilities_disjoint(
+    capabilities: &ManifestCapabilities,
+) -> Result<(), ValidationError> {
+    let mut required = BTreeSet::new();
+    if capabilities
+        .required
+        .iter()
+        .any(|capability| !required.insert(capability.as_str()))
+    {
+        return Err(ValidationError::new("capability_required_duplicate"));
+    }
+
+    let mut optional = BTreeSet::new();
+    if capabilities
+        .optional
+        .iter()
+        .any(|capability| !optional.insert(capability.as_str()))
+    {
+        return Err(ValidationError::new("capability_optional_duplicate"));
+    }
+    if required
+        .iter()
+        .any(|capability| optional.contains(capability))
+    {
+        return Err(ValidationError::new("capability_required_optional_overlap"));
+    }
+    Ok(())
+}
+
+fn validate_outbound_hosts(hosts: &[String]) -> Result<(), ValidationError> {
+    for host in hosts {
+        if let Err(error) = canonicalize_outbound_host(host) {
+            let mut validation_error = ValidationError::new("outbound_host");
+            validation_error.message = Some(error.to_string().into());
+            return Err(validation_error);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_misplaced_capabilities(value: &toml::Value) -> Result<(), &'static str> {
+    fn walk(value: &toml::Value, top_level: bool) -> Result<(), &'static str> {
+        match value {
+            toml::Value::Array(values) => {
+                for array_value in values {
+                    walk(array_value, false)?;
+                }
+            }
+            toml::Value::Table(table) => {
+                for (key, nested_value) in table {
+                    if is_reserved_capabilities_key(key) && (!top_level || key != "capabilities") {
+                        return Err(
+                            "capabilities is reserved for the exact lowercase top-level table",
+                        );
+                    }
+                    walk(nested_value, false)?;
+                }
+            }
+            toml::Value::Boolean(_)
+            | toml::Value::Datetime(_)
+            | toml::Value::Float(_)
+            | toml::Value::Integer(_)
+            | toml::Value::String(_) => {}
+        }
+        Ok(())
+    }
+
+    walk(value, true)
+}
+
+fn reject_misplaced_capabilities_json(value: &serde_json::Value) -> Result<(), ()> {
+    fn walk(value: &serde_json::Value, top_level: bool) -> Result<(), ()> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for array_value in values {
+                    walk(array_value, false)?;
+                }
+            }
+            serde_json::Value::Object(object) => {
+                for (key, nested_value) in object {
+                    if is_reserved_capabilities_key(key) && (!top_level || key != "capabilities") {
+                        return Err(());
+                    }
+                    walk(nested_value, false)?;
+                }
+            }
+            serde_json::Value::Bool(_)
+            | serde_json::Value::Null
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+        Ok(())
+    }
+
+    walk(value, true)
 }
 
 /// Validates a single `[adapters.<name>.adapter]` block. The portable
@@ -1050,6 +1604,580 @@ adapters = ["fastly"]
 name = "API_TOKEN"
 env = "APP_TOKEN"
 "#;
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive capability parse-and-validation table is clearer in one test"
+    )]
+    fn capability_manifest_rejects_unknown_duplicate_and_overlap() {
+        let source = r#"
+[capabilities]
+required = [
+    "config-read-allocation-bounds",
+    "config-read-deadlines",
+    "inbound-read-deadlines",
+    "ingress-admission",
+    "lazy-streamed-response-passthrough",
+    "outbound-complete-resource-accounting",
+    "outbound-deadlines",
+    "outbound-flexible-phase-budget",
+    "outbound-header-fidelity",
+    "outbound-http",
+    "raw-ingress-framing-validation",
+    "raw-ingress-head-limits",
+    "response-egress-abort",
+    "response-egress-backpressure",
+    "response-egress-completion",
+    "response-write-deadlines",
+    "send-all-slot-isolation",
+    "streamed-upload-deadlines",
+]
+optional = []
+
+[capabilities.outbound]
+hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
+"#;
+        let loader = ManifestLoader::try_load_from_str(source).expect("capability manifest");
+        let expected = [
+            Capability::ConfigReadAllocationBounds,
+            Capability::ConfigReadDeadlines,
+            Capability::InboundReadDeadlines,
+            Capability::IngressAdmission,
+            Capability::LazyStreamedResponsePassthrough,
+            Capability::OutboundCompleteResourceAccounting,
+            Capability::OutboundDeadlines,
+            Capability::OutboundFlexiblePhaseBudget,
+            Capability::OutboundHeaderFidelity,
+            Capability::OutboundHttp,
+            Capability::RawIngressFramingValidation,
+            Capability::RawIngressHeadLimits,
+            Capability::ResponseEgressAbort,
+            Capability::ResponseEgressBackpressure,
+            Capability::ResponseEgressCompletion,
+            Capability::ResponseWriteDeadlines,
+            Capability::SendAllSlotIsolation,
+            Capability::StreamedUploadDeadlines,
+        ];
+        assert_eq!(loader.manifest().capabilities.required, expected);
+        assert!(loader.manifest().capabilities.optional.is_empty());
+        assert_eq!(
+            loader.manifest().capabilities.outbound.hosts.as_deref(),
+            Some(
+                ["*", "HTTPS://Example.COM", "api.example.com:8443"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        for (capability, expected_name) in expected.iter().zip([
+            "config-read-allocation-bounds",
+            "config-read-deadlines",
+            "inbound-read-deadlines",
+            "ingress-admission",
+            "lazy-streamed-response-passthrough",
+            "outbound-complete-resource-accounting",
+            "outbound-deadlines",
+            "outbound-flexible-phase-budget",
+            "outbound-header-fidelity",
+            "outbound-http",
+            "raw-ingress-framing-validation",
+            "raw-ingress-head-limits",
+            "response-egress-abort",
+            "response-egress-backpressure",
+            "response-egress-completion",
+            "response-write-deadlines",
+            "send-all-slot-isolation",
+            "streamed-upload-deadlines",
+        ]) {
+            assert_eq!(capability.as_str(), expected_name);
+        }
+
+        let serialized = toml::to_string(loader.manifest()).expect("serialize manifest");
+        let reparsed = ManifestLoader::try_load_from_str(&serialized).expect("round trip");
+        assert_eq!(reparsed.manifest().capabilities.required, expected);
+        assert_eq!(
+            reparsed.manifest().capabilities.outbound.hosts.as_deref(),
+            loader.manifest().capabilities.outbound.hosts.as_deref()
+        );
+
+        for invalid in [
+            "[capabilities]\nrequired = [\"outbound-retries\"]\n",
+            "[capabilities]\nrequired = [\"Outbound-Http\"]\n",
+            "[capabilities]\nrequire = [\"outbound-http\"]\n",
+            "[capabilities.outbound]\nhost = [\"*\"]\n",
+            "[capabilites]\nrequired = [\"outbound-http\"]\n",
+            "[capability]\nrequired = [\"outbound-http\"]\n",
+            "[custom]\nvalue = true\n",
+            "[capabilities]\nrequired = [\"outbound-http\", \"outbound-http\"]\n",
+            "[capabilities]\noptional = [\"outbound-http\", \"outbound-http\"]\n",
+            "[capabilities]\nrequired = [\"outbound-http\"]\noptional = [\"outbound-http\"]\n",
+            "[capabilities.outbound]\nhosts = []\n",
+        ] {
+            assert!(
+                ManifestLoader::try_load_from_str(invalid).is_err(),
+                "manifest unexpectedly accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_manifest_rejects_reserved_key_at_every_depth_and_case() {
+        let valid =
+            ManifestLoader::try_load_from_str("[capabilities]\nrequired = [\"outbound-http\"]\n")
+                .expect("exact lowercase top-level key");
+        assert_eq!(
+            valid.manifest().capabilities.required,
+            [Capability::OutboundHttp]
+        );
+
+        let invalid = [
+            "[Capabilities]\nrequired = []\n",
+            "[CAPABILITIES]\nrequired = []\n",
+            "[capabilitieS]\nrequired = []\n",
+            "[app.capabilities]\nrequired = []\n",
+            "[app.Capabilities]\nrequired = []\n",
+            "[[triggers.http]]\npath = \"/\"\n[triggers.http.CAPABILITIES]\nrequired = []\n",
+            "[[environment.variables]]\nname = \"X\"\n[environment.variables.capabilitieS]\nrequired = []\n",
+            "[adapters.axum.build.cApAbIlItIeS]\nrequired = []\n",
+            "[app]\nlayers = [{ capabilities = { required = [] } }]\n",
+            "[app]\nlayers = [[{ CaPaBiLiTiEs = { required = [] } }]]\n",
+            "[capabilities.outbound.capabilities]\nrequired = []\n",
+        ];
+
+        for source in invalid {
+            assert!(
+                ManifestLoader::try_load_from_str(source).is_err(),
+                "reserved key unexpectedly accepted: {source}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the required grammar table keeps accepted and rejected cases together"
+    )]
+    fn outbound_host_grammar_table() {
+        let label_63 = "a".repeat(63);
+        let name_253 = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        let accepted = [
+            (
+                "*".to_owned(),
+                vec![
+                    AtomicHost {
+                        scheme: Scheme::Http,
+                        host: HostPat::Any,
+                        port: Port::Any,
+                    },
+                    AtomicHost {
+                        scheme: Scheme::Https,
+                        host: HostPat::Any,
+                        port: Port::Any,
+                    },
+                ],
+                vec!["http://*:*", "https://*:*"],
+            ),
+            (
+                "*.example.com".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::WildcardSubdomain("example.com".to_owned()),
+                    port: Port::Exact(443),
+                }],
+                vec!["https://*.example.com"],
+            ),
+            (
+                "x:8443".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("x".to_owned()),
+                    port: Port::Exact(8443),
+                }],
+                vec!["https://x:8443"],
+            ),
+            (
+                "x:1".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("x".to_owned()),
+                    port: Port::Exact(1),
+                }],
+                vec!["https://x:1"],
+            ),
+            (
+                "x:65535".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("x".to_owned()),
+                    port: Port::Exact(u16::MAX),
+                }],
+                vec!["https://x:65535"],
+            ),
+            (
+                "https://x:443".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("x".to_owned()),
+                    port: Port::Exact(443),
+                }],
+                vec!["https://x"],
+            ),
+            (
+                "https://[::1]".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("[::1]".to_owned()),
+                    port: Port::Exact(443),
+                }],
+                vec!["https://[::1]"],
+            ),
+            (
+                "HTTP://[2001:0DB8::1]:80".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Http,
+                    host: HostPat::Exact("[2001:db8::1]".to_owned()),
+                    port: Port::Exact(80),
+                }],
+                vec!["http://[2001:db8::1]"],
+            ),
+            (
+                "https://127.0.0.1".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("127.0.0.1".to_owned()),
+                    port: Port::Exact(443),
+                }],
+                vec!["https://127.0.0.1"],
+            ),
+            (
+                "xn--caf-dma.com".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("xn--caf-dma.com".to_owned()),
+                    port: Port::Exact(443),
+                }],
+                vec!["https://xn--caf-dma.com"],
+            ),
+            (
+                "HTTPS://Example.COM:*".to_owned(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact("example.com".to_owned()),
+                    port: Port::Any,
+                }],
+                vec!["https://example.com:*"],
+            ),
+            (
+                format!("https://{label_63}"),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact(label_63),
+                    port: Port::Exact(443),
+                }],
+                vec![],
+            ),
+            (
+                name_253.clone(),
+                vec![AtomicHost {
+                    scheme: Scheme::Https,
+                    host: HostPat::Exact(name_253),
+                    port: Port::Exact(443),
+                }],
+                vec![],
+            ),
+        ];
+
+        for (entry, expected, rendered) in accepted {
+            let actual = canonicalize_outbound_host(&entry).expect("accepted host");
+            assert_eq!(actual, expected, "entry: {entry}");
+            if !rendered.is_empty() {
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(AtomicHost::render_spin_host)
+                        .collect::<Vec<_>>(),
+                    rendered,
+                    "entry: {entry}"
+                );
+                for host in &actual {
+                    assert_eq!(
+                        canonicalize_outbound_host(&host.render_spin_host()),
+                        Ok(vec![host.clone()]),
+                        "rendered host must parse to the same atomic"
+                    );
+                }
+            }
+
+            let source = format!("[capabilities.outbound]\nhosts = [{entry:?}]\n");
+            ManifestLoader::try_load_from_str(&source).expect("manifest host validation");
+        }
+
+        let label_64 = "a".repeat(64);
+        let name_254 = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        let rejected = [
+            (String::new(), HostParseError::Empty, "host entry is empty"),
+            (
+                " x".to_owned(),
+                HostParseError::Whitespace,
+                "whitespace is not allowed",
+            ),
+            (
+                "x.com ".to_owned(),
+                HostParseError::Whitespace,
+                "whitespace is not allowed",
+            ),
+            (
+                "x .com".to_owned(),
+                HostParseError::Whitespace,
+                "whitespace is not allowed",
+            ),
+            (
+                "https:// x".to_owned(),
+                HostParseError::Whitespace,
+                "whitespace is not allowed",
+            ),
+            (
+                "ftp://x".to_owned(),
+                HostParseError::InvalidScheme,
+                "scheme must be http or https",
+            ),
+            (
+                "https://".to_owned(),
+                HostParseError::MissingAuthority,
+                "authority is required",
+            ),
+            (
+                "https://u:p@x".to_owned(),
+                HostParseError::UserinfoNotAllowed,
+                "userinfo is not allowed",
+            ),
+            (
+                "https://x/p".to_owned(),
+                HostParseError::PathNotAllowed,
+                "path is not allowed",
+            ),
+            (
+                "https://x?q".to_owned(),
+                HostParseError::QueryNotAllowed,
+                "query is not allowed",
+            ),
+            (
+                "https://x#f".to_owned(),
+                HostParseError::FragmentNotAllowed,
+                "fragment is not allowed",
+            ),
+            (
+                "ex\u{20ac}ample.com".to_owned(),
+                HostParseError::NonAsciiHost,
+                "host must be ASCII",
+            ),
+            (
+                "caf\u{e9}.com".to_owned(),
+                HostParseError::NonAsciiHost,
+                "host must be ASCII",
+            ),
+            (
+                "ex*ample.com".to_owned(),
+                HostParseError::InvalidWildcard,
+                "wildcard is invalid",
+            ),
+            (
+                "*.*.com".to_owned(),
+                HostParseError::InvalidWildcard,
+                "wildcard is invalid",
+            ),
+            (
+                "a.*.com".to_owned(),
+                HostParseError::InvalidWildcard,
+                "wildcard is invalid",
+            ),
+            (
+                "**.com".to_owned(),
+                HostParseError::InvalidWildcard,
+                "wildcard is invalid",
+            ),
+            (
+                "-x.com".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "x-.com".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "x..com".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "x_y.com".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "x.com.".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (label_64, HostParseError::InvalidHost, "host is invalid"),
+            (name_254, HostParseError::InvalidHost, "host is invalid"),
+            (
+                "https://[::g]".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "https://[:::1]".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "https://[12345::]".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "https://[1:2:3:4:5:6:7:8:9]".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "https://[::1".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "https://::1]".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "https://::1".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+            (
+                "https://x:0".to_owned(),
+                HostParseError::InvalidPort,
+                "port must be * or 1..=65535",
+            ),
+            (
+                "https://x:70000".to_owned(),
+                HostParseError::InvalidPort,
+                "port must be * or 1..=65535",
+            ),
+            (
+                "https://x:abc".to_owned(),
+                HostParseError::InvalidPort,
+                "port must be * or 1..=65535",
+            ),
+            (
+                "x:+443".to_owned(),
+                HostParseError::InvalidPort,
+                "port must be * or 1..=65535",
+            ),
+            (
+                "https://x:".to_owned(),
+                HostParseError::InvalidPort,
+                "port must be * or 1..=65535",
+            ),
+            (
+                "ftp:// x/p?q#f".to_owned(),
+                HostParseError::Whitespace,
+                "whitespace is not allowed",
+            ),
+            (
+                "ftp://".to_owned(),
+                HostParseError::InvalidScheme,
+                "scheme must be http or https",
+            ),
+            (
+                "https://u@x/p?q#f".to_owned(),
+                HostParseError::UserinfoNotAllowed,
+                "userinfo is not allowed",
+            ),
+            (
+                "https://x/p?q#f".to_owned(),
+                HostParseError::PathNotAllowed,
+                "path is not allowed",
+            ),
+            (
+                "https://x?q#f".to_owned(),
+                HostParseError::QueryNotAllowed,
+                "query is not allowed",
+            ),
+            (
+                "https://x#caf\u{e9}".to_owned(),
+                HostParseError::FragmentNotAllowed,
+                "fragment is not allowed",
+            ),
+            (
+                "caf\u{e9}*.com:0".to_owned(),
+                HostParseError::NonAsciiHost,
+                "host must be ASCII",
+            ),
+            (
+                "ex*ample_.com:0".to_owned(),
+                HostParseError::InvalidWildcard,
+                "wildcard is invalid",
+            ),
+            (
+                "x_y.com:0".to_owned(),
+                HostParseError::InvalidHost,
+                "host is invalid",
+            ),
+        ];
+
+        for (entry, expected, message) in rejected {
+            let error = canonicalize_outbound_host(&entry).expect_err("rejected host");
+            assert_eq!(error, expected, "entry: {entry}");
+            assert_eq!(error.to_string(), message, "entry: {entry}");
+            assert!(!error.to_string().is_empty());
+
+            let source = format!("[capabilities.outbound]\nhosts = [{entry:?}]\n");
+            assert!(
+                ManifestLoader::try_load_from_str(&source).is_err(),
+                "invalid manifest host accepted: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn outbound_host_default_is_https_only() {
+        let loader = ManifestLoader::try_load_from_str("").expect("empty manifest");
+        assert!(loader.manifest().capabilities.outbound.hosts.is_none());
+
+        let absent = canonicalize_outbound_host("https://*:*").expect("https-only default");
+        assert_eq!(
+            absent,
+            [AtomicHost {
+                scheme: Scheme::Https,
+                host: HostPat::Any,
+                port: Port::Any,
+            }]
+        );
+        assert_eq!(absent[0].render_spin_host(), "https://*:*");
+
+        let explicit = canonicalize_outbound_host("*").expect("explicit wildcard");
+        assert_eq!(explicit.len(), 2);
+        assert_eq!(explicit[0].scheme, Scheme::Http);
+        assert_eq!(explicit[1].scheme, Scheme::Https);
+        assert!(explicit.iter().all(|host| host.port == Port::Any));
+    }
 
     #[test]
     fn parse_manifest_sample() {
@@ -2005,6 +3133,7 @@ ids = ["default"]
         let manifest = r#"
 [[triggers.http]]
 id = "route-1"
+class = "auction"
 path = "/api/users"
 methods = ["GET", "POST"]
 handler = "handlers::users"
@@ -2015,6 +3144,7 @@ body-mode = "buffered"
         let loader = ManifestLoader::load_from_str(manifest);
         let trigger = &loader.manifest().triggers.http[0];
         assert_eq!(trigger.id.as_deref(), Some("route-1"));
+        assert_eq!(trigger.class.as_deref(), Some("auction"));
         assert_eq!(trigger.path, "/api/users");
         assert_eq!(trigger.methods(), vec!["GET", "POST"]);
         assert_eq!(trigger.handler.as_deref(), Some("handlers::users"));
@@ -2024,6 +3154,19 @@ body-mode = "buffered"
             Some("User management endpoint")
         );
         assert_eq!(trigger.body_mode, Some(BodyMode::Buffered));
+    }
+
+    #[test]
+    fn http_trigger_rejects_empty_route_class() {
+        let manifest = r#"
+[[triggers.http]]
+class = ""
+path = "/api/users"
+"#;
+        let error = ManifestLoader::try_load_from_str(manifest)
+            .err()
+            .expect("an empty route class must fail validation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     // -- Secret store config -----------------------------------------------
@@ -2172,5 +3315,30 @@ default = "feature__flags"
         ManifestLoader::try_load_from_str(manifest)
             .err()
             .expect("double-underscore store id must fail validation");
+    }
+
+    #[test]
+    fn baked_manifest_states_are_distinct() {
+        assert!(matches!(
+            Manifest::from_baked_json("not json"),
+            BakedManifest::Malformed("baked manifest did not parse")
+        ));
+        assert!(matches!(
+            Manifest::from_baked_json(r#"{"app":{"Capabilities":{}}}"#),
+            BakedManifest::Malformed("baked manifest has misplaced capabilities")
+        ));
+        let baked = Manifest::from_baked_json(r#"{"capabilities":{"required":["outbound-http"]}}"#);
+        let BakedManifest::Present(manifest) = baked else {
+            panic!("expected present baked manifest");
+        };
+        assert_eq!(manifest.capabilities.required, [Capability::OutboundHttp]);
+        assert!(matches!(
+            BakedManifest::Absent.as_contract(),
+            ManifestContract::None
+        ));
+        assert!(matches!(
+            ManifestContract::from_opt(Some(manifest)),
+            ManifestContract::Present(_)
+        ));
     }
 }

@@ -1,5 +1,8 @@
 use std::env;
+use std::io::Error as IoError;
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use edgezero_core::action;
@@ -9,25 +12,64 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::extractor::{
     AppConfig, Headers, Json, Kv, Path, Query, Secrets, State, ValidatedPath,
 };
-use edgezero_core::http::{self, Response, StatusCode, Uri};
-use edgezero_core::proxy::ProxyRequest;
+use edgezero_core::http::{self, Method, Response, StatusCode, Uri};
+use edgezero_core::outbound::{OutboundRequest, OutboundSlotResult};
 use edgezero_core::response::Text;
+use edgezero_core::time::Deadline;
 use futures::{stream, StreamExt as _};
 
-use crate::config::AppDemoConfig;
+use crate::{config::AppDemoConfig, AdmissionLease};
 
 const ALLOWED_CONFIG_KEYS: &[&str] = &["greeting", "feature.new_checkout", "service.timeout_ms"];
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
+const MAX_BROTLI_DECODER_BYTES: u64 = 0x0200_0000;
+const MAX_BROTLI_WINDOW_BITS: u8 = 24;
 /// Maximum request body size (25 MB, matches KV value limit).
 const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
+const MAX_DECODED_RESPONSE_BYTES: u64 = 0x0010_0000;
+const MAX_ENCODED_RESPONSE_BYTES: u64 = 0x0020_0000;
+const MAX_FANOUT_INPUT_BYTES: usize = 0x4000;
+const MAX_FANOUT_REQUESTS: usize = 8;
+const MAX_FINAL_RESPONSE_BYTES: u64 = 0x0020_0000;
+const MAX_OUTBOUND_REQUEST_BODY_BYTES: u64 = 0x0010_0000;
+const MAX_RESPONSE_CHUNK_BYTES: u64 = 0x0001_0000;
+const MAX_RESPONSE_HEADER_BYTES: u64 = 0x0001_0000;
+const MAX_RESPONSE_HEADER_COUNT: u64 = 100;
 // 512 (KV key limit) - 5 (len of "note:") = 507
 const MAX_NOTE_ID_LEN: u64 = 507;
+const OUTBOUND_BATCH_BUDGET: Duration = Duration::from_secs(5);
+const OUTBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
 const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
+
+#[derive(serde::Serialize)]
+struct AdmissionView {
+    grant_consumed_once: bool,
+    route_class: Option<String>,
+}
 
 #[derive(serde::Deserialize)]
 struct ConfigParams {
     name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FanoutRequest {
+    paths: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FanoutSlot {
+    elapsed_ms: u128,
+    index: usize,
+    outcome: FanoutSlotOutcome,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum FanoutSlotOutcome {
+    Error { category: &'static str, status: u16 },
+    Response { status: u16 },
 }
 
 #[derive(serde::Deserialize)]
@@ -94,19 +136,119 @@ pub async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
 }
 
 #[action]
+pub async fn admission(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
+    let route_class = ctx
+        .route_metadata()
+        .and_then(|metadata| metadata.class())
+        .map(str::to_owned);
+    let grant = ctx
+        .take_ingress_grant()
+        .ok_or_else(|| EdgeError::internal(IoError::other("admission grant was not installed")))?;
+    let lease = grant
+        .downcast::<AdmissionLease>()
+        .map_err(|_grant| EdgeError::internal(IoError::other("admission grant type mismatch")))?;
+    if lease.route_class != route_class {
+        return Err(EdgeError::internal(IoError::other(
+            "admission grant route class mismatch",
+        )));
+    }
+
+    json_response(&AdmissionView {
+        grant_consumed_once: ctx.take_ingress_grant().is_none(),
+        route_class,
+    })
+}
+
+#[action]
+pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
+    let Some(client) = ctx.http_client() else {
+        return proxy_not_available_response();
+    };
+    let input: FanoutRequest = ctx.json_within(MAX_FANOUT_INPUT_BYTES).await?;
+    if input.paths.len() > MAX_FANOUT_REQUESTS {
+        return Err(EdgeError::validation(format!(
+            "fanout accepts at most {MAX_FANOUT_REQUESTS} paths"
+        )));
+    }
+
+    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
+    let now = ctx.monotonic_clock().now();
+    let deadline = Deadline::at_instant(now.checked_add(OUTBOUND_BATCH_BUDGET).unwrap_or(now));
+    let source_uri = Uri::from_static("/fanout");
+    let requests = input
+        .paths
+        .into_iter()
+        .map(|path| {
+            let target = build_proxy_target(&base, &path, &source_uri)?;
+            Ok(outbound_policy(OutboundRequest::new(Method::GET, target)?).deadline(deadline))
+        })
+        .collect::<Result<Vec<_>, EdgeError>>()?;
+    let slots = client.send_all(requests).await;
+    let output = slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, slot)| fanout_slot(index, slot))
+        .collect::<Vec<_>>();
+
+    json_response(&output)
+}
+
+#[action]
 pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
-    let proxy_handle = ctx.proxy_handle();
-    let request = ctx.into_request();
+    let http_client = ctx.http_client();
+    let request = ctx.into_request()?;
     let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
     let target = build_proxy_target(&base, &params.rest, request.uri())?;
-    let proxy_request = ProxyRequest::from_request(request, target);
+    let outbound_request = outbound_policy(OutboundRequest::from_request(request, target)?);
 
-    if let Some(handle) = proxy_handle {
-        handle.forward(proxy_request).await
+    if let Some(client) = http_client {
+        client.send(outbound_request).await?.into_response()
     } else {
         proxy_not_available_response()
     }
+}
+
+fn error_category(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::BAD_GATEWAY => "bad_gateway",
+        StatusCode::GATEWAY_TIMEOUT => "gateway_timeout",
+        StatusCode::REQUEST_TIMEOUT => "request_timeout",
+        StatusCode::UNPROCESSABLE_ENTITY => "validation",
+        _ => "error",
+    }
+}
+
+fn fanout_slot(index: usize, slot: OutboundSlotResult) -> FanoutSlot {
+    let outcome = match slot.outcome {
+        Ok(response) => FanoutSlotOutcome::Response {
+            status: response.status().as_u16(),
+        },
+        Err(error) => FanoutSlotOutcome::Error {
+            category: error_category(error.status()),
+            status: error.status().as_u16(),
+        },
+    };
+    FanoutSlot {
+        elapsed_ms: slot.elapsed.as_millis(),
+        index,
+        outcome,
+    }
+}
+
+fn outbound_policy(request: OutboundRequest) -> OutboundRequest {
+    request
+        .max_brotli_decoder_bytes(MAX_BROTLI_DECODER_BYTES)
+        .max_brotli_window_bits(MAX_BROTLI_WINDOW_BITS)
+        .max_decoded_response_bytes(MAX_DECODED_RESPONSE_BYTES)
+        .max_encoded_response_bytes(MAX_ENCODED_RESPONSE_BYTES)
+        .max_request_body_bytes(MAX_OUTBOUND_REQUEST_BODY_BYTES)
+        .max_response_bytes(MAX_FINAL_RESPONSE_BYTES)
+        .max_chunk_bytes(NonZeroU64::new(MAX_RESPONSE_CHUNK_BYTES).unwrap_or(NonZeroU64::MIN))
+        .max_response_header_bytes(MAX_RESPONSE_HEADER_BYTES)
+        .max_response_header_count(MAX_RESPONSE_HEADER_COUNT)
+        .timeout(OUTBOUND_REQUEST_TIMEOUT)
 }
 
 fn build_proxy_target(base: &str, rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> {
@@ -130,12 +272,22 @@ fn build_proxy_target(base: &str, rest: &str, original_uri: &Uri) -> Result<Uri,
 }
 
 fn proxy_not_available_response() -> Result<Response, EdgeError> {
-    let body = Body::text(
-        "proxy example is not enabled for this adapter build; enable a proxy-capable adapter",
-    );
+    let body = Body::text("outbound HTTP is not enabled for this adapter build");
     http::response_builder()
         .status(StatusCode::NOT_IMPLEMENTED)
         .header("content-type", "text/plain; charset=utf-8")
+        .body(body)
+        .map_err(EdgeError::internal)
+}
+
+fn json_response<T>(value: &T) -> Result<Response, EdgeError>
+where
+    T: serde::Serialize,
+{
+    let body = Body::json(value).map_err(EdgeError::internal)?;
+    http::response_builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
         .body(body)
         .map_err(EdgeError::internal)
 }
@@ -224,7 +376,7 @@ pub async fn kv_note_put(
     let store = kv
         .named("cache")
         .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
-    let body = ctx.into_request().into_body();
+    let body = ctx.into_request()?.into_body();
     let body_bytes = body.into_bytes_bounded(MAX_BODY_SIZE).await?;
     store
         .put_bytes(&format!("note:{}", path.id), body_bytes)
@@ -319,6 +471,11 @@ pub async fn state_demo(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::missing_trait_methods,
+        reason = "legacy config fixtures intentionally exercise the bounded-read compatibility default"
+    )]
+
     use super::*;
     use async_trait::async_trait;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -326,15 +483,19 @@ mod tests {
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
-    use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
+    use edgezero_core::http::{request_builder, HeaderMap, Method, StatusCode, Uri};
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
+    use edgezero_core::outbound::{
+        HttpClient, OutboundHttpClient, OutboundRequestParts, OutboundResponse, OutboundSlotResult,
+        ResponseMode,
+    };
     use edgezero_core::params::PathParams;
-    use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
     use edgezero_core::store_registry::{
         ConfigRegistry, ConfigStoreBinding, KvRegistry, StoreRegistry,
     };
+    use edgezero_core::BudgetSource;
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -346,7 +507,7 @@ mod tests {
         data: Mutex<BTreeMap<String, Bytes>>,
     }
 
-    struct TestProxyClient;
+    struct TestOutboundClient;
 
     struct UnavailableConfigStore;
 
@@ -420,11 +581,37 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl ProxyClient for TestProxyClient {
-        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
-            let (_method, uri, _headers, _body, _) = request.into_parts();
-            assert!(uri.to_string().contains("status/201"));
-            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
+    impl OutboundHttpClient for TestOutboundClient {
+        async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
+            let parts = request.into_parts();
+            assert_eq!(parts.method, Method::POST);
+            assert!(parts
+                .uri
+                .path_and_query()
+                .is_some_and(|value| value.as_str() == "/status/201?source=demo"));
+            assert!(parts.deadline.is_none());
+            assert_outbound_policy(&parts);
+            response_for(parts)
+        }
+
+        async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
+            let mut deadline = None;
+            let mut results = Vec::with_capacity(requests.len());
+            for (index, request) in requests.into_iter().enumerate() {
+                let parts = request.into_parts();
+                assert_outbound_policy(&parts);
+                let slot_deadline = parts.deadline.expect("batch deadline");
+                if let Some(expected) = deadline {
+                    assert_eq!(slot_deadline.instant(), expected);
+                } else {
+                    deadline = Some(slot_deadline.instant());
+                }
+                let elapsed = Duration::from_millis(
+                    u64::try_from(index).expect("slot index").saturating_add(1),
+                );
+                results.push(OutboundSlotResult::new(elapsed, response_for(parts)));
+            }
+            results
         }
     }
 
@@ -442,6 +629,65 @@ mod tests {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.clone()))
         }
+    }
+
+    fn assert_outbound_policy(parts: &OutboundRequestParts) {
+        assert_eq!(parts.timeout, Some(OUTBOUND_REQUEST_TIMEOUT));
+        assert_eq!(
+            parts.max_request_body_bytes,
+            MAX_OUTBOUND_REQUEST_BODY_BYTES
+        );
+        assert_eq!(
+            parts.max_encoded_response_bytes,
+            Some(MAX_ENCODED_RESPONSE_BYTES)
+        );
+        assert_eq!(
+            parts.max_decoded_response_bytes,
+            Some(MAX_DECODED_RESPONSE_BYTES)
+        );
+        assert_eq!(
+            parts.response_mode,
+            ResponseMode::Buffered {
+                max_bytes: MAX_FINAL_RESPONSE_BYTES,
+            }
+        );
+        assert_eq!(
+            parts.max_response_header_bytes,
+            Some(MAX_RESPONSE_HEADER_BYTES)
+        );
+        assert_eq!(
+            parts.max_response_header_count,
+            Some(MAX_RESPONSE_HEADER_COUNT)
+        );
+        assert_eq!(
+            parts.max_chunk_bytes,
+            Some(NonZeroU64::new(MAX_RESPONSE_CHUNK_BYTES).unwrap_or(NonZeroU64::MIN))
+        );
+        assert_eq!(parts.max_brotli_window_bits, MAX_BROTLI_WINDOW_BITS);
+        assert_eq!(parts.max_brotli_decoder_bytes, MAX_BROTLI_DECODER_BYTES);
+    }
+
+    fn response_for(parts: OutboundRequestParts) -> Result<OutboundResponse, EdgeError> {
+        if parts.uri.path() == "/fail" {
+            return Err(EdgeError::gateway_timeout_caused(
+                "provider URL https://user:token@example.invalid",
+                BudgetSource::BatchDeadline,
+            ));
+        }
+
+        let status = match parts.uri.path() {
+            "/status/201" => StatusCode::CREATED,
+            "/status/204" => StatusCode::NO_CONTENT,
+            _ => StatusCode::OK,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-outbound-test", HeaderValue::from_static("preserved"));
+        Ok(OutboundResponse::new(
+            parts.method,
+            status,
+            headers,
+            Body::text("outbound-response"),
+        ))
     }
 
     #[test]
@@ -905,15 +1151,15 @@ mod tests {
     }
 
     #[test]
-    fn proxy_demo_uses_injected_handle() {
+    fn app_demo_outbound_client_preserves_method_and_uri() {
         let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/proxy/status/201")
-            .body(Body::empty())
+            .method(Method::POST)
+            .uri("/proxy/status/201?source=demo")
+            .body(Body::text("request-body"))
             .expect("request");
         request
             .extensions_mut()
-            .insert(ProxyHandle::with_client(TestProxyClient));
+            .insert(HttpClient::with_client(TestOutboundClient));
 
         let mut params = HashMap::new();
         params.insert("rest".to_owned(), "status/201".to_owned());
@@ -921,13 +1167,75 @@ mod tests {
 
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["x-outbound-test"], "preserved");
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .as_ref(),
+            b"outbound-response"
+        );
     }
 
     #[test]
-    fn proxy_demo_without_handle_returns_placeholder() {
+    fn fanout_reports_positional_elapsed_and_typed_outcomes() {
+        let ctx = fanout_context(r#"{"paths":["status/200","status/204","fail"]}"#);
+        let response = block_on(fanout(ctx)).expect("fanout response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert!(
+            !String::from_utf8_lossy(response.body().as_bytes().expect("buffered"))
+                .contains("token@example.invalid")
+        );
+
+        let payload: serde_json::Value = response.body().to_json().expect("json");
+        assert_eq!(payload[0]["index"], 0_i64);
+        assert_eq!(payload[0]["elapsed_ms"], 1_i64);
+        assert_eq!(payload[0]["outcome"]["kind"], "response");
+        assert_eq!(payload[0]["outcome"]["status"], 200_i64);
+        assert_eq!(payload[1]["index"], 1_i64);
+        assert_eq!(payload[1]["elapsed_ms"], 2_i64);
+        assert_eq!(payload[1]["outcome"]["status"], 204_i64);
+        assert_eq!(payload[2]["index"], 2_i64);
+        assert_eq!(payload[2]["elapsed_ms"], 3_i64);
+        assert_eq!(payload[2]["outcome"]["kind"], "error");
+        assert_eq!(payload[2]["outcome"]["category"], "gateway_timeout");
+        assert_eq!(payload[2]["outcome"]["status"], 504_i64);
+    }
+
+    #[test]
+    fn fanout_with_empty_input_returns_an_empty_array() {
+        let ctx = fanout_context(r#"{"paths":[]}"#);
+        let response = block_on(fanout(ctx)).expect("fanout response");
+        let payload: serde_json::Value = response.body().to_json().expect("json");
+        assert_eq!(payload, serde_json::json!([]));
+    }
+
+    #[test]
+    fn fanout_rejects_more_than_eight_paths() {
+        let ctx = fanout_context(r#"{"paths":["1","2","3","4","5","6","7","8","9"]}"#);
+        let error = block_on(fanout(ctx)).expect_err("oversized fanout must fail");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn proxy_demo_without_client_returns_placeholder() {
         let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    fn fanout_context(json: &str) -> RequestContext {
+        let mut request = request_builder()
+            .method(Method::POST)
+            .uri("/fanout")
+            .body(Body::from(json))
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(HttpClient::with_client(TestOutboundClient));
+        RequestContext::new(request, PathParams::default())
     }
 
     #[test]
@@ -983,7 +1291,8 @@ mod tests {
                 .to_vec(),
         )
         .expect("utf8");
-        assert!(body.contains("required secret is not configured"));
+        assert!(body.contains("internal server error"));
+        assert!(!body.contains("required secret is not configured"));
         assert!(!body.contains("SMOKE_SECRET_MISSING"));
     }
 

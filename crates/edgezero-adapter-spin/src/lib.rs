@@ -1,6 +1,6 @@
 //! Adapter helpers for Spin (Fermyon).
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -13,8 +13,12 @@ pub mod key_value_store;
 // It is host-compilable so its tests run under `cargo test`, while the wasm32
 // `SpinKvStore` is the production consumer.
 mod kv_pagination;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub mod proxy;
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(feature = "spin", target_arch = "wasm32")
+))]
+pub mod outbound;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub mod request;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]

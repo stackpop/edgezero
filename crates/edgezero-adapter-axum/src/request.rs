@@ -1,37 +1,50 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use axum::body::{Body as AxumBody, to_bytes};
+use axum::body::{Body as AxumBody, BodyDataStream};
 use axum::extract::connect_info::ConnectInfo;
-use axum::http::Request;
+use axum::http::{Request, request::Parts};
 use edgezero_core::body::Body;
-use edgezero_core::http::HeaderValue;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::Request as CoreRequest;
-use edgezero_core::http::header::CONTENT_TYPE;
-use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::outbound::HttpClient;
+use edgezero_core::time::{Deadline, MonotonicClock};
+use futures_util::{StreamExt as _, stream};
+use tokio::time::timeout;
 
 use crate::context::AxumRequestContext;
-use crate::proxy::AxumProxyClient;
+use crate::outbound::AxumOutboundClient;
 
 /// Convert an Axum/Hyper request into an `EdgeZero` core request while preserving streaming bodies
 /// and exposing connection metadata through `AxumRequestContext`.
 ///
 /// # Errors
-/// Returns an error if a buffered (`application/json`) body cannot be read into memory.
+/// Returns an error if the outbound client cannot be initialized.
 #[inline]
+#[expect(
+    clippy::unused_async,
+    reason = "the public converter retains its established async API while request bodies remain lazy"
+)]
 pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest, String> {
     let (parts, axum_body) = request.into_parts();
+    into_core_request_parts(parts, axum_body, None, None)
+}
 
-    let body = match parts.headers.get(CONTENT_TYPE) {
-        Some(value) if is_json_content_type(value) => {
-            let bytes = to_bytes(axum_body, usize::MAX)
-                .await
-                .map_err(|err| format!("Failed to convert body into bytes: {err}"))?;
-            Body::from_bytes(bytes)
+pub(crate) fn into_core_request_parts(
+    parts: Parts,
+    axum_body: AxumBody,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
+    outbound_transport: Option<Arc<reqwest::Client>>,
+) -> Result<CoreRequest, String> {
+    let outbound_clock = read_lifetime
+        .as_ref()
+        .map_or_else(MonotonicClock::default, |(_, clock)| clock.clone());
+    let body = match read_lifetime {
+        Some((deadline, monotonic_clock)) => {
+            deadline_body(axum_body.into_data_stream(), deadline, monotonic_clock)
         }
-        _ => {
-            let stream = axum_body.into_data_stream();
-            Body::from_stream(stream)
-        }
+        None => Body::from_external_stream(axum_body.into_data_stream()),
     };
 
     let mut core_request = CoreRequest::from_parts(parts, body);
@@ -52,47 +65,112 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
         );
     }
 
-    let proxy_client =
-        AxumProxyClient::try_new().map_err(|err| format!("failed to build proxy client: {err}"))?;
+    let outbound_client = match outbound_transport {
+        Some(transport) => AxumOutboundClient::with_transport_and_clock(transport, outbound_clock),
+        None => AxumOutboundClient::try_with_clock(outbound_clock)
+            .map_err(|_error| "failed to build outbound HTTP client".to_owned())?,
+    };
     core_request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(proxy_client));
+        .insert(HttpClient::with_client(outbound_client));
 
     Ok(core_request)
 }
 
-fn is_json_content_type(value: &HeaderValue) -> bool {
-    let Ok(raw) = value.to_str() else {
-        return false;
-    };
-
-    let media_type = raw.split(';').next().map_or("", str::trim);
-    if media_type.eq_ignore_ascii_case("application/json") {
-        return true;
-    }
-
-    let Some((ty, raw_subtype)) = media_type.split_once('/') else {
-        return false;
-    };
-
-    if !ty.eq_ignore_ascii_case("application") {
-        return false;
-    }
-
-    let subtype = raw_subtype.trim();
-    let Some(suffix_start) = subtype.len().checked_sub(5) else {
-        return false;
-    };
-    subtype
-        .get(suffix_start..)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json"))
+fn deadline_body(
+    body_stream: BodyDataStream,
+    deadline: Deadline,
+    monotonic_clock: MonotonicClock,
+) -> Body {
+    let deadline_stream = stream::unfold(
+        Some(Box::pin(body_stream)),
+        move |stream_state: Option<Pin<Box<BodyDataStream>>>| {
+            let clock = monotonic_clock.clone();
+            async move {
+                let mut state_stream = stream_state?;
+                let Some(remaining) = deadline.remaining_at(clock.now()) else {
+                    return Some((
+                        Err(EdgeError::request_timeout(
+                            "inbound body read deadline exceeded",
+                        )),
+                        None,
+                    ));
+                };
+                let item = match timeout(remaining, state_stream.next()).await {
+                    Ok(item) => item,
+                    Err(_elapsed) => {
+                        return Some((
+                            Err(EdgeError::request_timeout(
+                                "inbound body read deadline exceeded",
+                            )),
+                            None,
+                        ));
+                    }
+                };
+                if deadline.is_expired_at(clock.now()) {
+                    return Some((
+                        Err(EdgeError::request_timeout(
+                            "inbound body read deadline exceeded",
+                        )),
+                        None,
+                    ));
+                }
+                match item {
+                    Some(Ok(bytes)) => Some((Ok(bytes), Some(state_stream))),
+                    Some(Err(error)) => Some((Err(EdgeError::internal(error)), None)),
+                    None => None,
+                }
+            }
+        },
+    );
+    Body::from_stream(deadline_stream)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use edgezero_core::body::Body;
-    use edgezero_core::http::Method;
+    use edgezero_core::http::{Method, StatusCode};
+    use edgezero_core::time::MonotonicInstant;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    struct DropSignal(Arc<AtomicUsize>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_body_releases_source_when_timeout_is_emitted() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let signal = DropSignal(Arc::clone(&dropped));
+        let source = stream::poll_fn(move |_cx| {
+            let _keep_alive = &signal;
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        });
+        let start = MonotonicInstant::now();
+        let clock = MonotonicClock::new(move || start);
+        let body = deadline_body(
+            AxumBody::from_stream(source).into_data_stream(),
+            Deadline::at_instant(start),
+            clock,
+        );
+        let mut body_stream = body.into_stream().expect("stream");
+
+        let error = body_stream
+            .next()
+            .await
+            .expect("terminal timeout item")
+            .expect_err("timeout");
+        assert_eq!(error.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn converts_request_and_records_connect_info() {
@@ -125,6 +203,25 @@ mod tests {
                 .get::<ConnectInfo<SocketAddr>>()
                 .is_none()
         );
+        assert!(core_request.extensions().get::<HttpClient>().is_some());
+    }
+
+    #[tokio::test]
+    async fn supplied_outbound_transport_is_retained_by_the_core_request() {
+        let transport = AxumOutboundClient::try_transport().expect("transport");
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/demo")
+            .body(AxumBody::empty())
+            .expect("request");
+        let (parts, body) = request.into_parts();
+
+        let core_request = into_core_request_parts(parts, body, None, Some(Arc::clone(&transport)))
+            .expect("request conversion");
+
+        assert_eq!(Arc::strong_count(&transport), 2);
+        drop(core_request);
+        assert_eq!(Arc::strong_count(&transport), 1);
     }
 
     #[tokio::test]
@@ -142,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_content_type_buffers_body() {
+    async fn json_content_type_stays_streaming() {
         let json_payload = r#"{"name":"test"}"#;
         let request = Request::builder()
             .method(Method::POST)
@@ -156,12 +253,7 @@ mod tests {
             .expect("request conversion");
         assert_eq!(core_request.method(), &Method::POST);
 
-        match core_request.body() {
-            Body::Once(bytes) => {
-                assert_eq!(bytes.as_ref(), json_payload.as_bytes());
-            }
-            Body::Stream(_) => panic!("JSON body should be buffered, not streaming"),
-        }
+        assert!(matches!(core_request.body(), Body::Stream(_)));
     }
 
     #[tokio::test]
@@ -178,28 +270,5 @@ mod tests {
             .expect("request conversion");
 
         assert!(matches!(core_request.body(), Body::Stream(_)));
-    }
-
-    #[test]
-    fn json_content_type_detection() {
-        assert!(is_json_content_type(&HeaderValue::from_static(
-            "application/json"
-        )));
-        assert!(is_json_content_type(&HeaderValue::from_static(
-            "application/json; charset=utf-8"
-        )));
-        assert!(is_json_content_type(&HeaderValue::from_static(
-            "application/vnd.api+json"
-        )));
-        assert!(is_json_content_type(&HeaderValue::from_static(
-            "APPLICATION/VND.CUSTOM+JSON; CHARSET=UTF-8"
-        )));
-
-        assert!(!is_json_content_type(&HeaderValue::from_static(
-            "text/json"
-        )));
-        assert!(!is_json_content_type(&HeaderValue::from_static(
-            "application/json+xml"
-        )));
     }
 }

@@ -1,6 +1,6 @@
 //! Adapter helpers for Cloudflare Workers.
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 
 // `config_store` compiles on host for its `InMemory` test backend; the
@@ -11,8 +11,12 @@ pub mod config_store;
 pub mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod key_value_store;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub mod proxy;
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(feature = "cloudflare", target_arch = "wasm32")
+))]
+pub mod outbound;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]

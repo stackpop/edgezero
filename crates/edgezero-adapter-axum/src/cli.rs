@@ -11,8 +11,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    register_adapter,
+    Adapter, AdapterAction, AdapterExecutionTarget, AdapterPushContext, ProvisionStores,
+    ReadConfigEntry, ResolvedStoreId, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -20,6 +20,7 @@ use edgezero_adapter::scaffold::{
 };
 use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::{Capability, CapabilitySupport};
 use toml::Value;
 use walkdir::WalkDir;
 
@@ -133,6 +134,31 @@ struct EdgezeroAxumConfig {
     reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for AxumCliAdapter {
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::ConfigReadDeadlines | Capability::LazyStreamedResponsePassthrough => {
+                CapabilitySupport::BestEffort
+            }
+            Capability::InboundReadDeadlines
+            | Capability::IngressAdmission
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHeaderFidelity
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
+            | _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // The axum adapter is the in-process native dev server —
@@ -155,6 +181,29 @@ impl Adapter for AxumCliAdapter {
                 "axum adapter does not support the Fastly staging lifecycle action {action:?}"
             )),
             other => Err(format!("axum adapter does not support {other:?}")),
+        }
+    }
+
+    fn execute_target(
+        &self,
+        action: AdapterAction,
+        target: &AdapterExecutionTarget,
+        args: &[String],
+    ) -> Result<(), String> {
+        match action {
+            AdapterAction::Build => build_target(target, args),
+            AdapterAction::Deploy => deploy(args),
+            AdapterAction::Serve => serve_target(target, args),
+            AdapterAction::AuthLogin
+            | AdapterAction::AuthLogout
+            | AdapterAction::AuthStatus
+            | AdapterAction::DeployStaged
+            | AdapterAction::EmitVersion
+            | AdapterAction::Healthcheck
+            | AdapterAction::Rollback
+            | _ => Err(format!(
+                "axum adapter does not support pinned target action {action:?}"
+            )),
         }
     }
 
@@ -374,9 +423,32 @@ fn build(extra_args: &[String]) -> Result<(), String> {
     run_cargo(&project, "build", extra_args)
 }
 
+fn build_target(target: &AdapterExecutionTarget, extra_args: &[String]) -> Result<(), String> {
+    let project = read_axum_project(&target_manifest(target, "axum.toml")?)?;
+    run_cargo(&project, "build", extra_args)
+}
+
 fn serve(extra_args: &[String]) -> Result<(), String> {
     let project = locate_project()?;
     run_cargo(&project, "run", extra_args)
+}
+
+fn serve_target(target: &AdapterExecutionTarget, extra_args: &[String]) -> Result<(), String> {
+    let project = read_axum_project(&target_manifest(target, "axum.toml")?)?;
+    run_cargo(&project, "run", extra_args)
+}
+
+fn target_manifest(target: &AdapterExecutionTarget, name: &str) -> Result<PathBuf, String> {
+    let manifest = target
+        .platform_manifest()
+        .map_or_else(|| target.app_root().join(name), Path::to_path_buf);
+    if !manifest.is_file() {
+        return Err(format!(
+            "pinned axum manifest {} is not a regular file",
+            manifest.display()
+        ));
+    }
+    Ok(manifest)
 }
 
 fn deploy(_extra_args: &[String]) -> Result<(), String> {
@@ -694,6 +766,77 @@ mod tests {
     use edgezero_adapter::cli_support::find_manifest_upwards;
     use std::net::Ipv6Addr;
     use tempfile::tempdir;
+
+    #[test]
+    fn adapter_capability_matrix_matches_contracts() {
+        let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::InboundReadDeadlines, CapabilitySupport::Native),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::Unsupported,
+            ),
+            (Capability::OutboundHttp, CapabilitySupport::Native),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::Native),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::Native,
+            ),
+            (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::BestEffort,
+            ),
+        ];
+
+        for (capability, support) in expected {
+            assert_eq!(
+                AXUM_ADAPTER.capability(capability),
+                support,
+                "{capability:?}"
+            );
+        }
+    }
 
     #[test]
     fn read_axum_project_loads_defaults() {

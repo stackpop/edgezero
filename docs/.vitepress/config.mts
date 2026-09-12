@@ -36,8 +36,9 @@ export default defineConfig({
           { text: 'Routing', link: '/guide/routing' },
           { text: 'Handlers & Extractors', link: '/guide/handlers' },
           { text: 'Middleware', link: '/guide/middleware' },
+          { text: 'Capabilities', link: '/guide/capabilities' },
           { text: 'Streaming', link: '/guide/streaming' },
-          { text: 'Proxying', link: '/guide/proxying' },
+          { text: 'Outbound HTTP', link: '/guide/proxying' },
         ],
       },
       {

@@ -20,6 +20,7 @@ cli = [
     "dep:walkdir",
 ]
 fastly = ["dep:fastly", "dep:log-fastly"]
+test-utils = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -49,5 +50,6 @@ walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
+fastly-shared = { workspace = true }
 handlebars = { workspace = true }
 tempfile = { workspace = true }

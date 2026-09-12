@@ -1,49 +1,69 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body as AxumBody;
 use axum::http::{Request, Response};
+use edgezero_core::app::App;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::StatusCode;
+use edgezero_core::ingress::{
+    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts,
+    validate_normalized_ingress_parts,
+};
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::response::IntoResponse as _;
+use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry,
 };
+use tokio::time::timeout;
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
-use crate::request::into_core_request;
+use crate::outbound::AxumOutboundClient;
+use crate::request::into_core_request_parts;
 use crate::response::into_axum_response;
 
 /// Tower service that adapts `EdgeZero` router requests to Axum/Hyper compatible responses.
 #[derive(Clone)]
 pub struct EdgeZeroAxumService {
+    app: Arc<App>,
     config_registry: Option<ConfigRegistry>,
     config_store_handle: Option<ConfigStoreHandle>,
     kv_handle: Option<KvHandle>,
     kv_registry: Option<KvRegistry>,
-    router: RouterService,
+    outbound_transport: Option<Arc<reqwest::Client>>,
     secret_handle: Option<SecretHandle>,
     secret_registry: Option<SecretRegistry>,
 }
 
 impl EdgeZeroAxumService {
+    /// Creates a service that preserves all policies configured on `App`.
     #[must_use]
     #[inline]
-    pub fn new(router: RouterService) -> Self {
+    pub fn from_app(app: App) -> Self {
         Self {
+            app: Arc::new(app),
             config_registry: None,
             config_store_handle: None,
             kv_handle: None,
             kv_registry: None,
-            router,
+            outbound_transport: AxumOutboundClient::try_transport().ok(),
             secret_handle: None,
             secret_registry: None,
         }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn new(router: RouterService) -> Self {
+        Self::from_app(App::new(router))
     }
 
     /// Attach an id-keyed config-store registry to this service.
@@ -130,7 +150,9 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 
     #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
-        let router = self.router.clone();
+        let request_start = self.app.monotonic_now();
+        let app = Arc::clone(&self.app);
+        let outbound_transport_handle = self.outbound_transport.clone();
         // Hard-cutoff: legacy bare `KvHandle` /
         // `ConfigStoreHandle` / `SecretHandle` entries are NO
         // LONGER inserted into request extensions. The legacy
@@ -170,38 +192,65 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
             })
         });
         Box::pin(async move {
-            let mut core_request = match into_core_request(req).await {
-                Ok(converted) => converted,
-                Err(err) => {
-                    let mut err_response = Response::new(AxumBody::from(err.clone()));
-                    *err_response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            let response = task::block_in_place(move || {
+                Handle::current().block_on(async move {
+                    let (parts, native_body) = req.into_parts();
+                    if let Err(error) =
+                        validate_normalized_ingress_parts(&parts, app.ingress_head_limits())
+                    {
+                        return convert_error_response(error).await;
+                    }
+                    let head_parts = IngressHeadParts::from_parts(
+                        &parts,
+                        IngressHeadAccounting::HostManaged,
+                        IngressFraming::HostManaged,
+                    );
+                    let prepared = match app.begin_ingress(head_parts, request_start) {
+                        Ok(IngressBeginOutcome::Admitted(prepared)) => prepared,
+                        Ok(IngressBeginOutcome::Refused(response)) => {
+                            return convert_egress_envelope(response).await;
+                        }
+                        Err(error) => return convert_error_response(error).await,
+                        Ok(_) => {
+                            return minimal_error_response(
+                                "unsupported ingress admission outcome".to_owned(),
+                            );
+                        }
+                    };
+                    let read_deadline = prepared.read_deadline();
+                    let monotonic_clock = prepared.monotonic_clock();
+                    let Some(outbound_transport) = outbound_transport_handle else {
+                        return minimal_error_response(
+                            "failed to initialize outbound HTTP transport".to_owned(),
+                        );
+                    };
+                    let mut core_request = match into_core_request_parts(
+                        parts,
+                        native_body,
+                        Some((read_deadline, monotonic_clock)),
+                        Some(outbound_transport),
+                    ) {
+                        Ok(converted) => converted,
+                        Err(err) => return minimal_error_response(err),
+                    };
 
-                    return Ok(err_response);
-                }
-            };
+                    if let Some(registry) = config_registry {
+                        core_request.extensions_mut().insert(registry);
+                    }
+                    if let Some(registry) = kv_registry {
+                        core_request.extensions_mut().insert(registry);
+                    }
+                    if let Some(registry) = secret_registry {
+                        core_request.extensions_mut().insert(registry);
+                    }
 
-            if let Some(registry) = config_registry {
-                core_request.extensions_mut().insert(registry);
-            }
-            if let Some(registry) = kv_registry {
-                core_request.extensions_mut().insert(registry);
-            }
-            if let Some(registry) = secret_registry {
-                core_request.extensions_mut().insert(registry);
-            }
-
-            let core_response = task::block_in_place(move || {
-                Handle::current().block_on(router.oneshot(core_request))
+                    let egress = match app.dispatch_admitted(prepared, core_request).await {
+                        Ok(egress) => egress,
+                        Err(error) => return convert_error_response(error).await,
+                    };
+                    convert_egress_envelope(egress).await
+                })
             });
-            let response = match core_response {
-                Ok(response) => into_axum_response(response),
-                Err(err) => {
-                    let body = AxumBody::from(format!("internal error: {err}"));
-                    let mut fallback = Response::new(body);
-                    *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                    fallback
-                }
-            };
             Ok(response)
         })
     }
@@ -212,22 +261,144 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     }
 }
 
+async fn convert_egress_envelope(egress: ResponseEgressEnvelope) -> Response<AxumBody> {
+    let Ok((response, policy, mut attempt, clock)) = egress.begin() else {
+        return minimal_error_response("response-egress policy failed".to_owned());
+    };
+    let Some(remaining) = policy.write_deadline.remaining_at(clock.now()) else {
+        attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, clock.now());
+        return minimal_status_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "response write deadline exceeded".to_owned(),
+        );
+    };
+
+    let result = match timeout(remaining, into_axum_response(response)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, clock.now());
+            return minimal_status_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "response write deadline exceeded".to_owned(),
+            );
+        }
+    };
+    let observed_at = clock.now();
+    if policy.write_deadline.is_expired_at(observed_at) {
+        attempt.terminate(ResponseEgressOutcome::DeadlineExceeded, observed_at);
+        return minimal_status_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "response write deadline exceeded".to_owned(),
+        );
+    }
+    match result {
+        Ok(converted) => {
+            attempt.terminate(ResponseEgressOutcome::ResponseReturned, observed_at);
+            converted
+        }
+        Err(error) => {
+            let outcome = if matches!(error, EdgeError::ResponseTooLarge { .. }) {
+                ResponseEgressOutcome::ConversionError
+            } else {
+                ResponseEgressOutcome::SourceError
+            };
+            attempt.terminate(outcome, observed_at);
+            convert_error_response(error).await
+        }
+    }
+}
+
+async fn convert_error_response(error: EdgeError) -> Response<AxumBody> {
+    match error.into_response() {
+        Ok(error_response) => match into_axum_response(error_response).await {
+            Ok(converted) => converted,
+            Err(fallback_error) => minimal_error_response(format!(
+                "internal response conversion error: {fallback_error}"
+            )),
+        },
+        Err(fallback_error) => {
+            minimal_error_response(format!("internal error response error: {fallback_error}"))
+        }
+    }
+}
+
+fn minimal_error_response(message: String) -> Response<AxumBody> {
+    minimal_status_response(StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn minimal_status_response(status: StatusCode, message: String) -> Response<AxumBody> {
+    let mut response = Response::new(AxumBody::from(message));
+    *response.status_mut() = status;
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{StatusCode, response_builder};
+    use edgezero_core::http::{
+        HeaderMap, HeaderValue, Response as CoreResponse, StatusCode, response_builder,
+    };
+    use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
     use edgezero_core::key_value_store::KvStore;
-    use std::sync::Arc;
+    use edgezero_core::middleware::{Middleware, Next};
+    use edgezero_core::outbound::OutboundRequest;
+    use edgezero_core::response_egress::{
+        ResponseEgressObserver, ResponseEgressPolicy, ResponseEgressReport,
+    };
+    use edgezero_core::router::{RouteMetadata, RouteResolution};
+    use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
+    use futures_util::stream::poll_fn;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Poll, Waker};
+    use std::time::Duration;
     use tower::ServiceExt as _;
 
     struct FixedConfigStore(String);
 
+    struct CountingMiddleware(Arc<AtomicUsize>);
+
+    struct DropSignal(Arc<AtomicUsize>);
+
+    #[derive(Clone)]
+    struct RecordingEgressObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
+
+    impl ResponseEgressObserver for RecordingEgressObserver {
+        fn complete(&self, report: &ResponseEgressReport) {
+            self.0.lock().expect("reports lock").push(report.clone());
+        }
+    }
+
     #[async_trait::async_trait(?Send)]
+    impl Middleware for CountingMiddleware {
+        async fn handle(
+            &self,
+            ctx: RequestContext,
+            next: Next<'_>,
+        ) -> Result<CoreResponse, EdgeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            next.run(ctx).await
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the legacy test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for FixedConfigStore {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.clone()))
@@ -250,6 +421,558 @@ mod tests {
         let request = Request::builder().uri("/").body(AxumBody::empty()).unwrap();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_service_installs_the_exact_application_outbound_clock() {
+        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+            let client = ctx
+                .http_client()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+            let request = OutboundRequest::get("https://example.com/")?.stream_response();
+            let results = client.send_all(vec![request]).await;
+            Ok(results[0].elapsed.as_millis().to_string())
+        }
+
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(AtomicUsize::new(0));
+        let clock_observations = Arc::clone(&observations);
+        let router = RouterService::builder().get("/clock", elapsed).build();
+        let mut app = App::new(router);
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                start
+            } else {
+                completed
+            }
+        }));
+        let request = Request::builder()
+            .uri("/clock")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = EdgeZeroAxumService::from_app(app)
+            .oneshot(request)
+            .await
+            .expect("response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+
+        assert_eq!(body, "7");
+        assert!(observations.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_admission_refuses_before_native_body_poll() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&admission_calls);
+        let observed_during_admission = Arc::clone(&body_polls);
+
+        let router = RouterService::builder()
+            .post("/upload", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("handler must not run")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(move |head| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(observed_during_admission.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                head.route_resolution(),
+                RouteResolution::Matched(_)
+            ));
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Body::empty())
+                    .expect("refusal"),
+            )
+        });
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(native_body)
+            .expect("request");
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    fn guarded_fallback_app() -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let handler_call_count = Arc::new(AtomicUsize::new(0));
+        let observed_handler_calls = Arc::clone(&handler_call_count);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .get("/known", move |_ctx: RequestContext| {
+                let request_handler_calls = Arc::clone(&observed_handler_calls);
+                async move {
+                    request_handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("handler must not run")
+                }
+            })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+            .build();
+        (App::new(router), handler_call_count, middleware_calls)
+    }
+
+    fn fallback_body_app(
+        max_body_bytes: usize,
+        read_budget: Duration,
+        grant_drop_count: &Arc<AtomicUsize>,
+    ) -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let observed_grant_drops = Arc::clone(grant_drop_count);
+        app.set_ingress_admission_policy(move |head| match head.route_resolution() {
+            RouteResolution::Matched(_) => AdmissionDecision::Admit {
+                grant: IngressGrant::empty(),
+                read_deadline: head.read_deadline_after(read_budget),
+            },
+            RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
+                AdmissionDecision::ReadBodyBeforeFallback {
+                    grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+                    max_body_bytes,
+                    read_deadline: head.read_deadline_after(read_budget),
+                    on_exceeded: buffered_terminal_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "exceeded",
+                        b"configured overflow\0response",
+                    ),
+                    on_timeout: buffered_terminal_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timeout",
+                        b"configured timeout\0response",
+                    ),
+                }
+            }
+        });
+        (app, handler_calls, middleware_calls)
+    }
+
+    fn buffered_terminal_response(
+        status: StatusCode,
+        marker: &'static str,
+        body: &'static [u8],
+    ) -> BufferedIngressResponse {
+        BufferedIngressResponse::new(
+            status,
+            terminal_response_headers(marker),
+            Bytes::from_static(body),
+        )
+    }
+
+    fn terminal_response_headers(marker: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fallback-terminal", HeaderValue::from_static(marker));
+        headers
+    }
+
+    fn tracked_lengthless_request(
+        path: &str,
+        body_chunks: Vec<Bytes>,
+        grant_drops: &Arc<AtomicUsize>,
+        source_drops: &Arc<AtomicUsize>,
+        body_polls: &Arc<AtomicUsize>,
+    ) -> Request<AxumBody> {
+        let observed_grant_drops = Arc::clone(grant_drops);
+        let source_drop = DropSignal(Arc::clone(source_drops));
+        let observed_body_polls = Arc::clone(body_polls);
+        let mut pending_chunks = body_chunks.into_iter();
+        let stream = poll_fn(move |_cx| {
+            let _keep_source_alive = &source_drop;
+            observed_body_polls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
+            Poll::Ready(pending_chunks.next().map(Ok::<Bytes, io::Error>))
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(AxumBody::from_stream(stream))
+            .expect("request");
+        assert!(request.headers().get("content-length").is_none());
+        request
+    }
+
+    fn assert_no_fallback_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn assert_terminal_response(
+        response: Response<AxumBody>,
+        status: StatusCode,
+        marker: &'static str,
+        body: &[u8],
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers(), &terminal_response_headers(marker));
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body"),
+            body
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fallback_preserves_404_and_405_at_exact_cap() {
+        for (path, expected) in [
+            ("/missing", StatusCode::NOT_FOUND),
+            ("/known", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                fallback_body_app(4, Duration::from_secs(1), &grant_drops);
+            let request = tracked_lengthless_request(
+                path,
+                vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
+                &grant_drops,
+                &source_drops,
+                &body_polls,
+            );
+            let response = EdgeZeroAxumService::from_app(app)
+                .ready()
+                .await
+                .expect("ready")
+                .call(request)
+                .await
+                .expect("response");
+            assert_eq!(response.status(), expected);
+            assert_eq!(body_polls.load(Ordering::SeqCst), 3);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fallback_overflow_precedes_404_and_405() {
+        for path in ["/missing", "/known"] {
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let (app, handler_calls, middleware_calls) =
+                fallback_body_app(4, Duration::from_secs(1), &grant_drops);
+            let request = tracked_lengthless_request(
+                path,
+                vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"e")],
+                &grant_drops,
+                &source_drops,
+                &body_polls,
+            );
+            let response = EdgeZeroAxumService::from_app(app)
+                .ready()
+                .await
+                .expect("ready")
+                .call(request)
+                .await
+                .expect("response");
+            assert_terminal_response(
+                response,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "exceeded",
+                b"configured overflow\0response",
+            )
+            .await;
+            assert_eq!(body_polls.load(Ordering::SeqCst), 2);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fallback_deadline_interrupts_pending_native_body() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let observed_grant_drops = Arc::clone(&grant_drops);
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let source_drop = DropSignal(Arc::clone(&source_drops));
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            let _keep_source_alive = &source_drop;
+            assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let (app, handler_calls, middleware_calls) =
+            fallback_body_app(4_096, Duration::from_millis(500), &grant_drops);
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/missing")
+            .body(native_body)
+            .expect("request");
+
+        let response_task =
+            tokio::spawn(async move { service.ready().await.expect("ready").call(request).await });
+        timeout(Duration::from_secs(2), async {
+            while body_polls.load(Ordering::SeqCst) == 0 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native body must be polled before its read deadline");
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+
+        let response = timeout(Duration::from_secs(5), response_task)
+            .await
+            .expect("fallback deadline must preempt the pending native body")
+            .expect("service task")
+            .expect("response");
+
+        assert_terminal_response(
+            response,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            b"configured timeout\0response",
+        )
+        .await;
+        assert!(body_polls.load(Ordering::SeqCst) > 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_requested_service_continues_until_the_fallback_drain_finishes() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let body_ready = Arc::new(AtomicBool::new(false));
+        let observed_ready = Arc::clone(&body_ready);
+        let body_waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        let observed_waker = Arc::clone(&body_waker);
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let observed_grant_drops = Arc::clone(&grant_drops);
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let source_drop = DropSignal(Arc::clone(&source_drops));
+        let native_body = AxumBody::from_stream(poll_fn(move |context| {
+            let _keep_source_alive = &source_drop;
+            assert_eq!(observed_grant_drops.load(Ordering::SeqCst), 0);
+            if observed_ready.load(Ordering::SeqCst) {
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                return Poll::<Option<Result<Bytes, io::Error>>>::Ready(None);
+            }
+            *observed_waker.lock().expect("body waker") = Some(context.waker().clone());
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            if observed_ready.load(Ordering::SeqCst) {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        }));
+        let (app, handler_calls, middleware_calls) =
+            fallback_body_app(4_096, Duration::from_secs(5), &grant_drops);
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/missing")
+            .body(native_body)
+            .expect("request");
+
+        let response_task =
+            tokio::spawn(async move { service.ready().await.expect("ready").call(request).await });
+        timeout(Duration::from_secs(2), async {
+            while body_polls.load(Ordering::SeqCst) == 0 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native body must be polled before cancellation");
+
+        response_task.abort();
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+        body_ready.store(true, Ordering::SeqCst);
+        body_waker
+            .lock()
+            .expect("body waker")
+            .take()
+            .expect("pending body waker")
+            .wake();
+
+        let response = timeout(Duration::from_secs(2), response_task)
+            .await
+            .expect("completed fallback drain must finish the blocking bridge")
+            .expect("blocking bridge completes despite the abort request")
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_refusal_returns_503_without_polling_native_body() {
+        for path in ["/missing", "/known"] {
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let observed_polls = Arc::clone(&body_polls);
+            let source_drops = Arc::new(AtomicUsize::new(0));
+            let source_drop = DropSignal(Arc::clone(&source_drops));
+            let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+                let _keep_source_alive = &source_drop;
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                Poll::<Option<Result<Bytes, io::Error>>>::Pending
+            }));
+            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+            app.set_ingress_admission_policy(|head| {
+                assert!(matches!(
+                    head.route_resolution(),
+                    RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
+                ));
+                AdmissionDecision::Refuse(
+                    response_builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Body::from("fallback unavailable\n"))
+                        .expect("refusal response"),
+                )
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(native_body)
+                .expect("request");
+
+            let response = EdgeZeroAxumService::from_app(app)
+                .ready()
+                .await
+                .expect("ready")
+                .call(request)
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body"),
+                b"fallback unavailable\n".as_slice()
+            );
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+            assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn returned_response_reports_once_without_claiming_host_handoff() {
+        let router = RouterService::builder()
+            .get("/observed", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("ok")
+            })
+            .build();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(router);
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/observed")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let observed = reports.lock().expect("reports lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].outcome, ResponseEgressOutcome::ResponseReturned);
+        assert_eq!(observed[0].bytes_written, 0);
+        assert_eq!(
+            observed[0].route.as_ref().map(RouteMetadata::pattern),
+            Some("/observed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_clock_controls_response_write_deadline() {
+        let router = RouterService::builder()
+            .get("/deadline", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("too late")
+            })
+            .build();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let start = MonotonicInstant::now();
+        let observed_now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&observed_now);
+        let policy_now = Arc::clone(&observed_now);
+        let mut app = App::new(router);
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            *clock_now.lock().expect("clock lock")
+        }));
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        app.set_response_egress_policy(move |_head, started_at| {
+            let deadline = started_at
+                .checked_add(Duration::from_secs(1))
+                .expect("write deadline");
+            *policy_now.lock().expect("clock lock") = deadline;
+            ResponseEgressPolicy {
+                write_deadline: Deadline::at_instant(deadline),
+            }
+        });
+        let request = Request::builder()
+            .method("GET")
+            .uri("/deadline")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = EdgeZeroAxumService::from_app(app)
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let observed = reports.lock().expect("reports lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].outcome, ResponseEgressOutcome::DeadlineExceeded);
+        assert_eq!(observed[0].elapsed, Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_deadline_reaches_body_cell_as_request_timeout() {
+        let router = RouterService::builder()
+            .post("/upload", |ctx: RequestContext| async move {
+                let _bytes = ctx.body_bytes(1024).await?;
+                Ok::<_, EdgeError>("unexpected success")
+            })
+            .build();
+        let mut app = App::new(router);
+        let request_start = MonotonicInstant::now();
+        app.set_monotonic_clock(MonotonicClock::new(move || request_start));
+        app.set_ingress_admission_policy(move |head| {
+            assert_eq!(head.request_start(), request_start);
+            AdmissionDecision::Admit {
+                grant: IngressGrant::empty(),
+                read_deadline: Deadline::at_instant(head.request_start()),
+            }
+        });
+        let mut service = EdgeZeroAxumService::from_app(app);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(AxumBody::from("data"))
+            .expect("request");
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

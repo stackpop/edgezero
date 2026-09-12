@@ -17,13 +17,14 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    TypedSecretEntry, register_adapter,
+    Adapter, AdapterAction, AdapterExecutionTarget, AdapterPushContext, ProvisionStores,
+    ReadConfigEntry, ResolvedStoreId, TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
+use edgezero_core::{Capability, CapabilitySupport};
 use walkdir::WalkDir;
 
 mod push_cloud;
@@ -136,6 +137,30 @@ struct SpinCliAdapter;
     reason = "KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch)."
 )]
 impl Adapter for SpinCliAdapter {
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::IngressAdmission
+            | Capability::OutboundHeaderFidelity
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation => CapabilitySupport::Native,
+            Capability::ConfigReadDeadlines
+            | Capability::InboundReadDeadlines
+            | Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
+            | _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `spin cloud {login|logout|info}` is the native sign-in
@@ -165,6 +190,34 @@ impl Adapter for SpinCliAdapter {
                 "spin adapter does not support the Fastly staging lifecycle action {action:?}"
             )),
             other => Err(format!("spin adapter does not support {other:?}")),
+        }
+    }
+
+    fn execute_target(
+        &self,
+        action: AdapterAction,
+        target: &AdapterExecutionTarget,
+        args: &[String],
+    ) -> Result<(), String> {
+        let manifest = target_manifest(target)?;
+        match action {
+            AdapterAction::Build => {
+                let artifact = build_from_manifest(&manifest, args)?;
+                log::info!("[edgezero] Spin build complete -> {}", artifact.display());
+                Ok(())
+            }
+            AdapterAction::Deploy => deploy_from_manifest(&manifest, args),
+            AdapterAction::Serve => serve_from_manifest(&manifest, args),
+            AdapterAction::AuthLogin
+            | AdapterAction::AuthLogout
+            | AdapterAction::AuthStatus
+            | AdapterAction::DeployStaged
+            | AdapterAction::EmitVersion
+            | AdapterAction::Healthcheck
+            | AdapterAction::Rollback
+            | _ => Err(format!(
+                "spin adapter cannot execute operational action {action:?} against a pinned runtime target"
+            )),
         }
     }
 
@@ -1054,6 +1107,10 @@ fn ensure_kv_label_in_component(
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest =
         find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    build_from_manifest(&manifest, extra_args)
+}
+
+fn build_from_manifest(manifest: &Path, extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -1096,6 +1153,10 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    deploy_from_manifest(&manifest, extra_args)
+}
+
+fn deploy_from_manifest(manifest: &Path, extra_args: &[String]) -> Result<(), String> {
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -1143,6 +1204,19 @@ fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
     });
 
     Ok(candidates.remove(0))
+}
+
+fn target_manifest(target: &AdapterExecutionTarget) -> Result<PathBuf, String> {
+    let manifest = target
+        .platform_manifest()
+        .map_or_else(|| target.app_root().join("spin.toml"), Path::to_path_buf);
+    if !manifest.is_file() {
+        return Err(format!(
+            "pinned spin manifest {} is not a regular file",
+            manifest.display()
+        ));
+    }
+    Ok(manifest)
 }
 
 fn locate_artifact(
@@ -1203,6 +1277,10 @@ fn register_ctor() {
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    serve_from_manifest(&manifest, extra_args)
+}
+
+fn serve_from_manifest(manifest: &Path, extra_args: &[String]) -> Result<(), String> {
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -1237,6 +1315,80 @@ mod tests {
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
     const TEST_COMPONENT_ID: &str = "demo";
+
+    #[test]
+    fn adapter_capability_matrix_matches_contracts() {
+        let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::InboundReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::Unsupported,
+            ),
+            (Capability::OutboundHttp, CapabilitySupport::Native),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::BestEffort,
+            ),
+        ];
+
+        for (capability, support) in expected {
+            assert_eq!(
+                SPIN_ADAPTER.capability(capability),
+                support,
+                "{capability:?}"
+            );
+        }
+    }
 
     #[test]
     fn is_valid_spin_key_accepts_lowercase_with_digits_and_underscores() {

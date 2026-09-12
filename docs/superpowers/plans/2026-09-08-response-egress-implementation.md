@@ -1,0 +1,185 @@
+# Response Egress Implementation Plan
+
+> **Status:** Partially implemented in PR #275. Core policy, reports, completion guards,
+> dispatch metadata, converter-level deadlines/fallback reporting, and capability cells are
+> implemented. Axum currently emits `ResponseReturned` after conversion but before returning
+> the response to Hyper, so it is not transport acceptance or completion evidence.
+> Transport-observable abort, backpressure, completion, write deadlines, and deployed probes
+> remain open; all four capability cells stay `Unsupported`. Source of truth:
+> [response-egress design](../specs/2026-09-08-response-egress-design.md).
+>
+> Checkboxes record implementation status. Mixed converter/transport-certification tasks stay
+> unchecked until every assertion in that task has named evidence.
+
+**Goal:** Make client-response conversion and delivery observable and deadline-bounded where
+platform APIs permit, with backpressure, native abort, and one terminal report.
+
+**Architecture:** Core defines policy, metadata, terminal outcome/report, and a non-clone
+completion guard. Adapter services retain request start/route metadata across router dispatch,
+start one guarded egress attempt, and hand it to response converters. Streaming converters
+poll under platform demand and one absolute timer. Buffered-only hosts enforce a converter
+cap but remain Unsupported for delivery guarantees they cannot observe.
+
+**Dependency:** Stable route metadata/request-start reuse depends on Tasks 1-3 of the
+[inbound ingress plan](2026-09-08-inbound-ingress-admission.md). Response-egress work may be
+developed earlier with `route: None`, but no adapter claims Native completion until the
+service handoff preserves the original request metadata.
+
+## Global Constraints
+
+- This work does not alter outbound request/response deadlines.
+- Do not add Tokio to core or shared adapter crates.
+- No terminal path may call the observer twice.
+- Do not reset the deadline per chunk, flush, or platform call.
+- Do not rewrite status or append an error body after the adapter's response commit point.
+- Do not claim client completion from response-object construction.
+- Apply TDD per task; record the red failure before production edits.
+
+## Task 1: Core policy, report, and completion guard
+
+**Files:** new `crates/edgezero-core/src/response_egress.rs`, `lib.rs`, app configuration.
+
+- [x] Write red tests for the 30-second default, immediate expiry, checked
+  `egress_started_at + DEADLINE_FAR_FUTURE` clamping, checked-add overflow failure, all
+  `ResponseEgressOutcome` variants, report accessors, and observer object safety.
+- [x] Write red state tests for `Initial -> Writing -> Completed`, every failure from both
+  nonterminal states, terminal-signal races, guard drop, disarm, and exactly one callback.
+- [x] Write red accounting tests for zero/exact bytes and checked `u64` overflow. Inject a
+  backwards clock and assert zero elapsed plus `Unspecified`, one notification, and a log.
+- [x] Add `ResponseEgressPolicy`, body-blind immutable head accessors, outcome/report,
+  observer handle,
+  and a public, non-clone, adapter-facing completion guard (optionally `#[doc(hidden)]`). Keep
+  observer payload bounded and body/header-free.
+- [x] Run `cargo test -p edgezero-core --lib response_egress`.
+
+## Task 2: Preserve request metadata through dispatch
+
+**Files:** core router/service result, adapter request services, context tests.
+
+- [x] Write red tests proving response policy sees the ingress-captured request start and
+  canonical registered route pattern, never a dynamic path or a newly sampled start.
+- [x] Add an internal dispatch envelope carrying `Response`, request start, optional route
+  metadata, and the app's policy/observer handles to the adapter converter boundary.
+- [x] Keep public handler return types unchanged; the envelope is service plumbing, not an
+  application response type.
+- [x] Ensure 404/405 and converted `EdgeError` responses also create one egress attempt.
+- [x] Run core router/service tests.
+
+## Task 3: Shared converter contract and capability cells
+
+**Files:** `edgezero-adapter` registry/contracts, core manifest, CLI enforcement, docs.
+
+- [x] Write red parse/display/round-trip tests for `response-egress-abort`,
+  `response-egress-backpressure`, `response-egress-completion`, and
+  `response-write-deadlines`.
+- [x] Write red build/serve/deploy/demo tests that fail closed when an app requires Native
+  and the selected target advertises BestEffort/Unsupported.
+- [x] Add the exact initial matrix from the spec. Keep cells separate so one target can
+  expose pull backpressure without claiming observable finish.
+- [ ] Define adapter contract fixtures for source, sink, timer, commit, abort, disconnect,
+  and completion observation without introducing a runtime into core.
+- [ ] Run manifest, registry, and CLI capability tests.
+
+## Task 4: Future Axum transport-egress certification
+
+**Files:** `edgezero-adapter-axum/src/response.rs`, service wiring, integration tests.
+
+Current Axum behavior stops at `ResponseReturned` after conversion and before returning the
+response to Hyper. The work below is required before any of the four capability cells can be
+promoted from `Unsupported`.
+
+- [ ] Write red body-wrapper tests: no second source poll while one chunk is pending;
+  independent timer wake; first-byte/inter-chunk/finish deadline; exact byte count; source
+  error; sink error; body drop; normal EOF; and competing drop/deadline notification.
+- [ ] Write red raw-socket tests for a client that does not read, disconnects before body,
+  disconnects mid-body, and consumes normally. Assert reset/close and exactly one report.
+- [ ] Add a bounded local-executor/channel bridge from core's non-`Send` stream to Axum's
+  `Send` body requirement. Retain the guard through that bridge and race source progress
+  against an adapter-owned Tokio sleep created from the same absolute deadline.
+- [ ] Own the Hyper connection so deadline expiry can reset/close it even when Hyper accepted
+  a frame and never polls the body again. A body-wrapper timer by itself is not
+  response-write-deadline evidence.
+- [ ] Define and test the header commit point. Conversion/deadline failure before commit may
+  use the minimal fallback response; after commit it emits a body error/resets instead.
+- [ ] Promote each Axum capability separately only after its connection-level behavior and
+  named raw-socket evidence satisfy the corresponding row in the design. Local conversion
+  tests alone cannot promote any cell.
+- [ ] Run `cargo test -p edgezero-adapter-axum --all-targets`.
+
+## Task 5: Cloudflare stream wrapper and deployed probe
+
+**Files:** Cloudflare response converter, WASM tests/harness, deployed probe script/docs.
+
+- [ ] Write red wrapper tests for pull-driven source polling, cancel, source error, absolute
+  deadline, exact byte count, and exactly-once finish/drop behavior.
+- [ ] Add a frozen-clock fixture where the source continuously returns ready chunks. Assert
+  the wrapper cooperatively yields and its independent Worker timer can win.
+- [x] Replace simple stream mapping with a pull-driven wrapper that owns the source, timer,
+  completion guard, and injected clock; cooperatively yield and recheck the deadline around
+  every ready source result.
+- [ ] Move to a custom JavaScript `ReadableStream` source with explicit `pull` and `cancel`
+  callbacks. Keep the attempt live when no pull occurs, count bytes only after successful
+  `controller.enqueue`, and classify downstream cancellation instead of relying on Rust stream
+  drop.
+- [ ] Add a deployed probe covering slow client/backpressure, first-byte and midstream
+  timeout, explicit disconnect, normal finish, elapsed tolerance, and runtime version.
+- [ ] Keep all four cells Unsupported until deployed evidence demonstrates the corresponding
+  host behavior; a local WASM mock cannot upgrade them.
+- [ ] Run Cloudflare unit/contract/WASM checks and archive the probe artifact.
+
+## Task 6: Fastly and Spin send-owning egress integration
+
+**Files:** Fastly/Spin response converters, generated entrypoints, tests, capability docs, and
+deployed probes.
+
+- [ ] Complete exact-cap and one-byte-over tests for streamed bodies on both adapters. Preserve
+  the design's separate rule that `Body::Once` is already materialized and does not enter the
+  converter collection cap; checked accounting prevents streamed collection overflow.
+- [ ] Complete source-error and pre-return deadline tests. Assert reports use
+  `ConversionError`, `SourceError`, or `DeadlineExceeded` as appropriate and fire once.
+- [x] Refactor collection into bounded helpers with one absolute converter
+  deadline. Drop partial buffers/source on failure.
+- [x] Keep `response-egress-abort`, `response-egress-backpressure`,
+  `response-egress-completion`, and `response-write-deadlines` Unsupported. Document that
+  successful host response construction emits `ResponseReturned` with zero bytes exactly once,
+  never `HostHandoff` or `Completed`; this preserves observer cardinality without claiming host
+  acceptance or an unobservable client finish.
+- [ ] Add a Fastly send-owning entrypoint that uses `Response::stream_to_client`, retains the
+  attempt across `write`/`flush`, calls `finish` only on clean EOF, and calls `abandon` on every
+  post-commit failure. Replace the generated `#[fastly::main]` return-response path atomically.
+  Treat synchronous blocked writes as BestEffort and characterize them in Viceroy/deployed
+  probes.
+- [ ] Add a Spin raw-WASI response path that constructs and owns `BodyWriter` rather than
+  returning `SpinFullResponse` through `http_into_wasi_response`. Retain the attempt through
+  the body pump, observe stream/result reader closure, and race source/writer progress against
+  an independent timer.
+- [ ] Run Fastly and Spin unit/contract suites, both WASM builds, generated-project tests, and
+  deployed slow-reader/disconnect/finish probes before promoting any cell.
+
+## Task 7: Cross-adapter lifecycle tests and documentation
+
+- [ ] Run the shared matrix for empty, buffered, streaming, source failure, transport failure,
+  deadline, disconnect, converter failure, and terminal races on every supporting target.
+- [ ] Verify reports never contain body bytes, header values, dynamic paths, or raw source
+  error strings.
+- [ ] Update adapter guides with commit points, byte-count boundary, abort primitive,
+  provider-buffer exclusions, and capability/evidence links.
+- [ ] Audit all response converters with `rg` for `block_on`, unbounded `Vec` growth, stream
+  mapping without cancel/drop observation, deadline resets, and variant-only completion.
+
+## Task 8: Final verification
+
+- [ ] Run:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+cargo check --workspace --all-targets --features "fastly cloudflare spin"
+cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
+```
+
+- [ ] Run Axum raw-socket and Cloudflare deployed timing probes separately; record versions
+  and tolerances.
+- [ ] Re-read the source spec and account for every normative statement before marking the
+  plan complete.

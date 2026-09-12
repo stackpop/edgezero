@@ -1,29 +1,38 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Display;
-use std::io::Read as _;
+use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::task::Poll;
 
+use bytes::Bytes;
 use edgezero_core::app::{App, StoreMetadata, StoresMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request, request_builder};
+#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
+use edgezero_core::http::{Method, Uri};
+use edgezero_core::ingress::{
+    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
+};
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::outbound::HttpClient;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
+use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
+use futures_util::stream;
 use std::collections::BTreeMap;
 
 use crate::config_store::FastlyConfigStore;
 use crate::context::FastlyRequestContext;
 use crate::key_value_store::FastlyKvStore;
-use crate::proxy::FastlyProxyClient;
-use crate::response::{from_core_response, parse_uri};
+use crate::outbound::FastlyOutboundClient;
+use crate::response::{from_egress_response, parse_uri};
 use crate::secret_store::FastlySecretStore;
 
 const WARNED_STORE_CACHE_LIMIT: usize = 64;
@@ -123,6 +132,7 @@ impl<'app> FastlyService<'app> {
     /// the underlying handler returns an error.
     #[inline]
     pub fn dispatch(self, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
+        let request_start = self.app.monotonic_now();
         let config_store = match self.config {
             ConfigSource::Handle(handle) => Some(handle),
             ConfigSource::Name(name) => match FastlyConfigStore::try_open(&name) {
@@ -151,6 +161,7 @@ impl<'app> FastlyService<'app> {
                 secrets,
                 ..Default::default()
             },
+            request_start,
             |_req, _extensions| {},
         )
     }
@@ -263,6 +274,7 @@ fn dispatch_core_request(
     app: &App,
     mut core_request: Request,
     stores: Stores,
+    prepared: PreparedIngress,
 ) -> Result<FastlyResponse, FastlyError> {
     // Hard-cutoff: legacy bare handles are no longer
     // inserted into request extensions. `with_config_handle`
@@ -282,9 +294,9 @@ fn dispatch_core_request(
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let response = executor::block_on(app.router().oneshot(core_request))
+    let response = executor::block_on(app.dispatch_admitted(prepared, core_request))
         .map_err(|err| map_edge_error(&err))?;
-    from_core_response(response).map_err(|err| map_edge_error(&err))
+    from_egress_response(response).map_err(|err| map_edge_error(&err))
 }
 
 /// Run an app-provided closure against a scratch `Extensions` populated from the
@@ -301,8 +313,9 @@ where
 
 fn dispatch_with_handles<F>(
     app: &App,
-    req: FastlyRequest,
+    mut req: FastlyRequest,
     stores: Stores,
+    request_start: MonotonicInstant,
     extend: F,
 ) -> Result<FastlyResponse, FastlyError>
 where
@@ -310,9 +323,48 @@ where
 {
     // Read raw-request signals into a scratch bag BEFORE conversion consumes `req`.
     let scratch = apply_request_extend(&req, extend);
-    let mut core_request = into_core_request(req).map_err(|err| map_edge_error(&err))?;
-    core_request.extensions_mut().extend(scratch);
-    dispatch_core_request(app, core_request, stores)
+    let mut head_request = into_core_request_head(&req, app.monotonic_clock())
+        .map_err(|error| map_edge_error(&error))?;
+    head_request.extensions_mut().extend(scratch);
+    dispatch_ingress_reader(app, head_request, stores, request_start, move || {
+        req.take_body()
+    })
+}
+
+fn dispatch_ingress_reader<Source, MakeSource>(
+    app: &App,
+    mut head_request: Request,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    make_source: MakeSource,
+) -> Result<FastlyResponse, FastlyError>
+where
+    Source: Read + 'static,
+    MakeSource: FnOnce() -> Source,
+{
+    let head_parts = IngressHeadParts::from_request(
+        &head_request,
+        IngressHeadAccounting::HostManaged,
+        IngressFraming::HostManaged,
+    );
+    head_parts
+        .validate_normalized(app.ingress_head_limits())
+        .map_err(|error| map_edge_error(&error))?;
+    let prepared = match app
+        .begin_ingress(head_parts, request_start)
+        .map_err(|error| map_edge_error(&error))?
+    {
+        IngressBeginOutcome::Admitted(prepared) => prepared,
+        IngressBeginOutcome::Refused(response) => {
+            return from_egress_response(response).map_err(|error| map_edge_error(&error));
+        }
+        _ => return Err(FastlyError::msg("unsupported ingress admission outcome")),
+    };
+    *head_request.body_mut() = fastly_deadline_body(
+        make_source(),
+        Some((prepared.read_deadline(), prepared.monotonic_clock())),
+    );
+    dispatch_core_request(app, head_request, stores, prepared)
 }
 
 /// Dispatch with per-id store registries built from baked metadata — the same
@@ -344,6 +396,7 @@ pub fn dispatch_with_registries<F>(
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
+    let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(stores.kv, env)?;
     let config_registry = build_config_registry(stores.config, env);
     let secret_registry = build_secret_registry(stores.secrets, env);
@@ -356,6 +409,7 @@ where
             secret_registry,
             ..Default::default()
         },
+        request_start,
         extend,
     )
 }
@@ -489,6 +543,14 @@ fn build_secret_registry(
 /// Returns [`EdgeError::Internal`] if the Fastly request cannot be reconstituted into a core request (e.g., method or URI conversion failure).
 #[inline]
 pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
+    let request = into_core_request_head(&req, MonotonicClock::default())?;
+    Ok(attach_core_body(&mut req, request, None))
+}
+
+fn into_core_request_head(
+    req: &FastlyRequest,
+    outbound_clock: MonotonicClock,
+) -> Result<Request, EdgeError> {
     let method = req.get_method().clone();
     let uri = parse_uri(req.get_url_str())?;
 
@@ -497,13 +559,7 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
 
-    let mut body = req.take_body();
-    let mut bytes = Vec::new();
-    body.read_to_end(&mut bytes).map_err(EdgeError::internal)?;
-
-    let mut request = builder
-        .body(Body::from(bytes))
-        .map_err(EdgeError::internal)?;
+    let mut request = builder.body(Body::empty()).map_err(EdgeError::internal)?;
 
     let context = FastlyRequestContext {
         client_ip: req.get_client_ip_addr(),
@@ -511,9 +567,113 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
     FastlyRequestContext::insert(&mut request, context);
     request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(FastlyProxyClient));
+        .insert(outbound_client(outbound_clock));
 
     Ok(request)
+}
+
+fn outbound_client(clock: MonotonicClock) -> HttpClient {
+    HttpClient::with_client(FastlyOutboundClient::with_clock(clock))
+}
+
+fn attach_core_body(
+    req: &mut FastlyRequest,
+    mut request: Request,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
+) -> Request {
+    *request.body_mut() = fastly_deadline_body(req.take_body(), read_lifetime);
+    request
+}
+
+fn fastly_deadline_body<Source>(
+    source: Source,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
+) -> Body
+where
+    Source: Read + 'static,
+{
+    let mut native_body = Some(source);
+    let mut terminal = false;
+    let stream = stream::poll_fn(move |_cx| {
+        if terminal {
+            return Poll::Ready(None);
+        }
+        if read_lifetime
+            .as_ref()
+            .is_some_and(|(deadline, clock)| deadline.is_expired_at(clock.now()))
+        {
+            terminal = true;
+            native_body.take();
+            return Poll::Ready(Some(Err(EdgeError::request_timeout(
+                "inbound body read deadline exceeded",
+            ))));
+        }
+
+        let Some(body) = native_body.as_mut() else {
+            terminal = true;
+            return Poll::Ready(None);
+        };
+        let mut chunk = vec![0_u8; 16 * 1024];
+        let result = body.read(&mut chunk);
+        if read_lifetime
+            .as_ref()
+            .is_some_and(|(deadline, clock)| deadline.is_expired_at(clock.now()))
+        {
+            terminal = true;
+            native_body.take();
+            return Poll::Ready(Some(Err(EdgeError::request_timeout(
+                "inbound body read deadline exceeded",
+            ))));
+        }
+        match result {
+            Ok(0) => {
+                terminal = true;
+                native_body.take();
+                Poll::Ready(None)
+            }
+            Ok(read) => {
+                chunk.truncate(read);
+                Poll::Ready(Some(Ok(Bytes::from(chunk))))
+            }
+            Err(error) => {
+                terminal = true;
+                native_body.take();
+                Poll::Ready(Some(Err(EdgeError::internal(error))))
+            }
+        }
+    });
+    Body::from_stream(stream)
+}
+
+/// Dispatches an observable reader through the production ingress body wrapper.
+#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
+#[doc(hidden)]
+#[inline]
+pub fn dispatch_ingress_reader_for_test<Source>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    source: Source,
+) -> Result<FastlyResponse, FastlyError>
+where
+    Source: Read + 'static,
+{
+    let request_start = app.monotonic_now();
+    let mut core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(|error| map_edge_error(&EdgeError::internal(error)))?;
+    core_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
+    dispatch_ingress_reader(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        move || source,
+    )
 }
 
 fn map_edge_error(err: &EdgeError) -> FastlyError {
@@ -592,13 +752,21 @@ fn warn_missing_store_once(store_name: &str, detail: &str) {
 mod synthesis_tests {
     use super::*;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::context::RequestContext;
     use edgezero_core::key_value_store::{KvStore, NoopKvStore};
+    use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the legacy test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for StubConfig {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(None)
@@ -640,6 +808,44 @@ mod synthesis_tests {
     }
 
     #[test]
+    fn standard_service_installs_the_exact_application_outbound_clock() {
+        use edgezero_core::http::Method;
+
+        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+            let client = ctx
+                .http_client()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+            let request =
+                edgezero_core::OutboundRequest::get("https://example.com/")?.stream_response();
+            let results = client.send_all(vec![request]).await;
+            Ok(results[0].elapsed.as_millis().to_string())
+        }
+
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(AtomicUsize::new(0));
+        let clock_observations = Arc::clone(&observations);
+        let mut app = App::new(RouterService::builder().get("/clock", elapsed).build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                start
+            } else {
+                completed
+            }
+        }));
+        let request = FastlyRequest::new(Method::GET, "http://example.test/clock");
+
+        let mut response = FastlyService::new(&app)
+            .dispatch(request)
+            .expect("Fastly response");
+
+        assert_eq!(response.take_body_bytes(), b"7");
+        assert!(observations.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
     fn extended_request_extensions_are_visible_to_handler() {
         use edgezero_core::body::Body;
         use edgezero_core::context::RequestContext;
@@ -652,7 +858,6 @@ mod synthesis_tests {
 
         async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let ja4 = ctx
-                .request()
                 .extensions()
                 .get::<Ja4>()
                 .map_or_else(|| "missing".to_owned(), |value| value.0.clone());

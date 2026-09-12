@@ -27,13 +27,14 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    register_adapter,
+    Adapter, AdapterAction, AdapterExecutionTarget, AdapterPushContext, ProvisionStores,
+    ReadConfigEntry, ResolvedStoreId, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
+use edgezero_core::{Capability, CapabilitySupport};
 use walkdir::WalkDir;
 
 static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
@@ -389,6 +390,31 @@ struct RuntimeStoreNameReconciliation {
     reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::IngressAdmission | Capability::OutboundHeaderFidelity => {
+                CapabilitySupport::Native
+            }
+            Capability::ConfigReadDeadlines
+            | Capability::InboundReadDeadlines
+            | Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
+            | _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `fastly profile {create|delete|list}` is the native
@@ -416,6 +442,37 @@ impl Adapter for FastlyCliAdapter {
             AdapterAction::Healthcheck => healthcheck(args),
             AdapterAction::Rollback => rollback(args),
             other => Err(format!("fastly adapter does not support {other:?}")),
+        }
+    }
+
+    fn execute_target(
+        &self,
+        action: AdapterAction,
+        target: &AdapterExecutionTarget,
+        args: &[String],
+    ) -> Result<(), String> {
+        let manifest = target_manifest(target)?;
+        let manifest_dir = manifest
+            .parent()
+            .ok_or_else(|| "pinned fastly manifest has no parent directory".to_owned())?;
+        match action {
+            AdapterAction::Build => {
+                let artifact = build_from_manifest(&manifest, args)?;
+                log::info!("[edgezero] Fastly build complete -> {}", artifact.display());
+                Ok(())
+            }
+            AdapterAction::Deploy => deploy_from_dir(manifest_dir, args),
+            AdapterAction::DeployStaged => deploy_staged_from_dir(args, manifest_dir),
+            AdapterAction::Serve => serve_from_dir(manifest_dir, args),
+            AdapterAction::AuthLogin
+            | AdapterAction::AuthLogout
+            | AdapterAction::AuthStatus
+            | AdapterAction::EmitVersion
+            | AdapterAction::Healthcheck
+            | AdapterAction::Rollback
+            | _ => Err(format!(
+                "fastly adapter cannot execute operational action {action:?} against a pinned runtime target"
+            )),
         }
     }
 
@@ -4115,6 +4172,10 @@ fn no_matching_store_error(name: &str) -> String {
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest =
         find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    build_from_manifest(&manifest, extra_args)
+}
+
+fn build_from_manifest(manifest: &Path, extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
@@ -4176,20 +4237,18 @@ fn build_compute_deploy_args(extra_args: &[String]) -> Vec<String> {
 /// # Errors
 /// Returns an error if the Fastly CLI deploy command fails.
 ///
-/// Honours a CLI-threaded `--manifest-path <abs fastly.toml>` (see
-/// [`resolve_manifest_dir`]) so a monorepo with several Fastly apps
-/// deploys the one the operator's `edgezero.toml` selected, rather than
-/// whichever `fastly.toml` a bare working-directory search finds first.
-/// The flag is EdgeZero-internal — `fastly compute deploy` has no such
-/// flag — so it is stripped from the forwarded argv.
 #[inline]
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest_dir = resolve_manifest_dir(extra_args)?;
+    deploy_from_dir(&manifest_dir, extra_args)
+}
+
+fn deploy_from_dir(manifest_dir: &Path, extra_args: &[String]) -> Result<(), String> {
     let forwarded = args_without_flag_value(extra_args, "--manifest-path");
 
     let status = Command::new("fastly")
         .args(build_compute_deploy_args(&forwarded))
-        .current_dir(&manifest_dir)
+        .current_dir(manifest_dir)
         .status()
         .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
@@ -4293,7 +4352,10 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
+    serve_from_dir(manifest_dir, extra_args)
+}
 
+fn serve_from_dir(manifest_dir: &Path, extra_args: &[String]) -> Result<(), String> {
     let status = Command::new("fastly")
         .args(["compute", "serve"])
         .args(extra_args)
@@ -5010,18 +5072,25 @@ fn fastly_api_put(path: &str, token: &str) -> Result<u16, String> {
     }
 }
 
-/// Resolve the directory containing the Fastly manifest for a deploy
-/// (production [`deploy`] or [`deploy_staged`]).
+fn target_manifest(target: &AdapterExecutionTarget) -> Result<PathBuf, String> {
+    let manifest = target
+        .platform_manifest()
+        .map_or_else(|| target.app_root().join("fastly.toml"), Path::to_path_buf);
+    if !manifest.is_file() {
+        return Err(format!(
+            "pinned fastly manifest {} is not a regular file",
+            manifest.display()
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Resolve the directory containing the Fastly manifest for a legacy
+/// direct staged-deploy call.
 ///
-/// The CLI (`edgezero_cli::run_deploy`) resolves the `edgezero.toml`
-/// manifest — honouring `EDGEZERO_MANIFEST` — and threads the
-/// manifest-configured `[adapters.fastly.adapter].manifest` path in as
-/// `--manifest-path <abs fastly.toml>`. Prefer that so a monorepo with
-/// multiple Fastly apps deploys/stages the app the operator actually
-/// selected, rather than whichever `fastly.toml` a bare working-directory
-/// search happens to find first. Only when no `--manifest-path` is
-/// threaded (e.g. a manifest that declares Fastly commands but no adapter
-/// `manifest` key) do we fall back to the working-directory search.
+/// Runtime-producing CLI actions use [`Adapter::execute_target`] and never
+/// enter this discovery path. The `--manifest-path` token remains accepted for
+/// compatibility with callers of this crate-level function.
 fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
     if let Some(raw) = arg_value(args, "--manifest-path") {
         let path = PathBuf::from(raw);
@@ -5043,6 +5112,11 @@ fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
 /// build, upload to a new draft version (no activation), stage it, and
 /// emit `version=<N>`.
 fn deploy_staged(args: &[String]) -> Result<(), String> {
+    let manifest_dir = resolve_manifest_dir(args)?;
+    deploy_staged_from_dir(args, &manifest_dir)
+}
+
+fn deploy_staged_from_dir(args: &[String], manifest_dir: &Path) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
@@ -5050,8 +5124,6 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
     // `fastly compute update` error.
     require_token()?;
 
-    let manifest_dir_buf = resolve_manifest_dir(args)?;
-    let manifest_dir = manifest_dir_buf.as_path();
     // The CLI threads the app's declared config-store logical ids as
     // `--edgezero-staging-config=<logical>` (one per store) so the staging relink
     // knows which selectors to redirect — read from the app manifest, never a
@@ -5579,15 +5651,92 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    // Shared fixture names. Pinning these as consts (instead of
-    // inline `"sessions"` / `"app_config"` per call site) keeps the
-    // setup-vs-assertion pair in sync -- a typo in one place no
-    // longer silently divorces from the other, because both reference
-    // the same const. Also names the intent: these are the LOGICAL
-    // store ids the fastly adapter operates on, not arbitrary strings.
-    const TEST_KV_ID: &str = "sessions";
+    // Logical store ids shared by setup and assertions.
     const TEST_CONFIG_ID: &str = "app_config";
+    const TEST_KV_ID: &str = "sessions";
     const TEST_SECRET_ID: &str = "default";
+
+    #[test]
+    fn adapter_capability_matrix_matches_contracts() {
+        adapter_capability_matrix_matches_outbound_spec();
+    }
+
+    #[test]
+    fn adapter_capability_matrix_matches_outbound_spec() {
+        let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::InboundReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::Unsupported,
+            ),
+            (Capability::OutboundHttp, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::SendAllSlotIsolation,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::BestEffort,
+            ),
+        ];
+
+        for (capability, support) in expected {
+            assert_eq!(
+                FASTLY_ADAPTER.capability(capability),
+                support,
+                "{capability:?}"
+            );
+        }
+    }
 
     // `PathPrepend` (RAII $PATH guard) is the shared helper imported above from
     // `edgezero_core::test_env`; the merge with edition-2024 main replaced our

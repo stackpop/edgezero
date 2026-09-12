@@ -13,7 +13,29 @@ This workspace demonstrates a multi-target EdgeZero app.
 - `GET /headers` - prints the incoming `user-agent`
 - `GET /stream` - emits a short streamed response body
 - `POST /echo` - echoes JSON payloads
-- `GET|POST /proxy/{*rest}` - forwards requests to `API_BASE_URL`, falling back to a 501 when the active adapter does not expose a proxy client
+- `GET /admission` - confirms route-aware admission and one-time grant consumption
+- `GET|POST /proxy/{*rest}` - sends the request to `API_BASE_URL`, falling back to a 501 when the active adapter does not inject an outbound HTTP client
+- `POST /fanout` - sends up to eight relative paths concurrently and returns index-aligned status, error category, and per-slot elapsed milliseconds
+
+## Outbound HTTP
+
+The generated `edgezero.toml` declares `outbound-http` as optional and grants
+HTTPS destinations only. An optional capability accepts documented behavioral
+deviations and may fail at runtime when a deployment prerequisite has not been
+verified. If application behavior depends on successful outbound requests,
+promote `outbound-http` to `required` and choose an adapter and deployment whose
+capability check passes. See the
+[capability guide](https://stackpop.github.io/edgezero/guide/capabilities) for
+the current support matrix and deployment prerequisites.
+
+Both outbound examples set a 5-second timeout, a 1 MiB request-body cap,
+independent 2 MiB encoded / 1 MiB decoded / 2 MiB final-buffer response caps,
+64 KiB / 100-field response-header caps, and explicit Brotli window and decoder
+memory limits. `/fanout` also gives every slot one shared absolute deadline and
+returns the adapter-recorded elapsed time for that slot. This elapsed value
+includes EdgeZero and provider processing rather than representing pure wire
+RTT. Cross-slot timing isolation is adapter-dependent; deployments that require
+it must declare `send-all-slot-isolation` as a required capability.
 
 ## Dev
 

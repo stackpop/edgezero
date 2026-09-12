@@ -1,4 +1,22 @@
-use crate::router::RouterService;
+use std::sync::Arc;
+
+use crate::config_store::ConfigExtractionLimits;
+use crate::error::EdgeError;
+use crate::http::{Request, Response};
+use crate::ingress::{
+    AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressBeginOutcome,
+    IngressFraming, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
+    PreparedIngress, apply_admission_policy, default_admission_policy,
+};
+use crate::manifest::BakedManifest;
+use crate::response::IntoResponse as _;
+use crate::response_egress::{
+    ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
+    ResponseEgressObserverHandle, ResponseEgressPolicy, ResponseEgressPolicyCallback,
+    default_response_egress_policy,
+};
+use crate::router::{RouteMetadata, RouteResolution, RouterService};
+use crate::time::{MonotonicClock, MonotonicInstant};
 
 /// Canonical adapter name for the Axum adapter.
 pub const AXUM_ADAPTER: &str = "axum";
@@ -12,11 +30,71 @@ pub const SPIN_ADAPTER: &str = "spin";
 
 /// Lightweight container around a `RouterService` that can be extended via hook implementations.
 pub struct App {
+    config_extraction_limits: ConfigExtractionLimits,
+    ingress_head_limits: IngressHeadLimits,
+    ingress_policy: IngressAdmissionPolicy,
+    monotonic_clock: MonotonicClock,
     name: String,
+    response_egress_observer: ResponseEgressObserverHandle,
+    response_egress_policy: ResponseEgressPolicyCallback,
     router: RouterService,
 }
 
 impl App {
+    /// Runs the configured body-blind admission policy exactly once.
+    ///
+    /// # Errors
+    /// Returns an internal policy error if the resulting absolute deadline cannot be
+    /// normalized safely or if fallback draining is selected for a matched route.
+    #[inline]
+    pub fn admit_ingress(&self, head: &IngressHead) -> Result<IngressAdmissionOutcome, EdgeError> {
+        match apply_admission_policy(&self.ingress_policy, head, self.monotonic_clock())? {
+            IngressAdmissionOutcome::Admitted(admitted) => Ok(IngressAdmissionOutcome::Admitted(
+                admitted.with_config_extraction_limits(self.config_extraction_limits),
+            )),
+            IngressAdmissionOutcome::Refused(response) => {
+                Ok(IngressAdmissionOutcome::Refused(response))
+            }
+        }
+    }
+
+    /// Resolves and admits a normalized request head before an adapter transfers native body
+    /// ownership into a core [`Request`].
+    ///
+    /// # Errors
+    /// Returns an internal policy error if the admission deadline cannot be normalized safely
+    /// or if fallback draining is selected for a matched route.
+    #[inline]
+    pub fn begin_ingress(
+        &self,
+        head_parts: IngressHeadParts,
+        request_start: MonotonicInstant,
+    ) -> Result<IngressBeginOutcome, EdgeError> {
+        let resolved = self
+            .router
+            .resolve(head_parts.method(), head_parts.target().path());
+        let route = match resolved.resolution() {
+            RouteResolution::Matched(route) => Some(route.clone()),
+            RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound => None,
+        };
+        let head = head_parts.into_head(request_start, resolved.resolution().clone());
+
+        match self.admit_ingress(&head)? {
+            IngressAdmissionOutcome::Admitted(admitted) => Ok(IngressBeginOutcome::Admitted(
+                PreparedIngress::new(resolved, admitted),
+            )),
+            IngressAdmissionOutcome::Refused(response) => Ok(IngressBeginOutcome::Refused(
+                self.response_egress_envelope(response, request_start, route),
+            )),
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn config_extraction_limits(&self) -> ConfigExtractionLimits {
+        self.config_extraction_limits
+    }
+
     /// Default name used when none is provided.
     #[must_use]
     #[inline]
@@ -24,11 +102,81 @@ impl App {
         DEFAULT_APP_NAME
     }
 
+    /// Dispatches a request whose native body was wrapped after admission.
+    ///
+    /// # Errors
+    /// Returns an error only when handler/routing error rendering fails.
+    #[inline]
+    pub async fn dispatch_admitted(
+        &self,
+        prepared: PreparedIngress,
+        request: Request,
+    ) -> Result<ResponseEgressEnvelope, EdgeError> {
+        let request_start = prepared.request_start();
+        let route = prepared.route_metadata().cloned();
+        let (resolved, admitted) = prepared.into_parts();
+        let response = match self
+            .router
+            .dispatch_resolved(resolved, request, admitted)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => error.into_response()?,
+        };
+        Ok(self.response_egress_envelope(response, request_start, route))
+    }
+
+    /// Resolves, admits, and dispatches one normalized inbound request.
+    ///
+    /// Adapters must call this before polling the request body. The route selected for admission
+    /// is consumed during dispatch, so handlers cannot observe a different route identity.
+    ///
+    /// # Errors
+    /// Returns an error only when admission or error rendering fails. Handler and routing errors
+    /// are rendered with the same semantics as [`RouterService::oneshot`].
+    #[inline]
+    pub async fn dispatch_ingress(
+        &self,
+        request: Request,
+        request_start: MonotonicInstant,
+        head_accounting: IngressHeadAccounting,
+        framing: IngressFraming,
+    ) -> Result<Response, EdgeError> {
+        let head_parts = IngressHeadParts::from_request(&request, head_accounting, framing);
+        match self.begin_ingress(head_parts, request_start)? {
+            IngressBeginOutcome::Admitted(prepared) => self
+                .dispatch_admitted(prepared, request)
+                .await
+                .map(ResponseEgressEnvelope::into_response),
+            IngressBeginOutcome::Refused(response) => Ok(response.into_response()),
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn ingress_head_limits(&self) -> IngressHeadLimits {
+        self.ingress_head_limits
+    }
+
     /// Consume the app and return the contained router service.
     #[must_use]
     #[inline]
     pub fn into_router(self) -> RouterService {
         self.router
+    }
+
+    /// Returns the application clock used to stamp and enforce admitted ingress lifetimes.
+    #[must_use]
+    #[inline]
+    pub fn monotonic_clock(&self) -> MonotonicClock {
+        self.monotonic_clock.clone()
+    }
+
+    /// Captures one instant from the application clock.
+    #[must_use]
+    #[inline]
+    pub fn monotonic_now(&self) -> MonotonicInstant {
+        self.monotonic_clock.now()
     }
 
     /// Name assigned to the application.
@@ -45,11 +193,75 @@ impl App {
         Self::with_name(router, DEFAULT_APP_NAME)
     }
 
+    fn response_egress_envelope(
+        &self,
+        response: Response,
+        request_start: MonotonicInstant,
+        route: Option<RouteMetadata>,
+    ) -> ResponseEgressEnvelope {
+        ResponseEgressEnvelope::new(
+            response,
+            request_start,
+            route,
+            self.response_egress_policy(),
+            self.response_egress_observer(),
+            self.monotonic_clock(),
+        )
+    }
+
+    /// Returns an owned handle to the configured terminal response-egress observer.
+    #[must_use]
+    #[inline]
+    pub fn response_egress_observer(&self) -> ResponseEgressObserverHandle {
+        self.response_egress_observer.clone()
+    }
+
+    /// Returns an owned handle to the configured synchronous response-egress policy callback.
+    #[must_use]
+    #[inline]
+    pub fn response_egress_policy(&self) -> ResponseEgressPolicyCallback {
+        Arc::clone(&self.response_egress_policy)
+    }
+
     /// Access the underlying router service.
     #[must_use]
     #[inline]
     pub fn router(&self) -> &RouterService {
         &self.router
+    }
+
+    /// Installs validated typed-config extraction limits.
+    ///
+    /// # Errors
+    /// Returns an internal startup-policy error when limits are zero, inconsistent, or unbounded.
+    #[inline]
+    pub fn set_config_extraction_limits(
+        &mut self,
+        limits: ConfigExtractionLimits,
+    ) -> Result<(), EdgeError> {
+        self.config_extraction_limits = limits.validate()?;
+        Ok(())
+    }
+
+    /// Installs the synchronous body-blind ingress admission callback.
+    #[inline]
+    pub fn set_ingress_admission_policy<Policy>(&mut self, policy: Policy)
+    where
+        Policy: Fn(&IngressHead) -> AdmissionDecision + Send + Sync + 'static,
+    {
+        self.ingress_policy = Arc::new(policy);
+    }
+
+    /// Installs already-validated finite request-head limits.
+    #[inline]
+    pub fn set_ingress_head_limits(&mut self, limits: IngressHeadLimits) {
+        self.ingress_head_limits = limits;
+    }
+
+    /// Installs the monotonic clock used by subsequent ingress attempts.
+    #[inline]
+    pub fn set_monotonic_clock(&mut self, clock: MonotonicClock) {
+        self.monotonic_clock = clock;
     }
 
     /// Update the application name.
@@ -61,6 +273,27 @@ impl App {
         self.name = name.into();
     }
 
+    /// Installs the terminal response-egress observer used by adapter conversion attempts.
+    #[inline]
+    pub fn set_response_egress_observer<Observer>(&mut self, observer: Observer)
+    where
+        Observer: ResponseEgressObserver,
+    {
+        self.response_egress_observer = ResponseEgressObserverHandle::new(observer);
+    }
+
+    /// Installs the synchronous body-blind response-egress policy callback.
+    #[inline]
+    pub fn set_response_egress_policy<Policy>(&mut self, policy: Policy)
+    where
+        Policy: for<'head> Fn(&ResponseEgressHead<'head>, MonotonicInstant) -> ResponseEgressPolicy
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.response_egress_policy = Arc::new(policy);
+    }
+
     /// Construct a new application with the provided router and name.
     #[inline]
     pub fn with_name<S>(router: RouterService, name: S) -> Self
@@ -68,8 +301,14 @@ impl App {
         S: Into<String>,
     {
         Self {
-            router,
+            config_extraction_limits: ConfigExtractionLimits::default(),
+            ingress_head_limits: IngressHeadLimits::default(),
+            ingress_policy: default_admission_policy(),
+            monotonic_clock: MonotonicClock::default(),
             name: name.into(),
+            response_egress_observer: ResponseEgressObserverHandle::default(),
+            response_egress_policy: Arc::new(default_response_egress_policy),
+            router,
         }
     }
 }
@@ -120,6 +359,23 @@ pub trait Hooks {
     #[inline]
     fn configure(_app: &mut App) {}
 
+    /// Parsed and finalized manifest contract baked by `app!`.
+    ///
+    /// The default is deliberately uncached: every macro-generated application
+    /// supplies its own per-implementation cache.
+    #[must_use]
+    #[inline]
+    fn manifest() -> BakedManifest {
+        BakedManifest::Absent
+    }
+
+    /// Raw manifest JSON baked at compile time by `app!`.
+    #[must_use]
+    #[inline]
+    fn manifest_json() -> Option<&'static str> {
+        None
+    }
+
     /// Display name for the application. Defaults to `"EdgeZero App"`.
     #[must_use]
     #[inline]
@@ -152,17 +408,71 @@ pub trait Hooks {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use std::{future::Future as _, str};
+
     use super::*;
     use crate::body::Body;
+    use crate::config_store::ConfigExtractionLimits;
     use crate::context::RequestContext;
     use crate::error::EdgeError;
-    use crate::http::{Method, StatusCode, request_builder};
+    use crate::http::{
+        HeaderMap, HeaderValue, Method, StatusCode, Version, request_builder, response_builder,
+    };
+    use crate::ingress::{
+        BufferedIngressResponse, IngressBeginOutcome, IngressFraming, IngressGrant,
+        IngressHeadAccounting, IngressHeadParts,
+    };
+    use crate::manifest::BakedManifest;
+    use crate::middleware::{Middleware, Next};
+    use crate::response_egress::{
+        DEFAULT_RESPONSE_WRITE_BUDGET, ResponseEgressAttempt, ResponseEgressHead,
+        ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressReport,
+    };
+    use crate::router::{RouteMetadata, RouteResolution};
+    use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::StreamExt as _;
     use futures::executor::block_on;
+    use futures::stream::{iter, poll_fn};
+    use futures::task::noop_waker_ref;
     use tower_service::Service as _;
 
     struct DefaultHooks;
 
     struct TestHooks;
+
+    struct CountingMiddleware(Arc<AtomicUsize>);
+
+    struct GrantDropProbe(Arc<AtomicUsize>);
+
+    #[derive(Clone)]
+    struct AppEgressObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
+
+    impl ResponseEgressObserver for AppEgressObserver {
+        fn complete(&self, report: &ResponseEgressReport) {
+            self.0.lock().expect("reports lock").push(report.clone());
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Middleware for CountingMiddleware {
+        async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            next.run(ctx).await
+        }
+    }
+
+    impl Drop for GrantDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[expect(
         clippy::missing_trait_methods,
@@ -214,8 +524,90 @@ mod tests {
         }
     }
 
+    fn assert_buffered_terminal_response(
+        response: &Response,
+        status: StatusCode,
+        marker: &str,
+        body: &[u8],
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-fallback-terminal")
+                .expect("terminal marker"),
+            marker
+        );
+        assert_eq!(response.body().as_bytes().expect("buffered body"), body);
+    }
+
+    fn assert_no_fallback_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn buffered_terminal(
+        status: StatusCode,
+        marker: &'static str,
+        body: &'static [u8],
+    ) -> BufferedIngressResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fallback-terminal", HeaderValue::from_static(marker));
+        BufferedIngressResponse::new(status, headers, Bytes::from_static(body))
+    }
+
+    fn configure_fallback_policy(
+        app: &mut App,
+        drops: &Arc<AtomicUsize>,
+        max_body_bytes: usize,
+        read_deadline: Deadline,
+        on_exceeded: BufferedIngressResponse,
+        on_timeout: BufferedIngressResponse,
+    ) {
+        let grant_drops = Arc::clone(drops);
+        app.set_ingress_admission_policy(move |_| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::new(GrantDropProbe(Arc::clone(&grant_drops))),
+            max_body_bytes,
+            read_deadline,
+            on_exceeded: on_exceeded.clone(),
+            on_timeout: on_timeout.clone(),
+        });
+    }
+
+    fn dispatch_fallback(app: &App, body: Body) -> Response {
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(body)
+            .expect("request");
+        block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response")
+    }
+
     fn empty_router() -> RouterService {
         RouterService::builder().build()
+    }
+
+    fn guarded_fallback_app() -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_counter = Arc::clone(&handler_calls);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .get("/known", move |_ctx: RequestContext| {
+                let call_counter = Arc::clone(&handler_counter);
+                async move {
+                    call_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("unexpected")
+                }
+            })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+            .build();
+        (App::new(router), handler_calls, middleware_calls)
     }
 
     #[test]
@@ -249,6 +641,793 @@ mod tests {
     }
 
     #[test]
+    fn app_pairs_admitted_ingress_with_its_injected_clock() {
+        let start = MonotonicInstant::now();
+        let now = Arc::new(Mutex::new(start));
+        let observed_now = Arc::clone(&now);
+        let mut app = App::new(empty_router());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            *observed_now.lock().expect("clock lock")
+        }));
+
+        let request_start = app.monotonic_now();
+        assert_eq!(request_start, start);
+        let head = IngressHeadParts::new(
+            Method::GET,
+            "/".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let IngressBeginOutcome::Admitted(prepared) =
+            app.begin_ingress(head, request_start).expect("admission")
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(prepared.request_start(), start);
+
+        let advanced = start
+            .checked_add(Duration::from_secs(1))
+            .expect("advanced instant");
+        *now.lock().expect("clock lock") = advanced;
+        assert_eq!(prepared.monotonic_clock().now(), advanced);
+    }
+
+    #[test]
+    fn app_owns_default_and_configurable_response_egress_policy() {
+        let mut app = App::new(empty_router());
+        let headers = HeaderMap::new();
+        let request_start = MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_millis(5))
+            .expect("egress start");
+        let route = RouteMetadata::new(Method::GET, "/items/{id}");
+        let head = ResponseEgressHead::new(
+            StatusCode::OK,
+            Version::HTTP_11,
+            &headers,
+            request_start,
+            Some(&route),
+        );
+
+        let default_policy = app.response_egress_policy();
+        assert_eq!(
+            default_policy(&head, egress_started_at)
+                .write_deadline
+                .instant(),
+            egress_started_at
+                .checked_add(DEFAULT_RESPONSE_WRITE_BUDGET)
+                .expect("default deadline")
+        );
+
+        app.set_response_egress_policy(move |response_head, started_at| {
+            assert_eq!(response_head.status(), StatusCode::OK);
+            assert_eq!(response_head.request_start(), request_start);
+            assert_eq!(
+                response_head.route().map(RouteMetadata::pattern),
+                Some("/items/{id}")
+            );
+            assert_eq!(started_at, egress_started_at);
+            ResponseEgressPolicy {
+                write_deadline: Deadline::at_instant(started_at),
+            }
+        });
+        let configured_policy = app.response_egress_policy();
+        assert_eq!(
+            configured_policy(&head, egress_started_at)
+                .write_deadline
+                .instant(),
+            egress_started_at
+        );
+    }
+
+    #[test]
+    fn app_owns_configurable_response_egress_observer() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(empty_router());
+        app.set_response_egress_observer(AppEgressObserver(Arc::clone(&reports)));
+
+        let started_at = MonotonicInstant::now();
+        let headers = HeaderMap::new();
+        let head = ResponseEgressHead::new(
+            StatusCode::NO_CONTENT,
+            Version::HTTP_11,
+            &headers,
+            started_at,
+            None,
+        );
+        let mut attempt =
+            ResponseEgressAttempt::new(&head, started_at, app.response_egress_observer());
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(started_at));
+
+        let observed_reports = reports.lock().expect("reports lock");
+        assert_eq!(observed_reports.len(), 1);
+        assert_eq!(
+            observed_reports[0].outcome,
+            ResponseEgressOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn config_extraction_limits_are_validated_and_reach_routed_context() {
+        let limits = ConfigExtractionLimits {
+            max_backend_bytes: 64,
+            max_blob_bytes: 32,
+            max_secret_bytes: 16,
+            max_total_bytes: 48,
+            timeout: Duration::from_secs(2),
+        };
+        let router = RouterService::builder()
+            .get("/limits", move |ctx: RequestContext| async move {
+                assert_eq!(ctx.config_extraction_limits(), limits);
+                Ok::<_, EdgeError>("ok")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_config_extraction_limits(limits)
+            .expect("valid extraction limits");
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/limits")
+            .body(Body::empty())
+            .expect("request");
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn default_app_admits_with_finite_deadline_and_empty_grant() {
+        let app = App::new(empty_router());
+        let start = MonotonicInstant::now();
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        let head = IngressHead::from_request(
+            &request,
+            start,
+            RouteResolution::NotFound,
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        );
+
+        let IngressAdmissionOutcome::Admitted(admitted) =
+            app.admit_ingress(&head).expect("admitted")
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(admitted.request_start(), start);
+        assert!(admitted.read_deadline().instant() > start);
+        assert!(
+            admitted.read_deadline().instant()
+                <= start.checked_add(DEADLINE_FAR_FUTURE).expect("maximum")
+        );
+        let (_, _, grant, _, _) = admitted.into_parts();
+        grant.downcast::<()>().expect_err("empty grant");
+    }
+
+    #[test]
+    fn ingress_refusal_skips_handler_and_body_poll() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_counter = Arc::clone(&handler_calls);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .post("/upload", move |_ctx: RequestContext| {
+                let call_counter = Arc::clone(&handler_counter);
+                async move {
+                    call_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("unexpected")
+                }
+            })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+            .build();
+        let mut app = App::new(router);
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let admission_counter = Arc::clone(&admission_calls);
+        app.set_ingress_admission_policy(move |_| {
+            admission_counter.fetch_add(1, Ordering::SeqCst);
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("x-admission", "saturated")
+                    .body(Body::from("busy"))
+                    .expect("response"),
+            )
+        });
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let poll_counter = Arc::clone(&body_polls);
+        let body = Body::stream(poll_fn(move |_| {
+            poll_counter.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(None::<Bytes>)
+        }));
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .body(body)
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("x-admission").expect("header"),
+            "saturated"
+        );
+        assert_eq!(response.body().as_bytes().expect("body"), b"busy");
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn ingress_refusal_preserves_metadata_through_response_egress() {
+        let router = RouterService::builder()
+            .post("/upload/{id}", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|_| {
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Body::empty())
+                    .expect("response"),
+            )
+        });
+        app.set_response_egress_observer(AppEgressObserver(Arc::clone(&reports)));
+        let request_start = MonotonicInstant::now();
+        let started_at = request_start
+            .checked_add(Duration::from_millis(5))
+            .expect("egress start");
+        app.set_monotonic_clock(MonotonicClock::new(move || started_at));
+        app.set_response_egress_policy(move |head, egress_started_at| {
+            assert_eq!(head.request_start(), request_start);
+            assert_eq!(
+                head.route().map(RouteMetadata::pattern),
+                Some("/upload/{id}")
+            );
+            ResponseEgressPolicy {
+                write_deadline: Deadline::at_instant(
+                    egress_started_at
+                        .checked_add(Duration::from_secs(1))
+                        .expect("deadline"),
+                ),
+            }
+        });
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/upload/42".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+
+        let IngressBeginOutcome::Refused(egress) =
+            app.begin_ingress(head, request_start).expect("refusal")
+        else {
+            panic!("expected refusal");
+        };
+        let (response, _, mut attempt, egress_clock) = egress.begin().expect("begin egress");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(egress_clock.now(), started_at);
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(started_at));
+
+        let observed = reports.lock().expect("reports lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].request_start, request_start);
+        assert_eq!(
+            observed[0].route.as_ref().map(RouteMetadata::pattern),
+            Some("/upload/{id}")
+        );
+    }
+
+    #[test]
+    fn fallback_body_policy_rejects_matched_routes_before_body_construction() {
+        let router = RouterService::builder()
+            .post("/upload", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
+            max_body_bytes: 4_096,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
+        });
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/upload".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+
+        assert!(matches!(
+            app.begin_ingress(head, MonotonicInstant::now()),
+            Err(EdgeError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn fallback_body_exact_cap_preserves_not_found() {
+        let mut app = App::new(empty_router());
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
+            max_body_bytes: 4,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/missing")
+            .body(Body::stream(iter([
+                Bytes::from_static(b"ab"),
+                Bytes::from_static(b"cd"),
+            ])))
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn fallback_body_overflow_precedes_method_not_allowed() {
+        let router = RouterService::builder()
+            .get("/known", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
+            max_body_bytes: 4,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(Body::stream(iter([
+                Bytes::from_static(b"abcd"),
+                Bytes::from_static(b"e"),
+            ])))
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn fallback_body_zero_cap_accepts_only_empty_body() {
+        let mut app = App::new(empty_router());
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
+            max_body_bytes: 0,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
+        });
+
+        for (body, expected) in [
+            (Body::empty(), StatusCode::NOT_FOUND),
+            (Body::from_bytes("a"), StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let request = request_builder()
+                .method(Method::POST)
+                .uri("/missing")
+                .body(body)
+                .expect("request");
+            let response = block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response");
+
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[test]
+    fn fallback_body_deadline_precedes_body_poll_and_not_found() {
+        let start = MonotonicInstant::now();
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let body = Body::stream(poll_fn(move |_| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Some(Bytes::from_static(b"a")))
+        }));
+        let mut app = App::new(empty_router());
+        app.set_monotonic_clock(MonotonicClock::new(move || start));
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            grant: IngressGrant::empty(),
+            max_body_bytes: 4_096,
+            read_deadline: Deadline::at_instant(head.request_start()),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(
+                StatusCode::GATEWAY_TIMEOUT,
+                "fallback timeout",
+            ),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/missing")
+            .body(body)
+            .expect("request");
+
+        let response = block_on(app.dispatch_ingress(
+            request,
+            start,
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.body().as_bytes().expect("buffered body"),
+            b"fallback timeout"
+        );
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fallback_grant_is_live_during_exact_cap_eof_and_drops_before_egress() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let mut poll = 0_usize;
+        let body = Body::stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            let next = match poll {
+                0 => Some(Bytes::from_static(b"ab")),
+                1 => Some(Bytes::from_static(b"cd")),
+                2 => None,
+                _ => panic!("body polled after EOF"),
+            };
+            poll += 1;
+            Poll::Ready(next)
+        }));
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/known".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let IngressBeginOutcome::Admitted(prepared) = app
+            .begin_ingress(head, MonotonicInstant::now())
+            .expect("begin ingress")
+        else {
+            panic!("expected admission");
+        };
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(body)
+            .expect("request");
+
+        let egress = block_on(app.dispatch_admitted(prepared, request)).expect("dispatch");
+
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            egress.into_response().status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_overflow_returns_exact_application_response_and_drops_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "exceeded",
+                b"limit\0exceeded",
+            ),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::stream(
+            iter([Bytes::from_static(b"abcd"), Bytes::from_static(b"e")]).inspect(move |_| {
+                assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            }),
+        );
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_buffered_terminal_response(
+            &response,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exceeded",
+            b"limit\0exceeded",
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_deadline_expiry_returns_exact_application_response_and_drops_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let start = MonotonicInstant::now();
+        let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
+        let now = Arc::new(Mutex::new(start));
+        let observed_now = Arc::clone(&now);
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            *observed_now.lock().expect("clock lock")
+        }));
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::at_instant(deadline),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"deadline\0expired"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            *now.lock().expect("clock lock") = deadline;
+            Poll::Ready(Some(Bytes::from_static(b"a")))
+        }));
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_buffered_terminal_response(
+            &response,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            b"deadline\0expired",
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_adapter_request_timeout_uses_application_timeout_response() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"adapter timeout"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::from_stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            Poll::Ready(Some(Err(EdgeError::request_timeout(
+                "adapter deadline wrapper expired",
+            ))))
+        }));
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_buffered_terminal_response(
+            &response,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            b"adapter timeout",
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn fallback_non_timeout_source_error_is_preserved_and_drops_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body = Body::from_stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            Poll::Ready(Some(Err(EdgeError::service_unavailable(
+                "source unavailable",
+            ))))
+        }));
+
+        let response = dispatch_fallback(&app, body);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get("x-fallback-terminal").is_none());
+        assert!(
+            str::from_utf8(response.body().as_bytes().expect("buffered body"))
+                .expect("JSON body")
+                .contains("service_unavailable")
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn cancelling_fallback_dispatch_drops_live_grant_once() {
+        let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        configure_fallback_policy(
+            &mut app,
+            &grant_drops,
+            4,
+            Deadline::after(Duration::from_secs(1)),
+            buffered_terminal(StatusCode::PAYLOAD_TOO_LARGE, "exceeded", b"over"),
+            buffered_terminal(StatusCode::GATEWAY_TIMEOUT, "timeout", b"late"),
+        );
+        let observed_drops = Arc::clone(&grant_drops);
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let body = Body::stream(poll_fn(move |_| {
+            assert_eq!(observed_drops.load(Ordering::SeqCst), 0);
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending::<Option<Bytes>>
+        }));
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/known".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let IngressBeginOutcome::Admitted(prepared) = app
+            .begin_ingress(head, MonotonicInstant::now())
+            .expect("begin ingress")
+        else {
+            panic!("expected admission");
+        };
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(body)
+            .expect("request");
+        let mut dispatch = Box::pin(app.dispatch_admitted(prepared, request));
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(dispatch.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(body_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
+
+        drop(dispatch);
+
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
+    }
+
+    #[test]
+    fn ordinary_admit_does_not_poll_fallback_bodies() {
+        let router = RouterService::builder()
+            .get("/known", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let app = App::new(router);
+
+        for (path, expected) in [
+            ("/missing", StatusCode::NOT_FOUND),
+            ("/known", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let observed_polls = Arc::clone(&body_polls);
+            let body = Body::stream(poll_fn(move |_| {
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(None::<Bytes>)
+            }));
+            let request = request_builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(body)
+                .expect("request");
+
+            let response = block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response");
+
+            assert_eq!(response.status(), expected);
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn ingress_two_phase_admission_precedes_body_construction() {
+        let router = RouterService::builder()
+            .post("/upload", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("accepted")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| {
+            assert!(matches!(
+                head.route_resolution(),
+                RouteResolution::Matched(metadata) if metadata.pattern() == "/upload"
+            ));
+            AdmissionDecision::Admit {
+                grant: IngressGrant::empty(),
+                read_deadline: Deadline::after(Duration::from_secs(1)),
+            }
+        });
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/upload".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let start = MonotonicInstant::now();
+
+        let IngressBeginOutcome::Admitted(prepared) =
+            app.begin_ingress(head, start).expect("begin ingress")
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(prepared.request_start(), start);
+
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .body(Body::from("payload"))
+            .expect("request");
+        let response = block_on(app.dispatch_admitted(prepared, request)).expect("dispatch");
+        assert_eq!(response.into_response().status(), StatusCode::OK);
+    }
+
+    #[test]
     fn default_hooks_do_not_own_logging() {
         assert!(!DefaultHooks::owns_logging());
     }
@@ -257,6 +1436,8 @@ mod tests {
     fn default_hooks_use_default_name_and_into_router() {
         let app = DefaultHooks::build_app();
         assert_eq!(app.name(), App::default_name());
+        assert!(matches!(DefaultHooks::manifest(), BakedManifest::Absent));
+        assert_eq!(DefaultHooks::manifest_json(), None);
         assert_eq!(DefaultHooks::stores(), StoresMetadata::default());
         let router = app.into_router();
         assert!(router.routes().is_empty());

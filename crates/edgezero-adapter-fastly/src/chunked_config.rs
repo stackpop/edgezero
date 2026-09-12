@@ -21,6 +21,11 @@
 
 use sha2::{Digest as _, Sha256};
 
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::config_store::ConfigStoreError;
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::{BoundedStoreRead, Deadline, MonotonicInstant};
+
 /// Per-entry value limit enforced by Fastly Config Store. Used by the CLI writer
 /// to gate direct-vs-chunked storage, and by the pointer validator (which both
 /// the CLI and the runtime resolver call) — a chunked envelope is always larger
@@ -47,6 +52,17 @@ pub(crate) const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
 /// BOTH the writer (when serialising the pointer) AND the resolver
 /// (when validating the parsed pointer) -- stays unconditional.
 pub(crate) const POINTER_KIND: &str = "fastly_config_chunks";
+
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) struct FastlyReadTooLarge;
+
+#[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) enum SyncHostCallError<E> {
+    Backend(E),
+    DeadlineExceeded,
+}
 
 // ---------------------------------------------------------------------------
 // Private pointer schema
@@ -91,6 +107,7 @@ enum RootValueKind {
 /// pointer resolution — a v2 envelope reassembled from v1 chunks is only knowable
 /// AFTER the chunks are fetched — so it cannot be recovered from the raw value
 /// alone.
+#[derive(Debug)]
 pub(crate) enum ResolveFailure {
     /// Corrupt or incomplete state a push can repair by overwriting. Carries a
     /// redacted, human-readable message.
@@ -99,6 +116,17 @@ pub(crate) enum ResolveFailure {
     /// build does not recognise: an unknown/newer `edgezero_kind`, or a bumped
     /// envelope/pointer `version`. Carries a redacted, human-readable message.
     FutureFormat(String),
+}
+
+/// A bounded resolver failure that preserves store boundary errors instead of
+/// misclassifying them as corrupt pointer state.
+#[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) enum BoundedResolveFailure {
+    Backend(ConfigStoreError),
+    DeadlineExceeded,
+    Resolve(ResolveFailure),
+    ValueTooLarge,
 }
 
 impl ResolveFailure {
@@ -111,7 +139,11 @@ impl ResolveFailure {
 
     /// Is this a newer format this build must not overwrite (vs. repairable
     /// corruption)?
-    #[cfg(any(feature = "cli", feature = "fastly", test))]
+    #[cfg(any(
+        feature = "fastly",
+        test,
+        all(feature = "cli", not(target_arch = "wasm32"))
+    ))]
     pub(crate) fn is_future_format(&self) -> bool {
         matches!(self, Self::FutureFormat(_))
     }
@@ -125,7 +157,7 @@ struct FastlyChunkRef {
 }
 
 /// A chunk reference from a validated pointer, for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) struct GcChunkRef {
     pub key: String,
     pub len: usize,
@@ -133,7 +165,7 @@ pub(crate) struct GcChunkRef {
 }
 
 /// A validated v1 pointer's contents, for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) struct GcPointer {
     /// Validated: non-empty, one generation, dense `0..n-1` in order.
     pub chunks: Vec<GcChunkRef>,
@@ -142,7 +174,7 @@ pub(crate) struct GcPointer {
 }
 
 /// What a root's value IS, once classified for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) enum GcRootValue {
     /// A valid v1 chunk pointer. Its METADATA is validated; its CONTENT must
     /// still be verified against the store -- see [`gc_verify_generation`].
@@ -154,6 +186,62 @@ pub(crate) enum GcRootValue {
 // ---------------------------------------------------------------------------
 // Public helpers
 // ---------------------------------------------------------------------------
+
+/// Account for the exact bytes materialized by a Fastly store operation.
+#[cfg(any(feature = "fastly", test))]
+pub(crate) fn exact_fastly_read<T>(
+    value: Option<T>,
+    max_backend_bytes: u64,
+) -> Result<BoundedStoreRead<T>, FastlyReadTooLarge>
+where
+    T: AsRef<[u8]>,
+{
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.as_ref().len()).map_err(|_length_error| FastlyReadTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes {
+        return Err(FastlyReadTooLarge);
+    }
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value,
+    })
+}
+
+/// Run one synchronous Fastly operation under cooperative deadline checks.
+///
+/// The host call itself is not preemptible. An overrun is observed immediately
+/// after the call returns and its result is discarded.
+#[cfg(any(feature = "fastly", test))]
+pub(crate) fn run_sync_host_call<T, E, F>(
+    deadline: Deadline,
+    call: F,
+) -> Result<T, SyncHostCallError<E>>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    run_sync_host_call_at(deadline, MonotonicInstant::now, call)
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn run_sync_host_call_at<T, E, N, F>(
+    deadline: Deadline,
+    mut now: N,
+    call: F,
+) -> Result<T, SyncHostCallError<E>>
+where
+    N: FnMut() -> MonotonicInstant,
+    F: FnOnce() -> Result<T, E>,
+{
+    if deadline.instant() <= now() {
+        return Err(SyncHostCallError::DeadlineExceeded);
+    }
+    let result = call();
+    if deadline.instant() <= now() {
+        return Err(SyncHostCallError::DeadlineExceeded);
+    }
+    result.map_err(SyncHostCallError::Backend)
+}
 
 /// Compute the lowercase-hex SHA-256 of `bytes`.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -175,7 +263,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// characters (extremely unlikely in practice; recommends restructuring).
 /// Reject a physical Config Store key that exceeds the store's key limit,
 /// before any write is attempted.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 fn check_config_key_len(key: &str) -> Result<(), String> {
     // CHARACTERS, not bytes: Fastly's limit is a character count, so a non-ASCII
     // `--key` must be measured by `chars().count()`, not `len()` (UTF-8 bytes).
@@ -192,7 +280,7 @@ fn check_config_key_len(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
@@ -386,7 +474,7 @@ pub(crate) fn verify_writer_split_layout(
 /// Only the GC path (`cli.rs`) needs it; the runtime resolver inlines the same
 /// mapping, so this is gated to the `cli` feature to stay dead-code-free in the
 /// guest build.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub(crate) fn chunk_lengths(chunks: &[GcChunkRef]) -> Vec<usize> {
     chunks.iter().map(|chunk| chunk.len).collect()
 }
@@ -572,6 +660,112 @@ where
     finalize_reconstructed_envelope(root_key, reconstructed)
 }
 
+/// Resolve a Fastly value while accounting for every materialized store byte.
+///
+/// `fetch` receives the backend allowance left after the root pointer and all
+/// prior chunks. Deadline checks are cooperative: they bracket each callback,
+/// but cannot interrupt a synchronous host call already in progress.
+#[cfg(any(feature = "fastly", test))]
+pub(crate) fn resolve_fastly_config_value_typed_bounded<F>(
+    root_key: &str,
+    root_value: String,
+    root_backend_bytes: u64,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+    mut fetch: F,
+) -> Result<BoundedStoreRead<String>, BoundedResolveFailure>
+where
+    F: FnMut(&str, u64) -> Result<BoundedStoreRead<String>, ConfigStoreError>,
+{
+    if deadline.is_expired() {
+        return Err(BoundedResolveFailure::DeadlineExceeded);
+    }
+
+    let root_value_bytes = u64::try_from(root_value.len())
+        .map_err(|_length_error| BoundedResolveFailure::ValueTooLarge)?;
+    if root_backend_bytes != root_value_bytes || root_backend_bytes > max_backend_bytes {
+        return Err(BoundedResolveFailure::ValueTooLarge);
+    }
+
+    let mut backend_bytes = root_backend_bytes;
+    let mut chunk_value_bytes = 0_u64;
+    let mut boundary_error = None;
+    let resolve_outcome = resolve_fastly_config_value_typed(root_key, root_value, |chunk_key| {
+        if deadline.is_expired() {
+            boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        let Some(remaining_backend_bytes) = max_backend_bytes.checked_sub(backend_bytes) else {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        };
+        let read = match fetch(chunk_key, remaining_backend_bytes) {
+            Ok(read) => read,
+            Err(error) => {
+                boundary_error = Some(BoundedResolveFailure::Backend(error));
+                return Err("bounded config read failed".to_owned());
+            }
+        };
+
+        if deadline.is_expired() {
+            boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        let value_bytes = match read.value.as_ref() {
+            Some(value) => {
+                let Ok(value_bytes) = u64::try_from(value.len()) else {
+                    boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                    return Err("bounded config read failed".to_owned());
+                };
+                value_bytes
+            }
+            None => 0,
+        };
+        if read.backend_bytes != value_bytes || read.backend_bytes > remaining_backend_bytes {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        let Some(next_backend_bytes) = backend_bytes.checked_add(read.backend_bytes) else {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        };
+        let Some(next_chunk_value_bytes) = chunk_value_bytes.checked_add(value_bytes) else {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        };
+        if next_backend_bytes > max_backend_bytes || next_chunk_value_bytes > max_value_bytes {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        backend_bytes = next_backend_bytes;
+        chunk_value_bytes = next_chunk_value_bytes;
+        Ok(read.value)
+    });
+
+    if let Some(error) = boundary_error {
+        return Err(error);
+    }
+    let resolved_value = resolve_outcome.map_err(BoundedResolveFailure::Resolve)?;
+    if deadline.is_expired() {
+        return Err(BoundedResolveFailure::DeadlineExceeded);
+    }
+    let resolved_bytes = u64::try_from(resolved_value.len())
+        .map_err(|_length_error| BoundedResolveFailure::ValueTooLarge)?;
+    if resolved_bytes > max_value_bytes {
+        return Err(BoundedResolveFailure::ValueTooLarge);
+    }
+
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value: Some(resolved_value),
+    })
+}
+
 /// The final gate the chunked path shares with the direct one: reject a NEWER
 /// inner envelope, then parse+verify the exact v1 `BlobEnvelope`.
 ///
@@ -647,7 +841,7 @@ where
 ///   but fails validation: malformed, unsupported `version`, or a
 ///   referenced key falls outside this root's chunk prefix. Callers log
 ///   `msg` as a warning and skip GC for this root (delete nothing).
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>, String> {
     // 1. Parse loosely. Not-JSON, or not our pointer kind => silent.
     let value: serde_json::Value = match serde_json::from_str(raw) {
@@ -885,7 +1079,7 @@ pub(crate) fn value_is_pointer_kind(raw: &str) -> bool {
 /// a malformed object (a possible truncated/corrupt pointer whose chunk
 /// references we cannot read), an unknown-kind value, and a pointer: those must
 /// fail closed, because assuming they reference no chunks could orphan live ones.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
     matches!(classify_root_value(raw), RootValueKind::Foreign)
 }
@@ -898,7 +1092,7 @@ pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
 /// envelope fragment that announces nothing, so anything that DOES announce is
 /// suspicious (a parked pointer, a future-format value) and must be classified,
 /// not blindly treated as a deletable fragment.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn value_announces_our_kind(raw: &str) -> bool {
     matches!(
         classify_root_value(raw),
@@ -980,7 +1174,7 @@ pub(crate) fn value_is_future_format(raw: &str) -> bool {
 /// every metadata check still passes while the dropped chunk silently leaves the
 /// live set. Callers MUST reconstruct the referenced chunks and put them through
 /// [`gc_verify_generation`] before trusting the live set.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue, String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -1078,7 +1272,7 @@ pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue,
 ///   chunk list is not the true live set);
 /// - a delete candidate's generation must reconstruct a real envelope (a
 ///   necessary, but not sufficient, condition for reclaiming it).
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Result<(), String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -1119,7 +1313,7 @@ pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Res
 /// This is how reclamation groups the store's ACTUAL keys into generations. It
 /// validates the shape (`<root>.__edgezero_chunks.<hex-sha>.<index>`) rather
 /// than trusting it: a hand-edited or foreign key never becomes a delete target.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> {
     chunk_key_parts(root_key, key).map(|(generation, _)| generation)
 }
@@ -1130,7 +1324,7 @@ pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> 
 /// `config gc` uses this to order a proven generation's chunks by writer index
 /// before deleting, so preview and failure-recovery order do not depend on the
 /// remote listing order.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn chunk_key_index(root_key: &str, key: &str) -> Option<usize> {
     chunk_key_parts(root_key, key).map(|(_, index)| index)
 }
@@ -1192,8 +1386,307 @@ fn canonical_index(index: &str) -> Option<usize> {
 mod tests {
 
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use super::*;
+    use edgezero_core::blob_envelope::BlobEnvelope;
+    use edgezero_core::{BoundedStoreRead, Deadline, MonotonicInstant};
+
+    fn unexpected_chunk_fetch(
+        _key: &str,
+        _remaining_backend_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        Err(ConfigStoreError::unavailable("unexpected chunk fetch"))
+    }
+
+    #[test]
+    fn exact_fastly_read_accepts_exact_bytes_and_rejects_one_over() {
+        let exact = exact_fastly_read(Some(bytes::Bytes::from_static(b"secret")), 6)
+            .expect("an exact-sized value must succeed");
+        assert_eq!(exact.backend_bytes, 6);
+        assert_eq!(exact.value.as_deref(), Some(b"secret".as_slice()));
+
+        let error = exact_fastly_read(Some(bytes::Bytes::from_static(b"secret")), 5)
+            .expect_err("one byte over the cap must fail");
+        assert_eq!(error, FastlyReadTooLarge);
+    }
+
+    #[test]
+    fn synchronous_host_call_checks_deadline_before_and_after_operation() {
+        let start = MonotonicInstant::now();
+        let deadline = Deadline::at_instant(
+            start
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let after_deadline = start
+            .checked_add(Duration::from_secs(2))
+            .expect("post-deadline instant");
+        let mut observations = [start, after_deadline].into_iter();
+        let mut calls = 0_usize;
+
+        let error = run_sync_host_call_at(
+            deadline,
+            || observations.next().expect("clock observation"),
+            || {
+                calls += 1;
+                Ok::<_, ()>("materialized")
+            },
+        )
+        .expect_err("an operation completing after the deadline must fail");
+        assert!(matches!(error, SyncHostCallError::DeadlineExceeded));
+        assert_eq!(
+            calls, 1,
+            "the deadline elapsed while the call was in flight"
+        );
+
+        let mut backend_observations = [start, after_deadline].into_iter();
+        let backend_error = run_sync_host_call_at(
+            deadline,
+            || backend_observations.next().expect("clock observation"),
+            || Err::<(), _>("backend failed"),
+        )
+        .expect_err("post-call deadline must also be checked after backend failure");
+        assert!(matches!(backend_error, SyncHostCallError::DeadlineExceeded));
+
+        let mut called_after_expiry = false;
+        let preflight_error = run_sync_host_call_at(
+            deadline,
+            || after_deadline,
+            || {
+                called_after_expiry = true;
+                Ok::<_, ()>("unreachable")
+            },
+        )
+        .expect_err("an already-expired operation must fail");
+        assert!(matches!(
+            preflight_error,
+            SyncHostCallError::DeadlineExceeded
+        ));
+        assert!(!called_after_expiry, "an expired call must not be started");
+    }
+
+    #[test]
+    fn bounded_failures_preserve_backend_and_resolver_payloads() {
+        let backend_failure = BoundedResolveFailure::Backend(ConfigStoreError::unavailable(
+            "temporary store failure",
+        ));
+        match backend_failure {
+            BoundedResolveFailure::Backend(error) => drop(error),
+            BoundedResolveFailure::DeadlineExceeded
+            | BoundedResolveFailure::Resolve(_)
+            | BoundedResolveFailure::ValueTooLarge => {
+                panic!("backend failure variant changed");
+            }
+        }
+
+        let resolve_failure =
+            BoundedResolveFailure::Resolve(ResolveFailure::Corrupt("invalid pointer".to_owned()));
+        match resolve_failure {
+            BoundedResolveFailure::Resolve(error) => {
+                assert_eq!(error.into_message(), "invalid pointer");
+            }
+            BoundedResolveFailure::Backend(_)
+            | BoundedResolveFailure::DeadlineExceeded
+            | BoundedResolveFailure::ValueTooLarge => {
+                panic!("resolver failure variant changed");
+            }
+        }
+
+        let start = MonotonicInstant::now();
+        let deadline = Deadline::at_instant(
+            start
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let mut observations = [start, start].into_iter();
+        let backend_error = run_sync_host_call_at(
+            deadline,
+            || observations.next().expect("clock observation"),
+            || Err::<(), _>("backend failed"),
+        )
+        .expect_err("backend failure must remain inspectable");
+        match backend_error {
+            SyncHostCallError::Backend(message) => assert_eq!(message, "backend failed"),
+            SyncHostCallError::DeadlineExceeded => panic!("deadline must not win"),
+        }
+
+        let wrapper_result = run_sync_host_call(Deadline::after(Duration::from_secs(1)), || {
+            Ok::<_, ()>("materialized")
+        })
+        .expect("wrapper call before its deadline must succeed");
+        assert_eq!(wrapper_result, "materialized");
+    }
+
+    #[test]
+    fn bounded_resolver_accepts_exact_direct_caps_and_rejects_over_cap() {
+        let exact = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            Deadline::after(Duration::from_secs(1)),
+            5,
+            5,
+            unexpected_chunk_fetch,
+        )
+        .expect("a direct value at both exact caps must succeed");
+
+        assert_eq!(exact.backend_bytes, 5);
+        assert_eq!(exact.value.as_deref(), Some("value"));
+
+        let over_backend = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            Deadline::after(Duration::from_secs(1)),
+            4,
+            5,
+            unexpected_chunk_fetch,
+        )
+        .expect_err("a direct value over the backend cap must fail");
+        assert!(matches!(over_backend, BoundedResolveFailure::ValueTooLarge));
+
+        let over_value = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            Deadline::after(Duration::from_secs(1)),
+            5,
+            4,
+            unexpected_chunk_fetch,
+        )
+        .expect_err("a direct value over the value cap must fail");
+        assert!(matches!(over_value, BoundedResolveFailure::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_resolver_rejects_expired_deadline_without_fetching() {
+        let mut fetched = false;
+        let error = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            Deadline::after(Duration::ZERO),
+            5,
+            5,
+            |_key, _remaining_backend_bytes| {
+                fetched = true;
+                Ok(BoundedStoreRead {
+                    backend_bytes: 0,
+                    value: None,
+                })
+            },
+        )
+        .expect_err("an expired deadline must fail");
+
+        assert!(matches!(error, BoundedResolveFailure::DeadlineExceeded));
+        assert!(!fetched, "an expired read must not fetch chunks");
+    }
+
+    #[test]
+    fn bounded_resolver_counts_pointer_and_chunks_with_decreasing_allowance() {
+        let root_key = "app_config";
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            serde_json::json!({ "pad": "x".repeat(9_000) }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let mut entries = prepare_fastly_config_entries(root_key, &envelope).expect("entries");
+        let (_, pointer) = entries.pop().expect("root pointer");
+        let chunks: HashMap<_, _> = entries.into_iter().collect();
+        let pointer_bytes = u64::try_from(pointer.len()).expect("pointer length");
+        let maybe_chunk_bytes = chunks.values().try_fold(0_u64, |total, chunk| {
+            total.checked_add(u64::try_from(chunk.len()).ok()?)
+        });
+        let chunk_bytes = maybe_chunk_bytes.expect("chunk byte sum");
+        let total_backend_bytes = pointer_bytes
+            .checked_add(chunk_bytes)
+            .expect("backend byte sum");
+        let mut remaining_allowances = Vec::new();
+
+        let resolved = resolve_fastly_config_value_typed_bounded(
+            root_key,
+            pointer.clone(),
+            pointer_bytes,
+            Deadline::after(Duration::from_secs(1)),
+            total_backend_bytes,
+            u64::try_from(envelope.len()).expect("envelope length"),
+            |chunk_key, remaining_backend_bytes| {
+                remaining_allowances.push(remaining_backend_bytes);
+                let value = chunks.get(chunk_key).cloned();
+                Ok(BoundedStoreRead {
+                    backend_bytes: value
+                        .as_ref()
+                        .map_or(0, |chunk| u64::try_from(chunk.len()).expect("chunk length")),
+                    value,
+                })
+            },
+        )
+        .expect("exact pointer and chunk caps must succeed");
+
+        assert_eq!(resolved.backend_bytes, total_backend_bytes);
+        assert_eq!(resolved.value.as_deref(), Some(envelope.as_str()));
+        assert_eq!(remaining_allowances.first(), Some(&chunk_bytes));
+        assert!(
+            remaining_allowances
+                .windows(2)
+                .all(|pair| pair[1] < pair[0]),
+            "each chunk must receive a smaller backend allowance"
+        );
+
+        let error = resolve_fastly_config_value_typed_bounded(
+            root_key,
+            pointer,
+            pointer_bytes,
+            Deadline::after(Duration::from_secs(1)),
+            total_backend_bytes - 1,
+            u64::try_from(envelope.len()).expect("envelope length"),
+            |chunk_key, _remaining_backend_bytes| {
+                let value = chunks.get(chunk_key).cloned();
+                Ok(BoundedStoreRead {
+                    backend_bytes: value
+                        .as_ref()
+                        .map_or(0, |chunk| u64::try_from(chunk.len()).expect("chunk length")),
+                    value,
+                })
+            },
+        )
+        .expect_err("one byte below the aggregate backend cap must fail");
+        assert!(matches!(error, BoundedResolveFailure::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_resolver_rejects_inconsistent_chunk_reports() {
+        let root_key = "app_config";
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            serde_json::json!({ "pad": "x".repeat(9_000) }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let mut entries = prepare_fastly_config_entries(root_key, &envelope).expect("entries");
+        let (_, pointer) = entries.pop().expect("root pointer");
+        let chunks: HashMap<_, _> = entries.into_iter().collect();
+        let pointer_bytes = u64::try_from(pointer.len()).expect("pointer length");
+
+        let error = resolve_fastly_config_value_typed_bounded(
+            root_key,
+            pointer,
+            pointer_bytes,
+            Deadline::after(Duration::from_secs(1)),
+            u64::MAX,
+            u64::try_from(envelope.len()).expect("envelope length"),
+            |chunk_key, _remaining_backend_bytes| {
+                let value = chunks.get(chunk_key).cloned();
+                Ok(BoundedStoreRead {
+                    backend_bytes: 0,
+                    value,
+                })
+            },
+        )
+        .expect_err("a provider report smaller than its result must fail closed");
+
+        assert!(matches!(error, BoundedResolveFailure::ValueTooLarge));
+    }
 
     /// the index must be one this writer could emit. The
     /// chunk loop counts in `usize`, so a digit run that overflows it is not

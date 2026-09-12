@@ -805,8 +805,10 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::Capability;
     use edgezero_core::app_config::app_name_prefix;
-    use edgezero_core::test_env::PathPrepend as PathOverride;
+    use edgezero_core::manifest::ManifestLoader;
+    use edgezero_core::test_env::{PathPrepend as PathOverride, env_lock};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -1012,6 +1014,77 @@ mod tests {
         }
     }
 
+    fn with_generated_demo_app(assertions: impl FnOnce(&Path)) {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp = TempDir::new().expect("temp dir");
+        let bin_dir = temp.path().join("bin");
+        write_git_stub(&bin_dir);
+        let _path_guard = PathOverride::new(&bin_dir);
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+        };
+        generate_new(&args).expect("scaffold succeeds");
+        assertions(&temp.path().join("demo-app"));
+    }
+
+    #[test]
+    fn generated_manifest_declares_outbound_http_optional() {
+        with_generated_demo_app(|project_dir| {
+            let source =
+                fs::read_to_string(project_dir.join("edgezero.toml")).expect("read manifest");
+            let manifest = ManifestLoader::load_from_str(&source);
+            assert_eq!(
+                manifest.manifest().capabilities.optional,
+                [Capability::OutboundHttp]
+            );
+            let hosts = manifest
+                .manifest()
+                .capabilities
+                .outbound
+                .hosts
+                .as_deref()
+                .expect("generated outbound hosts");
+            assert_eq!(hosts, ["https://*:*"]);
+
+            let readme = fs::read_to_string(project_dir.join("README.md")).expect("read README.md");
+            assert!(
+                readme.contains("may fail at runtime"),
+                "generated README must explain optional capability behavior"
+            );
+            assert!(
+                readme.contains("promote `outbound-http` to `required`"),
+                "generated README must explain how to require outbound success"
+            );
+        });
+    }
+
+    #[test]
+    fn generated_spin_hosts_default_to_https_only() {
+        with_generated_demo_app(|project_dir| {
+            let source =
+                fs::read_to_string(project_dir.join("crates/demo-app-adapter-spin/spin.toml"))
+                    .expect("read spin.toml");
+            let manifest: toml::Value = toml::from_str(&source).expect("parse spin.toml");
+            let hosts = manifest
+                .get("component")
+                .and_then(|components| components.get("demo-app-adapter-spin"))
+                .and_then(|component| component.get("allowed_outbound_hosts"))
+                .and_then(toml::Value::as_array)
+                .expect("allowed outbound hosts");
+            assert_eq!(hosts.len(), 1);
+            assert_eq!(hosts[0].as_str(), Some("https://*:*"));
+            assert!(
+                hosts.iter().all(|host| {
+                    host.as_str()
+                        .is_some_and(|value| !value.starts_with("http://"))
+                }),
+                "generated Spin manifest must not grant cleartext implicitly"
+            );
+        });
+    }
+
     fn assert_scaffold_files(project_dir: &Path) {
         assert!(project_dir.is_dir(), "project directory created");
         assert!(project_dir.join("Cargo.toml").exists());
@@ -1124,6 +1197,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scaffold contract is clearest as one exhaustive generated-workspace assertion"
+    )]
     fn assert_scaffold_workspace(project_dir: &Path) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
@@ -1156,6 +1233,27 @@ mod tests {
 
         let manifest =
             fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
+        let manifest_value: toml::Value = toml::from_str(&manifest).expect("parse edgezero.toml");
+        assert_eq!(
+            manifest_value
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("optional"))
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("outbound-http"),
+            "generated manifest must explicitly opt into portable outbound HTTP"
+        );
+        assert_eq!(
+            manifest_value
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("outbound"))
+                .and_then(|outbound| outbound.get("hosts"))
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("https://*:*")
+        );
         assert!(manifest.contains("[adapters.cloudflare.adapter]"));
         assert!(manifest.contains("[adapters.fastly.adapter]"));
         assert!(
@@ -1266,7 +1364,117 @@ mod tests {
     /// templates shipped a production `.expect(...)` in the `stream` handler,
     /// infallible `IntoResponse` test usage, and adapter host stubs that
     /// tripped `print_stderr` / `exit`.
+    fn fallback_initializer_block(core_lib: &str) -> &str {
+        const VARIANT: &str = "AdmissionDecision::ReadBodyBeforeFallback";
+        let variant_start = core_lib
+            .find(VARIANT)
+            .expect("fallback decision initializer");
+        let after_variant = core_lib
+            .get(variant_start..)
+            .expect("fallback decision start boundary");
+        let open_brace = after_variant
+            .find('{')
+            .and_then(|offset| variant_start.checked_add(offset))
+            .expect("fallback decision opening brace");
+        let mut depth = 0_usize;
+
+        let after_open_brace = core_lib
+            .get(open_brace..)
+            .expect("fallback opening brace boundary");
+        for (offset, character) in after_open_brace.char_indices() {
+            match character {
+                '{' => depth = depth.checked_add(1).expect("fallback brace depth"),
+                '}' => {
+                    depth = depth.checked_sub(1).expect("balanced fallback braces");
+                    if depth == 0 {
+                        let block_end = open_brace
+                            .checked_add(offset)
+                            .and_then(|end| end.checked_add(character.len_utf8()))
+                            .expect("fallback initializer end");
+                        return core_lib
+                            .get(variant_start..block_end)
+                            .expect("fallback initializer boundaries");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        panic!("fallback decision closing brace");
+    }
+
+    fn normalize_source_whitespace(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn assert_generated_fallback_policy(core_lib: &str) {
+        let fallback = normalize_source_whitespace(fallback_initializer_block(core_lib));
+        assert!(
+            core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
+                && fallback
+                    .contains("grant: IngressGrant::new(AdmissionLease { route_class: None })")
+                && fallback.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
+                && fallback.contains(concat!(
+                    "on_exceeded: BufferedIngressResponse::text( ",
+                    "StatusCode::BAD_REQUEST, ",
+                    "\"request body too large\\n\", ),",
+                ))
+                && fallback.contains(concat!(
+                    "on_timeout: BufferedIngressResponse::text( ",
+                    "StatusCode::REQUEST_TIMEOUT, ",
+                    "\"request timeout\\n\", ),",
+                )),
+            "generated admission policy must own the fallback lease and exact terminal responses",
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "generated admission policy must own the fallback lease and exact terminal responses"
+    )]
+    fn generated_fallback_policy_rejects_swapped_terminal_mappings() {
+        assert_generated_fallback_policy(
+            r#"AdmissionDecision::ReadBodyBeforeFallback {
+                grant: IngressGrant::new(AdmissionLease { route_class: None }),
+                max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
+                on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),
+                on_timeout: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+            }
+            const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
+            on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+            on_timeout: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),"#,
+        );
+    }
+
     fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
+        let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
+            .expect("read core lib.rs");
+        assert!(
+            core_lib.contains("configure = crate::configure_app"),
+            "generated app macro must install the lifecycle configuration callback",
+        );
+        assert!(
+            core_lib.contains("set_ingress_admission_policy"),
+            "generated app must configure ingress admission",
+        );
+        assert!(
+            core_lib.contains("IngressGrant::new"),
+            "generated admission policy must issue an app-owned grant",
+        );
+        assert_generated_fallback_policy(&core_lib);
+
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");
         assert!(
@@ -1280,6 +1488,53 @@ mod tests {
         assert!(
             handlers.contains(".into_response()"),
             "handler tests must use the fallible IntoResponse pattern",
+        );
+        assert!(
+            handlers.contains("HttpClient::with_client(TestOutboundClient)"),
+            "generated tests must execute the portable outbound client",
+        );
+        assert!(
+            handlers.contains("fn generated_outbound_http_smoke()"),
+            "generated core must contain the outbound smoke sentinel",
+        );
+        for required in [
+            ".max_request_body_bytes(",
+            ".max_encoded_response_bytes(",
+            ".max_decoded_response_bytes(",
+            ".max_response_bytes(",
+            ".max_response_header_bytes(",
+            ".max_response_header_count(",
+            ".max_chunk_bytes(",
+            ".max_brotli_window_bits(",
+            ".max_brotli_decoder_bytes(",
+            ".timeout(",
+            "send_all(",
+            "slot.elapsed",
+        ] {
+            assert!(
+                handlers.contains(required),
+                "generated outbound example must contain `{required}`",
+            );
+        }
+
+        let manifest =
+            fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
+        assert!(
+            manifest.contains("path = \"/admission\"")
+                && manifest.contains("class = \"diagnostic\""),
+            "generated manifest must wire the admission diagnostic class",
+        );
+        assert!(
+            manifest.contains("path = \"/fanout\"") && manifest.contains("class = \"outbound\""),
+            "generated manifest must wire the outbound fanout class",
+        );
+
+        let spin_manifest =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-spin/spin.toml"))
+                .expect("read spin.toml");
+        assert!(
+            spin_manifest.contains("allowed_outbound_hosts = [\"https://*:*\"]"),
+            "generated Spin hosts must default to HTTPS only",
         );
 
         let axum_main =
@@ -1301,24 +1556,13 @@ mod tests {
 
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
-        let temp = TempDir::new().expect("temp dir");
-        let bin_dir = temp.path().join("bin");
-        write_git_stub(&bin_dir);
-        let _path_guard = PathOverride::new(&bin_dir);
-
-        let args = NewArgs {
-            name: "demo-app".into(),
-            dir: Some(temp.path().to_string_lossy().into_owned()),
-        };
-
-        generate_new(&args).expect("scaffold succeeds");
-
-        let project_dir = temp.path().join("demo-app");
-        assert_scaffold_files(&project_dir);
-        assert_scaffold_workspace(&project_dir);
-        assert_scaffold_app_config(&project_dir);
-        assert_scaffold_crate_lints(&project_dir);
-        assert_scaffold_cli_full_command_set(&project_dir);
+        with_generated_demo_app(|project_dir| {
+            assert_scaffold_files(project_dir);
+            assert_scaffold_workspace(project_dir);
+            assert_scaffold_app_config(project_dir);
+            assert_scaffold_crate_lints(project_dir);
+            assert_scaffold_cli_full_command_set(project_dir);
+        });
     }
 
     /// The scaffolded `<name>-cli` must

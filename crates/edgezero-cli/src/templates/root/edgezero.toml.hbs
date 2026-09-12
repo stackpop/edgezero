@@ -7,12 +7,19 @@ version = "0.1.0"
 kind = "http"
 entry = "crates/{{proj_core}}"
 
+[capabilities]
+optional = ["outbound-http"]
+
+[capabilities.outbound]
+hosts = ["https://*:*"]
+
 [[triggers.http]]
 id = "root"
 path = "/"
 methods = ["GET"]
 handler = "{{proj_core_mod}}::handlers::root"
 adapters = [{{{adapter_list}}}]
+class = "health"
 description = "Default health-check endpoint"
 
 [[triggers.http]]
@@ -44,6 +51,14 @@ methods = ["POST"]
 handler = "{{proj_core_mod}}::handlers::echo_json"
 adapters = [{{{adapter_list}}}]
 
+[[triggers.http]]
+id = "admission"
+path = "/admission"
+methods = ["GET"]
+handler = "{{proj_core_mod}}::handlers::admission"
+adapters = [{{{adapter_list}}}]
+class = "diagnostic"
+description = "Confirms route-aware admission and one-time grant consumption"
 
 [[triggers.http]]
 id = "proxy_demo"
@@ -51,6 +66,16 @@ path = "/proxy/{*rest}"
 methods = ["GET", "POST"]
 handler = "{{proj_core_mod}}::handlers::proxy_demo"
 adapters = [{{{adapter_list}}}]
+class = "outbound"
+
+[[triggers.http]]
+id = "fanout"
+path = "/fanout"
+methods = ["POST"]
+handler = "{{proj_core_mod}}::handlers::fanout"
+adapters = [{{{adapter_list}}}]
+class = "outbound"
+description = "Concurrent positional outbound batch with per-slot elapsed time"
 
 # -- Introspection routes ------------------------------------------------------
 
@@ -60,6 +85,7 @@ path = "/_{{name}}/manifest"
 methods = ["GET"]
 handler = "edgezero_core::introspection::manifest"
 adapters = [{{{adapter_list}}}]
+class = "diagnostic"
 description = "App manifest as JSON"
 
 [[triggers.http]]
@@ -68,6 +94,7 @@ path = "/_{{name}}/config"
 methods = ["GET"]
 handler = "edgezero_core::introspection::config"
 adapters = [{{{adapter_list}}}]
+class = "diagnostic"
 description = "Effective app config (secret-safe)"
 
 [[triggers.http]]
@@ -76,6 +103,7 @@ path = "/_{{name}}/routes"
 methods = ["GET"]
 handler = "edgezero_core::introspection::routes"
 adapters = [{{{adapter_list}}}]
+class = "diagnostic"
 description = "Registered route table"
 
 # -- Stores ----------------------------------------------------------------
