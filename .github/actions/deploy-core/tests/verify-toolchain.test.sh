@@ -27,9 +27,15 @@ assert_pass() {
   fi
 }
 assert_fail() {
-  local description=$1
-  shift
-  if "$@" >/dev/null 2>&1; then no "$description"; else ok "$description"; fi
+  local description=$1 expected=$2 stdout="$WORK/assert-fail.stdout" stderr="$WORK/assert-fail.stderr" status=0
+  shift 2
+  "$@" >"$stdout" 2>"$stderr" || status=$?
+  if [[ "$status" -ne 0 && ! -s "$stdout" ]] && grep -Fq -e "$expected" "$stderr"; then
+    ok "$description"
+  else
+    cat "$stdout" "$stderr" >&2
+    no "$description"
+  fi
 }
 
 write_executable() {
@@ -130,6 +136,7 @@ EOF
   # shellcheck disable=SC2016
   write_executable "$ROOT/usr/local/bin/edgezero-provenance-validator" \
     '[[ "$#" == 3 && "$1" == self-test && "$2" == --fixtures ]]' \
+    '[[ "$3" == "$FAKE_ROOT/usr/local/share/edgezero/provenance-fixtures" ]]' \
     'printf "%s" "$3" >"$FAKE_STATE/validator-fixtures"' \
     'exit "$(cat "$FAKE_STATE/validator-status")"'
   # shellcheck disable=SC2016
@@ -137,12 +144,15 @@ EOF
     'case "$1" in -u) cat "$FAKE_STATE/uid" ;; -g) cat "$FAKE_STATE/gid" ;; *) exit 1 ;; esac'
   # shellcheck disable=SC2016
   write_executable "$ROOT/usr/bin/touch" \
+    '[[ "$#" == 1 ]]' \
+    'printf "%s" "$1" >"$FAKE_STATE/touch-path"' \
     'exit "$(cat "$FAKE_STATE/touch-status")"'
   # shellcheck disable=SC2016
   write_executable "$ROOT/usr/bin/env" \
     'cat "$FAKE_STATE/env-output"'
   # shellcheck disable=SC2016
   write_executable "$ROOT/usr/bin/x86_64-linux-gnu-readelf" \
+    'case "$2" in "$FAKE_ROOT/lib64/ld-linux-x86-64.so.2"|"$FAKE_ROOT/opt/edgezero/runtime-lib/libc.so.6"|"$FAKE_ROOT/opt/edgezero/runtime-lib/libgcc_s.so.1"|"$FAKE_ROOT/opt/edgezero/runtime-lib/libm.so.6") ;; *) exit 94 ;; esac' \
     'base=$(basename -- "$2")' \
     '[[ "$base" != ld-linux-x86-64.so.2 ]] || base=loader' \
     'case "$1" in' \
@@ -186,120 +196,151 @@ if [[ "$(cat "$STATE/validator-fixtures")" == "$canonical_root/usr/local/share/e
 else
   no "validator self-test reads fixtures beneath the non-/ audit root"
 fi
+if [[ "$(cat "$STATE/touch-path")" == "$canonical_root/.edgezero-read-only-probe."* ]]; then
+  ok "root-writability probe targets the non-/ audit root"
+else
+  no "root-writability probe targets the non-/ audit root"
+fi
 
 make_root rust-prerelease
 sed -i.bak 's/release: 1.95.0/release: 1.95.0-beta.1/' "$STATE/rustc"
 rm "$STATE/rustc.bak"
-assert_fail "a prerelease Rust version is rejected" run_verify
+assert_fail "a prerelease Rust version is rejected" \
+  "verify-toolchain: Rust version is not an exact stable semantic version" run_verify
 
 make_root rust-extra
 sed -i.bak '1s/$/ extra/' "$STATE/rustc"
 rm "$STATE/rustc.bak"
-assert_fail "extra Rust version text is rejected" run_verify
+assert_fail "extra Rust version text is rejected" \
+  "verify-toolchain: rustc version output differs" run_verify
 
 make_root rust-missing
 sed -i.bak '/^release:/d' "$STATE/rustc"
 rm "$STATE/rustc.bak"
-assert_fail "missing Rust release output is rejected" run_verify
+assert_fail "missing Rust release output is rejected" \
+  "verify-toolchain: Rust version is not an exact stable semantic version" run_verify
 
 make_root rust-malformed
 sed -i.bak 's/release: 1.95.0/release: 1.95/' "$STATE/rustc"
 rm "$STATE/rustc.bak"
-assert_fail "malformed Rust version output is rejected" run_verify
+assert_fail "malformed Rust version output is rejected" \
+  "verify-toolchain: Rust version is not an exact stable semantic version" run_verify
 
 make_root fastly-malformed
 printf 'Fastly CLI version 15.1.0\n' >"$STATE/fastly"
-assert_fail "malformed Fastly version output is rejected" run_verify
+assert_fail "malformed Fastly version output is rejected" \
+  "verify-toolchain: Fastly version is not an exact stable semantic version" run_verify
 
 make_root fastly-prerelease
 sed -i.bak 's/v15.1.0/v15.1.0-rc.1/' "$STATE/fastly"
 rm "$STATE/fastly.bak"
-assert_fail "a prerelease Fastly version is rejected" run_verify
+assert_fail "a prerelease Fastly version is rejected" \
+  "verify-toolchain: Fastly version is not an exact stable semantic version" run_verify
 
 make_root fastly-extra
 printf 'unexpected\n' >>"$STATE/fastly"
-assert_fail "extra Fastly version text is rejected" run_verify
+assert_fail "extra Fastly version text is rejected" \
+  "verify-toolchain: Fastly version output differs" run_verify
 
 make_root fastly-missing
 : >"$STATE/fastly"
-assert_fail "missing Fastly version output is rejected" run_verify
+assert_fail "missing Fastly version output is rejected" \
+  "verify-toolchain: Fastly version is not an exact stable semantic version" run_verify
 
 make_root fastly-wrong
 sed -i.bak 's/v15.1.0/v15.1.1/' "$STATE/fastly"
 rm "$STATE/fastly.bak"
-assert_fail "a different Fastly version is rejected" run_verify
+assert_fail "a different Fastly version is rejected" \
+  "verify-toolchain: Fastly version differs" run_verify
 
 make_root sccache-prerelease
 printf 'sccache 0.10.0-rc.1\n' >"$STATE/sccache"
-assert_fail "a prerelease sccache version is rejected" run_verify
+assert_fail "a prerelease sccache version is rejected" \
+  "verify-toolchain: sccache version is not an exact stable semantic version" run_verify
 
 make_root sccache-extra
 printf 'sccache 0.10.0 extra\n' >"$STATE/sccache"
-assert_fail "extra sccache version text is rejected" run_verify
+assert_fail "extra sccache version text is rejected" \
+  "verify-toolchain: sccache version is not an exact stable semantic version" run_verify
 
 make_root sccache-missing
 : >"$STATE/sccache"
-assert_fail "missing sccache version output is rejected" run_verify
+assert_fail "missing sccache version output is rejected" \
+  "verify-toolchain: sccache version is not an exact stable semantic version" run_verify
 
 make_root sccache-malformed
 printf 'sccache version 0.10.0\n' >"$STATE/sccache"
-assert_fail "malformed sccache version output is rejected" run_verify
+assert_fail "malformed sccache version output is rejected" \
+  "verify-toolchain: sccache version is not an exact stable semantic version" run_verify
 
 make_root sccache-wrong
 printf 'sccache 0.10.1\n' >"$STATE/sccache"
-assert_fail "a different sccache version is rejected" run_verify
+assert_fail "a different sccache version is rejected" \
+  "verify-toolchain: sccache version differs" run_verify
 
 make_root target-missing
 : >"$STATE/targets"
-assert_fail "an absent wasm32-wasip1 target is rejected" run_verify
+assert_fail "an absent wasm32-wasip1 target is rejected" \
+  "verify-toolchain: installed Rust target set differs" run_verify
 
 make_root target-extra
 printf 'aarch64-unknown-linux-gnu\nwasm32-wasip1\nx86_64-unknown-linux-gnu\n' >"$STATE/targets"
-assert_fail "an extra installed target is rejected" run_verify
+assert_fail "an extra installed target is rejected" \
+  "verify-toolchain: installed Rust target set differs" run_verify
 
 make_root compile-failure
 printf '1\n' >"$STATE/compile-status"
-assert_fail "a failed minimal wasm compile is rejected" run_verify
+assert_fail "a failed minimal wasm compile is rejected" \
+  "verify-toolchain: minimal wasm compile failed" run_verify
 
 make_root invalid-wasm
 printf 'bad\n' >"$STATE/compile-output"
-assert_fail "invalid wasm magic is rejected" run_verify
+assert_fail "invalid wasm magic is rejected" \
+  "verify-toolchain: minimal compile output lacks wasm magic" run_verify
 
 make_root validator-failure
 printf '1\n' >"$STATE/validator-status"
-assert_fail "a validator self-test failure is rejected" run_verify
+assert_fail "a validator self-test failure is rejected" \
+  "verify-toolchain: validator self-test failed" run_verify
 
 make_root wrong-uid
 printf '1002\n' >"$STATE/uid"
-assert_fail "a wrong uid is rejected" run_verify
+assert_fail "a wrong uid is rejected" \
+  "verify-toolchain: runtime uid is not 1001" run_verify
 
 make_root wrong-gid
 printf '1002\n' >"$STATE/gid"
-assert_fail "a wrong gid is rejected" run_verify
+assert_fail "a wrong gid is rejected" \
+  "verify-toolchain: runtime gid is not 1001" run_verify
 
 make_root wrong-rustc-alias
 rm "$ROOT/usr/local/cargo/bin/rustc"
 ln -s ../../bin/fastly "$ROOT/usr/local/cargo/bin/rustc"
-assert_fail "a rustc proxy pointing anywhere except rustup is rejected" run_verify
+assert_fail "a rustc proxy pointing anywhere except rustup is rejected" \
+  "verify-toolchain: rustc is not the exact rustup proxy alias" run_verify
 
 make_root symlinked-loader-parent
 mkdir -p "$ROOT/usr/lib64"
 mv "$ROOT/lib64/ld-linux-x86-64.so.2" "$ROOT/usr/lib64/ld-linux-x86-64.so.2"
 rmdir "$ROOT/lib64"
 ln -s usr/lib64 "$ROOT/lib64"
-assert_fail "a symlinked /lib64 acquisition path is rejected" run_verify
+assert_fail "a symlinked /lib64 acquisition path is rejected" \
+  "verify-toolchain: /lib64 is not a real directory" run_verify
 
 make_root writable-root
 printf '0\n' >"$STATE/touch-status"
-assert_fail "a writable root filesystem is rejected" run_verify
+assert_fail "a writable root filesystem is rejected" \
+  "verify-toolchain: root filesystem is writable" run_verify
 
 make_root missing-env
 rm "$ROOT/usr/bin/env"
-assert_fail "a missing GNU env is rejected" run_verify
+assert_fail "a missing GNU env is rejected" \
+  "verify-toolchain: required executable is missing, linked, or not executable:" run_verify
 
 make_root incompatible-env
 printf 'EDGEZERO_ENV_PROBE=unexpanded\n' >"$STATE/env-output"
-assert_fail "an env without expansion-before-clear semantics is rejected" run_verify
+assert_fail "an env without expansion-before-clear semantics is rejected" \
+  "verify-toolchain: GNU env lacks required expansion-before-clear semantics" run_verify
 
 make_root bookworm-libc-interpreter
 printf '[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]\n' \
@@ -308,45 +349,65 @@ assert_pass "Bookworm libc may carry the exact supported PT_INTERP" run_verify
 
 make_root missing-runtime-member
 rm "$ROOT/opt/edgezero/runtime-lib/libc.so.6"
-assert_fail "a missing flat runtime-library member is rejected" run_verify
+assert_fail "a missing flat runtime-library member is rejected" \
+  "verify-toolchain: flat runtime-library member set differs" run_verify
 
 make_root extra-runtime-member
 printf rogue >"$ROOT/opt/edgezero/runtime-lib/librogue.so.1"
-assert_fail "an extra flat runtime-library member is rejected" run_verify
+assert_fail "an extra flat runtime-library member is rejected" \
+  "verify-toolchain: flat runtime-library member set differs" run_verify
 
 make_root hidden-runtime-member
 printf rogue >"$ROOT/opt/edgezero/runtime-lib/.hidden.so"
-assert_fail "a hidden flat runtime-library member is rejected" run_verify
+assert_fail "a hidden flat runtime-library member is rejected" \
+  "verify-toolchain: flat runtime-library member set differs" run_verify
 
 make_root linked-runtime-member
 rm "$ROOT/opt/edgezero/runtime-lib/libm.so.6"
 ln -s libc.so.6 "$ROOT/opt/edgezero/runtime-lib/libm.so.6"
-assert_fail "a symlinked flat runtime-library member is rejected" run_verify
+assert_fail "a symlinked flat runtime-library member is rejected" \
+  "verify-toolchain: runtime object is missing, linked, or non-regular: libm.so.6" run_verify
 
 make_root replaced-runtime-member
 printf 'wrong\n' >"$STATE/closure-hash-status"
-assert_fail "a byte-replaced runtime closure member is rejected" run_verify
+assert_fail "a byte-replaced runtime closure member is rejected" \
+  "verify-toolchain: runtime object digest differs: libc.so.6" run_verify
 
 make_root wrong-runtime-soname
 printf 'SONAME=libwrong.so.6\nNEEDED=libc.so.6\n' >"$STATE/dynamic-libm.so.6"
-assert_fail "a filename and SONAME disagreement is rejected" run_verify
+assert_fail "a filename and SONAME disagreement is rejected" \
+  "verify-toolchain: runtime filename and SONAME differ: libm.so.6" run_verify
+
+make_root extra-runtime-needed
+printf 'NEEDED=libunexpected.so.1\n' >>"$STATE/dynamic-libm.so.6"
+assert_fail "an extra runtime dependency is rejected" \
+  "verify-toolchain: runtime dependency set differs: libm.so.6" run_verify
 
 make_root runtime-interpreter
 printf '[Requesting program interpreter: /attacker/ld.so]\n' \
   >"$STATE/program-libm.so.6"
-assert_fail "a runtime library carrying a foreign PT_INTERP is rejected" run_verify
+assert_fail "a runtime library carrying a foreign PT_INTERP is rejected" \
+  "verify-toolchain: runtime object carries unsupported PT_INTERP: libm.so.6" run_verify
 
 make_root hardlinked-loader
-ln "$ROOT/lib64/ld-linux-x86-64.so.2" "$ROOT/lib64/loader-alias"
-assert_fail "a multiply linked dynamic interpreter is rejected" run_verify
+ln "$ROOT/lib64/ld-linux-x86-64.so.2" "$ROOT/loader-alias"
+assert_fail "a multiply linked dynamic interpreter is rejected" \
+  "verify-toolchain: dynamic interpreter is multiply linked" run_verify
+
+make_root extra-loader-member
+printf rogue >"$ROOT/lib64/loader-alias"
+assert_fail "an extra dynamic-interpreter directory member is rejected" \
+  "verify-toolchain: dynamic interpreter directory member set differs" run_verify
 
 make_root wrong-loader-soname
 printf 'SONAME=attacker-loader.so\n' >"$STATE/dynamic-loader"
-assert_fail "a dynamic interpreter carrying the wrong SONAME is rejected" run_verify
+assert_fail "a dynamic interpreter carrying the wrong SONAME is rejected" \
+  "verify-toolchain: dynamic interpreter tags differ" run_verify
 
 make_root preload-present
 printf '/attacker/lib.so\n' >"$ROOT/etc/ld.so.preload"
-assert_fail "a system preload file is rejected" run_verify
+assert_fail "a system preload file is rejected" \
+  "verify-toolchain: /etc/ld.so.preload must be absent" run_verify
 
 printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
