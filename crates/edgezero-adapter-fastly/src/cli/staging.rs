@@ -1717,6 +1717,9 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
     use std::path::PathBuf;
+    // Every `tempdir()` call site sits in a `#[cfg(unix)]` test (they drive a
+    // PATH-shimmed fake `fastly`), so on wasm this import is unused.
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     fn owned(args: &[&str]) -> Vec<String> {

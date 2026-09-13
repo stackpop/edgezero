@@ -376,6 +376,18 @@ fn resolve_declared_adapter_paths(
         return Ok((None, None));
     };
     let root = declared_root.unwrap_or_else(|| Path::new("."));
+    // A COMMANDS-ONLY adapter (`[adapters.<name>.commands]` with no
+    // `[adapters.<name>.adapter]` fields at all) is valid: it manages its own
+    // build/deploy and never relies on declared-path discovery. That is the
+    // same contract `assert_adapter_declaration_consistent` enforces, which
+    // rejects only a HALF-declared adapter. Such an adapter still reaches here
+    // on dispatch paths that bypass `commands.<action>` (a staged deploy drives
+    // the vendor CLI directly), so returning `(None, None)` -- exactly as for an
+    // undeclared adapter -- lets the adapter fall back to its own discovery
+    // instead of failing a legitimate configuration.
+    if cfg.adapter.manifest.is_none() && cfg.adapter.crate_path.is_none() {
+        return Ok((None, None));
+    }
     let rel = cfg.adapter.manifest.as_deref().ok_or_else(|| {
         format!(
             "`[adapters.{adapter_name}.adapter].manifest` is not declared. It is required: \
@@ -807,6 +819,23 @@ mod tests {
         let (manifest_abs, crate_abs) =
             resolve_declared_adapter_paths(None, "spin").expect("no manifest is not an error");
         assert!(manifest_abs.is_none() && crate_abs.is_none());
+    }
+
+    #[test]
+    fn declared_adapter_paths_are_none_for_a_commands_only_adapter() {
+        // A commands-only adapter declares `[adapters.<name>.commands]` and no
+        // `[adapters.<name>.adapter]` fields. It owns its build/deploy, so it
+        // must NOT be forced to declare discovery paths -- dispatch paths that
+        // bypass `commands.<action>` (a staged deploy) still reach here.
+        let loader = ManifestLoader::load_from_str(
+            "[app]\nname = \"demo\"\n\n[adapters.fastly.commands]\ndeploy = \"bash deploy.sh\"\n",
+        );
+        let (manifest_abs, crate_abs) = resolve_declared_adapter_paths(Some(&loader), "fastly")
+            .expect("a commands-only adapter is not an error");
+        assert!(
+            manifest_abs.is_none() && crate_abs.is_none(),
+            "commands-only must fall back to the adapter's own discovery"
+        );
     }
 
     #[test]
