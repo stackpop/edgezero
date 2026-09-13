@@ -34,7 +34,7 @@ assert_fail_message() {
   local description=$1 expected=$2 stdout="$WORK/assert-fail.stdout" stderr="$WORK/assert-fail.stderr" status=0
   shift 2
   "$@" >"$stdout" 2>"$stderr" || status=$?
-  if [[ "$status" -ne 0 ]] && grep -Fq -e "$expected" "$stderr"; then
+  if [[ "$status" -ne 0 && ! -s "$stdout" ]] && grep -Fq -e "$expected" "$stderr"; then
     ok "$description"
   else
     cat "$stdout" "$stderr" >&2
@@ -266,7 +266,7 @@ EOF
 }
 
 reset_state() {
-  rm -f "$STATE"/create-* "$STATE/docker.log"
+  rm -f "$STATE"/create-* "$STATE/docker.log" "$STATE/package-real.expected"
   : >"$STATE/docker.log"
   mkdir -p "$STATE/hostile-docker-config"
   printf '{"auths":{"ghcr.io":{"auth":"hostile"}}}\n' >"$STATE/hostile-docker-config/config.json"
