@@ -1480,10 +1480,10 @@ fn classify_resolved_read(
 /// Shell out to `fastly <kind>-store create --name=<platform-name>`. The
 /// caller resolves `<platform-name>` from `EDGEZERO__STORES__<KIND>__<ID>__NAME`
 /// (falling back to the logical id), so this helper takes whatever the
-/// caller hands it and does not re-translate. Returns `Ok(())` on success;
-/// surfaces the CLI's stderr verbatim on failure (including the "already
-/// exists" error, which is the caller's signal to fix the toml or use a
-/// different name).
+/// caller hands it and does not re-translate. Returns `Ok(())` on success.
+/// Failure stderr is inspected for the idempotent already-exists case but is
+/// otherwise suppressed because Fastly diagnostics may contain credentials or
+/// response payloads.
 ///
 /// # Errors
 /// Returns an error if `fastly` isn't on `PATH`, the child fails to
@@ -1520,7 +1520,7 @@ fn create_fastly_store_in(kind: &str, name: &str, cwd: &Path) -> Result<(), Stri
     Err(format!(
         "`fastly {subcommand} create --name={name}` exited with status {}\nstderr: {}",
         output.status,
-        stderr.trim()
+        redact_stderr(&stderr)
     ))
 }
 
@@ -3942,17 +3942,16 @@ fn redact_describe_response(stdout: &str) -> String {
     )
 }
 
-/// Summarise a failing `fastly` invocation's stderr WITHOUT echoing it.
+/// Summarise a failing external command's stderr WITHOUT echoing it.
 ///
-/// The `describe` and `update --stdin` paths carry the stored config value, so
-/// a Fastly error that quotes the payload back would put credentials straight
-/// into CI logs — the same exposure as the stdout leak, via the failure branch.
-/// Not-found *classification* still inspects stderr internally; only the
-/// user-facing string is redacted.
+/// The Fastly and curl stdin paths carry stored config values, so an error that
+/// quotes the payload back would put credentials straight into CI logs. Some
+/// classification paths still inspect stderr internally; only the user-facing
+/// string is redacted.
 fn redact_stderr(stderr: &str) -> String {
     let len = stderr.trim().len();
     format!(
-        "{len} bytes suppressed (may echo the stored config value); re-run the `fastly` command directly to inspect it"
+        "{len} bytes suppressed (may contain sensitive data); re-run the command directly to inspect it"
     )
 }
 
@@ -4040,7 +4039,7 @@ fn classify_remote_config_store_with_cwd(
         return Err(format!(
             "`fastly config-store list --json` exited with status {}\nstderr: {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            redact_stderr(&String::from_utf8_lossy(&output.stderr))
         ));
     }
     // Adopt main's strict UTF-8 gate (fail closed on undecodable stdout) but
@@ -4739,8 +4738,7 @@ fn run_fastly_capture(fastly_args: &[String], cwd: &Path) -> Result<String, Stri
         Ok(combined)
     } else {
         Err(format!(
-            "`fastly {}` exited with status {}; command output suppressed (stdout {} bytes, stderr {} bytes)",
-            fastly_args.join(" "),
+            "`fastly` exited with status {}; command arguments and output suppressed (stdout {} bytes, stderr {} bytes)",
             output.status,
             output.stdout.len(),
             output.stderr.len()
@@ -4795,18 +4793,19 @@ fn curl_config_capture(config: &str) -> Result<String, String> {
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `curl`: {err}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else if output.status.code() == Some(CURL_EXIT_TIMEOUT) {
         Err(format!(
             "`curl` timed out after connect-timeout {FASTLY_API_CONNECT_TIMEOUT_SECS}s / max-time {FASTLY_API_MAX_TIME_SECS}s: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            redact_stderr(&stderr)
         ))
     } else {
         Err(format!(
             "`curl` exited with status {}: {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            redact_stderr(&stderr)
         ))
     }
 }
@@ -6173,9 +6172,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_fastly_capture_redacts_failed_stdout_and_stderr() {
+    fn run_fastly_capture_redacts_failed_arguments_stdout_and_stderr() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        const ARG_SECRET: &str = "argument-secret-sentinel";
         const STDOUT_SECRET: &str = "stdout-secret-sentinel";
         const STDERR_SECRET: &str = "stderr-secret-sentinel";
         let _lock = path_mutation_guard().lock().expect("guard");
@@ -6193,15 +6193,88 @@ mod tests {
         fs::set_permissions(&script_path, permissions).expect("chmod fake fastly");
         let _path = PathPrepend::new(dir.path());
 
-        let err = run_fastly_capture(&["config-store-entry".to_owned()], dir.path())
-            .expect_err("nonzero fastly exit must fail");
+        let err = run_fastly_capture(
+            &[
+                "compute".to_owned(),
+                "update".to_owned(),
+                "--token".to_owned(),
+                ARG_SECRET.to_owned(),
+            ],
+            dir.path(),
+        )
+        .expect_err("nonzero fastly exit must fail");
 
+        assert!(!err.contains(ARG_SECRET), "argument leaked: {err}");
         assert!(!err.contains(STDOUT_SECRET), "stdout leaked: {err}");
         assert!(!err.contains(STDERR_SECRET), "stderr leaked: {err}");
         assert!(
             err.contains("suppressed"),
             "error must explain that command output was suppressed: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_command_failures_redact_stderr() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const STDERR_SECRET: &str = "provision-stderr-secret-sentinel";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("fastly");
+        fs::write(
+            &script_path,
+            format!("#!/bin/sh\nprintf '%s' '{STDERR_SECRET}' >&2\nexit 1\n"),
+        )
+        .expect("write fake fastly");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod fake fastly");
+        let _path = PathPrepend::new(dir.path());
+
+        let create_err = create_fastly_store_in("kv", "sessions", dir.path())
+            .expect_err("failed store creation must error");
+        let lookup_err = classify_remote_config_store_in(RUNTIME_ENV_STORE_NAME, dir.path())
+            .expect_err("failed store lookup must error");
+
+        for err in [create_err, lookup_err] {
+            assert!(!err.contains(STDERR_SECRET), "stderr leaked: {err}");
+            assert!(
+                err.contains("suppressed"),
+                "error must explain that stderr was suppressed: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_config_failures_redact_token_bearing_stderr() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const TOKEN_SECRET: &str = "curl-config-token-sentinel";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("curl");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\ncat >&2\nexit \"$FAKE_CURL_STATUS\"\n",
+        )
+        .expect("write fake curl");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod fake curl");
+        let _path = PathPrepend::new(dir.path());
+        let config = format!("header = \"Fastly-Key: {TOKEN_SECRET}\"\n");
+
+        for status in ["28", "1"] {
+            let _status = EnvOverride::set("FAKE_CURL_STATUS", status);
+            let err = curl_config_capture(&config).expect_err("nonzero curl exit must fail");
+            assert!(!err.contains(TOKEN_SECRET), "curl stderr leaked: {err}");
+            assert!(
+                err.contains("suppressed"),
+                "error must explain that curl stderr was suppressed: {err}"
+            );
+        }
     }
 
     #[test]
