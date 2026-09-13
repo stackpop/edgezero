@@ -56,9 +56,13 @@ is_positive_decimal_at_most() {
 
 decimal_compare() {
   local left=$1 right=$2
-  if ((${#left} < ${#right})) || ((${#left} == ${#right})) && [[ "$left" < "$right" ]]; then
+  if ((${#left} < ${#right})) || {
+    ((${#left} == ${#right})) && [[ "$left" < "$right" ]]
+  }; then
     printf '%s' -1
-  elif ((${#left} > ${#right})) || ((${#left} == ${#right})) && [[ "$left" > "$right" ]]; then
+  elif ((${#left} > ${#right})) || {
+    ((${#left} == ${#right})) && [[ "$left" > "$right" ]]
+  }; then
     printf '%s' 1
   else
     printf '%s' 0

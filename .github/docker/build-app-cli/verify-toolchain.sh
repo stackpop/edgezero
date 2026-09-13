@@ -192,7 +192,7 @@ RUSTUP_HOME="$rustup_home" RUSTUP_TOOLCHAIN="$rustup_toolchain" "$rustc" \
 magic=$(od -An -tx1 -N4 "$work/wasm-smoke.wasm" | tr -d ' \n')
 [[ "$magic" == "0061736d" ]] || die "minimal compile output lacks wasm magic"
 
-"$validator" self-test --fixtures /usr/local/share/edgezero/provenance-fixtures ||
+"$validator" self-test --fixtures "$prefix/usr/local/share/edgezero/provenance-fixtures" ||
   die "validator self-test failed"
 
 [[ "$("$id_bin" -u)" == "1001" ]] || die "runtime uid is not 1001"

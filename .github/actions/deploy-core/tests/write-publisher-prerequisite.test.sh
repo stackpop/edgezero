@@ -889,7 +889,8 @@ fi
 
 for transition in same-source-refresh same-source-url-refresh forward-source forward-source-tuple \
   verified-forward-source gate-rotation \
-  verified-gate-rotation first-bootstrap-rollback clear-on-forward-rotation inert-forward-rotation; do
+  verified-gate-rotation rotation-digit-boundary first-bootstrap-rollback clear-on-forward-rotation \
+  inert-forward-rotation; do
   new_case
   old_previous="\"sha256:$(printf '3%.0s' {1..64})\""
   case "$transition" in
@@ -932,6 +933,13 @@ for transition in same-source-refresh same-source-url-refresh forward-source for
       previous="\"sha256:$(hash_bytes "$from")\""
       to=$(verified_record "$EVIDENCE_DIGEST" "$G" "$previous" null 11 1 \
         2026-09-10T11:01:00Z "sha256:$(printf '9%.0s' {1..64})" 11 "sha256:$(printf '6%.0s' {1..64})")
+      ;;
+    rotation-digit-boundary)
+      from=$(verified_record "sha256:$(printf '2%.0s' {1..64})" "$G" "$old_previous" null 9 1 \
+        "$ROTATION_AT" "$ROTATION_DIGEST" 9 "$HISTORY_DIGEST")
+      previous="\"sha256:$(hash_bytes "$from")\""
+      to=$(verified_record "$EVIDENCE_DIGEST" "$G" "$previous" null 10 1 \
+        2026-09-10T11:01:00Z "sha256:$(printf '9%.0s' {1..64})" 10 "sha256:$(printf '6%.0s' {1..64})")
       ;;
     first-bootstrap-rollback)
       from=$(bootstrap_record "sha256:$(printf '2%.0s' {1..64})" "$G" "$old_previous" "\"$S1\"")

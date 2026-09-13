@@ -48,6 +48,7 @@ make_root() {
     "$ROOT/usr/local/cargo/bin" \
     "$ROOT/usr/local/bin" \
     "$ROOT/usr/local/share/edgezero" \
+    "$ROOT/usr/local/share/edgezero/provenance-fixtures" \
     "$ROOT/lib64" \
     "$ROOT/opt/edgezero/runtime-lib" \
     "$ROOT/etc" \
@@ -128,7 +129,8 @@ EOF
     'cat "$FAKE_STATE/sccache"'
   # shellcheck disable=SC2016
   write_executable "$ROOT/usr/local/bin/edgezero-provenance-validator" \
-    '[[ "$*" == "self-test --fixtures /usr/local/share/edgezero/provenance-fixtures" ]]' \
+    '[[ "$#" == 3 && "$1" == self-test && "$2" == --fixtures ]]' \
+    'printf "%s" "$3" >"$FAKE_STATE/validator-fixtures"' \
     'exit "$(cat "$FAKE_STATE/validator-status")"'
   # shellcheck disable=SC2016
   write_executable "$ROOT/usr/bin/id" \
@@ -178,6 +180,12 @@ mkdir "$WORK/tmp"
 
 make_root exact
 assert_pass "exact toolchain and runtime capabilities pass" run_verify
+canonical_root=$(cd -- "$ROOT" && pwd -P)
+if [[ "$(cat "$STATE/validator-fixtures")" == "$canonical_root/usr/local/share/edgezero/provenance-fixtures" ]]; then
+  ok "validator self-test reads fixtures beneath the non-/ audit root"
+else
+  no "validator self-test reads fixtures beneath the non-/ audit root"
+fi
 
 make_root rust-prerelease
 sed -i.bak 's/release: 1.95.0/release: 1.95.0-beta.1/' "$STATE/rustc"
