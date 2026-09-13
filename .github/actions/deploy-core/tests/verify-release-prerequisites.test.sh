@@ -79,6 +79,7 @@ printf '%s\n' \
   '/.github/docker/build-app-cli/gate-paths.txt @stackpop/edgezero-build-container-gate-reviewers' \
   '/.github/docker/build-app-cli/verify-release-prerequisites.sh @stackpop/edgezero-build-container-gate-reviewers' \
   '/.github/workflows/build-container-ci.yml @stackpop/edgezero-build-container-gate-reviewers' \
+  '/.github/workflows/ @stackpop/edgezero-build-container-gate-reviewers' \
   >"$GATE_ROOT/.github/CODEOWNERS"
 printf 'name: build-container-ci\n' >"$GATE_ROOT/.github/workflows/build-container-ci.yml"
 git -C "$GATE_ROOT" init -q -b main
@@ -400,6 +401,28 @@ BASE_G=$G
 BASE_CANDIDATE_HEAD=$CANDIDATE_HEAD
 BASE_Q_D=$Q_D
 git -C "$GATE_ROOT" checkout -q --detach "$G"
+printf '/.github/** @attacker-team\n' >>"$GATE_ROOT/.github/CODEOWNERS"
+git -C "$GATE_ROOT" add .github/CODEOWNERS
+git -C "$GATE_ROOT" commit -q -m codeowners-overridden
+G=$(git -C "$GATE_ROOT" rev-parse HEAD)
+CANDIDATE_HEAD=$G
+Q_D=$G
+new_case codeowners-overridden
+printf '%s' "${BOOTSTRAP_RECORD//$BASE_G/$G}" >"$FAKE_BIN/prerequisite"
+sed -i.bak "s/MAIN_SHA='$S'/MAIN_SHA='$G'/" "$FAKE_BIN/values"
+configuration_args
+assert_contract_failure_message 'configuration rejects a later broad CODEOWNERS override' \
+  'CODEOWNERS does not exactly protect every gate path' \
+  "${CONFIGURATION_ARGS[@]}"
+G=$BASE_G
+CANDIDATE_HEAD=$BASE_CANDIDATE_HEAD
+Q_D=$BASE_Q_D
+git -C "$GATE_ROOT" checkout -q --detach "$G"
+
+BASE_G=$G
+BASE_CANDIDATE_HEAD=$CANDIDATE_HEAD
+BASE_Q_D=$Q_D
+git -C "$GATE_ROOT" checkout -q --detach "$G"
 grep -Fvx '.github/docker/build-app-cli/gate-paths.txt' \
   "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt" \
   >"$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt.tmp"
@@ -416,6 +439,53 @@ sed -i.bak "s/MAIN_SHA='$S'/MAIN_SHA='$G'/" "$FAKE_BIN/values"
 configuration_args
 assert_contract_failure_message 'configuration rejects a gate manifest that omits itself' \
   'gate path manifest must contain itself' \
+  "${CONFIGURATION_ARGS[@]}"
+G=$BASE_G
+CANDIDATE_HEAD=$BASE_CANDIDATE_HEAD
+Q_D=$BASE_Q_D
+git -C "$GATE_ROOT" checkout -q --detach "$G"
+
+grep -Fvx '.github/docker/build-app-cli/verify-release-prerequisites.sh' \
+  "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt" \
+  >"$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt.tmp"
+mv "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt.tmp" \
+  "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt"
+git -C "$GATE_ROOT" add .github/docker/build-app-cli/gate-paths.txt
+git -C "$GATE_ROOT" commit -q -m manifest-omits-helper
+G=$(git -C "$GATE_ROOT" rev-parse HEAD)
+CANDIDATE_HEAD=$G
+Q_D=$G
+new_case manifest-omits-helper
+printf '%s' "${BOOTSTRAP_RECORD//$BASE_G/$G}" >"$FAKE_BIN/prerequisite"
+sed -i.bak "s/MAIN_SHA='$S'/MAIN_SHA='$G'/" "$FAKE_BIN/values"
+configuration_args
+assert_contract_failure_message 'configuration rejects a gate manifest that omits the auditor helper' \
+  'gate path manifest must contain auditor helper' \
+  "${CONFIGURATION_ARGS[@]}"
+G=$BASE_G
+CANDIDATE_HEAD=$BASE_CANDIDATE_HEAD
+Q_D=$BASE_Q_D
+git -C "$GATE_ROOT" checkout -q --detach "$G"
+
+grep -Fvx '.github/CODEOWNERS' \
+  "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt" \
+  >"$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt.tmp"
+mv "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt.tmp" \
+  "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt"
+grep -Fvx '/.github/CODEOWNERS @stackpop/edgezero-build-container-gate-reviewers' \
+  "$GATE_ROOT/.github/CODEOWNERS" >"$GATE_ROOT/.github/CODEOWNERS.tmp"
+mv "$GATE_ROOT/.github/CODEOWNERS.tmp" "$GATE_ROOT/.github/CODEOWNERS"
+git -C "$GATE_ROOT" add .github/CODEOWNERS .github/docker/build-app-cli/gate-paths.txt
+git -C "$GATE_ROOT" commit -q -m manifest-omits-codeowners
+G=$(git -C "$GATE_ROOT" rev-parse HEAD)
+CANDIDATE_HEAD=$G
+Q_D=$G
+new_case manifest-omits-codeowners
+printf '%s' "${BOOTSTRAP_RECORD//$BASE_G/$G}" >"$FAKE_BIN/prerequisite"
+sed -i.bak "s/MAIN_SHA='$S'/MAIN_SHA='$G'/" "$FAKE_BIN/values"
+configuration_args
+assert_contract_failure_message 'configuration rejects a gate manifest that omits CODEOWNERS' \
+  'gate path manifest must contain CODEOWNERS' \
   "${CONFIGURATION_ARGS[@]}"
 G=$BASE_G
 CANDIDATE_HEAD=$BASE_CANDIDATE_HEAD

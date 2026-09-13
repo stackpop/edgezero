@@ -907,25 +907,32 @@ validate_record_string() {
 }
 
 validate_manifest_and_codeowners() {
-  local gate=$1 main=$2 manifest entry size previous='' path line expected old_entry new_entry
+  local gate=$1 main=$2 manifest expected_codeowners actual_codeowners entry size previous='' path old_entry new_entry
   new_temp manifest gate-manifest
+  new_temp expected_codeowners expected-codeowners
+  new_temp actual_codeowners actual-codeowners
   repo_git show "$gate:$GATE_MANIFEST" >"$manifest" 2>/dev/null || die 'gate path manifest is absent'
   size=$(file_size "$manifest"); ((size > 0 && size <= 65536)) || die 'gate path manifest size is invalid'
   [[ "$(tail -c 1 "$manifest" | od -An -tuC | tr -d ' ')" == 10 ]] || die 'gate path manifest must end in one LF'
   grep -Fqx -e "$GATE_MANIFEST" "$manifest" || die 'gate path manifest must contain itself'
+  grep -Fqx -e "$HELPER_PATH" "$manifest" || die 'gate path manifest must contain auditor helper'
+  grep -Fqx -e "$CODEOWNERS" "$manifest" || die 'gate path manifest must contain CODEOWNERS'
+  : >"$expected_codeowners"
   while IFS= read -r path; do
     [[ -n "$path" && "$path" =~ ^[A-Za-z0-9._/+-]+$ && "$path" != /* && "$path" != -* && "$path" != *//* && "$path" != */../* ]] || die 'gate path manifest contains an invalid path'
     [[ -z "$previous" || "$previous" < "$path" ]] || die 'gate path manifest is not uniquely sorted'
     previous=$path
     entry=$(repo_git ls-tree "$gate" -- "$path") || die 'cannot inspect gate path'
     [[ "$entry" =~ ^100(644|755)[[:space:]]blob[[:space:]][0-9a-f]{40,64}$'\t'"$path"$ ]] || die 'gate path is not a regular blob'
-    line="/$path @stackpop/edgezero-build-container-gate-reviewers"
-    [[ "$(repo_git show "$gate:$CODEOWNERS" | grep -Fxc "$line")" == 1 ]] || die 'CODEOWNERS does not exactly cover a gate path'
+    printf '/%s @stackpop/edgezero-build-container-gate-reviewers\n' "$path" >>"$expected_codeowners"
     if [[ -n "$main" ]]; then
       old_entry=$(repo_git ls-tree "$gate" -- "$path"); new_entry=$(repo_git ls-tree "$main" -- "$path")
       [[ "$old_entry" == "$new_entry" ]] || die 'protected main gate path differs from active gate'
     fi
   done <"$manifest"
+  printf '/.github/workflows/ @stackpop/edgezero-build-container-gate-reviewers\n' >>"$expected_codeowners"
+  repo_git show "$gate:$CODEOWNERS" >"$actual_codeowners" 2>/dev/null || die 'CODEOWNERS is absent'
+  cmp -s "$expected_codeowners" "$actual_codeowners" || die 'CODEOWNERS does not exactly protect every gate path'
 }
 
 verify_policy_actor() {
