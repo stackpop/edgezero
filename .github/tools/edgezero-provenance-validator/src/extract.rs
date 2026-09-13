@@ -252,6 +252,8 @@ struct OwnedPath {
     path: Option<PathBuf>,
     device: u64,
     inode: u64,
+    // Keep the owned inode allocated so an unlinked replacement cannot reuse its identity.
+    _file: File,
 }
 
 #[cfg(unix)]
@@ -292,11 +294,13 @@ impl OwnedPath {
     fn new(path: PathBuf, file: &File) -> Result<Self> {
         use std::os::unix::fs::MetadataExt;
 
-        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        let owned_file = file.try_clone().map_err(|error| error.to_string())?;
+        let metadata = owned_file.metadata().map_err(|error| error.to_string())?;
         Ok(Self {
             path: Some(path),
             device: metadata.dev(),
             inode: metadata.ino(),
+            _file: owned_file,
         })
     }
 
