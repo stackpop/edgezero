@@ -15,6 +15,7 @@ WORK=$(cd -- "$WORK" && pwd -P)
 trap 'rm -rf -- "$WORK"' EXIT
 
 REAL_PATH=$PATH
+REAL_GIT=$(command -v git)
 POLICY_TOKEN='policy-audit-secret-value'
 PACKAGE_TOKEN='package-audit-secret-value'
 AUDIT_TOKEN='installation-audit-secret-value'
@@ -264,6 +265,7 @@ if [[ "$fault" == approval-reviewer-only && "$path" == "/repos/stackpop/edgezero
 if [[ "$fault" == approval-comment-trailing-lf && "$path" == "/repos/stackpop/edgezero/actions/runs/$LOCK_RUN_ID/approvals" ]]; then body=$(printf '%s' "$body" | jq -c '.[0].comment += "\n"'); fi
 if [[ "$fault" == approval-user-trailing-lf && "$path" == "/repos/stackpop/edgezero/actions/runs/$LOCK_RUN_ID/approvals" ]]; then body=$(printf '%s' "$body" | jq -c '.[0].user.login += "\n"'); fi
 if [[ "$fault" == history-attempt-mismatch && "$path" == '/repos/stackpop/edgezero/actions/workflows/rotate-build-container-gate.yml/runs?event=workflow_dispatch&per_page=100&page=1' ]]; then body=$(printf '%s' "$body" | jq -c '.workflow_runs[0].run_attempt = 1'); fi
+if [[ "$fault" == history-api-order && "$path" == '/repos/stackpop/edgezero/actions/workflows/rotate-build-container-gate.yml/runs?event=workflow_dispatch&per_page=100&page=1' ]]; then body=$(jq -cn --arg created "$CREATED_AT" --argjson id "$LOCK_RUN_ID" --argjson attempt "$RUN_ATTEMPT" --argjson number "$LOCK_RUN_NUMBER" '{total_count:2,workflow_runs:[{created_at:$created,id:$id,run_attempt:$attempt,run_number:$number},{created_at:$created,id:6999,run_attempt:1,run_number:8}]}'); fi
 if [[ "$fault" == history-future-created && "$path" == '/repos/stackpop/edgezero/actions/workflows/rotate-build-container-gate.yml/runs?event=workflow_dispatch&per_page=100&page=1' ]]; then body=$(printf '%s' "$body" | jq -c '.workflow_runs[0].created_at = "2026-09-10T12:00:01Z"'); fi
 if [[ "$fault" == detail-created-mismatch && "$path" == "/repos/stackpop/edgezero/actions/runs/$LOCK_RUN_ID" ]]; then body=$(printf '%s' "$body" | jq -c '.created_at = "2026-09-10T11:29:59Z"'); fi
 if [[ "$fault" == rotation-job-head-mismatch && "$path" == "/repos/stackpop/edgezero/actions/runs/$LOCK_RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100&page=1" ]]; then body=$(printf '%s' "$body" | jq -c --arg head "$FINAL_GATE" '.jobs[].head_sha = $head'); fi
@@ -285,6 +287,21 @@ if [[ "$fault" == pagination-bad-link && "$path" == '/repos/stackpop/edgezero/ru
 printf '%s' "$body" >"$body_file"
 SH
 chmod 0755 "$FAKE_BIN/curl"
+
+printf '%s' "$REAL_GIT" >"$FAKE_BIN/real-git"
+cat >"$FAKE_BIN/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+fixture=$(cd -- "$(dirname -- "$0")" && pwd)
+fault=$(cat "$fixture/fault")
+case "$fault:$*" in
+  git-partialclone-fatal:*' config --get extensions.partialclone') exit 128 ;;
+  git-promisor-fatal:*' config --get-regexp ^remote\..*\.promisor$') exit 128 ;;
+  git-sparse-fatal:*' config --bool core.sparseCheckout') exit 128 ;;
+esac
+exec "$(cat "$fixture/real-git")" "$@"
+SH
+chmod 0755 "$FAKE_BIN/git"
 
 write_values() {
   cat >"$FAKE_BIN/values" <<EOF
@@ -358,6 +375,7 @@ run_helper() {
 
 assert_success() { local description=$1; shift; if run_helper "$@"; then ok "$description"; else no "$description"; sed -n '1,5p' "$STDERR" >&2; fi; }
 assert_contract_failure() { local description=$1; shift; local status=0; run_helper "$@" || status=$?; if [[ "$status" -eq 1 && ! -e "$EVIDENCE_OUT" && ! -e "$PREREQUISITE_OUT" && ! -e "$COMMENT_OUT" ]]; then ok "$description"; else no "$description (status=$status)"; fi; }
+assert_contract_failure_message() { local description=$1 expected=$2; shift 2; local status=0; run_helper "$@" || status=$?; if [[ "$status" -eq 1 && ! -e "$EVIDENCE_OUT" && ! -e "$PREREQUISITE_OUT" && ! -e "$COMMENT_OUT" ]] && grep -Fq -e "$expected" "$STDERR"; then ok "$description"; else no "$description (status=$status)"; sed -n '1,5p' "$STDERR" >&2; fi; }
 assert_usage_failure() { local description=$1; shift; local status=0; run_helper "$@" || status=$?; if [[ "$status" -eq 2 && ! -s "$FAKE_BIN/calls" && ! -e "$EVIDENCE_OUT" ]]; then ok "$description"; else no "$description (status=$status)"; fi; }
 
 printf 'verify-release-prerequisites tests\n'
@@ -368,6 +386,41 @@ assert_success 'configuration mode accepts the complete reviewed baseline' "${CO
 [[ ! -s "$STDOUT" ]] && ok 'configuration success is silent' || no 'configuration success is silent'
 jq -e --arg gate "$G" --arg head "$CANDIDATE_HEAD" --arg admin "$ADMIN_PNG_DIGEST" '.mode == "configuration" and ."gate-sha" == $gate and .environment."administrator-bypass"."candidate-head-sha" == $head and .environment."administrator-bypass"."sha256" == $admin and .policy."required-workflow-sha" == $gate and .credentials."app-probes"."publisher-probe-revoked" == true' "$EVIDENCE_OUT" >/dev/null && ok 'configuration emits canonical bound audit evidence' || no 'configuration emits canonical bound audit evidence'
 [[ "$(tail -c 1 "$EVIDENCE_OUT" | od -An -tuC | tr -d ' ')" != 10 ]] && ok 'configuration evidence has no trailing LF' || no 'configuration evidence has no trailing LF'
+
+for git_case in partialclone promisor sparse; do
+  new_case "git-$git_case-fatal"
+  printf 'git-%s-fatal' "$git_case" >"$FAKE_BIN/fault"
+  configuration_args
+  assert_contract_failure_message "configuration rejects fatal $git_case probe failure" \
+    "cannot inspect $git_case checkout configuration" \
+    "${CONFIGURATION_ARGS[@]}"
+done
+
+BASE_G=$G
+BASE_CANDIDATE_HEAD=$CANDIDATE_HEAD
+BASE_Q_D=$Q_D
+git -C "$GATE_ROOT" checkout -q --detach "$G"
+grep -Fvx '.github/docker/build-app-cli/gate-paths.txt' \
+  "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt" \
+  >"$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt.tmp"
+mv "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt.tmp" \
+  "$GATE_ROOT/.github/docker/build-app-cli/gate-paths.txt"
+git -C "$GATE_ROOT" add .github/docker/build-app-cli/gate-paths.txt
+git -C "$GATE_ROOT" commit -q -m manifest-omits-itself
+G=$(git -C "$GATE_ROOT" rev-parse HEAD)
+CANDIDATE_HEAD=$G
+Q_D=$G
+new_case manifest-omits-itself
+printf '%s' "${BOOTSTRAP_RECORD//$BASE_G/$G}" >"$FAKE_BIN/prerequisite"
+sed -i.bak "s/MAIN_SHA='$S'/MAIN_SHA='$G'/" "$FAKE_BIN/values"
+configuration_args
+assert_contract_failure_message 'configuration rejects a gate manifest that omits itself' \
+  'gate path manifest must contain itself' \
+  "${CONFIGURATION_ARGS[@]}"
+G=$BASE_G
+CANDIDATE_HEAD=$BASE_CANDIDATE_HEAD
+Q_D=$BASE_Q_D
+git -C "$GATE_ROOT" checkout -q --detach "$G"
 
 new_case copied-helper
 configuration_args
@@ -415,6 +468,16 @@ assert_success 'rotation-complete authenticates completed lock history' "${ROTAT
 expected_history=$(printf '[{"run-attempt":"%s","run-id":"%s","run-number":"%s"}]' "$RUN_ATTEMPT" "$LOCK_RUN_ID" "$LOCK_RUN_NUMBER")
 jq -e --arg evidence "sha256:$(hash_file "$EVIDENCE_OUT")" --arg history "sha256:$(hash_bytes "$expected_history")" --arg gate "$G_PRIME" --arg id "$LOCK_RUN_ID" --arg attempt "$RUN_ATTEMPT" --arg number "$LOCK_RUN_NUMBER" '."schema-version" == 2 and ."evidence-sha256" == $evidence and ."gate-sha" == $gate and ."source-revision" == null and ."source-pr" == null and ."evidence-url" == null and ."rotation-history"."history-sha256" == $history and ."rotation-history"."run-id" == $id and ."rotation-history"."run-attempt" == $attempt and ."rotation-history"."run-number" == $number and ."rotation-history".state == "verified"' "$PREREQUISITE_OUT" >/dev/null && ok 'rotation-complete emits exact schema-version-2 verified inert state' || no 'rotation-complete emits exact schema-version-2 verified inert state'
 [[ "$(grep -c 'actions/workflows/rotate-build-container-gate.yml/runs' "$FAKE_BIN/calls")" -eq 2 ]] && ok 'rotation-complete uses a two-pass fail-closed history read' || no 'rotation-complete uses a two-pass fail-closed history read'
+
+new_case rotation-history-api-order
+sed -i.bak "s/FINAL_GATE='$G'/FINAL_GATE='$G_PRIME'/; s/MAIN_SHA='$S'/MAIN_SHA='$Q_F'/" "$FAKE_BIN/values"
+cp "$WORK/cases/rotation-review/output/comment.txt" "$FAKE_BIN/approval-comment"
+printf completed >"$FAKE_BIN/rotation-state"
+printf history-api-order >"$FAKE_BIN/fault"
+rotation_complete_args
+for i in "${!ROTATION_COMPLETE_ARGS[@]}"; do [[ "${ROTATION_COMPLETE_ARGS[$i]}" != --gate-sha ]] || ROTATION_COMPLETE_ARGS[$((i + 1))]=$G_PRIME; done
+assert_success 'rotation-complete selects the attempt from the greatest run-number row' \
+  "${ROTATION_COMPLETE_ARGS[@]}"
 
 new_case rotation-approval-reviewer-only
 sed -i.bak "s/FINAL_GATE='$G'/FINAL_GATE='$G_PRIME'/; s/MAIN_SHA='$S'/MAIN_SHA='$Q_F'/" "$FAKE_BIN/values"

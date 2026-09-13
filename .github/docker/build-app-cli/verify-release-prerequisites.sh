@@ -260,6 +260,17 @@ canonical_root() {
   [[ "$canonical" == "$supplied" ]] || die 'gate root must already be canonical'
 }
 
+read_optional_git_config() {
+  local result_name=$1 label=$2 value status=0
+  shift 2
+  value=$(repo_git config "$@" 2>/dev/null) || status=$?
+  case "$status" in
+    0 | 1) ;;
+    *) die "cannot inspect $label checkout configuration" ;;
+  esac
+  printf -v "$result_name" '%s' "$value"
+}
+
 require_checkout() {
   local expected=$1 top git_dir common_dir replacements shallow partial promisor sparse actual status gitlinks
   [[ "$ALTERNATES_WERE_SET" == false ]] || die 'gate checkout cannot use environment object alternates'
@@ -274,10 +285,10 @@ require_checkout() {
   [[ -z "$replacements" ]] || die 'gate checkout cannot contain replacement refs'
   shallow=$(repo_git rev-parse --is-shallow-repository 2>/dev/null) || die 'cannot inspect history depth'
   [[ "$shallow" == false ]] || die 'gate checkout must contain full history'
-  partial=$(repo_git config --get extensions.partialclone 2>/dev/null || true)
-  promisor=$(repo_git config --get-regexp '^remote\..*\.promisor$' 2>/dev/null || true)
+  read_optional_git_config partial partialclone --get extensions.partialclone
+  read_optional_git_config promisor promisor --get-regexp '^remote\..*\.promisor$'
   [[ -z "$partial$promisor" ]] || die 'gate checkout cannot use partial or promisor objects'
-  sparse=$(repo_git config --bool core.sparseCheckout 2>/dev/null || true)
+  read_optional_git_config sparse sparse --bool core.sparseCheckout
   [[ "$sparse" != true ]] || die 'gate checkout cannot be sparse'
   actual=$(repo_git rev-parse --verify HEAD 2>/dev/null) || die 'gate checkout HEAD is absent'
   [[ "$actual" == "$expected" ]] || die 'gate checkout HEAD differs from supplied gate SHA'
@@ -901,6 +912,7 @@ validate_manifest_and_codeowners() {
   repo_git show "$gate:$GATE_MANIFEST" >"$manifest" 2>/dev/null || die 'gate path manifest is absent'
   size=$(file_size "$manifest"); ((size > 0 && size <= 65536)) || die 'gate path manifest size is invalid'
   [[ "$(tail -c 1 "$manifest" | od -An -tuC | tr -d ' ')" == 10 ]] || die 'gate path manifest must end in one LF'
+  grep -Fqx -e "$GATE_MANIFEST" "$manifest" || die 'gate path manifest must contain itself'
   while IFS= read -r path; do
     [[ -n "$path" && "$path" =~ ^[A-Za-z0-9._/+-]+$ && "$path" != /* && "$path" != -* && "$path" != *//* && "$path" != */../* ]] || die 'gate path manifest contains an invalid path'
     [[ -z "$previous" || "$previous" < "$path" ]] || die 'gate path manifest is not uniquely sorted'
@@ -1331,12 +1343,12 @@ rotation_history_snapshot() {
     case "$seen_ids" in *"|$id|"*) die 'rotation history repeats a run id' ;; esac; seen_ids="$seen_ids$id|"
     case "$seen_numbers" in *"|$number|"*) die 'rotation history repeats a run number' ;; esac; seen_numbers="$seen_numbers$number|"
     line=$(safe_jq -cnS --arg attempt "$attempt" --arg id "$id" --arg number "$number" '{"run-attempt":$attempt,"run-id":$id,"run-number":$number}')
-    printf '%02d\t%s\t%s\t%s\t%s\n' "${#number}" "$number" "$id" "$created" "$line" >>"$rows"
+    printf '%02d\t%s\t%s\t%s\t%s\t%s\n' "${#number}" "$number" "$id" "$attempt" "$created" "$line" >>"$rows"
     index=$((index + 1))
   done
   sort -t $'\t' -k1,1n -k2,2 "$rows" >"$rows.sorted" || tool_die 'cannot order rotation history'
   temporary_files+=("$rows.sorted")
-  while IFS=$'\t' read -r _ number id created line; do
+  while IFS=$'\t' read -r _ number id attempt created line; do
     next=$(safe_jq -cnS --argjson records "$records" --argjson line "$line" '$records + [$line]')
     records=$next
     SELECTED_RUN_NUMBER=$number; SELECTED_RUN_ID=$id; SELECTED_RUN_ATTEMPT=$attempt; SELECTED_CREATED_AT=$created
