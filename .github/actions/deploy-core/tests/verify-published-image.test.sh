@@ -30,6 +30,17 @@ assert_fail() {
   shift
   if "$@" >/dev/null 2>&1; then no "$description"; else ok "$description"; fi
 }
+assert_fail_message() {
+  local description=$1 expected=$2 stdout="$WORK/assert-fail.stdout" stderr="$WORK/assert-fail.stderr" status=0
+  shift 2
+  "$@" >"$stdout" 2>"$stderr" || status=$?
+  if [[ "$status" -ne 0 ]] && grep -Fq -e "$expected" "$stderr"; then
+    ok "$description"
+  else
+    cat "$stdout" "$stderr" >&2
+    no "$description"
+  fi
+}
 
 REF=ghcr.io/stackpop/edgezero-build-app-cli@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 LOCAL_ID=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
@@ -191,21 +202,24 @@ case "$1" in
             "$(cat "$FAKE_STATE/create-$id.mount-expected")/expected.json"
         elif grep -Fxq package "$FAKE_STATE/create-$id.args"; then
           binary=$(cat "$FAKE_STATE/create-$id.mount-app-cli")
-          if [[ "$binary" == "$FAKE_FIXTURES/valid/elf-static/app-cli" ]]; then
+          if cmp -s "$binary" "$FAKE_FIXTURES/valid/elf-static/app-cli"; then
             cp "$FAKE_FIXTURES/valid/archive.tar" \
               "$(cat "$FAKE_STATE/create-$id.mount-packaged")/artifact.tar"
           else
+            cp "$binary" "$FAKE_STATE/package-real.expected"
             cp "$binary" "$(cat "$FAKE_STATE/create-$id.mount-packaged")/artifact.tar"
             chmod 0644 "$(cat "$FAKE_STATE/create-$id.mount-packaged")/artifact.tar"
           fi
         elif grep -Fxq validate "$FAKE_STATE/create-$id.args"; then
           archive=$(cat "$FAKE_STATE/create-$id.mount-artifact")
-          [[ "$archive" != */invalid/* ]] || exit 1
-          if [[ "$archive" == */package-real/artifact.tar ]]; then
-            cp "$archive" "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
-          else
+          if cmp -s "$archive" "$FAKE_FIXTURES/valid/archive.tar"; then
             cp "$FAKE_FIXTURES/valid/elf-static/app-cli" \
               "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
+          elif [[ -f "$FAKE_STATE/package-real.expected" ]] && \
+            cmp -s "$archive" "$FAKE_STATE/package-real.expected"; then
+            cp "$archive" "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
+          else
+            exit 1
           fi
           chmod 0755 "$(cat "$FAKE_STATE/create-$id.mount-validated")/app-cli"
         elif grep -Fxq /lib64/ld-linux-x86-64.so.2 "$FAKE_STATE/create-$id.args"; then
@@ -327,6 +341,24 @@ echo "== published build-container verification =="
 
 reset_state
 assert_pass "an OCI leaf with exact platform, labels, and runtime passes" run_verify
+
+reset_state
+ORIGINAL_FIXTURES=$FIXTURES
+ORIGINAL_VERIFY=$VERIFY
+MUTATED_SCRIPT_DIR="$WORK/content-mutated-build-app-cli"
+MUTATED_FIXTURES="$MUTATED_SCRIPT_DIR/fixtures/provenance"
+mkdir -p "$MUTATED_FIXTURES"
+cp "$VERIFY" "$MUTATED_SCRIPT_DIR/verify-published-image.sh"
+chmod 0755 "$MUTATED_SCRIPT_DIR/verify-published-image.sh"
+cp -R "$FIXTURES/." "$MUTATED_FIXTURES/"
+cp "$MUTATED_FIXTURES/valid/archive.tar" \
+  "$MUTATED_FIXTURES/invalid/archive-base256.tar"
+FIXTURES=$MUTATED_FIXTURES
+VERIFY="$MUTATED_SCRIPT_DIR/verify-published-image.sh"
+assert_fail_message "fixture verdicts follow archive bytes rather than invalid/ pathnames" \
+  "malformed archive fixture was accepted" run_verify
+FIXTURES=$ORIGINAL_FIXTURES
+VERIFY=$ORIGINAL_VERIFY
 
 reset_state
 assert_pass "an immutable local BuildKit image ID passes without registry access" run_verify_local
