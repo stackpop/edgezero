@@ -184,6 +184,7 @@ EXPECTED_CODEOWNERS="$WORK_DIR/CODEOWNERS"
 while IFS= read -r path; do
   printf '/%s %s\n' "$path" "$GATE_TEAM" >>"$EXPECTED_CODEOWNERS"
 done <"$GATE_PATHS"
+printf '/.github/workflows/ %s\n' "$GATE_TEAM" >>"$EXPECTED_CODEOWNERS"
 gate_git show "$EDGEZERO_GATE_SHA:$CODEOWNERS" >"$WORK_DIR/actual-CODEOWNERS" ||
   die "cannot read CODEOWNERS"
 cmp -s "$EXPECTED_CODEOWNERS" "$WORK_DIR/actual-CODEOWNERS" ||

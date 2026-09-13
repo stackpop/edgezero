@@ -90,6 +90,8 @@ printf '%s\n' \
 while IFS= read -r path; do
   printf '/%s @stackpop/edgezero-build-container-gate-reviewers\n' "$path"
 done <"$REPO/.github/docker/build-app-cli/gate-paths.txt" >"$REPO/.github/CODEOWNERS"
+printf '/.github/workflows/ @stackpop/edgezero-build-container-gate-reviewers\n' \
+  >>"$REPO/.github/CODEOWNERS"
 git -C "$REPO" init -q -b main
 git -C "$REPO" config user.name fixture
 git -C "$REPO" config user.email fixture@example.invalid
@@ -269,6 +271,58 @@ export FAKE_FSMONITOR_SENTINEL=$FSMONITOR_SENTINEL
 assert_pass 'ambient Git fsmonitor cannot execute in dispatch preflight' \
   run_assert_with_ambient_fsmonitor
 unset FAKE_FSMONITOR_SENTINEL
+
+ORIGINAL_G=$G
+ORIGINAL_Q=$Q
+assert_codeowners_variant_rejected() {
+  local mode=$1 description=$2 codeowners=$REPO/.github/CODEOWNERS last
+  git -C "$REPO" checkout -q --detach "$ORIGINAL_G"
+  case "$mode" in
+    missing)
+      sed '$d' "$codeowners" >"$codeowners.tmp"
+      ;;
+    misplaced)
+      last=$(tail -n 1 "$codeowners")
+      {
+        printf '%s\n' "$last"
+        sed '$d' "$codeowners"
+      } >"$codeowners.tmp"
+      ;;
+    duplicate)
+      cp "$codeowners" "$codeowners.tmp"
+      tail -n 1 "$codeowners" >>"$codeowners.tmp"
+      ;;
+    wrong-owner)
+      sed '$s/@stackpop\/edgezero-build-container-gate-reviewers/@stackpop\/other-team/' \
+        "$codeowners" >"$codeowners.tmp"
+      ;;
+    overridden)
+      cp "$codeowners" "$codeowners.tmp"
+      printf '/.github/workflows/release.yml @stackpop/other-team\n' >>"$codeowners.tmp"
+      ;;
+    *)
+      no "unknown CODEOWNERS test mode: $mode"
+      return
+      ;;
+  esac
+  mv "$codeowners.tmp" "$codeowners"
+  git -C "$REPO" add .github/CODEOWNERS
+  git -C "$REPO" commit -q -m "CODEOWNERS $mode"
+  G=$(git -C "$REPO" rev-parse HEAD)
+  Q=$G
+  write_reply stackpop/edgezero "$Q"
+  assert_fail_message "$description" 'CODEOWNERS does not exactly protect every gate path'
+  G=$ORIGINAL_G
+  Q=$ORIGINAL_Q
+  git -C "$REPO" checkout -q --detach "$G"
+  write_reply stackpop/edgezero "$Q"
+}
+
+assert_codeowners_variant_rejected missing 'workflow namespace CODEOWNERS rule is required'
+assert_codeowners_variant_rejected misplaced 'workflow namespace CODEOWNERS rule must be terminal'
+assert_codeowners_variant_rejected duplicate 'workflow namespace CODEOWNERS rule cannot repeat'
+assert_codeowners_variant_rejected wrong-owner 'workflow namespace CODEOWNERS owner must be exact'
+assert_codeowners_variant_rejected overridden 'later workflow-specific CODEOWNERS override is rejected'
 
 ORIGINAL_REPO=$REPO
 REPO="$WORK/linked-gate"
