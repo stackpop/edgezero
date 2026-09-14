@@ -12,7 +12,7 @@ use edgezero_core::extractor::{
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
-use futures::{stream, StreamExt as _};
+use futures::{StreamExt as _, stream};
 
 use crate::config::AppDemoConfig;
 
@@ -117,11 +117,11 @@ fn build_proxy_target(base: &str, rest: &str, original_uri: &Uri) -> Result<Uri,
         target.push_str(trimmed_rest);
     }
 
-    if let Some(query) = original_uri.query() {
-        if !query.is_empty() {
-            target.push('?');
-            target.push_str(query);
-        }
+    if let Some(query) = original_uri.query()
+        && !query.is_empty()
+    {
+        target.push('?');
+        target.push_str(query);
     }
 
     target
@@ -290,7 +290,7 @@ pub async fn secrets_echo(
         _ => {
             return Err(EdgeError::bad_request(
                 "only smoke-test secret names are allowed",
-            ))
+            ));
         }
     }
 
@@ -326,7 +326,7 @@ mod tests {
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
-    use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
+    use edgezero_core::http::{Method, StatusCode, Uri, request_builder};
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
@@ -473,9 +473,10 @@ mod tests {
         assert_eq!(routes_resp.status(), StatusCode::OK);
         let routes_body: serde_json::Value = routes_resp.into_body().to_json().unwrap();
         let arr = routes_body.as_array().expect("routes array");
-        assert!(arr
-            .iter()
-            .any(|entry| entry["method"] == "GET" && entry["path"] == "/"));
+        assert!(
+            arr.iter()
+                .any(|entry| entry["method"] == "GET" && entry["path"] == "/")
+        );
 
         // /config: seed a default config store with a valid envelope so a wired
         // route returns 200 (a routing miss would be 404, proving nothing).

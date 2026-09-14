@@ -642,7 +642,10 @@ impl<'de> Deserialize<'de> for HttpMethod {
 
 impl serde::Serialize for HttpMethod {
     #[inline]
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
         serializer.serialize_str(self.as_str())
     }
 }
@@ -679,7 +682,10 @@ impl<'de> Deserialize<'de> for BodyMode {
 
 impl serde::Serialize for BodyMode {
     #[inline]
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
         serializer.serialize_str(match self {
             Self::Buffered => "buffered",
             Self::Stream => "stream",
@@ -759,7 +765,10 @@ impl<'de> Deserialize<'de> for LogLevel {
 
 impl serde::Serialize for LogLevel {
     #[inline]
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
         serializer.serialize_str(self.as_str())
     }
 }

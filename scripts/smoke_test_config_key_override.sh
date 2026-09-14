@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Spin CLI floor check, shared with the other smoke tests.
+# shellcheck source=scripts/spin_version_guard.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/spin_version_guard.sh"
+
 # 12.7 + 9.3 + 8.3 multi-adapter smoke:
 #
 # 1. Per-adapter loop:
@@ -448,23 +452,12 @@ for suite in "${SUITES[@]}"; do
     continue
   fi
 
-  # Spin compatibility pre-check: spin-sdk ~6 imports
-  # wasi:http/types@0.3.0-rc-2026-03-15 which Spin < 3.7 does
-  # not provide. Auto-skip the row with a clear note rather
-  # than fail in the wasm linker; operators can install 3.7+
-  # and re-run.
-  if [ "$adapter" = "spin" ]; then
-    if ! command -v spin >/dev/null 2>&1; then
-      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (spin CLI not on PATH) ===\n'
-      continue
-    fi
-    spin_ver=$(spin --version 2>/dev/null | awk '{print $2}' | head -1)
-    # Extract MAJOR.MINOR portion, drop pre-release suffix.
-    spin_minor=$(printf '%s' "$spin_ver" | awk -F'.' '{printf "%d%02d", $1, $2}')
-    if [ -n "$spin_minor" ] && [ "$spin_minor" -lt 307 ]; then
-      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (CLI %s; need >= 3.7 for spin-sdk 6 wasi:http 0.3) ===\n' "$spin_ver"
-      continue
-    fi
+  # Spin compatibility pre-check (see scripts/spin_version_guard.sh).
+  # Auto-skip the row rather than fail in the wasm linker; the guard
+  # prints the reason to stderr.
+  if [ "$adapter" = "spin" ] && ! spin_meets_floor; then
+    printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (see reason above) ===\n'
+    continue
   fi
 
   printf '\n=== 12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
