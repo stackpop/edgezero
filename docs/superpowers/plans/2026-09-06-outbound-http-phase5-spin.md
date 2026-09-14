@@ -1,14 +1,16 @@
 # Outbound HTTP Phase 5: Spin WASI HTTP Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** Implemented on PR 275 with the repository-pinned WASI SDK-resource runner. Provider teardown remains `BestEffort`; the unchecked steps below are retained as the original implementation record.
 
 **Goal:** Implement Spin outbound HTTP with owned WASI resources, exact request/response completion, typed error classification, cooperative fairness, and a real executable SDK-resource test gate.
 
 **Architecture:** A target-neutral state-machine driver is exercised natively; a thin Spin SDK layer supplies real WASI HTTP resources. Upload, send, request completion, response body, trailers, and caller-result handles remain owned until their specified terminal branch. One outer monotonic race covers the complete buffered exchange; streamed bodies retain the original deadline.
 
-**Tech Stack:** exact manifest-pinned Spin SDK 6.0.0, WASI HTTP 0.3, `web-time`, `futures`, wasm32-wasip2, validated Wasmtime runner.
+**Tech Stack:** exact manifest-pinned Spin SDK 7.0.0, WASI HTTP 0.3, `web-time`, `futures`, wasm32-wasip2, validated Wasmtime runner.
 
-> **Readiness:** Only Task 0 is executable. Tasks 1-6 are blocked until Task 0 records a nonzero passing real SDK-resource run and freezes the exact runner in the crate-local Cargo configuration and CI.
+> **Readiness record:** Task 0's nonzero SDK-resource gate passed and the exact runner is frozen in crate-local Cargo configuration and CI. This note records the original dependency of Tasks 1-6; it is no longer a blocker.
 
 ---
 
@@ -58,11 +60,11 @@ enum ExchangeState {
 - Modify: `crates/edgezero-adapter-spin/Cargo.toml`
 - Modify after proof: `crates/edgezero-adapter-spin/.cargo/config.toml`, `.tool-versions`, `.github/workflows/test.yml`
 
-- [ ] Pin root and app-demo `spin-sdk` requirements to exact `=6.0.0`. Add root workspace `wasip3 = "=0.6.0"` and make it an optional direct dependency of `edgezero-adapter-spin` enabled by `spin`, so that path dependency constrains the enum re-export in both the root and excluded app-demo graphs rather than relying on Spin SDK's compatible range.
-- [ ] Refresh both independent locks with the exact manifest requirements using `cargo check --offline -p edgezero-adapter-spin --features spin --target wasm32-wasip2` and `cargo check --offline --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-spin --features spin --target wasm32-wasip2`; these dependency-refresh commands are intentionally unlocked. Assert both locked trees report exactly `spin-sdk v6.0.0` and `wasip3 v0.6.0+wasi-0.3.0-rc-2026-03-15`.
+- [x] Pin root and app-demo `spin-sdk` requirements to exact `=7.0.0`; the adapter's exhaustive WASI HTTP classifier makes SDK upgrades explicit review events.
+- [x] Refresh both independent locks with the exact manifest requirements using `cargo check --offline -p edgezero-adapter-spin --features spin --target wasm32-wasip2` and `cargo check --offline --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-spin --features spin --target wasm32-wasip2`; these dependency-refresh commands are intentionally unlocked. Assert both locked trees report exactly `spin-sdk v7.0.0`.
 - [ ] Add the independent `test-utils = []` feature without enabling `spin`; Task 1 adds the driver dependencies.
 - [ ] Add nonzero WASM tests that construct real `Fields`, append duplicate fields, construct `RequestOptions`, call all three timeout setters, construct `Request`, and exercise request/response completion resources without invoking an external origin.
-- [ ] Start with the pinned Wasmtime 44.0.1 candidate:
+- [x] Use the repository-pinned Wasmtime 48.0.2 runner:
 
 ```sh
 CARGO_TARGET_WASM32_WASIP2_RUNNER='wasmtime run -W component-model-async=y -S p3=y -S http=y' \

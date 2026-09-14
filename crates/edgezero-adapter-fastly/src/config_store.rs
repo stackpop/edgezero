@@ -10,8 +10,8 @@ use crate::chunked_config::{
     run_sync_host_call,
 };
 use async_trait::async_trait;
-use edgezero_core::Deadline;
 use edgezero_core::config_store::{BoundedStoreRead, ConfigStore, ConfigStoreError};
+use edgezero_core::{Deadline, MonotonicClock};
 use fastly::ConfigStore as FastlyConfigStoreInner;
 use fastly::config_store::{LookupError, OpenError};
 
@@ -125,11 +125,12 @@ impl ConfigStore for FastlyConfigStore {
     async fn get_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
-        let materialized_root = run_sync_host_call(deadline, || {
+        let materialized_root = run_sync_host_call(clock, deadline, || {
             Ok(match &self.inner {
                 FastlyConfigStoreBackend::Fastly(inner) => {
                     inner.try_get(key).map_err(|err| map_lookup_error(&err))?
@@ -150,11 +151,12 @@ impl ConfigStore for FastlyConfigStore {
             key,
             root_value,
             root_read.backend_bytes,
+            clock,
             deadline,
             max_backend_bytes,
             max_value_bytes,
             |chunk_key, remaining_backend_bytes| {
-                let chunk_value = run_sync_host_call(deadline, || {
+                let chunk_value = run_sync_host_call(clock, deadline, || {
                     Ok(match &self.inner {
                         FastlyConfigStoreBackend::Fastly(inner) => {
                             inner.try_get(chunk_key).map_err(|err| {
@@ -268,7 +270,8 @@ fn map_lookup_error(err: &LookupError) -> ConfigStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgezero_core::Deadline;
+    use edgezero_core::{Deadline, MonotonicClock, MonotonicInstant};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     edgezero_core::config_store_contract_tests!(fastly_config_store_contract, {
@@ -296,9 +299,11 @@ mod tests {
         });
         let expected_backend_bytes = maybe_backend_bytes.expect("backend byte sum");
         let store = FastlyConfigStore::from_entries(entries);
+        let clock = MonotonicClock::default();
 
         let read = block_on(store.get_bounded(
             "app_config",
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             expected_backend_bytes,
             u64::try_from(envelope.len()).expect("envelope length"),
@@ -307,6 +312,40 @@ mod tests {
 
         assert_eq!(read.backend_bytes, expected_backend_bytes);
         assert_eq!(read.value.as_deref(), Some(envelope.as_str()));
+    }
+
+    #[test]
+    fn bounded_config_read_uses_injected_clock() {
+        use futures::executor::block_on;
+
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let clock = MonotonicClock::new(move || injected_now);
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let store = FastlyConfigStore::from_entries([("key".to_owned(), "value".to_owned())]);
+        let read = block_on(store.get_bounded("key", &clock, deadline, 5, 5))
+            .expect("the application clock is still before its deadline");
+        assert_eq!(read.value.as_deref(), Some("value"));
+
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let advancing_clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let error = run_sync_host_call(&advancing_clock, Deadline::at_instant(terminal), || {
+            *now.lock().expect("clock lock") = terminal;
+            Err::<(), _>(ConfigStoreError::unavailable("provider failed at expiry"))
+        })
+        .expect_err("equality expiry must beat a ready provider error");
+        assert!(matches!(error, SyncHostCallError::DeadlineExceeded));
     }
 
     #[test]

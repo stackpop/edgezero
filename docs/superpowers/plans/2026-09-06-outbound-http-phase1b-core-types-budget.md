@@ -1,6 +1,8 @@
 # Outbound HTTP Phase 1b: Core Types and Budget Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** Implemented on PR 275. The unchecked steps below are retained as the original implementation record, not current readiness state.
 
 **Goal:** Add the runtime-independent outbound request, response, client, URL, and dispatch-budget value layer specified in §§3.1-3.3 of the outbound design.
 

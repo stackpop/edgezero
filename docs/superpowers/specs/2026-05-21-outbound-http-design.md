@@ -1,9 +1,9 @@
 # EdgeZero Outbound HTTP — Design Spec
 
-> **Status:** Normative design complete; Phases 1a-7, review hardening, and the hard-cut owned response-egress integration are implemented on PR 275. Response-egress capabilities remain `BestEffort` pending deployed proof of end-client completion and finite provider teardown. · **Date:** 2026-09-13
+> **Status:** Normative design complete; Phases 1a-7, review hardening, and the hard-cut owned response-egress integration are implemented on PR 275. Response-egress capabilities remain `BestEffort` pending deployed proof of end-client completion and finite provider teardown. · **Date:** 2026-09-14
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
-> **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). Relevant baseline changes are the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, expanded runtime `AdapterAction` variants, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the app-demo integration crate. Non-outbound store/config lifecycle changes remain outside this design.
+> **Historical target baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). Relevant baseline changes were the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, expanded runtime `AdapterAction` variants, the then-current Spin SDK 6 / wasip2 integration, the contributor-only `demo` command replacing `dev`, and the app-demo integration crate. The current implementation pins Spin SDK 7.0.0. Non-outbound store/config lifecycle changes remain outside this design.
 > **Current checkout (post-#269 and staged-deploy work):** the CLI surface includes `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`; `Action` / `AdapterAction` additionally include `DeployStaged`, `EmitVersion`, `Healthcheck`, and `Rollback`; and adapter dispatch has both `execute(..)` and `execute_capture(..)` entry points. `dev` is gone. This outbound spec gates construction/deployment of the current runtime: `build` / `serve` / `deploy` / `deploy --staging` through both dispatch entry points, plus `demo` before Axum starts. Operational auth/version/health/rollback actions and provisioning/config/store lifecycle policy are exempt or belong to their owning specifications (§3.5.3).
 > **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape, §5.4 capability tests, and the §7 `edgezero-cli` migration bullet. The §3.5.3 + §7 active text is authoritative.
 
@@ -422,8 +422,10 @@ impl OutboundRequest {
  /// `Err(EdgeError::bad_request("outbound URI must not contain
  /// userinfo; pass credentials via the `authorization` header"))`.
  /// This keeps the Fastly backend Host override unambiguous and
- /// stops accidental credential leakage. Before WHATWG parsing, string constructors reject
- /// every raw `\\` byte. Backslash is a special-URL separator that WHATWG parsing can
+ /// stops accidental credential leakage. Before WHATWG parsing, every constructor inspects
+ /// the serialized URI authority and rejects a literal `@`, including empty userinfo such as
+ /// `https://@example.com/`; this applies equally to `new`, `from_parts`, `get`, and `post`.
+ /// String constructors additionally reject every raw `\\` byte. Backslash is a special-URL separator that WHATWG parsing can
  /// normalize into `/`; rejecting it avoids a second, security-sensitive authority parser
  /// and prevents forms such as `https:\\@example.com/`, `https:/\\@example.com/`, and
  /// `https:\\/\\@example.com/` from hiding empty userinfo during normalization. The
@@ -488,7 +490,7 @@ impl OutboundRequest {
  /// the rules live in core so adapters cannot diverge:
  ///
  /// - hop-by-hop headers are stripped: `connection`, `keep-alive`,
- /// `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`,
+ /// `proxy-connection`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`,
  /// `transfer-encoding`, `upgrade` (RFC 7230), plus every header
  /// named in the inbound `connection` header value;
  /// - `host` is **dropped** from the headers. Axum, Fastly, and Spin set the final
@@ -1173,7 +1175,7 @@ impl OutboundResponse {
  /// against a later adapter-side `headers_mut()` mutation. A proxied UPSTREAM response
  /// can carry hop-by-hop headers
  /// that MUST NOT be forwarded downstream: `into_response` strips `connection`,
- /// `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`,
+ /// `keep-alive`, `proxy-connection`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`,
  /// `transfer-encoding`, `upgrade`, **AND every header NOMINATED by the response's own
  /// `connection` value** — so an upstream `Connection: x-private` + `X-Private: secret`
  /// cannot leak `X-Private` to the downstream client. Both passes use one core helper,
@@ -1202,7 +1204,9 @@ returns `EdgeError`, so handler code uses `?` uniformly.
 
 These rules define two explicit levels. The portable baseline on all four adapters strips
 visible hop-by-hop headers and visible `connection` nominations and preserves repeated
-`set-cookie`. The stronger **`outbound-header-fidelity`** capability covers both directions:
+`set-cookie`. The fixed portable strip set includes the de facto `proxy-connection` field in
+addition to the standard hop-by-hop fields. The stronger **`outbound-header-fidelity`**
+capability covers both directions:
 outbound request field lines reach the platform transport without EdgeZero coalescing, and
 raw response-header octets plus original field-line boundaries reach normalization. This
 includes fail-closed malformed `connection`, malformed/repeated `content-encoding`
@@ -1405,6 +1409,9 @@ request for a case with no legitimate use.
 byte outside visible ASCII — and would incorrectly drop valid non-ASCII UTF-8 headers
 (e.g. an `x-app-display-name: café` style header). Adapters and the core
 `normalize_for_dispatch` helper both use `str::from_utf8(value.as_bytes()).is_ok()`.
+Framing-sensitive response `Content-Length` is exempt from this lossy filter until its strict
+parser runs; malformed or non-UTF-8 values fail as `bad_gateway` reason `Protocol` rather than
+disappearing before framing validation.
 §5.4 asserts exact non-ASCII UTF-8 request/response preservation on the three
 Native-fidelity adapters. Cloudflare separately proves that its guest-visible string path
 does not panic or discard a valid value, without claiming raw-octet or field-line fidelity;
@@ -1472,7 +1479,7 @@ rules end-to-end:
    pre-validated-map paths are lossy (don't fail an otherwise-good forward over an
    exotic header). The `warn!` makes the drop observable in either case. **The
    `connection` header is exempt — it was already resolved fail-closed in step 1.**
-3. Strip hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`,
+3. Strip hop-by-hop headers (`connection`, `keep-alive`, `proxy-connection`, `proxy-authenticate`,
    `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`, plus every
    header named in any `connection` header value — parsed and validated from the
    now-guaranteed-UTF-8 values per step 1). Idempotent for `from_request`
@@ -2506,6 +2513,11 @@ separate upstream layers (§3.4.5):
 5. `content-encoding` and `content-length` are stripped from
    `OutboundResponse.headers` at construction time — the wrapper's output bytes are
    the new ground truth.
+
+Every terminal error item is a resource-ownership boundary. Before a response limiter, gzip or
+Brotli decoder, native-EOF validator, or framing wrapper yields `Err`, it drops its source and
+decoder/native reader state. The caller need not poll the wrapper again or drop it to release the
+owned upstream body; the yielded error item is already terminal and resource-free.
 
 Cap ownership is then unambiguous:
 
@@ -6116,12 +6128,14 @@ Required coverage:
   dot segments, percent-encoded delimiters, numeric IPv4 aliases, IDNA, empty paths, and
   query characters in addition to DNS names, default/non-default ports, bracketed IPv6,
   and backend-target/Host/host-only/SNI/certificate values. App-visible and
-  adapter-visible serializations are equal.
+  adapter-visible serializations are equal. Empty userinfo is rejected through both raw-string
+  and typed-`Uri` constructors before WHATWG normalization can erase it.
 - Request normalization strips standard hop-by-hop fields plus every field nominated by
   each visible `Connection` value, case-insensitively and across repeated field lines.
   Empty or invalid nomination tokens fail the whole request as 400; valid prefixes are not
   partially honored. Native-fidelity raw non-UTF-8 `Connection` is also a 400.
-  Cloudflare's portable baseline is tested over the visible normalized strings.
+  Cloudflare's portable baseline is tested over the visible normalized strings. The fixed
+  request and response strip sets include `Proxy-Connection`.
 - Valid non-ASCII UTF-8 custom header values survive on Native-fidelity adapters;
   forbidden controls reject at construction, and invalid UTF-8 introduced through
   `headers_mut` is dropped except for the fail-closed `Connection` case.
@@ -6130,7 +6144,8 @@ Required coverage:
   `Connection: content-length` cannot influence decode/cap logic. Every adapter classifies
   malformed visible nomination syntax as 502; Native adapters also classify malformed
   raw/non-UTF-8 `Connection` as 502. Cloudflare is tested only to its BestEffort raw-header
-  fidelity contract.
+  fidelity contract. A non-UTF-8 `Content-Length` remains visible until strict framing parsing
+  and is therefore a protocol 502 rather than a silently absent length.
 - `OutboundResponse` construction and `into_parts` round-trip request method, status,
   normalized headers, and body. Adapters apply bodyless handling for HEAD, every 1xx, 204,
   and 304 before content decoding or streaming. For 205, clean EOF completes normally while
@@ -6150,6 +6165,8 @@ Required coverage:
   including read-ahead bytes already held by the recovered buffered reader. For both
   codecs, a complete encoded payload followed by a typed source error preserves that
   error; a payload followed by a pending native EOF cannot report successful completion.
+  Limiter, decoder, native-EOF, and framing errors release their source/native state before the
+  terminal `Err` item becomes visible, without requiring a second poll or wrapper drop.
 - Response resource tests cover exact-limit and first-byte/entry-over boundaries for raw
   encoded body bytes, decoded bytes, header bytes, and header count. They exercise repeated
   fields, checked-`u64` overflow/conversion, passthrough encodings, cleanup, deadline
@@ -6378,7 +6395,7 @@ raw bytes, stalls, EOF, and disconnect facts. Untrusted forks run workerd only; 
 a maintainer reproduces the exact tree on `refs/heads/outbound-probe-reviewed` and dispatches the protected
 job for that SHA. Phase 4 specifies the concrete commands and origin protocol.
 
-Fastly WASM gates assert repository-pinned Viceroy 0.17.0 and run from the adapter crate so
+Fastly WASM gates assert repository-pinned Viceroy 0.21.0 and run from the adapter crate so
 its committed runner, including the demo `fastly.toml`, is used without an environment
 override. Its default-branch deployed entitlement dispatcher follows the same exact-SHA,
 protected-environment, disposable-resource, positive-probe, and cleanup rules in Phase 6.

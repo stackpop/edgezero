@@ -155,6 +155,12 @@ pub struct ResolvedDispatch {
 impl ResolvedDispatch {
     #[must_use]
     #[inline]
+    pub(crate) fn method(&self) -> &Method {
+        &self.method
+    }
+
+    #[must_use]
+    #[inline]
     pub fn resolution(&self) -> &RouteResolution {
         &self.resolution
     }

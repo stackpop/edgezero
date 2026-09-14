@@ -323,8 +323,7 @@ where
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let response = executor::block_on(app.dispatch_admitted(prepared, core_request))
-        .map_err(|err| map_edge_error(&err))?;
+    let response = executor::block_on(app.dispatch_admitted(prepared, core_request));
     deliver(response)
 }
 
@@ -362,7 +361,7 @@ where
         head_request,
         stores,
         request_start,
-        move || req.take_body(),
+        move || Ok(req.take_body()),
         deliver,
     )
 }
@@ -377,29 +376,46 @@ fn dispatch_ingress_reader<T, Source, MakeSource, Deliver>(
 ) -> Result<T, FastlyError>
 where
     Source: Read + 'static,
-    MakeSource: FnOnce() -> Source,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
     Deliver: FnOnce(ResponseEgressEnvelope) -> Result<T, FastlyError>,
 {
+    let request_method = head_request.method().clone();
     let head_parts = IngressHeadParts::from_request(
         &head_request,
         IngressHeadAccounting::HostManaged,
         IngressFraming::HostManaged,
     );
-    head_parts
-        .validate_normalized(app.ingress_head_limits())
-        .map_err(|error| map_edge_error(&error))?;
-    let prepared = match app
-        .begin_ingress(head_parts, request_start)
-        .map_err(|error| map_edge_error(&error))?
-    {
-        IngressBeginOutcome::Admitted(prepared) => prepared,
-        IngressBeginOutcome::Refused(response) => {
-            return deliver(response);
+    if let Err(error) = head_parts.validate_normalized(app.ingress_head_limits()) {
+        return deliver(app.detached_ingress_error_egress(error, request_method, request_start));
+    }
+    let prepared = match app.begin_ingress(head_parts, request_start) {
+        Ok(outcome) => match outcome {
+            IngressBeginOutcome::Admitted(prepared) => prepared,
+            IngressBeginOutcome::Refused(response) => {
+                return deliver(response);
+            }
+            _ => {
+                return deliver(app.detached_ingress_error_egress(
+                    EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome")),
+                    request_method,
+                    request_start,
+                ));
+            }
+        },
+        Err(error) => {
+            return deliver(app.detached_ingress_error_egress(
+                error,
+                request_method,
+                request_start,
+            ));
         }
-        _ => return Err(FastlyError::msg("unsupported ingress admission outcome")),
+    };
+    let source = match make_source() {
+        Ok(source) => source,
+        Err(error) => return deliver(app.admitted_error_egress(prepared, error)),
     };
     *head_request.body_mut() = fastly_deadline_body(
-        make_source(),
+        source,
         Some((prepared.read_deadline(), prepared.monotonic_clock())),
     );
     dispatch_core_request(app, head_request, stores, prepared, deliver)
@@ -712,7 +728,39 @@ where
         core_request,
         Stores::default(),
         request_start,
-        move || source,
+        move || Ok(source),
+        Ok,
+    )
+}
+
+/// Exercises a reader-construction failure after admission through the production seam.
+#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
+#[doc(hidden)]
+#[inline]
+pub fn dispatch_ingress_source_error_for_test(
+    app: &App,
+    method: Method,
+    uri: Uri,
+) -> Result<ResponseEgressEnvelope, FastlyError> {
+    let request_start = app.monotonic_now();
+    let mut core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(|error| map_edge_error(&EdgeError::internal(error)))?;
+    core_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
+    dispatch_ingress_reader(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        || -> Result<std::io::Cursor<Vec<u8>>, EdgeError> {
+            Err(EdgeError::internal(anyhow::anyhow!(
+                "fastly source construction failed"
+            )))
+        },
         Ok,
     )
 }

@@ -16,7 +16,7 @@ use bytes::Bytes;
 use edgezero_core::config_store::BoundedStoreRead;
 use edgezero_core::secret_store::SecretError;
 use edgezero_core::secret_store::SecretStore;
-use edgezero_core::time::Deadline;
+use edgezero_core::time::{Deadline, MonotonicClock};
 use worker::Error as WorkerError;
 
 /// Secret store backed by Cloudflare Workers `Env`.
@@ -63,12 +63,14 @@ impl SecretStore for CloudflareSecretStore {
         &self,
         store_name: &str,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
         bounded_secret_read(
             self.get_bytes(store_name, key),
+            clock,
             deadline,
             max_backend_bytes,
             max_value_bytes,
@@ -81,6 +83,7 @@ impl SecretStore for CloudflareSecretStore {
 // and apply immediately after host materialization rather than during allocation.
 pub(crate) async fn bounded_secret_read<F>(
     read: F,
+    clock: &MonotonicClock,
     deadline: Deadline,
     max_backend_bytes: u64,
     max_value_bytes: u64,
@@ -88,12 +91,12 @@ pub(crate) async fn bounded_secret_read<F>(
 where
     F: Future<Output = Result<Option<Bytes>, SecretError>>,
 {
-    if deadline.is_expired() {
+    if deadline.is_expired_at(clock.now()) {
         return Err(SecretError::DeadlineExceeded);
     }
 
     let result = read.await;
-    if deadline.is_expired() {
+    if deadline.is_expired_at(clock.now()) {
         drop(result);
         return Err(SecretError::DeadlineExceeded);
     }

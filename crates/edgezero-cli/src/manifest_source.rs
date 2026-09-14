@@ -30,18 +30,13 @@ pub(crate) struct ResolvedShellTarget {
     bind_host: Option<String>,
     bind_port: Option<u16>,
     command: String,
+    component: Option<String>,
     environment: ResolvedEnvironment,
+    platform_manifest: Option<PathBuf>,
     root: PathBuf,
 }
 
 impl ResolvedManifest {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read-only accessor is part of the resolved-manifest contract and exercised by focused tests"
-        )
-    )]
     #[inline]
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -67,6 +62,11 @@ impl ResolvedRuntime {
     }
 
     #[inline]
+    pub(crate) fn manifest_path(&self) -> Option<&Path> {
+        self.contract.as_ref().map(ResolvedManifest::path)
+    }
+
+    #[inline]
     pub(crate) fn target(&self) -> &ResolvedAdapterTarget {
         &self.target
     }
@@ -89,8 +89,18 @@ impl ResolvedShellTarget {
     }
 
     #[inline]
+    pub(crate) fn component(&self) -> Option<&str> {
+        self.component.as_deref()
+    }
+
+    #[inline]
     pub(crate) fn environment(&self) -> &ResolvedEnvironment {
         &self.environment
+    }
+
+    #[inline]
+    pub(crate) fn platform_manifest(&self) -> Option<&Path> {
+        self.platform_manifest.as_deref()
     }
 
     #[inline]
@@ -324,7 +334,7 @@ fn resolve_contract_path(
     discover_default_manifest(invocation_dir)
 }
 
-fn resolve_runtime_from(
+pub(crate) fn resolve_runtime_from(
     adapter: &str,
     action: Action,
     invocation_dir: &Path,
@@ -352,12 +362,20 @@ fn resolve_runtime_from(
             "application root",
         )?;
         let adapter_name = canonical_adapter.to_ascii_lowercase();
+        let component = config.adapter.component.clone();
         let target = if let Some(command) = command_for(manifest, &adapter_name, action) {
+            let platform_manifest = if adapter_name == "spin" {
+                platform_manifest_from_contract(manifest, &adapter_name, &app_root)?
+            } else {
+                None
+            };
             ResolvedAdapterTarget::Shell(ResolvedShellTarget {
                 bind_host: config.adapter.host.clone(),
                 bind_port: config.adapter.port,
                 command,
+                component,
                 environment: manifest.environment_for(&adapter_name),
+                platform_manifest,
                 root: app_root,
             })
         } else {
@@ -365,7 +383,7 @@ fn resolve_runtime_from(
                 platform_manifest_from_contract(manifest, &adapter_name, &app_root)?;
             ResolvedAdapterTarget::Registered(AdapterExecutionTarget::new(
                 app_root,
-                config.adapter.component.clone(),
+                component,
                 platform_manifest,
             ))
         };

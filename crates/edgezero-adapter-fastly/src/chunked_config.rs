@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::config_store::ConfigStoreError;
 #[cfg(any(feature = "fastly", test))]
-use edgezero_core::{BoundedStoreRead, Deadline, MonotonicInstant};
+use edgezero_core::{BoundedStoreRead, Deadline, MonotonicClock, MonotonicInstant};
 
 /// Per-entry value limit enforced by Fastly Config Store. Used by the CLI writer
 /// to gate direct-vs-chunked storage, and by the pointer validator (which both
@@ -214,13 +214,14 @@ where
 /// after the call returns and its result is discarded.
 #[cfg(any(feature = "fastly", test))]
 pub(crate) fn run_sync_host_call<T, E, F>(
+    clock: &MonotonicClock,
     deadline: Deadline,
     call: F,
 ) -> Result<T, SyncHostCallError<E>>
 where
     F: FnOnce() -> Result<T, E>,
 {
-    run_sync_host_call_at(deadline, MonotonicInstant::now, call)
+    run_sync_host_call_at(deadline, || clock.now(), call)
 }
 
 #[cfg(any(feature = "fastly", test))]
@@ -666,10 +667,15 @@ where
 /// prior chunks. Deadline checks are cooperative: they bracket each callback,
 /// but cannot interrupt a synchronous host call already in progress.
 #[cfg(any(feature = "fastly", test))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "root accounting, the shared clock/deadline, both byte caps, and the chunk callback are independent contract inputs"
+)]
 pub(crate) fn resolve_fastly_config_value_typed_bounded<F>(
     root_key: &str,
     root_value: String,
     root_backend_bytes: u64,
+    clock: &MonotonicClock,
     deadline: Deadline,
     max_backend_bytes: u64,
     max_value_bytes: u64,
@@ -678,7 +684,7 @@ pub(crate) fn resolve_fastly_config_value_typed_bounded<F>(
 where
     F: FnMut(&str, u64) -> Result<BoundedStoreRead<String>, ConfigStoreError>,
 {
-    if deadline.is_expired() {
+    if deadline.is_expired_at(clock.now()) {
         return Err(BoundedResolveFailure::DeadlineExceeded);
     }
 
@@ -692,7 +698,7 @@ where
     let mut chunk_value_bytes = 0_u64;
     let mut boundary_error = None;
     let resolve_outcome = resolve_fastly_config_value_typed(root_key, root_value, |chunk_key| {
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
             return Err("bounded config read failed".to_owned());
         }
@@ -709,7 +715,7 @@ where
             }
         };
 
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
             return Err("bounded config read failed".to_owned());
         }
@@ -751,7 +757,7 @@ where
         return Err(error);
     }
     let resolved_value = resolve_outcome.map_err(BoundedResolveFailure::Resolve)?;
-    if deadline.is_expired() {
+    if deadline.is_expired_at(clock.now()) {
         return Err(BoundedResolveFailure::DeadlineExceeded);
     }
     let resolved_bytes = u64::try_from(resolved_value.len())
@@ -1511,19 +1517,23 @@ mod tests {
             SyncHostCallError::DeadlineExceeded => panic!("deadline must not win"),
         }
 
-        let wrapper_result = run_sync_host_call(Deadline::after(Duration::from_secs(1)), || {
-            Ok::<_, ()>("materialized")
-        })
-        .expect("wrapper call before its deadline must succeed");
+        let clock = MonotonicClock::default();
+        let wrapper_result =
+            run_sync_host_call(&clock, Deadline::after(Duration::from_secs(1)), || {
+                Ok::<_, ()>("materialized")
+            })
+            .expect("wrapper call before its deadline must succeed");
         assert_eq!(wrapper_result, "materialized");
     }
 
     #[test]
     fn bounded_resolver_accepts_exact_direct_caps_and_rejects_over_cap() {
+        let clock = MonotonicClock::default();
         let exact = resolve_fastly_config_value_typed_bounded(
             "root",
             "value".to_owned(),
             5,
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             5,
             5,
@@ -1538,6 +1548,7 @@ mod tests {
             "root",
             "value".to_owned(),
             5,
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             4,
             5,
@@ -1550,6 +1561,7 @@ mod tests {
             "root",
             "value".to_owned(),
             5,
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             5,
             4,
@@ -1562,10 +1574,12 @@ mod tests {
     #[test]
     fn bounded_resolver_rejects_expired_deadline_without_fetching() {
         let mut fetched = false;
+        let clock = MonotonicClock::default();
         let error = resolve_fastly_config_value_typed_bounded(
             "root",
             "value".to_owned(),
             5,
+            &clock,
             Deadline::after(Duration::ZERO),
             5,
             5,
@@ -1585,6 +1599,7 @@ mod tests {
 
     #[test]
     fn bounded_resolver_counts_pointer_and_chunks_with_decreasing_allowance() {
+        let clock = MonotonicClock::default();
         let root_key = "app_config";
         let envelope = serde_json::to_string(&BlobEnvelope::new(
             serde_json::json!({ "pad": "x".repeat(9_000) }),
@@ -1608,6 +1623,7 @@ mod tests {
             root_key,
             pointer.clone(),
             pointer_bytes,
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             total_backend_bytes,
             u64::try_from(envelope.len()).expect("envelope length"),
@@ -1638,6 +1654,7 @@ mod tests {
             root_key,
             pointer,
             pointer_bytes,
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             total_backend_bytes - 1,
             u64::try_from(envelope.len()).expect("envelope length"),
@@ -1657,6 +1674,7 @@ mod tests {
 
     #[test]
     fn bounded_resolver_rejects_inconsistent_chunk_reports() {
+        let clock = MonotonicClock::default();
         let root_key = "app_config";
         let envelope = serde_json::to_string(&BlobEnvelope::new(
             serde_json::json!({ "pad": "x".repeat(9_000) }),
@@ -1672,6 +1690,7 @@ mod tests {
             root_key,
             pointer,
             pointer_bytes,
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             u64::MAX,
             u64::try_from(envelope.len()).expect("envelope length"),

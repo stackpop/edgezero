@@ -619,7 +619,6 @@ mod worker_impl {
         budget: DispatchBudget,
         clock: &MonotonicClock,
     ) -> Result<(WorkerResponse, AbortGuard), EdgeError> {
-        let remaining = budget_remaining(budget, clock)?;
         let controller = web_sys::AbortController::new().map_err(|_error| {
             EdgeError::internal(anyhow::anyhow!("failed to construct abort controller"))
         })?;
@@ -642,7 +641,9 @@ mod worker_impl {
         }
 
         let global: web_sys::WorkerGlobalScope = global().unchecked_into();
-        let promise = global.fetch_with_request_and_init(request.inner(), &fetch_init);
+        let (promise, remaining) = begin_fetch(budget, clock, || {
+            global.fetch_with_request_and_init(request.inner(), &fetch_init)
+        })?;
         let fetch = JsFuture::from(promise);
         let timer = Delay::from(remaining);
         futures_util::pin_mut!(fetch, timer);
@@ -656,6 +657,15 @@ mod worker_impl {
             EdgeError::internal(anyhow::anyhow!("fetch returned a non-response value"))
         })?;
         Ok((WorkerResponse::from(web_response), abort_guard))
+    }
+
+    fn begin_fetch<Output>(
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+        dispatch: impl FnOnce() -> Output,
+    ) -> Result<(Output, Duration), EdgeError> {
+        let remaining = budget_remaining(budget, clock)?;
+        Ok((dispatch(), remaining))
     }
 
     async fn request_body(
@@ -1013,6 +1023,33 @@ mod worker_impl {
                 deadline: Deadline::at_instant(start.checked_add(duration).expect("deadline")),
                 duration,
             }
+        }
+
+        #[wasm_bindgen_test]
+        fn raw_fetch_timer_arms_from_final_remaining_budget() {
+            let start = MonotonicInstant::now();
+            let observed = start
+                .checked_add(Duration::from_millis(3))
+                .expect("observed instant");
+            let budget = test_budget(start, Duration::from_millis(10));
+            let sampled = Arc::new(Mutex::new(false));
+            let sampled_by_clock = Arc::clone(&sampled);
+            let clock = MonotonicClock::new(move || {
+                *sampled_by_clock.lock().expect("sampled lock") = true;
+                observed
+            });
+
+            let (value, remaining) = begin_fetch(budget, &clock, || {
+                assert!(
+                    *sampled.lock().expect("sampled lock"),
+                    "budget must be sampled before dispatch"
+                );
+                42_u8
+            })
+            .expect("live budget");
+
+            assert_eq!(value, 42);
+            assert_eq!(remaining, Duration::from_millis(7));
         }
 
         #[wasm_bindgen_test]

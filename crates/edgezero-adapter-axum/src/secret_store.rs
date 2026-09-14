@@ -12,7 +12,7 @@ use std::env;
 use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::secret_store::{SecretError, SecretStore};
-use edgezero_core::{BoundedStoreRead, Deadline};
+use edgezero_core::{BoundedStoreRead, Deadline, MonotonicClock};
 
 /// Secret store for local development that reads secrets from environment variables.
 ///
@@ -68,11 +68,12 @@ impl SecretStore for EnvSecretStore {
         &self,
         _store_name: &str,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             return Err(SecretError::DeadlineExceeded);
         }
 
@@ -82,7 +83,7 @@ impl SecretStore for EnvSecretStore {
         #[cfg(not(unix))]
         let stored_value = env::var(key);
 
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             return Err(SecretError::DeadlineExceeded);
         }
 
@@ -126,7 +127,7 @@ impl SecretStore for EnvSecretStore {
         #[cfg(not(unix))]
         let value = stored_value.map(|value| Bytes::from(value.into_bytes()));
 
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             return Err(SecretError::DeadlineExceeded);
         }
 
@@ -155,7 +156,7 @@ mod tests {
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
     use edgezero_core::secret_store_contract_tests;
     use edgezero_core::test_env::EnvOverride;
-    use edgezero_core::{Deadline, MonotonicInstant};
+    use edgezero_core::{Deadline, MonotonicClock, MonotonicInstant};
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::sync::Arc;
@@ -166,11 +167,13 @@ mod tests {
         let _guard = env_guard().lock().await;
         let _env = EnvOverride::set("__EDGEZERO_TEST_BOUNDED_SECRET__", "hello");
         let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
+        let clock = MonotonicClock::default();
 
         let read = handle
             .get_bytes_bounded(
                 "env",
                 "__EDGEZERO_TEST_BOUNDED_SECRET__",
+                &clock,
                 Deadline::after(Duration::from_secs(1)),
                 5,
                 5,
@@ -187,12 +190,14 @@ mod tests {
         let _guard = env_guard().lock().await;
         let _env = EnvOverride::set("__EDGEZERO_TEST_OVERSIZE_SECRET__", "hello");
         let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
+        let clock = MonotonicClock::default();
 
         for (max_backend_bytes, max_value_bytes) in [(4, 5), (5, 4)] {
             let error = handle
                 .get_bytes_bounded(
                     "env",
                     "__EDGEZERO_TEST_OVERSIZE_SECRET__",
+                    &clock,
                     Deadline::after(Duration::from_secs(1)),
                     max_backend_bytes,
                     max_value_bytes,
@@ -210,9 +215,17 @@ mod tests {
         let _env = EnvOverride::set("__EDGEZERO_TEST_EXPIRED_SECRET__", "hello");
         let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
         let expired = Deadline::at_instant(MonotonicInstant::now());
+        let clock = MonotonicClock::default();
 
         let error = handle
-            .get_bytes_bounded("env", "__EDGEZERO_TEST_EXPIRED_SECRET__", expired, 5, 5)
+            .get_bytes_bounded(
+                "env",
+                "__EDGEZERO_TEST_EXPIRED_SECRET__",
+                &clock,
+                expired,
+                5,
+                5,
+            )
             .await
             .expect_err("expired deadline must fail");
 
@@ -222,13 +235,52 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn bounded_get_bytes_preserves_handle_name_validation() {
         let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
+        let clock = MonotonicClock::default();
 
         let error = handle
-            .get_bytes_bounded("", "key", Deadline::after(Duration::from_secs(1)), 5, 5)
+            .get_bytes_bounded(
+                "",
+                "key",
+                &clock,
+                Deadline::after(Duration::from_secs(1)),
+                5,
+                5,
+            )
             .await
             .expect_err("empty store name must be rejected");
 
         assert!(matches!(error, SecretError::Validation(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_secret_read_uses_injected_clock() {
+        let _guard = env_guard().lock().await;
+        let _env = EnvOverride::set("__EDGEZERO_TEST_CLOCKED_SECRET__", "hello");
+        let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let clock = MonotonicClock::new(move || injected_now);
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+
+        let read = handle
+            .get_bytes_bounded(
+                "env",
+                "__EDGEZERO_TEST_CLOCKED_SECRET__",
+                &clock,
+                deadline,
+                5,
+                5,
+            )
+            .await
+            .expect("the application clock is still before its deadline");
+
+        assert_eq!(read.value, Some(Bytes::from_static(b"hello")));
     }
 
     #[cfg(unix)]

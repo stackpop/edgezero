@@ -6,6 +6,16 @@ const capabilityPath = 'docs/guide/capabilities.md'
 const outboundCorePath = 'crates/edgezero-core/src/outbound.rs'
 const outboundSpecPath =
   'docs/superpowers/specs/2026-05-21-outbound-http-design.md'
+const outboundImplementationIndexPath =
+  'docs/superpowers/plans/2026-07-10-outbound-http-implementation.md'
+const spinPhasePath =
+  'docs/superpowers/plans/2026-09-06-outbound-http-phase5-spin.md'
+const cloudflarePhasePath =
+  'docs/superpowers/plans/2026-09-06-outbound-http-phase4-axum-cloudflare.md'
+const fastlyPhasePath =
+  'docs/superpowers/plans/2026-09-06-outbound-http-phase6-fastly.md'
+const migrationPhasePath =
+  'docs/superpowers/plans/2026-09-06-outbound-http-phase7-migration-docs.md'
 const sidebarPath = 'docs/.vitepress/config.mts'
 const expectedHeader = [
   'Capability',
@@ -359,6 +369,44 @@ if (cloudflareExactDeadlineRecommendation.test(outboundSpecSource)) {
   fail(
     'outbound specification recommends Cloudflare for exact deadlines despite its BestEffort capability',
   )
+}
+
+const currentDocumentation = [
+  [outboundImplementationIndexPath, readFileSync(outboundImplementationIndexPath, 'utf8')],
+  [cloudflarePhasePath, readFileSync(cloudflarePhasePath, 'utf8')],
+  [spinPhasePath, readFileSync(spinPhasePath, 'utf8')],
+  [fastlyPhasePath, readFileSync(fastlyPhasePath, 'utf8')],
+  [migrationPhasePath, readFileSync(migrationPhasePath, 'utf8')],
+  [outboundSpecPath, outboundSpecSource],
+]
+for (const [path, source] of currentDocumentation) {
+  for (const staleVersion of [
+    'Spin SDK 6.0.0',
+    'spin-sdk v6.0.0',
+    'Viceroy 0.17.0',
+    'viceroy 0.17.0',
+    'Fastly SDK 0.12.1',
+    'Worker 0.8.3',
+    'worker = "=0.8.3"',
+    'worker --precise 0.8.3',
+    "worker v0\\.8\\.3",
+  ]) {
+    if (source.includes(staleVersion)) {
+      fail(`${path} contains stale runtime tooling: ${staleVersion}`)
+    }
+  }
+}
+
+const outboundImplementationIndexSource = currentDocumentation[0][1]
+if (!outboundImplementationIndexSource.includes('Spin SDK 7 / WASI HTTP 0.3')) {
+  fail('outbound implementation index must name the current Spin SDK 7 baseline')
+}
+if (
+  outboundImplementationIndexSource.includes('| Executable:') ||
+  outboundImplementationIndexSource.includes('Tasks 1-6 blocked') ||
+  outboundImplementationIndexSource.includes('all downstream phases stay')
+) {
+  fail('outbound implementation index still presents implemented phases as pending')
 }
 
 const limitsHeadingIndex = lines.findIndex(

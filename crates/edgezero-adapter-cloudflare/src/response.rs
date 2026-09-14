@@ -131,6 +131,8 @@ trait CloudflareEgressIo {
         clock: &MonotonicClock,
     ) -> Result<Option<Result<Bytes, EdgeError>>, IoFailureKind>;
 
+    fn preflight(&self, deadline: Deadline, clock: &MonotonicClock) -> Result<(), IoFailureKind>;
+
     async fn write(
         &mut self,
         bytes: Vec<u8>,
@@ -330,11 +332,11 @@ where
             };
         }
     };
-    if policy.write_deadline.is_expired_at(clock.now()) {
+    if let Err(error) = io.preflight(policy.write_deadline, &clock) {
         abort(&mut io);
         return StartOutcome::Precommit {
             attempt: Box::new(attempt),
-            cause: ResponseEgressOutcome::DeadlineExceeded,
+            cause: error.delivery_error().outcome(),
         };
     }
     if !attempt.begin_writing() {
@@ -371,8 +373,8 @@ where
     Committer: CloudflareEgressCommitter,
 {
     if !attempt.begin_fallback(original_cause) {
-        attempt.terminate(ResponseEgressOutcome::ConversionError, clock.now());
-        return Err(DeliveryError::Conversion);
+        attempt.terminate(original_cause, clock.now());
+        return Err(DeliveryError::from_outcome(original_cause));
     }
     let started_at = clock.now();
     let fallback_deadline = started_at
@@ -552,13 +554,14 @@ mod platform {
         }
     }
 
-    async fn race_operation<Operation>(
-        operation: Operation,
+    async fn race_operation<OperationFactory, Operation>(
+        operation: OperationFactory,
         deadline: Deadline,
         clock: &MonotonicClock,
         signal: &AbortSignal,
     ) -> RaceEvent<Operation::Output>
     where
+        OperationFactory: FnOnce() -> Operation,
         Operation: Future,
     {
         if signal.aborted() {
@@ -576,6 +579,7 @@ mod platform {
                 Either::Right(((), _cancellation)) => RaceEvent::Deadline,
             }
         };
+        let operation = operation();
         futures_util::pin_mut!(guard, operation);
         match select(guard, operation).await {
             Either::Left((event, _operation)) => event,
@@ -589,6 +593,44 @@ mod platform {
                 };
                 RaceEvent::Operation { output, terminal }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod race_tests {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use futures_util::future;
+        use wasm_bindgen_test::wasm_bindgen_test;
+
+        use super::*;
+
+        #[wasm_bindgen_test]
+        async fn response_egress_preflight_precedes_writer_operation() {
+            let controller = web_sys::AbortController::new().expect("abort controller");
+            controller.abort();
+            let signal: AbortSignal = controller.signal().into();
+            let now = edgezero_core::time::MonotonicInstant::now();
+            let deadline =
+                Deadline::at_instant(now.checked_add(Duration::from_secs(1)).expect("deadline"));
+            let clock = MonotonicClock::new(move || now);
+            let constructed = Rc::new(Cell::new(false));
+            let observed = Rc::clone(&constructed);
+
+            let event = race_operation(
+                move || {
+                    observed.set(true);
+                    future::ready(())
+                },
+                deadline,
+                &clock,
+                &signal,
+            )
+            .await;
+
+            assert!(matches!(event, RaceEvent::Cancelled));
+            assert!(!constructed.get());
         }
     }
 
@@ -610,7 +652,7 @@ mod platform {
                 return ensure_deadline(deadline, clock).map_err(|_error| IoFailureKind::Deadline);
             };
             let event = race_operation(
-                JsFuture::from(writer.close()),
+                || JsFuture::from(writer.close()),
                 deadline,
                 clock,
                 &self.signal,
@@ -647,7 +689,7 @@ mod platform {
             clock: &MonotonicClock,
         ) -> Result<Option<Result<Bytes, EdgeError>>, IoFailureKind> {
             Delay::from(Duration::ZERO).await;
-            match race_operation(source.next(), deadline, clock, &self.signal).await {
+            match race_operation(|| source.next(), deadline, clock, &self.signal).await {
                 RaceEvent::Cancelled => Err(IoFailureKind::Cancelled),
                 RaceEvent::Deadline => Err(IoFailureKind::Deadline),
                 RaceEvent::Operation {
@@ -658,6 +700,18 @@ mod platform {
                     output: item,
                     terminal: None,
                 } => Ok(item),
+            }
+        }
+
+        fn preflight(
+            &self,
+            deadline: Deadline,
+            clock: &MonotonicClock,
+        ) -> Result<(), IoFailureKind> {
+            if self.signal.aborted() {
+                Err(IoFailureKind::Cancelled)
+            } else {
+                ensure_deadline(deadline, clock).map_err(|_error| IoFailureKind::Deadline)
             }
         }
 
@@ -676,7 +730,7 @@ mod platform {
             };
             let chunk = Uint8Array::from(bytes.as_slice());
             let event = race_operation(
-                JsFuture::from(writer.write_with_chunk(&chunk.into())),
+                || JsFuture::from(writer.write_with_chunk(&chunk.into())),
                 deadline,
                 clock,
                 &self.signal,
@@ -811,6 +865,7 @@ mod tests {
 
     struct MockIo {
         close_error: Option<IoFailureKind>,
+        preflight_error: Option<IoFailureKind>,
         state: Rc<RefCell<MockState>>,
         writes: VecDeque<MockWrite>,
     }
@@ -840,6 +895,14 @@ mod tests {
             Ok(source.next().await)
         }
 
+        fn preflight(
+            &self,
+            _deadline: Deadline,
+            _clock: &MonotonicClock,
+        ) -> Result<(), IoFailureKind> {
+            self.preflight_error.map_or(Ok(()), Err)
+        }
+
         async fn write(
             &mut self,
             bytes: Vec<u8>,
@@ -866,6 +929,7 @@ mod tests {
 
     struct MockCommitter {
         close_error: Option<IoFailureKind>,
+        preflight_error: Option<IoFailureKind>,
         prepare_error: Option<DeliveryError>,
         state: Rc<RefCell<MockState>>,
         writes: VecDeque<MockWrite>,
@@ -877,6 +941,7 @@ mod tests {
             (
                 Self {
                     close_error: None,
+                    preflight_error: None,
                     prepare_error: None,
                     state: Rc::clone(&state),
                     writes: VecDeque::new(),
@@ -908,6 +973,7 @@ mod tests {
                 },
                 MockIo {
                     close_error: self.close_error,
+                    preflight_error: self.preflight_error,
                     state: Rc::clone(&self.state),
                     writes: mem::take(&mut self.writes),
                 },
@@ -1005,7 +1071,7 @@ mod tests {
             prepared(&Method::GET, Body::from(Bytes::from_static(b"body"))),
             policy(deadline),
             attempt(&observer, now),
-            clock,
+            clock.clone(),
             EgressKind::Application,
             &mut committer,
         );
@@ -1045,6 +1111,36 @@ mod tests {
         assert!(!polled.get());
         assert!(state.borrow().writes.is_empty());
         assert_eq!(observer.reports()[0].bytes_written, 0);
+    }
+
+    #[test]
+    fn bodyless_response_checks_cancel_and_deadline_before_handoff() {
+        let now = MonotonicInstant::now();
+        let deadline = now.checked_add(Duration::from_secs(10)).expect("deadline");
+        let clock = MonotonicClock::new(move || now);
+        let observer = RecordingObserver::default();
+        let (mut committer, state) = MockCommitter::new();
+        committer.preflight_error = Some(IoFailureKind::Cancelled);
+
+        let StartOutcome::Precommit { attempt, cause } = start_prepared(
+            prepared(&Method::HEAD, Body::empty()),
+            policy(deadline),
+            attempt(&observer, now),
+            clock.clone(),
+            EgressKind::Application,
+            &mut committer,
+        ) else {
+            panic!("cancelled request must not be handed off");
+        };
+
+        assert_eq!(cause, ResponseEgressOutcome::RequestCancelled);
+        assert_eq!(
+            start_fallback(&Method::HEAD, cause, *attempt, &clock, &mut committer)
+                .expect_err("cancelled request cannot start fallback delivery"),
+            DeliveryError::Cancelled
+        );
+        assert_eq!(state.borrow().aborts, 1);
+        assert_eq!(observer.reports()[0].outcome, cause);
     }
 
     #[test]

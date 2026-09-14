@@ -953,6 +953,10 @@ impl ConfigExtractionBudget {
         Ok(())
     }
 
+    fn clock(&self) -> &MonotonicClock {
+        &self.clock
+    }
+
     fn deadline(&self) -> Deadline {
         self.deadline
     }
@@ -1070,6 +1074,7 @@ where
     let read = handle
         .get_bounded(
             key,
+            budget.clock(),
             budget.deadline(),
             budget.remaining_backend_bytes(),
             budget.max_blob_bytes(),
@@ -1376,6 +1381,7 @@ async fn resolve_leaf(
     let read = bound
         .get_bytes_bounded(
             &key_name,
+            budget.clock(),
             budget.deadline(),
             budget.remaining_backend_bytes(),
             budget.max_secret_bytes(),
@@ -2676,6 +2682,7 @@ mod tests {
             async fn get_bounded(
                 &self,
                 _key: &str,
+                _clock: &MonotonicClock,
                 deadline: Deadline,
                 max_backend_bytes: u64,
                 max_value_bytes: u64,
@@ -2737,6 +2744,7 @@ mod tests {
             async fn get_bounded(
                 &self,
                 _key: &str,
+                _clock: &MonotonicClock,
                 deadline: Deadline,
                 max_backend_bytes: u64,
                 max_value_bytes: u64,
@@ -2771,6 +2779,7 @@ mod tests {
                 &self,
                 _store_name: &str,
                 _key: &str,
+                _clock: &MonotonicClock,
                 deadline: Deadline,
                 max_backend_bytes: u64,
                 max_value_bytes: u64,

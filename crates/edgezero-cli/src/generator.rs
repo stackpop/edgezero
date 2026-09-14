@@ -799,6 +799,7 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_adapter::cli_support::validate_spin_outbound_host_contract;
     use edgezero_core::Capability;
     use edgezero_core::app_config::app_name_prefix;
     use edgezero_core::manifest::ManifestLoader;
@@ -1048,9 +1049,9 @@ mod tests {
     #[test]
     fn generated_spin_hosts_default_to_https_only() {
         with_generated_demo_app(|project_dir| {
-            let source =
-                fs::read_to_string(project_dir.join("crates/demo-app-adapter-spin/spin.toml"))
-                    .expect("read spin.toml");
+            let app_manifest_path = project_dir.join("edgezero.toml");
+            let spin_manifest_path = project_dir.join("crates/demo-app-adapter-spin/spin.toml");
+            let source = fs::read_to_string(&spin_manifest_path).expect("read spin.toml");
             let manifest: toml::Value = toml::from_str(&source).expect("parse spin.toml");
             let hosts = manifest
                 .get("component")
@@ -1067,6 +1068,15 @@ mod tests {
                 }),
                 "generated Spin manifest must not grant cleartext implicitly"
             );
+            let app_manifest = ManifestLoader::from_path(&app_manifest_path)
+                .expect("parse generated edgezero.toml");
+            validate_spin_outbound_host_contract(
+                app_manifest.manifest(),
+                &app_manifest_path,
+                &spin_manifest_path,
+                None,
+            )
+            .expect("generated application and selected Spin component must remain aligned");
         });
     }
 

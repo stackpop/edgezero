@@ -74,7 +74,7 @@ secret, missing driver, zero probe count, or mismatched SHA is never success.
 - [ ] Before the Cloudflare secret-bearing driver step, install the exact Rust and Node
   versions from `.tool-versions`, add `wasm32-unknown-unknown`, run
   `npm ci --prefix crates/edgezero-adapter-cloudflare`, run the fixture's locked Cargo
-  metadata and Worker 0.8.3 tree assertions, install
+  metadata and Worker 0.8.5 tree assertions, install
   `worker-build 0.8.3 --locked`, assert `worker-build --version` plus locked Wrangler's
   version, assert fixture/template compatibility settings, and run
   `npm --prefix crates/edgezero-adapter-cloudflare run build:outbound-fixture`. None of these

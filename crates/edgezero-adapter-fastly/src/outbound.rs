@@ -13,6 +13,8 @@
     )
 )]
 
+#[cfg(any(feature = "fastly", feature = "test-utils"))]
+use std::future::Future;
 #[cfg(test)]
 use std::time::Duration;
 
@@ -140,7 +142,6 @@ mod fastly_impl {
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::io::{Result as IoResult, Write};
-    use std::mem::replace;
     use std::num::NonZeroU64;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -174,7 +175,9 @@ mod fastly_impl {
     use futures_util::StreamExt as _;
     use sha2::{Digest as _, Sha256};
 
-    use super::{dispatch_all_before_wait, timeout_error, validate_batch_request};
+    use super::{
+        BatchDispatch, BatchProbe, orchestrate_batch, timeout_error, validate_batch_request,
+    };
 
     pub const DYNAMIC_BACKENDS_DISABLED_MESSAGE: &str = "Fastly dynamic backends are not enabled on this service; enable them in the service configuration";
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
@@ -234,12 +237,6 @@ mod fastly_impl {
         pending: PendingRequest,
         request_method: Method,
         response_mode: ResponseMode,
-    }
-
-    enum Slot {
-        Done(OutboundSlotResult),
-        Pending(Box<PendingSlot>),
-        Taken,
     }
 
     /// Native outbound HTTP implementation for Fastly Compute.
@@ -495,37 +492,41 @@ mod fastly_impl {
         #[inline]
         async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
             let batch_started_at = self.clock.now();
-            let mut slots: Vec<Slot> = dispatch_all_before_wait(requests, |request| {
-                let prepared = self.prepare_batch(request, batch_started_at)?;
-                self.dispatch_batch_slot(prepared)
-            })
-            .into_iter()
-            .map(|result| {
-                result.map_or_else(
-                    |error| Slot::Done(finish_slot(batch_started_at, Err(error), &self.clock)),
-                    |pending| Slot::Pending(Box::new(pending)),
-                )
-            })
-            .collect();
-
-            for index in 0..slots.len() {
-                let Some(slot) = slots.get_mut(index) else {
-                    continue;
-                };
-                let current = replace(slot, Slot::Taken);
-                *slot = if let Slot::Pending(pending) = current {
-                    let outcome = finish_pending(*pending, &self.clock).await;
-                    Slot::Done(finish_slot(batch_started_at, outcome, &self.clock))
-                } else {
-                    current
-                };
-
-                for later in slots.iter_mut().skip(index.saturating_add(1)) {
-                    poll_slot(later, batch_started_at, &self.clock).await;
-                }
-            }
-
-            resolve_slots(slots, batch_started_at, &self.clock)
+            let harvest_clock = self.clock.clone();
+            let poll_clock = self.clock.clone();
+            orchestrate_batch(
+                requests,
+                |request| match self
+                    .prepare_batch(request, batch_started_at)
+                    .and_then(|prepared| self.dispatch_batch_slot(prepared))
+                {
+                    Ok(pending) => BatchDispatch::Pending(Box::new(pending)),
+                    Err(error) => {
+                        BatchDispatch::Done(finish_slot(batch_started_at, Err(error), &self.clock))
+                    }
+                },
+                move |pending| {
+                    let clock = harvest_clock.clone();
+                    async move {
+                        let outcome = finish_pending(*pending, &clock).await;
+                        finish_slot(batch_started_at, outcome, &clock)
+                    }
+                },
+                move |pending| {
+                    let clock = poll_clock.clone();
+                    async move { poll_slot(pending, batch_started_at, &clock).await }
+                },
+                || {
+                    finish_slot(
+                        batch_started_at,
+                        Err(EdgeError::internal(anyhow::anyhow!(
+                            "Fastly batch orchestration left an unresolved slot"
+                        ))),
+                        &self.clock,
+                    )
+                },
+            )
+            .await
         }
     }
 
@@ -681,26 +682,6 @@ mod fastly_impl {
         }
     }
 
-    fn resolve_slots(
-        slots: Vec<Slot>,
-        started_at: MonotonicInstant,
-        clock: &MonotonicClock,
-    ) -> Vec<OutboundSlotResult> {
-        slots
-            .into_iter()
-            .map(|slot| match slot {
-                Slot::Done(done) => done,
-                Slot::Pending(_) | Slot::Taken => finish_slot(
-                    started_at,
-                    Err(EdgeError::internal(anyhow::anyhow!(
-                        "Fastly batch harvest left an unresolved slot"
-                    ))),
-                    clock,
-                ),
-            })
-            .collect()
-    }
-
     fn map_backend_creation_error(error: &BackendCreationError) -> EdgeError {
         match error {
             BackendCreationError::Disallowed => EdgeError::bad_gateway_with_reason(
@@ -800,12 +781,11 @@ mod fastly_impl {
         super::classify_send_failure(cause_to_failure(error.root_cause()), budget, clock.now())
     }
 
-    async fn poll_slot(slot: &mut Slot, started_at: MonotonicInstant, clock: &MonotonicClock) {
-        let current = replace(slot, Slot::Taken);
-        let Slot::Pending(pending_slot) = current else {
-            *slot = current;
-            return;
-        };
+    async fn poll_slot(
+        pending_slot: Box<PendingSlot>,
+        started_at: MonotonicInstant,
+        clock: &MonotonicClock,
+    ) -> BatchProbe<Box<PendingSlot>, OutboundSlotResult> {
         let PendingSlot {
             budget,
             max_brotli_decoder_bytes,
@@ -820,21 +800,19 @@ mod fastly_impl {
             response_mode,
         } = *pending_slot;
         match pending_request.poll() {
-            PollResult::Pending(still_pending) => {
-                *slot = Slot::Pending(Box::new(PendingSlot {
-                    budget,
-                    max_brotli_decoder_bytes,
-                    max_brotli_window_bits,
-                    max_chunk_bytes,
-                    max_decoded_response_bytes,
-                    max_encoded_response_bytes,
-                    max_response_header_bytes,
-                    max_response_header_count,
-                    pending: still_pending,
-                    request_method,
-                    response_mode,
-                }));
-            }
+            PollResult::Pending(still_pending) => BatchProbe::Pending(Box::new(PendingSlot {
+                budget,
+                max_brotli_decoder_bytes,
+                max_brotli_window_bits,
+                max_chunk_bytes,
+                max_decoded_response_bytes,
+                max_encoded_response_bytes,
+                max_response_header_bytes,
+                max_response_header_count,
+                pending: still_pending,
+                request_method,
+                response_mode,
+            })),
             PollResult::Done(result) => {
                 let outcome = match result {
                     Ok(response) => {
@@ -856,7 +834,7 @@ mod fastly_impl {
                     }
                     Err(error) => Err(map_send_error(&error, budget, clock)),
                 };
-                *slot = Slot::Done(finish_slot(started_at, outcome, clock));
+                BatchProbe::Done(finish_slot(started_at, outcome, clock))
             }
         }
     }
@@ -1261,6 +1239,7 @@ mod fastly_impl {
         use edgezero_core::time::Deadline;
         use flate2::{Compression, write::GzEncoder};
         use futures::executor::block_on;
+        use futures::future::ready;
         use futures_util::stream;
 
         use super::*;
@@ -1623,29 +1602,49 @@ mod fastly_impl {
 
         #[test]
         fn send_all_reverse_completion_preserves_order() {
-            let started_at = MonotonicInstant::now();
-            let clock = constant_clock(started_at);
-            let mut slots = vec![Slot::Taken, Slot::Taken];
-            slots[1] = Slot::Done(OutboundSlotResult::new(
-                Duration::from_millis(2),
-                Ok(OutboundResponse::new(
-                    Method::GET,
-                    StatusCode::ACCEPTED,
-                    HeaderMap::new(),
-                    Body::empty(),
-                )),
+            let results = block_on(orchestrate_batch(
+                0_usize..2_usize,
+                BatchDispatch::Pending,
+                |index| {
+                    let status = if index == 0 {
+                        StatusCode::CREATED
+                    } else {
+                        StatusCode::ACCEPTED
+                    };
+                    ready(OutboundSlotResult::new(
+                        Duration::from_millis(if index == 0 { 5 } else { 2 }),
+                        Ok(OutboundResponse::new(
+                            Method::GET,
+                            status,
+                            HeaderMap::new(),
+                            Body::empty(),
+                        )),
+                    ))
+                },
+                |index| async move {
+                    if index == 1 {
+                        BatchProbe::Done(OutboundSlotResult::new(
+                            Duration::from_millis(2),
+                            Ok(OutboundResponse::new(
+                                Method::GET,
+                                StatusCode::ACCEPTED,
+                                HeaderMap::new(),
+                                Body::empty(),
+                            )),
+                        ))
+                    } else {
+                        BatchProbe::Pending(index)
+                    }
+                },
+                || {
+                    OutboundSlotResult::new(
+                        Duration::ZERO,
+                        Err(EdgeError::internal(anyhow::anyhow!(
+                            "batch slot invariant failed"
+                        ))),
+                    )
+                },
             ));
-            slots[0] = Slot::Done(OutboundSlotResult::new(
-                Duration::from_millis(5),
-                Ok(OutboundResponse::new(
-                    Method::GET,
-                    StatusCode::CREATED,
-                    HeaderMap::new(),
-                    Body::empty(),
-                )),
-            ));
-
-            let results = resolve_slots(slots, started_at, &clock);
 
             assert_eq!(
                 results[0].outcome.as_ref().expect("slot 0").status(),
@@ -1660,19 +1659,43 @@ mod fastly_impl {
         }
 
         #[test]
-        fn done_error_survives_poll_sweep() {
-            let started_at = MonotonicInstant::now();
-            let clock = constant_clock(started_at);
-            let mut slot = Slot::Done(OutboundSlotResult::new(
-                Duration::from_millis(4),
-                Err(EdgeError::bad_gateway_with_reason(
-                    "retained error",
-                    BadGatewayReason::Transport,
-                )),
+        fn preflight_error_survives_poll_sweep() {
+            let mut results = block_on(orchestrate_batch(
+                0_usize..2_usize,
+                |index| {
+                    if index == 0 {
+                        BatchDispatch::Done(OutboundSlotResult::new(
+                            Duration::from_millis(4),
+                            Err(EdgeError::bad_gateway_with_reason(
+                                "retained error",
+                                BadGatewayReason::Transport,
+                            )),
+                        ))
+                    } else {
+                        BatchDispatch::Pending(index)
+                    }
+                },
+                |_index| {
+                    ready(OutboundSlotResult::new(
+                        Duration::from_millis(6),
+                        Ok(OutboundResponse::new(
+                            Method::GET,
+                            StatusCode::OK,
+                            HeaderMap::new(),
+                            Body::empty(),
+                        )),
+                    ))
+                },
+                |index| async move { BatchProbe::Pending(index) },
+                || {
+                    OutboundSlotResult::new(
+                        Duration::ZERO,
+                        Err(EdgeError::internal(anyhow::anyhow!(
+                            "batch slot invariant failed"
+                        ))),
+                    )
+                },
             ));
-
-            block_on(poll_slot(&mut slot, started_at, &clock));
-            let mut results = resolve_slots(vec![slot], started_at, &clock);
             let retained = results.remove(0);
 
             assert_eq!(retained.elapsed, Duration::from_millis(4));
@@ -2201,11 +2224,99 @@ pub use fastly_impl::inject_dispatch_slack_for_test;
 pub use fastly_impl::{DYNAMIC_BACKENDS_DISABLED_MESSAGE, FastlyOutboundClient};
 
 #[cfg(any(feature = "fastly", feature = "test-utils"))]
-fn dispatch_all_before_wait<Item, Pending, Failure>(
-    items: impl IntoIterator<Item = Item>,
-    dispatch: impl FnMut(Item) -> Result<Pending, Failure>,
-) -> Vec<Result<Pending, Failure>> {
-    items.into_iter().map(dispatch).collect()
+enum BatchDispatch<Pending, Output> {
+    Done(Output),
+    Pending(Pending),
+}
+
+#[cfg(any(feature = "fastly", feature = "test-utils"))]
+#[cfg_attr(
+    not(feature = "fastly"),
+    expect(
+        dead_code,
+        reason = "native test utilities leave target-only ready polling unconstructed"
+    )
+)]
+enum BatchProbe<Pending, Output> {
+    Done(Output),
+    Pending(Pending),
+}
+
+#[cfg(any(feature = "fastly", feature = "test-utils"))]
+async fn orchestrate_batch<
+    Items,
+    Dispatch,
+    Harvest,
+    HarvestFuture,
+    Poll,
+    PollFuture,
+    Invariant,
+    Item,
+    Pending,
+    Output,
+>(
+    items: Items,
+    mut dispatch: Dispatch,
+    mut harvest: Harvest,
+    mut poll: Poll,
+    mut invariant_failure: Invariant,
+) -> Vec<Output>
+where
+    Items: IntoIterator<Item = Item>,
+    Dispatch: FnMut(Item) -> BatchDispatch<Pending, Output>,
+    Harvest: FnMut(Pending) -> HarvestFuture,
+    HarvestFuture: Future<Output = Output>,
+    Poll: FnMut(Pending) -> PollFuture,
+    PollFuture: Future<Output = BatchProbe<Pending, Output>>,
+    Invariant: FnMut() -> Output,
+{
+    let dispatched: Vec<_> = items.into_iter().map(&mut dispatch).collect();
+    let mut pending = Vec::with_capacity(dispatched.len());
+    let mut outputs = Vec::with_capacity(dispatched.len());
+    for slot in dispatched {
+        match slot {
+            BatchDispatch::Pending(value) => {
+                pending.push(Some(value));
+                outputs.push(None);
+            }
+            BatchDispatch::Done(output) => {
+                pending.push(None);
+                outputs.push(Some(output));
+            }
+        }
+    }
+
+    for index in 0..pending.len() {
+        if outputs.get(index).is_some_and(Option::is_none)
+            && let Some(slot) = pending.get_mut(index).and_then(Option::take)
+            && let Some(output) = outputs.get_mut(index)
+        {
+            *output = Some(harvest(slot).await);
+        }
+
+        for later in index.saturating_add(1)..pending.len() {
+            let Some(slot) = pending.get_mut(later).and_then(Option::take) else {
+                continue;
+            };
+            match poll(slot).await {
+                BatchProbe::Done(done) => {
+                    if let Some(output) = outputs.get_mut(later) {
+                        *output = Some(done);
+                    }
+                }
+                BatchProbe::Pending(still_pending) => {
+                    if let Some(destination) = pending.get_mut(later) {
+                        *destination = Some(still_pending);
+                    }
+                }
+            }
+        }
+    }
+
+    outputs
+        .into_iter()
+        .map(|output| output.unwrap_or_else(&mut invariant_failure))
+        .collect()
 }
 
 #[cfg(any(feature = "fastly", feature = "test-utils"))]
@@ -2234,18 +2345,40 @@ pub fn validate_batch_request_for_test(request: &OutboundRequest) -> Result<(), 
     validate_batch_request(request)
 }
 
-/// Runs the same eager dispatch phase used by Fastly production batching.
+/// Runs the same dispatch-before-harvest orchestration used by Fastly production batching.
 #[cfg(feature = "test-utils")]
 #[inline]
-pub fn dispatch_all_before_wait_for_test<Items, Dispatch, Item, Pending, Failure>(
+pub async fn orchestrate_batch_for_test<
+    Items,
+    Dispatch,
+    Harvest,
+    HarvestFuture,
+    Item,
+    Pending,
+    Output,
+>(
     items: Items,
-    dispatch: Dispatch,
-) -> Vec<Result<Pending, Failure>>
+    mut dispatch: Dispatch,
+    harvest: Harvest,
+) -> Vec<Output>
 where
     Items: IntoIterator<Item = Item>,
-    Dispatch: FnMut(Item) -> Result<Pending, Failure>,
+    Dispatch: FnMut(Item) -> Result<Pending, Output>,
+    Harvest: FnMut(Pending) -> HarvestFuture,
+    HarvestFuture: Future<Output = Output>,
+    Output: Default,
 {
-    dispatch_all_before_wait(items, dispatch)
+    orchestrate_batch(
+        items,
+        move |item| match dispatch(item) {
+            Ok(pending) => BatchDispatch::Pending(pending),
+            Err(output) => BatchDispatch::Done(output),
+        },
+        harvest,
+        |pending| async move { BatchProbe::Pending(pending) },
+        Output::default,
+    )
+    .await
 }
 
 #[cfg(any(feature = "fastly", test))]

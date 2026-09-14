@@ -28,7 +28,7 @@ use bytes::Bytes;
 
 use crate::config_store::BoundedStoreRead;
 use crate::error::EdgeError;
-use crate::time::Deadline;
+use crate::time::{Deadline, MonotonicClock};
 
 // ---------------------------------------------------------------------------
 // Contract test macro
@@ -208,14 +208,19 @@ impl SecretStore for InMemorySecretStore {
         &self,
         store_name: &str,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             return Err(SecretError::DeadlineExceeded);
         }
-        let value = self.get_bytes(store_name, key).await?;
+        let result = self.get_bytes(store_name, key).await;
+        if deadline.is_expired_at(clock.now()) {
+            return Err(SecretError::DeadlineExceeded);
+        }
+        let value = result?;
         let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
             u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
         })?;
@@ -252,11 +257,12 @@ impl SecretStore for NoopSecretStore {
         &self,
         _store_name: &str,
         _key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         _max_backend_bytes: u64,
         _max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             return Err(SecretError::DeadlineExceeded);
         }
         Ok(BoundedStoreRead {
@@ -310,6 +316,7 @@ impl SecretHandle {
         &self,
         store_name: &str,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
@@ -320,6 +327,7 @@ impl SecretHandle {
             .get_bytes_bounded(
                 store_name,
                 key,
+                clock,
                 deadline,
                 max_backend_bytes,
                 max_value_bytes,
@@ -387,17 +395,19 @@ pub trait SecretStore: Send + Sync {
         &self,
         store_name: &str,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             return Err(SecretError::DeadlineExceeded);
         }
-        let value = self.get_bytes(store_name, key).await?;
-        if deadline.is_expired() {
+        let result = self.get_bytes(store_name, key).await;
+        if deadline.is_expired_at(clock.now()) {
             return Err(SecretError::DeadlineExceeded);
         }
+        let value = result?;
         let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
             u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
         })?;
@@ -451,8 +461,11 @@ mod tests {
 
     use super::*;
     use crate::http::StatusCode;
+    use crate::time::{MonotonicClock, MonotonicInstant};
     use bytes::Bytes;
     use futures::executor::block_on;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     fn provider_handle_with(entries: &[(&str, &str)]) -> SecretHandle {
         let provider = InMemorySecretStore::new(
@@ -492,14 +505,14 @@ mod tests {
 
     #[test]
     fn bounded_secret_exact_cap_succeeds_and_over_cap_discards_value() {
-        use std::time::Duration;
-
         use crate::time::Deadline;
 
         let handle = provider_handle_with(&[("signing-keys/current", "abc123")]);
+        let clock = MonotonicClock::default();
         let exact = block_on(handle.get_bytes_bounded(
             "signing-keys",
             "current",
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             6,
             6,
@@ -511,12 +524,79 @@ mod tests {
         let error = block_on(handle.get_bytes_bounded(
             "signing-keys",
             "current",
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             6,
             5,
         ))
         .expect_err("value cap");
         assert!(matches!(error, SecretError::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_secret_read_uses_injected_clock() {
+        let handle = provider_handle_with(&[("signing-keys/current", "abc123")]);
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let clock = MonotonicClock::new(move || injected_now);
+
+        let read =
+            block_on(handle.get_bytes_bounded("signing-keys", "current", &clock, deadline, 6, 6))
+                .expect("the application clock is still before its deadline");
+
+        assert_eq!(read.value, Some(Bytes::from_static(b"abc123")));
+    }
+
+    #[test]
+    fn bounded_secret_read_deadline_wins_ready_provider_error() {
+        struct AdvancingErrorStore {
+            now: Arc<Mutex<MonotonicInstant>>,
+            terminal: MonotonicInstant,
+        }
+
+        #[async_trait(?Send)]
+        #[expect(
+            clippy::missing_trait_methods,
+            reason = "the test provider advances time through the unbounded method to exercise the default bounded implementation"
+        )]
+        impl SecretStore for AdvancingErrorStore {
+            async fn get_bytes(
+                &self,
+                _store_name: &str,
+                _key: &str,
+            ) -> Result<Option<Bytes>, SecretError> {
+                *self.now.lock().expect("clock lock") = self.terminal;
+                Err(SecretError::Unavailable)
+            }
+        }
+
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let handle = SecretHandle::new(Arc::new(AdvancingErrorStore { now, terminal }));
+
+        let error = block_on(handle.get_bytes_bounded(
+            "signing-keys",
+            "current",
+            &clock,
+            Deadline::at_instant(terminal),
+            6,
+            6,
+        ))
+        .expect_err("equality expiry must beat a ready provider error");
+
+        assert!(matches!(error, SecretError::DeadlineExceeded));
     }
 
     #[test]

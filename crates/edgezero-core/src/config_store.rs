@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::error::EdgeError;
-use crate::time::{DEADLINE_FAR_FUTURE, Deadline};
+use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock};
 
 // ---------------------------------------------------------------------------
 // Contract test macro
@@ -303,17 +303,19 @@ pub trait ConfigStore: Send + Sync {
     async fn get_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
-        if deadline.is_expired() {
+        if deadline.is_expired_at(clock.now()) {
             return Err(ConfigStoreError::DeadlineExceeded);
         }
-        let value = self.get(key).await?;
-        if deadline.is_expired() {
+        let result = self.get(key).await;
+        if deadline.is_expired_at(clock.now()) {
             return Err(ConfigStoreError::DeadlineExceeded);
         }
+        let value = result?;
         let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
             u64::try_from(stored_value.len())
                 .map_err(|_length_error| ConfigStoreError::ValueTooLarge)
@@ -363,12 +365,13 @@ impl ConfigStoreHandle {
     pub async fn get_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
         self.store
-            .get_bounded(key, deadline, max_backend_bytes, max_value_bytes)
+            .get_bounded(key, clock, deadline, max_backend_bytes, max_value_bytes)
             .await
     }
 
@@ -397,9 +400,10 @@ mod tests {
     );
 
     use super::*;
-    use crate::time::Deadline;
+    use crate::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures::executor::block_on;
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     struct FailingConfigStore;
@@ -458,8 +462,10 @@ mod tests {
     #[test]
     fn bounded_exact_cap_succeeds_and_over_cap_discards_value() {
         let store_handle = handle(&[("feature.checkout", "true")]);
+        let clock = MonotonicClock::default();
         let exact = block_on(store_handle.get_bounded(
             "feature.checkout",
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             4,
             4,
@@ -470,12 +476,69 @@ mod tests {
 
         let error = block_on(store_handle.get_bounded(
             "feature.checkout",
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             3,
             4,
         ))
         .expect_err("backend cap");
         assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_read_uses_injected_clock() {
+        let store_handle = handle(&[("feature.checkout", "true")]);
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let clock = MonotonicClock::new(move || injected_now);
+
+        let read = block_on(store_handle.get_bounded("feature.checkout", &clock, deadline, 4, 4))
+            .expect("the application clock is still before its deadline");
+
+        assert_eq!(read.value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn bounded_read_deadline_wins_ready_provider_error() {
+        struct AdvancingErrorStore {
+            now: Arc<Mutex<MonotonicInstant>>,
+            terminal: MonotonicInstant,
+        }
+
+        #[async_trait(?Send)]
+        impl ConfigStore for AdvancingErrorStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                *self.now.lock().expect("clock lock") = self.terminal;
+                Err(ConfigStoreError::unavailable("provider failed at expiry"))
+            }
+        }
+
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let store_handle = ConfigStoreHandle::new(Arc::new(AdvancingErrorStore { now, terminal }));
+
+        let error = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            &clock,
+            Deadline::at_instant(terminal),
+            4,
+            4,
+        ))
+        .expect_err("equality expiry must beat a ready provider error");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
     }
 
     #[test]

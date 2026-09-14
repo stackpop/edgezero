@@ -11,7 +11,7 @@
 ## Current Baseline
 
 - Rust 1.95, edition 2024, resolver 2.
-- Four runtime adapters: Axum, Cloudflare, Fastly, and Spin SDK 6 / WASI HTTP 0.3.
+- Four runtime adapters: Axum, Cloudflare, Fastly, and Spin SDK 7 / WASI HTTP 0.3.
 - Adapter dispatch has both `execute(..)` and `execute_capture(..)` entry points.
 - The action set includes staged deploy, version emission, healthcheck, and rollback in
   addition to build/serve/deploy/auth.
@@ -68,15 +68,15 @@
 
 | Phase | Scope | Plan status |
 | --- | --- | --- |
-| 0 | Bootstrap inert default-branch exact-SHA probe dispatchers and provision protected disposable environments/origin | Executable and required before Phase 4: [`2026-09-06-outbound-http-phase0-probe-bootstrap.md`](2026-09-06-outbound-http-phase0-probe-bootstrap.md) |
+| 0 | Bootstrap inert default-branch exact-SHA probe dispatchers and provision protected disposable environments/origin | Not landed; required only before promoting provider capabilities from `BestEffort`: [`2026-09-06-outbound-http-phase0-probe-bootstrap.md`](2026-09-06-outbound-http-phase0-probe-bootstrap.md) |
 | 1a | Add `BadGatewayReason`, `BudgetSource`, typed `BadGateway`, attributed `GatewayTimeout`, `Deadline`, and the three deadline constants | Implemented; plan: [`2026-07-10-outbound-http-phase1a-error-time.md`](2026-07-10-outbound-http-phase1a-error-time.md) |
-| 1b | Add the pinned direct `url` dependency, outbound request/response types, one-time canonical URI construction, resource-limit builders, `DispatchBudget`, and `dispatch_budget` in a buildable dependency order | Executable: [`2026-09-06-outbound-http-phase1b-core-types-budget.md`](2026-09-06-outbound-http-phase1b-core-types-budget.md) |
-| 2 | Typed body errors, typed response-limit errors, encoded/header/Brotli/chunk controls, bounded/deadline-aware drains, normalization, and shared decoder primitives | Executable: [`2026-09-06-outbound-http-phase2-body-response-limits.md`](2026-09-06-outbound-http-phase2-body-response-limits.md) |
-| 3 | Manifest capability declarations, fail-closed adapter metadata contract, paired target/contract resolver, CLI gates, and selected-component Spin host-drift validation | Executable: [`2026-09-06-outbound-http-phase3-capabilities-cli.md`](2026-09-06-outbound-http-phase3-capabilities-cli.md) |
-| 4 | Axum and Cloudflare outbound implementations, response-converter scheduling, host-event fairness, and contract tests | Executable: [`2026-09-06-outbound-http-phase4-axum-cloudflare.md`](2026-09-06-outbound-http-phase4-axum-cloudflare.md) |
-| 5 | Spin hand-built WASI HTTP request/response state machines, completion-error mapping, and cooperative raw/decoded-input fairness | Task 0 executable characterization; Tasks 1-6 blocked until it passes: [`2026-09-06-outbound-http-phase5-spin.md`](2026-09-06-outbound-http-phase5-spin.md) |
-| 6 | Fastly dispatch/harvest engine, dynamic backends, timers, and test seams | Authored; execute only after Phase 5's blocker is cleared: [`2026-09-06-outbound-http-phase6-fastly.md`](2026-09-06-outbound-http-phase6-fastly.md) |
-| 7 | Templates, `app-demo`, public docs, generated-project checks, hard legacy-API removal, and remaining live-host characterization | Authored; execute only after Phases 5-6 pass: [`2026-09-06-outbound-http-phase7-migration-docs.md`](2026-09-06-outbound-http-phase7-migration-docs.md) |
+| 1b | Add the pinned direct `url` dependency, outbound request/response types, one-time canonical URI construction, resource-limit builders, `DispatchBudget`, and `dispatch_budget` in a buildable dependency order | Implemented; plan: [`2026-09-06-outbound-http-phase1b-core-types-budget.md`](2026-09-06-outbound-http-phase1b-core-types-budget.md) |
+| 2 | Typed body errors, typed response-limit errors, encoded/header/Brotli/chunk controls, bounded/deadline-aware drains, normalization, and shared decoder primitives | Implemented; plan: [`2026-09-06-outbound-http-phase2-body-response-limits.md`](2026-09-06-outbound-http-phase2-body-response-limits.md) |
+| 3 | Manifest capability declarations, fail-closed adapter metadata contract, paired target/contract resolver, CLI gates, and selected-component Spin host-drift validation | Implemented; plan: [`2026-09-06-outbound-http-phase3-capabilities-cli.md`](2026-09-06-outbound-http-phase3-capabilities-cli.md) |
+| 4 | Axum and Cloudflare outbound implementations, response-converter scheduling, host-event fairness, and contract tests | Implemented; deployed Cloudflare promotion evidence remains external: [`2026-09-06-outbound-http-phase4-axum-cloudflare.md`](2026-09-06-outbound-http-phase4-axum-cloudflare.md) |
+| 5 | Spin hand-built WASI HTTP request/response state machines, completion-error mapping, and cooperative raw/decoded-input fairness | Implemented with repository-pinned SDK-resource execution: [`2026-09-06-outbound-http-phase5-spin.md`](2026-09-06-outbound-http-phase5-spin.md) |
+| 6 | Fastly dispatch/harvest engine, dynamic backends, timers, and test seams | Implemented; deployed Fastly characterization remains external: [`2026-09-06-outbound-http-phase6-fastly.md`](2026-09-06-outbound-http-phase6-fastly.md) |
+| 7 | Templates, `app-demo`, public docs, generated-project checks, hard legacy-API removal, and remaining live-host characterization | Implemented; live-host promotion evidence remains external: [`2026-09-06-outbound-http-phase7-migration-docs.md`](2026-09-06-outbound-http-phase7-migration-docs.md) |
 
 After the inert workflow bootstrap above, the phase numbers after 1a are organizational
 guidance, not permission to split an
@@ -141,10 +141,9 @@ Before writing any later phase plan:
 
 ## Readiness
 
-Phase 1a is implemented. Phase 0 and Plans 1b-3 are executable; Phase 0 must merge before
-Phase 4's protected host-evidence task. Phase 5 Task 0 is an executable characterization;
-the remainder of Phase 5 and all downstream phases stay
-blocked until its mandatory real WASI HTTP SDK-resource runner proof passes with the named
-nonzero tests. The master design remains the normative behavior contract; these plans
-define implementation order, red/green tests, commits, and verification commands without
-replacing it.
+Phases 1a-7 are implemented on PR 275. Phase 0's protected default-branch probe
+dispatchers and the resulting deployed-provider observations remain external promotion
+evidence; their absence keeps the documented provider limitations at `BestEffort` and does
+not turn local or WASM-runner tests into host-certification evidence. The master design
+remains the normative behavior contract; these phase plans preserve the implementation
+history without replacing it.

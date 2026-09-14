@@ -1,3 +1,4 @@
+use edgezero_adapter::cli_support::validate_spin_outbound_host_contract;
 use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
 use edgezero_core::manifest::{
     CapabilitySupport, Manifest, ManifestContract, ManifestLoader, ResolvedEnvironment,
@@ -233,10 +234,36 @@ fn ensure_action_capabilities(runtime: &ResolvedRuntime) -> Result<(), String> {
     if !produces_current_runtime(runtime.action()) {
         return Err("operational action entered outbound runtime dispatcher".to_owned());
     }
+    ensure_spin_outbound_hosts(runtime)?;
     ensure_capabilities(
         runtime.adapter_name(),
         ManifestContract::from_opt(runtime.manifest()),
     )
+}
+
+fn ensure_spin_outbound_hosts(runtime: &ResolvedRuntime) -> Result<(), String> {
+    if !runtime.adapter_name().eq_ignore_ascii_case("spin") {
+        return Ok(());
+    }
+    let Some(manifest) = runtime.manifest() else {
+        return Ok(());
+    };
+    let manifest_path = runtime
+        .manifest_path()
+        .ok_or_else(|| "resolved Spin runtime lost its application manifest path".to_owned())?;
+    let (platform_manifest, component) = match runtime.target() {
+        ResolvedAdapterTarget::Registered(target) => {
+            (target.platform_manifest(), target.component())
+        }
+        ResolvedAdapterTarget::Shell(shell) => (shell.platform_manifest(), shell.component()),
+    };
+    let platform_manifest_path = platform_manifest.ok_or_else(|| {
+        format!(
+            "Spin runtime in {} has no selected spin.toml; set [adapters.spin.adapter].manifest",
+            manifest_path.display()
+        )
+    })?;
+    validate_spin_outbound_host_contract(manifest, manifest_path, platform_manifest_path, component)
 }
 
 fn execute_after_gate(runtime: &ResolvedRuntime, adapter_args: &[String]) -> Result<(), String> {
@@ -612,14 +639,19 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, apply_environment, ensure_capabilities};
+    use super::{ResolvedEnvironment, apply_environment, ensure_capabilities, execute_runtime};
+    use crate::adapter::Action;
+    use crate::manifest_source::resolve_runtime_from;
     use crate::test_support::manifest_guard;
     use edgezero_adapter::registry::{Adapter, AdapterAction, register_adapter};
     use edgezero_core::manifest::{
         Capability, CapabilitySupport, ManifestContract, ManifestLoader, ResolvedEnvironmentBinding,
     };
     use edgezero_core::test_env::EnvOverride;
+    use std::ffi::OsString;
+    use std::fs;
     use std::process::Command;
+    use tempfile::tempdir;
 
     static BEST_EFFORT_ADAPTER: GateAdapter = GateAdapter {
         name: "gate-best-effort",
@@ -841,6 +873,66 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    #[test]
+    fn spin_host_drift_blocks_runtime_actions_before_dispatch() {
+        let dir = tempdir().expect("temp dir");
+        let marker = dir.path().join("runtime-started");
+        let manifest_path = dir.path().join("edgezero.toml");
+        fs::write(
+            dir.path().join("spin.toml"),
+            "[component.app]\nallowed_outbound_hosts = [\"https://actual.example\"]\n",
+        )
+        .expect("write Spin manifest");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[capabilities.outbound]\nhosts = [\"https://expected.example\"]\n\
+                 [adapters.spin.adapter]\nmanifest = \"spin.toml\"\ncomponent = \"app\"\n\
+                 [adapters.spin.commands]\nbuild = \"touch {}\"\nserve = \"touch {}\"\ndeploy = \"touch {}\"\n",
+                marker.display(),
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .expect("write application manifest");
+
+        for action in [
+            Action::Build,
+            Action::Serve,
+            Action::Deploy,
+            Action::DeployStaged,
+        ] {
+            let runtime = resolve_runtime_from(
+                "spin",
+                action,
+                dir.path(),
+                Some(OsString::from(&manifest_path)),
+            )
+            .expect("resolve runtime");
+            let error = execute_runtime(&runtime, &[]).expect_err("host drift must fail closed");
+            assert!(error.contains("Spin outbound host drift"), "{error}");
+            assert!(!marker.exists(), "runtime side effect for {action}");
+        }
+
+        fs::write(
+            &manifest_path,
+            "[capabilities.outbound]\nhosts = [\"https://expected.example\"]\n\
+             [adapters.spin.adapter]\nmanifest = \"spin.toml\"\ncomponent = \"app\"\n",
+        )
+        .expect("replace application manifest with registered target");
+        let registered = resolve_runtime_from(
+            "spin",
+            Action::Build,
+            dir.path(),
+            Some(OsString::from(&manifest_path)),
+        )
+        .expect("resolve registered runtime");
+        let error = execute_runtime(&registered, &[])
+            .expect_err("registered target host drift must fail before adapter dispatch");
+        assert!(error.contains("Spin outbound host drift"), "{error}");
+        assert!(!marker.exists(), "registered adapter must not run on drift");
     }
 
     #[test]

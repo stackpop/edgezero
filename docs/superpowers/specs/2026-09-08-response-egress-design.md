@@ -45,13 +45,19 @@ request signals, connection supervisors, and platform writers submit events to t
 they do not own independent attempt guards. The coordinator serializes competing terminal
 events and releases all source and transport resources after the first terminal transition.
 
-Every final client response produced after the adapter successfully constructs an EdgeZero
-request-egress context uses the owned transport path, including successful handlers, handler
-errors, admission refusals, framework 404/405 responses, and adapter-private fallbacks. Errors
-that arise after that boundary but before an application response envelope exists use the same
-app clock and request metadata with the default bounded policy; they do not bypass egress
-ownership. Host/parser-generated responses emitted before EdgeZero can construct that context
-are outside this lifecycle and remain governed by the raw-ingress capability contract.
+Every final client response produced after successful admission uses the application-owned
+transport path, including successful handlers, handler errors, framework 404/405 responses, and
+adapter-private fallbacks. Errors that arise after `PreparedIngress` exists but before normal
+dispatch complete consume that proof through `App::admitted_error_egress`; the envelope retains
+the app clock, request metadata, policy, observer, deadline, and exactly-once terminal semantics.
+An adapter must not turn source construction, core request conversion, or dispatch failure into a
+provider error or detached response after this boundary.
+
+Normalized head-validation failures and admission refusals occur before successful admission.
+They are converted to typed HTTP responses through detached ingress egress and invoke the
+application response-egress policy and observer zero times. Host/parser-generated responses
+emitted before EdgeZero can construct normalized ingress metadata remain outside this lifecycle
+and are governed by the raw-ingress capability contract.
 
 ## 3. Core contract
 
@@ -233,7 +239,9 @@ platform's empty-body finish boundary.
 After commit, status and headers are immutable. Deadline, source failure, cancellation, and
 write failure drop the source and staged chunk, invoke the strongest platform abort/reset/error
 primitive, and report the first terminal cause. No adapter appends an error payload to a
-partially written response.
+partially written response. A shared body/framing wrapper drops its source and any native reader
+state before making a terminal `Err` item visible; cleanup never depends on the adapter polling
+that wrapper again or dropping it after observing the error.
 
 ### 4.2 Backpressure and memory
 
@@ -295,7 +303,8 @@ After suppression is resolved, every adapter applies these common field rules:
 
 Repeated end-to-end fields are appended rather than replaced. Every adapter that receives an
 application `Connection` field parses its comma-separated tokens and removes every nominated
-field in addition to the standard hop-by-hop fields before provider conversion. A provider
+field in addition to the standard hop-by-hop fields and the de facto `Proxy-Connection` field
+before provider conversion. A provider
 that rejects or hides `Connection` earlier documents that equivalent boundary. Invalid
 connection tokens fail before commit as `ConversionError`. These rules are shared semantics
 implemented separately with each provider's structured header API; adapters do not serialize
@@ -498,7 +507,7 @@ Every adapter gets deterministic lifecycle tests before provider integration:
 | Accounting   | Exact payload totals, zero-byte response, checked overflow, short/partial writes, cancellation prefixes, and no headers/framing in the count.                                                                      |
 | Commit       | Pre-commit failure may synthesize a bounded fallback; post-commit failure aborts without rewriting status or appending a body.                                                                                     |
 | Backpressure | Holding one platform write prevents the next source poll and bounds EdgeZero staging to one chunk.                                                                                                                 |
-| Teardown     | Source drop and native abort/reset/error/close occur on every supported failure path. A losing future cannot mutate terminal state.                                                                                |
+| Teardown     | Source drop and native abort/reset/error/close occur on every supported failure path. A terminal stream error releases its source/native state before yielding `Err`, without a repoll or wrapper drop. A losing future cannot mutate terminal state. |
 | Headers      | Repeated fields, including `Set-Cookie`, survive the new low-level conversion paths.                                                                                                                               |
 | Framing      | `HEAD`, body-forbidden statuses, content-length exact/short/long bodies, removed transfer encoding, unsupported upgrades, and early EOF behave identically across adapters.                                        |
 | Migration    | Removed APIs fail to compile; generated and demo applications compile only against the new entrypoints and response types.                                                                                         |

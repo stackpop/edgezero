@@ -2849,6 +2849,7 @@ where
         let read = bound
             .get_bytes_bounded(
                 &key_name,
+                budget.clock(),
                 budget.deadline(),
                 budget.remaining_backend_bytes(),
                 budget.max_secret_bytes(),
@@ -3017,6 +3018,7 @@ where
     let read = handle
         .get_bounded(
             key,
+            budget.clock(),
             budget.deadline(),
             budget.remaining_backend_bytes(),
             budget.max_blob_bytes(),

@@ -20,7 +20,7 @@ use std::future::Future;
 
 use async_trait::async_trait;
 use edgezero_core::config_store::{BoundedStoreRead, ConfigStore, ConfigStoreError};
-use edgezero_core::time::Deadline;
+use edgezero_core::time::{Deadline, MonotonicClock};
 #[cfg(test)]
 use std::collections::HashMap;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
@@ -88,11 +88,19 @@ impl ConfigStore for CloudflareConfigStore {
     async fn get_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
-        bounded_config_read(self.get(key), deadline, max_backend_bytes, max_value_bytes).await
+        bounded_config_read(
+            self.get(key),
+            clock,
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+        )
+        .await
     }
 }
 
@@ -100,6 +108,7 @@ impl ConfigStore for CloudflareConfigStore {
 // apply immediately after host materialization rather than during allocation.
 async fn bounded_config_read<F>(
     read: F,
+    clock: &MonotonicClock,
     deadline: Deadline,
     max_backend_bytes: u64,
     max_value_bytes: u64,
@@ -107,12 +116,12 @@ async fn bounded_config_read<F>(
 where
     F: Future<Output = Result<Option<String>, ConfigStoreError>>,
 {
-    if deadline.is_expired() {
+    if deadline.is_expired_at(clock.now()) {
         return Err(ConfigStoreError::DeadlineExceeded);
     }
 
     let result = read.await;
-    if deadline.is_expired() {
+    if deadline.is_expired_at(clock.now()) {
         drop(result);
         return Err(ConfigStoreError::DeadlineExceeded);
     }
@@ -136,10 +145,10 @@ where
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::thread;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use edgezero_core::time::Deadline;
+    use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures::executor::block_on;
 
     edgezero_core::config_store_contract_tests!(cloudflare_config_store_contract, {
@@ -151,8 +160,10 @@ mod tests {
 
     #[test]
     fn bounded_read_reports_exact_bytes_and_accepts_exact_caps() {
+        let clock = MonotonicClock::default();
         let result = block_on(bounded_config_read(
             async { Ok(Some("value".to_owned())) },
+            &clock,
             Deadline::after(Duration::from_secs(1)),
             5,
             5,
@@ -166,8 +177,10 @@ mod tests {
     #[test]
     fn bounded_read_rejects_either_exceeded_cap() {
         for (max_backend_bytes, max_value_bytes) in [(4, 5), (5, 4)] {
+            let clock = MonotonicClock::default();
             let error = block_on(bounded_config_read(
                 async { Ok(Some("value".to_owned())) },
+                &clock,
                 Deadline::after(Duration::from_secs(1)),
                 max_backend_bytes,
                 max_value_bytes,
@@ -181,11 +194,13 @@ mod tests {
     #[test]
     fn bounded_read_checks_deadline_before_polling_host_call() {
         let polled = Cell::new(false);
+        let clock = MonotonicClock::default();
         let error = block_on(bounded_config_read(
             async {
                 polled.set(true);
                 Ok(None)
             },
+            &clock,
             Deadline::after(Duration::ZERO),
             1,
             1,
@@ -198,12 +213,20 @@ mod tests {
 
     #[test]
     fn bounded_read_checks_deadline_after_host_call() {
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
         let error = block_on(bounded_config_read(
             async {
-                thread::sleep(Duration::from_millis(10));
+                *now.lock().expect("clock lock") = terminal;
                 Ok(None)
             },
-            Deadline::after(Duration::from_millis(1)),
+            &clock,
+            Deadline::at_instant(terminal),
             1,
             1,
         ))
@@ -214,17 +237,50 @@ mod tests {
 
     #[test]
     fn bounded_read_deadline_wins_over_late_host_error() {
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
         let error = block_on(bounded_config_read(
             async {
-                thread::sleep(Duration::from_millis(10));
+                *now.lock().expect("clock lock") = terminal;
                 Err(ConfigStoreError::unavailable("late host error"))
             },
-            Deadline::after(Duration::from_millis(1)),
+            &clock,
+            Deadline::at_instant(terminal),
             1,
             1,
         ))
         .expect_err("the post-call deadline check must run after host errors");
 
         assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn bounded_config_read_uses_injected_clock() {
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let clock = MonotonicClock::new(move || injected_now);
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+
+        let result = block_on(bounded_config_read(
+            async { Ok(Some("value".to_owned())) },
+            &clock,
+            deadline,
+            5,
+            5,
+        ))
+        .expect("the application clock is still before its deadline");
+
+        assert_eq!(result.value.as_deref(), Some("value"));
     }
 }

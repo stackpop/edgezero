@@ -10,9 +10,7 @@ use std::task::{Context, Poll};
 use axum::http::Response;
 use bytes::Bytes;
 use edgezero_core::body::{Body, BodyStream};
-use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method, Response as CoreResponse, StatusCode};
-use edgezero_core::response::IntoResponse as _;
 use edgezero_core::response_egress::{
     RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
     ResponseEgressFallbackDisposition, ResponseEgressOutcome,
@@ -422,6 +420,19 @@ impl HttpBody for AxumEgressBody {
             ResponseSource::Once(bytes) => Poll::Ready(bytes.take().map(Ok)),
             ResponseSource::Stream(stream) => stream.as_mut().poll_next(cx),
         };
+        if !matches!(next, Poll::Pending) {
+            if let Some(outcome) = this.requested_failure() {
+                this.fail(outcome);
+                return Poll::Ready(Some(Err(AxumBodyError(outcome))));
+            }
+            if this.deadline_expired() {
+                this.source = ResponseSource::Done;
+                this.fail(ResponseEgressOutcome::DeadlineExceeded);
+                return Poll::Ready(Some(Err(AxumBodyError(
+                    ResponseEgressOutcome::DeadlineExceeded,
+                ))));
+            }
+        }
         match next {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(bytes))) => {
@@ -573,18 +584,6 @@ fn detached_fallback(cause: ResponseEgressOutcome) -> Response<AxumEgressBody> {
     response
 }
 
-/// Converts a pre-admission failure without exposing provider diagnostics or polling a stream.
-pub(crate) fn detached_error_response(error: EdgeError) -> Response<AxumEgressBody> {
-    let Ok(response) = error.into_response() else {
-        return detached_fallback(ResponseEgressOutcome::ConversionError);
-    };
-    let (parts, body) = response.into_parts();
-    let Body::Once(bytes) = body else {
-        return detached_fallback(ResponseEgressOutcome::ConversionError);
-    };
-    Response::from_parts(parts, AxumEgressBody::detached(bytes))
-}
-
 const fn fallback_parts(cause: ResponseEgressOutcome) -> (StatusCode, &'static [u8]) {
     if matches!(cause, ResponseEgressOutcome::DeadlineExceeded) {
         (StatusCode::GATEWAY_TIMEOUT, TIMEOUT_FALLBACK_BODY)
@@ -595,6 +594,7 @@ const fn fallback_parts(cause: ResponseEgressOutcome) -> (StatusCode, &'static [
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
@@ -622,6 +622,17 @@ mod tests {
         fn complete(&self, report: &ResponseEgressReport) {
             self.0.lock().expect("reports lock").push(report.clone());
         }
+    }
+
+    fn scripted_clock(script: Vec<MonotonicInstant>) -> MonotonicClock {
+        let observations = Arc::new(Mutex::new(VecDeque::from(script)));
+        MonotonicClock::new(move || {
+            observations
+                .lock()
+                .expect("clock observations")
+                .pop_front()
+                .expect("clock observation")
+        })
     }
 
     fn attempt(observer: &RecordingObserver, now: MonotonicInstant) -> ResponseEgressAttempt {
@@ -727,6 +738,40 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bytes_written, 0);
         assert_eq!(reports[0].outcome, ResponseEgressOutcome::TransportError);
+        assert!(connection.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_egress_post_ready_deadline_precedence() {
+        let observer = RecordingObserver::default();
+        let now = MonotonicInstant::now();
+        let deadline = now.checked_add(Duration::from_secs(1)).expect("deadline");
+        let clock = scripted_clock(vec![now, now, deadline, deadline]);
+        let connection = EgressConnection::default();
+        let body_result = AxumEgressBody::application(
+            Body::from_stream(poll_stream(|_context| {
+                Poll::Ready(Some(Ok(Bytes::from_static(b"late"))))
+            })),
+            Deadline::at_instant(deadline),
+            clock,
+            attempt(&observer, now),
+            &connection,
+        );
+        let Ok(body) = body_result else {
+            panic!("register body");
+        };
+        let mut pinned_body = Box::pin(body);
+
+        let error = poll_future(|context| pinned_body.as_mut().poll_frame(context))
+            .await
+            .expect("terminal frame")
+            .expect_err("deadline must win over ready source data");
+
+        assert!(error.is_deadline());
+        let reports = observer.0.lock().expect("reports lock");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].bytes_written, 0);
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::DeadlineExceeded);
         assert!(connection.is_empty());
     }
 }

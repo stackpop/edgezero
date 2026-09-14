@@ -154,9 +154,7 @@ mod lifecycle_tests {
             .body(Body::empty())
             .expect("request");
 
-        let response = block_on(app.dispatch_admitted(prepared, request))
-            .expect("dispatch")
-            .into_response();
+        let response = block_on(app.dispatch_admitted(prepared, request)).into_response();
         let payload: serde_json::Value = response.body().to_json().expect("json");
         assert_eq!(payload["route_class"], "diagnostic");
         assert_eq!(payload["grant_consumed_once"], true);
