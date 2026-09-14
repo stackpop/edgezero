@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "the platform module follows runtime, writer, race, and entrypoint lifecycle order"
+    )
+)]
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
@@ -336,6 +344,10 @@ where
             cause: ResponseEgressOutcome::ConversionError,
         };
     }
+    if !transmits_body {
+        settle_success(kind, &mut attempt, clock.now());
+        return StartOutcome::Started(platform_response);
+    }
     let task = AssertUnwindSafe(transmit_committed(body, policy, attempt, clock, kind, io))
         .catch_unwind()
         .map(|result| {
@@ -404,21 +416,21 @@ fn fallback_response(cause: ResponseEgressOutcome) -> Response {
 }
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-#[expect(
-    clippy::arbitrary_source_item_ordering,
-    reason = "the platform module follows runtime, writer, race, and entrypoint lifecycle order"
-)]
 mod platform {
     use super::{
         BodyStream, Bytes, CloudflareEgressCommitter, CloudflareEgressIo, Deadline, DeliveryError,
         Duration, EdgeError, EgressKind, HeaderMap, IoFailure, IoFailureKind, LocalBoxFuture,
         MonotonicClock, StartOutcome, StatusCode, ensure_deadline, start_fallback, start_prepared,
     };
+    use std::future::Future;
     use std::sync::Arc;
 
     use edgezero_core::response_egress::ResponseEgressEnvelope;
     use futures_util::StreamExt as _;
+    use futures_util::future::{Either, select};
+    use worker::js_sys::{BigInt, Uint8Array};
     use worker::wasm_bindgen_futures::JsFuture;
+    use worker::worker_sys::FixedLengthStream;
     use worker::{AbortSignal, Context, Delay, Response as CfResponse};
 
     use crate::outbound::copy_header_values;
@@ -461,12 +473,12 @@ mod platform {
         fn prepare(
             &mut self,
             status: StatusCode,
-            source_headers: &HeaderMap,
+            headers: &HeaderMap,
             declared_length: Option<u64>,
             transmits_body: bool,
         ) -> Result<(Self::Response, Self::Io), DeliveryError> {
-            let mut headers = worker::Headers::new();
-            copy_header_values(source_headers, &mut headers, |_name| {
+            let mut worker_headers = worker::Headers::new();
+            copy_header_values(headers, &mut worker_headers, |_name| {
                 EdgeError::internal(anyhow::anyhow!(
                     "response header cannot be represented by Workers"
                 ))
@@ -474,7 +486,7 @@ mod platform {
             .map_err(|_error| DeliveryError::Conversion)?;
             let builder = CfResponse::builder()
                 .with_status(status.as_u16())
-                .with_headers(headers);
+                .with_headers(worker_headers);
             if !transmits_body {
                 return Ok((
                     builder.empty(),
@@ -484,23 +496,18 @@ mod platform {
                     },
                 ));
             }
-            let (readable, writable) = match declared_length {
-                Some(length) => {
-                    let fixed = if let Ok(length) = u32::try_from(length) {
-                        worker::worker_sys::FixedLengthStream::new(length)
-                    } else {
-                        worker::worker_sys::FixedLengthStream::new_big_int(
-                            worker::js_sys::BigInt::from(length),
-                        )
-                    }
-                    .map_err(|_error| DeliveryError::Conversion)?;
-                    (fixed.readable(), fixed.writable())
+            let (readable, writable) = if let Some(length) = declared_length {
+                let fixed = if let Ok(length_u32) = u32::try_from(length) {
+                    FixedLengthStream::new(length_u32)
+                } else {
+                    FixedLengthStream::new_big_int(BigInt::from(length))
                 }
-                None => {
-                    let transform = web_sys::TransformStream::new()
-                        .map_err(|_error| DeliveryError::Conversion)?;
-                    (transform.readable(), transform.writable())
-                }
+                .map_err(|_error| DeliveryError::Conversion)?;
+                (fixed.readable(), fixed.writable())
+            } else {
+                let transform =
+                    web_sys::TransformStream::new().map_err(|_error| DeliveryError::Conversion)?;
+                (transform.readable(), transform.writable())
             };
             let writer = writable
                 .get_writer()
@@ -552,7 +559,7 @@ mod platform {
         signal: &AbortSignal,
     ) -> RaceEvent<Operation::Output>
     where
-        Operation: std::future::Future,
+        Operation: Future,
     {
         if signal.aborted() {
             return RaceEvent::Cancelled;
@@ -564,15 +571,15 @@ mod platform {
         let timer = Delay::from(remaining);
         let guard = async move {
             futures_util::pin_mut!(cancellation, timer);
-            match futures_util::future::select(cancellation, timer).await {
-                futures_util::future::Either::Left(((), _timer)) => RaceEvent::Cancelled,
-                futures_util::future::Either::Right(((), _cancellation)) => RaceEvent::Deadline,
+            match select(cancellation, timer).await {
+                Either::Left(((), _timer)) => RaceEvent::Cancelled,
+                Either::Right(((), _cancellation)) => RaceEvent::Deadline,
             }
         };
         futures_util::pin_mut!(guard, operation);
-        match futures_util::future::select(guard, operation).await {
-            futures_util::future::Either::Left((event, _operation)) => event,
-            futures_util::future::Either::Right((output, _guard)) => {
+        match select(guard, operation).await {
+            Either::Left((event, _operation)) => event,
+            Either::Right((output, _guard)) => {
                 let terminal = if signal.aborted() {
                     Some(IoFailureKind::Cancelled)
                 } else if deadline.is_expired_at(clock.now()) {
@@ -626,9 +633,9 @@ mod platform {
                 } => Err(IoFailureKind::Transport),
             };
             if result.is_ok()
-                && let Some(writer) = self.writer.take()
+                && let Some(finished_writer) = self.writer.take()
             {
-                writer.release_lock();
+                finished_writer.release_lock();
             }
             result
         }
@@ -667,7 +674,7 @@ mod platform {
                     kind: IoFailureKind::Transport,
                 });
             };
-            let chunk = worker::js_sys::Uint8Array::from(bytes.as_slice());
+            let chunk = Uint8Array::from(bytes.as_slice());
             let event = race_operation(
                 JsFuture::from(writer.write_with_chunk(&chunk.into())),
                 deadline,
@@ -731,9 +738,16 @@ mod platform {
                     &mut committer,
                 ) {
                     StartOutcome::Started(response) => Ok(response),
-                    StartOutcome::Precommit { attempt, cause } => {
-                        start_fallback(&request_method, cause, *attempt, &clock, &mut committer)
-                    }
+                    StartOutcome::Precommit {
+                        attempt: failed_attempt,
+                        cause,
+                    } => start_fallback(
+                        &request_method,
+                        cause,
+                        *failed_attempt,
+                        &clock,
+                        &mut committer,
+                    ),
                 }
             }
             Err(failure) => {

@@ -839,6 +839,7 @@ mod tests {
 
     use super::*;
     use edgezero_core::context::RequestContext;
+    use edgezero_core::http::{Response, StatusCode, response_builder};
     use edgezero_core::outbound::OutboundRequest;
     use edgezero_core::router::RouterService;
     use wasm_bindgen_test::wasm_bindgen_test;
@@ -862,13 +863,29 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn standard_service_installs_the_exact_application_outbound_clock() {
-        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+        async fn elapsed(ctx: RequestContext) -> Result<Response, EdgeError> {
             let client = ctx
                 .http_client()
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
-            let request = OutboundRequest::get("https://example.com/")?.stream_response();
+            let request =
+                OutboundRequest::get("https://example.com/")?.body(Body::from("invalid GET body"));
             let results = client.send_all(vec![request]).await;
-            Ok(results[0].elapsed.as_millis().to_string())
+            let result = results
+                .first()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing outbound result")))?;
+            if !matches!(&result.outcome, Err(EdgeError::BadRequest { .. })) {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "clock probe did not fail during batch preflight"
+                )));
+            }
+            response_builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(
+                    "x-edgezero-elapsed-ms",
+                    result.elapsed.as_millis().to_string(),
+                )
+                .body(Body::empty())
+                .map_err(EdgeError::internal)
         }
 
         let start = MonotonicInstant::now();
@@ -891,12 +908,19 @@ mod tests {
         let env = Object::new().unchecked_into::<Env>();
         let js_context = Object::new().unchecked_into::<WorkerSysContext>();
 
-        let mut response = CloudflareService::new(&app)
+        let response = CloudflareService::new(&app)
             .dispatch(request, env, Context::new(js_context))
             .await
             .expect("Cloudflare response");
 
-        assert_eq!(response.text().await.expect("response body"), "7");
+        assert_eq!(response.status_code(), StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(
+            response
+                .headers()
+                .get("x-edgezero-elapsed-ms")
+                .expect("elapsed header"),
+            Some("7".to_owned())
+        );
         assert!(observations.load(Ordering::SeqCst) >= 3);
     }
 }

@@ -35,14 +35,16 @@ use edgezero_core::app::{App, Hooks};
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use spin_sdk::http::Request as SpinRequest;
-
-/// Raw WASIp3 response whose body and transmission lifetime remain owned by EdgeZero.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub type SpinResponse = spin_sdk::wasip3::http::types::Response;
+use spin_sdk::wasip3::http::types::Response as WasiResponse;
+
+/// Raw `WASIp3` response whose body and transmission lifetime remain owned by `EdgeZero`.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub type SpinResponse = WasiResponse;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub trait AppExt {
-    /// Dispatch a Spin request and return the raw response backed by EdgeZero's owned writer.
+    /// Dispatch a Spin request and return the raw response backed by `EdgeZero`'s owned writer.
     fn dispatch<'app>(
         &'app self,
         req: SpinRequest,

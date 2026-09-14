@@ -353,6 +353,14 @@ for (const staleFragment of [
   }
 }
 
+const cloudflareExactDeadlineRecommendation =
+  /\btarget(?:s|ing)?\s+(?:Axum\s+(?:or|and)\s+Cloudflare|Cloudflare\s+(?:or|and)\s+Axum)\b/u
+if (cloudflareExactDeadlineRecommendation.test(outboundSpecSource)) {
+  fail(
+    'outbound specification recommends Cloudflare for exact deadlines despite its BestEffort capability',
+  )
+}
+
 const limitsHeadingIndex = lines.findIndex(
   (line) => line.trim() === '## Limits And Accounting',
 )

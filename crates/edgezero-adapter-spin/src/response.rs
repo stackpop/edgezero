@@ -1,3 +1,11 @@
+#![cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "the platform module follows response construction, cancellation, and entrypoint lifecycle order"
+    )
+)]
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::time::Duration;
@@ -308,10 +316,6 @@ fn settle_success(
 }
 
 #[cfg(target_arch = "wasm32")]
-#[expect(
-    clippy::arbitrary_source_item_ordering,
-    reason = "the platform module follows response construction, cancellation, and entrypoint lifecycle order"
-)]
 mod platform {
     use futures_util::StreamExt as _;
 
@@ -320,15 +324,19 @@ mod platform {
         IoFailureKind, LocalBoxFuture, MonotonicClock, SpinEgressCommitter, SpinEgressIo,
         StartOutcome, StatusCode, WriteProgress, ensure_deadline, start_fallback, start_prepared,
     };
-    use std::future::{Future, IntoFuture as _};
+    use std::future::{Future, IntoFuture as _, pending};
     use std::pin::Pin;
     use std::task::Poll;
 
     use edgezero_core::response_egress::ResponseEgressEnvelope;
+    use futures_util::future::poll_fn;
+    use spin_sdk::time::sleep;
     use spin_sdk::wasip3::http::types::{ErrorCode, Fields};
     use spin_sdk::wasip3::http_compat::{BodyResult, BodyWriter};
+    use spin_sdk::wasip3::spawn;
     use spin_sdk::wit_bindgen::rt::async_support::{
-        FutureRead, FutureWriteCancel, FutureWriter, StreamResult, StreamWriter,
+        FutureRead, FutureWrite, FutureWriteCancel, FutureWriter, StreamResult, StreamWrite,
+        StreamWriter,
     };
 
     use crate::SpinResponse;
@@ -363,10 +371,11 @@ mod platform {
             let BodyWriter {
                 stream_writer,
                 result_writer,
-                trailers: _,
+                ..
             } = body_writer;
-            let contents = transmits_body.then_some(contents);
-            let (response, response_result) = SpinResponse::new(fields, contents, body_result);
+            let response_contents = transmits_body.then_some(contents);
+            let (response, response_result) =
+                SpinResponse::new(fields, response_contents, body_result);
             response
                 .set_status_code(status.as_u16())
                 .map_err(|()| DeliveryError::Conversion)?;
@@ -381,7 +390,7 @@ mod platform {
         }
 
         fn spawn(&mut self, task: LocalBoxFuture<'static, ()>) {
-            spin_sdk::wasip3::spawn(task);
+            spawn(task);
         }
     }
 
@@ -400,8 +409,8 @@ mod platform {
     async fn race_operation<Operation>(
         deadline: Deadline,
         clock: &MonotonicClock,
-        response_result: Pin<&mut FutureRead<Result<(), ErrorCode>>>,
-        operation: Pin<&mut Operation>,
+        mut response_result: Pin<&mut FutureRead<Result<(), ErrorCode>>>,
+        mut operation: Pin<&mut Operation>,
     ) -> RaceEvent<Operation::Output>
     where
         Operation: Future,
@@ -409,11 +418,9 @@ mod platform {
         let Some(remaining) = deadline.remaining_at(clock.now()) else {
             return RaceEvent::Deadline;
         };
-        let timer = spin_sdk::time::sleep(remaining);
+        let timer = sleep(remaining);
         futures_util::pin_mut!(timer);
-        let mut response_result = response_result;
-        let mut operation = operation;
-        futures_util::future::poll_fn(|context| {
+        poll_fn(|context| {
             if timer.as_mut().poll(context).is_ready() {
                 return Poll::Ready(RaceEvent::Deadline);
             }
@@ -431,7 +438,7 @@ mod platform {
         }
 
         fn cancelled_write(
-            write: Pin<&mut spin_sdk::wit_bindgen::rt::async_support::StreamWrite<'_, u8>>,
+            write: Pin<&mut StreamWrite<'_, u8>>,
             requested: usize,
             kind: IoFailureKind,
         ) -> IoFailure {
@@ -485,7 +492,7 @@ mod platform {
                 return Err(IoFailureKind::Deadline);
             }
 
-            let pending = std::future::pending::<()>();
+            let pending = pending::<()>();
             futures_util::pin_mut!(pending);
             match race_operation(
                 deadline,
@@ -620,7 +627,7 @@ mod platform {
     }
 
     fn cancel_result_write(
-        write: Pin<&mut spin_sdk::wit_bindgen::rt::async_support::FutureWrite<BodyResult>>,
+        write: Pin<&mut FutureWrite<BodyResult>>,
     ) -> Option<FutureWriter<BodyResult>> {
         match write.cancel() {
             FutureWriteCancel::AlreadySent | FutureWriteCancel::Dropped(_) => None,
@@ -628,7 +635,7 @@ mod platform {
         }
     }
 
-    /// Converts an owned response-egress envelope into a raw WASIp3 response and spawns the sole
+    /// Converts an owned response-egress envelope into a raw `WASIp3` response and spawns the sole
     /// body/transmission coordinator.
     ///
     /// # Errors
@@ -650,9 +657,16 @@ mod platform {
                     &mut committer,
                 ) {
                     StartOutcome::Started(response) => Ok(response),
-                    StartOutcome::Precommit { attempt, cause } => {
-                        start_fallback(&request_method, cause, *attempt, &clock, &mut committer)
-                    }
+                    StartOutcome::Precommit {
+                        attempt: failed_attempt,
+                        cause,
+                    } => start_fallback(
+                        &request_method,
+                        cause,
+                        *failed_attempt,
+                        &clock,
+                        &mut committer,
+                    ),
                 }
             }
             Err(failure) => {
