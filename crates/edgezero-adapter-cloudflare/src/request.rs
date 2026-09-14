@@ -551,9 +551,13 @@ where
         IngressHeadAccounting::HostManaged,
         IngressFraming::HostManaged,
     );
-    if let Err(error) = head_parts.validate_normalized(app.ingress_head_limits()) {
-        return deliver(app.detached_ingress_error_egress(error, request_method, request_start))
-            .map_err(|error| edge_error_to_worker(&error));
+    if let Err(validation_error) = head_parts.validate_normalized(app.ingress_head_limits()) {
+        return deliver(app.detached_ingress_error_egress(
+            validation_error,
+            request_method,
+            request_start,
+        ))
+        .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
     }
     let prepared = match app.begin_ingress(head_parts, request_start) {
         Ok(outcome) => match outcome {
@@ -562,30 +566,30 @@ where
                 return deliver(response).map_err(|error| edge_error_to_worker(&error));
             }
             _ => {
-                let error =
+                let admission_error =
                     EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome"));
                 return deliver(app.detached_ingress_error_egress(
-                    error,
+                    admission_error,
                     request_method,
                     request_start,
                 ))
-                .map_err(|error| edge_error_to_worker(&error));
+                .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
             }
         },
-        Err(error) => {
+        Err(admission_error) => {
             return deliver(app.detached_ingress_error_egress(
-                error,
+                admission_error,
                 request_method,
                 request_start,
             ))
-            .map_err(|error| edge_error_to_worker(&error));
+            .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
         }
     };
     let source = match make_source() {
         Ok(source) => source,
-        Err(error) => {
-            return deliver(app.admitted_error_egress(prepared, error))
-                .map_err(|error| edge_error_to_worker(&error));
+        Err(source_error) => {
+            return deliver(app.admitted_error_egress(prepared, source_error))
+                .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
         }
     };
     *head_request.body_mut() =

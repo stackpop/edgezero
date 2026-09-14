@@ -579,9 +579,9 @@ mod platform {
                 Either::Right(((), _cancellation)) => RaceEvent::Deadline,
             }
         };
-        let operation = operation();
-        futures_util::pin_mut!(guard, operation);
-        match select(guard, operation).await {
+        let operation_future = operation();
+        futures_util::pin_mut!(guard, operation_future);
+        match select(guard, operation_future).await {
             Either::Left((event, _operation)) => event,
             Either::Right((output, _guard)) => {
                 let terminal = if signal.aborted() {
@@ -593,44 +593,6 @@ mod platform {
                 };
                 RaceEvent::Operation { output, terminal }
             }
-        }
-    }
-
-    #[cfg(test)]
-    mod race_tests {
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        use futures_util::future;
-        use wasm_bindgen_test::wasm_bindgen_test;
-
-        use super::*;
-
-        #[wasm_bindgen_test]
-        async fn response_egress_preflight_precedes_writer_operation() {
-            let controller = web_sys::AbortController::new().expect("abort controller");
-            controller.abort();
-            let signal: AbortSignal = controller.signal().into();
-            let now = edgezero_core::time::MonotonicInstant::now();
-            let deadline =
-                Deadline::at_instant(now.checked_add(Duration::from_secs(1)).expect("deadline"));
-            let clock = MonotonicClock::new(move || now);
-            let constructed = Rc::new(Cell::new(false));
-            let observed = Rc::clone(&constructed);
-
-            let event = race_operation(
-                move || {
-                    observed.set(true);
-                    future::ready(())
-                },
-                deadline,
-                &clock,
-                &signal,
-            )
-            .await;
-
-            assert!(matches!(event, RaceEvent::Cancelled));
-            assert!(!constructed.get());
         }
     }
 
@@ -810,6 +772,45 @@ mod platform {
             }
         };
         result.map_err(|error| EdgeError::internal(anyhow::anyhow!(public_message(error))))
+    }
+
+    #[cfg(test)]
+    mod race_tests {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use edgezero_core::time::MonotonicInstant;
+        use futures_util::future;
+        use wasm_bindgen_test::wasm_bindgen_test;
+
+        use super::*;
+
+        #[wasm_bindgen_test]
+        async fn response_egress_preflight_precedes_writer_operation() {
+            let controller = web_sys::AbortController::new().expect("abort controller");
+            controller.abort();
+            let signal: AbortSignal = controller.signal().into();
+            let now = MonotonicInstant::now();
+            let deadline =
+                Deadline::at_instant(now.checked_add(Duration::from_secs(1)).expect("deadline"));
+            let clock = MonotonicClock::new(move || now);
+            let constructed = Rc::new(Cell::new(false));
+            let observed = Rc::clone(&constructed);
+
+            let event = race_operation(
+                move || {
+                    observed.set(true);
+                    future::ready(())
+                },
+                deadline,
+                &clock,
+                &signal,
+            )
+            .await;
+
+            assert!(matches!(event, RaceEvent::Cancelled));
+            assert!(!constructed.get());
+        }
     }
 }
 

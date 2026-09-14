@@ -6,6 +6,8 @@ const capabilityPath = 'docs/guide/capabilities.md'
 const outboundCorePath = 'crates/edgezero-core/src/outbound.rs'
 const outboundSpecPath =
   'docs/superpowers/specs/2026-05-21-outbound-http-design.md'
+const inboundSpecPath =
+  'docs/superpowers/specs/2026-08-22-inbound-body-design.md'
 const outboundImplementationIndexPath =
   'docs/superpowers/plans/2026-07-10-outbound-http-implementation.md'
 const spinPhasePath =
@@ -369,6 +371,17 @@ if (cloudflareExactDeadlineRecommendation.test(outboundSpecSource)) {
   fail(
     'outbound specification recommends Cloudflare for exact deadlines despite its BestEffort capability',
   )
+}
+
+const inboundSpecSource = readFileSync(inboundSpecPath, 'utf8')
+for (const staleFragment of [
+  'current Tower adapter nevertheless drives',
+  'block_in_place` plus a nested runtime `block_on',
+  'Tokio cannot cancel that blocking closure',
+]) {
+  if (inboundSpecSource.includes(staleFragment)) {
+    fail(`inbound specification contains removed Axum bridge text: ${staleFragment}`)
+  }
 }
 
 const currentDocumentation = [
