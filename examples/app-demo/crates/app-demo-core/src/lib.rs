@@ -180,7 +180,8 @@ mod lifecycle_tests {
                 edgezero_core::IngressHeadAccounting::HostManaged,
                 edgezero_core::IngressFraming::HostManaged,
             ))
-            .expect("dispatch");
+            .expect("dispatch")
+            .into_response();
             assert_eq!(response.status(), expected);
         }
     }
@@ -203,7 +204,8 @@ mod lifecycle_tests {
                 edgezero_core::IngressHeadAccounting::HostManaged,
                 edgezero_core::IngressFraming::HostManaged,
             ))
-            .expect("dispatch");
+            .expect("dispatch")
+            .into_response();
 
             assert_plain_text_response(
                 &response,
@@ -229,7 +231,8 @@ mod lifecycle_tests {
             edgezero_core::IngressHeadAccounting::HostManaged,
             edgezero_core::IngressFraming::HostManaged,
         ))
-        .expect("dispatch");
+        .expect("dispatch")
+        .into_response();
 
         assert_plain_text_response(&response, StatusCode::REQUEST_TIMEOUT, b"request timeout\n");
     }

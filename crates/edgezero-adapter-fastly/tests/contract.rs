@@ -12,19 +12,15 @@ mod secret_store_compile_check {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "fastly", target_arch = "wasm32"))]
-#[cfg_attr(
-    feature = "test-utils",
-    expect(
-        clippy::arbitrary_source_item_ordering,
-        reason = "ingress contracts are grouped after the provider fixture tests"
-    )
+#[cfg(all(feature = "fastly", feature = "test-utils", target_arch = "wasm32"))]
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "ingress contracts are grouped after the provider fixture tests"
 )]
 mod tests {
     use bytes::Bytes;
     use edgezero_adapter_fastly::context::FastlyRequestContext;
     use edgezero_adapter_fastly::request::{FastlyService, into_core_request};
-    use edgezero_adapter_fastly::response::from_core_response;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
@@ -33,7 +29,7 @@ mod tests {
     use edgezero_core::http::{Method, Response, StatusCode, response_builder};
     use edgezero_core::router::RouterService;
     use fastly::Request as FastlyRequest;
-    use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
+    use fastly::http::Method as FastlyMethod;
     use futures::{executor::block_on, stream};
     use std::sync::Arc;
 
@@ -152,76 +148,77 @@ mod tests {
     }
 
     #[test]
-    fn from_core_response_translates_status_headers_and_streaming_body() {
-        let response = response_builder()
-            .status(StatusCode::CREATED)
-            .header("x-edgezero-res", "1")
-            .body(Body::stream(stream::iter(vec![
-                Bytes::from_static(b"hello"),
-                Bytes::from_static(b" "),
-                Bytes::from_static(b"world"),
-            ])))
-            .expect("response");
-
-        let mut fastly_response = from_core_response(response).expect("fastly response");
-
-        assert_eq!(fastly_response.get_status(), FastlyStatus::CREATED);
-        assert!(fastly_response.get_header("x-edgezero-res").is_some());
-        assert_eq!(fastly_response.take_body_bytes(), b"hello world");
-    }
-
-    #[test]
+    #[cfg(feature = "test-utils")]
     fn dispatch_runs_router_and_returns_response() {
         let app = build_test_app();
         let req = fastly_request(FastlyMethod::GET, "/uri", None);
 
-        let mut response = FastlyService::new(&app)
-            .dispatch(req)
-            .expect("fastly response");
+        let response = FastlyService::new(&app)
+            .capture_egress_for_test(req)
+            .expect("egress envelope")
+            .into_response();
 
-        assert_eq!(response.get_status(), FastlyStatus::OK);
-        assert_eq!(response.take_body_bytes(), b"http://example.com/uri");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            block_on(response.into_body().into_bytes_bounded(64)).expect("response body"),
+            Bytes::from_static(b"http://example.com/uri")
+        );
     }
 
     #[test]
+    #[cfg(feature = "test-utils")]
     fn dispatch_streaming_route_preserves_chunks() {
         let app = build_test_app();
         let req = fastly_request(FastlyMethod::GET, "/stream", None);
 
-        let mut response = FastlyService::new(&app)
-            .dispatch(req)
-            .expect("fastly response");
+        let response = FastlyService::new(&app)
+            .capture_egress_for_test(req)
+            .expect("egress envelope")
+            .into_response();
 
-        assert_eq!(response.get_status(), FastlyStatus::OK);
-        assert_eq!(response.take_body_bytes(), b"chunk-1chunk-2");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            block_on(response.into_body().into_bytes_bounded(64)).expect("response body"),
+            Bytes::from_static(b"chunk-1chunk-2")
+        );
     }
 
     #[test]
+    #[cfg(feature = "test-utils")]
     fn dispatch_passes_request_body_to_handlers() {
         let app = build_test_app();
         let req = fastly_request(FastlyMethod::POST, "/mirror", Some(b"echo"));
 
-        let mut response = FastlyService::new(&app)
-            .dispatch(req)
-            .expect("fastly response");
+        let response = FastlyService::new(&app)
+            .capture_egress_for_test(req)
+            .expect("egress envelope")
+            .into_response();
 
-        assert_eq!(response.get_status(), FastlyStatus::OK);
-        assert_eq!(response.take_body_bytes(), b"echo");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            block_on(response.into_body().into_bytes_bounded(64)).expect("response body"),
+            Bytes::from_static(b"echo")
+        );
     }
 
     #[test]
+    #[cfg(feature = "test-utils")]
     fn service_with_config_handle_injects_handle() {
         let app = build_test_app();
         let req = fastly_request(FastlyMethod::GET, "/config", None);
         let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from fastly test")));
 
-        let mut response = FastlyService::new(&app)
+        let response = FastlyService::new(&app)
             .with_config_handle(handle)
-            .dispatch(req)
-            .expect("fastly response");
+            .capture_egress_for_test(req)
+            .expect("egress envelope")
+            .into_response();
 
-        assert_eq!(response.get_status(), FastlyStatus::OK);
-        assert_eq!(response.take_body_bytes(), b"hello from fastly test");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            block_on(response.into_body().into_bytes_bounded(64)).expect("response body"),
+            Bytes::from_static(b"hello from fastly test")
+        );
     }
 
     #[cfg(feature = "test-utils")]
@@ -423,20 +420,18 @@ mod tests {
         }
 
         fn assert_terminal_response(
-            mut response: fastly::Response,
+            response: Response,
             status: StatusCode,
             expected_headers: &HeaderMap,
             body: &[u8],
         ) {
-            assert_eq!(response.get_status().as_u16(), status.as_u16());
-            let mut actual_headers = HeaderMap::new();
-            for name in response.get_header_names() {
-                for value in response.get_header_all(name) {
-                    actual_headers.append(name.clone(), value.clone());
-                }
-            }
-            assert_eq!(&actual_headers, expected_headers);
-            assert_eq!(response.take_body_bytes(), body);
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers(), expected_headers);
+            assert_eq!(
+                block_on(response.into_body().into_bytes_bounded(body.len()))
+                    .expect("terminal body"),
+                Bytes::copy_from_slice(body)
+            );
         }
 
         #[test]
@@ -464,9 +459,10 @@ mod tests {
                     path.parse().expect("URI"),
                     reader,
                 )
-                .expect("response");
+                .expect("egress envelope")
+                .into_response();
 
-                assert_eq!(response.get_status().as_u16(), expected_status.as_u16());
+                assert_eq!(response.status(), expected_status);
                 assert_eq!(body_reads.load(Ordering::SeqCst), 3);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
@@ -496,7 +492,8 @@ mod tests {
                     path.parse().expect("URI"),
                     reader,
                 )
-                .expect("response");
+                .expect("egress envelope")
+                .into_response();
 
                 assert_terminal_response(
                     response,
@@ -519,8 +516,9 @@ mod tests {
             let request = fastly_request(FastlyMethod::POST, "/missing", Some(b"abcde"));
 
             let response = FastlyService::new(&app)
-                .dispatch(request)
-                .expect("Fastly response");
+                .capture_egress_for_test(request)
+                .expect("egress envelope")
+                .into_response();
 
             assert_terminal_response(
                 response,
@@ -556,7 +554,8 @@ mod tests {
                     path.parse().expect("URI"),
                     reader,
                 )
-                .expect("response");
+                .expect("egress envelope")
+                .into_response();
 
                 assert_terminal_response(
                     response,
@@ -600,7 +599,8 @@ mod tests {
                     path.parse().expect("URI"),
                     reader,
                 )
-                .expect("response");
+                .expect("egress envelope")
+                .into_response();
 
                 assert_terminal_response(
                     response,
@@ -643,28 +643,23 @@ mod tests {
                     None,
                 );
 
-                let mut response = dispatch_ingress_reader_for_test(
+                let response = dispatch_ingress_reader_for_test(
                     &app,
                     Method::POST,
                     path.parse().expect("URI"),
                     reader,
                 )
-                .expect("response");
+                .expect("egress envelope")
+                .into_response();
 
                 let mut expected_headers = HeaderMap::new();
                 expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(response.headers(), &expected_headers);
                 assert_eq!(
-                    response.get_status().as_u16(),
-                    StatusCode::SERVICE_UNAVAILABLE.as_u16()
+                    block_on(response.into_body().into_bytes_bounded(64)).expect("response body"),
+                    Bytes::from_static(b"fastly unavailable\n")
                 );
-                let mut actual_headers = HeaderMap::new();
-                for name in response.get_header_names() {
-                    for value in response.get_header_all(name) {
-                        actual_headers.append(name.clone(), value.clone());
-                    }
-                }
-                assert_eq!(actual_headers, expected_headers);
-                assert_eq!(response.take_body_bytes(), b"fastly unavailable\n");
                 assert_eq!(body_reads.load(Ordering::SeqCst), 0);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
@@ -690,7 +685,8 @@ mod tests {
                 "/missing".parse().expect("URI"),
                 reader,
             )
-            .expect("standard error response");
+            .expect("egress envelope")
+            .into_response();
 
             assert_terminal_response(
                 response,

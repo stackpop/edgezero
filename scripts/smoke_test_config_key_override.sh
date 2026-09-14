@@ -387,7 +387,7 @@ boot_runtime() {
     fastly)
       # DEMO_API_TOKEN_SECRET is the env var viceroy reads to
       # populate the `demo_api_token` secret-store entry seeded
-      # by seed_secret_for_adapter. viceroy 0.17+ uses `serve`
+      # by seed_secret_for_adapter. Current Viceroy uses `serve`
       # for the long-running HTTP path (`run` was renamed).
       #
       # The wasm artifact lives in the app-demo workspace's
@@ -448,10 +448,10 @@ for suite in "${SUITES[@]}"; do
     continue
   fi
 
-  # Spin compatibility pre-check: spin-sdk ~6 imports
-  # wasi:http/types@0.3.0-rc-2026-03-15 which Spin < 3.7 does
-  # not provide. Auto-skip the row with a clear note rather
-  # than fail in the wasm linker; operators can install 3.7+
+  # Spin compatibility pre-check: spin-sdk 7 imports stable
+  # wasi:http/types@0.3.0, which Spin < 4.0 does not provide.
+  # Auto-skip the row with a clear note rather than fail in the
+  # wasm linker; operators can install Spin 4.x
   # and re-run.
   if [ "$adapter" = "spin" ]; then
     if ! command -v spin >/dev/null 2>&1; then
@@ -461,8 +461,8 @@ for suite in "${SUITES[@]}"; do
     spin_ver=$(spin --version 2>/dev/null | awk '{print $2}' | head -1)
     # Extract MAJOR.MINOR portion, drop pre-release suffix.
     spin_minor=$(printf '%s' "$spin_ver" | awk -F'.' '{printf "%d%02d", $1, $2}')
-    if [ -n "$spin_minor" ] && [ "$spin_minor" -lt 307 ]; then
-      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (CLI %s; need >= 3.7 for spin-sdk 6 wasi:http 0.3) ===\n' "$spin_ver"
+    if [ -n "$spin_minor" ] && [ "$spin_minor" -lt 400 ]; then
+      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (CLI %s; need >= 4.0 for spin-sdk 7 wasi:http 0.3) ===\n' "$spin_ver"
       continue
     fi
   fi

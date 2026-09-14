@@ -26,87 +26,6 @@ mod store_trait_compile_checks {
     )
 )]
 mod tests {
-    // `from_core_response` tests live in a nested module so they're grouped
-    // together; the `tests_outside_test_module` lint is satisfied by the
-    // outer `#[cfg(test)] mod tests` wrapper.
-    mod from_core_response_tests {
-        use super::*;
-        use edgezero_adapter_spin::response::from_core_response;
-        use http_body_util::BodyExt as _;
-
-        #[test]
-        fn from_core_response_translates_status_and_headers() {
-            block_on(async {
-                let response = response_builder()
-                    .status(StatusCode::CREATED)
-                    .header("x-edgezero-res", "1")
-                    .body(Body::from(b"hello".to_vec()))
-                    .expect("response");
-
-                let spin_response = from_core_response(response).await.expect("spin response");
-
-                assert_eq!(
-                    spin_response.status(),
-                    StatusCode::CREATED,
-                    "status translated"
-                );
-                assert!(
-                    spin_response.headers().get("x-edgezero-res").is_some(),
-                    "response header preserved"
-                );
-            });
-        }
-
-        #[test]
-        fn from_core_response_collects_streaming_body() {
-            block_on(async {
-                let response = response_builder()
-                    .status(StatusCode::OK)
-                    .body(Body::stream(stream::iter(vec![
-                        Bytes::from_static(b"chunk-1"),
-                        Bytes::from_static(b"chunk-2"),
-                    ])))
-                    .expect("response");
-
-                let spin_response = from_core_response(response).await.expect("spin response");
-
-                assert_eq!(spin_response.status(), StatusCode::OK, "status translated");
-                let body = spin_response
-                    .into_body()
-                    .collect()
-                    .await
-                    .expect("collect")
-                    .to_bytes();
-                assert_eq!(body.as_ref(), b"chunk-1chunk-2", "streaming body collected");
-            });
-        }
-
-        #[test]
-        fn from_core_response_handles_empty_body() {
-            block_on(async {
-                let response = response_builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(Body::from(Vec::new()))
-                    .expect("response");
-
-                let spin_response = from_core_response(response).await.expect("spin response");
-
-                assert_eq!(
-                    spin_response.status(),
-                    StatusCode::NO_CONTENT,
-                    "status translated"
-                );
-                let body = spin_response
-                    .into_body()
-                    .collect()
-                    .await
-                    .expect("collect")
-                    .to_bytes();
-                assert!(body.is_empty(), "empty body preserved");
-            });
-        }
-    }
-
     use bytes::Bytes;
     use edgezero_adapter_spin::context::SpinRequestContext;
     #[cfg(feature = "test-utils")]
@@ -568,16 +487,15 @@ mod tests {
             dispatch_ingress_stream_for_test, dispatch_ingress_stream_with_timer_for_test,
             dispatch_request_for_test,
         };
-        use edgezero_adapter_spin::response::response_write_deadline_uses_injected_clock_for_test;
         use edgezero_core::http::{HeaderMap, HeaderValue, Method};
         use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
         use edgezero_core::middleware::{Middleware, Next};
         use edgezero_core::outbound::{OutboundHttpClient as _, OutboundRequest};
+        use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
         use edgezero_core::router::RouteResolution;
         use edgezero_core::time::{MonotonicClock, MonotonicInstant};
         use futures::FutureExt as _;
         use futures::stream::{empty, poll_fn};
-        use http_body_util::BodyExt as _;
         use spin_sdk::http::{FromRequest as _, IntoRequest as _, Request as SpinRequest};
 
         use super::*;
@@ -680,13 +598,6 @@ mod tests {
         }
 
         #[test]
-        fn response_write_deadline_uses_the_injected_clock() {
-            assert!(block_on(
-                response_write_deadline_uses_injected_clock_for_test()
-            ));
-        }
-
-        #[test]
         fn standard_dispatch_installs_the_application_outbound_clock() {
             async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
                 let client = ctx
@@ -724,9 +635,7 @@ mod tests {
             ))
             .expect("Spin response");
 
-            let bytes = block_on(response.into_body().collect())
-                .expect("provider body")
-                .to_bytes();
+            let bytes = captured_body(response);
             assert_eq!(bytes.as_ref(), b"7");
             assert!(observations.load(Ordering::SeqCst) >= 3);
         }
@@ -965,18 +874,35 @@ mod tests {
             assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
         }
 
+        fn capture_response(envelope: ResponseEgressEnvelope) -> Response {
+            let Ok((prepared, _policy, mut attempt, clock)) = envelope.begin() else {
+                panic!("test egress envelope must prepare");
+            };
+            assert!(attempt.begin_writing());
+            assert!(attempt.terminate(ResponseEgressOutcome::HostHandoff, clock.now()));
+            prepared.into_response()
+        }
+
         fn assert_terminal_response(
-            response: edgezero_adapter_spin::SpinFullResponse,
+            envelope: ResponseEgressEnvelope,
             status: StatusCode,
             expected_headers: &HeaderMap,
             body: &[u8],
         ) {
+            let response = capture_response(envelope);
             assert_eq!(response.status(), status);
             assert_eq!(response.headers(), expected_headers);
-            let bytes = block_on(response.into_body().collect())
-                .expect("provider body")
-                .to_bytes();
+            let bytes = captured_response_body(response);
             assert_eq!(bytes.as_ref(), body);
+        }
+
+        fn captured_body(envelope: ResponseEgressEnvelope) -> Bytes {
+            captured_response_body(capture_response(envelope))
+        }
+
+        fn captured_response_body(response: Response) -> Bytes {
+            block_on(response.into_body().into_bytes_bounded(usize::MAX))
+                .expect("captured response body")
         }
 
         #[test]
@@ -1005,6 +931,7 @@ mod tests {
                     source,
                 ))
                 .expect("response");
+                let response = capture_response(response);
 
                 assert_eq!(response.status(), expected_status);
                 assert_eq!(body_polls.load(Ordering::SeqCst), 3);
@@ -1151,15 +1078,14 @@ mod tests {
                 |_remaining| deadline_timer(),
             ))
             .expect("Spin response");
+            let response = capture_response(response);
 
             assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
             assert_eq!(
                 response.headers().get("content-type"),
                 Some(&HeaderValue::from_static("application/json"))
             );
-            let bytes = block_on(response.into_body().collect())
-                .expect("provider body")
-                .to_bytes();
+            let bytes = captured_response_body(response);
             assert_eq!(
                 bytes.as_ref(),
                 br#"{"error":{"kind":"request_timeout","message":"inbound body read deadline exceeded","status":408}}"#
@@ -1194,6 +1120,7 @@ mod tests {
                 |_remaining| ready(()),
             ))
             .expect("Spin response");
+            let response = capture_response(response);
 
             assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
             assert_eq!(body_polls.load(Ordering::SeqCst), 0);
@@ -1270,14 +1197,13 @@ mod tests {
                     source,
                 ))
                 .expect("response");
+                let response = capture_response(response);
 
                 let mut expected_headers = HeaderMap::new();
                 expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(response.headers(), &expected_headers);
-                let bytes = block_on(response.into_body().collect())
-                    .expect("provider body")
-                    .to_bytes();
+                let bytes = captured_response_body(response);
                 assert_eq!(bytes.as_ref(), b"spin unavailable\n");
                 assert_eq!(body_polls.load(Ordering::SeqCst), 0);
                 assert_eq!(unobserved_grant.load(Ordering::SeqCst), 0);

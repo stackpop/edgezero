@@ -148,15 +148,15 @@ impl Adapter for SpinCliAdapter {
             | Capability::LazyStreamedResponsePassthrough
             | Capability::OutboundDeadlines
             | Capability::OutboundFlexiblePhaseBudget
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
             | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
             Capability::ConfigReadAllocationBounds
             | Capability::OutboundCompleteResourceAccounting
             | Capability::RawIngressFramingValidation
             | Capability::RawIngressHeadLimits
-            | Capability::ResponseEgressAbort
-            | Capability::ResponseEgressBackpressure
-            | Capability::ResponseEgressCompletion
-            | Capability::ResponseWriteDeadlines
             | _ => CapabilitySupport::Unsupported,
         }
     }
@@ -1342,19 +1342,19 @@ mod tests {
             ),
             (
                 Capability::ResponseEgressAbort,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseEgressBackpressure,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseEgressCompletion,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseWriteDeadlines,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (Capability::OutboundHttp, CapabilitySupport::Native),
             (

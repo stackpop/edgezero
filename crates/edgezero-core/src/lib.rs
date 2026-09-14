@@ -37,6 +37,8 @@ pub mod params;
 pub mod responder;
 pub mod response;
 pub mod response_egress;
+#[doc(hidden)]
+pub mod response_egress_framing;
 pub mod router;
 pub mod secret_store;
 pub mod store_registry;
@@ -84,10 +86,11 @@ pub use outbound::{
     validate_for_dispatch,
 };
 pub use response_egress::{
-    DEFAULT_RESPONSE_WRITE_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
-    ResponseEgressHead, ResponseEgressObserver, ResponseEgressObserverHandle,
-    ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressPolicyCallback,
-    ResponseEgressReport, default_response_egress_policy,
+    DEFAULT_RESPONSE_WRITE_BUDGET, RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
+    ResponseEgressBeginFailure, ResponseEgressBodyKind, ResponseEgressEnvelope,
+    ResponseEgressFallbackDisposition, ResponseEgressHead, ResponseEgressObserver,
+    ResponseEgressObserverHandle, ResponseEgressOutcome, ResponseEgressPolicy,
+    ResponseEgressPolicyCallback, ResponseEgressReport, default_response_egress_policy,
 };
 pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
 pub use time::{

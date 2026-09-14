@@ -41,9 +41,6 @@ mod tests {
     #[cfg(feature = "test-utils")]
     use edgezero_adapter_cloudflare::request::deadline_body_releases_source_for_test;
     use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
-    use edgezero_adapter_cloudflare::response::from_core_response;
-    #[cfg(feature = "test-utils")]
-    use edgezero_adapter_cloudflare::response::response_write_deadline_uses_injected_clock_for_test;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
@@ -55,7 +52,7 @@ mod tests {
     use edgezero_core::time::{MonotonicClock, MonotonicInstant};
     use futures::stream;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-    use worker::js_sys::Object;
+    use worker::js_sys::{Function, Object, Reflect};
     use worker::wasm_bindgen::{JsCast as _, JsValue};
     use worker::worker_sys::Context as WorkerSysContext;
     use worker::{Context, Env, Method as CfMethod, Request as CfRequest, RequestInit};
@@ -176,7 +173,15 @@ mod tests {
 
     fn test_env_ctx() -> (Env, Context) {
         let env = Object::new().unchecked_into::<Env>();
-        let js_context = Object::new().unchecked_into::<WorkerSysContext>();
+        let js_context = Object::new();
+        let wait_until = Function::new_with_args("_promise", "return undefined;");
+        Reflect::set(
+            &js_context,
+            &JsValue::from_str("waitUntil"),
+            wait_until.as_ref(),
+        )
+        .expect("install test waitUntil");
+        let js_context = js_context.unchecked_into::<WorkerSysContext>();
         (env, Context::new(js_context))
     }
 
@@ -232,28 +237,6 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::OK.as_u16());
         let bytes = response.bytes().await.expect("bytes");
         assert_eq!(bytes.as_slice(), b"chunk-1chunk-2");
-    }
-
-    #[wasm_bindgen_test]
-    async fn from_core_response_translates_status_headers_and_streaming_body() {
-        let response = response_builder()
-            .status(StatusCode::CREATED)
-            .header("x-edgezero-res", "1")
-            .body(Body::stream(stream::iter(vec![
-                Bytes::from_static(b"hello"),
-                Bytes::from_static(b" "),
-                Bytes::from_static(b"world"),
-            ])))
-            .expect("response");
-
-        let mut cf_response = from_core_response(response).expect("cf response");
-
-        assert_eq!(cf_response.status_code(), StatusCode::CREATED.as_u16());
-        let header = cf_response.headers().get("x-edgezero-res").unwrap();
-        assert_eq!(header.as_deref(), Some("1"));
-
-        let bytes = cf_response.bytes().await.expect("bytes");
-        assert_eq!(bytes.as_slice(), b"hello world");
     }
 
     #[wasm_bindgen_test]
@@ -462,9 +445,8 @@ mod tests {
 
     #[cfg(feature = "test-utils")]
     #[wasm_bindgen_test]
-    async fn response_abort_and_write_deadline_lifecycles_are_enforced() {
+    async fn response_abort_lifecycle_is_enforced() {
         assert!(response_abort_lifecycle_holds_for_test().await);
-        assert!(response_write_deadline_uses_injected_clock_for_test().await);
     }
 
     #[cfg(feature = "test-utils")]
@@ -479,6 +461,7 @@ mod tests {
         use edgezero_core::http::{HeaderMap, HeaderValue};
         use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
         use edgezero_core::middleware::{Middleware, Next};
+        use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
         use edgezero_core::router::RouteResolution;
         use futures::future::poll_fn as poll_future;
         use futures::stream::poll_fn;
@@ -644,7 +627,33 @@ mod tests {
             assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
         }
 
+        fn capture_response(envelope: ResponseEgressEnvelope) -> Response {
+            let Ok((prepared, _policy, mut attempt, clock)) = envelope.begin() else {
+                panic!("test egress envelope must prepare");
+            };
+            assert!(attempt.begin_writing());
+            assert!(attempt.terminate(ResponseEgressOutcome::HostHandoff, clock.now()));
+            prepared.into_response()
+        }
+
         async fn assert_terminal_response(
+            envelope: ResponseEgressEnvelope,
+            status: StatusCode,
+            expected_headers: HeaderMap,
+            body: &[u8],
+        ) {
+            let response = capture_response(envelope);
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers(), &expected_headers);
+            let bytes = response
+                .into_body()
+                .into_bytes_bounded(usize::MAX)
+                .await
+                .expect("captured body");
+            assert_eq!(bytes.as_ref(), body);
+        }
+
+        async fn assert_worker_response(
             mut response: CfResponse,
             status: StatusCode,
             expected_headers: HeaderMap,
@@ -693,8 +702,9 @@ mod tests {
                 )
                 .await
                 .expect("response");
+                let response = capture_response(response);
 
-                assert_eq!(response.status_code(), expected_status.as_u16());
+                assert_eq!(response.status(), expected_status);
                 assert_eq!(body_polls.load(Ordering::SeqCst), 3);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
@@ -753,7 +763,7 @@ mod tests {
                 .await
                 .expect("Cloudflare response");
 
-            assert_terminal_response(
+            assert_worker_response(
                 response,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 terminal_headers("overflow"),

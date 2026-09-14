@@ -136,25 +136,24 @@ struct EdgezeroAxumConfig {
 impl Adapter for AxumCliAdapter {
     fn capability(&self, capability: Capability) -> CapabilitySupport {
         match capability {
-            Capability::ConfigReadDeadlines | Capability::LazyStreamedResponsePassthrough => {
-                CapabilitySupport::BestEffort
-            }
+            Capability::ConfigReadDeadlines
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines => CapabilitySupport::BestEffort,
             Capability::InboundReadDeadlines
             | Capability::IngressAdmission
             | Capability::OutboundDeadlines
             | Capability::OutboundFlexiblePhaseBudget
             | Capability::OutboundHeaderFidelity
             | Capability::OutboundHttp
+            | Capability::LazyStreamedResponsePassthrough
             | Capability::SendAllSlotIsolation
             | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
             Capability::ConfigReadAllocationBounds
             | Capability::OutboundCompleteResourceAccounting
             | Capability::RawIngressFramingValidation
             | Capability::RawIngressHeadLimits
-            | Capability::ResponseEgressAbort
-            | Capability::ResponseEgressBackpressure
-            | Capability::ResponseEgressCompletion
-            | Capability::ResponseWriteDeadlines
             | _ => CapabilitySupport::Unsupported,
         }
     }
@@ -790,19 +789,19 @@ mod tests {
             ),
             (
                 Capability::ResponseEgressAbort,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseEgressBackpressure,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseEgressCompletion,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseWriteDeadlines,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (Capability::OutboundHttp, CapabilitySupport::Native),
             (
@@ -825,7 +824,7 @@ mod tests {
             ),
             (
                 Capability::LazyStreamedResponsePassthrough,
-                CapabilitySupport::BestEffort,
+                CapabilitySupport::Native,
             ),
         ];
 

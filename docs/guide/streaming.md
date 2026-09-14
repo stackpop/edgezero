@@ -1,8 +1,8 @@
 # Streaming
 
-EdgeZero accepts streaming response bodies on every adapter. The current standard Cloudflare
-path preserves lazy downstream delivery; Axum, Fastly, and Spin collect a stream under a finite
-16 MiB converter cap before returning the platform response.
+EdgeZero preserves lazy streaming response bodies on every adapter. Each adapter owns body
+delivery through its strongest platform boundary; no standard entrypoint collects the complete
+downstream response before handoff.
 
 ## Streaming Responses
 
@@ -35,16 +35,16 @@ async fn stream_data() -> Response {
 
 ## How Streaming Works
 
-The router keeps `Body::Stream` intact until the adapter response boundary:
+The router keeps `Body::Stream` intact until the adapter response coordinator:
 
 1. Your handler returns `Body::stream(...)` with a `Stream` of chunks
-2. Cloudflare adopts the source into a pull-driven `ReadableStream`
-3. Axum, Fastly, and Spin currently collect it before their generated/host response boundary
-4. The capability matrix records whether lazy delivery, backpressure, and completion are proved
+2. Core validates response framing and wraps declared-length enforcement around the source
+3. The adapter polls one chunk at a time under its host's demand or write readiness
+4. Accepted bytes, deadline/abort events, and one terminal outcome are recorded by that adapter
 
-Fastly exposes `stream_to_client` and Spin exposes a WASI `BodyWriter`, but EdgeZero's standard
-entrypoints do not yet own those send lifetimes. See [Capabilities](/guide/capabilities) for the
-current target-specific contract.
+Axum uses a connection-local Hyper body, Cloudflare a JavaScript stream writer, Fastly
+`stream_to_client`, and Spin a WASI body writer. See [Capabilities](/guide/capabilities) for the
+exact acceptance and completion boundary on each target.
 
 ## Server-Sent Events
 
@@ -74,10 +74,10 @@ async fn events() -> Response {
 }
 ```
 
-::: warning Adapter support
-Progressive SSE delivery currently requires the Cloudflare adapter. Axum, Fastly, and Spin
-buffer the response stream and therefore cannot deliver an unbounded SSE stream through their
-standard entrypoints.
+::: warning Completion semantics
+All adapters preserve progressive production, but their response-egress capability cells remain
+BestEffort because host acceptance or close does not prove end-client receipt. Fastly source polls
+and hostcalls are synchronous and cannot be preempted.
 :::
 
 ## Body Modes
@@ -127,9 +127,9 @@ Lazy streaming is useful for:
 - Responses larger than available memory
 
 ::: warning Platform limits
-Edge platforms have finite memory. A `Body::Stream` does not guarantee downstream streaming on
-every adapter: Axum, Fastly, and Spin currently enforce a 16 MiB converter cap. Choose payload
-limits from the capability matrix and do not use those standard paths for unbounded responses.
+Edge platforms have finite memory. Lazy response delivery removes whole-body collection but does
+not bound provider queues, SDK allocations, source chunk size, or transport buffers. Bound source
+chunks and application work, and use the capability matrix when certifying a deployment.
 :::
 
 ## Chunked Transfer
@@ -150,8 +150,9 @@ async fn dynamic_content() -> Response {
 }
 ```
 
-The provider owns the final wire framing. EdgeZero does not guarantee HTTP/1 chunked transfer,
-especially on adapters that collect the stream before returning the response.
+The provider owns the final wire framing. EdgeZero does not guarantee a particular HTTP/1 transfer
+coding; it normalizes framing and enforces the application's declared payload length before the
+adapter writes body bytes.
 
 ## Next Steps
 

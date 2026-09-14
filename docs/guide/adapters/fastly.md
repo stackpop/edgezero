@@ -43,11 +43,13 @@ The Fastly entrypoint wires the adapter:
 ```rust
 use my_app_core::App;
 
-#[fastly::main]
-fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    edgezero_adapter_fastly::run_app::<App>(req)
+pub fn main() -> Result<(), fastly::Error> {
+    edgezero_adapter_fastly::run_app::<App>()
 }
 ```
+
+Do not add Fastly's response-returning entrypoint attribute. EdgeZero initializes the ABI,
+receives the client request, and owns `stream_to_client` through final body-handle close.
 
 `run_app` reads logging and store config at runtime from `EDGEZERO__*`
 environment variables (see
@@ -56,15 +58,13 @@ per-id `KV` / `Config` / `Secret` registries from the portable store
 metadata baked into `App` by the `app!` macro. No `edgezero.toml` is
 loaded by the runtime.
 
-The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
-`dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
-`ConfigStoreHandle`.
+For fully manual wiring, build `FastlyService`, attach stores as needed, and call its send-owning
+`send()` method. Prefer `run_app` for manifest-driven store resolution.
 
 ### Capturing raw-request signals (JA4, H2 fingerprint)
 
-`run_app` converts the `fastly::Request` into a neutral core request before
-dispatch. The client IP is carried across automatically — read it via
+`run_app` receives and converts the `fastly::Request` into a neutral core request before
+dispatch. The client IP is carried across automatically; read it via
 `FastlyRequestContext` (see [Context Access](#context-access) below). Other
 Fastly-only signals that are readable only on the raw request
 (`get_tls_ja4()`, `get_client_h2_fingerprint()`) aren't reachable from handlers
@@ -77,9 +77,8 @@ can read them:
 #[derive(Clone)]
 struct Ja4(String);
 
-#[fastly::main]
-fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    edgezero_adapter_fastly::run_app_with_request_extensions::<App, _>(req, |raw, ext| {
+pub fn main() -> Result<(), fastly::Error> {
+    edgezero_adapter_fastly::run_app_with_request_extensions::<App, _>(|raw, ext| {
         if let Some(ja4) = raw.get_tls_ja4() {
             ext.insert(Ja4(ja4.to_owned()));
         }
@@ -87,7 +86,7 @@ fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
 }
 ```
 
-`run_app` is exactly `run_app_with_request_extensions::<App, _>(req, |_, _| {})`.
+`run_app` is exactly `run_app_with_request_extensions::<App, _>(|_, _| {})`.
 The closure runs once per request; insert whatever typed values your handlers
 need, then read them in a handler via a custom extractor or
 `ctx.request().extensions().get::<Ja4>()`.
@@ -154,9 +153,10 @@ cannot prove that service entitlement, so `outbound-http` is BestEffort. A disab
 returns a typed 502 with an enablement diagnostic.
 
 Fastly also has documented deadline, upload, elastic-budget, batch-isolation, and lazy downstream
-streaming limitations. The standard `#[fastly::main]` entrypoint buffers a portable response
-stream under the fixed 16 MiB `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` cap. See
-[Capabilities](/guide/capabilities) before marking an outbound capability required.
+streaming limitations. EdgeZero owns the low-level `stream_to_client` lifetime and writes portable
+response chunks without whole-body collection. Synchronous source polls and hostcalls cannot be
+preempted, so downstream streaming and response-egress guarantees remain BestEffort. See
+[Capabilities](/guide/capabilities) before marking a capability required.
 
 ## Logging
 
@@ -265,9 +265,12 @@ async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
 ## Streaming
 
 Fastly provides `stream_to_client`, but that API is incompatible with the standard
-`#[fastly::main]` entrypoint used by generated projects. The current response converter therefore
-collects `Body::stream` under a fixed 16 MiB cap before returning the final response. Outbound
-response streams retain typed read/decode/deadline errors during that collection.
+response-returning SDK entrypoint. Generated applications use EdgeZero's undecorated, send-owning
+entrypoint instead. EdgeZero commits the response head through the raw Fastly ABI, writes each
+portable body chunk to the streaming body handle with short-write accounting, and closes or
+abandons that handle exactly once. A blocked synchronous source poll or hostcall cannot be
+preempted, and a failed consuming `finish` call leaves no handle to abandon; those limits keep the
+response-egress capabilities at BestEffort.
 
 See the [Streaming guide](/guide/streaming) and
 [capability matrix](/guide/capabilities#outbound-matrix) for the exact boundary.

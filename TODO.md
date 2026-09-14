@@ -49,11 +49,11 @@ High-level backlog and decisions to drive the next milestones.
   - [x] Map `edgezero-core::Response` -> Fastly Response (headers/body)
   - [x] Handle binary/text bodies and content-length
   - [x] Example: runnable Fastly demo (`examples/app-demo/crates/app-demo-adapter-fastly`) with wasm32-wasip1 target and explicit logger init
-  - [x] Streaming: native streaming on Fastly via `stream_to_client` (wasm32-wasip1), buffered fallback elsewhere
-- [ ] Cloudflare Workers adapter MVP
+  - [x] Streaming: adapter-owned lazy response delivery on Axum, Cloudflare, Fastly, and Spin
+- [x] Cloudflare Workers adapter MVP
   - [x] Basic mapping: Workers Request -> EdgeZero Request
-  - [x] Basic mapping: EdgeZero Response -> Workers Response (buffered bodies)
-  - [ ] Streaming behavior (ReadableStream) and backpressure
+  - [x] Basic mapping: EdgeZero Response -> Workers Response
+  - [x] Adapter-owned streaming writer and backpressure propagation
   - [x] Example: deploy sample with `wrangler` (`examples/app-demo/crates/app-demo-adapter-cloudflare`)
 - [ ] CLI
   - [x] `edgezero new <name>`: scaffold an app (lib with `build_app()`)
@@ -311,7 +311,7 @@ High-level backlog and decisions to drive the next milestones.
 ## Review (2025-09-19 02:35 UTC)
 
 - Temporary stopgap: adapter builds against Fastly 0.11 by buffering request/response bodies and wiring a new logging helper; wasm demo (`cargo build -p app-demo-adapter-fastly --target wasm32-wasip1`) and `cargo test` now succeed.
-- Outbound streaming and decompression are implemented with adapter-specific capability declarations; Axum, Fastly, and Spin retain the documented 16 MiB downstream conversion fallback.
+- Superseded by the 2026 response-egress hard cut: every adapter now preserves lazy downstream response production without a 16 MiB conversion fallback.
 
 ## Review (2025-09-19 07:35 UTC)
 

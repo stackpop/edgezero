@@ -12,6 +12,11 @@ pub struct CloudflareRequestContext {
 
 impl CloudflareRequestContext {
     #[inline]
+    pub(crate) fn context_handle(&self) -> Arc<Context> {
+        Arc::clone(&self.ctx)
+    }
+
+    #[inline]
     #[must_use]
     pub fn ctx(&self) -> &Context {
         &self.ctx

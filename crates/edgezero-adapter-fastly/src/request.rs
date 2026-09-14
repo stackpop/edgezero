@@ -18,21 +18,23 @@ use edgezero_core::ingress::{
 };
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
+use edgezero_core::response_egress::ResponseEgressEnvelope;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
-use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
+use fastly::{Error as FastlyError, Request as FastlyRequest};
 use futures::executor;
 use futures_util::stream;
 use std::collections::BTreeMap;
 
 use crate::config_store::FastlyConfigStore;
 use crate::context::FastlyRequestContext;
+use crate::init_fastly_abi;
 use crate::key_value_store::FastlyKvStore;
 use crate::outbound::FastlyOutboundClient;
-use crate::response::{from_egress_response, parse_uri};
+use crate::response::{parse_uri, send_egress_response};
 use crate::secret_store::FastlySecretStore;
 
 const WARNED_STORE_CACHE_LIMIT: usize = 64;
@@ -103,7 +105,7 @@ enum ConfigSource {
 ///     .with_kv("sessions").require_kv()
 ///     .with_config("app_config")
 ///     .with_secrets()
-///     .dispatch(req)
+///     .send()
 /// ```
 pub struct FastlyService<'app> {
     app: &'app App,
@@ -123,15 +125,25 @@ enum SecretSource {
 }
 
 impl<'app> FastlyService<'app> {
-    /// Resolve every wired store at request time and dispatch
-    /// against the wrapped `App`. Consumes the service so a builder
-    /// can't be reused with stale wiring.
-    ///
-    /// # Errors
-    /// Returns an error if a required store cannot be opened or
-    /// the underlying handler returns an error.
+    /// Test-only request-in/egress-envelope dispatch seam.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
     #[inline]
-    pub fn dispatch(self, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
+    pub fn capture_egress_for_test(
+        self,
+        req: FastlyRequest,
+    ) -> Result<ResponseEgressEnvelope, FastlyError> {
+        self.dispatch_with(req, Ok)
+    }
+
+    fn dispatch_with<T, Deliver>(
+        self,
+        req: FastlyRequest,
+        deliver: Deliver,
+    ) -> Result<T, FastlyError>
+    where
+        Deliver: FnOnce(ResponseEgressEnvelope) -> Result<T, FastlyError>,
+    {
         let request_start = self.app.monotonic_now();
         let config_store = match self.config {
             ConfigSource::Handle(handle) => Some(handle),
@@ -163,6 +175,7 @@ impl<'app> FastlyService<'app> {
             },
             request_start,
             |_req, _extensions| {},
+            deliver,
         )
     }
 
@@ -203,6 +216,18 @@ impl<'app> FastlyService<'app> {
         self
     }
 
+    /// Resolve every wired store, receive the client request, and transmit its response.
+    ///
+    /// # Errors
+    /// Returns an error if a required store cannot be opened or
+    /// the underlying handler returns an error.
+    #[inline]
+    pub fn send(self) -> Result<(), FastlyError> {
+        init_fastly_abi();
+        let req = FastlyRequest::from_client();
+        self.dispatch_with(req, send_egress_response)
+    }
+
     /// Open the Fastly Config Store named `name` and inject its
     /// handle into request extensions. If the store is unavailable
     /// at request time, the dispatcher logs the warning once and
@@ -211,7 +236,7 @@ impl<'app> FastlyService<'app> {
     /// Env-overlay limitation: this bare-handle path does not resolve
     /// `EDGEZERO__STORES__CONFIG__*` selectors and binds the config registry's
     /// default key to `"default"`. Use [`runtime_env_config`](crate::runtime_env_config)
-    /// with [`dispatch_with_registries`] when a custom entry point needs the
+    /// with [`send_with_registries`] when a custom entry point needs the
     /// same `__NAME` / `__KEY` resolution as [`run_app`](crate::run_app).
     #[must_use]
     #[inline]
@@ -226,7 +251,7 @@ impl<'app> FastlyService<'app> {
     /// Like [`Self::with_config`], this binds the config registry's default key
     /// to `"default"` and does not apply the [`EnvConfig`] overlay. Use
     /// [`runtime_env_config`](crate::runtime_env_config) with
-    /// [`dispatch_with_registries`] for manifest-driven selector resolution.
+    /// [`send_with_registries`] for manifest-driven selector resolution.
     #[must_use]
     #[inline]
     pub fn with_config_handle(mut self, handle: ConfigStoreHandle) -> Self {
@@ -270,12 +295,16 @@ impl<'app> FastlyService<'app> {
     }
 }
 
-fn dispatch_core_request(
+fn dispatch_core_request<T, Deliver>(
     app: &App,
     mut core_request: Request,
     stores: Stores,
     prepared: PreparedIngress,
-) -> Result<FastlyResponse, FastlyError> {
+    deliver: Deliver,
+) -> Result<T, FastlyError>
+where
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<T, FastlyError>,
+{
     // Hard-cutoff: legacy bare handles are no longer
     // inserted into request extensions. `with_config_handle`
     // still accepts a `ConfigStoreHandle`, but the dispatcher
@@ -296,7 +325,7 @@ fn dispatch_core_request(
     }
     let response = executor::block_on(app.dispatch_admitted(prepared, core_request))
         .map_err(|err| map_edge_error(&err))?;
-    from_egress_response(response).map_err(|err| map_edge_error(&err))
+    deliver(response)
 }
 
 /// Run an app-provided closure against a scratch `Extensions` populated from the
@@ -311,36 +340,45 @@ where
     scratch
 }
 
-fn dispatch_with_handles<F>(
+fn dispatch_with_handles<T, F, Deliver>(
     app: &App,
     mut req: FastlyRequest,
     stores: Stores,
     request_start: MonotonicInstant,
     extend: F,
-) -> Result<FastlyResponse, FastlyError>
+    deliver: Deliver,
+) -> Result<T, FastlyError>
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<T, FastlyError>,
 {
     // Read raw-request signals into a scratch bag BEFORE conversion consumes `req`.
     let scratch = apply_request_extend(&req, extend);
     let mut head_request = into_core_request_head(&req, app.monotonic_clock())
         .map_err(|error| map_edge_error(&error))?;
     head_request.extensions_mut().extend(scratch);
-    dispatch_ingress_reader(app, head_request, stores, request_start, move || {
-        req.take_body()
-    })
+    dispatch_ingress_reader(
+        app,
+        head_request,
+        stores,
+        request_start,
+        move || req.take_body(),
+        deliver,
+    )
 }
 
-fn dispatch_ingress_reader<Source, MakeSource>(
+fn dispatch_ingress_reader<T, Source, MakeSource, Deliver>(
     app: &App,
     mut head_request: Request,
     stores: Stores,
     request_start: MonotonicInstant,
     make_source: MakeSource,
-) -> Result<FastlyResponse, FastlyError>
+    deliver: Deliver,
+) -> Result<T, FastlyError>
 where
     Source: Read + 'static,
     MakeSource: FnOnce() -> Source,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<T, FastlyError>,
 {
     let head_parts = IngressHeadParts::from_request(
         &head_request,
@@ -356,7 +394,7 @@ where
     {
         IngressBeginOutcome::Admitted(prepared) => prepared,
         IngressBeginOutcome::Refused(response) => {
-            return from_egress_response(response).map_err(|error| map_edge_error(&error));
+            return deliver(response);
         }
         _ => return Err(FastlyError::msg("unsupported ingress admission outcome")),
     };
@@ -364,7 +402,7 @@ where
         make_source(),
         Some((prepared.read_deadline(), prepared.monotonic_clock())),
     );
-    dispatch_core_request(app, head_request, stores, prepared)
+    dispatch_core_request(app, head_request, stores, prepared, deliver)
 }
 
 /// Dispatch with per-id store registries built from baked metadata — the same
@@ -386,16 +424,17 @@ where
 /// Returns an error if a declared KV store cannot be opened, or if the
 /// underlying handler returns an error.
 #[inline]
-pub fn dispatch_with_registries<F>(
+pub fn send_with_registries<F>(
     app: &App,
-    req: FastlyRequest,
     stores: StoresMetadata,
     env: &EnvConfig,
     extend: F,
-) -> Result<FastlyResponse, FastlyError>
+) -> Result<(), FastlyError>
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
+    init_fastly_abi();
+    let req = FastlyRequest::from_client();
     let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(stores.kv, env)?;
     let config_registry = build_config_registry(stores.config, env);
@@ -411,6 +450,7 @@ where
         },
         request_start,
         extend,
+        send_egress_response,
     )
 }
 
@@ -654,7 +694,7 @@ pub fn dispatch_ingress_reader_for_test<Source>(
     method: Method,
     uri: Uri,
     source: Source,
-) -> Result<FastlyResponse, FastlyError>
+) -> Result<ResponseEgressEnvelope, FastlyError>
 where
     Source: Read + 'static,
 {
@@ -673,6 +713,7 @@ where
         Stores::default(),
         request_start,
         move || source,
+        Ok,
     )
 }
 
@@ -837,11 +878,11 @@ mod synthesis_tests {
         }));
         let request = FastlyRequest::new(Method::GET, "http://example.test/clock");
 
-        let mut response = FastlyService::new(&app)
-            .dispatch(request)
-            .expect("Fastly response");
+        let response = FastlyService::new(&app)
+            .dispatch_with(request, |egress| Ok(egress.into_response()))
+            .expect("core response");
 
-        assert_eq!(response.take_body_bytes(), b"7");
+        assert_eq!(response.body().as_bytes(), Some(b"7".as_slice()));
         assert!(observations.load(Ordering::SeqCst) >= 3);
     }
 
@@ -965,7 +1006,7 @@ mod synthesis_tests {
 
     // Regression for the `.with_secrets()` bug — the pre-fix
     // `resolve_secret_handle(false)` short-circuited to `None`, so the
-    // documented `.with_secrets().dispatch(...)` path silently ran
+    // documented `.with_secrets().send()` path silently ran
     // handlers without a `SecretRegistry`. After the fix, the handle
     // is always built when `SecretSource::On` is selected; `_required`
     // is reserved for whichever future per-secret-lookup availability
