@@ -30,14 +30,15 @@
 //! accepts MULTIPLE pairs in one invocation — so a 1000-entry batch
 //! is one shellout, not 1000.
 //!
-//! Auto-detection: the dispatcher activates this writer when the
-//! manifest's `[adapters.spin.commands].deploy` shells to `spin
-//! deploy` or `spin cloud deploy` (operator intent: this app deploys
-//! to Fermyon Cloud) AND the operator did NOT pass `--local`.
+//! Selection: the dispatcher activates this writer when the manifest sets
+//! `[adapters.spin.adapter].cloud = true` (the SOLE cloud selector -- no
+//! deploy-command heuristic) AND the operator did NOT pass `--local`.
 
 use std::io;
 use std::mem;
 use std::process::Command;
+
+use edgezero_adapter::registry::AdapterPushContext;
 
 /// Approximate worst-case argv size we'll squeeze into ONE `spin cloud
 /// key-value set` invocation before chunking into multiple
@@ -45,17 +46,14 @@ use std::process::Command;
 /// 256 KiB. Stay well under the floor so a long argv doesn't `E2BIG`.
 const MAX_ARGV_BYTES_PER_INVOCATION: usize = 96 * 1024;
 
-/// Detect whether the spin adapter's deploy command targets Fermyon
-/// Cloud. Looks for `spin deploy` or `spin cloud deploy` as a substring
-/// of the configured command. Substring match (not equality) so a
-/// pre-deploy hook like `cd dist && spin deploy --provider …` still
-/// trips it.
+/// Whether a `config push`/`diff` should target Fermyon Cloud. The EXPLICIT
+/// `[adapters.spin.adapter].cloud = true` flag is the SOLE selector -- there
+/// is no deploy-command heuristic and no backward-compatibility fallback, so
+/// `config push` and `config diff` agree, and a project only reaches Fermyon
+/// Cloud when it opts in explicitly.
 #[must_use]
-pub(crate) fn deploy_command_targets_fermyon_cloud(deploy_cmd: Option<&str>) -> bool {
-    let Some(cmd) = deploy_cmd else {
-        return false;
-    };
-    cmd.contains("spin cloud deploy") || cmd.contains("spin deploy")
+pub(crate) fn push_targets_fermyon_cloud(push_ctx: &AdapterPushContext<'_>) -> bool {
+    push_ctx.cloud_target
 }
 
 /// Build the `key=value` argv strings for one chunk. Each entry's
@@ -260,42 +258,20 @@ mod tests {
     #[cfg(unix)]
     use std::path::Path as StdPath;
     #[cfg(unix)]
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     #[cfg(unix)]
     use tempfile::{TempDir, tempdir};
 
     #[test]
-    fn detect_fermyon_cloud_from_spin_deploy() {
-        assert!(deploy_command_targets_fermyon_cloud(Some("spin deploy")));
-        assert!(deploy_command_targets_fermyon_cloud(Some(
-            "spin deploy --from crates/foo"
-        )));
-        assert!(deploy_command_targets_fermyon_cloud(Some(
-            "cd dist && spin deploy"
-        )));
-    }
-
-    #[test]
-    fn detect_fermyon_cloud_from_spin_cloud_deploy() {
-        assert!(deploy_command_targets_fermyon_cloud(Some(
-            "spin cloud deploy"
-        )));
-    }
-
-    #[test]
-    fn non_cloud_deploy_commands_are_not_detected() {
-        assert!(!deploy_command_targets_fermyon_cloud(Some("echo no-op")));
-        assert!(!deploy_command_targets_fermyon_cloud(Some(
-            "kubectl apply -f spin.yaml"
-        )));
-        // Sanity: just having "spin" or "deploy" alone doesn't count.
-        assert!(!deploy_command_targets_fermyon_cloud(Some("spin build")));
-        assert!(!deploy_command_targets_fermyon_cloud(Some("./deploy.sh")));
-    }
-
-    #[test]
-    fn missing_deploy_command_returns_false() {
-        assert!(!deploy_command_targets_fermyon_cloud(None));
+    fn cloud_is_selected_only_by_the_explicit_flag() {
+        // `[adapters.spin.adapter].cloud = true` is the SOLE cloud selector:
+        // set routes to Fermyon Cloud, unset stays local. There is no
+        // deploy-command heuristic and no backward-compatibility fallback, so
+        // `config push` and `config diff` can never disagree.
+        assert!(push_targets_fermyon_cloud(
+            &AdapterPushContext::new().with_cloud_target(true)
+        ));
+        assert!(!push_targets_fermyon_cloud(&AdapterPushContext::new()));
     }
 
     // ---------- argv shape ----------
@@ -472,10 +448,12 @@ exit {exit}
 
     /// A process-wide mutex serialising `PATH`-mutating tests in
     /// this module so two parallel tests don't race on the env.
+    /// Delegates to the shared `cli::env_mutation_guard()` so this
+    /// suite also serialises against `provision_local`'s PATH-
+    /// mutating tests (both suites prepend a fake `spin` shim).
     #[cfg(unix)]
     fn path_mutation_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
+        super::super::env_mutation_guard()
     }
 
     #[cfg(unix)]
@@ -672,6 +650,44 @@ exit {exit}
         assert!(
             err.contains("\"k0\""),
             "committed bucket must include at least `k0` from chunk 1: {err}"
+        );
+    }
+
+    // ---------- read_config_entry: Fermyon Cloud branch ----------
+
+    /// Branch 2: `read_config_entry` returns `Unsupported` when the
+    /// deploy command indicates Fermyon Cloud (no per-key `get` in
+    /// the cloud CLI as of v1).
+    #[test]
+    fn read_config_entry_returns_unsupported_for_fermyon_cloud_deploy_cmd() {
+        use crate::cli::SpinCliAdapter;
+        use edgezero_adapter::registry::{
+            Adapter as _, AdapterPushContext, ReadConfigEntry, ResolvedStoreId,
+        };
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"a.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let mut ctx = AdapterPushContext::new();
+        ctx.cloud_target = true;
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &ResolvedStoreId::new("app_config".to_owned(), "app_config".to_owned()),
+                "greeting",
+                &ctx,
+            )
+            .expect("cloud branch returns Ok(Unsupported)");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "Fermyon Cloud must return Unsupported"
         );
     }
 }

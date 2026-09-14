@@ -6,6 +6,39 @@ The `edgezero.toml` manifest describes an EdgeZero application, providing a sing
 
 New workspaces scaffolded with `edgezero new` include this manifest by default. The manifest drives both runtime routing and CLI commands.
 
+### Where does each setting live?
+
+`edgezero.toml` (plus the typed `<name>.toml` app-config sitting next to
+it) is the durable, portable, **tracked** source of truth — durable
+settings such as adapter selection, store declarations, routes, and
+middleware belong here. Everything else is generated:
+
+- `edgezero.toml` and `<name>.toml` — tracked. The portable manifest and
+  the typed app-config the runtime reads.
+- `axum.toml` / `wrangler.toml` / `fastly.toml` / `spin.toml` /
+  `runtime-config.toml` / `.dev.vars` — **operator-modifiable but
+  gitignored**. Each is synthesised by
+  `<app>-cli provision --adapter <name> --local` (which the scaffolder
+  runs for you on `edgezero new`) and merged with per-store bindings
+  drawn from `edgezero.toml`. Teammates regenerate them after cloning;
+  hand-edits stay local until you hand-share.
+- `.edgezero/.env` (Axum) and `<spin_crate>/.env` (Spin) — gitignored.
+  These files carry two layers of content, both sourced by
+  `run_serve` on startup:
+  - **Base**: bundled `edgezero provision --local` writes the
+    runtime env-label lines
+    (`EDGEZERO__STORES__<KIND>__<ID>__NAME=<value>`) the runtime
+    needs to resolve stores at startup.
+  - **Typed**: your generated `<app>-cli provision --local`
+    additionally appends per-secret placeholder lines derived
+    from `AppConfig`'s `#[secret]` / `#[secret(store_ref)]`
+    fields (Axum gets `<key_value>=` lines here; Spin gets
+    `SPIN_VARIABLE_<NAME>=` lines plus matching `[variables]`
+    stanzas inside `spin.toml`). The bundled `edgezero` binary
+    intentionally does not — it has no downstream `AppConfig`
+    type to walk — so operators depending on secret placeholders
+    must invoke their generated CLI.
+
 ```toml
 [app]
 name = "my-app"

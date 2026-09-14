@@ -20,7 +20,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use edgezero_adapter::env_file::reject_symlinked_target;
+
 use serde::Deserialize;
+use serde::de::Error as DeError;
 
 /// Backend selected for one `[key_value_store.<label>]` stanza. The
 /// variant tells the dispatcher which writer to invoke.
@@ -43,11 +46,15 @@ pub(crate) enum KeyValueBackend {
     Unknown { type_name: String },
 }
 
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "deserialize_in_place's default body is correct for this enum; overriding adds no value"
-)]
 impl<'de> Deserialize<'de> for KeyValueBackend {
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
+    }
+
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -56,24 +63,27 @@ impl<'de> Deserialize<'de> for KeyValueBackend {
         // Spin's runtime-config format requires a `type` discriminant
         // for every store; we treat its absence as Unknown.
         let table = toml::Table::deserialize(deserializer)?;
-        let type_name = table
-            .get("type")
-            .and_then(toml::Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        // A field that is PRESENT but not a string is a malformed
+        // runtime-config, not a silent fall-through to the default: e.g.
+        // `path = 123` must surface an error rather than be dropped and
+        // resolve to the default SQLite location (which would push config
+        // to the wrong database). Absent fields keep their defaults.
+        let str_field = |field: &str| -> Result<Option<&str>, D::Error> {
+            match table.get(field) {
+                None => Ok(None),
+                Some(toml::Value::String(value)) => Ok(Some(value.as_str())),
+                Some(_) => Err(DeError::custom(format!(
+                    "`{field}` in a `[key_value_store]` stanza must be a string"
+                ))),
+            }
+        };
+        let type_name = str_field("type")?.unwrap_or("").to_owned();
         Ok(match type_name.as_str() {
             "spin" => Self::Spin {
-                path: table
-                    .get("path")
-                    .and_then(toml::Value::as_str)
-                    .map(PathBuf::from),
+                path: str_field("path")?.map(PathBuf::from),
             },
             "redis" => Self::Redis {
-                url: table
-                    .get("url")
-                    .and_then(toml::Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
+                url: str_field("url")?.unwrap_or("").to_owned(),
             },
             "azure_cosmos" => Self::AzureCosmos,
             other => Self::Unknown {
@@ -101,6 +111,10 @@ pub(crate) struct ParsedRuntimeConfig {
 /// Returns a human-readable error string if the file exists but is
 /// malformed TOML or doesn't deserialise into the expected shape.
 pub(crate) fn read(path: &Path) -> Result<ParsedRuntimeConfig, String> {
+    // Reject a symlinked final component before reading, matching the
+    // write side (provision refuses to create `runtime-config.toml`
+    // through a symlink) -- one consistent final-path policy.
+    reject_symlinked_target(path)?;
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -132,6 +146,19 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let parsed = read(&dir.path().join("absent.toml")).expect("missing file is fine");
         assert!(parsed.key_value_stores.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_symlinked_runtime_config() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("tempdir");
+        let real = dir.path().join("real.toml");
+        fs::write(&real, "[key_value_store.app_config]\ntype = \"spin\"\n").expect("write");
+        let link = dir.path().join("runtime-config.toml");
+        symlink(&real, &link).expect("symlink");
+        let err = read(&link).expect_err("symlinked runtime-config must be refused");
+        assert!(err.contains("symlink"), "error names the symlink: {err}");
     }
 
     #[test]
@@ -216,6 +243,41 @@ mod tests {
             parsed.key_value_stores["global"],
             KeyValueBackend::AzureCosmos
         ));
+    }
+
+    #[test]
+    fn spin_backend_rejects_non_string_path() {
+        // `path = 123` is malformed: silently defaulting to the standard
+        // SQLite location would push config to the wrong database. It must
+        // surface an error.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("runtime-config.toml");
+        fs::write(
+            &path,
+            "[key_value_store.app_config]\ntype = \"spin\"\npath = 123\n",
+        )
+        .expect("write");
+        let err = read(&path).expect_err("a non-string `path` must error, not silently default");
+        assert!(
+            err.contains("`path`") && err.contains("must be a string"),
+            "error names the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn redis_backend_rejects_non_string_url() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("runtime-config.toml");
+        fs::write(
+            &path,
+            "[key_value_store.cache]\ntype = \"redis\"\nurl = true\n",
+        )
+        .expect("write");
+        let err = read(&path).expect_err("a non-string `url` must error");
+        assert!(
+            err.contains("`url`") && err.contains("must be a string"),
+            "error names the offending field: {err}"
+        );
     }
 
     #[test]

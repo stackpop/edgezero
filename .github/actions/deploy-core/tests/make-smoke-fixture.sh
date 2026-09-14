@@ -209,7 +209,14 @@ FTOML
   # deploy-argv.txt) so they never dirty the source and trip the committed-source
   # guard. This matters for the cache smoke, which deploys TWICE: the first deploy
   # writes these, and the second deploy's guard would otherwise see a dirty tree.
-  printf 'target/\nenv-seen.txt\ndeploy-argv.txt\n' >.gitignore
+  #
+  # `.edgezero/` is per-machine local state that a deploy creates in the project
+  # root (the cross-process `provision.lock` the deploy holds, plus Axum's `.env`
+  # and local config stores). Every real project gitignores the whole directory
+  # -- this repo's own .gitignore and the scaffolder's gitignore.hbs both do --
+  # so the fixture must too, or the second deploy's committed-source guard sees
+  # the lock file as untracked and fails.
+  printf 'target/\nenv-seen.txt\ndeploy-argv.txt\n.edgezero/\n' >.gitignore
 
   cargo generate-lockfile
 

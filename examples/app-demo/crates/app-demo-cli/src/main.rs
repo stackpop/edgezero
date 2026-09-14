@@ -116,7 +116,7 @@ fn main() {
         Cmd::ActiveVersion(args) => edgezero_cli::run_active_version(&args),
         Cmd::Rollback(args) => edgezero_cli::run_rollback(&args),
         Cmd::New(args) => edgezero_cli::run_new(&args),
-        Cmd::Provision(args) => edgezero_cli::run_provision(&args),
+        Cmd::Provision(args) => edgezero_cli::run_provision_typed::<AppDemoConfig>(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),
     };
     if let Err(err) = result {

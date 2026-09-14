@@ -131,6 +131,15 @@ impl PathPrepend {
 /// into their own process, so cross-crate races are impossible. Crates whose
 /// env-touching tests are `async` own an equivalent `tokio::sync::Mutex`
 /// instead (a `std` guard cannot be held across an `.await`).
+///
+/// "One lock per binary" means exactly that: ALL env-mutating tests in a
+/// binary must take the SAME mutex. A binary that also defines its own
+/// guard (e.g. `edgezero-cli`'s `manifest_guard`) must route every
+/// env-mutating test through that one guard -- mixing it with `env_lock`
+/// leaves two disjoint mutexes over one process-global environment, which
+/// serialises nothing. `TMPDIR` is the sharpest edge: `TempDir::new()`
+/// reads it, so an unsynchronised override redirects every concurrent
+/// test's tempdir into a directory that then gets deleted.
 #[inline]
 #[must_use]
 pub fn env_lock() -> &'static Mutex<()> {

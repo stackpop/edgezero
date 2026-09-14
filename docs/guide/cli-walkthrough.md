@@ -6,7 +6,10 @@ command you'll use day-to-day: `auth`, `provision`, `config validate`, `config p
 documents each command exhaustively — this page tells the story of how they fit
 together.
 
-The full command surface in your generated `myapp-cli`:
+The full command surface in your generated `myapp-cli` (on a fresh
+checkout the binary isn't installed — invoke it from source with
+`cargo run -p myapp-cli -- <command>`, or `cargo install --path
+crates/myapp-cli` first):
 
 ```bash
 myapp-cli build       # cargo build for a target adapter
@@ -65,6 +68,30 @@ auth-status = "wrangler whoami --json"
 
 ## 3. Provision platform resources
 
+`provision` has two modes:
+
+- **`provision --local`** — synthesises each adapter's baseline
+  manifest (Cloudflare `wrangler.toml`, Fastly `fastly.toml`, Spin
+  `spin.toml` + `runtime-config.toml`, Axum `axum.toml`) and merges
+  per-store `[[kv_namespaces]]` / `[local_server.*]` /
+  `key_value_stores` bindings + writes line-oriented `.env` /
+  `.dev.vars` / `.edgezero/.env` files. **No cloud shell-outs.** The
+  scaffolder runs this for every selected adapter as part of
+  `edgezero new`, so you rarely invoke it by hand for a first-run
+  project.
+- **`provision` (no `--local`)** — creates the backing platform
+  resources for real: `wrangler kv namespace create` (Cloudflare),
+  `fastly <kind>-store create` (Fastly), or the Spin-manifest edits
+  described below.
+
+All adapter manifests (`axum.toml`, `wrangler.toml`, `fastly.toml`,
+`spin.toml`, `runtime-config.toml`) are gitignored — teammates
+regenerate them via `<app>-cli provision --adapter <name> --local`
+after cloning. The scaffold-time provision loop writes each on
+`edgezero new`, and provision is the single source of truth for
+each generated file (no scaffold `.hbs` template for any adapter
+manifest).
+
 Once you've declared store ids in `edgezero.toml`:
 
 ```toml
@@ -84,6 +111,10 @@ ids = ["default"]
 ```bash
 myapp-cli provision --adapter cloudflare --dry-run
 myapp-cli provision --adapter cloudflare
+
+# Regenerate the local manifest + env files (no cloud calls) —
+# what the scaffolder ran for you on `edgezero new`.
+myapp-cli provision --adapter cloudflare --local
 ```
 
 Per-adapter behaviour:
@@ -116,8 +147,8 @@ Per-adapter behaviour:
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
   by the Fermyon stack). For each KV id AND each `[stores.config]` id (both KV-backed
   at runtime since the KV-config migration), appends the platform-resolved label to
-  the resolved `[component.<component>].key_value_stores = [...]` array. Secrets stay
-  manual — see [§5 Spin manual secret declarations](#5-spin-manual-secret-declarations).
+  the resolved `[component.<component>].key_value_stores = [...]` array. Typed
+  `#[secret]` variables are declared by `provision` — see [Spin secret variables](#spin-secret-variables).
 
 If your `spin.toml` declares more than one `[component.*]`, set
 `[adapters.spin.adapter].component = "<id>"` in `edgezero.toml` so `provision` knows
@@ -220,24 +251,32 @@ SET <key> <value>`).
   at build time), and the cloud writer shells out to the official
   Fermyon plugin.
 
-### Spin manual secret declarations
+### Spin secret variables
 
-`config push` never writes secret **values** or Spin secret variables — the blob
-stores each `#[secret]` field's key NAME (not its resolved value), and a
-`#[secret(store_ref)]` field's runtime key is code-local (e.g.
-`ctx.secret_store(&cfg.vault)?.require_str("active")`), so the CLI cannot infer it.
-Declare them manually in `spin.toml`:
+`provision --adapter spin --local` declares your typed `#[secret]` fields for
+you. For each one it adds a lowercased `[variables]` entry plus a
+`[component.<id>.variables]` binding to `spin.toml`, and seeds a
+`SPIN_VARIABLE_<NAME>=` line in the adapter's `.env`:
 
 ```toml
 [variables]
-api_token = { required = true, secret = true }  # the #[secret] field
+api_token = { default = "", secret = true }
 
 [component.myapp.variables]
 api_token = "{{ api_token }}"
 ```
 
-Then set the value at run time via `SPIN_VARIABLE_API_TOKEN=<value>` or
-`spin up --env API_TOKEN=<value>`.
+Existing entries are left untouched, so a re-run never clobbers an operator
+edit. You do **not** hand-edit `spin.toml` for typed secrets.
+
+`config push` still never writes secret **values** — the blob stores each
+`#[secret]` field's key NAME, not its resolved value. Set the value at run time
+via `SPIN_VARIABLE_<NAME>=<value>` (or `spin up --env <NAME>=<value>`).
+
+The one case the CLI cannot infer is a `#[secret(store_ref)]` field whose runtime
+key is code-local (e.g. `ctx.secret_store(&cfg.vault)?.require_str("active")`):
+declare that variable + binding in `spin.toml` yourself, since only your code
+knows the key.
 
 ## 6. Env-var overlay
 
@@ -285,14 +324,17 @@ myapp-cli build --adapter cloudflare
 myapp-cli deploy --adapter cloudflare
 ```
 
-For Spin (which has the most manual setup because of secret variables):
+For Spin:
 
 ```bash
 edgezero new myapp && cd myapp
-# Add manual secret declarations to crates/myapp-adapter-spin/spin.toml first
-# (see "Spin manual secret declarations" above)
 myapp-cli auth login --adapter spin
-myapp-cli provision --adapter spin
+# provision --local synthesises the gitignored spin.toml AND declares your
+# typed #[secret] variables in it. This is the step that writes the secret
+# bindings -- the cloud arm no-ops on typed secrets (Fermyon Cloud manages
+# variables). Only code-local #[secret(store_ref)] keys need a manual
+# declaration (see "Spin secret variables" above).
+myapp-cli provision --adapter spin --local
 myapp-cli config validate --strict
 myapp-cli config push --adapter spin
 myapp-cli build --adapter spin

@@ -35,6 +35,13 @@ pub struct CommandTemplates {
     pub build: &'static str,
     pub deploy: &'static str,
     pub serve: &'static str,
+    /// Whether the generator emits an `[adapters.<id>.commands]` shell block.
+    /// When `false`, `build`/`serve`/`deploy` dispatch through the registry
+    /// adapter instead -- which reads the adapter's own manifest (e.g. Axum's
+    /// `axum.toml` `crate_dir`). A shell `commands` block would take
+    /// precedence over that dispatch and bypass the manifest, so adapters
+    /// whose build/serve must honour their manifest opt OUT here.
+    pub emit_commands: bool,
 }
 
 /// Describes a dependency entry inserted into an adapter crate manifest.
@@ -108,6 +115,7 @@ mod tests {
             build: "build",
             deploy: "deploy",
             serve: "serve",
+            emit_commands: true,
         },
         crate_suffix: "adapter-alpha",
         dependencies: &[DependencySpec {
@@ -150,6 +158,7 @@ mod tests {
             build: "build",
             deploy: "deploy",
             serve: "serve",
+            emit_commands: true,
         },
         crate_suffix: "adapter-beta",
         dependencies: &[],

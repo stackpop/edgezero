@@ -29,6 +29,7 @@ edgezero-adapter-spin = { workspace = true, features = ["cli"], optional = true 
 app-demo-core = { path = "../../examples/app-demo/crates/app-demo-core", package = "app-demo-core", optional = true }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive"], optional = true }
+fs4 = { workspace = true }
 futures = { workspace = true }
 handlebars = { workspace = true }
 log = { workspace = true }
@@ -36,8 +37,10 @@ serde = { workspace = true }
 similar = { workspace = true }
 simple_logger = { workspace = true }
 serde_json = { workspace = true}
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 validator = { workspace = true }
 proc-macro2 = { workspace = true, features = ["span-locations"], optional = true }
 syn = { workspace = true, optional = true }

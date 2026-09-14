@@ -360,6 +360,13 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub commands: ManifestAdapterCommands,
+    /// Deploy-time identifiers returned by cloud CLIs and persisted in
+    /// `edgezero.toml` so teammates' `provision --local` can regenerate
+    /// adapter manifests with real ids. See spec §"Where durable
+    /// identifiers live".
+    #[serde(default)]
+    #[validate(nested)]
+    pub deployed: Option<ManifestAdapterDeployed>,
     /// Catch-all for any sub-table other than the four canonical ones
     /// (`adapter`, `build`, `commands`, `logging`). The pre-rewrite
     /// `[adapters.<name>.stores.*]` tables land here and are rejected by
@@ -371,10 +378,80 @@ pub struct ManifestAdapter {
     pub logging: ManifestLoggingConfig,
 }
 
+/// Deploy-time identifiers returned by cloud CLIs and persisted
+/// in `edgezero.toml` so teammates' `provision --local` can
+/// regenerate adapter manifests with real ids. See spec
+/// §"Where durable identifiers live".
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestAdapterDeployed {
+    /// Primary namespace ids, keyed by logical
+    /// `[stores.kv]` / `[stores.config]` id (Cloudflare only).
+    #[serde(default)]
+    pub kv_namespaces: BTreeMap<String, String>,
+    /// Preview-namespace ids, keyed by the SAME logical id.
+    /// Separate map so a legal store id like `sessions_preview`
+    /// cannot collide with a sibling-suffix convention.
+    #[serde(default)]
+    pub preview_kv_namespaces: BTreeMap<String, String>,
+    /// Fastly compute service id returned by `fastly compute deploy`.
+    #[serde(default)]
+    pub service_id: Option<String>,
+}
+
+impl ManifestAdapterDeployed {
+    /// Scalar field names in this schema. Consumed by the CLI writeback
+    /// path to reject adapter-emitted unknown scalar keys before they
+    /// land in `edgezero.toml`. Adding a new scalar field to the struct
+    /// above REQUIRES adding it here — the two arrays live in the same
+    /// impl block deliberately so the coupling is unmissable.
+    pub const SCALAR_FIELDS: &'static [&'static str] = &["service_id"];
+
+    /// Sub-table field names in this schema. Same rule as
+    /// [`Self::SCALAR_FIELDS`].
+    pub const SUB_TABLE_FIELDS: &'static [&'static str] =
+        &["kv_namespaces", "preview_kv_namespaces"];
+
+    /// Return the names of fields that are populated (non-empty
+    /// map, or `Some` value). Used by the CLI to cross-check
+    /// against `Adapter::deployed_fields` — but the mapping of
+    /// field-to-adapter lives in the adapter crates, NOT here.
+    /// Adding a new field to this struct requires adding a matching
+    /// arm below.
+    #[inline]
+    #[must_use]
+    pub fn populated_fields(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.kv_namespaces.is_empty() {
+            out.push("kv_namespaces");
+        }
+        if !self.preview_kv_namespaces.is_empty() {
+            out.push("preview_kv_namespaces");
+        }
+        if self.service_id.is_some() {
+            out.push("service_id");
+        }
+        out
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 #[validate(schema(function = "validate_manifest_adapter_definition"))]
 pub struct ManifestAdapterDefinition {
+    /// Outbound-host allow-list emitted into the synthesised Spin
+    /// manifest as `[component.<id>].allowed_outbound_hosts`.
+    ///
+    /// Spin defaults outbound HTTP to deny-all; leaving this empty
+    /// (the default) keeps the synthesised `spin.toml` at that secure
+    /// baseline. Set it to opt a generated project into outbound
+    /// calls, e.g. `allowed_outbound_hosts = ["https://*:*"]`. Only
+    /// the Spin adapter reads it; other adapters ignore it. Because
+    /// both `edgezero new` and clean-clone `provision --local`
+    /// synthesise from the SAME manifest, the emitted file stays
+    /// byte-identical across the two paths regardless of this value.
+    #[serde(default)]
+    pub allowed_outbound_hosts: Vec<String>,
     /// Spin component id, when the adapter's `manifest` (`spin.toml`) declares
     /// more than one `[component.*]`. Read by `provision` and
     /// `config push`; ignored at runtime. `config validate --strict`
@@ -382,6 +459,15 @@ pub struct ManifestAdapterDefinition {
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub component: Option<String>,
+    /// Whether config `push` / `diff` targets the platform's CLOUD store
+    /// rather than the local emulator store. Currently only the Spin adapter
+    /// reads it: `true` routes `config push`/`diff --adapter spin` to Fermyon
+    /// Cloud key-value (`spin cloud key-value ...`); unset/`false` uses the
+    /// local `SQLite` store. Replaces the old heuristic that inferred cloud
+    /// from the `[adapters.spin.commands].deploy` string, which the
+    /// hard-cutoff manifest no longer emits.
+    #[serde(default)]
+    pub cloud: Option<bool>,
     #[serde(rename = "crate")]
     #[serde(default)]
     #[validate(length(min = 1_u64))]
@@ -610,14 +696,6 @@ impl HttpMethod {
     }
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for HttpMethod {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -638,6 +716,15 @@ impl<'de> Deserialize<'de> for HttpMethod {
             ))),
         }
     }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
+    }
 }
 
 impl serde::Serialize for HttpMethod {
@@ -654,14 +741,6 @@ pub enum BodyMode {
     Stream,
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for BodyMode {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -674,6 +753,15 @@ impl<'de> Deserialize<'de> for BodyMode {
             "stream" => Ok(Self::Stream),
             other => Err(DeError::custom(format!("unsupported body mode `{other}`"))),
         }
+    }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
     }
 }
 
@@ -728,14 +816,6 @@ impl From<LogLevel> for LevelFilter {
     }
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for LogLevel {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -754,6 +834,15 @@ impl<'de> Deserialize<'de> for LogLevel {
                 "logging level must be trace, debug, info, warn, error, or off (got `{other}`)"
             ))),
         }
+    }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
     }
 }
 
@@ -883,6 +972,65 @@ fn validate_manifest_adapter_keys_case_unique(manifest: &Manifest) -> Result<(),
                 .into(),
             );
             return Err(error);
+        }
+    }
+    validate_canonical_deployed_ownership(manifest)?;
+    Ok(())
+}
+
+/// Canonical `[adapters.<name>.deployed]` field ownership for the
+/// built-in adapters.
+///
+/// A deployed field is meaningful only for the adapter that produces
+/// it -- `service_id` for Fastly, the KV-namespace maps for
+/// Cloudflare -- and Spin / Axum have no durable cloud identifiers at
+/// all. Placing e.g. `service_id` under `[adapters.cloudflare.deployed]`
+/// is always a mistake.
+///
+/// The CLI already rejects this, but only for adapters present in its
+/// build registry -- a reduced-feature build or a non-CLI reader of
+/// the manifest would silently accept the misplaced field. Enforcing
+/// the canonical ownership here in core closes that gap for EVERY
+/// consumer. Adapter names core doesn't recognise are left to the
+/// CLI's registry-based check (out-of-tree adapters define their own
+/// ownership).
+const CANONICAL_DEPLOYED_OWNERS: &[(&str, &[&str])] = &[
+    ("axum", &[]),
+    ("cloudflare", &["kv_namespaces", "preview_kv_namespaces"]),
+    ("fastly", &["service_id"]),
+    ("spin", &[]),
+];
+
+fn validate_canonical_deployed_ownership(manifest: &Manifest) -> Result<(), ValidationError> {
+    for (name, adapter) in &manifest.adapters {
+        let Some(deployed) = adapter.deployed.as_ref() else {
+            continue;
+        };
+        let canonical = name.to_ascii_lowercase();
+        let Some((_, owned)) = CANONICAL_DEPLOYED_OWNERS
+            .iter()
+            .find(|(known, _)| *known == canonical)
+        else {
+            continue;
+        };
+        for field in deployed.populated_fields() {
+            if !owned.contains(&field) {
+                let mut error = ValidationError::new("deployed_field_not_owned");
+                let owned_list = if owned.is_empty() {
+                    "none".to_owned()
+                } else {
+                    owned.join(", ")
+                };
+                error.message = Some(
+                    format!(
+                        "[adapters.{name}.deployed].{field}: the `{canonical}` adapter does not \
+                         own this deployed field (owned: [{owned_list}]). A deployed field is only \
+                         valid under the adapter that produces it; move it or remove it."
+                    )
+                    .into(),
+                );
+                return Err(error);
+            }
         }
     }
     Ok(())
@@ -1678,6 +1826,78 @@ manifest = "fastly.toml"
         assert_eq!(adapter.adapter.manifest.as_deref(), Some("fastly.toml"));
     }
 
+    // The manifest parser treats `[adapters.<name>.deployed]` as a
+    // shared schema — it doesn't branch on the adapter name. These
+    // tests name the fixture adapter `demo` so their coverage is
+    // read as "the shared struct captures each field kind" rather
+    // than "the parser knows about a specific adapter." Section 6
+    // is where individual adapters read the field subset they use.
+
+    #[test]
+    fn adapter_deployed_block_captures_kv_namespace_maps() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "crates/x"
+        manifest = "crates/x/manifest.toml"
+        [adapters.demo.deployed]
+        kv_namespaces.sessions = "abc123"
+        preview_kv_namespaces.sessions = "abc123_preview"
+        "#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        manifest.validate().unwrap();
+        let deployed = manifest.adapters["demo"].deployed.as_ref().unwrap();
+        assert_eq!(deployed.kv_namespaces["sessions"], "abc123");
+        assert_eq!(deployed.preview_kv_namespaces["sessions"], "abc123_preview");
+        assert!(deployed.service_id.is_none());
+    }
+
+    #[test]
+    fn adapter_deployed_block_captures_service_id() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "crates/x"
+        manifest = "crates/x/manifest.toml"
+        [adapters.demo.deployed]
+        service_id = "SVC1"
+        "#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.adapters["demo"]
+                .deployed
+                .as_ref()
+                .unwrap()
+                .service_id
+                .as_deref(),
+            Some("SVC1")
+        );
+    }
+
+    #[test]
+    fn adapter_deployed_block_rejects_unknown_field() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "x"
+        manifest = "x/manifest.toml"
+        [adapters.demo.deployed]
+        typo_field = "x"
+        "#;
+        let err = toml::from_str::<Manifest>(toml).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
     // Empty/minimal manifest tests
     #[test]
     fn empty_manifest_has_defaults() {
@@ -1790,7 +2010,7 @@ ids = ["default"]
 
     #[test]
     fn manifest_rejects_case_fold_duplicate_adapter_keys() {
-        // PR #269 round 4: case-fold dup detection. `[adapters.xenon]`
+        // Case-fold duplicate detection. `[adapters.xenon]`
         // and `[adapters.Xenon]` are distinct TOML keys but resolve
         // to the same `adapter_entry` lookup at runtime — reject at
         // load time so the case-insensitive lookup is never
@@ -1837,7 +2057,7 @@ ids = ["default"]
 
     #[test]
     fn manifest_stores_rejects_unknown_kind_at_parse_time() {
-        // PR #269 round 4 / F2: `deny_unknown_fields` on
+        // `deny_unknown_fields` on
         // ManifestStores catches typos like `[stores.secret]` (vs
         // the correct `[stores.secrets]`). Pre-fix, a typo passed
         // parsing silently and the runtime saw no secrets
@@ -2172,5 +2392,91 @@ default = "feature__flags"
         ManifestLoader::try_load_from_str(manifest)
             .err()
             .expect("double-underscore store id must fail validation");
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_service_id_when_set() {
+        let deployed = ManifestAdapterDeployed {
+            service_id: Some("SVC1".to_owned()),
+            ..ManifestAdapterDeployed::default()
+        };
+        assert_eq!(deployed.populated_fields(), vec!["service_id"]);
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_kv_maps_when_non_empty() {
+        let mut deployed = ManifestAdapterDeployed::default();
+        deployed
+            .kv_namespaces
+            .insert("sessions".to_owned(), "abc".to_owned());
+        assert_eq!(deployed.populated_fields(), vec!["kv_namespaces"]);
+    }
+
+    #[test]
+    fn deployed_populated_fields_empty_when_all_defaults() {
+        let deployed = ManifestAdapterDeployed::default();
+        assert!(deployed.populated_fields().is_empty());
+    }
+
+    #[test]
+    fn core_rejects_deployed_field_under_wrong_adapter() {
+        // `service_id` is Fastly's; declaring it under Cloudflare is a
+        // mistake core must reject on load, so reduced-feature builds
+        // and non-CLI readers catch it too (not just the CLI registry
+        // check).
+        let toml = "[adapters.cloudflare.deployed]\nservice_id = \"SVC1\"\n";
+        let msg = match ManifestLoader::try_load_from_str(toml) {
+            Ok(_) => panic!("service_id under cloudflare must be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("service_id") && msg.contains("cloudflare"),
+            "error names the field and adapter: {msg}"
+        );
+    }
+
+    #[test]
+    fn core_rejects_deployed_field_under_no_owner_adapter() {
+        // Spin owns no deployed fields.
+        let toml = "[adapters.spin.deployed]\nservice_id = \"SVC1\"\n";
+        assert!(
+            ManifestLoader::try_load_from_str(toml).is_err(),
+            "a deployed field under spin (owns none) must be rejected"
+        );
+    }
+
+    #[test]
+    fn core_accepts_deployed_field_under_owning_adapter() {
+        // Fastly owns `service_id`; Cloudflare owns the KV maps.
+        let toml = "[adapters.fastly.deployed]\nservice_id = \"SVC1\"\n\n[adapters.cloudflare.deployed.kv_namespaces]\nsessions = \"abc\"\n";
+        ManifestLoader::try_load_from_str(toml)
+            .expect("correctly-owned deployed fields must validate");
+    }
+
+    #[test]
+    fn core_leaves_unknown_adapter_deployed_fields_to_the_cli() {
+        // An out-of-tree adapter name core doesn't recognise defines
+        // its own ownership; core must not reject it.
+        let toml = "[adapters.myvendor.deployed]\nservice_id = \"SVC1\"\n";
+        ManifestLoader::try_load_from_str(toml)
+            .expect("unknown adapter's deployed fields are the CLI registry check's job");
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_all_when_all_set() {
+        let mut deployed = ManifestAdapterDeployed {
+            service_id: Some("SVC1".to_owned()),
+            ..ManifestAdapterDeployed::default()
+        };
+        deployed
+            .kv_namespaces
+            .insert("sessions".to_owned(), "abc".to_owned());
+        deployed
+            .preview_kv_namespaces
+            .insert("sessions".to_owned(), "abc_preview".to_owned());
+        assert_eq!(
+            deployed.populated_fields(),
+            vec!["kv_namespaces", "preview_kv_namespaces", "service_id"]
+        );
     }
 }
