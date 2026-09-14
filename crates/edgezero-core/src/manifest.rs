@@ -1110,6 +1110,32 @@ pub fn canonicalize_outbound_host(entry: &str) -> Result<Vec<AtomicHost>, HostPa
     Ok(vec![AtomicHost { host, port, scheme }])
 }
 
+/// Canonicalizes the complete outbound host declaration into a sorted, duplicate-free list.
+///
+/// An absent declaration retains Spin's HTTPS-only wildcard default.
+///
+/// # Errors
+/// Returns [`HostParseError`] when any declared host is outside the portable host grammar.
+#[inline]
+pub fn canonicalize_outbound_hosts(
+    hosts: Option<&[String]>,
+) -> Result<Vec<String>, HostParseError> {
+    let mut canonical = BTreeSet::new();
+    match hosts {
+        Some(entries) => {
+            for entry in entries {
+                for host in canonicalize_outbound_host(entry)? {
+                    canonical.insert(host.render_spin_host());
+                }
+            }
+        }
+        None => {
+            canonical.insert(String::from("https://*:*"));
+        }
+    }
+    Ok(canonical.into_iter().collect())
+}
+
 /// Serialize a `[[environment.secrets]]` list without exposing `value`.
 /// Secret bindings share `ManifestBinding` with variables, whose `value`
 /// is safe to emit; secret values must never appear in manifest output.
@@ -2177,6 +2203,28 @@ hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
         assert_eq!(explicit[0].scheme, Scheme::Http);
         assert_eq!(explicit[1].scheme, Scheme::Https);
         assert!(explicit.iter().all(|host| host.port == Port::Any));
+    }
+
+    #[test]
+    fn canonical_outbound_host_set_expands_defaults_and_normalizes_order() {
+        assert_eq!(
+            canonicalize_outbound_hosts(None).expect("absent default"),
+            vec!["https://*:*".to_owned()]
+        );
+
+        let hosts = vec![
+            "HTTPS://API.EXAMPLE.COM:443".to_owned(),
+            "*".to_owned(),
+            "api.example.com".to_owned(),
+        ];
+        assert_eq!(
+            canonicalize_outbound_hosts(Some(&hosts)).expect("canonical hosts"),
+            vec![
+                "http://*:*".to_owned(),
+                "https://*:*".to_owned(),
+                "https://api.example.com".to_owned(),
+            ]
+        );
     }
 
     #[test]

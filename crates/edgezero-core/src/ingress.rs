@@ -663,6 +663,13 @@ impl PreparedIngress {
         self.admitted.read_deadline()
     }
 
+    /// Canonical request method captured before admission.
+    #[must_use]
+    #[inline]
+    pub fn request_method(&self) -> &Method {
+        self.resolved.method()
+    }
+
     #[must_use]
     #[inline]
     pub fn request_start(&self) -> MonotonicInstant {

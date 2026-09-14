@@ -30,9 +30,7 @@ use tower::Service as TowerService;
 
 use crate::outbound::AxumOutboundClient;
 use crate::request::into_core_request_parts;
-use crate::response::{
-    AxumEgressBody, EgressConnection, detached_error_response, prepare_egress_response,
-};
+use crate::response::{AxumEgressBody, EgressConnection, prepare_egress_response};
 
 /// Shared application state used to construct one private Hyper service per HTTP/1 connection.
 #[derive(Clone)]
@@ -163,32 +161,15 @@ impl AxumServiceState {
         }
     }
 
-    async fn dispatch_request(
+    fn resolved_store_registries(
         &self,
-        mut request: Request<AxumBody>,
-        connection: &EgressConnection,
-        remote_addr: Option<SocketAddr>,
-    ) -> Response<AxumEgressBody> {
-        if let Some(peer_addr) = remote_addr {
-            request.extensions_mut().insert(ConnectInfo(peer_addr));
-        }
-        let request_start = self.app.monotonic_now();
-        let app = Arc::clone(&self.app);
-        let outbound_transport_handle = self.outbound_transport.clone();
-        // Hard-cutoff: legacy bare `KvHandle` /
-        // `ConfigStoreHandle` / `SecretHandle` entries are NO
-        // LONGER inserted into request extensions. The legacy
-        // `with_*_handle` constructors still take a single
-        // handle, but the dispatcher synthesises a one-id
-        // `<kind>Registry` under the conventional `"default"`
-        // id from that handle — and only the registry goes into
-        // extensions. Handlers must use the registry-aware
-        // `RequestContext` accessors (`kv_store_default`,
-        // `config_store_default`, `secret_store_default`) or
-        // the `Kv` / `Config` / `Secrets` extractors. The
-        // pre-rewrite `ctx.kv_handle()` / `config_handle()` /
-        // `secret_handle()` accessors are gone (spec
-        // hard-cutoff).
+    ) -> (
+        Option<ConfigRegistry>,
+        Option<KvRegistry>,
+        Option<SecretRegistry>,
+    ) {
+        // Legacy single-handle constructors synthesize only the conventional
+        // `default` registry entry; request extensions contain registries only.
         let config_registry = self.config_registry.clone().or_else(|| {
             self.config_store_handle.clone().map(|handle| {
                 ConfigRegistry::single_id(
@@ -213,9 +194,29 @@ impl AxumServiceState {
                 )
             })
         });
+        (config_registry, kv_registry, secret_registry)
+    }
+
+    async fn dispatch_request(
+        &self,
+        mut request: Request<AxumBody>,
+        connection: &EgressConnection,
+        remote_addr: Option<SocketAddr>,
+    ) -> Response<AxumEgressBody> {
+        if let Some(peer_addr) = remote_addr {
+            request.extensions_mut().insert(ConnectInfo(peer_addr));
+        }
+        let request_start = self.app.monotonic_now();
+        let app = Arc::clone(&self.app);
+        let outbound_transport_handle = self.outbound_transport.clone();
+        let (config_registry, kv_registry, secret_registry) = self.resolved_store_registries();
         let (parts, native_body) = request.into_parts();
+        let request_method = parts.method.clone();
         if let Err(error) = validate_normalized_ingress_parts(&parts, app.ingress_head_limits()) {
-            return detached_error_response(error);
+            return prepare_egress_response(
+                app.detached_ingress_error_egress(error, request_method.clone(), request_start),
+                connection,
+            );
         }
         let head_parts = IngressHeadParts::from_parts(
             &parts,
@@ -227,19 +228,35 @@ impl AxumServiceState {
             Ok(IngressBeginOutcome::Refused(response)) => {
                 return prepare_egress_response(response, connection);
             }
-            Err(error) => return detached_error_response(error),
+            Err(error) => {
+                return prepare_egress_response(
+                    app.detached_ingress_error_egress(error, request_method.clone(), request_start),
+                    connection,
+                );
+            }
             Ok(_) => {
-                return detached_error_response(EdgeError::internal(anyhow::anyhow!(
-                    "unsupported ingress admission outcome"
-                )));
+                return prepare_egress_response(
+                    app.detached_ingress_error_egress(
+                        EdgeError::internal(anyhow::anyhow!(
+                            "unsupported ingress admission outcome"
+                        )),
+                        request_method,
+                        request_start,
+                    ),
+                    connection,
+                );
             }
         };
         let read_deadline = prepared.read_deadline();
         let monotonic_clock = prepared.monotonic_clock();
         let Some(outbound_transport) = outbound_transport_handle else {
-            return detached_error_response(EdgeError::internal(anyhow::anyhow!(
-                "failed to initialize outbound HTTP transport"
-            )));
+            let egress = app.admitted_error_egress(
+                prepared,
+                EdgeError::internal(anyhow::anyhow!(
+                    "failed to initialize outbound HTTP transport"
+                )),
+            );
+            return prepare_egress_response(egress, connection);
         };
         let mut core_request = match into_core_request_parts(
             parts,
@@ -248,10 +265,14 @@ impl AxumServiceState {
             Some(outbound_transport),
         ) {
             Ok(converted) => converted,
-            Err(_error) => {
-                return detached_error_response(EdgeError::internal(anyhow::anyhow!(
-                    "failed to convert inbound request"
-                )));
+            Err(error) => {
+                let egress = app.admitted_error_egress(
+                    prepared,
+                    EdgeError::internal(anyhow::anyhow!(
+                        "failed to convert inbound request: {error}"
+                    )),
+                );
+                return prepare_egress_response(egress, connection);
             }
         };
 
@@ -265,10 +286,7 @@ impl AxumServiceState {
             core_request.extensions_mut().insert(registry);
         }
 
-        let egress = match app.dispatch_admitted(prepared, core_request).await {
-            Ok(egress) => egress,
-            Err(error) => return detached_error_response(error),
-        };
+        let egress = app.dispatch_admitted(prepared, core_request).await;
         prepare_egress_response(egress, connection)
     }
 }
@@ -335,7 +353,9 @@ mod tests {
     use edgezero_core::http::{
         HeaderMap, HeaderValue, Response as CoreResponse, StatusCode, response_builder,
     };
-    use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
+    use edgezero_core::ingress::{
+        AdmissionDecision, BufferedIngressResponse, IngressGrant, IngressHeadLimits,
+    };
     use edgezero_core::key_value_store::KvStore;
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::outbound::OutboundRequest;
@@ -349,6 +369,7 @@ mod tests {
     use http_body::Body as _;
     use std::future::poll_fn as poll_future;
     use std::io;
+    use std::str;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
@@ -522,6 +543,86 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
         assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn normalized_ingress_error_returns_typed_response_without_application_observation() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let clock_samples = Arc::new(AtomicUsize::new(0));
+        let observed_clock_samples = Arc::clone(&clock_samples);
+        let now = MonotonicInstant::now();
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            observed_clock_samples.fetch_add(1, Ordering::SeqCst);
+            now
+        }));
+        app.set_ingress_head_limits(
+            IngressHeadLimits::default()
+                .with_max_request_target_bytes(4)
+                .expect("target limit"),
+        );
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let request = Request::builder()
+            .uri("/too-long")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = AxumServiceState::from_app(app)
+            .oneshot(request)
+            .await
+            .expect("typed response");
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        assert!(
+            str::from_utf8(&body)
+                .expect("UTF-8 body")
+                .contains("uri_too_long")
+        );
+        assert!(reports.lock().expect("reports lock").is_empty());
+        assert!(clock_samples.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_admission_failure_uses_owned_error_egress() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let observed_grant_drops = Arc::clone(&grant_drops);
+        let router = RouterService::builder()
+            .get("/owned", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("handler must not run")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+            grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let mut service = AxumServiceState::from_app(app);
+        service.outbound_transport = None;
+        let request = Request::builder()
+            .uri("/owned")
+            .body(AxumBody::empty())
+            .expect("request");
+
+        let response = service
+            .oneshot(request)
+            .await
+            .expect("owned error response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let _body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        let observed = reports.lock().expect("reports lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].outcome, ResponseEgressOutcome::HostHandoff);
+        assert_eq!(
+            observed[0].route.as_ref().map(RouteMetadata::pattern),
+            Some("/owned")
+        );
     }
 
     fn guarded_fallback_app() -> (App, Arc<AtomicUsize>, Arc<AtomicUsize>) {

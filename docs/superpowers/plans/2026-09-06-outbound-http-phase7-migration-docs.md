@@ -1,6 +1,8 @@
 # Outbound HTTP Phase 7: Public Migration, Documentation, and Final Gates Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** Deterministic migration, hard-cut API removal, generated/demo alignment, and documentation gates are implemented on PR 275. Protected provider evidence remains external and does not promote `BestEffort` cells. The unchecked steps below are retained as the original implementation record.
 
 **Goal:** Migrate all remaining consumers, delete the legacy proxy API without aliases, publish capability/outbound documentation, and make every generated, example, adapter, WASM, host, and docs gate executable in CI.
 
@@ -194,17 +196,17 @@ scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec carg
 - [ ] `scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-spin --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec`
 - [ ] `env CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner scripts/run_test_nonzero.sh cloudflare_fetch_options_are_raw_manual_abortable_and_no_redirect cargo test --offline --locked -p edgezero-adapter-cloudflare --no-default-features --features cloudflare,test-utils --target wasm32-unknown-unknown --test contract`
 - [ ] `(cd crates/edgezero-adapter-cloudflare && ../../scripts/run_test_nonzero.sh cloudflare_fetch_options_are_raw_manual_abortable_and_no_redirect cargo test --offline --locked --no-default-features --features cloudflare,test-utils --test contract)`; this separate run has no target/runner override and proves the committed crate-local Cargo config selects `wasm32-unknown-unknown` plus `wasm-bindgen-test-runner`.
-- [ ] `test "$(viceroy --version)" = "viceroy 0.17.0"`
+- [ ] `test "$(viceroy --version)" = "viceroy 0.21.0"`
 - [ ] `(cd crates/edgezero-adapter-fastly && ../../scripts/run_test_nonzero.sh send_all_dispatches_every_slot_before_wait cargo test --offline --locked --no-default-features --features fastly,test-utils --test contract)`
 - [ ] `(cd crates/edgezero-adapter-fastly && ../../scripts/run_test_nonzero.sh backend_creation_error_table_is_exhaustive cargo test --offline --locked --no-default-features --features fastly,test-utils --lib)`
 - [ ] `cargo metadata --offline --locked --format-version 1 --manifest-path crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/Cargo.toml`
-- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/Cargo.toml | rg 'fastly v0\.12\.1'`
+- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/Cargo.toml | rg 'fastly v0\.13\.1'`
 - [ ] `fastly compute build --non-interactive --dir crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly`
 - [ ] `test -f crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/pkg/edgezero-outbound-probe.tar.gz`
 - [ ] `(cd crates/edgezero-adapter-spin && ../../scripts/run_test_nonzero.sh response_caller_result_succeeds_only_after_native_eof cargo test --offline --locked --no-default-features --features spin,test-utils --target wasm32-wasip2 --test contract)`; the crate-local runner must contain the exact Phase 5 validated command.
 - [ ] `(cd crates/edgezero-adapter-spin && ../../scripts/run_test_nonzero.sh spin_error_code_table_is_exhaustive cargo test --offline --locked --no-default-features --features spin,test-utils --target wasm32-wasip2 --test sdk_resources)`
 - [ ] `cargo metadata --offline --locked --format-version 1 --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml`
-- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml | rg 'worker v0\.8\.3'`
+- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml | rg 'worker v0\.8\.5'`
 - [ ] `npm ci --prefix crates/edgezero-adapter-cloudflare`
 - [ ] `npm --prefix crates/edgezero-adapter-cloudflare run build:outbound-fixture`
 - [ ] `npm --prefix crates/edgezero-adapter-cloudflare run test:workerd`; the host driver requires every exact probe ID and a positive count.

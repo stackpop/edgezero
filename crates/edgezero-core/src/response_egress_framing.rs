@@ -1,6 +1,6 @@
 use std::mem;
 
-use crate::body::Body;
+use crate::body::{Body, BodyStream};
 use crate::error::EdgeError;
 use crate::http::header::{
     CONNECTION, CONTENT_LENGTH, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
@@ -129,47 +129,8 @@ pub fn prepare_response_egress(
                 Body::Stream(_) => {
                     let body = mem::take(response.body_mut());
                     if let Body::Stream(stream) = body {
-                        *response.body_mut() = Body::from_stream(unfold(
-                            (stream, length, false),
-                            |(mut source, remaining, terminal)| async move {
-                                if terminal {
-                                    return None;
-                                }
-                                match source.next().await {
-                                    Some(Ok(bytes)) => {
-                                        let Ok(chunk_length) = u64::try_from(bytes.len()) else {
-                                            return Some((
-                                                Err(EdgeError::internal(
-                                                    ResponseEgressBodyLengthError::Exceeded,
-                                                )),
-                                                (source, remaining, true),
-                                            ));
-                                        };
-                                        let Some(next_remaining) =
-                                            remaining.checked_sub(chunk_length)
-                                        else {
-                                            return Some((
-                                                Err(EdgeError::internal(
-                                                    ResponseEgressBodyLengthError::Exceeded,
-                                                )),
-                                                (source, remaining, true),
-                                            ));
-                                        };
-                                        Some((Ok(bytes), (source, next_remaining, false)))
-                                    }
-                                    Some(Err(error)) => {
-                                        Some((Err(error), (source, remaining, true)))
-                                    }
-                                    None if remaining == 0 => None,
-                                    None => Some((
-                                        Err(EdgeError::internal(
-                                            ResponseEgressBodyLengthError::Incomplete,
-                                        )),
-                                        (source, remaining, true),
-                                    )),
-                                }
-                            },
-                        ));
+                        *response.body_mut() =
+                            Body::from_stream(limit_declared_stream(stream, length));
                     }
                 }
             }
@@ -181,6 +142,49 @@ pub fn prepare_response_egress(
         response,
         transmits_body: !suppress_body,
     })
+}
+
+fn limit_declared_stream(stream: BodyStream, length: u64) -> BodyStream {
+    unfold(
+        (Some(stream), length),
+        |(optional_source, remaining)| async move {
+            let mut source = optional_source?;
+            match source.next().await {
+                Some(Ok(bytes)) => {
+                    let Ok(chunk_length) = u64::try_from(bytes.len()) else {
+                        drop(source);
+                        return Some((
+                            Err(EdgeError::internal(ResponseEgressBodyLengthError::Exceeded)),
+                            (None, remaining),
+                        ));
+                    };
+                    let Some(next_remaining) = remaining.checked_sub(chunk_length) else {
+                        drop(source);
+                        return Some((
+                            Err(EdgeError::internal(ResponseEgressBodyLengthError::Exceeded)),
+                            (None, remaining),
+                        ));
+                    };
+                    Some((Ok(bytes), (Some(source), next_remaining)))
+                }
+                Some(Err(error)) => {
+                    drop(source);
+                    Some((Err(error), (None, remaining)))
+                }
+                None if remaining == 0 => None,
+                None => {
+                    drop(source);
+                    Some((
+                        Err(EdgeError::internal(
+                            ResponseEgressBodyLengthError::Incomplete,
+                        )),
+                        (None, remaining),
+                    ))
+                }
+            }
+        },
+    )
+    .boxed_local()
 }
 
 /// Returns the typed streamed-body length violation carried by an internal body error.
@@ -256,6 +260,7 @@ fn strip_connection_fields(headers: &mut HeaderMap) -> Result<bool, ResponseEgre
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::VecDeque;
     use std::rc::Rc;
     use std::task::Poll;
 
@@ -265,12 +270,30 @@ mod tests {
     use futures_util::stream::{self, poll_fn};
 
     use crate::body::Body;
+    use crate::error::EdgeError;
     use crate::http::{Method, Response, StatusCode, response_builder};
 
     use super::{
         ResponseEgressBodyLengthError, ResponseEgressFramingError, prepare_response_egress,
         response_egress_body_length_error,
     };
+
+    struct DropSignal(Rc<Cell<usize>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_add(1));
+        }
+    }
+
+    fn tracked_body(source_items: Vec<Result<Bytes, EdgeError>>, drops: &Rc<Cell<usize>>) -> Body {
+        let signal = DropSignal(Rc::clone(drops));
+        let mut pending_items = VecDeque::from(source_items);
+        Body::from_stream(poll_fn(move |_context| {
+            let _keep_signal_alive = &signal;
+            Poll::Ready(pending_items.pop_front())
+        }))
+    }
 
     fn prepare_error(
         method: &Method,
@@ -534,6 +557,66 @@ mod tests {
             );
             assert!(early_eof_stream.next().await.is_none());
         });
+    }
+
+    #[test]
+    fn terminal_stream_error_releases_source_before_yield() {
+        let overrun_drops = Rc::new(Cell::new(0_usize));
+        let overrun = response_builder()
+            .status(StatusCode::OK)
+            .header("content-length", "1")
+            .body(tracked_body(
+                vec![Ok(Bytes::from_static(b"over"))],
+                &overrun_drops,
+            ))
+            .expect("response");
+        let mut overrun_stream = prepare_response_egress(&Method::GET, overrun)
+            .expect("prepared response")
+            .into_response()
+            .into_body()
+            .into_stream()
+            .expect("stream body");
+        block_on(overrun_stream.next())
+            .expect("overrun result")
+            .expect_err("overrun error");
+        assert_eq!(overrun_drops.get(), 1_usize);
+
+        let source_drops = Rc::new(Cell::new(0_usize));
+        let source_error = response_builder()
+            .status(StatusCode::OK)
+            .header("content-length", "1")
+            .body(tracked_body(
+                vec![Err(EdgeError::bad_gateway("source failed"))],
+                &source_drops,
+            ))
+            .expect("response");
+        let mut source_stream = prepare_response_egress(&Method::GET, source_error)
+            .expect("prepared response")
+            .into_response()
+            .into_body()
+            .into_stream()
+            .expect("stream body");
+        block_on(source_stream.next())
+            .expect("source result")
+            .expect_err("source error");
+        assert_eq!(source_drops.get(), 1_usize);
+
+        let eof_drops = Rc::new(Cell::new(0_usize));
+        let early_eof = response_builder()
+            .status(StatusCode::OK)
+            .header("content-length", "1")
+            .body(tracked_body(Vec::new(), &eof_drops))
+            .expect("response");
+        let mut eof_stream = prepare_response_egress(&Method::GET, early_eof)
+            .expect("prepared response")
+            .into_response()
+            .into_body()
+            .into_stream()
+            .expect("stream body");
+        block_on(eof_stream.next())
+            .expect("early EOF result")
+            .expect_err("early EOF error");
+        assert_eq!(eof_drops.get(), 1_usize);
     }
 
     #[test]

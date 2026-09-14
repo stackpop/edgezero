@@ -128,6 +128,16 @@ mod exchange {
         .boxed_local()
     }
 
+    pub(super) async fn settle_reset_content(
+        mut source: BodyStream,
+        declared_body: bool,
+    ) -> Result<(), EdgeError> {
+        if !declared_body && let Some(item) = source.next().await {
+            item?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn run_exchange<Send, Pump, RequestDone, Output, HostError, MapError>(
         send_future: Send,
         pump_future: Pump,
@@ -225,7 +235,8 @@ use exchange::duration_nanos;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use exchange::{
     UploadCompletion, cooperate_after_response_read, cooperative_stream, cooperative_yield_once,
-    request_body_limit, request_timeouts, run_exchange, should_emit_response_chunk,
+    request_body_limit, request_timeouts, run_exchange, settle_reset_content,
+    should_emit_response_chunk,
 };
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -266,7 +277,8 @@ mod spin_impl {
 
     use super::{
         UploadCompletion, cooperate_after_response_read, cooperative_yield_once,
-        map_spin_send_error, run_exchange, should_emit_response_chunk, timeout_error,
+        map_spin_send_error, run_exchange, settle_reset_content, should_emit_response_chunk,
+        timeout_error,
     };
 
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
@@ -644,7 +656,6 @@ mod spin_impl {
 
         let native = response_stream(response, budget, clock.clone());
         if disposition == ResponseBodyDisposition::FramingBodyless {
-            drain_response(native, budget, &clock).await?;
             return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
@@ -661,9 +672,7 @@ mod spin_impl {
             }
         );
         if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
-            if !declared_reset_body {
-                drain_response(native, budget, &clock).await?;
-            }
+            settle_reset_content(native, declared_reset_body).await?;
             return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
                 status,
@@ -849,18 +858,6 @@ mod spin_impl {
             }
         }
         .boxed_local()
-    }
-
-    async fn drain_response(
-        mut body: BodyStream,
-        budget: DispatchBudget,
-        clock: &MonotonicClock,
-    ) -> Result<(), EdgeError> {
-        while let Some(item) = body.next().await {
-            item?;
-            budget_remaining(budget, clock)?;
-        }
-        Ok(())
     }
 
     async fn race_deadline<Output>(
@@ -1221,7 +1218,7 @@ mod exchange_tests {
     use super::{
         EdgeError, READY_ITEM_YIELD_QUOTA, UploadCompletion, cooperate_after_response_read,
         cooperative_stream, cooperative_yield_once, duration_nanos, request_body_limit,
-        request_timeouts, run_exchange, should_emit_response_chunk,
+        request_timeouts, run_exchange, settle_reset_content, should_emit_response_chunk,
     };
 
     struct ScriptedFuture<Output> {
@@ -1353,6 +1350,65 @@ mod exchange_tests {
     fn zero_length_complete_does_not_emit_an_empty_response_chunk() {
         assert!(!should_emit_response_chunk(0));
         assert!(should_emit_response_chunk(1));
+    }
+
+    #[test]
+    fn reset_content_settlement_is_bounded_and_releases_source() {
+        use bytes::Bytes;
+        use futures_util::StreamExt as _;
+        use futures_util::stream::poll_fn;
+
+        struct DropSignal(Rc<Cell<u32>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.set(self.0.get().saturating_add(1));
+            }
+        }
+
+        let polls = Rc::new(Cell::new(0_u32));
+        let drops = Rc::new(Cell::new(0_u32));
+        let observed_polls = Rc::clone(&polls);
+        let signal = DropSignal(Rc::clone(&drops));
+        let source = poll_fn(move |_context| {
+            let _keep_signal_alive = &signal;
+            observed_polls.set(observed_polls.get().saturating_add(1));
+            Poll::Ready(Some(Ok(Bytes::from_static(b"illegal"))))
+        })
+        .boxed_local();
+
+        block_on(settle_reset_content(source, false)).expect("205 settlement");
+
+        assert_eq!(polls.get(), 1);
+        assert_eq!(drops.get(), 1);
+
+        let declared_polls = Rc::new(Cell::new(0_u32));
+        let declared_drops = Rc::new(Cell::new(0_u32));
+        let observed_declared_polls = Rc::clone(&declared_polls);
+        let declared_signal = DropSignal(Rc::clone(&declared_drops));
+        let declared_source = poll_fn(move |_context| {
+            let _keep_signal_alive = &declared_signal;
+            observed_declared_polls.set(observed_declared_polls.get().saturating_add(1));
+            Poll::Pending::<Option<Result<Bytes, EdgeError>>>
+        })
+        .boxed_local();
+
+        block_on(settle_reset_content(declared_source, true)).expect("declared 205 settlement");
+
+        assert_eq!(declared_polls.get(), 0);
+        assert_eq!(declared_drops.get(), 1);
+
+        let error_drops = Rc::new(Cell::new(0_u32));
+        let error_signal = DropSignal(Rc::clone(&error_drops));
+        let error_source = poll_fn(move |_context| {
+            let _keep_signal_alive = &error_signal;
+            Poll::Ready(Some(Err(EdgeError::bad_gateway("205 source failed"))))
+        })
+        .boxed_local();
+
+        block_on(settle_reset_content(error_source, false)).expect_err("205 source error");
+
+        assert_eq!(error_drops.get(), 1);
     }
 
     #[test]

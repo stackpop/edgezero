@@ -28,7 +28,7 @@ use bytes::Bytes;
 use crate::config_store::{BoundedStoreRead, ConfigStoreHandle};
 use crate::key_value_store::KvHandle;
 use crate::secret_store::{SecretError, SecretHandle};
-use crate::time::Deadline;
+use crate::time::{Deadline, MonotonicClock};
 
 /// A per-bind KV handle, returned by [`KvRegistry::named`] / [`KvRegistry::default`].
 pub type BoundKvStore = KvHandle;
@@ -80,6 +80,7 @@ impl BoundSecretStore {
     pub async fn get_bytes_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
@@ -88,6 +89,7 @@ impl BoundSecretStore {
             .get_bytes_bounded(
                 &self.store_name,
                 key,
+                clock,
                 deadline,
                 max_backend_bytes,
                 max_value_bytes,

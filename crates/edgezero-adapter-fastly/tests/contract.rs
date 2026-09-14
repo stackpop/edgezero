@@ -229,10 +229,18 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
-        use edgezero_adapter_fastly::request::dispatch_ingress_reader_for_test;
+        use edgezero_adapter_fastly::request::{
+            dispatch_ingress_reader_for_test, dispatch_ingress_source_error_for_test,
+        };
         use edgezero_core::http::{HeaderMap, HeaderValue};
-        use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
+        use edgezero_core::ingress::{
+            AdmissionDecision, BufferedIngressResponse, IngressGrant, IngressHeadLimits,
+        };
         use edgezero_core::middleware::{Middleware, Next};
+        use edgezero_core::response_egress::{
+            ResponseEgressEnvelope, ResponseEgressObserver, ResponseEgressOutcome,
+            ResponseEgressReport,
+        };
         use edgezero_core::router::RouteResolution;
         use edgezero_core::time::{MonotonicClock, MonotonicInstant};
 
@@ -247,6 +255,15 @@ mod tests {
         }
 
         struct CountingMiddleware(Arc<AtomicUsize>);
+
+        #[derive(Clone)]
+        struct RecordingEgressObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
+
+        impl ResponseEgressObserver for RecordingEgressObserver {
+            fn complete(&self, report: &ResponseEgressReport) {
+                self.0.lock().expect("reports lock").push(report.clone());
+            }
+        }
 
         #[async_trait::async_trait(?Send)]
         impl Middleware for CountingMiddleware {
@@ -417,6 +434,79 @@ mod tests {
         fn assert_no_route_dispatch(handler_calls: &AtomicUsize, middleware_calls: &AtomicUsize) {
             assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
             assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+        }
+
+        fn complete_response(envelope: ResponseEgressEnvelope) -> Response {
+            let Ok((prepared, _policy, mut attempt, clock)) = envelope.begin() else {
+                panic!("test egress envelope must prepare");
+            };
+            assert!(attempt.begin_writing());
+            assert!(attempt.terminate(ResponseEgressOutcome::HostHandoff, clock.now()));
+            prepared.into_response()
+        }
+
+        #[test]
+        fn normalized_ingress_error_returns_typed_response_without_application_observation() {
+            let reports = Arc::new(Mutex::new(Vec::new()));
+            let mut app = App::new(RouterService::builder().build());
+            app.set_ingress_head_limits(
+                IngressHeadLimits::default()
+                    .with_max_request_target_bytes(4)
+                    .expect("target limit"),
+            );
+            app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+
+            let egress = dispatch_ingress_reader_for_test(
+                &app,
+                Method::GET,
+                "/too-long".parse().expect("URI"),
+                std::io::Cursor::new(Vec::<u8>::new()),
+            )
+            .expect("typed response");
+            let response = complete_response(egress);
+
+            assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+            assert!(reports.lock().expect("reports lock").is_empty());
+        }
+
+        #[test]
+        fn post_admission_failure_uses_owned_error_egress() {
+            let reports = Arc::new(Mutex::new(Vec::new()));
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let observed_grant_drops = Arc::clone(&grant_drops);
+            let mut app = App::new(
+                RouterService::builder()
+                    .get("/owned", |_ctx: RequestContext| async move {
+                        Ok::<_, EdgeError>("handler must not run")
+                    })
+                    .build(),
+            );
+            app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+                grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+                read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            });
+            app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+
+            let egress = dispatch_ingress_source_error_for_test(
+                &app,
+                Method::GET,
+                "/owned".parse().expect("URI"),
+            )
+            .expect("owned error egress");
+            let response = complete_response(egress);
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            let observed = reports.lock().expect("reports lock");
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].outcome, ResponseEgressOutcome::HostHandoff);
+            assert_eq!(
+                observed[0]
+                    .route
+                    .as_ref()
+                    .map(edgezero_core::router::RouteMetadata::pattern),
+                Some("/owned")
+            );
         }
 
         fn assert_terminal_response(
@@ -709,11 +799,12 @@ mod outbound_contract_tests {
 
     use bytes::Bytes;
     use edgezero_adapter_fastly::outbound::{
-        dispatch_all_before_wait_for_test, validate_batch_request_for_test,
+        orchestrate_batch_for_test, validate_batch_request_for_test,
     };
     use edgezero_core::body::Body;
     use edgezero_core::http::{Method, Uri};
     use edgezero_core::outbound::OutboundRequest;
+    use futures::{executor::block_on, future::ready};
     use futures_util::stream;
 
     fn request() -> OutboundRequest {
@@ -746,15 +837,21 @@ mod outbound_contract_tests {
     #[test]
     fn send_all_dispatches_every_slot_before_wait() {
         let events = RefCell::new(Vec::new());
-        let pending = dispatch_all_before_wait_for_test(0_usize..3_usize, |index| {
-            events.borrow_mut().push(format!("dispatch:{index}"));
-            Ok::<_, ()>(index)
-        });
-
-        for slot in pending {
-            let index = slot.expect("dispatch succeeds");
-            events.borrow_mut().push(format!("wait:{index}"));
-        }
+        let outcomes = block_on(orchestrate_batch_for_test(
+            0_usize..4_usize,
+            |index| {
+                events.borrow_mut().push(format!("dispatch:{index}"));
+                if index == 1 {
+                    Err(101_usize)
+                } else {
+                    Ok(index)
+                }
+            },
+            |index| {
+                events.borrow_mut().push(format!("wait:{index}"));
+                ready(index.saturating_add(10))
+            },
+        ));
 
         assert_eq!(
             events.into_inner(),
@@ -762,11 +859,13 @@ mod outbound_contract_tests {
                 "dispatch:0",
                 "dispatch:1",
                 "dispatch:2",
+                "dispatch:3",
                 "wait:0",
-                "wait:1",
                 "wait:2",
+                "wait:3",
             ]
         );
+        assert_eq!(outcomes, [10, 101, 12, 13]);
     }
 
     #[cfg(all(feature = "fastly", target_arch = "wasm32"))]

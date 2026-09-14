@@ -76,9 +76,12 @@ retains or processes a returned value. That does not bound provider-side materia
 parser allocation, SDK copies, or other work performed before the value reaches guest code, so
 `config-read-allocation-bounds` remains `Unsupported` everywhere.
 
-Config reads use one absolute extraction deadline with pre-read and post-ready checks, but
-current provider operations are not proved cancellable within a finite wall-clock interval.
-They therefore report `BestEffort` for `config-read-deadlines`. The
+Config reads use one absolute extraction deadline in the application's monotonic clock domain.
+Core passes that same clock through every root, Fastly chunk, and secret read. Adapters sample it
+before provider dispatch and after readiness, before propagating either success or provider
+failure, so equality expiry wins simultaneous readiness. Current provider operations are not
+proved cancellable within a finite wall-clock interval, so every adapter reports `BestEffort`
+for `config-read-deadlines`. The
 [configuration design](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/2026-06-16-blob-app-config.md#632-bounded-cancellable-extraction-reads)
 defines the normative accounting, cancellation, error, and promotion requirements.
 

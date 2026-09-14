@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use crate::body::Body;
 use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
-use crate::http::{Method, Request, Response};
+use crate::http::header::CONTENT_TYPE;
+use crate::http::{HeaderValue, Method, Request, Response, StatusCode};
 use crate::ingress::{
     AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressBeginOutcome,
     IngressFraming, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
@@ -15,7 +17,7 @@ use crate::response_egress::{
     ResponseEgressObserverHandle, ResponseEgressPolicy, ResponseEgressPolicyCallback,
     default_response_egress_policy,
 };
-use crate::router::{RouteMetadata, RouteResolution, RouterService};
+use crate::router::{RouteMetadata, RouterService};
 use crate::time::{MonotonicClock, MonotonicInstant};
 
 /// Canonical adapter name for the Axum adapter.
@@ -58,6 +60,30 @@ impl App {
         }
     }
 
+    /// Converts a failure that occurred after successful admission into app-owned egress.
+    ///
+    /// Consuming `prepared` releases its single-use grant exactly once while retaining the
+    /// admitted request metadata in the resulting response-egress attempt.
+    ///
+    #[must_use]
+    #[inline]
+    pub fn admitted_error_egress(
+        &self,
+        prepared: PreparedIngress,
+        error: EdgeError,
+    ) -> ResponseEgressEnvelope {
+        let request_method = prepared.request_method().clone();
+        let request_start = prepared.request_start();
+        let route = prepared.route_metadata().cloned();
+        drop(prepared);
+        self.response_egress_envelope(
+            render_error_response(error),
+            request_method,
+            request_start,
+            route,
+        )
+    }
+
     /// Resolves and admits a normalized request head before an adapter transfers native body
     /// ownership into a core [`Request`].
     ///
@@ -74,10 +100,6 @@ impl App {
         let resolved = self
             .router
             .resolve(head_parts.method(), head_parts.target().path());
-        let route = match resolved.resolution() {
-            RouteResolution::Matched(route) => Some(route.clone()),
-            RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound => None,
-        };
         let head = head_parts.into_head(request_start, resolved.resolution().clone());
 
         match self.admit_ingress(&head)? {
@@ -85,7 +107,7 @@ impl App {
                 PreparedIngress::new(resolved, admitted),
             )),
             IngressAdmissionOutcome::Refused(response) => Ok(IngressBeginOutcome::Refused(
-                self.response_egress_envelope(response, request_method, request_start, route),
+                self.detached_response_egress(response, request_method, request_start),
             )),
         }
     }
@@ -103,16 +125,44 @@ impl App {
         DEFAULT_APP_NAME
     }
 
+    /// Converts a normalized failure that occurred before admission into detached egress.
+    ///
+    /// Detached ingress responses use the adapter response converter but do not invoke the
+    /// application's response-egress policy or observer.
+    ///
+    #[must_use]
+    #[inline]
+    pub fn detached_ingress_error_egress(
+        &self,
+        error: EdgeError,
+        request_method: Method,
+        request_start: MonotonicInstant,
+    ) -> ResponseEgressEnvelope {
+        self.detached_response_egress(render_error_response(error), request_method, request_start)
+    }
+
+    fn detached_response_egress(
+        &self,
+        response: Response,
+        request_method: Method,
+        request_start: MonotonicInstant,
+    ) -> ResponseEgressEnvelope {
+        ResponseEgressEnvelope::detached(
+            response,
+            request_start,
+            request_method,
+            self.monotonic_clock(),
+        )
+    }
+
     /// Dispatches a request whose native body was wrapped after admission.
     ///
-    /// # Errors
-    /// Returns an error only when handler/routing error rendering fails.
     #[inline]
     pub async fn dispatch_admitted(
         &self,
         prepared: PreparedIngress,
         request: Request,
-    ) -> Result<ResponseEgressEnvelope, EdgeError> {
+    ) -> ResponseEgressEnvelope {
         let request_method = request.method().clone();
         let request_start = prepared.request_start();
         let route = prepared.route_metadata().cloned();
@@ -123,9 +173,9 @@ impl App {
             .await
         {
             Ok(response) => response,
-            Err(error) => error.into_response()?,
+            Err(error) => render_error_response(error),
         };
-        Ok(self.response_egress_envelope(response, request_method, request_start, route))
+        self.response_egress_envelope(response, request_method, request_start, route)
     }
 
     /// Resolves, admits, and dispatches one normalized inbound request into owned egress.
@@ -148,7 +198,7 @@ impl App {
         let head_parts = IngressHeadParts::from_request(&request, head_accounting, framing);
         match self.begin_ingress(head_parts, request_start)? {
             IngressBeginOutcome::Admitted(prepared) => {
-                self.dispatch_admitted(prepared, request).await
+                Ok(self.dispatch_admitted(prepared, request).await)
             }
             IngressBeginOutcome::Refused(response) => Ok(response),
         }
@@ -407,6 +457,23 @@ pub trait Hooks {
     #[inline]
     fn stores() -> StoresMetadata {
         StoresMetadata::default()
+    }
+}
+
+fn render_error_response(error: EdgeError) -> Response {
+    match error.into_response() {
+        Ok(response) => response,
+        Err(render_error) => {
+            log::error!("failed to render typed ingress error response: {render_error}");
+            let mut response = Response::new(Body::from(
+                r#"{"error":{"kind":"internal","message":"internal server error","status":500}}"#,
+            ));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            response
+        }
     }
 }
 
@@ -886,13 +953,14 @@ mod tests {
     }
 
     #[test]
-    fn ingress_refusal_preserves_metadata_through_response_egress() {
+    fn ingress_refusal_is_detached_from_application_response_egress() {
         let router = RouterService::builder()
             .post("/upload/{id}", |_ctx: RequestContext| async move {
                 Ok::<_, EdgeError>("unexpected")
             })
             .build();
         let reports = Arc::new(Mutex::new(Vec::new()));
+        let policy_calls = Arc::new(AtomicUsize::new(0));
         let mut app = App::new(router);
         app.set_ingress_admission_policy(|_| {
             AdmissionDecision::Refuse(
@@ -908,12 +976,9 @@ mod tests {
             .checked_add(Duration::from_millis(5))
             .expect("egress start");
         app.set_monotonic_clock(MonotonicClock::new(move || started_at));
-        app.set_response_egress_policy(move |head, egress_started_at| {
-            assert_eq!(head.request_start(), request_start);
-            assert_eq!(
-                head.route().map(RouteMetadata::pattern),
-                Some("/upload/{id}")
-            );
+        let observed_policy_calls = Arc::clone(&policy_calls);
+        app.set_response_egress_policy(move |_head, egress_started_at| {
+            observed_policy_calls.fetch_add(1, Ordering::SeqCst);
             ResponseEgressPolicy {
                 write_deadline: Deadline::at_instant(
                     egress_started_at
@@ -942,6 +1007,54 @@ mod tests {
         assert_eq!(egress_clock.now(), started_at);
         assert!(attempt.begin_writing());
         assert!(attempt.complete(started_at));
+
+        assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
+        assert!(reports.lock().expect("reports lock").is_empty());
+    }
+
+    #[test]
+    fn post_admission_failure_uses_owned_error_egress() {
+        let router = RouterService::builder()
+            .post("/upload/{id}", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let observed_grant_drops = Arc::clone(&grant_drops);
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+            grant: IngressGrant::new(GrantDropProbe(Arc::clone(&observed_grant_drops))),
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+        app.set_response_egress_observer(AppEgressObserver(Arc::clone(&reports)));
+        let request_start = MonotonicInstant::now();
+        let head = IngressHeadParts::new(
+            Method::POST,
+            "/upload/42".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+        let IngressBeginOutcome::Admitted(prepared) =
+            app.begin_ingress(head, request_start).expect("admission")
+        else {
+            panic!("expected admission");
+        };
+
+        let egress = app.admitted_error_egress(
+            prepared,
+            EdgeError::internal(anyhow::anyhow!("post-admission failure")),
+        );
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        let Ok((prepared_egress, _, mut attempt, clock)) = egress.begin() else {
+            panic!("begin egress");
+        };
+        assert_eq!(
+            prepared_egress.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
 
         let observed = reports.lock().expect("reports lock");
         assert_eq!(observed.len(), 1);
@@ -1208,7 +1321,7 @@ mod tests {
             .body(body)
             .expect("request");
 
-        let egress = block_on(app.dispatch_admitted(prepared, request)).expect("dispatch");
+        let egress = block_on(app.dispatch_admitted(prepared, request));
 
         assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -1483,7 +1596,7 @@ mod tests {
             .uri("/upload")
             .body(Body::from("payload"))
             .expect("request");
-        let response = block_on(app.dispatch_admitted(prepared, request)).expect("dispatch");
+        let response = block_on(app.dispatch_admitted(prepared, request));
         assert_eq!(response.into_response().status(), StatusCode::OK);
     }
 

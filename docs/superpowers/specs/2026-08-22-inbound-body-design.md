@@ -63,8 +63,10 @@ performs this ordered protocol exactly once per platform request:
    max_body_bytes, read_deadline, on_exceeded, on_timeout }`. The callback is synchronous
    and body-blind: it can inspect the head but cannot obtain or poll the body. A refusal
    bypasses resolved dispatch, terminates the unread platform body with the strongest
-   target-specific primitive, drops any policy-local resources, and converts that response
-   normally.
+   target-specific primitive, drops any policy-local resources, and converts that response as
+   detached ingress egress. Head-validation failures and admission refusals are typed HTTP
+   responses, but they invoke the application's response-egress policy and observer zero times:
+   no successful admission exists for the application to observe.
 6. For `Admit`, wrap the still-unread platform body with the absolute deadline and native
    cancellation owner, construct the core `Request`, and call
    `RouterService::dispatch_resolved` with the exact token from step 3. For `Matched`, the
@@ -73,6 +75,10 @@ performs this ordered protocol exactly once per platform request:
    admission retains immediate 405/404 handling without polling the body; no middleware or
    handler runs and the grant is dropped exactly once. The wrapper is installed for
    `Body::Once` and `Body::Stream`; a content-type path must not pre-buffer before this point.
+   After `PreparedIngress` is returned, every adapter setup or conversion failure consumes that
+   proof through `App::admitted_error_egress`. The resulting envelope retains the admitted app
+   clock, request start, request method, route metadata, response-egress policy, and observer.
+   No adapter may convert such a failure directly to a provider error or detached response.
 7. `ReadBodyBeforeFallback` is valid only for the pre-resolved `MethodNotAllowed` and
    `NotFound` outcomes. It preserves the exact resolved token, installs the same absolute
    deadline wrapper, holds the supplied grant, and drains the body to EOF while discarding its
@@ -219,6 +225,14 @@ accessor snapshots a new instant. `PreparedIngress::monotonic_clock()` and
 `RequestContext::monotonic_clock()` return clones of the exact app clock handle attached at
 admission. `IngressHead::route_resolution()` exposes the value above, and a matched
 `RequestContext::route_metadata()` returns that exact matched metadata.
+
+`App::detached_ingress_error_egress(error, method, request_start)` is the adapter boundary for
+normalized validation and admission-policy failures. It renders the typed error using a bounded
+default response-egress policy and no-op observer, never the application policy or observer.
+`App::admitted_error_egress(prepared, error)` consumes the single-use admission proof, releases
+its grant exactly once, and creates an application-owned envelope with the captured request and
+route metadata. `App::dispatch_admitted` is infallible at this boundary: handler and routing
+errors are rendered into the same owned envelope instead of escaping after admission.
 
 ```rust
 pub type MonotonicInstant = web_time::Instant;

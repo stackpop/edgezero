@@ -11,6 +11,7 @@
 #![cfg(test)]
 
 use app_demo_core::config::AppDemoConfig;
+use edgezero_adapter::cli_support::validate_spin_outbound_host_contract;
 use edgezero_cli::args::{ConfigPushArgs, ConfigValidateArgs};
 use edgezero_core::manifest::ManifestLoader;
 use edgezero_core::Capability;
@@ -125,8 +126,10 @@ fn push_args(manifest: &Path, adapter: &str, dry_run: bool) -> ConfigPushArgs {
 #[test]
 fn app_demo_manifest_declares_outbound_http_optional() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest = ManifestLoader::from_path(&root.join("edgezero.toml"))
-        .expect("parse shipped app-demo manifest");
+    let app_manifest_path = root.join("edgezero.toml");
+    let spin_manifest_path = root.join("crates/app-demo-adapter-spin/spin.toml");
+    let manifest =
+        ManifestLoader::from_path(&app_manifest_path).expect("parse shipped app-demo manifest");
     assert_eq!(
         manifest.manifest().capabilities.optional,
         [Capability::OutboundHttp]
@@ -140,8 +143,7 @@ fn app_demo_manifest_declares_outbound_http_optional() {
         .expect("app-demo outbound hosts");
     assert_eq!(hosts, ["https://*:*"]);
 
-    let spin = fs::read_to_string(root.join("crates/app-demo-adapter-spin/spin.toml"))
-        .expect("read shipped Spin manifest");
+    let spin = fs::read_to_string(&spin_manifest_path).expect("read shipped Spin manifest");
     assert_eq!(
         spin.matches("allowed_outbound_hosts = [\"https://*:*\"]")
             .count(),
@@ -149,6 +151,13 @@ fn app_demo_manifest_declares_outbound_http_optional() {
         "app-demo Spin manifest must grant exactly the canonical HTTPS wildcard"
     );
     assert!(!spin.contains("allowed_outbound_hosts = [\"http://"));
+    validate_spin_outbound_host_contract(
+        manifest.manifest(),
+        &app_manifest_path,
+        &spin_manifest_path,
+        None,
+    )
+    .expect("app-demo application and selected Spin component must remain aligned");
 }
 
 #[test]

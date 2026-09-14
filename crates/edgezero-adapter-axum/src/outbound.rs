@@ -66,13 +66,12 @@ impl AxumOutboundClient {
         }
         let request_body =
             collect_request_body(body, max_request_body_bytes, budget, &self.clock).await?;
-        let remaining = budget_remaining(budget, &self.clock)?;
-        let request = self
+        let request_builder = self
             .client
             .request(reqwest_method(&method)?, uri.to_string())
             .headers(headers)
-            .body(request_body)
-            .timeout(remaining);
+            .body(request_body);
+        let request = apply_dispatch_timeout(request_builder, budget, &self.clock)?;
         let response = request
             .send()
             .await
@@ -495,6 +494,14 @@ fn timeout_error(cause: BudgetSource) -> EdgeError {
     EdgeError::gateway_timeout_caused("outbound request deadline expired", cause)
 }
 
+fn apply_dispatch_timeout(
+    request: reqwest::RequestBuilder,
+    budget: DispatchBudget,
+    clock: &MonotonicClock,
+) -> Result<reqwest::RequestBuilder, EdgeError> {
+    Ok(request.timeout(budget_remaining(budget, clock)?))
+}
+
 #[cfg(test)]
 mod clock_tests {
     use std::collections::VecDeque;
@@ -579,6 +586,19 @@ mod clock_tests {
             budget_remaining(budget, &clock).expect("remaining budget"),
             budget.duration
         );
+    }
+
+    #[test]
+    fn request_timer_arms_from_final_remaining_budget() {
+        let start = MonotonicInstant::now();
+        let budget = test_budget(start, Duration::from_millis(10));
+        let clock = scripted_clock(vec![budget.deadline.instant()]);
+        let request = reqwest::Client::new().get("https://example.com/");
+
+        let error = apply_dispatch_timeout(request, budget, &clock)
+            .expect_err("final dispatch sample must reject equality expiry");
+
+        assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
     }
 
     #[tokio::test]

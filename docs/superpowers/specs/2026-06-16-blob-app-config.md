@@ -2695,10 +2695,14 @@ where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
     // 1. Fetch under the one extraction-wide byte/time budget (§6.3.2).
-    let mut budget = ConfigExtractionBudget::start(req.config_extraction_limits())?;
+    let mut budget = ConfigExtractionBudget::start(
+        req.config_extraction_limits(),
+        req.monotonic_clock(),
+    )?;
     let read = config_store
         .get_bounded(
             &resolved_key,
+            budget.clock(),
             budget.deadline(),
             budget.remaining_backend_bytes(),
             budget.max_blob_bytes(),
@@ -2794,6 +2798,7 @@ where
         let read = bound
             .get_bytes_bounded(
                 &key_name,
+                budget.clock(),
                 budget.deadline(),
                 budget.remaining_backend_bytes(),
                 budget.max_secret_bytes(),
@@ -3124,7 +3129,7 @@ extractor doesn't touch TOML on disk at all):
 | --------------------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `config push` / `config diff` / generated CLI `config validate` | `<name>.toml` on disk                             | `deserialize_app_config_with_options(path, app_name, opts)` → `validate_excluding_secrets(&cfg)` → §3.3.2 structural checks                                                                                                                                                                                             |
 | Bundled raw `edgezero config validate`                          | `<name>.toml` on disk                             | `load_app_config_raw(path, app_name)` (TOML round-trip, no `C`, no validators)                                                                                                                                                                                                                                          |
-| Runtime extractor (`AppConfig<C>`)                              | Envelope JSON string from `ConfigStore::get_bounded(key, deadline, caps)` | bounded read → envelope parse → SHA verify → bounded secret walk (per §3.3.3) → `serde_path_to_error::Deserializer` over the JSON `data` field → `Validate::validate(&cfg)`. The runtime path does not load TOML and does not apply the env overlay; the operator's push run resolves that CLI-side overlay into the blob. |
+| Runtime extractor (`AppConfig<C>`)                              | Envelope JSON string from `ConfigStore::get_bounded(key, clock, deadline, caps)` | bounded read → envelope parse → SHA verify → bounded secret walk (per §3.3.3) → `serde_path_to_error::Deserializer` over the JSON `data` field → `Validate::validate(&cfg)`. The runtime path does not load TOML and does not apply the env overlay; the operator's push run resolves that CLI-side overlay into the blob. |
 
 The CLI paths all share a `build_and_validate<C>` helper
 in `crates/edgezero-cli/src/config.rs` (sketch in §3.3.2).
@@ -3879,7 +3884,10 @@ async fn extract<C>(req: &RequestContext, override_key: Option<&str>) -> Result<
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
-    let mut budget = ConfigExtractionBudget::start(req.config_extraction_limits())?;
+    let mut budget = ConfigExtractionBudget::start(
+        req.config_extraction_limits(),
+        req.monotonic_clock(),
+    )?;
     let binding = req
         .config_store_default_binding()
         .ok_or_else(|| EdgeError::store_extraction(
@@ -3892,6 +3900,7 @@ where
         .handle
         .get_bounded(
             key,
+            budget.clock(),
             budget.deadline(),
             budget.remaining_backend_bytes(),
             budget.max_blob_bytes(),
@@ -4556,6 +4565,7 @@ pub trait ConfigStore: Send + Sync {
     async fn get_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
@@ -4571,6 +4581,7 @@ pub trait SecretStore: Send + Sync {
         &self,
         store_name: &str,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
@@ -4588,6 +4599,7 @@ impl ConfigStoreHandle {
     pub async fn get_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
@@ -4599,6 +4611,7 @@ impl SecretHandle {
         &self,
         store_name: &str,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
@@ -4609,6 +4622,7 @@ impl BoundSecretStore {
     pub async fn get_bytes_bounded(
         &self,
         key: &str,
+        clock: &MonotonicClock,
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
@@ -4628,15 +4642,21 @@ config-extraction-limits value, set through `Hooks::configure`; the adapter copi
 `max_total_bytes >= max(max_blob_bytes, max_secret_bytes)`. `timeout` must not exceed
 `DEADLINE_FAR_FUTURE`; invalid startup configuration fails before serving requests.
 
-At the first `AppConfig<C>`/`named`/`from_store` call, core snapshots
-`extraction_started_at = web_time::Instant::now()` and computes exactly one absolute
-deadline with checked `extraction_started_at + limits.timeout` and
-`Deadline::at_instant(..)`. It does not call `Deadline::after` after the first snapshot.
+At the first `AppConfig<C>`/`named`/`from_store` call, core clones the
+application-owned `MonotonicClock` from `RequestContext`, snapshots
+`extraction_started_at = clock.now()`, and computes exactly one absolute deadline with
+checked `extraction_started_at + limits.timeout` and `Deadline::at_instant(..)`. It does
+not call `Deadline::after` or sample the process-global clock after the first snapshot.
 The deadline is not reset between the root blob read,
 Fastly pointer/chunk reads, secret resolution, deserialization, or validation. Every adapter
-checks it before entering a host read and after the host read becomes ready; a native async
-adapter additionally races the pending read with the remaining budget and drops/aborts its
-native operation on expiry. Equality is expired, and expiry wins simultaneous readiness.
+receives that same `&MonotonicClock` on every bounded call and checks the deadline before
+entering a host read and after the host read becomes ready. The post-ready clock check occurs
+before applying `?` or otherwise propagating the provider result, so equality expiry wins a
+simultaneously ready success or provider error. Fastly uses the same clock for the root read,
+each pointer chunk, and every synchronous secret-store open/lookup/plaintext operation. Equality
+is expired. Promotion from `BestEffort` to `Native` additionally requires racing each pending
+provider read against the remaining budget and proving that expiry cancels or aborts the native
+operation within a finite bound; no current adapter claims that proof.
 
 Each bounded method applies both remaining extraction-wide backend-byte allowance and its
 per-value output cap. `backend_bytes` counts every byte exposed to guest code while

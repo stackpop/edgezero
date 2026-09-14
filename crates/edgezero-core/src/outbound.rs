@@ -966,7 +966,9 @@ fn bracket_ipv6(host: &str) -> String {
 }
 
 fn canonicalize_typed_uri(uri: &Uri) -> Result<Uri, EdgeError> {
-    canonicalize_url(&uri.to_string())
+    let raw = uri.to_string();
+    reject_ambiguous_raw_target(&raw)?;
+    canonicalize_url(&raw)
 }
 
 fn canonicalize_url(raw: &str) -> Result<Uri, EdgeError> {
@@ -1129,21 +1131,28 @@ fn limit_response_stream(
             match item {
                 Ok(bytes) => {
                     let Ok(chunk_len) = u64::try_from(bytes.len()) else {
-                        yield Err(response_limit_error(reason));
+                        let error = response_limit_error(reason);
+                        drop(source);
+                        yield Err(error);
                         return;
                     };
                     let Some(next_total) = total.checked_add(chunk_len) else {
-                        yield Err(response_limit_error(reason));
+                        let error = response_limit_error(reason);
+                        drop(source);
+                        yield Err(error);
                         return;
                     };
                     if next_total > maximum {
-                        yield Err(response_limit_error(reason));
+                        let error = response_limit_error(reason);
+                        drop(source);
+                        yield Err(error);
                         return;
                     }
                     total = next_total;
                     yield Ok(bytes);
                 }
                 Err(error) => {
+                    drop(source);
                     yield Err(error);
                     return;
                 }
@@ -1190,7 +1199,7 @@ fn retain_utf8_header_values(headers: &mut HeaderMap, response: bool) {
     let mut retained = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers.iter() {
         if name != CONNECTION
-            && !(response && name == CONTENT_ENCODING)
+            && !(response && (name == CONTENT_ENCODING || name == CONTENT_LENGTH))
             && str::from_utf8(value.as_bytes()).is_err()
         {
             if response {
@@ -1216,6 +1225,7 @@ fn strip_hop_by_hop(
     for name in [
         CONNECTION,
         HeaderName::from_static("keep-alive"),
+        HeaderName::from_static("proxy-connection"),
         PROXY_AUTHENTICATE,
         PROXY_AUTHORIZATION,
         TE,
@@ -1287,6 +1297,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1529,6 +1540,43 @@ mod tests {
         ));
         assert_eq!(polls.get(), 1);
         assert!(block_on(limited.next()).is_none());
+    }
+
+    #[test]
+    fn terminal_stream_error_releases_source_before_yield() {
+        struct DropSignal(Rc<Cell<usize>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.set(self.0.get().saturating_add(1));
+            }
+        }
+
+        let limit_drops = Rc::new(Cell::new(0_usize));
+        let limit_signal = DropSignal(Rc::clone(&limit_drops));
+        let limit_source = stream::poll_fn(move |_context| {
+            let _keep_signal_alive = &limit_signal;
+            Poll::Ready(Some(Ok(Bytes::from_static(b"over"))))
+        })
+        .boxed_local();
+        let mut limited = limit_encoded_stream(limit_source, Some(3));
+        block_on(limited.next())
+            .expect("limit result")
+            .expect_err("over limit");
+        assert_eq!(limit_drops.get(), 1_usize);
+
+        let source_drops = Rc::new(Cell::new(0_usize));
+        let source_signal = DropSignal(Rc::clone(&source_drops));
+        let source_error = stream::poll_fn(move |_context| {
+            let _keep_signal_alive = &source_signal;
+            Poll::Ready(Some(Err(EdgeError::bad_gateway("source failed"))))
+        })
+        .boxed_local();
+        let mut limited = limit_decoded_stream(source_error, Some(3));
+        block_on(limited.next())
+            .expect("source result")
+            .expect_err("source error");
+        assert_eq!(source_drops.get(), 1_usize);
     }
 
     #[test]
@@ -2011,6 +2059,26 @@ mod tests {
     }
 
     #[test]
+    fn response_normalization_rejects_non_utf8_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "content-length",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque content-length"),
+        );
+
+        let error = normalize_response_headers(&Method::GET, StatusCode::OK, &mut headers)
+            .expect_err("non-UTF-8 content-length must fail closed");
+
+        assert!(matches!(
+            error,
+            EdgeError::BadGateway {
+                reason: BadGatewayReason::Protocol,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn head_and_not_modified_validate_and_retain_representation_length() {
         for (method, status) in [
             (Method::HEAD, StatusCode::OK),
@@ -2395,6 +2463,20 @@ mod tests {
     }
 
     #[test]
+    fn typed_outbound_request_rejects_empty_userinfo() {
+        let typed = "https://@example.com/"
+            .parse::<Uri>()
+            .expect("typed URI retains empty userinfo syntax");
+        OutboundRequest::new(Method::GET, typed.clone()).expect_err("typed empty userinfo");
+
+        let mut parts = OutboundRequest::get("https://example.com/")
+            .expect("baseline request")
+            .into_parts();
+        parts.uri = typed;
+        OutboundRequest::from_parts(parts).expect_err("parts empty userinfo");
+    }
+
+    #[test]
     fn outbound_request_rejects_backslash_authority_forms() {
         for target in [
             r"https:\\@example.com/",
@@ -2452,6 +2534,22 @@ mod tests {
             outbound.headers().get("x-keep"),
             Some(&HeaderValue::from_static("yes"))
         );
+    }
+
+    #[test]
+    fn outbound_normalization_strips_proxy_connection() {
+        let mut request = OutboundRequest::get("https://example.com/").expect("request");
+        request
+            .headers_mut()
+            .insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        normalize_for_dispatch(&mut request).expect("request normalization");
+        assert!(!request.headers().contains_key("proxy-connection"));
+
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        normalize_response_headers(&Method::GET, StatusCode::OK, &mut response_headers)
+            .expect("response normalization");
+        assert!(!response_headers.contains_key("proxy-connection"));
     }
 
     #[test]

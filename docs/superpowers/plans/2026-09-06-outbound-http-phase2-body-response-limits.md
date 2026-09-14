@@ -1,6 +1,8 @@
 # Outbound HTTP Phase 2: Typed Bodies, Decoding, and Response Limits Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** Implemented on PR 275. The unchecked steps below are retained as the original implementation record, not current readiness state.
 
 **Goal:** Complete the portable response pipeline: exact typed stream errors, response-limit errors, header/body normalization, encoded and decoded caps, Brotli preflight, gzip/Brotli completion, optional rechunking, and deadline-aware drains.
 

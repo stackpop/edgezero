@@ -1,6 +1,8 @@
 # Outbound HTTP Phase 3: Capabilities and CLI Enforcement Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** Implemented on PR 275. The unchecked steps below are retained as the original implementation record, not current readiness state.
 
 **Goal:** Make outbound requirements declarative and enforce them against one pinned app/runtime pair before build, serve, deploy, staged deploy, or demo execution.
 

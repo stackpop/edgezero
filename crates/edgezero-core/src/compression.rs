@@ -114,8 +114,12 @@ pub fn decode_gzip_stream(stream: BodyStream) -> BodyStream {
         loop {
             let read = match decoder.read(&mut buffer).await {
                 Ok(read) => read,
-                Err(error) => {
-                    yield Err(io_to_edge_error(error, BadGatewayDecodeReason::Gzip));
+                Err(source_error) => {
+                    let error = release_before_terminal(
+                        (decoder, buffer),
+                        io_to_edge_error(source_error, BadGatewayDecodeReason::Gzip),
+                    );
+                    yield Err(error);
                     return;
                 }
             };
@@ -123,10 +127,13 @@ pub fn decode_gzip_stream(stream: BodyStream) -> BodyStream {
                 break;
             }
             let Some(chunk) = buffer.get(..read) else {
-                yield Err(codec_error(
+                let decoder_error = codec_error(
                     BadGatewayDecodeReason::Gzip,
                     format!("decoder reported {read}-byte read into a {BUFFER_SIZE}-byte buffer"),
-                ));
+                );
+                let terminal_error =
+                    release_before_terminal((decoder, buffer), decoder_error);
+                yield Err(terminal_error);
                 return;
             };
             yield Ok(Bytes::copy_from_slice(chunk));
@@ -148,16 +155,23 @@ pub fn decode_brotli_stream(
         let mut initial_chunks = Vec::new();
         let window_bits = loop {
             let Some(item) = source.next().await else {
-                yield Err(codec_error(
+                let prefix_error = codec_error(
                     BadGatewayDecodeReason::Brotli,
                     "brotli stream ended before its window prefix",
-                ));
+                );
+                let terminal_error = release_before_terminal(
+                    (source, initial_chunks, prefix),
+                    prefix_error,
+                );
+                yield Err(terminal_error);
                 return;
             };
             let chunk = match item {
                 Ok(chunk) => chunk,
-                Err(error) => {
-                    yield Err(error);
+                Err(source_error) => {
+                    let terminal_error =
+                        release_before_terminal((source, initial_chunks, prefix), source_error);
+                    yield Err(terminal_error);
                     return;
                 }
             };
@@ -171,37 +185,65 @@ pub fn decode_brotli_stream(
             match parse_brotli_prefix(&prefix) {
                 Ok(BrotliPrefix::WindowBits(bits)) => break bits,
                 Ok(BrotliPrefix::NeedSecondByte) => {}
-                Err(error) => {
-                    yield Err(error);
+                Err(prefix_error) => {
+                    let terminal_error =
+                        release_before_terminal((source, initial_chunks, prefix), prefix_error);
+                    yield Err(terminal_error);
                     return;
                 }
             }
         };
 
         if window_bits > max_window_bits {
-            yield Err(EdgeError::response_too_large_with_reason(
+            let limit_error = EdgeError::response_too_large_with_reason(
                 format!(
                     "brotli response advertises a {window_bits}-bit window; limit is {max_window_bits}"
                 ),
                 ResponseLimitReason::BrotliWindow,
-            ));
+            );
+            let terminal_error =
+                release_before_terminal((source, initial_chunks, prefix), limit_error);
+            yield Err(terminal_error);
             return;
         }
         let charge = match brotli_decoder_memory_charge(window_bits) {
             Ok(charge) => charge,
-            Err(error) => {
-                yield Err(error);
+            Err(charge_error) => {
+                let terminal_error =
+                    release_before_terminal((source, initial_chunks, prefix), charge_error);
+                yield Err(terminal_error);
                 return;
             }
         };
         if charge > max_decoder_bytes {
-            yield Err(EdgeError::response_too_large_with_reason(
+            let limit_error = EdgeError::response_too_large_with_reason(
                 format!("brotli decoder requires {charge} bytes; limit is {max_decoder_bytes}"),
                 ResponseLimitReason::DecoderMemory,
-            ));
+            );
+            let terminal_error =
+                release_before_terminal((source, initial_chunks, prefix), limit_error);
+            yield Err(terminal_error);
             return;
         }
 
+        drop(prefix);
+        let mut decoded = decode_brotli_payload(source, initial_chunks);
+        while let Some(item) = decoded.next().await {
+            match item {
+                Ok(bytes) => yield Ok(bytes),
+                Err(error) => {
+                    drop(decoded);
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+    }
+    .boxed_local()
+}
+
+fn decode_brotli_payload(source: BodyStream, initial_chunks: Vec<Bytes>) -> BodyStream {
+    stream! {
         let replayed_stream = futures_stream::iter(initial_chunks.into_iter().map(Ok)).chain(source);
         let reader = replayed_stream.map_err(edge_error_to_io).into_async_read();
         let mut decoder = BrotliDecoder::new(reader);
@@ -210,8 +252,12 @@ pub fn decode_brotli_stream(
         loop {
             let read = match decoder.read(&mut buffer).await {
                 Ok(read) => read,
-                Err(error) => {
-                    yield Err(io_to_edge_error(error, BadGatewayDecodeReason::Brotli));
+                Err(source_error) => {
+                    let terminal_error = release_before_terminal(
+                        (decoder, buffer),
+                        io_to_edge_error(source_error, BadGatewayDecodeReason::Brotli),
+                    );
+                    yield Err(terminal_error);
                     return;
                 }
             };
@@ -219,10 +265,13 @@ pub fn decode_brotli_stream(
                 break;
             }
             let Some(chunk) = buffer.get(..read) else {
-                yield Err(codec_error(
+                let decoder_error = codec_error(
                     BadGatewayDecodeReason::Brotli,
                     format!("decoder reported {read}-byte read into a {BUFFER_SIZE}-byte buffer"),
-                ));
+                );
+                let terminal_error =
+                    release_before_terminal((decoder, buffer), decoder_error);
+                yield Err(terminal_error);
                 return;
             };
             yield Ok(Bytes::copy_from_slice(chunk));
@@ -236,17 +285,28 @@ pub fn decode_brotli_stream(
         match native_reader.read(&mut trailing).await {
             Ok(0) => {}
             Ok(_) => {
-                yield Err(codec_error(
+                let trailing_error = codec_error(
                     BadGatewayDecodeReason::Brotli,
                     "brotli response contains trailing data or a second stream",
-                ));
+                );
+                let terminal_error = release_before_terminal(native_reader, trailing_error);
+                yield Err(terminal_error);
             }
-            Err(error) => {
-                yield Err(io_to_edge_error(error, BadGatewayDecodeReason::Brotli));
+            Err(source_error) => {
+                let terminal_error = release_before_terminal(
+                    native_reader,
+                    io_to_edge_error(source_error, BadGatewayDecodeReason::Brotli),
+                );
+                yield Err(terminal_error);
             }
         }
     }
     .boxed_local()
+}
+
+fn release_before_terminal<Owned>(owned: Owned, error: EdgeError) -> EdgeError {
+    drop(owned);
+    error
 }
 
 fn codec_error(reason: BadGatewayDecodeReason, message: impl Into<String>) -> EdgeError {
@@ -331,11 +391,32 @@ mod tests {
     use bytes::Bytes;
     use flate2::{Compression, write::GzEncoder};
     use futures::executor::block_on;
-    use futures_util::stream;
+    use futures_util::stream::{self, poll_fn};
+    use std::cell::Cell;
     use std::io::Write as _;
+    use std::rc::Rc;
+    use std::task::Poll;
+
+    struct DropSignal(Rc<Cell<usize>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_add(1));
+        }
+    }
 
     fn source(items: Vec<Result<Bytes, EdgeError>>) -> BodyStream {
         stream::iter(items).boxed_local()
+    }
+
+    fn tracked_source(first_item: Result<Bytes, EdgeError>, drops: &Rc<Cell<usize>>) -> BodyStream {
+        let signal = DropSignal(Rc::clone(drops));
+        let mut pending_item = Some(first_item);
+        poll_fn(move |_context| {
+            let _keep_signal_alive = &signal;
+            Poll::Ready(pending_item.take())
+        })
+        .boxed_local()
     }
 
     fn gzip(input: &[u8]) -> Vec<u8> {
@@ -465,6 +546,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn terminal_stream_error_releases_source_before_yield() {
+        let gzip_drops = Rc::new(Cell::new(0_usize));
+        let mut gzip_stream = decode_gzip_stream(tracked_source(
+            Ok(Bytes::from_static(b"not a gzip stream")),
+            &gzip_drops,
+        ));
+        block_on(gzip_stream.next())
+            .expect("gzip result")
+            .expect_err("gzip decode error");
+        assert_eq!(gzip_drops.get(), 1_usize);
+
+        let brotli_drops = Rc::new(Cell::new(0_usize));
+        let mut brotli_stream = decode_brotli_stream(
+            tracked_source(Ok(Bytes::from_static(&[0xff])), &brotli_drops),
+            24,
+            1_u64 << 25,
+        );
+        block_on(brotli_stream.next())
+            .expect("brotli result")
+            .expect_err("brotli prefix error");
+        assert_eq!(brotli_drops.get(), 1_usize);
     }
 
     #[test]

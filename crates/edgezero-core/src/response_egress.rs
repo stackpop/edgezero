@@ -265,6 +265,23 @@ impl ResponseEgressEnvelope {
         Ok((prepared, normalized_policy, attempt, self.clock))
     }
 
+    pub(crate) fn detached(
+        response: Response,
+        request_start: MonotonicInstant,
+        request_method: Method,
+        clock: MonotonicClock,
+    ) -> Self {
+        Self::new(
+            response,
+            request_start,
+            None,
+            request_method,
+            Arc::new(default_response_egress_policy),
+            ResponseEgressObserverHandle::default(),
+            clock,
+        )
+    }
+
     /// Extracts the response for low-level callers that do not own a platform converter.
     #[must_use]
     #[inline]

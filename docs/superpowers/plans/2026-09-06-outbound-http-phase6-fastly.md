@@ -1,12 +1,14 @@
 # Outbound HTTP Phase 6: Fastly Dispatch and Harvest Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** Deterministic implementation is complete on PR 275. Protected deployed-provider characterization remains an external promotion gate, so Fastly limitations remain `BestEffort`. The unchecked steps below are retained as the original implementation record.
 
 **Goal:** Implement Fastly outbound HTTP with dispatch-all-before-wait fan-out, deterministic dynamic backends, host timer derivation, typed errors, streamed upload ownership, and bounded downstream conversion.
 
 **Architecture:** A target-neutral synchronous engine owns slots, backend identity/cache behavior, timing arithmetic, and cleanup. The SDK layer supplies `PendingRequest`, backend registration, and body handles. Batch dispatch is a distinct first phase; ordered harvest may opportunistically poll later slots but never loses a result.
 
-**Tech Stack:** Fastly SDK 0.12.1, `web-time`, `sha2`, core typed streams/decoders, native `test-utils`, wasm32-wasip1/Viceroy.
+**Tech Stack:** Fastly SDK 0.13.1, `web-time`, `sha2`, core typed streams/decoders, native `test-utils`, wasm32-wasip1/Viceroy.
 
 ---
 
@@ -24,7 +26,7 @@
 - [ ] Re-read spec §4.3, Fastly rows in §§5.2-5.5, and the Fastly file summary in §7.
 - [ ] Keep outbound HTTP, deadlines, flexible phase budgets, slot isolation, streamed-upload deadlines, and lazy response passthrough at the exact reviewed BestEffort levels. Dynamic-backend service enablement is not statically provable, so `outbound-http` cannot be published as Native.
 - [ ] Confirm `OutboundRequest::host_name()` exists from Phase 1b; never reparse the URI to construct backend identity.
-- [ ] Require `viceroy --version` to print exactly the repository-pinned `0.17.0`. Run WASM tests from `crates/edgezero-adapter-fastly` so its committed `.cargo/config.toml` supplies both `wasm32-wasip1` and `viceroy run -C ../../examples/app-demo/crates/app-demo-adapter-fastly/fastly.toml --`; no CI environment override may replace that service configuration.
+- [ ] Require `viceroy --version` to print exactly the repository-pinned `0.21.0`. Run WASM tests from `crates/edgezero-adapter-fastly` so its committed `.cargo/config.toml` supplies both `wasm32-wasip1` and `viceroy run -C ../../examples/app-demo/crates/app-demo-adapter-fastly/fastly.toml --`; no CI environment override may replace that service configuration.
 
 ## Task Protocol
 
@@ -190,11 +192,11 @@ Phase one converts every valid slot to `Pending` or `Done`; no wait occurs. Phas
 - Create: `crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/README.md`
 
 - [ ] Add the native contract command and enable `test-utils` in Fastly WASM contract/library runs. Execute every test target through `scripts/run_test_nonzero.sh` with one exact sentinel; retain production target checks.
-- [ ] Assert `viceroy --version` is exactly `0.17.0`, then execute both WASM suites from the adapter crate without `CARGO_TARGET_*_RUNNER`; this proves the checked-in runner and demo `fastly.toml` are used locally and in CI.
+- [ ] Assert `viceroy --version` is exactly `0.21.0`, then execute both WASM suites from the adapter crate without `CARGO_TARGET_*_RUNNER`; this proves the checked-in runner and demo `fastly.toml` are used locally and in CI.
 - [ ] Add the generated Fastly adapter target check:
   `(cd examples/app-demo && cargo check --offline --locked -p app-demo-adapter-fastly --no-default-features --features fastly --target wasm32-wasip1)`.
 - [ ] Add a standalone deployed-probe crate with an empty `[workspace]`, exact
-  `fastly = "=0.12.1"`, path dependencies on the production adapter/core, and its own
+  `fastly = "=0.13.1"`, path dependencies on the production adapter/core, and its own
   committed lock. The binary directly exercises `FastlyOutboundClient` for every named
   probe case; it must not depend on the not-yet-migrated app-demo handler. Pin the package
   name and output to
@@ -204,7 +206,7 @@ Phase one converts every valid slot to `Pending` or `Done`; no wait occurs. Phas
   subsequent metadata, tree, and build commands are locked. Its `fastly.toml` build script
   runs Cargo with `--offline --locked --profile release --target wasm32-wasip1`.
 - [ ] Before any protected dispatch, run locked metadata/tree checks for the fixture, require
-  exactly Fastly SDK 0.12.1, and build without secrets using
+  exactly Fastly SDK 0.13.1, and build without secrets using
   `fastly compute build --non-interactive --dir crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly`.
   Require the fixed package path to exist. `deployed.sh` accepts only that prebuilt package;
   it exits before deployment if the artifact is absent and contains no build, dependency
@@ -220,14 +222,14 @@ Phase one converts every valid slot to `Pending` or `Done`; no wait occurs. Phas
 ## Phase Verification
 
 - [ ] `scripts/run_test_nonzero.sh send_all_dispatches_every_slot_before_wait cargo test --offline --locked -p edgezero-adapter-fastly --no-default-features --features test-utils --test contract`
-- [ ] `test "$(viceroy --version)" = "viceroy 0.17.0"`
+- [ ] `test "$(viceroy --version)" = "viceroy 0.21.0"`
 - [ ] `(cd crates/edgezero-adapter-fastly && ../../scripts/run_test_nonzero.sh send_all_dispatches_every_slot_before_wait cargo test --offline --locked --no-default-features --features fastly,test-utils --test contract)`
 - [ ] `(cd crates/edgezero-adapter-fastly && ../../scripts/run_test_nonzero.sh backend_creation_error_table_is_exhaustive cargo test --offline --locked --no-default-features --features fastly,test-utils --lib)`
 - [ ] `scripts/run_test_nonzero.sh adapter_capability_matrix_matches_outbound_spec cargo test --offline --locked -p edgezero-adapter-fastly --no-default-features --features cli --lib adapter_capability_matrix_matches_outbound_spec`
 - [ ] `cargo check --offline --locked -p edgezero-adapter-fastly --no-default-features --features fastly --target wasm32-wasip1`
 - [ ] `(cd examples/app-demo && cargo check --offline --locked -p app-demo-adapter-fastly --no-default-features --features fastly --target wasm32-wasip1)`
 - [ ] `cargo metadata --offline --locked --format-version 1 --manifest-path crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/Cargo.toml`
-- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/Cargo.toml | rg 'fastly v0\.12\.1'`
+- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/Cargo.toml | rg 'fastly v0\.13\.1'`
 - [ ] `fastly compute build --non-interactive --dir crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly`
 - [ ] `test -f crates/edgezero-adapter-fastly/tests/fixtures/outbound-fastly/pkg/edgezero-outbound-probe.tar.gz`
 - [ ] `cargo fmt --all -- --check`

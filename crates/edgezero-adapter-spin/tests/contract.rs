@@ -484,14 +484,19 @@ mod tests {
             SpinOutboundClient, deferred_clock_paths_hold_for_test,
         };
         use edgezero_adapter_spin::request::{
-            dispatch_ingress_stream_for_test, dispatch_ingress_stream_with_timer_for_test,
-            dispatch_request_for_test,
+            dispatch_ingress_source_error_for_test, dispatch_ingress_stream_for_test,
+            dispatch_ingress_stream_with_timer_for_test, dispatch_request_for_test,
         };
         use edgezero_core::http::{HeaderMap, HeaderValue, Method};
-        use edgezero_core::ingress::{AdmissionDecision, BufferedIngressResponse, IngressGrant};
+        use edgezero_core::ingress::{
+            AdmissionDecision, BufferedIngressResponse, IngressGrant, IngressHeadLimits,
+        };
         use edgezero_core::middleware::{Middleware, Next};
         use edgezero_core::outbound::{OutboundHttpClient as _, OutboundRequest};
-        use edgezero_core::response_egress::{ResponseEgressEnvelope, ResponseEgressOutcome};
+        use edgezero_core::response_egress::{
+            ResponseEgressEnvelope, ResponseEgressObserver, ResponseEgressOutcome,
+            ResponseEgressReport,
+        };
         use edgezero_core::router::RouteResolution;
         use edgezero_core::time::{MonotonicClock, MonotonicInstant};
         use futures::FutureExt as _;
@@ -501,6 +506,15 @@ mod tests {
         use super::*;
 
         struct DropSignal(Arc<AtomicUsize>);
+
+        #[derive(Clone)]
+        struct RecordingEgressObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
+
+        impl ResponseEgressObserver for RecordingEgressObserver {
+            fn complete(&self, report: &ResponseEgressReport) {
+                self.0.lock().expect("reports lock").push(report.clone());
+            }
+        }
 
         impl Drop for DropSignal {
             fn drop(&mut self) {
@@ -898,6 +912,70 @@ mod tests {
 
         fn captured_body(envelope: ResponseEgressEnvelope) -> Bytes {
             captured_response_body(capture_response(envelope))
+        }
+
+        #[test]
+        fn normalized_ingress_error_returns_typed_response_without_application_observation() {
+            let reports = Arc::new(Mutex::new(Vec::new()));
+            let mut app = App::new(RouterService::builder().build());
+            app.set_ingress_head_limits(
+                IngressHeadLimits::default()
+                    .with_max_request_target_bytes(4)
+                    .expect("target limit"),
+            );
+            app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+
+            let egress = block_on(dispatch_ingress_stream_for_test(
+                &app,
+                Method::GET,
+                "/too-long".parse().expect("URI"),
+                empty::<Result<Bytes, io::Error>>(),
+            ))
+            .expect("typed response");
+            let response = capture_response(egress);
+
+            assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+            assert!(reports.lock().expect("reports lock").is_empty());
+        }
+
+        #[test]
+        fn post_admission_failure_uses_owned_error_egress() {
+            let reports = Arc::new(Mutex::new(Vec::new()));
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let observed_grant_drops = Arc::clone(&grant_drops);
+            let mut app = App::new(
+                RouterService::builder()
+                    .get("/owned", |_ctx: RequestContext| async move {
+                        Ok::<_, EdgeError>("handler must not run")
+                    })
+                    .build(),
+            );
+            app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+                grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+                read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            });
+            app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+
+            let egress = block_on(dispatch_ingress_source_error_for_test(
+                &app,
+                Method::GET,
+                "/owned".parse().expect("URI"),
+            ))
+            .expect("owned error egress");
+            let response = capture_response(egress);
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            let observed = reports.lock().expect("reports lock");
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].outcome, ResponseEgressOutcome::HostHandoff);
+            assert_eq!(
+                observed[0]
+                    .route
+                    .as_ref()
+                    .map(edgezero_core::router::RouteMetadata::pattern),
+                Some("/owned")
+            );
         }
 
         fn captured_response_body(response: Response) -> Bytes {

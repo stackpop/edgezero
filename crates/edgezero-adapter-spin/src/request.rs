@@ -245,7 +245,38 @@ where
         core_request,
         Stores::default(),
         request_start,
-        move || source,
+        move || Ok(source),
+        |_| pending::<()>(),
+        Ok,
+    )
+    .await
+}
+
+/// Exercises a source-construction failure after admission through the production seam.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_source_error_for_test(
+    app: &App,
+    method: Method,
+    uri: Uri,
+) -> anyhow::Result<ResponseEgressEnvelope> {
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(EdgeError::internal)?;
+    dispatch_ingress_stream_with_timer_and(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        || -> Result<futures_util::stream::Empty<Result<Bytes, io::Error>>, EdgeError> {
+            Err(EdgeError::internal(anyhow::anyhow!(
+                "spin source construction failed"
+            )))
+        },
         |_| pending::<()>(),
         Ok,
     )
@@ -280,7 +311,7 @@ where
         core_request,
         Stores::default(),
         request_start,
-        move || source,
+        move || Ok(source),
         make_timer,
         Ok,
     )
@@ -389,7 +420,7 @@ where
         core_request,
         stores,
         request_start,
-        move || native_body.stream(),
+        move || Ok(native_body.stream()),
         deliver,
     )
     .await
@@ -406,7 +437,7 @@ async fn dispatch_ingress_stream_and<Source, SourceError, MakeSource, Output, De
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
-    MakeSource: FnOnce() -> Source,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
     Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
 {
     dispatch_ingress_stream_with_timer_and(
@@ -441,7 +472,7 @@ async fn dispatch_ingress_stream_with_timer_and<
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
-    MakeSource: FnOnce() -> Source,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
     Timer: Future<Output = ()> + 'static,
     MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
     Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
@@ -449,21 +480,47 @@ where
     head_request
         .extensions_mut()
         .insert(outbound_client(app.monotonic_clock()));
+    let request_method = head_request.method().clone();
     let head_parts = IngressHeadParts::from_request(
         &head_request,
         IngressHeadAccounting::HostManaged,
         IngressFraming::HostManaged,
     );
-    head_parts.validate_normalized(app.ingress_head_limits())?;
-    let prepared = match app.begin_ingress(head_parts, request_start)? {
-        IngressBeginOutcome::Admitted(prepared) => prepared,
-        IngressBeginOutcome::Refused(response) => {
-            return Ok(deliver(response)?);
+    if let Err(error) = head_parts.validate_normalized(app.ingress_head_limits()) {
+        return Ok(deliver(app.detached_ingress_error_egress(
+            error,
+            request_method,
+            request_start,
+        ))?);
+    }
+    let prepared = match app.begin_ingress(head_parts, request_start) {
+        Ok(outcome) => match outcome {
+            IngressBeginOutcome::Admitted(prepared) => prepared,
+            IngressBeginOutcome::Refused(response) => {
+                return Ok(deliver(response)?);
+            }
+            _ => {
+                return Ok(deliver(app.detached_ingress_error_egress(
+                    EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome")),
+                    request_method,
+                    request_start,
+                ))?);
+            }
+        },
+        Err(error) => {
+            return Ok(deliver(app.detached_ingress_error_egress(
+                error,
+                request_method,
+                request_start,
+            ))?);
         }
-        _ => return Err(anyhow::anyhow!("unsupported ingress admission outcome")),
+    };
+    let source = match make_source() {
+        Ok(source) => source,
+        Err(error) => return Ok(deliver(app.admitted_error_egress(prepared, error))?),
     };
     *head_request.body_mut() = deadline_body_with_timer(
-        make_source(),
+        source,
         prepared.read_deadline(),
         prepared.monotonic_clock(),
         make_timer,
@@ -495,7 +552,7 @@ where
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let response = app.dispatch_admitted(prepared, core_request).await?;
+    let response = app.dispatch_admitted(prepared, core_request).await;
     Ok(deliver(response)?)
 }
 

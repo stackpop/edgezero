@@ -1,12 +1,14 @@
 # Outbound HTTP Phase 4: Axum and Cloudflare Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** Deterministic implementation is complete on PR 275. Protected deployed-provider evidence remains an external promotion gate, so the affected capability cells remain `BestEffort`. The unchecked steps below are retained as the original implementation record.
 
 **Goal:** Implement the full outbound contract for Axum and Cloudflare, including batch behavior, typed cleanup, adapter scheduling, and executable native/WASM/host contracts.
 
 **Architecture:** Both clients consume the same core request and response pipeline. Axum uses Reqwest and bounded conversion at one Tokio blocking boundary. Cloudflare uses a target-neutral orchestration driver plus a small Worker WASM bridge that owns abort, timer, native body, and host-event yield resources through terminal completion.
 
-**Tech Stack:** Reqwest 0.13.4, Axum/Tokio, Worker 0.8.3, Web APIs, `web-time`, `futures`, wasm-bindgen-test, workerd/deployed probes.
+**Tech Stack:** Reqwest 0.13.4, Axum/Tokio, Worker 0.8.5, Web APIs, `web-time`, `futures`, wasm-bindgen-test, workerd/deployed probes.
 
 ---
 
@@ -48,11 +50,11 @@ For each adapter task: add only the named contract cases; run its exact Task 1 c
 - Modify/Create: both adapters' `src/test_utils.rs`
 - Modify: `.github/workflows/test.yml`
 
-- [ ] Pin Reqwest and Worker before compiling either bridge. Set root `reqwest = "=0.13.4"`. Set root and app-demo Worker requirements to exact `=0.8.3`, both with `default-features = false` and `features = ["http"]`; make the Cloudflare adapter inherit that workspace dependency while retaining `optional = true`.
-- [ ] Refresh both independent lock graphs with `cargo update --offline -p reqwest --precise 0.13.4`, `cargo update --offline -p worker --precise 0.8.3`, `cargo update --offline --manifest-path examples/app-demo/Cargo.toml -p reqwest --precise 0.13.4`, and `cargo update --offline --manifest-path examples/app-demo/Cargo.toml -p worker --precise 0.8.3`.
+- [ ] Pin Reqwest and Worker before compiling either bridge. Set root `reqwest = "=0.13.4"`. Set root and app-demo Worker requirements to exact `=0.8.5`, both with `default-features = false` and `features = ["http"]`; make the Cloudflare adapter inherit that workspace dependency while retaining `optional = true`.
+- [ ] Refresh both independent lock graphs with `cargo update --offline -p reqwest --precise 0.13.4`, `cargo update --offline -p worker --precise 0.8.5`, `cargo update --offline --manifest-path examples/app-demo/Cargo.toml -p reqwest --precise 0.13.4`, and `cargo update --offline --manifest-path examples/app-demo/Cargo.toml -p worker --precise 0.8.5`.
 - [ ] Assert both graphs before adding bridge code:
-  - `cargo tree --offline --locked -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown | rg 'worker v0\.8\.3'`
-  - `cargo tree --offline --locked --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown | rg 'worker v0\.8\.3'`
+  - `cargo tree --offline --locked -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown | rg 'worker v0\.8\.5'`
+  - `cargo tree --offline --locked --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown | rg 'worker v0\.8\.5'`
 - [ ] Assert both Reqwest graphs resolve exactly 0.13.4:
   - `cargo tree --offline --locked -p edgezero-adapter-axum --features axum -e normal | rg 'reqwest v0\.13\.4'`
   - `cargo tree --offline --locked --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-axum -e normal | rg 'reqwest v0\.13\.4'`
@@ -128,7 +130,7 @@ For each adapter task: add only the named contract cases; run its exact Task 1 c
 - Create: `crates/edgezero-adapter-cloudflare/package-lock.json`
 
 - [ ] Put an empty `[workspace]` table in the fixture `Cargo.toml` so Cargo treats it as a standalone nested workspace rather than an undeclared member of the repository workspace.
-- [ ] Pin the fixture's Worker dependency to exact `=0.8.3`. Generate and commit its independent Rust lock with `cargo check --offline --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml`; then require `cargo metadata --offline --locked --format-version 1 --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml` and `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml | rg 'worker v0\.8\.3'` before `worker-build`.
+- [ ] Pin the fixture's Worker dependency to exact `=0.8.5`. Generate and commit its independent Rust lock with `cargo check --offline --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml`; then require `cargo metadata --offline --locked --format-version 1 --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml` and `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml | rg 'worker v0\.8\.5'` before `worker-build`.
 - [ ] Pin fixture `compatibility_date = "2023-05-01"` and no additional compatibility flags, exactly matching the generated production `wrangler.toml.hbs`. Add a fixture assertion that parses both files and fails if their date/flags diverge.
 - [ ] Pin `worker-build = 0.8.3` in the fixture instructions/CI setup and add package script
   `build:outbound-fixture` running
@@ -204,7 +206,7 @@ For each adapter task: add only the named contract cases; run its exact Task 1 c
 - Modify: `crates/edgezero-adapter-cloudflare/tests/contract.rs`
 
 - [ ] Add browser WASM tests that inspect `RequestRedirect::Manual` on the constructed `request.inner()` separately from `signal` plus `encodeResponseBody: "manual"` on the final fetch initializer; the latter must not reset redirect. Preserve request header list semantics and compile/exercise only portable Web API bridge construction.
-- [ ] Do not call `worker::Headers::get_all` or claim real Worker SDK response conversion in the browser runner: Worker 0.8.3 binds the Workers-only `Headers.getAll()` API without a catch boundary. Compile the production response bridge here, but execute its real header/body conversion, repeated `Set-Cookie`, and checked completion assertions in Task 7's workerd fixture.
+- [ ] Do not call `worker::Headers::get_all` or claim real Worker SDK response conversion in the browser runner: Worker 0.8.5 binds the Workers-only `Headers.getAll()` API without a catch boundary. Compile the production response bridge here, but execute its real header/body conversion, repeated `Set-Cookie`, and checked completion assertions in Task 7's workerd fixture.
 - [ ] Keep payload-length/decode/cap/body-disposition behavior in the target-neutral native suite. The workerd suite repeats the SDK boundary cases proving malformed/conflicting lengths and encoded/effective-identity overages reject before a Worker body stream is polled.
 - [ ] Ensure the production bridge composes the same native-tested pipeline in both Buffered and Streamed modes. Task 7 runs real Worker cases stalled before decoded output, midstream, and after codec EOF but before native EOF; those cases must retain attributed 504, typed late source/completion errors, and exactly-once abort ownership.
 - [ ] Add the same joined send-plus-immediate-body-consumption regression as Axum to the native driver suite. The first response chunk before source EOF is repeated through the real Worker response bridge in Task 7; collecting the whole body is not sufficient evidence.
@@ -244,7 +246,7 @@ For each adapter task: add only the named contract cases; run its exact Task 1 c
   exact full SHA, and fails unless `git rev-parse HEAD` is byte-for-byte equal before any
   probe command receives secrets. Do not modify the workflow on this implementation branch
   and mistake that branch-only file for executable dispatch infrastructure.
-- [ ] The protected job uses only a disposable Workers account and independently observable disposable origin. Define exact secrets `CLOUDFLARE_API_TOKEN` (Workers Scripts edit limited to that account), `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_WORKERS_SUBDOMAIN`, `OUTBOUND_PROBE_ORIGIN_URL`, and `OUTBOUND_PROBE_ORIGIN_TOKEN`; production account tokens, zones, routes, and origins are forbidden. Install Node/Rust from `.tool-versions`, run `npm ci`, assert both lock graphs and Worker 0.8.3, install `worker-build 0.8.3 --locked`, assert tool versions, build the fixture, then run `npm --prefix crates/edgezero-adapter-cloudflare run test:deployed-timing`.
+- [ ] The protected job uses only a disposable Workers account and independently observable disposable origin. Define exact secrets `CLOUDFLARE_API_TOKEN` (Workers Scripts edit limited to that account), `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_WORKERS_SUBDOMAIN`, `OUTBOUND_PROBE_ORIGIN_URL`, and `OUTBOUND_PROBE_ORIGIN_TOKEN`; production account tokens, zones, routes, and origins are forbidden. Install Node/Rust from `.tool-versions`, run `npm ci`, assert both lock graphs and Worker 0.8.5, install `worker-build 0.8.3 --locked`, assert tool versions, build the fixture, then run `npm --prefix crates/edgezero-adapter-cloudflare run test:deployed-timing`.
 - [ ] Implement the Phase 0-frozen origin protocol in the fixture README and driver:
   authenticated `POST /v1/probes/{run_id}/arm` creates isolated state; Worker requests use
   `/v1/probes/{run_id}/{case_id}` for raw bytes, delayed headers/chunks, stalled upload reads,
@@ -278,7 +280,7 @@ For each adapter task: add only the named contract cases; run its exact Task 1 c
 - [ ] `cargo check --offline --locked -p edgezero-adapter-cloudflare --no-default-features --features cloudflare --target wasm32-unknown-unknown`
 - [ ] `(cd examples/app-demo && cargo check --offline --locked -p app-demo-adapter-cloudflare --no-default-features --features cloudflare --target wasm32-unknown-unknown)`
 - [ ] `cargo metadata --offline --locked --format-version 1 --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml`
-- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml | rg 'worker v0\.8\.3'`
+- [ ] `cargo tree --offline --locked --manifest-path crates/edgezero-adapter-cloudflare/tests/fixtures/outbound-worker/Cargo.toml | rg 'worker v0\.8\.5'`
 - [ ] `npm ci --prefix crates/edgezero-adapter-cloudflare`
 - [ ] `npm --prefix crates/edgezero-adapter-cloudflare run build:outbound-fixture`
 - [ ] `npm --prefix crates/edgezero-adapter-cloudflare run test:workerd`
