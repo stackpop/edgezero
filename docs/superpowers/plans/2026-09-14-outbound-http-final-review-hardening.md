@@ -11,6 +11,12 @@
 **Execution note:** Unchecked `run_test_nonzero.sh` red-phase steps are retained as the original
 TDD recipe. All implementation and final green-phase checks are recorded below.
 
+**Post-push CI note:** The exact Cloudflare WASM Clippy gate exposed target-only restriction
+lints that the earlier host/all-feature runs did not surface. The follow-up scopes test imports,
+removes shadowed bindings, keeps test modules after production items, corrects the superseded Axum
+blocking-bridge text, and adds a documentation regression guard. The exact target Clippy command
+and the 21-test browser contract plus 18-test runtime suites pass after the correction.
+
 ---
 
 ### Task 1: Core protocol and stream terminal hardening

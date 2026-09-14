@@ -458,13 +458,12 @@ two raw capability cells remain `Unsupported` until the parser-boundary implemen
 raw-socket evidence land.
 
 Axum can preempt its asynchronous native body read at the configured deadline, which supports
-the `Native` deadline cell. Its current Tower adapter nevertheless drives the core's non-`Send`
-dispatch future through `block_in_place` plus a nested runtime `block_on`; Tokio cannot cancel
-that blocking closure. Aborting the outer service task therefore does not promptly release a
-fallback grant. The inner drain continues until body completion or the finite absolute read
-deadline, then releases the grant and native body source exactly once before returning its
-terminal response. The adapter suite pins this distinction; the capability is a read-deadline
-claim, not a prompt caller-cancellation claim.
+the `Native` deadline cell. Its owned Hyper HTTP/1 connection loop runs the portable non-`Send`
+dispatch future on a Tokio `LocalSet`; no blocking bridge or nested runtime separates caller
+cancellation from the drain. Closing the connection drops the in-flight dispatch future, body
+source, and fallback grant. Deadline expiry races the native body read, returns the selected
+timeout response when the connection remains writable, and releases the source and grant exactly
+once. The adapter suite covers pending reads, cancellation/drop, and deadline precedence.
 
 Cloudflare performs one `Delay::from(Duration::ZERO).await` cooperative yield before
 selecting the body read against its host timer. A deliberately frozen injected clock means
