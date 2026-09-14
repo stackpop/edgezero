@@ -269,10 +269,10 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     );
     deps.insert(
         "worker".to_owned(),
-        "worker = { version = \"0.8\", default-features = false, features = [\"http\"] }"
+        "worker = { version = \"0.8.5\", default-features = false, features = [\"http\"] }"
             .to_owned(),
     );
-    deps.insert("fastly".to_owned(), "fastly = \"0.12\"".to_owned());
+    deps.insert("fastly".to_owned(), "fastly = \"0.13\"".to_owned());
     deps.insert("once_cell".to_owned(), "once_cell = \"1\"".to_owned());
     deps.insert(
         "tokio".to_owned(),
@@ -281,7 +281,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     deps.insert("tracing".to_owned(), "tracing = \"0.1\"".to_owned());
     deps.insert(
         "spin-sdk".to_owned(),
-        "spin-sdk = { version = \"6\", default-features = false }".to_owned(),
+        "spin-sdk = { version = \"7\", default-features = false }".to_owned(),
     );
     // Core depends on `validator` for `#[derive(Validate)]` on the
     // generated `<Name>Config` struct. Pinned to the same
@@ -642,10 +642,7 @@ fn build_base_data(
 /// - `fastly` → `fastly` (the Fastly CLI we shell out to for
 ///   provision + config push) plus `viceroy` (what
 ///   `fastly compute serve` uses for local emulation).
-/// - `spin` → no asdf pin; the Spin CLI is install-flow-managed
-///   (<https://spinframework.dev/install>). A header comment points
-///   the operator at the URL when `spin` is in the adapter set so
-///   they don't wonder why everything else is pinned but spin.
+/// - `spin` → `spin` (the runtime used by `spin build` and `spin up`).
 /// - `axum` → no extra pin (uses the host Rust toolchain only).
 ///
 /// Versions are pulled from this repo's own `.tool-versions` (see
@@ -658,7 +655,10 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
     }
     if has("fastly") {
         lines.push("fastly 15.1.0".to_owned());
-        lines.push("viceroy 0.17.0".to_owned());
+        lines.push("viceroy 0.21.0".to_owned());
+    }
+    if has("spin") {
+        lines.push("spin 4.1.0".to_owned());
     }
     lines.push("rust 1.95.0".to_owned());
     // Sort + dedup so the file is stable regardless of adapter
@@ -666,13 +666,7 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
     lines.sort();
     lines.dedup();
     let mut body = lines.join("\n");
-    if has("spin") {
-        body.push_str(
-            "\n\n# Spin is not asdf-managed in this scaffold; install via\n# https://spinframework.dev/install\n",
-        );
-    } else {
-        body.push('\n');
-    }
+    body.push('\n');
     body
 }
 
@@ -904,7 +898,7 @@ mod tests {
         // requirement.
         let out = build_tool_versions(&["fastly".to_owned()]);
         assert!(out.contains("fastly 15.1.0"), "must pin fastly: {out}");
-        assert!(out.contains("viceroy 0.17.0"), "must pin viceroy: {out}");
+        assert!(out.contains("viceroy 0.21.0"), "must pin viceroy: {out}");
         assert!(out.contains("rust 1.95.0"));
         assert!(
             !out.contains("nodejs"),
@@ -922,20 +916,12 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_versions_spin_adds_install_hint_comment_not_asdf_pin() {
-        // Spin is install-flow-managed (not consistently asdf-
-        // managed in our toolchain), so don't write a brittle pin
-        // we can't honour — explain why with an inline hint so the
-        // operator isn't left guessing.
+    fn build_tool_versions_pins_spin_runtime() {
         let out = build_tool_versions(&["spin".to_owned()]);
         assert!(out.contains("rust 1.95.0"));
         assert!(
-            !out.contains("spin "),
-            "must NOT pin spin via asdf shape: {out}"
-        );
-        assert!(
-            out.contains("spinframework.dev/install"),
-            "must point operators at the spin install URL: {out}"
+            out.contains("spin 4.1.0"),
+            "must pin the verified Spin runtime: {out}"
         );
     }
 
@@ -957,7 +943,8 @@ mod tests {
         for pin in [
             "nodejs 24.12.0",
             "fastly 15.1.0",
-            "viceroy 0.17.0",
+            "spin 4.1.0",
+            "viceroy 0.21.0",
             "rust 1.95.0",
         ] {
             assert_eq!(
@@ -966,8 +953,6 @@ mod tests {
                 "`{pin}` must appear exactly once in: {out}"
             );
         }
-        // Spin install hint present.
-        assert!(out.contains("spinframework.dev/install"));
         // Stable order (alphabetical).
         let pin_block = out.split("\n\n").next().expect("pin block").to_owned();
         let lines: Vec<&str> = pin_block.lines().collect();
@@ -1218,6 +1203,7 @@ mod tests {
         }
         assert!(cargo_toml.contains("[workspace.lints.clippy]"));
         assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
+        assert_scaffold_sdk_dependencies(&cargo_toml);
 
         // Generated from a checkout: edgezero crates must resolve to local
         // path dependencies, not the Git fallback (whose `edgezero-cli` has
@@ -1336,6 +1322,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn assert_scaffold_sdk_dependencies(cargo_toml: &str) {
+        assert!(
+            cargo_toml.contains("fastly = \"0.13\""),
+            "generated Fastly adapter must use the current SDK release line"
+        );
+        assert!(
+            cargo_toml.contains(concat!(
+                "worker = { version = \"0.8.5\", default-features = false, ",
+                "features = [\"http\"] }",
+            )),
+            "generated Cloudflare adapter must use the current SDK release"
+        );
+        assert!(
+            cargo_toml.contains("spin-sdk = { version = \"7\", default-features = false }"),
+            "generated Spin adapter must use the current SDK major"
+        );
     }
 
     fn assert_scaffold_crate_lints(project_dir: &Path) {
@@ -1458,6 +1462,69 @@ mod tests {
         );
     }
 
+    fn assert_generated_axum_entrypoint(project_dir: &Path) {
+        let axum_main =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-axum/src/main.rs"))
+                .expect("read axum main.rs");
+        assert!(
+            !axum_main.contains("process::exit")
+                && !axum_main.contains("EdgeZeroAxumService")
+                && !axum_main.contains("into_axum_response")
+                && axum_main.contains("run_app::<demo_app_core::App>()"),
+            "generated Axum entrypoint must use the connection-owning runner",
+        );
+    }
+
+    fn assert_generated_cloudflare_entrypoint(project_dir: &Path) {
+        let entrypoint =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-cloudflare/src/lib.rs"))
+                .expect("read Cloudflare lib.rs");
+        assert!(
+            entrypoint.contains("run_app::<demo_app_core::App>(req, env, ctx).await")
+                && !entrypoint.contains("from_core_response"),
+            "generated Cloudflare entrypoint must use the context-owning runner",
+        );
+        let manifest = fs::read_to_string(
+            project_dir.join("crates/demo-app-adapter-cloudflare/wrangler.toml"),
+        )
+        .expect("read Cloudflare wrangler.toml");
+        assert!(
+            manifest.contains("compatibility_flags = [\"enable_request_signal\"]"),
+            "generated Cloudflare manifest must expose the request abort signal",
+        );
+    }
+
+    fn assert_generated_fastly_entrypoint(project_dir: &Path) {
+        let entrypoint =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-fastly/src/main.rs"))
+                .expect("read fastly main.rs");
+        assert!(
+            entrypoint.contains("reason ="),
+            "adapter attributes must carry a reason for allow_attributes_without_reason",
+        );
+        assert!(
+            !entrypoint.contains("#[fastly::main]")
+                && !entrypoint.contains("Request")
+                && !entrypoint.contains("Response")
+                && entrypoint.contains("run_app::<demo_app_core::App>()"),
+            "generated Fastly entrypoint must let EdgeZero own request receipt and response delivery",
+        );
+    }
+
+    fn assert_generated_spin_entrypoint(project_dir: &Path) {
+        let entrypoint =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-spin/src/lib.rs"))
+                .expect("read Spin lib.rs");
+        assert!(
+            !entrypoint.contains("IntoResponse")
+                && !entrypoint.contains("SpinFullResponse")
+                && !entrypoint.contains("FullBody")
+                && entrypoint.contains("anyhow::Result<edgezero_adapter_spin::SpinResponse>")
+                && entrypoint.contains("run_app::<demo_app_core::App>(req)"),
+            "generated Spin entrypoint must return EdgeZero's raw WASIp3 response type",
+        );
+    }
+
     fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
         let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
             .expect("read core lib.rs");
@@ -1536,22 +1603,10 @@ mod tests {
             spin_manifest.contains("allowed_outbound_hosts = [\"https://*:*\"]"),
             "generated Spin hosts must default to HTTPS only",
         );
-
-        let axum_main =
-            fs::read_to_string(project_dir.join("crates/demo-app-adapter-axum/src/main.rs"))
-                .expect("read axum main.rs");
-        assert!(
-            !axum_main.contains("process::exit"),
-            "axum host entrypoint must return Result, not call process::exit",
-        );
-
-        let fastly_main =
-            fs::read_to_string(project_dir.join("crates/demo-app-adapter-fastly/src/main.rs"))
-                .expect("read fastly main.rs");
-        assert!(
-            fastly_main.contains("reason ="),
-            "adapter attributes must carry a reason for allow_attributes_without_reason",
-        );
+        assert_generated_axum_entrypoint(project_dir);
+        assert_generated_cloudflare_entrypoint(project_dir);
+        assert_generated_fastly_entrypoint(project_dir);
+        assert_generated_spin_entrypoint(project_dir);
     }
 
     #[test]

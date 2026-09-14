@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
-use crate::http::{Request, Response};
+use crate::http::{Method, Request, Response};
 use crate::ingress::{
     AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressBeginOutcome,
     IngressFraming, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
@@ -70,6 +70,7 @@ impl App {
         head_parts: IngressHeadParts,
         request_start: MonotonicInstant,
     ) -> Result<IngressBeginOutcome, EdgeError> {
+        let request_method = head_parts.method().clone();
         let resolved = self
             .router
             .resolve(head_parts.method(), head_parts.target().path());
@@ -84,7 +85,7 @@ impl App {
                 PreparedIngress::new(resolved, admitted),
             )),
             IngressAdmissionOutcome::Refused(response) => Ok(IngressBeginOutcome::Refused(
-                self.response_egress_envelope(response, request_start, route),
+                self.response_egress_envelope(response, request_method, request_start, route),
             )),
         }
     }
@@ -112,6 +113,7 @@ impl App {
         prepared: PreparedIngress,
         request: Request,
     ) -> Result<ResponseEgressEnvelope, EdgeError> {
+        let request_method = request.method().clone();
         let request_start = prepared.request_start();
         let route = prepared.route_metadata().cloned();
         let (resolved, admitted) = prepared.into_parts();
@@ -123,13 +125,14 @@ impl App {
             Ok(response) => response,
             Err(error) => error.into_response()?,
         };
-        Ok(self.response_egress_envelope(response, request_start, route))
+        Ok(self.response_egress_envelope(response, request_method, request_start, route))
     }
 
-    /// Resolves, admits, and dispatches one normalized inbound request.
+    /// Resolves, admits, and dispatches one normalized inbound request into owned egress.
     ///
-    /// Adapters must call this before polling the request body. The route selected for admission
-    /// is consumed during dispatch, so handlers cannot observe a different route identity.
+    /// Adapters must call this before polling the request body and retain the returned envelope
+    /// through their response transmission boundary. The route selected for admission is consumed
+    /// during dispatch, so handlers cannot observe a different route identity.
     ///
     /// # Errors
     /// Returns an error only when admission or error rendering fails. Handler and routing errors
@@ -141,14 +144,13 @@ impl App {
         request_start: MonotonicInstant,
         head_accounting: IngressHeadAccounting,
         framing: IngressFraming,
-    ) -> Result<Response, EdgeError> {
+    ) -> Result<ResponseEgressEnvelope, EdgeError> {
         let head_parts = IngressHeadParts::from_request(&request, head_accounting, framing);
         match self.begin_ingress(head_parts, request_start)? {
-            IngressBeginOutcome::Admitted(prepared) => self
-                .dispatch_admitted(prepared, request)
-                .await
-                .map(ResponseEgressEnvelope::into_response),
-            IngressBeginOutcome::Refused(response) => Ok(response.into_response()),
+            IngressBeginOutcome::Admitted(prepared) => {
+                self.dispatch_admitted(prepared, request).await
+            }
+            IngressBeginOutcome::Refused(response) => Ok(response),
         }
     }
 
@@ -196,6 +198,7 @@ impl App {
     fn response_egress_envelope(
         &self,
         response: Response,
+        request_method: Method,
         request_start: MonotonicInstant,
         route: Option<RouteMetadata>,
     ) -> ResponseEgressEnvelope {
@@ -203,6 +206,7 @@ impl App {
             response,
             request_start,
             route,
+            request_method,
             self.response_egress_policy(),
             self.response_egress_observer(),
             self.monotonic_clock(),
@@ -580,13 +584,14 @@ mod tests {
             .uri("/known")
             .body(body)
             .expect("request");
-        block_on(app.dispatch_ingress(
+        let envelope: ResponseEgressEnvelope = block_on(app.dispatch_ingress(
             request,
             MonotonicInstant::now(),
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         ))
-        .expect("response")
+        .expect("response");
+        envelope.into_response()
     }
 
     fn empty_router() -> RouterService {
@@ -735,8 +740,12 @@ mod tests {
             started_at,
             None,
         );
-        let mut attempt =
-            ResponseEgressAttempt::new(&head, started_at, app.response_egress_observer());
+        let mut attempt = ResponseEgressAttempt::new(
+            &head,
+            started_at,
+            app.response_egress_observer(),
+            app.monotonic_clock(),
+        );
         assert!(attempt.begin_writing());
         assert!(attempt.complete(started_at));
 
@@ -778,7 +787,8 @@ mod tests {
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         ))
-        .expect("response");
+        .expect("response")
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -860,7 +870,8 @@ mod tests {
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         ))
-        .expect("response");
+        .expect("response")
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -923,7 +934,10 @@ mod tests {
         else {
             panic!("expected refusal");
         };
-        let (response, _, mut attempt, egress_clock) = egress.begin().expect("begin egress");
+        let Ok((prepared, _, mut attempt, egress_clock)) = egress.begin() else {
+            panic!("begin egress");
+        };
+        let response = prepared.into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(egress_clock.now(), started_at);
         assert!(attempt.begin_writing());
@@ -936,6 +950,47 @@ mod tests {
             observed[0].route.as_ref().map(RouteMetadata::pattern),
             Some("/upload/{id}")
         );
+    }
+
+    #[test]
+    fn ingress_method_reaches_owned_response_framing() {
+        let mut app = App::new(RouterService::builder().build());
+        app.set_ingress_admission_policy(|_| {
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::OK)
+                    .header("content-length", "7")
+                    .body(Body::from("ignored"))
+                    .expect("response"),
+            )
+        });
+        let head = IngressHeadParts::new(
+            Method::HEAD,
+            "/missing".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+
+        let IngressBeginOutcome::Refused(egress) = app
+            .begin_ingress(head, MonotonicInstant::now())
+            .expect("refusal")
+        else {
+            panic!("expected refusal");
+        };
+        let Ok((prepared, _, mut attempt, clock)) = egress.begin() else {
+            panic!("owned response egress failed");
+        };
+        assert!(!prepared.transmits_body());
+        assert_eq!(
+            prepared
+                .into_response()
+                .body()
+                .as_bytes()
+                .expect("suppressed body"),
+            b""
+        );
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
     }
 
     #[test]
@@ -991,7 +1046,8 @@ mod tests {
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         ))
-        .expect("response");
+        .expect("response")
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -1026,7 +1082,8 @@ mod tests {
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         ))
-        .expect("response");
+        .expect("response")
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -1057,7 +1114,8 @@ mod tests {
                 IngressHeadAccounting::HostManaged,
                 IngressFraming::HostManaged,
             ))
-            .expect("response");
+            .expect("response")
+            .into_response();
 
             assert_eq!(response.status(), expected);
         }
@@ -1096,7 +1154,8 @@ mod tests {
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         ))
-        .expect("response");
+        .expect("response")
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
@@ -1378,7 +1437,8 @@ mod tests {
                 IngressHeadAccounting::HostManaged,
                 IngressFraming::HostManaged,
             ))
-            .expect("response");
+            .expect("response")
+            .into_response();
 
             assert_eq!(response.status(), expected);
             assert_eq!(body_polls.load(Ordering::SeqCst), 0);

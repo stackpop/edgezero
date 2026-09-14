@@ -1,7 +1,7 @@
 [build]
 target = "wasm32-wasip2"
 
-# Wasmtime 44.0.1 runs the Spin SDK resource tests with Preview 3 async and
+# Wasmtime 48.0.2 runs the Spin SDK resource tests with Preview 3 async and
 # WASI HTTP imports enabled. Only applies when Cargo is invoked from this
 # package directory. CI uses the same command through the target runner env.
 [target.'cfg(target_arch = "wasm32")']

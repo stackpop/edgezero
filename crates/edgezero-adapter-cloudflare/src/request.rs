@@ -22,6 +22,7 @@ use edgezero_core::ingress::{
 };
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
+use edgezero_core::response_egress::ResponseEgressEnvelope;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
@@ -42,7 +43,7 @@ use crate::config_store::CloudflareConfigStore;
 use crate::context::CloudflareRequestContext;
 use crate::key_value_store::CloudflareKvStore;
 use crate::outbound::CloudflareOutboundClient;
-use crate::response::from_egress_response;
+use crate::response::{CloudflareEgressRuntime, from_egress_response};
 use crate::secret_store::CloudflareSecretStore;
 
 /// Groups the optional per-request store handles injected at dispatch time.
@@ -449,7 +450,7 @@ pub async fn dispatch_ingress_stream_for_test<Source, SourceError>(
     method: CoreMethod,
     uri: Uri,
     source: Source,
-) -> Result<CfResponse, WorkerError>
+) -> Result<ResponseEgressEnvelope, WorkerError>
 where
     Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
@@ -463,12 +464,13 @@ where
     core_request
         .extensions_mut()
         .insert(outbound_client(app.monotonic_clock()));
-    dispatch_ingress_stream(
+    dispatch_ingress_stream_and(
         app,
         core_request,
         Stores::default(),
         request_start,
         move || Ok(source),
+        Ok,
     )
     .await
 }
@@ -481,25 +483,37 @@ pub(crate) async fn dispatch_with_handles(
     stores: Stores,
     request_start: MonotonicInstant,
 ) -> Result<CfResponse, WorkerError> {
+    let signal = req.inner().signal();
     let head_request = into_core_request_head(&req, env, ctx, app.monotonic_clock())
         .map_err(|error| edge_error_to_worker(&error))?;
-    dispatch_ingress_stream(app, head_request, stores, request_start, move || {
-        cloudflare_body_stream(req)
-    })
+    let context = CloudflareRequestContext::get(&head_request)
+        .map(CloudflareRequestContext::context_handle)
+        .ok_or_else(|| WorkerError::RustError("missing Cloudflare request context".to_owned()))?;
+    let runtime = CloudflareEgressRuntime::new(signal, context);
+    dispatch_ingress_stream_and(
+        app,
+        head_request,
+        stores,
+        request_start,
+        move || cloudflare_body_stream(req),
+        move |egress| from_egress_response(egress, runtime),
+    )
     .await
 }
 
-async fn dispatch_ingress_stream<Source, SourceError, MakeSource>(
+async fn dispatch_ingress_stream_and<Source, SourceError, MakeSource, Output, Deliver>(
     app: &App,
     mut head_request: Request,
     stores: Stores,
     request_start: MonotonicInstant,
     make_source: MakeSource,
-) -> Result<CfResponse, WorkerError>
+    deliver: Deliver,
+) -> Result<Output, WorkerError>
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
     MakeSource: FnOnce() -> Result<Source, EdgeError>,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
 {
     let head_parts = IngressHeadParts::from_request(
         &head_request,
@@ -515,7 +529,7 @@ where
     {
         IngressBeginOutcome::Admitted(prepared) => prepared,
         IngressBeginOutcome::Refused(response) => {
-            return from_egress_response(response).map_err(|error| edge_error_to_worker(&error));
+            return deliver(response).map_err(|error| edge_error_to_worker(&error));
         }
         _ => {
             return Err(WorkerError::RustError(
@@ -526,7 +540,7 @@ where
     let source = make_source().map_err(|error| edge_error_to_worker(&error))?;
     *head_request.body_mut() =
         cloudflare_deadline_body(source, prepared.read_deadline(), prepared.monotonic_clock());
-    dispatch_core_request(app, head_request, stores, prepared).await
+    dispatch_core_request(app, head_request, stores, prepared, deliver).await
 }
 
 /// Dispatch with per-id store registries built from baked metadata.
@@ -683,12 +697,16 @@ fn build_secret_registry(
     StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
-async fn dispatch_core_request(
+async fn dispatch_core_request<Output, Deliver>(
     app: &App,
     mut core_request: Request,
     stores: Stores,
     prepared: PreparedIngress,
-) -> Result<CfResponse, WorkerError> {
+    deliver: Deliver,
+) -> Result<Output, WorkerError>
+where
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
@@ -707,7 +725,7 @@ async fn dispatch_core_request(
         .dispatch_admitted(prepared, core_request)
         .await
         .map_err(|err| edge_error_to_worker(&err))?;
-    from_egress_response(response).map_err(|err| edge_error_to_worker(&err))
+    deliver(response).map_err(|err| edge_error_to_worker(&err))
 }
 
 fn edge_error_to_worker(err: &EdgeError) -> WorkerError {

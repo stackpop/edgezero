@@ -19,7 +19,7 @@ pub mod key_value_store;
 pub mod outbound;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod request;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
 pub mod response;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;

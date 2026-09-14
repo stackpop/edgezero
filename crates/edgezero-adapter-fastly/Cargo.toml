@@ -19,7 +19,7 @@ cli = [
     "dep:toml_edit",
     "dep:walkdir",
 ]
-fastly = ["dep:fastly", "dep:log-fastly"]
+fastly = ["dep:fastly", "dep:fastly-shared", "dep:fastly-sys", "dep:log-fastly"]
 test-utils = []
 
 [dependencies]
@@ -34,6 +34,8 @@ brotli = { workspace = true }
 bytes = { workspace = true }
 ctor = { workspace = true, optional = true }
 fastly = { workspace = true, optional = true }
+fastly-shared = { workspace = true, optional = true }
+fastly-sys = { workspace = true, optional = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
@@ -50,6 +52,5 @@ walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
-fastly-shared = { workspace = true }
 handlebars = { workspace = true }
 tempfile = { workspace = true }

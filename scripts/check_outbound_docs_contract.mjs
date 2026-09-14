@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs'
 
 const capabilityPath = 'docs/guide/capabilities.md'
+const outboundCorePath = 'crates/edgezero-core/src/outbound.rs'
 const outboundSpecPath =
   'docs/superpowers/specs/2026-05-21-outbound-http-design.md'
 const sidebarPath = 'docs/.vitepress/config.mts'
@@ -63,7 +64,13 @@ const expectedOutboundRows = [
     'Unsupported',
   ],
   ['outbound-header-fidelity', 'Native', 'BestEffort', 'Native', 'Native'],
-  ['outbound-deadlines', 'Native', 'Native', 'BestEffort', 'BestEffort'],
+  [
+    'outbound-deadlines',
+    'Native',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+  ],
   [
     'outbound-flexible-phase-budget',
     'Native',
@@ -75,13 +82,13 @@ const expectedOutboundRows = [
   [
     'streamed-upload-deadlines',
     'Native',
-    'Native',
+    'BestEffort',
     'BestEffort',
     'BestEffort',
   ],
   [
     'lazy-streamed-response-passthrough',
-    'BestEffort',
+    'Native',
     'Native',
     'BestEffort',
     'BestEffort',
@@ -90,31 +97,31 @@ const expectedOutboundRows = [
 const expectedResponseEgressRows = [
   [
     'response-egress-abort',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
   ],
   [
     'response-egress-backpressure',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
   ],
   [
     'response-egress-completion',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
   ],
   [
     'response-write-deadlines',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
-    'Unsupported',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
   ],
 ]
 const expectedLimitHeader = ['Control', 'Scope', 'Default']
@@ -191,6 +198,32 @@ function normalizeSupport(value) {
     .replace(/\[\^[^\]]+\]$/u, '')
     .replace(/[¹²³⁴⁵⁶⁷⁸⁹]+$/u, '')
     .trim()
+}
+
+function readRustU64Constant(source, name) {
+  const match = source.match(
+    new RegExp(`pub const ${name}: u64 = ([^;]+);`, 'u'),
+  )
+  const expression = match?.[1]
+  if (expression === undefined) {
+    fail(`cannot find Rust constant ${name}`)
+  }
+  const factors = expression.split('*').map((factor) => factor.trim())
+  if (!factors.every((factor) => /^[0-9][0-9_]*$/u.test(factor))) {
+    fail(`Rust constant ${name} has an unsupported expression: ${expression}`)
+  }
+  return factors.reduce(
+    (product, factor) => product * BigInt(factor.replaceAll('_', '')),
+    1n,
+  )
+}
+
+function formatBinaryBytes(bytes) {
+  const mebibyte = 1024n * 1024n
+  if (bytes % mebibyte === 0n) {
+    return `${bytes / mebibyte} MiB`
+  }
+  return `${bytes} bytes`
 }
 
 let capabilitySource
@@ -305,6 +338,20 @@ if (outboundSpecSource.includes("Today's Fastly client")) {
     'outbound specification still describes the historical Fastly client as current',
   )
 }
+for (const staleFragment of [
+  'So the collapse today is',
+  'The current adapter maps',
+  'two real bugs to fix',
+  'The current code (`proxy.rs',
+  'crates/edgezero-adapter-spin/src/proxy.rs',
+  '(`spin/proxy.rs`)',
+]) {
+  if (outboundSpecSource.includes(staleFragment)) {
+    fail(
+      `outbound specification contains stale implementation text: ${staleFragment}`,
+    )
+  }
+}
 
 const limitsHeadingIndex = lines.findIndex(
   (line) => line.trim() === '## Limits And Accounting',
@@ -347,6 +394,31 @@ if (JSON.stringify(actualLimitRows) !== JSON.stringify(expectedLimitRows)) {
   fail(
     `outbound limits mismatch\nexpected=${JSON.stringify(expectedLimitRows)}\nactual=${JSON.stringify(actualLimitRows)}`,
   )
+}
+
+let outboundCoreSource
+try {
+  outboundCoreSource = readFileSync(outboundCorePath, 'utf8')
+} catch (error) {
+  fail(`cannot read ${outboundCorePath}: ${error.message}`)
+}
+const documentedDefaults = new Map(
+  actualLimitRows.map((row) => [row[0], row[2]]),
+)
+for (const [control, constant] of [
+  ['max_request_body_bytes', 'DEFAULT_OUTBOUND_REQUEST_BODY_BYTES'],
+  ['max_response_bytes', 'DEFAULT_MAX_RESPONSE_BYTES'],
+  ['max_brotli_decoder_bytes', 'DEFAULT_MAX_BROTLI_DECODER_BYTES'],
+]) {
+  const rustDefault = formatBinaryBytes(
+    readRustU64Constant(outboundCoreSource, constant),
+  )
+  const documentedDefault = documentedDefaults.get(control)
+  if (documentedDefault !== rustDefault) {
+    fail(
+      `${control} default mismatch: Rust ${constant} is ${rustDefault}, documentation says ${documentedDefault}`,
+    )
+  }
 }
 
 const sidebarSource = readFileSync(sidebarPath, 'utf8')

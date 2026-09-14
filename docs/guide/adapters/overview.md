@@ -21,25 +21,31 @@ Each adapter exposes an `into_core_request` helper that accepts the provider's r
 - **Consume the request body** into an `edgezero_core::body::Body`. Adapters may buffer inbound bodies today; streaming input should be preserved where available
 - **Insert a provider context struct** (e.g., `FastlyRequestContext`) into the request extensions. The context should expose metadata such as client IP addresses or environment handles so handlers can reach platform APIs
 
-## Response Conversion
+## Response Egress
 
-Adapters also expose `from_core_response` (or equivalent) to transform an `edgezero_core::http::Response` into the provider response type. Implementations must:
+Adapters consume a `ResponseEgressEnvelope` and own delivery through the strongest platform
+transport boundary available. Implementations must:
 
 - **Map HTTP status codes** verbatim
 - **Copy headers**, respecting casing rules enforced by the provider
-- **Apply the declared response boundary** - Cloudflare preserves lazy response streams; Axum, Fastly, and Spin collect portable response streams under a fixed 16 MiB conversion cap
-- **Handle encoding helpers** (`decode_gzip_stream`, `decode_brotli_stream`) where a provider requires transparent decompression
+- **Preserve lazy body production** and platform backpressure without whole-response collection
+- **Use the application clock and one absolute write deadline** through terminal observation
+- **Account accepted payload bytes** at the adapter's documented host boundary
+- **Abort or close owned transport resources** and deliver exactly one terminal report
+- **Use the bounded precommit fallback** without replacing a response after commit
 
 ## Dispatch Helper
 
-Adapters surface a `dispatch` function that bridges from the provider event loop into the shared router (`App::router().oneshot(...)`). It should:
+Adapters surface a send-owning runner that bridges from the provider event loop into the shared
+router. It should:
 
 1. Convert the incoming provider request with `into_core_request`
 2. Await the router future
-3. Convert the resulting `Response` back into the provider type
-4. Map any `EdgeError` into the provider's error type so failures surface as provider errors (often 5xx) instead of panicking
+3. Carry the returned egress envelope into the adapter coordinator
+4. Own body delivery, deadline/abort handling, and terminal observation
+5. Map precommit failures to the bounded fallback and expose only category-safe diagnostics
 
-This helper is what demo entrypoints and adapters call when wiring their platform-specific main functions.
+Generated and demo entrypoints call only the canonical runner for their adapter.
 
 ## Store Registry Resolution
 
@@ -76,11 +82,13 @@ New adapters should provide a comparable helper so apps consistently opt into lo
 
 ## Contract Tests
 
-To keep the contract enforceable, each adapter includes integration tests that validate request/response conversions and the dispatch helper:
+To keep the contract enforceable, each adapter includes tests that validate request conversion,
+response framing, and the owned delivery coordinator:
 
 - `into_core_request` for method, URI, header, body, and context propagation
-- `from_core_response` for status propagation and streamed body writes
-- `dispatch` for routed handlers, body passthrough, and streaming responses
+- response-head commit and lazy streamed body writes
+- absolute deadlines, accepted-byte accounting, abort/close, and exactly-once terminal reports
+- routing, admission refusal, fallback drain, handler, middleware, and fallback response paths
 
 ### Fastly Tests
 
@@ -113,9 +121,9 @@ entry in `Cargo.lock` before running the Cloudflare tests.
 
 When bringing up another adapter:
 
-1. **Implement request/response conversion functions** that follow the rules above
+1. **Implement request conversion and an owned response coordinator** that follow the rules above
 2. **Provide a context type** exposing the adapter's metadata and insert it in `into_core_request`
-3. **Implement a `dispatch` wrapper** plus logging helper
+3. **Implement a send-owning runner** plus logging helper
 4. **Wire up an `OutboundHttpClient`** with limits, deadlines, batching, and typed errors
 5. **Copy the contract test suite**, swapping in the new adapter types. Ensure the tests are gated to the target architecture if the adapter SDK does not compile for native hosts
 6. **Register the adapter** with `edgezero-adapter::register_adapter` (typically in a `cli` module using the `ctor` crate) so the CLI can discover it dynamically

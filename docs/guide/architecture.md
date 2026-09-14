@@ -102,9 +102,9 @@ Adapters translate between provider-specific types and the portable core model:
 ┌─────────────────────────────────────────────────────────────┐
 │                        Adapter                               │
 │  - into_core_request(): Provider Request → Core Request     │
-│  - from_core_response(): Core Response → Provider Response  │
-│  - run_app()/dispatch_with_config(): Canonical lifecycle    │
-│  - dispatch(): Low-level manual lifecycle                   │
+│  - response coordinator: Core envelope → owned delivery     │
+│  - run_app(): Canonical request and response lifecycle      │
+│  - adapter service: Optional low-level send-owning wiring    │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼

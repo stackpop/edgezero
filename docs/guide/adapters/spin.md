@@ -26,11 +26,11 @@ crates/my-app-adapter-spin/
 The Spin entrypoint wires the adapter via `#[http_service]`:
 
 ```rust
-use spin_sdk::{http::IntoResponse, http::Request, http_service};
+use spin_sdk::{http::Request, http_service};
 use my_app_core::App;
 
 #[http_service]
-async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+async fn handle(req: Request) -> anyhow::Result<edgezero_adapter_spin::SpinResponse> {
     edgezero_adapter_spin::run_app::<App>(req).await
 }
 ```
@@ -80,9 +80,11 @@ manifest declaration.
 
 Spin exposes raw header bytes and supports isolated concurrent `send_all` slots. Deadline and
 streamed-upload cancellation remain BestEffort until host teardown has a documented observed
-bound, and provider phase-timer defaults may prevent a fully elastic budget. The current
-`SpinFullResponse` converter also buffers portable response streams under the fixed 16 MiB
-`SPIN_RESPONSE_STREAM_BUFFER_BYTES` cap. See [Capabilities](/guide/capabilities).
+bound, and provider phase-timer defaults may prevent a fully elastic budget. Downstream response
+delivery owns the raw WASI response, body, and result writers in one coordinator and preserves
+lazy body production under host backpressure. Successful close is a host handoff, not proof of
+client receipt, so response-egress capabilities also remain BestEffort. See
+[Capabilities](/guide/capabilities).
 
 ## KV Storage
 
@@ -209,9 +211,10 @@ Schema-coupling note: the SQLite writer uses the exact `spin_key_value`
 schema and `INSERT … ON CONFLICT DO UPDATE` statement vendored from
 spinframework/spin's `crates/key-value-spin/src/store.rs`. A contract
 test in `edgezero-adapter-spin/src/cli/push_sqlite.rs` asserts
-byte-equality against the upstream string, and the workspace's
-`spin-sdk = "~6.0"` pin blocks any Spin minor bump that would change
-the schema until the operator opts in.
+byte-equality against the upstream Spin 4.1.0 strings. The workspace's
+exact `spin-sdk = "=7.0.0"` pin makes every SDK upgrade explicit, and
+the CLI warns when the installed Spin runtime major is outside the
+schema-verified 2.x through 4.x range.
 
 ```bash
 # Local dev: writes through to .spin/sqlite_key_value.db.

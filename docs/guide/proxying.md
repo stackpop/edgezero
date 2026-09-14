@@ -90,8 +90,8 @@ consume `response.into_body()` while its absolute request deadline is still acti
 performs an additional collection step.
 
 `max_chunk_bytes` opt-in rechunks guest-visible response items before they reach the application.
-It bounds item shape and downstream per-item allocation; it does not bound a provider SDK's
-source-chunk allocation before EdgeZero receives that chunk.
+It bounds emitted item shape, not allocation: split `Bytes` values can retain their original
+backing allocation, and a provider SDK may allocate the source chunk before EdgeZero receives it.
 
 ## Batch Requests
 
@@ -117,5 +117,5 @@ cap.
 
 The API is portable, but not every runtime can provide identical timing, header, or lazy-stream
 semantics. See [Capabilities](/guide/capabilities) for the exact support matrix, Fastly's dynamic
-backend prerequisite, the 16 MiB Axum/Fastly/Spin response-conversion fallback, Cloudflare's
-manual encoding boundaries, and complete resource-accounting exclusions.
+backend prerequisite, each adapter's lazy downstream handoff boundary, Cloudflare's manual
+encoding boundaries, and complete resource-accounting exclusions.

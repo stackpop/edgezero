@@ -103,9 +103,17 @@ The adapter requests raw encoded upstream bytes with manual fetch encoding, disa
 redirect following, and owns an abort signal for the absolute request deadline. When an encoded
 body is passed through to the downstream response, the response converter separately selects
 manual response-body encoding so Workers does not encode it again. These are two distinct
-controls. Cloudflare is the only current adapter with Native lazy streamed response passthrough;
+controls. The abort path is implemented, but outbound and streamed-upload deadlines remain
+BestEffort until a deployed host-observed cancellation fixture proves a finite bound. Cloudflare
+and Axum have Native lazy streamed response passthrough;
 raw header octets and original non-`set-cookie` field boundaries remain unavailable, so header
 fidelity is BestEffort. See [Capabilities](/guide/capabilities).
+
+Downstream response delivery uses one JavaScript stream writer owned by a coordinator registered
+with `Context::wait_until`. It awaits writer backpressure and races the request abort signal and
+absolute write deadline. Writer acceptance and close are host-handoff observations; deployed
+disconnect and network-completion timing remain unproved, so response-egress capabilities are
+BestEffort.
 
 ## Logging
 

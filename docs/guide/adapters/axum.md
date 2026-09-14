@@ -84,9 +84,11 @@ portable client from `RequestContext::http_client()`; direct wiring and tests ca
 adapter client with `AxumOutboundClient::try_new()`.
 
 Axum provides native total deadlines, elastic phase budgeting, batch slot isolation, header
-fidelity, and streamed upload cancellation. A portable response stream is non-`Send`, while
-Hyper requires a `Send` body, so downstream conversion collects it under the fixed 16 MiB
-`AXUM_RESPONSE_STREAM_BUFFER_BYTES` cap. See [Capabilities](/guide/capabilities).
+fidelity, and streamed upload cancellation. Downstream responses run on a connection-local Hyper
+HTTP/1 executor, so portable non-`Send` streams remain lazy and are polled under Hyper demand.
+The connection supervisor enforces the absolute response-write deadline, but frame acceptance is
+not proof of socket or client receipt; response-egress capabilities therefore remain BestEffort.
+See [Capabilities](/guide/capabilities).
 
 ## Logging
 

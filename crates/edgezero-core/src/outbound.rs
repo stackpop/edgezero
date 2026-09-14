@@ -95,6 +95,11 @@ pub trait OutboundHttpClient: Send + Sync {
     /// Returns a typed request, transport, deadline, or response-policy failure.
     async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError>;
 
+    /// Attempts every eligible request before harvesting terminal results.
+    ///
+    /// Results remain index-aligned with `requests`. Axum, Cloudflare, and Spin drive complete
+    /// exchanges concurrently; Fastly dispatches sequentially before ordered harvest, so callers
+    /// requiring cross-slot timing isolation must require the corresponding capability.
     async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult>;
 }
 
@@ -109,8 +114,11 @@ pub struct OutboundResponse {
 
 #[derive(Debug)]
 #[non_exhaustive]
+/// One index-aligned terminal result returned by [`OutboundHttpClient::send_all`].
 pub struct OutboundSlotResult {
+    /// Time from the batch's shared method-entry snapshot until this slot became terminal.
     pub elapsed: Duration,
+    /// This slot's terminal response or typed failure.
     pub outcome: Result<OutboundResponse, EdgeError>,
 }
 
@@ -223,6 +231,10 @@ impl OutboundResponse {
     }
 
     #[must_use]
+    /// Returns adapter-facing mutable headers without normalizing them.
+    ///
+    /// Callers that mutate framing or hop-by-hop metadata must finish through
+    /// [`Self::into_response`], which reapplies the defensive normalization pass.
     #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
@@ -353,6 +365,11 @@ impl OutboundResponse {
     }
 
     #[must_use]
+    /// Constructs a low-level adapter response using the default monotonic clock.
+    ///
+    /// `headers` must already have passed [`normalize_response_headers`], including bodyless
+    /// disposition handling, before the response is exposed through app-facing accessors.
+    /// Standard adapters use the clock-paired internal constructor and enforce this precondition.
     #[inline]
     pub fn new(request_method: Method, status: StatusCode, headers: HeaderMap, body: Body) -> Self {
         Self::new_with_monotonic_clock(
@@ -365,6 +382,8 @@ impl OutboundResponse {
     }
 
     /// Constructs an adapter response paired with its application clock.
+    ///
+    /// `headers` must satisfy the same normalization precondition as [`Self::new`].
     #[doc(hidden)]
     #[must_use]
     #[inline]
@@ -2304,6 +2323,26 @@ mod tests {
         assert!(defaults.max_response_header_bytes.is_none());
         assert!(defaults.max_response_header_count.is_none());
         assert!(defaults.timeout.is_none());
+    }
+
+    #[test]
+    fn outbound_request_response_mode_setters_are_last_write_wins() {
+        let streamed = OutboundRequest::get("https://example.com")
+            .expect("streamed request")
+            .max_response_bytes(7)
+            .stream_response()
+            .into_parts();
+        assert_eq!(streamed.response_mode, ResponseMode::Streamed);
+
+        let buffered = OutboundRequest::get("https://example.com")
+            .expect("buffered request")
+            .stream_response()
+            .max_response_bytes(7)
+            .into_parts();
+        assert_eq!(
+            buffered.response_mode,
+            ResponseMode::Buffered { max_bytes: 7 }
+        );
     }
 
     #[test]

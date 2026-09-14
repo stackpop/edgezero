@@ -60,10 +60,9 @@ grant remains live throughout the drain and is released before response conversi
 core drain future is dropped, or when the finite read deadline terminates the drain. This path
 discards the body and invokes no route middleware, handler, or request context. `Refuse` remains
 the zero-read overload path, and ordinary admission retains the immediate, no-poll 404/405
-behavior. Axum's current `block_in_place` bridge is not cancellable: aborting the outer Tower
-service future does not promptly drop the inner fallback drain. The configured absolute read
-deadline still terminates that drain and releases its grant and body source; tests pin this
-deadline-bounded, rather than cancellation-bounded, release behavior.
+behavior. Axum dispatches the admission and fallback-drain future directly on its connection-local
+executor, so cancellation drops that future and its grant. Cloudflare, Fastly, and Spin retain the
+provider limitations described above.
 
 ## Config Matrix
 
@@ -85,21 +84,29 @@ defines the normative accounting, cancellation, error, and promotion requirement
 
 ## Response Egress Matrix
 
-| Capability                     | Axum        | Cloudflare  | Fastly      | Spin        |
-| ------------------------------ | ----------- | ----------- | ----------- | ----------- |
-| `response-egress-abort`        | Unsupported | Unsupported | Unsupported | Unsupported |
-| `response-egress-backpressure` | Unsupported | Unsupported | Unsupported | Unsupported |
-| `response-egress-completion`   | Unsupported | Unsupported | Unsupported | Unsupported |
-| `response-write-deadlines`     | Unsupported | Unsupported | Unsupported | Unsupported |
+| Capability                     | Axum       | Cloudflare | Fastly     | Spin       |
+| ------------------------------ | ---------- | ---------- | ---------- | ---------- |
+| `response-egress-abort`        | BestEffort | BestEffort | BestEffort | BestEffort |
+| `response-egress-backpressure` | BestEffort | BestEffort | BestEffort | BestEffort |
+| `response-egress-completion`   | BestEffort | BestEffort | BestEffort | BestEffort |
+| `response-write-deadlines`     | BestEffort | BestEffort | BestEffort | BestEffort |
 
 These cells describe transport-observable client-response delivery, not response conversion.
-Axum currently emits `ResponseReturned` with zero written bytes after conversion and before
-returning the response to Hyper. It does not observe Hyper acceptance, socket transmission,
-disconnect, abort, or client completion. The other adapters likewise expose no proved
-transport completion boundary. Fastly's `StreamingBody` and Spin/WASI's `BodyWriter` provide
-lower-level send APIs, but the current EdgeZero entrypoints do not own those lifetimes.
-Converter caps and deadline checks remain useful, but they do not satisfy these capabilities;
-whole-response-lifetime certification remains blocked.
+Every adapter now owns a response coordinator through its strongest available host boundary,
+uses the application's monotonic clock, applies one absolute write deadline, and emits one
+terminal report. The boundaries remain `BestEffort` because none proves end-client receipt:
+
+- Axum commits when Hyper accepts the response head, accounts payload frames as Hyper polls them,
+  closes the owned HTTP/1 connection on deadline, and reports clean source EOF as `HostHandoff`.
+- Cloudflare awaits JavaScript writer promises, races request abort/deadline signals, and keeps the
+  coordinator alive with `waitUntil`; deployed disconnect and completion timing remain unproved.
+- Fastly accounts synchronous body-handle writes through `stream_to_client` close, but cannot
+  preempt a blocked source poll or hostcall and loses the body handle if `finish` itself fails.
+- Spin owns the WASI response/body/result writers through handoff and races pending operations
+  against its timer; host teardown and network completion remain provider-observable only.
+
+Provider-owned buffering, SDK allocations, and bytes beyond each stated acceptance boundary are
+not included. These limitations block whole-response-lifetime certification.
 
 ## Outbound Matrix
 
@@ -108,11 +115,11 @@ whole-response-lifetime certification remains blocked.
 | `outbound-http`                         | Native                            | Native                            | BestEffort⁹                       | Native                            |
 | `outbound-complete-resource-accounting` | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] |
 | `outbound-header-fidelity`              | Native                            | BestEffort⁸                       | Native                            | Native                            |
-| `outbound-deadlines`                    | Native                            | Native                            | BestEffort¹                       | BestEffort⁸                       |
+| `outbound-deadlines`                    | Native                            | BestEffort⁸                       | BestEffort¹                       | BestEffort⁸                       |
 | `outbound-flexible-phase-budget`        | Native                            | Native                            | BestEffort⁵                       | BestEffort⁵                       |
 | `send-all-slot-isolation`               | Native                            | Native                            | BestEffort⁴                       | Native                            |
-| `streamed-upload-deadlines`             | Native                            | Native                            | BestEffort²                       | BestEffort⁸                       |
-| `lazy-streamed-response-passthrough`    | BestEffort³                       | Native                            | BestEffort⁶                       | BestEffort⁷                       |
+| `streamed-upload-deadlines`             | Native                            | BestEffort⁸                       | BestEffort²                       | BestEffort⁸                       |
+| `lazy-streamed-response-passthrough`    | Native³                           | Native                            | BestEffort⁶                       | BestEffort⁷                       |
 
 [^resource-accounting]:
     Complete accounting includes provider parsing and field-section
@@ -128,8 +135,10 @@ but they are not one end-to-end wall-clock guarantee.
 ² Fastly checks the absolute deadline between streamed upload chunks, but it cannot preempt a
 stalled source pull or host write.
 
-³ Axum collects a portable non-`Send` response stream before passing it to Hyper. Collection
-is capped at 16 MiB by `AXUM_RESPONSE_STREAM_BUFFER_BYTES`.
+³ Axum preserves the portable non-`Send` stream on a connection-local executor and yields one
+payload frame at a time under Hyper demand. Unit and raw-socket tests prove first-frame delivery
+before source EOF. Socket/client completion remains separately BestEffort under the response-egress
+capabilities above.
 
 ⁴ Fastly dispatches slots sequentially and harvests response bodies in input order. Cold
 backend registration can delay a later dispatch; unresolved uploads or an earlier body drain
@@ -138,16 +147,22 @@ can delay a sibling's terminal observation.
 ⁵ Fastly divides a total budget among provider phase timers. Spin's host may reject phase
 timer settings and retain opaque defaults. Neither can promise one fully elastic pool.
 
-⁶ The standard `#[fastly::main]` entrypoint cannot use Fastly's manual
-`stream_to_client` response lifetime. EdgeZero therefore buffers the stream under
-`FASTLY_RESPONSE_STREAM_BUFFER_BYTES`, currently 16 MiB.
+⁶ Fastly uses an undecorated, send-owning entrypoint and the low-level `stream_to_client` response
+lifetime. Scripted pump tests and the raw ABI Viceroy test prove the pieces, but the production
+`run_app` composition has not yet been exercised end to end under Viceroy. The lazy-passthrough
+cell therefore remains `BestEffort`; synchronous preemption and finish limitations separately
+keep the response-egress cells BestEffort.
 
-⁷ Spin's current `SpinFullResponse` boundary is buffered. EdgeZero collects the stream under
-`SPIN_RESPONSE_STREAM_BUFFER_BYTES`, currently 16 MiB.
+⁷ Spin writes one portable chunk at a time through the WASI body writer. Unit tests and target
+compilation prove the coordinator, but a live Spin component test has not yet established the
+generated production composition. Host teardown and network completion also lack deployed proof.
 
 ⁸ Spin cancellation is cooperative until host teardown is observable within a documented
-bound. Cloudflare exposes normalized header strings rather than original raw octets and field
-boundaries, although it preserves the visible header semantics used by the client.
+bound. Cloudflare wires one owned `AbortController` through fetch and streamed body consumption,
+but no deployed host-observed cancellation artifact currently proves a finite cancellation bound;
+its outbound and streamed-upload deadline cells therefore remain `BestEffort`. Cloudflare also
+exposes normalized header strings rather than original raw octets and field boundaries, although
+it preserves the visible header semantics used by the client.
 
 ⁹ Fastly outbound HTTP uses dynamic backends, which must be enabled on the deployed service.
 The CLI cannot currently prove that entitlement. If disabled, dispatch returns a typed 502
@@ -223,6 +238,9 @@ contains its own `elapsed` and `outcome`; one failure does not erase sibling out
 terminal, including preflight validation, adapter setup, provider queueing, upload, headers,
 buffered body drain, and any delayed guest observation. It is not pure transport RTT.
 Preflight failures are timed from the same batch start, and a same-tick result may be zero.
+A successful outcome is contractually terminal and on time. `elapsed` is metadata, not a second
+lateness check; callers must not sample their clock after the whole batch returns to reinterpret an
+earlier `Ok`, and the API intentionally exposes no absolute terminal or batch-start instant.
 
 Standard adapter wiring clones the application's monotonic clock into its outbound client, so
 ingress timing, dispatch budgets, slot elapsed values, error precedence, and deferred body

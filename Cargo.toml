@@ -48,8 +48,9 @@ edgezero-adapter-fastly = { path = "crates/edgezero-adapter-fastly", default-fea
 edgezero-adapter-spin = { path = "crates/edgezero-adapter-spin", default-features = false }
 edgezero-core = { path = "crates/edgezero-core", default-features = false }
 edgezero-cli = { path = "crates/edgezero-cli", default-features = false }
-fastly = "=0.12.1"
-fastly-shared = "=0.12.1"
+fastly = "=0.13.1"
+fastly-shared = "=0.13.1"
+fastly-sys = "=0.13.1"
 fern = "0.7"
 flate2 = { version = "1", features = ["rust_backend"] }
 futures = { version = "0.3", features = ["std", "executor"] }
@@ -58,8 +59,10 @@ handlebars = "6"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 log = "0.4"
-log-fastly = "0.12"
+log-fastly = "=0.13.1"
 matchit = "0.9"
 once_cell = "1"
 redb = "4.1.0"
@@ -84,11 +87,11 @@ syn = { version = "3", features = ["full", "extra-traits", "visit"] }
 subtle = "2"
 # The Spin outbound classifier exhaustively matches this SDK's WASI HTTP
 # snapshot, so both dependencies move only through an explicit review.
-spin-sdk = { version = "=6.0.0", default-features = false, features = ["http", "key-value", "variables"] }
+spin-sdk = { version = "=7.0.0", default-features = false, features = ["http", "key-value", "variables"] }
 tempfile = "3"
 toml_edit = "0.25"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 trybuild = "1"
 toml = { version = "1.1" }
 tower = { version = "0.5", features = ["util"] }
@@ -98,9 +101,8 @@ tracing = "0.1"
 url = "=2.5.8"
 validator = { version = "0.20", features = ["derive"] }
 walkdir = { version = "2" }
-wasip3 = "=0.6.0"
 web-time = "1"
-worker = { version = "=0.8.3", default-features = false, features = ["http"] }
+worker = { version = "=0.8.5", default-features = false, features = ["http"] }
 
 [workspace.lints.clippy]
 # Same strict gate as the demo workspace. Allow-list mirrors the demo's

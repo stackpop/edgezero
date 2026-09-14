@@ -714,6 +714,7 @@ mod fastly_impl {
             | BackendCreationError::ConnectTimeoutTooLarge(_)
             | BackendCreationError::EncodingError(_)
             | BackendCreationError::FirstByteTimeoutTooLarge(_)
+            | BackendCreationError::InvalidHealthcheckValue(_)
             | BackendCreationError::NameTooLong(_) => EdgeError::internal(anyhow::anyhow!(
                 "Fastly rejected deterministic dynamic backend configuration"
             )),
@@ -782,11 +783,12 @@ mod fastly_impl {
             | SendErrorCause::HttpCacheLimitExceeded
             | SendErrorCause::HttpRequestCacheKeyInvalid
             | SendErrorCause::HttpRequestUriInvalid => super::SendFailure::LocalInvariant,
-            SendErrorCause::ImageOptimizerUnsupported | SendErrorCause::Custom(_) => {
-                super::SendFailure::Unknown
-            }
             SendErrorCause::InternalError(_) => super::SendFailure::PlatformInternal,
-            _ => super::SendFailure::Unknown,
+            SendErrorCause::FanoutNotEnabled
+            | SendErrorCause::ImageOptimizerUnsupported
+            | SendErrorCause::RequestCollapse
+            | SendErrorCause::Custom(_)
+            | _ => super::SendFailure::Unknown,
         }
     }
 
@@ -1825,6 +1827,7 @@ mod fastly_impl {
                     String::from_utf8(vec![0xff]).expect_err("invalid UTF-8"),
                 ),
                 BackendCreationError::FirstByteTimeoutTooLarge(Duration::from_secs(1)),
+                BackendCreationError::InvalidHealthcheckValue("invalid".to_owned()),
                 BackendCreationError::NameTooLong("x".to_owned()),
                 BackendCreationError::NameInUse,
             ] {
@@ -2155,12 +2158,20 @@ mod fastly_impl {
                     super::super::SendFailure::Transport,
                 ),
                 (
+                    SendErrorCause::FanoutNotEnabled,
+                    super::super::SendFailure::Unknown,
+                ),
+                (
                     SendErrorCause::ImageOptimizerUnsupported,
                     super::super::SendFailure::Unknown,
                 ),
                 (
                     SendErrorCause::InternalError(None),
                     super::super::SendFailure::PlatformInternal,
+                ),
+                (
+                    SendErrorCause::RequestCollapse,
+                    super::super::SendFailure::Unknown,
                 ),
                 (
                     SendErrorCause::Custom(anyhow::anyhow!("test")),

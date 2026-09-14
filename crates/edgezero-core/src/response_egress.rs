@@ -4,12 +4,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::http::{HeaderMap, Response, StatusCode, Version};
+use crate::http::{HeaderMap, Method, Response, StatusCode, Version};
+use crate::response_egress_framing::{PreparedResponseEgress, prepare_response_egress};
 use crate::router::RouteMetadata;
 use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
 
 /// Portable response-write budget used when an application installs no policy.
 pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
+
+/// Internal safety budget used only when transmitting a bounded precommit fallback.
+pub const RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET: Duration = Duration::from_secs(1);
 
 /// One finite absolute deadline selected for a response-conversion attempt.
 #[derive(Clone, Copy, Debug)]
@@ -120,17 +124,35 @@ pub enum ResponseEgressOutcome {
     ConversionError,
     DeadlineExceeded,
     HostHandoff,
-    ResponseReturned,
+    RequestCancelled,
     SourceError,
     TransportError,
     Unspecified,
 }
 
+/// Identifies which bounded response body contributed the reported byte count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResponseEgressBodyKind {
+    Application,
+    Fallback,
+}
+
+/// Records whether a selected fallback reached its finish boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResponseEgressFallbackDisposition {
+    Aborted,
+    Completed,
+}
+
 /// Bounded terminal report for one response-conversion attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResponseEgressReport {
+    pub body_kind: ResponseEgressBodyKind,
     pub bytes_written: u64,
     pub elapsed: Duration,
+    pub fallback_disposition: Option<ResponseEgressFallbackDisposition>,
     pub outcome: ResponseEgressOutcome,
     pub request_start: MonotonicInstant,
     pub route: Option<RouteMetadata>,
@@ -160,28 +182,47 @@ pub struct ResponseEgressEnvelope {
     clock: MonotonicClock,
     observer: ResponseEgressObserverHandle,
     policy: ResponseEgressPolicyCallback,
+    request_method: Method,
     request_start: MonotonicInstant,
     response: Response,
     route: Option<RouteMetadata>,
 }
 
+/// Live response-egress state returned when application response preparation fails precommit.
+#[doc(hidden)]
+pub struct ResponseEgressBeginFailure {
+    attempt: ResponseEgressAttempt,
+    cause: ResponseEgressOutcome,
+    clock: MonotonicClock,
+}
+
+impl ResponseEgressBeginFailure {
+    /// Consumes the failure into the sole live attempt, its clock, and original cause.
+    #[must_use]
+    #[inline]
+    pub fn into_parts(self) -> (ResponseEgressAttempt, MonotonicClock, ResponseEgressOutcome) {
+        (self.attempt, self.clock, self.cause)
+    }
+}
+
 impl ResponseEgressEnvelope {
-    /// Starts one response-conversion attempt and evaluates the app policy exactly once.
+    /// Starts an owned response-egress attempt without pre-terminalizing fallback-eligible errors.
     ///
     /// # Errors
-    /// Returns `ConversionError` after reporting it when policy evaluation panics or deadline
-    /// normalization cannot represent the portable clamp.
+    /// Returns the sole live attempt, its injected clock, and a bounded precommit cause when the
+    /// policy panics on an unwind-capable target or its deadline cannot be normalized. A target
+    /// compiled with panic-abort cannot contain application callback panics.
     #[inline]
     pub fn begin(
         self,
     ) -> Result<
         (
-            Response,
+            PreparedResponseEgress,
             ResponseEgressPolicy,
             ResponseEgressAttempt,
             MonotonicClock,
         ),
-        ResponseEgressOutcome,
+        Box<ResponseEgressBeginFailure>,
     > {
         let egress_started_at = self.clock.now();
         let head = ResponseEgressHead::new(
@@ -191,27 +232,37 @@ impl ResponseEgressEnvelope {
             self.request_start,
             self.route.as_ref(),
         );
-        let mut attempt = ResponseEgressAttempt::new_with_clock(
-            &head,
-            egress_started_at,
-            self.observer,
-            self.clock.clone(),
-        );
+        let attempt =
+            ResponseEgressAttempt::new(&head, egress_started_at, self.observer, self.clock.clone());
         let Ok(selected_policy) =
             catch_unwind(AssertUnwindSafe(|| (self.policy)(&head, egress_started_at)))
         else {
             log::error!("response-egress policy panicked before conversion");
-            attempt.terminate(ResponseEgressOutcome::ConversionError, egress_started_at);
-            return Err(ResponseEgressOutcome::ConversionError);
+            return Err(Box::new(ResponseEgressBeginFailure {
+                attempt,
+                cause: ResponseEgressOutcome::ConversionError,
+                clock: self.clock,
+            }));
         };
         let normalized_policy = match selected_policy.normalize_at(egress_started_at) {
             Ok(normalized) => normalized,
             Err(outcome) => {
-                attempt.terminate(outcome, egress_started_at);
-                return Err(outcome);
+                return Err(Box::new(ResponseEgressBeginFailure {
+                    attempt,
+                    cause: outcome,
+                    clock: self.clock,
+                }));
             }
         };
-        Ok((self.response, normalized_policy, attempt, self.clock))
+        let Ok(prepared) = prepare_response_egress(&self.request_method, self.response) else {
+            log::error!("response-egress framing validation failed before commit");
+            return Err(Box::new(ResponseEgressBeginFailure {
+                attempt,
+                cause: ResponseEgressOutcome::ConversionError,
+                clock: self.clock,
+            }));
+        };
+        Ok((prepared, normalized_policy, attempt, self.clock))
     }
 
     /// Extracts the response for low-level callers that do not own a platform converter.
@@ -225,6 +276,7 @@ impl ResponseEgressEnvelope {
         response: Response,
         request_start: MonotonicInstant,
         route: Option<RouteMetadata>,
+        request_method: Method,
         policy: ResponseEgressPolicyCallback,
         observer: ResponseEgressObserverHandle,
         clock: MonotonicClock,
@@ -233,10 +285,18 @@ impl ResponseEgressEnvelope {
             clock,
             observer,
             policy,
+            request_method,
             request_start,
             response,
             route,
         }
+    }
+
+    /// Returns the original request method used for response framing.
+    #[must_use]
+    #[inline]
+    pub fn request_method(&self) -> &Method {
+        &self.request_method
     }
 }
 
@@ -279,9 +339,12 @@ enum AttemptState {
 /// conversion error from the initial state or a transport error from the writing state.
 #[doc(hidden)]
 pub struct ResponseEgressAttempt {
+    body_kind: ResponseEgressBodyKind,
     bytes_written: u64,
     clock: MonotonicClock,
     egress_started_at: MonotonicInstant,
+    fallback_cause: Option<ResponseEgressOutcome>,
+    fallback_disposition: Option<ResponseEgressFallbackDisposition>,
     observer: ResponseEgressObserverHandle,
     request_start: MonotonicInstant,
     route: Option<RouteMetadata>,
@@ -299,10 +362,27 @@ impl ResponseEgressAttempt {
             return false;
         }
         let Some(total) = self.bytes_written.checked_add(bytes) else {
-            self.transition(ResponseEgressOutcome::TransportError, observed_at);
+            self.fail_current_body(ResponseEgressOutcome::TransportError, observed_at);
             return false;
         };
         self.bytes_written = total;
+        true
+    }
+
+    /// Selects the bounded adapter fallback while retaining the original precommit cause.
+    #[inline]
+    pub fn begin_fallback(&mut self, cause: ResponseEgressOutcome) -> bool {
+        if !matches!(self.state, AttemptState::Initial)
+            || self.fallback_cause.is_some()
+            || !matches!(
+                cause,
+                ResponseEgressOutcome::ConversionError | ResponseEgressOutcome::DeadlineExceeded
+            )
+        {
+            return false;
+        }
+        self.body_kind = ResponseEgressBodyKind::Fallback;
+        self.fallback_cause = Some(cause);
         true
     }
 
@@ -324,6 +404,9 @@ impl ResponseEgressAttempt {
     /// enter writing even for an empty response. Later terminal signals return `false`.
     #[inline]
     pub fn complete(&mut self, observed_at: MonotonicInstant) -> bool {
+        if self.body_kind == ResponseEgressBodyKind::Fallback {
+            return false;
+        }
         match self.state {
             AttemptState::Initial => {
                 self.transition(ResponseEgressOutcome::ConversionError, observed_at)
@@ -333,26 +416,59 @@ impl ResponseEgressAttempt {
         }
     }
 
+    fn fail_current_body(
+        &mut self,
+        application_outcome: ResponseEgressOutcome,
+        observed_at: MonotonicInstant,
+    ) -> bool {
+        if let Some(cause) = self.fallback_cause {
+            self.fallback_disposition = Some(ResponseEgressFallbackDisposition::Aborted);
+            self.transition(cause, observed_at)
+        } else {
+            self.transition(application_outcome, observed_at)
+        }
+    }
+
+    /// Settles a selected fallback while preserving its original precommit cause.
+    #[inline]
+    pub fn finish_fallback(
+        &mut self,
+        disposition: ResponseEgressFallbackDisposition,
+        observed_at: MonotonicInstant,
+    ) -> bool {
+        let Some(cause) = self.fallback_cause else {
+            return false;
+        };
+        let valid_state = match disposition {
+            ResponseEgressFallbackDisposition::Aborted => {
+                matches!(self.state, AttemptState::Initial | AttemptState::Writing)
+            }
+            ResponseEgressFallbackDisposition::Completed => {
+                matches!(self.state, AttemptState::Writing)
+            }
+        };
+        if !valid_state {
+            return false;
+        }
+        self.fallback_disposition = Some(disposition);
+        self.transition(cause, observed_at)
+    }
+
     #[must_use]
     #[inline]
     pub fn new(
         head: &ResponseEgressHead<'_>,
         egress_started_at: MonotonicInstant,
         observer: ResponseEgressObserverHandle,
-    ) -> Self {
-        Self::new_with_clock(head, egress_started_at, observer, MonotonicClock::default())
-    }
-
-    fn new_with_clock(
-        head: &ResponseEgressHead<'_>,
-        egress_started_at: MonotonicInstant,
-        observer: ResponseEgressObserverHandle,
         clock: MonotonicClock,
     ) -> Self {
         Self {
+            body_kind: ResponseEgressBodyKind::Application,
             bytes_written: 0,
             clock,
             egress_started_at,
+            fallback_cause: None,
+            fallback_disposition: None,
             observer,
             request_start: head.request_start(),
             route: head.route().cloned(),
@@ -362,16 +478,27 @@ impl ResponseEgressAttempt {
 
     /// Terminalizes an attempt with the supplied outcome.
     ///
-    /// `Completed` follows [`Self::complete`] state validation. `ResponseReturned` always
-    /// reports zero bytes because response-object construction is not a guest-visible write.
+    /// `Completed` follows [`Self::complete`] state validation.
     #[inline]
     pub fn terminate(
         &mut self,
         outcome: ResponseEgressOutcome,
         observed_at: MonotonicInstant,
     ) -> bool {
-        if outcome == ResponseEgressOutcome::Completed {
-            self.complete(observed_at)
+        if self.body_kind == ResponseEgressBodyKind::Fallback {
+            return false;
+        }
+        if matches!(
+            outcome,
+            ResponseEgressOutcome::Completed | ResponseEgressOutcome::HostHandoff
+        ) {
+            if outcome == ResponseEgressOutcome::HostHandoff
+                && matches!(self.state, AttemptState::Writing)
+            {
+                self.transition(outcome, observed_at)
+            } else {
+                self.complete(observed_at)
+            }
         } else {
             self.transition(outcome, observed_at)
         }
@@ -386,7 +513,6 @@ impl ResponseEgressAttempt {
             return false;
         }
 
-        let force_zero_bytes = outcome == ResponseEgressOutcome::ResponseReturned;
         let elapsed =
             if let Some(elapsed) = observed_at.checked_duration_since(self.egress_started_at) {
                 elapsed
@@ -395,14 +521,11 @@ impl ResponseEgressAttempt {
                 outcome = ResponseEgressOutcome::Unspecified;
                 Duration::ZERO
             };
-        let bytes_written = if force_zero_bytes {
-            0
-        } else {
-            self.bytes_written
-        };
         let report = ResponseEgressReport {
-            bytes_written,
+            bytes_written: self.bytes_written,
+            body_kind: self.body_kind,
             elapsed,
+            fallback_disposition: self.fallback_disposition,
             outcome,
             request_start: self.request_start,
             route: self.route.clone(),
@@ -424,7 +547,7 @@ impl Drop for ResponseEgressAttempt {
             AttemptState::Writing => ResponseEgressOutcome::TransportError,
             AttemptState::Terminal(_) => return,
         };
-        self.transition(outcome, self.clock.now());
+        self.fail_current_body(outcome, self.clock.now());
     }
 }
 
@@ -450,7 +573,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, Version};
+    use crate::body::Body;
+    use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, Version, response_builder};
     use crate::router::RouteMetadata;
     use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
 
@@ -506,6 +630,7 @@ mod tests {
             &head,
             started_at,
             ResponseEgressObserverHandle::new(observer.clone()),
+            MonotonicClock::default(),
         )
     }
 
@@ -581,14 +706,17 @@ mod tests {
             ResponseEgressOutcome::ConversionError,
             ResponseEgressOutcome::DeadlineExceeded,
             ResponseEgressOutcome::HostHandoff,
-            ResponseEgressOutcome::ResponseReturned,
+            ResponseEgressOutcome::RequestCancelled,
             ResponseEgressOutcome::SourceError,
             ResponseEgressOutcome::TransportError,
             ResponseEgressOutcome::Unspecified,
         ];
 
         for outcome in outcomes {
-            let states = if outcome == ResponseEgressOutcome::Completed {
+            let states = if matches!(
+                outcome,
+                ResponseEgressOutcome::Completed | ResponseEgressOutcome::HostHandoff
+            ) {
                 &[true][..]
             } else {
                 &[false, true][..]
@@ -625,6 +753,20 @@ mod tests {
     }
 
     #[test]
+    fn host_handoff_cannot_skip_the_writing_state() {
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let mut attempt = attempt(&observer, started_at);
+
+        assert!(attempt.terminate(ResponseEgressOutcome::HostHandoff, started_at));
+        assert_eq!(observer.reports().len(), 1);
+        assert_eq!(
+            observer.reports()[0].outcome,
+            ResponseEgressOutcome::ConversionError
+        );
+    }
+
+    #[test]
     fn writing_completion_records_metadata_bytes_and_elapsed_once() {
         let observer = RecordingObserver::default();
         let started_at = MonotonicInstant::now();
@@ -641,6 +783,7 @@ mod tests {
             &head,
             started_at,
             ResponseEgressObserverHandle::new(observer.clone()),
+            MonotonicClock::default(),
         );
 
         assert!(attempt.begin_writing());
@@ -654,7 +797,9 @@ mod tests {
         let reports = observer.reports();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bytes_written, 7);
+        assert_eq!(reports[0].body_kind, ResponseEgressBodyKind::Application);
         assert_eq!(reports[0].elapsed, Duration::from_millis(25));
+        assert_eq!(reports[0].fallback_disposition, None);
         assert_eq!(reports[0].outcome, ResponseEgressOutcome::Completed);
         assert_eq!(reports[0].request_start, request_start);
         assert_eq!(reports[0].route, Some(route));
@@ -701,7 +846,7 @@ mod tests {
         let headers = HeaderMap::new();
         let head = head(&headers, started_at, None);
 
-        drop(ResponseEgressAttempt::new_with_clock(
+        drop(ResponseEgressAttempt::new(
             &head,
             started_at,
             ResponseEgressObserverHandle::new(observer.clone()),
@@ -728,20 +873,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_byte_completion_and_response_returned_have_zero_accounting() {
+    fn zero_byte_completion_has_zero_accounting() {
         let completed_observer = RecordingObserver::default();
         let started_at = MonotonicInstant::now();
         let mut completed = attempt(&completed_observer, started_at);
         assert!(completed.begin_writing());
         assert!(completed.complete(started_at));
         assert_eq!(completed_observer.reports()[0].bytes_written, 0);
-
-        let returned_observer = RecordingObserver::default();
-        let mut returned = attempt(&returned_observer, started_at);
-        assert!(returned.begin_writing());
-        assert!(returned.account_bytes(99, started_at));
-        assert!(returned.terminate(ResponseEgressOutcome::ResponseReturned, started_at));
-        assert_eq!(returned_observer.reports()[0].bytes_written, 0);
     }
 
     #[test]
@@ -763,25 +901,6 @@ mod tests {
     }
 
     #[test]
-    fn backwards_clock_does_not_undo_response_returned_zero_accounting() {
-        let observer = RecordingObserver::default();
-        let started_at = MonotonicInstant::now();
-        let earlier = started_at
-            .checked_sub(Duration::from_millis(1))
-            .expect("earlier instant");
-        let mut attempt = attempt(&observer, started_at);
-        assert!(attempt.begin_writing());
-        assert!(attempt.account_bytes(99, started_at));
-        assert!(attempt.terminate(ResponseEgressOutcome::ResponseReturned, earlier));
-
-        let reports = observer.reports();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].bytes_written, 0);
-        assert_eq!(reports[0].elapsed, Duration::ZERO);
-        assert_eq!(reports[0].outcome, ResponseEgressOutcome::Unspecified);
-    }
-
-    #[test]
     fn observer_panics_do_not_escape_terminal_or_drop_paths() {
         let direct = catch_unwind(AssertUnwindSafe(|| {
             let started_at = MonotonicInstant::now();
@@ -791,6 +910,7 @@ mod tests {
                 &head,
                 started_at,
                 ResponseEgressObserverHandle::new(PanickingObserver),
+                MonotonicClock::default(),
             );
             assert!(attempt.terminate(ResponseEgressOutcome::ConversionError, started_at));
         }));
@@ -804,8 +924,189 @@ mod tests {
                 &head,
                 started_at,
                 ResponseEgressObserverHandle::new(PanickingObserver),
+                MonotonicClock::default(),
             ));
         }));
         dropped.unwrap_or_else(|_| panic!("observer panic escaped guard drop"));
+    }
+
+    #[test]
+    fn fallback_reports_its_bytes_and_disposition_with_original_cause() {
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let mut fallback = attempt(&observer, started_at);
+
+        assert!(fallback.begin_fallback(ResponseEgressOutcome::ConversionError));
+        assert!(fallback.begin_writing());
+        assert!(fallback.account_bytes(7, started_at));
+        assert!(
+            fallback.finish_fallback(ResponseEgressFallbackDisposition::Completed, started_at,)
+        );
+
+        let reports = observer.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].bytes_written, 7);
+        assert_eq!(reports[0].body_kind, ResponseEgressBodyKind::Fallback);
+        assert_eq!(
+            reports[0].fallback_disposition,
+            Some(ResponseEgressFallbackDisposition::Completed)
+        );
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::ConversionError);
+    }
+
+    #[test]
+    fn fallback_selection_is_one_shot_and_preserves_its_first_cause() {
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let mut fallback = attempt(&observer, started_at);
+
+        assert!(fallback.begin_fallback(ResponseEgressOutcome::ConversionError));
+        assert!(!fallback.begin_fallback(ResponseEgressOutcome::DeadlineExceeded));
+        assert!(fallback.begin_writing());
+        assert!(fallback.account_bytes(3, started_at));
+        assert!(fallback.finish_fallback(ResponseEgressFallbackDisposition::Aborted, started_at,));
+
+        let reports = observer.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].bytes_written, 3);
+        assert_eq!(
+            reports[0].fallback_disposition,
+            Some(ResponseEgressFallbackDisposition::Aborted)
+        );
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::ConversionError);
+    }
+
+    #[test]
+    fn fallback_drop_and_accounting_overflow_abort_with_original_cause() {
+        let drop_observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let mut dropped = attempt(&drop_observer, started_at);
+        assert!(!dropped.begin_fallback(ResponseEgressOutcome::SourceError));
+        assert!(dropped.begin_fallback(ResponseEgressOutcome::DeadlineExceeded));
+        drop(dropped);
+        let dropped_report = &drop_observer.reports()[0];
+        assert_eq!(
+            dropped_report.outcome,
+            ResponseEgressOutcome::DeadlineExceeded
+        );
+        assert_eq!(
+            dropped_report.fallback_disposition,
+            Some(ResponseEgressFallbackDisposition::Aborted)
+        );
+
+        let overflow_observer = RecordingObserver::default();
+        let mut overflow = attempt(&overflow_observer, started_at);
+        assert!(overflow.begin_fallback(ResponseEgressOutcome::ConversionError));
+        assert!(overflow.begin_writing());
+        assert!(overflow.account_bytes(u64::MAX, started_at));
+        assert!(!overflow.account_bytes(1, started_at));
+        let overflow_report = &overflow_observer.reports()[0];
+        assert_eq!(overflow_report.bytes_written, u64::MAX);
+        assert_eq!(
+            overflow_report.outcome,
+            ResponseEgressOutcome::ConversionError
+        );
+        assert_eq!(
+            overflow_report.fallback_disposition,
+            Some(ResponseEgressFallbackDisposition::Aborted)
+        );
+    }
+
+    #[test]
+    fn policy_panic_returns_live_attempt_for_one_fallback_lifecycle() {
+        let observer = RecordingObserver::default();
+        let request_start = MonotonicInstant::now();
+        let started_at = request_start
+            .checked_add(Duration::from_millis(1))
+            .expect("egress start");
+        let clock = MonotonicClock::new(move || started_at);
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::from("private token=secret"))
+            .expect("response");
+        let envelope = ResponseEgressEnvelope::new(
+            response,
+            request_start,
+            None,
+            Method::GET,
+            Arc::new(|_, _| panic!("private token=secret")),
+            ResponseEgressObserverHandle::new(observer.clone()),
+            clock,
+        );
+        assert_eq!(envelope.request_method(), &Method::GET);
+
+        let Err(failure) = envelope.begin() else {
+            panic!("policy panic must select fallback");
+        };
+        assert!(observer.reports().is_empty());
+        let (mut attempt, failure_clock, cause) = failure.into_parts();
+        assert_eq!(cause, ResponseEgressOutcome::ConversionError);
+        assert_eq!(failure_clock.now(), started_at);
+        assert!(attempt.begin_fallback(cause));
+        assert!(attempt.begin_writing());
+        assert!(attempt.finish_fallback(ResponseEgressFallbackDisposition::Completed, started_at,));
+
+        let reports = observer.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].body_kind, ResponseEgressBodyKind::Fallback);
+        assert_eq!(reports[0].bytes_written, 0);
+    }
+
+    #[test]
+    fn framing_failure_drops_source_unpolled_and_returns_one_live_attempt() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::task::Poll;
+
+        use futures_util::stream::poll_fn;
+
+        struct DropSignal(Rc<Cell<usize>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let observer = RecordingObserver::default();
+        let request_start = MonotonicInstant::now();
+        let clock = MonotonicClock::new(move || request_start);
+        let polls = Rc::new(Cell::new(0_usize));
+        let drops = Rc::new(Cell::new(0_usize));
+        let observed_polls = Rc::clone(&polls);
+        let drop_signal = DropSignal(Rc::clone(&drops));
+        let body = Body::from_stream(poll_fn(move |_| {
+            let _keep_signal_alive = &drop_signal;
+            observed_polls.set(observed_polls.get() + 1);
+            Poll::Ready(Some(Ok(bytes::Bytes::from_static(b"private"))))
+        }));
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .header("trailer", "x-checksum")
+            .body(body)
+            .expect("response");
+        let envelope = ResponseEgressEnvelope::new(
+            response,
+            request_start,
+            None,
+            Method::GET,
+            Arc::new(default_response_egress_policy),
+            ResponseEgressObserverHandle::new(observer.clone()),
+            clock,
+        );
+
+        let Err(failure) = envelope.begin() else {
+            panic!("framing failure must retain the attempt");
+        };
+        assert_eq!(polls.get(), 0);
+        assert_eq!(drops.get(), 1);
+        assert!(observer.reports().is_empty());
+        let (mut attempt, _, cause) = failure.into_parts();
+        assert_eq!(cause, ResponseEgressOutcome::ConversionError);
+        assert!(attempt.begin_fallback(cause));
+        assert!(
+            attempt.finish_fallback(ResponseEgressFallbackDisposition::Aborted, request_start,)
+        );
+        assert_eq!(observer.reports().len(), 1);
     }
 }

@@ -15,7 +15,7 @@ use anyhow::Context as _;
 #[cfg(feature = "test-utils")]
 use bytes::Bytes;
 
-use crate::SpinFullResponse;
+use crate::SpinResponse;
 use crate::config_store::SpinConfigStore;
 use crate::context::{SpinRequestContext, parse_client_addr};
 use crate::key_value_store::{DEFAULT_MAX_LIST_KEYS, SpinKvStore};
@@ -36,6 +36,7 @@ use edgezero_core::ingress::{
 };
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
+use edgezero_core::response_egress::ResponseEgressEnvelope;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
@@ -228,7 +229,7 @@ pub async fn dispatch_ingress_stream_for_test<Source, SourceError>(
     method: Method,
     uri: Uri,
     source: Source,
-) -> anyhow::Result<SpinFullResponse>
+) -> anyhow::Result<ResponseEgressEnvelope>
 where
     Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
@@ -239,13 +240,14 @@ where
         .uri(uri)
         .body(Body::empty())
         .map_err(EdgeError::internal)?;
-    dispatch_ingress_stream_with_timer(
+    dispatch_ingress_stream_with_timer_and(
         app,
         core_request,
         Stores::default(),
         request_start,
         move || source,
         |_| pending::<()>(),
+        Ok,
     )
     .await
 }
@@ -260,7 +262,7 @@ pub async fn dispatch_ingress_stream_with_timer_for_test<Source, SourceError, Ti
     uri: Uri,
     source: Source,
     make_timer: MakeTimer,
-) -> anyhow::Result<SpinFullResponse>
+) -> anyhow::Result<ResponseEgressEnvelope>
 where
     Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
@@ -273,13 +275,14 @@ where
         .uri(uri)
         .body(Body::empty())
         .map_err(EdgeError::internal)?;
-    dispatch_ingress_stream_with_timer(
+    dispatch_ingress_stream_with_timer_and(
         app,
         core_request,
         Stores::default(),
         request_start,
         move || source,
         make_timer,
+        Ok,
     )
     .await
 }
@@ -294,8 +297,8 @@ where
 pub async fn dispatch_request_for_test(
     app: &App,
     req: SpinRequest,
-) -> anyhow::Result<SpinFullResponse> {
-    dispatch_with_handles(app, req, Stores::default(), app.monotonic_now()).await
+) -> anyhow::Result<ResponseEgressEnvelope> {
+    dispatch_with_handles_and(app, req, Stores::default(), app.monotonic_now(), Ok).await
 }
 
 /// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
@@ -310,7 +313,7 @@ pub async fn dispatch_request_for_test(
 /// cannot be converted, the router dispatch fails, or response translation
 /// fails.
 #[inline]
-pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
+pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinResponse> {
     let request_start = app.monotonic_now();
     dispatch_with_kv_label_at(app, req, "default", request_start).await
 }
@@ -340,7 +343,7 @@ pub async fn dispatch_with_kv_label(
     app: &App,
     req: SpinRequest,
     kv_label: &str,
-) -> anyhow::Result<SpinFullResponse> {
+) -> anyhow::Result<SpinResponse> {
     let request_start = app.monotonic_now();
     dispatch_with_kv_label_at(app, req, kv_label, request_start).await
 }
@@ -350,7 +353,7 @@ async fn dispatch_with_kv_label_at(
     req: SpinRequest,
     kv_label: &str,
     request_start: MonotonicInstant,
-) -> anyhow::Result<SpinFullResponse> {
+) -> anyhow::Result<SpinResponse> {
     let stores = Stores {
         config_store: resolve_config_handle(kv_label).await?,
         kv: resolve_kv_handle(kv_label, false).await?,
@@ -365,45 +368,83 @@ pub(crate) async fn dispatch_with_handles(
     req: SpinRequest,
     stores: Stores,
     request_start: MonotonicInstant,
-) -> anyhow::Result<SpinFullResponse> {
+) -> anyhow::Result<SpinResponse> {
+    dispatch_with_handles_and(app, req, stores, request_start, from_egress_response).await
+}
+
+async fn dispatch_with_handles_and<Output, Deliver>(
+    app: &App,
+    req: SpinRequest,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    deliver: Deliver,
+) -> anyhow::Result<Output>
+where
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
     let (parts, native_body) = req.into_parts();
     let core_request = into_core_request_head_for_app(parts, app);
-    dispatch_ingress_stream(app, core_request, stores, request_start, move || {
-        native_body.stream()
-    })
+    dispatch_ingress_stream_and(
+        app,
+        core_request,
+        stores,
+        request_start,
+        move || native_body.stream(),
+        deliver,
+    )
     .await
 }
 
-async fn dispatch_ingress_stream<Source, SourceError, MakeSource>(
+async fn dispatch_ingress_stream_and<Source, SourceError, MakeSource, Output, Deliver>(
     app: &App,
     head_request: Request,
     stores: Stores,
     request_start: MonotonicInstant,
     make_source: MakeSource,
-) -> anyhow::Result<SpinFullResponse>
+    deliver: Deliver,
+) -> anyhow::Result<Output>
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
     MakeSource: FnOnce() -> Source,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
 {
-    dispatch_ingress_stream_with_timer(app, head_request, stores, request_start, make_source, sleep)
-        .await
+    dispatch_ingress_stream_with_timer_and(
+        app,
+        head_request,
+        stores,
+        request_start,
+        make_source,
+        sleep,
+        deliver,
+    )
+    .await
 }
 
-async fn dispatch_ingress_stream_with_timer<Source, SourceError, MakeSource, Timer, MakeTimer>(
+async fn dispatch_ingress_stream_with_timer_and<
+    Source,
+    SourceError,
+    MakeSource,
+    Timer,
+    MakeTimer,
+    Output,
+    Deliver,
+>(
     app: &App,
     mut head_request: Request,
     stores: Stores,
     request_start: MonotonicInstant,
     make_source: MakeSource,
     make_timer: MakeTimer,
-) -> anyhow::Result<SpinFullResponse>
+    deliver: Deliver,
+) -> anyhow::Result<Output>
 where
     Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
     SourceError: Into<anyhow::Error> + 'static,
     MakeSource: FnOnce() -> Source,
     Timer: Future<Output = ()> + 'static,
     MakeTimer: Fn(Duration) -> Timer + Clone + 'static,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
 {
     head_request
         .extensions_mut()
@@ -417,7 +458,7 @@ where
     let prepared = match app.begin_ingress(head_parts, request_start)? {
         IngressBeginOutcome::Admitted(prepared) => prepared,
         IngressBeginOutcome::Refused(response) => {
-            return Ok(from_egress_response(response).await?);
+            return Ok(deliver(response)?);
         }
         _ => return Err(anyhow::anyhow!("unsupported ingress admission outcome")),
     };
@@ -427,15 +468,19 @@ where
         prepared.monotonic_clock(),
         make_timer,
     );
-    dispatch_core_request(app, head_request, stores, prepared).await
+    dispatch_core_request(app, head_request, stores, prepared, deliver).await
 }
 
-async fn dispatch_core_request(
+async fn dispatch_core_request<Output, Deliver>(
     app: &App,
     mut core_request: Request,
     stores: Stores,
     prepared: PreparedIngress,
-) -> anyhow::Result<SpinFullResponse> {
+    deliver: Deliver,
+) -> anyhow::Result<Output>
+where
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
@@ -451,7 +496,7 @@ async fn dispatch_core_request(
         core_request.extensions_mut().insert(registry);
     }
     let response = app.dispatch_admitted(prepared, core_request).await?;
-    Ok(from_egress_response(response).await?)
+    Ok(deliver(response)?)
 }
 
 /// Dispatch with per-id store registries built from baked metadata.
@@ -472,7 +517,7 @@ pub(crate) async fn dispatch_with_registries(
     kv_meta: Option<StoreMetadata>,
     secret_meta: Option<StoreMetadata>,
     env: &EnvConfig,
-) -> anyhow::Result<SpinFullResponse> {
+) -> anyhow::Result<SpinResponse> {
     let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(kv_meta, env).await?;
     let config_registry = build_config_registry(config_meta, env).await?;

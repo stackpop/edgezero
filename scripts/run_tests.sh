@@ -68,7 +68,7 @@ section "Fastly Wasm Tests"
   run cargo test --features fastly --target wasm32-wasip1 -- --nocapture
 )
 
-# Spin 6.0 compiles to wasm32-wasip2; CI runs the full contract
+# Spin SDK 7 compiles to wasm32-wasip2; CI runs the full contract
 # test under wasmtime. Locally we just check it compiles — the
 # contract test needs wasmtime + the wasm runner pinned in CI.
 section "Spin Wasm Compile Check"

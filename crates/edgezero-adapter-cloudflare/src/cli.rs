@@ -139,22 +139,22 @@ impl Adapter for CloudflareCliAdapter {
         match capability {
             Capability::ConfigReadDeadlines
             | Capability::InboundReadDeadlines
-            | Capability::OutboundHeaderFidelity => CapabilitySupport::BestEffort,
-            Capability::IngressAdmission
-            | Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundHeaderFidelity
             | Capability::OutboundDeadlines
-            | Capability::OutboundFlexiblePhaseBudget
-            | Capability::OutboundHttp
-            | Capability::SendAllSlotIsolation
-            | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
-            Capability::ConfigReadAllocationBounds
-            | Capability::OutboundCompleteResourceAccounting
-            | Capability::RawIngressFramingValidation
-            | Capability::RawIngressHeadLimits
             | Capability::ResponseEgressAbort
             | Capability::ResponseEgressBackpressure
             | Capability::ResponseEgressCompletion
             | Capability::ResponseWriteDeadlines
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
+            Capability::IngressAdmission
+            | Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHttp
+            | Capability::SendAllSlotIsolation => CapabilitySupport::Native,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
             | _ => CapabilitySupport::Unsupported,
         }
     }
@@ -1255,19 +1255,19 @@ mod tests {
             ),
             (
                 Capability::ResponseEgressAbort,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseEgressBackpressure,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseEgressCompletion,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::ResponseWriteDeadlines,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::BestEffort,
             ),
             (Capability::OutboundHttp, CapabilitySupport::Native),
             (
@@ -1278,7 +1278,7 @@ mod tests {
                 Capability::OutboundHeaderFidelity,
                 CapabilitySupport::BestEffort,
             ),
-            (Capability::OutboundDeadlines, CapabilitySupport::Native),
+            (Capability::OutboundDeadlines, CapabilitySupport::BestEffort),
             (
                 Capability::OutboundFlexiblePhaseBudget,
                 CapabilitySupport::Native,
@@ -1286,7 +1286,7 @@ mod tests {
             (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
             (
                 Capability::StreamedUploadDeadlines,
-                CapabilitySupport::Native,
+                CapabilitySupport::BestEffort,
             ),
             (
                 Capability::LazyStreamedResponsePassthrough,
