@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Spin CLI floor check, shared with the other smoke tests.
+# shellcheck source=scripts/spin_version_guard.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/spin_version_guard.sh"
+
 # Smoke-test the secret-store demo handlers by starting an adapter, running
 # checks, and tearing it down automatically.
 #
@@ -116,10 +120,7 @@ start_server() {
       ;;
     spin)
       PORT=3000
-      command -v spin >/dev/null 2>&1 || {
-        echo "Spin CLI is required. Install from https://developer.fermyon.com/spin/v3/install" >&2
-        exit 1
-      }
+      spin_meets_floor || exit 1
       echo "==> Building Spin WASM (wasm32-wasip2)..."
       (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
       echo "==> Starting Spin on port $PORT..."

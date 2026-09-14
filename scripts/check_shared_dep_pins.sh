@@ -22,16 +22,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Extract validator's version from a file. Accepts both the table form
-# (`validator = { version = "X", .. }`) and the bare form
-# (`validator = "X"`) so reformatting a pin does not blind this gate, but
-# only where the assignment actually starts a line (optionally inside a
-# Rust string literal, which is how the scaffold seeds it) -- a commented
-# or prose mention must not shadow the real pin. Prints nothing when
-# there is no match; callers treat empty as "missing".
+# Extract validator's version from a file. Accepts the table form with
+# `version` in any key position (`validator = { features = [..], version
+# = "X" }`), the bare form (`validator = "X"`), and the escaped spelling
+# the scaffold seeds it as. Anchored to an assignment at line start so a
+# commented-out or prose mention cannot shadow the real pin, and kept
+# deliberately in step with `extract_version` in
+# crates/edgezero-cli/src/generator.rs -- the two parsers describe the
+# same grammar, and a difference between them shows up as this gate
+# reporting a missing pin for one that is merely reformatted.
+# Prints nothing when there is no match; callers treat empty as missing.
 pin_in() {
-  grep -hoE '^[[:space:]]*(")?validator = (\\?\{ version = )?\\?"[^"\\]+' "$1" 2>/dev/null |
-    grep -oE '[0-9][^"\\]*$' || true
+  grep -hoE '^[[:space:]]*(\\?")?validator[[:space:]]*=[^#]*' "$1" 2>/dev/null |
+    head -1 |
+    grep -oE '[0-9]+(\.[0-9]+)*' |
+    head -1 || true
 }
 
 WANT="$(pin_in Cargo.toml)"

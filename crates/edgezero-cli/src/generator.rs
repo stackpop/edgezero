@@ -900,6 +900,36 @@ mod tests {
                 "scaffold seeds {crate_name} {got_version}, workspace uses {want_version}"
             );
         }
+
+        // `spin-sdk` is spelled `~7.0` in the workspace and `7` in the seed,
+        // so only the major is comparable. It is worth comparing anyway: a
+        // major mismatch here is the one that survives every compile-time
+        // check and dies at `spin up` with a WIT linker error.
+        let want_spin = root_manifest
+            .lines()
+            .find(|line| line.starts_with("spin-sdk = "))
+            .and_then(extract_version)
+            .map(major_of)
+            .expect("root Cargo.toml must declare spin-sdk");
+        let got_spin = seeds
+            .get("spin-sdk")
+            .and_then(|line| extract_version(line))
+            .map(major_of)
+            .expect("scaffold must seed spin-sdk");
+        assert_eq!(
+            got_spin, want_spin,
+            "scaffold seeds spin-sdk major {got_spin}, workspace uses {want_spin}"
+        );
+    }
+
+    /// Leading major from a requirement string, ignoring any range
+    /// operator — `~7.0`, `^7.1`, `7` and `=7.0.1` all yield `7`.
+    fn major_of(version: &str) -> &str {
+        version
+            .trim_start_matches(['~', '^', '=', '>', '<', ' '])
+            .split('.')
+            .next()
+            .unwrap_or(version)
     }
 
     /// Pull the `version = "X"` (or bare `crate = "X"`) value out of a
@@ -933,26 +963,6 @@ mod tests {
                 "scaffold pins a different {tool} than the repo: scaffold={got:?} repo={want:?}"
             );
         }
-    }
-
-    #[test]
-    fn build_tool_versions_rust_pin_tracks_repo_tool_versions() {
-        // `build_tool_versions` hardcodes the versions it emits, and the
-        // scaffolded app is expected to build on the same toolchain this
-        // repo does. Without this check the two drift silently: the repo
-        // bumps `.tool-versions` and every newly generated app keeps
-        // pinning the superseded release.
-        let repo_tool_versions =
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.tool-versions"));
-        let want = repo_tool_versions
-            .lines()
-            .find(|line| line.starts_with("rust "))
-            .expect("repo .tool-versions must pin rust");
-        let got = build_tool_versions(&[]);
-        assert!(
-            got.contains(want),
-            "scaffold pins a different rust than the repo: scaffold={got:?} repo={want:?}"
-        );
     }
 
     #[test]
