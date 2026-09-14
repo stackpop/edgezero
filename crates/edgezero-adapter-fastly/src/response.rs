@@ -1,6 +1,9 @@
-#![expect(
-    clippy::arbitrary_source_item_ordering,
-    reason = "portable protocol traits precede the gated Fastly ABI lifecycle implementation"
+#![cfg_attr(
+    feature = "fastly",
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "portable protocol traits precede the gated Fastly ABI lifecycle implementation"
+    )
 )]
 
 #[cfg(feature = "fastly")]

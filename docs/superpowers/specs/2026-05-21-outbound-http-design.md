@@ -4962,9 +4962,9 @@ async fn send_all(
   cold — so the static value is `BestEffort`, and a `required outbound-deadlines` hard-fails
   on Fastly.* Apps
   needing an exact absolute deadline on the dispatch+headers phase — including the first
-  request to a new host — target Axum or Cloudflare. Spin also avoids Fastly's blocking
-  registration step, but its cooperative host teardown keeps `outbound-deadlines`
-  BestEffort (footnote 8).
+  request to a new host — target Axum. Cloudflare and Spin also avoid Fastly's blocking
+  registration step, but their cooperative host-teardown semantics keep
+  `outbound-deadlines` BestEffort (footnote 8).
 
   Net guarantee, with the explicit **sub-4 ms branch** broken out separately. **Both
   branches below hold on the WARM path only — an already-registered (cached) backend, no
@@ -5031,8 +5031,8 @@ async fn send_all(
    (preflight + dynamic-backend lookup/creation + SDK setup) exceeded \
    BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration")`;
   without it, no slot ever returns that error. Apps that need exact
-  absolute-deadline enforcement on the dispatch+headers phase target Axum or Cloudflare.
-  Spin also arms from `budget.deadline.remaining()` (§4.4 step 3), but does not claim a
+  absolute-deadline enforcement on the dispatch+headers phase target Axum. Cloudflare and
+  Spin also arm from `budget.deadline.remaining()` (§4.4 step 3), but neither claims a
   finite host-teardown bound. **Collision detection** is
   belt-and-suspenders.
 

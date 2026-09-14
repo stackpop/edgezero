@@ -173,15 +173,15 @@ mod tests {
 
     fn test_env_ctx() -> (Env, Context) {
         let env = Object::new().unchecked_into::<Env>();
-        let js_context = Object::new();
+        let context_object = Object::new();
         let wait_until = Function::new_with_args("_promise", "return undefined;");
         Reflect::set(
-            &js_context,
+            &context_object,
             &JsValue::from_str("waitUntil"),
             wait_until.as_ref(),
         )
         .expect("install test waitUntil");
-        let js_context = js_context.unchecked_into::<WorkerSysContext>();
+        let js_context = context_object.unchecked_into::<WorkerSysContext>();
         (env, Context::new(js_context))
     }
 
@@ -399,16 +399,29 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn standard_service_installs_the_application_outbound_clock() {
-        async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
+        async fn elapsed(ctx: RequestContext) -> Result<Response, EdgeError> {
             let client = ctx
                 .http_client()
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
-            let request = OutboundRequest::get("https://example.com/")?.stream_response();
+            let request =
+                OutboundRequest::get("https://example.com/")?.body(Body::from("invalid GET body"));
             let results = client.send_all(vec![request]).await;
             let result = results
                 .first()
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing outbound result")))?;
-            Ok(result.elapsed.as_millis().to_string())
+            if !matches!(&result.outcome, Err(EdgeError::BadRequest { .. })) {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "clock probe did not fail during batch preflight"
+                )));
+            }
+            response_builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(
+                    "x-edgezero-elapsed-ms",
+                    result.elapsed.as_millis().to_string(),
+                )
+                .body(Body::empty())
+                .map_err(EdgeError::internal)
         }
 
         let start = MonotonicInstant::now();
@@ -428,12 +441,19 @@ mod tests {
         let req = cf_request(CfMethod::Get, "/clock", None);
         let (env, ctx) = test_env_ctx();
 
-        let mut response = CloudflareService::new(&app)
+        let response = CloudflareService::new(&app)
             .dispatch(req, env, ctx)
             .await
             .expect("Cloudflare response");
 
-        assert_eq!(response.text().await.expect("response body"), "7");
+        assert_eq!(response.status_code(), StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(
+            response
+                .headers()
+                .get("x-edgezero-elapsed-ms")
+                .expect("elapsed header"),
+            Some("7".to_owned())
+        );
         assert!(observations.load(Ordering::SeqCst) >= 3);
     }
 
