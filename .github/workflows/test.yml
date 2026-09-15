@@ -255,5 +255,15 @@ jobs:
         if: matrix.adapter == 'fastly'
         run: ./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime
 
+      - name: Preserve Fastly lifecycle evidence
+        if: always() && matrix.adapter == 'fastly'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastly-lifecycle-evidence
+          path: tests/fixtures/reusable-app/.runs/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Check ${{ matrix.adapter }} wasm target
         run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}
