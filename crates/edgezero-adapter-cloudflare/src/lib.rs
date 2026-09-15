@@ -21,7 +21,7 @@ pub mod response;
 pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::app::{Hooks, StoresMetadata};
+use edgezero_core::app::{App, Hooks, StoresMetadata};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
@@ -137,7 +137,7 @@ pub async fn run_app<A: Hooks>(
 /// Returns conversion or dispatch errors from the existing adapter boundary.
 #[inline]
 pub async fn dispatch_app(
-    app: &edgezero_core::app::App,
+    app: &App,
     stores: StoresMetadata,
     req: Request,
     env: Env,

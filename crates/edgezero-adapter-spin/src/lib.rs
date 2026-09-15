@@ -29,7 +29,7 @@ use core::pin::Pin;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use bytes::Bytes;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoresMetadata};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -137,7 +137,7 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullRespo
 #[inline]
 pub async fn dispatch_app(
     app: &App,
-    stores: edgezero_core::app::StoresMetadata,
+    stores: StoresMetadata,
     req: SpinRequest,
 ) -> anyhow::Result<SpinFullResponse> {
     let env = EnvConfig::from_env();
