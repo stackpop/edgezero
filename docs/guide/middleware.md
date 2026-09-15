@@ -227,4 +227,4 @@ EdgeZero provides these middleware out of the box:
 ## Next Steps
 
 - Learn about [Streaming](/guide/streaming) for progressive responses
-- Explore [Proxying](/guide/proxying) for upstream forwarding
+- Explore [Outbound HTTP](/guide/proxying) for upstream requests

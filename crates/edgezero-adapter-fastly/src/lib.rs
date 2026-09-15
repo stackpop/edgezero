@@ -4,9 +4,13 @@
 // Only compiled where it is actually used (the CLI push/GC path and the Fastly
 // runtime resolver). Gating it keeps a `--no-default-features` build dead-code
 // clean instead of dragging in helpers no feature references.
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(
+    feature = "fastly",
+    test,
+    all(feature = "cli", not(target_arch = "wasm32"))
+))]
 pub(crate) mod chunked_config;
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 #[cfg(feature = "fastly")]
 pub mod config_store;
@@ -15,11 +19,11 @@ pub mod context;
 pub mod key_value_store;
 #[cfg(feature = "fastly")]
 pub mod logger;
-#[cfg(feature = "fastly")]
-pub mod proxy;
+#[cfg(any(test, feature = "test-utils", feature = "fastly"))]
+pub mod outbound;
 #[cfg(feature = "fastly")]
 pub mod request;
-#[cfg(feature = "fastly")]
+#[cfg(any(test, feature = "fastly"))]
 pub mod response;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
@@ -31,13 +35,15 @@ use edgezero_core::app::StoresMetadata;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
-use edgezero_core::http::Extensions;
+use edgezero_core::http::{Extensions, Response};
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use fastly::compute_runtime::service_id;
+#[cfg(feature = "fastly")]
+use std::sync::Once;
 
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
@@ -47,6 +53,9 @@ const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 /// staging twin and links it into the staged version under THIS name, which is
 /// how the runtime resolves staged selectors without knowing the twin exists.
 pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
+
+#[cfg(feature = "fastly")]
+static FASTLY_ABI_INIT: Once = Once::new();
 
 #[cfg(any(feature = "fastly", test))]
 #[derive(Debug, Clone)]
@@ -104,12 +113,17 @@ impl From<&EnvConfig> for FastlyLogging {
     }
 }
 
+#[cfg(feature = "fastly")]
+fn init_fastly_abi() {
+    FASTLY_ABI_INIT.call_once(fastly::init);
+}
+
 /// Prefix a canonical `EDGEZERO__*` key with its owning Fastly service.
 ///
 /// The shared `edgezero_runtime_env` Config Store is account-wide. Service
 /// scoping prevents two linked services that declare the same logical store id
 /// from overwriting one another's runtime mappings.
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 fn service_scoped_runtime_env_key(service_id: &str, canonical_key: &str) -> String {
     let suffix = canonical_key
         .strip_prefix(RUNTIME_ENV_PREFIX)
@@ -154,28 +168,31 @@ pub fn init_logger(
 /// Returns an error if logger setup fails or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    run_app_with_request_extensions::<A, _>(req, |_req, _extensions| {})
+pub fn run_app<A: Hooks>() -> Result<(), fastly::Error> {
+    run_app_with_hooks::<A, _, _, ()>(|_req, _extensions| {}, |_response| ()).map(|_state| ())
 }
 
-/// Like [`run_app`], but runs `extend` against a scratch
-/// [`Extensions`] populated from the raw
-/// `fastly::Request` (TLS JA4, H2 fingerprint, client IP, …) before the request
-/// is converted; the scratch values are merged into the core request's
-/// extensions and are visible to middleware and the `State`/extractor layer.
+/// Runs the manifest-wired app through Fastly's closed request/response lifecycle.
+///
+/// `prepare` borrows the raw request and extension bag before conversion. `finalize` borrows only
+/// routed responses before response-egress policy and framing. `EdgeZero` retains transmission
+/// ownership; routed hook state is returned only after terminal delivery, while detached ingress
+/// responses skip `finalize` and return `None`.
 ///
 /// # Errors
 /// Returns an error if logger setup fails or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app_with_request_extensions<A, F>(
-    req: fastly::Request,
-    extend: F,
-) -> Result<fastly::Response, fastly::Error>
+pub fn run_app_with_hooks<A, Prepare, Finalize, State>(
+    prepare: Prepare,
+    finalize: Finalize,
+) -> Result<Option<State>, fastly::Error>
 where
     A: Hooks,
-    F: FnOnce(&fastly::Request, &mut Extensions),
+    Prepare: FnOnce(&mut fastly::Request, &mut Extensions),
+    Finalize: FnOnce(&mut Response) -> State,
 {
+    init_fastly_abi();
     let stores = A::stores();
     let env = runtime_env_config(stores);
     let logging = FastlyLogging::from(&env);
@@ -184,7 +201,7 @@ where
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
     let app = A::build_app();
-    request::dispatch_with_registries(&app, req, stores, &env, extend)
+    request::send_with_registries_and_hooks(&app, stores, &env, prepare, finalize)
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
@@ -200,7 +217,7 @@ where
 /// read because they have no safe owner when this Config Store is linked to more
 /// than one service. The returned [`EnvConfig`] contains canonical unscoped keys.
 ///
-/// [`run_app`] and [`run_app_with_request_extensions`] call this themselves.
+/// [`run_app`] and [`run_app_with_hooks`] call this themselves.
 /// [`run_app_with_config`] does NOT, and neither does a hand-built
 /// [`FastlyService`](request::FastlyService). A custom entry point on either path
 /// must call this explicitly.
@@ -239,7 +256,10 @@ pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
     EnvConfig::from_vars(vars)
 }
 
-#[cfg(any(feature = "fastly", test))]
+#[cfg(any(
+    feature = "fastly",
+    all(feature = "cli", test, not(target_arch = "wasm32"))
+))]
 fn runtime_env_vars_for_service<F>(
     stores: StoresMetadata,
     service_id: &str,
@@ -293,7 +313,7 @@ fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
 /// [`EnvConfig`] overlay: the store name comes directly from
 /// `config_store_name`, and its default key is always `"default"`, so staged or
 /// overridden `__NAME` / `__KEY` selectors are ignored. Use
-/// [`runtime_env_config`] with [`request::dispatch_with_registries`] for the
+/// [`runtime_env_config`] with [`request::send_with_registries_and_hooks`] for the
 /// same selector resolution as [`run_app`]. KV is not auto-injected on this
 /// path; chain `.with_kv(name)` on a [`request::FastlyService`] builder if you
 /// need KV alongside the config store.
@@ -304,9 +324,9 @@ fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
 #[inline]
 pub fn run_app_with_config<A: Hooks>(
     logging: &FastlyLogging,
-    req: fastly::Request,
     config_store_name: Option<&str>,
-) -> Result<fastly::Response, fastly::Error> {
+) -> Result<(), fastly::Error> {
+    init_fastly_abi();
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
@@ -316,7 +336,7 @@ pub fn run_app_with_config<A: Hooks>(
     if let Some(name) = config_store_name {
         service = service.with_config(name);
     }
-    service.dispatch(req)
+    service.send()
 }
 
 #[cfg(test)]

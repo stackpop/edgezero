@@ -1,7 +1,5 @@
 [build]
-target = "wasm32-wasip1"
+target = "wasm32-unknown-unknown"
 
-[target.'cfg(target_arch = "wasm32")']
-# Use Viceroy to run wasm built from binaries in this crate or dependents.
-# Points to the demo service config by default.
-runner = "wasmtime run --dir=. -- "
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

@@ -19,13 +19,13 @@
 //!
 //! 1. **Vendored schema constants** — `SPIN_KV_CREATE_TABLE` and
 //!    `SPIN_KV_SET` are copied byte-for-byte from
-//!    [spinframework/spin's `crates/key-value-spin/src/store.rs`](https://github.com/spinframework/spin/blob/main/crates/key-value-spin/src/store.rs).
+//!    [Spin 4.1.0's `crates/key-value-spin/src/store.rs`](https://github.com/spinframework/spin/blob/v4.1.0/crates/key-value-spin/src/store.rs).
 //!    A unit test (`vendored_schema_matches_upstream_byte_for_byte`)
 //!    pins both strings; a PRAGMA-shape test pins the resulting table
 //!    columns. Drift in OUR copy fails CI.
-//! 2. **Build-time SDK pin** — `Cargo.toml` pins `spin-sdk = "~6.0"`,
-//!    so a Spin minor bump that touches the schema fails the build
-//!    until the operator opts in and re-verifies.
+//! 2. **Build-time SDK pin** — `Cargo.toml` pins `spin-sdk = "=7.0.0"`,
+//!    so an SDK bump requires an explicit dependency update and
+//!    schema re-verification.
 //! 3. **Run-time CLI check** — [`verify_spin_runtime_compat`] shells
 //!    `spin --version` before the first write of a session and
 //!    `log::warn!`s if the major version is outside our verified
@@ -34,7 +34,7 @@
 //!    is told if their runtime is unknown.
 //!
 //! What the layered guards CANNOT catch: a Spin point-release that
-//! changes the schema WITHOUT bumping past `~6.0` AND with a
+//! changes the schema WITHOUT changing the SDK pin AND with a
 //! same-major CLI version. Operators must verify with `spin up`
 //! after the first push against a new Spin runtime; the warning
 //! above is a heads-up, not a guarantee.
@@ -49,20 +49,14 @@ use rusqlite::{Connection, params};
 /// Major version range of `spin` CLI / runtime we've verified the
 /// `spin_key_value` schema against. Spin's `crates/key-value-spin`
 /// has used this schema since at least Spin 2.x; we last verified
-/// against Spin 3.x (CLI 3.6.3, factor-key-value 3.x on
-/// spinframework/spin main, 2026-06-04).
-///
-/// When Spin 4.0 (or whichever major-version-bump touches the
-/// schema) lands, expect the verification to be repeated and this
-/// constant updated. Until then, an operator running a Spin CLI
-/// outside this range gets a `log::warn!` on first SQLite-direct
-/// push.
-const VERIFIED_SPIN_MAJOR_RANGE: &[u32] = &[2, 3];
+/// against Spin 4.1.0 on 2026-09-13. An operator running a Spin CLI
+/// outside this range gets a `log::warn!` on first SQLite-direct push.
+const VERIFIED_SPIN_MAJOR_RANGE: &[u32] = &[2, 3, 4];
 
 /// EXACT `CREATE TABLE IF NOT EXISTS spin_key_value (…)` statement
 /// Spin's `crates/key-value-spin/src/store.rs::KeyValueSqlite::create_connection`
 /// runs. Source-of-truth: pulled from the file linked at the module
-/// header on 2026-06-04 against an OPEN version of Spin's main branch.
+/// header on 2026-09-13 against Spin 4.1.0.
 /// **Do not reformat:** the contract test below compares this string
 /// byte-for-byte against the upstream statement (whitespace included).
 pub(crate) const SPIN_KV_CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS spin_key_value (
@@ -85,7 +79,7 @@ pub(crate) const SPIN_KV_SET: &str =
 /// hard-codes `.spin/sqlite_key_value.db` for its `type = "spin"`
 /// backend when no `path` is set in `runtime-config.toml`. Vendored
 /// from `crates/factor-key-value/src/runtime_config/spin.rs::path` in
-/// spinframework/spin (June 2026).
+/// spinframework/spin 4.1.0 (September 2026).
 pub(crate) const DEFAULT_SQLITE_RELATIVE_PATH: &str = ".spin/sqlite_key_value.db";
 
 /// Resolve the `SQLite` path for a `[key_value_store.<label>] type =
@@ -169,7 +163,7 @@ fn verify_spin_runtime_compat() {
     } else {
         log::warn!(
             "Spin CLI major version {major} is outside EdgeZero's verified range {VERIFIED_SPIN_MAJOR_RANGE:?}. \
-             The local SQLite KV writer uses Spin's internal `spin_key_value` schema vendored from spinframework/spin 3.x; \
+             The local SQLite KV writer uses Spin's internal `spin_key_value` schema verified through spinframework/spin 4.1.0; \
              if Spin {major}.x changed the schema, your push will write a file the runtime can't read. \
              Verify with `spin up` after the push, and consider opening an issue if you see incompatibility."
         );
@@ -428,7 +422,7 @@ mod tests {
     /// **Source of truth**: spinframework/spin, file
     /// `crates/key-value-spin/src/store.rs`, function
     /// `KeyValueSqlite::create_connection` and `SqliteStore::set`.
-    /// Pulled on 2026-06-04. If this test ever fails, re-pull the
+    /// Verified against Spin 4.1.0 on 2026-09-13. If this test ever fails, re-pull the
     /// statements from upstream and update both the constants AND
     /// this test's expected-bytes literal. Do NOT silently fix one
     /// without verifying the other matches upstream — that's the
@@ -505,6 +499,12 @@ mod tests {
     }
 
     // ---------- Spin runtime-compat parsing ----------
+
+    #[test]
+    fn verified_runtime_range_includes_spin_four_only_through_current_major() {
+        assert!(VERIFIED_SPIN_MAJOR_RANGE.contains(&4));
+        assert!(!VERIFIED_SPIN_MAJOR_RANGE.contains(&5));
+    }
 
     #[test]
     fn parse_spin_major_version_handles_cli_default_format() {

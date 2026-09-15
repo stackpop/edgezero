@@ -1,6 +1,8 @@
 # Streaming
 
-EdgeZero supports streaming responses for large payloads, real-time data, and server-sent events.
+EdgeZero preserves lazy streaming response bodies on every adapter. Each adapter owns body
+delivery through its strongest platform boundary; no standard entrypoint collects the complete
+downstream response before handoff.
 
 ## Streaming Responses
 
@@ -33,12 +35,16 @@ async fn stream_data() -> Response {
 
 ## How Streaming Works
 
-The router keeps streams intact through the adapter layer:
+The router keeps `Body::Stream` intact until the adapter response coordinator:
 
 1. Your handler returns `Body::stream(...)` with a `Stream` of chunks
-2. The adapter writes chunks sequentially to the provider's output API
-3. Fastly uses `stream_to_client`, Cloudflare uses `ReadableStream`
-4. The client receives data as it becomes available
+2. Core validates response framing and wraps declared-length enforcement around the source
+3. The adapter polls one chunk at a time under its host's demand or write readiness
+4. Accepted bytes, deadline/abort events, and one terminal outcome are recorded by that adapter
+
+Axum uses a connection-local Hyper body, Cloudflare a JavaScript stream writer, Fastly
+`stream_to_client`, and Spin a WASI body writer. See [Capabilities](/guide/capabilities) for the
+exact acceptance and completion boundary on each target.
 
 ## Server-Sent Events
 
@@ -68,6 +74,12 @@ async fn events() -> Response {
 }
 ```
 
+::: warning Completion semantics
+All adapters preserve progressive production, but their response-egress capability cells remain
+BestEffort because host acceptance or close does not prove end-client receipt. Fastly source polls
+and hostcalls are synchronous and cannot be preempted.
+:::
+
 ## Body Modes
 
 Routes can specify their body handling mode in the manifest. This is parsed today and reserved
@@ -86,34 +98,43 @@ body-mode = "buffered"  # or "stream"
 | `buffered` | Body is fully read into memory before handler runs    |
 | `stream`   | Body is passed as a stream for progressive processing |
 
-## Transparent Decompression
+## Outbound Response Decompression
 
-EdgeZero automatically decompresses gzip and brotli responses from upstream services:
+The outbound client decodes a single bare `gzip` or `br` content coding through shared
+`edgezero-core` decoders. Unknown, parameterized, or stacked codings pass through unchanged.
+Encoded transport bytes, decoded output, and final buffered bytes have independent limits; see
+[Capabilities](/guide/capabilities#limits-and-accounting).
 
 ```rust
-// Proxied response with Content-Encoding: gzip is automatically decoded
-let response = proxy.forward(request).await?;
-// response.body is now decompressed
+let request = OutboundRequest::get("https://api.example.com/data")?
+    .max_encoded_response_bytes(2 * 1024 * 1024)
+    .max_decoded_response_bytes(8 * 1024 * 1024)
+    .stream_response();
+let body = client.send(request).await?.into_body();
 ```
 
-This happens transparently in the adapter layer using shared decoders from `edgezero-core`.
+Multi-member gzip streams are decoded through every member and drained to transport EOF.
+For Brotli, the stream window is checked before decoder allocation and decoder state is charged
+against the configured policy limit.
 
 ## Memory Considerations
 
-Streaming is essential for:
+Lazy streaming is useful for:
 
 - Large file downloads
 - Video/audio content
 - Real-time data feeds
 - Responses larger than available memory
 
-::: warning Platform Limits
-Edge platforms have memory constraints. A Fastly Compute instance has ~128MB by default. Always stream large responses rather than buffering.
+::: warning Platform limits
+Edge platforms have finite memory. Lazy response delivery removes whole-body collection but does
+not bound provider queues, SDK allocations, source chunk size, or transport buffers. Bound source
+chunks and application work, and use the capability matrix when certifying a deployment.
 :::
 
 ## Chunked Transfer
 
-When the response size is unknown, EdgeZero uses chunked transfer encoding:
+Applications may omit `Content-Length` when the response size is unknown:
 
 ```rust
 #[action]
@@ -129,7 +150,11 @@ async fn dynamic_content() -> Response {
 }
 ```
 
+The provider owns the final wire framing. EdgeZero does not guarantee a particular HTTP/1 transfer
+coding; it normalizes framing and enforces the application's declared payload length before the
+adapter writes body bytes.
+
 ## Next Steps
 
-- Learn about [Proxying](/guide/proxying) for forwarding requests upstream
+- Learn about [Outbound HTTP](/guide/proxying) for upstream requests
 - Explore adapter-specific streaming in [Fastly](/guide/adapters/fastly) and [Cloudflare](/guide/adapters/cloudflare) guides

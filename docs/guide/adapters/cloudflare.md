@@ -95,17 +95,28 @@ wrangler deploy --cwd crates/my-app-adapter-cloudflare
 
 ## Fetch API
 
-Cloudflare Workers use the global `fetch` API for outbound requests:
+`CloudflareOutboundClient` uses the Workers global `fetch` API and is injected into core request
+extensions. Workers needs no backend registration, but application manifests still declare
+outbound hosts so the same portable contract validates on every target.
 
-```rust
-use edgezero_adapter_cloudflare::CloudflareProxyClient;
-use edgezero_core::proxy::ProxyService;
+The adapter requests raw encoded upstream bytes with manual fetch encoding, disables automatic
+redirect following, and owns an abort signal for the absolute request deadline. When an encoded
+body is passed through to the downstream response, the response converter separately selects
+manual response-body encoding so Workers does not encode it again. These are two distinct
+controls. The abort path is implemented, but outbound and streamed-upload deadlines remain
+BestEffort until a deployed host-observed cancellation fixture proves a finite bound. Cloudflare
+drives batch slots in completion order, maps cache bypass to `NoStore`, and applies a validated
+wire-authority override. The platform has not yet proved finite abort teardown or that its final
+wire request preserves authority independently from the connection target, so cancellation and
+authority override remain BestEffort. Cloudflare and Axum have Native lazy streamed response passthrough;
+raw header octets and original non-`set-cookie` field boundaries remain unavailable, so header
+fidelity is BestEffort. See [Capabilities](/guide/capabilities).
 
-let client = CloudflareProxyClient;
-let response = ProxyService::new(client).forward(request).await?;
-```
-
-Unlike Fastly, there's no backend configuration needed - Workers can fetch any URL directly.
+Downstream response delivery uses one JavaScript stream writer owned by a coordinator registered
+with `Context::wait_until`. It awaits writer backpressure and races the request abort signal and
+absolute write deadline. Writer acceptance and close are host-handoff observations; deployed
+disconnect and network-completion timing remain unproved, so response-egress capabilities are
+BestEffort.
 
 ## Logging
 

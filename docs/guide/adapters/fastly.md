@@ -43,11 +43,13 @@ The Fastly entrypoint wires the adapter:
 ```rust
 use my_app_core::App;
 
-#[fastly::main]
-fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    edgezero_adapter_fastly::run_app::<App>(req)
+pub fn main() -> Result<(), fastly::Error> {
+    edgezero_adapter_fastly::run_app::<App>()
 }
 ```
+
+Do not add Fastly's response-returning entrypoint attribute. EdgeZero initializes the ABI,
+receives the client request, and owns `stream_to_client` through final body-handle close.
 
 `run_app` reads logging and store config at runtime from `EDGEZERO__*`
 environment variables (see
@@ -56,41 +58,48 @@ per-id `KV` / `Config` / `Secret` registries from the portable store
 metadata baked into `App` by the `app!` macro. No `edgezero.toml` is
 loaded by the runtime.
 
-The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
-`dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
-`ConfigStoreHandle`.
+For fully manual wiring, build `FastlyService`, attach stores as needed, and call its send-owning
+`send()` method. Prefer `run_app` for manifest-driven store resolution.
 
 ### Capturing raw-request signals (JA4, H2 fingerprint)
 
-`run_app` converts the `fastly::Request` into a neutral core request before
-dispatch. The client IP is carried across automatically — read it via
+`run_app` receives and converts the `fastly::Request` into a neutral core request before
+dispatch. The client IP is carried across automatically; read it via
 `FastlyRequestContext` (see [Context Access](#context-access) below). Other
 Fastly-only signals that are readable only on the raw request
 (`get_tls_ja4()`, `get_client_h2_fingerprint()`) aren't reachable from handlers
-by default. Use `run_app_with_request_extensions`, which
-runs an app closure against a scratch `Extensions` **before** conversion and
-merges the values into the core request — so a `State`/extractor or middleware
-can read them:
+by default. Use `run_app_with_hooks`, which runs a request closure against a
+scratch `Extensions` **before** conversion and merges the values into the core
+request. Its response closure runs only for routed responses before egress
+policy and framing; EdgeZero retains delivery ownership:
 
 ```rust
 #[derive(Clone)]
 struct Ja4(String);
 
-#[fastly::main]
-fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    edgezero_adapter_fastly::run_app_with_request_extensions::<App, _>(req, |raw, ext| {
-        if let Some(ja4) = raw.get_tls_ja4() {
-            ext.insert(Ja4(ja4.to_owned()));
-        }
-    })
+pub fn main() -> Result<(), fastly::Error> {
+    edgezero_adapter_fastly::run_app_with_hooks::<App, _, _, ()>(
+        |raw, ext| {
+            if let Some(ja4) = raw.get_tls_ja4() {
+                ext.insert(Ja4(ja4.to_owned()));
+            }
+        },
+        |_response| (),
+    )
+    .map(|_post_send_state| ())
 }
 ```
 
-`run_app` is exactly `run_app_with_request_extensions::<App, _>(req, |_, _| {})`.
-The closure runs once per request; insert whatever typed values your handlers
-need, then read them in a handler via a custom extractor or
-`ctx.request().extensions().get::<Ja4>()`.
+The request closure runs once per routed request; insert whatever typed values
+your handlers need, then read them in a handler via a custom extractor or
+`ctx.request().extensions().get::<Ja4>()`. The optional state returned by
+`run_app_with_hooks` is available only after EdgeZero reaches its strongest
+terminal delivery boundary. Detached admission responses skip the response
+closure and return `None`.
+
+For fully manual wiring, `FastlyService::send_request_with_hooks` provides the
+same closed lifecycle for an already-received request. It does not expose a
+response-returning dispatch operation.
 
 ### Owning your own logging
 
@@ -147,16 +156,17 @@ fastly compute deploy
 
 ## Backends
 
-EdgeZero's Fastly proxy client uses **dynamic backends** derived from the target URI (host + scheme).
-You do not need to predeclare backends in `fastly.toml` for EdgeZero proxying.
+`FastlyOutboundClient` uses deterministic **dynamic backends** derived from the canonical target,
+TLS identity, and provider timer budget. You do not predeclare those destinations in
+`fastly.toml`, but dynamic backends must be enabled on the deployed Fastly service. The local CLI
+cannot prove that service entitlement, so `outbound-http` is BestEffort. A disabled service
+returns a typed 502 with an enablement diagnostic.
 
-```rust
-use edgezero_adapter_fastly::FastlyProxyClient;
-use edgezero_core::proxy::ProxyService;
-
-let client = FastlyProxyClient;
-let response = ProxyService::new(client).forward(request).await?;
-```
+Fastly also has documented deadline, upload, elastic-budget, batch-isolation, and lazy downstream
+streaming limitations. EdgeZero owns the low-level `stream_to_client` lifetime and writes portable
+response chunks without whole-body collection. Synchronous source polls and hostcalls cannot be
+preempted, so downstream streaming and response-egress guarantees remain BestEffort. See
+[Capabilities](/guide/capabilities) before marking a capability required.
 
 ## Logging
 
@@ -264,9 +274,16 @@ async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
 
 ## Streaming
 
-Fastly supports native streaming via `stream_to_client`. The adapter automatically converts `Body::stream` to Fastly's streaming APIs.
+Fastly provides `stream_to_client`, but that API is incompatible with the standard
+response-returning SDK entrypoint. Generated applications use EdgeZero's undecorated, send-owning
+entrypoint instead. EdgeZero commits the response head through the raw Fastly ABI, writes each
+portable body chunk to the streaming body handle with short-write accounting, and closes or
+abandons that handle exactly once. A blocked synchronous source poll or hostcall cannot be
+preempted, and a failed consuming `finish` call leaves no handle to abandon; those limits keep the
+response-egress capabilities at BestEffort.
 
-See the [Streaming guide](/guide/streaming) for examples and patterns.
+See the [Streaming guide](/guide/streaming) and
+[capability matrix](/guide/capabilities#outbound-matrix) for the exact boundary.
 
 ## Testing
 

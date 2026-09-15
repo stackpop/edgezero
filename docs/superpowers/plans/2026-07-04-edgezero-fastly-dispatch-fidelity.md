@@ -1,18 +1,21 @@
 # EdgeZero P0-C — Fastly `run_app` Dispatch Fidelity Implementation Plan
 
+> **Status:** Implemented and superseded. The 2026-09-15 consumer-alignment plan replaces the
+> request-only Fastly hook below with the closed request/response lifecycle API.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Bring Fastly's `run_app` to parity with hand-written custom dispatch: preserve multi-value response headers (`Set-Cookie`), let an app opt out of the adapter's logger init, and add a pre-dispatch hook that reads raw-`fastly::Request` signals (JA4 / H2 / client IP) into the core request's extensions.
 
 **Architecture:** Three independent Fastly-adapter changes plus one cross-adapter `Hooks` method. C1 swaps `set_header`→`append_header` on the (fresh) response and fixes the proxy-response conversion to append per value. C2 adds a platform-neutral `Hooks::owns_logging()` that every adapter's entrypoint gates its logger init on, with an `app!(owns_logging = …)` macro argument. C3 adds `run_app_with_request_extensions` that runs an app closure against a scratch `Extensions` **before** request conversion, then `extend`s it into the core request.
 
-**Tech Stack:** Rust 1.95, edition 2021. `edgezero-adapter-fastly` (behind the `fastly` feature), `edgezero-core` (`Hooks` trait, `http::Extensions`), `edgezero-macros` (`app!`). `http` crate `HeaderMap`/`Extensions` via `edgezero_core::http`.
+**Tech Stack:** Rust 1.95, edition 2024. `edgezero-adapter-fastly` (behind the `fastly` feature), `edgezero-core` (`Hooks` trait, `http::Extensions`), `edgezero-macros` (`app!`). `http` crate `HeaderMap`/`Extensions` via `edgezero_core::http`.
 
 **Source spec:** `docs/superpowers/specs/2026-07-03-edgezero-fastly-dispatch-and-appstate-design.md` (P0-C), verified against `65afbd3`.
 
 ## Global Constraints
 
-- **Rust 1.95.0**, edition 2021.
+- **Rust 1.95.0**, edition 2024.
 - **Strict clippy gate** — `[workspace.lints.clippy] restriction = { level = "deny" }`. Every restriction lint is an ERROR. The ones that bite here:
   - `missing_trait_methods` — an `impl Trait` may not inherit a defaulted method. Adding `Hooks::owns_logging()` forces the **macro-emitted** `impl Hooks` to emit it explicitly (the two in-file `Hooks` test stubs already carry `#[expect(clippy::missing_trait_methods)]`, so they need no change).
   - `arbitrary_source_item_ordering` — module items / struct fields / enum variants must be alphabetical; place new test fns and struct fields in the correct position, don't append.
@@ -27,7 +30,7 @@
     ```
     (cd crates/edgezero-adapter-fastly && cargo test --features fastly --lib <filter>)
     ```
-    This builds to `wasm32-wasip1` and runs the test binary under Viceroy (0.17.0, pinned in `.tool-versions`), which provides the hostcalls — so `FastlyResponse::from_status`/`append_header`/`get_header_all`, `FastlyRequest::new`/`get_url_str`, and even `get_client_ip_addr` all work at runtime. **Every `cargo test -p edgezero-adapter-fastly --features fastly …` command in the tasks below MUST be run in this `(cd crates/edgezero-adapter-fastly && cargo test --features fastly …)` form** — the commands are written the short way for brevity.
+    This builds to `wasm32-wasip1` and runs the test binary under Viceroy (0.21.0, pinned in `.tool-versions`), which provides the hostcalls — so `FastlyResponse::from_status`/`append_header`/`get_header_all`, `FastlyRequest::new`/`get_url_str`, and even `get_client_ip_addr` all work at runtime. **Every `cargo test -p edgezero-adapter-fastly --features fastly …` command in the tasks below MUST be run in this `(cd crates/edgezero-adapter-fastly && cargo test --features fastly …)` form** — the commands are written the short way for brevity.
   - `crates/edgezero-adapter-fastly/tests/contract.rs` is `#![cfg(all(feature = "fastly", target_arch = "wasm32"))]` (the same wasm/Viceroy path). CI runs it via `cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract`.
   - `cargo clippy`/`cargo check --features fastly` type-check on the **host** (no link), so clippy runs from the workspace root as usual.
 - **CI gates (all must pass):**

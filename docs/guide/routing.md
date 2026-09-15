@@ -15,10 +15,15 @@ handler = "my_app_core::handlers::hello"
 
 [[triggers.http]]
 id = "echo"
+class = "interactive"
 path = "/echo/{name}"
 methods = ["GET", "POST"]
 handler = "my_app_core::handlers::echo"
 ```
+
+An optional `class` is opaque application metadata for ingress admission. It is available through
+`RouteMetadata::class()` for matched and method-not-allowed resolutions and does not change the
+route's stable identity.
 
 You can also build routes programmatically using convenience methods:
 
@@ -40,7 +45,7 @@ use edgezero_core::http::Method;
 
 let router = RouterService::builder()
     .route("/hello", Method::GET, hello_handler)
-    .route("/echo/{name}", Method::GET, echo_handler)
+    .route_with_class("/echo/{name}", Method::GET, "interactive", echo_handler)
     .route("/echo", Method::POST, echo_json_handler)
     .build();
 ```

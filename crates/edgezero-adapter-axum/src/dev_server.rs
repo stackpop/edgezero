@@ -1,4 +1,5 @@
 use std::fs;
+use std::future;
 #[cfg(test)]
 use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
@@ -7,14 +8,14 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use axum::Router;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
-use tower::{Service as _, service_fn};
+use tokio::sync::oneshot::{Receiver as ShutdownReceiver, Sender as ShutdownSender, channel};
+use tokio::task::{LocalSet, spawn_blocking, spawn_local};
 
 use edgezero_core::addr;
-use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
@@ -28,9 +29,11 @@ use simple_logger::SimpleLogger;
 use std::collections::BTreeMap;
 
 use crate::config_store::AxumConfigStore;
+use crate::connection::serve_http1;
 use crate::key_value_store::PersistentKvStore;
+use crate::response::EgressConnection;
 use crate::secret_store::EnvSecretStore;
-use crate::service::EdgeZeroAxumService;
+use crate::service::AxumServiceState;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KvInitRequirement {
@@ -116,7 +119,7 @@ impl AxumDevServer {
         let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
 
-        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(App::new(router), listener, config.enable_ctrl_c, stores).await
     }
 
     #[cfg(test)]
@@ -126,7 +129,7 @@ impl AxumDevServer {
             config,
             stores,
         } = self;
-        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(App::new(router), listener, config.enable_ctrl_c, stores).await
     }
 
     #[must_use]
@@ -272,52 +275,111 @@ fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<KvHandle> {
 }
 
 async fn serve_with_stores(
-    router: RouterService,
+    app: App,
     listener: TokioTcpListener,
     enable_ctrl_c: bool,
     stores: Stores,
 ) -> anyhow::Result<()> {
-    let service = {
-        let mut service = EdgeZeroAxumService::new(router);
-        if let Some(registry) = stores.config_registry {
-            service = service.with_config_registry(registry);
-        }
-        if let Some(handle) = stores.config_store {
-            service = service.with_config_store_handle(handle);
-        }
-        if let Some(registry) = stores.kv_registry {
-            service = service.with_kv_registry(registry);
-        }
-        if let Some(handle) = stores.kv {
-            service = service.with_kv_handle(handle);
-        }
-        if let Some(registry) = stores.secret_registry {
-            service = service.with_secret_registry(registry);
-        }
-        if let Some(handle) = stores.secrets {
-            service = service.with_secret_handle(handle);
-        }
-        service
-    };
-    let axum_router = Router::new().fallback_service(service_fn(move |req| {
-        let mut svc = service.clone();
-        async move { svc.call(req).await }
-    }));
-    let make_service = axum_router.into_make_service_with_connect_info::<SocketAddr>();
+    struct ShutdownOnDrop(Option<ShutdownSender<()>>);
 
-    let shutdown = enable_ctrl_c.then_some(async {
-        let _ctrl_c = signal::ctrl_c().await;
-    });
-
-    let server = axum::serve(listener, make_service);
-    if let Some(shutdown_signal) = shutdown {
-        let graceful_server = server.with_graceful_shutdown(shutdown_signal);
-        graceful_server.await.context("axum server error")?;
-    } else {
-        server.await.context("axum server error")?;
+    impl Drop for ShutdownOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _sent = sender.send(());
+            }
+        }
     }
 
-    Ok(())
+    let native_listener = listener
+        .into_std()
+        .context("failed to release tokio listener")?;
+    let (shutdown_sender, shutdown_receiver) = channel();
+    let shutdown_guard = ShutdownOnDrop(Some(shutdown_sender));
+    let worker = spawn_blocking(move || {
+        serve_local(
+            app,
+            native_listener,
+            enable_ctrl_c,
+            stores,
+            shutdown_receiver,
+        )
+    });
+    let result = worker.await.context("axum server thread failed")?;
+    drop(shutdown_guard);
+    result
+}
+
+fn serve_local(
+    app: App,
+    std_listener: StdTcpListener,
+    enable_ctrl_c: bool,
+    stores: Stores,
+    shutdown_receiver: ShutdownReceiver<()>,
+) -> anyhow::Result<()> {
+    let mut service = AxumServiceState::from_app(app);
+    if let Some(registry) = stores.config_registry {
+        service = service.with_config_registry(registry);
+    }
+    if let Some(handle) = stores.config_store {
+        service = service.with_config_store_handle(handle);
+    }
+    if let Some(registry) = stores.kv_registry {
+        service = service.with_kv_registry(registry);
+    }
+    if let Some(handle) = stores.kv {
+        service = service.with_kv_handle(handle);
+    }
+    if let Some(registry) = stores.secret_registry {
+        service = service.with_secret_registry(registry);
+    }
+    if let Some(handle) = stores.secrets {
+        service = service.with_secret_handle(handle);
+    }
+
+    let runtime = RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build axum connection runtime")?;
+    let local = LocalSet::new();
+    #[expect(
+        clippy::integer_division_remainder_used,
+        reason = "tokio::select! expands to internal randomized branch selection arithmetic"
+    )]
+    let serve = async move {
+        let listener = TokioTcpListener::from_std(std_listener)
+            .context("failed to adopt listener on axum connection runtime")?;
+        let shutdown = async move {
+            let _closed = shutdown_receiver.await;
+        };
+        let ctrl_c = async move {
+            if enable_ctrl_c {
+                let _signal = signal::ctrl_c().await;
+            } else {
+                future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(shutdown);
+        tokio::pin!(ctrl_c);
+
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, remote_addr) = accepted.context("axum listener accept failed")?;
+                    let responses = EgressConnection::default();
+                    let connection_service = service.for_connection(remote_addr, responses.clone());
+                    spawn_local(async move {
+                        if let Err(error) = serve_http1(stream, connection_service, responses).await {
+                            log::debug!("axum HTTP/1 connection ended: {error}");
+                        }
+                    });
+                }
+                () = &mut shutdown => break,
+                () = &mut ctrl_c => break,
+            }
+        }
+        Ok(())
+    };
+    runtime.block_on(local.run_until(serve))
 }
 
 /// Entry point for an Axum dev-server application.
@@ -350,7 +412,6 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
     }
     let addr = resolution.addr;
     let app = A::build_app();
-    let router = app.router().clone();
 
     log::info!("[edgezero] starting axum server on http://{addr}");
 
@@ -378,7 +439,7 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
             secret_registry,
             ..Stores::default()
         };
-        serve_with_stores(router, listener, true, request_stores).await
+        serve_with_stores(app, listener, true, request_stores).await
     })
 }
 
@@ -859,7 +920,6 @@ mod integration_tests {
     async fn server_forwards_headers() {
         async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let value = ctx
-                .request()
                 .headers()
                 .get("x-custom")
                 .and_then(|val| val.to_str().ok())
@@ -1194,7 +1254,8 @@ mod integration_tests {
         );
         let body = response.text().await.unwrap();
         assert!(!body.contains("API_KEY"));
-        assert!(body.contains("required secret is not configured"));
+        assert!(body.contains("internal server error"));
+        assert!(!body.contains("required secret is not configured"));
 
         server.handle.abort();
     }
@@ -1215,7 +1276,8 @@ mod integration_tests {
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         );
         let body = response.text().await.unwrap();
-        assert!(body.contains(
+        assert!(body.contains("internal server error"));
+        assert!(!body.contains(
             "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
         ));
 

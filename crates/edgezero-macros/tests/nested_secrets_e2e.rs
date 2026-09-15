@@ -79,6 +79,10 @@ struct Vaulted {
 struct BlobStore(String);
 
 #[async_trait(?Send)]
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "the legacy test provider intentionally exercises the bounded-read compatibility default"
+)]
 impl ConfigStore for BlobStore {
     async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
         Ok(Some(self.0.clone()))

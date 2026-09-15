@@ -116,6 +116,11 @@ pub async fn config(ctx: RequestContext) -> Result<Response, EdgeError> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::missing_trait_methods,
+        reason = "legacy provider stubs intentionally exercise the bounded-read compatibility default"
+    )]
+
     use super::*;
     use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use crate::http::{Method, Response, request_builder};
