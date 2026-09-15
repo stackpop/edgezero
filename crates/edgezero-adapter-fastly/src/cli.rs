@@ -360,6 +360,7 @@ struct EntryCommitFailure {
 }
 
 struct RuntimeStoreNameReconciliation {
+    deletes: Vec<String>,
     upserts: Vec<(String, String)>,
 }
 
@@ -1480,10 +1481,10 @@ fn classify_resolved_read(
 /// Shell out to `fastly <kind>-store create --name=<platform-name>`. The
 /// caller resolves `<platform-name>` from `EDGEZERO__STORES__<KIND>__<ID>__NAME`
 /// (falling back to the logical id), so this helper takes whatever the
-/// caller hands it and does not re-translate. Returns `Ok(())` on success.
-/// Failure stderr is inspected for the idempotent already-exists case but is
-/// otherwise suppressed because Fastly diagnostics may contain credentials or
-/// response payloads.
+/// caller hands it and does not re-translate. Returns `Ok(())` on success;
+/// surfaces the CLI's stderr verbatim on failure (including the "already
+/// exists" error, which is the caller's signal to fix the toml or use a
+/// different name).
 ///
 /// # Errors
 /// Returns an error if `fastly` isn't on `PATH`, the child fails to
@@ -1520,7 +1521,7 @@ fn create_fastly_store_in(kind: &str, name: &str, cwd: &Path) -> Result<(), Stri
     Err(format!(
         "`fastly {subcommand} create --name={name}` exited with status {}\nstderr: {}",
         output.status,
-        redact_stderr(&stderr)
+        stderr.trim()
     ))
 }
 
@@ -3727,16 +3728,32 @@ fn runtime_env_store_name_entries(
     entries
 }
 
-/// Compute the required store-name mapping upserts for this Fastly service.
-/// Existing mappings are never deleted implicitly: an absent override cannot
-/// distinguish an operator intending the logical default from a lost
-/// production environment value.
+fn runtime_env_store_name_keys(stores: &ProvisionStores<'_>, service_id: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for (kind, ids) in [
+        ("CONFIG", stores.config),
+        ("KV", stores.kv),
+        ("SECRETS", stores.secrets),
+    ] {
+        keys.extend(
+            ids.iter()
+                .map(|store| runtime_store_name_key(service_id, kind, &store.logical)),
+        );
+    }
+    keys
+}
+
+/// Compute the minimal changes needed for store-name mappings owned by this
+/// Fastly service and the logical ids the app currently declares. Legacy
+/// unscoped entries, other service namespaces, undeclared ids, and unrelated
+/// runtime settings are preserved.
 fn runtime_store_name_reconciliation(
     stores: &ProvisionStores<'_>,
     service_id: &str,
     current: &[(String, String)],
 ) -> RuntimeStoreNameReconciliation {
     let desired = runtime_env_store_name_entries(stores, service_id);
+    let declared = runtime_env_store_name_keys(stores, service_id);
 
     let mut upserts = desired
         .iter()
@@ -3748,9 +3765,18 @@ fn runtime_store_name_reconciliation(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let mut deletes = current
+        .iter()
+        .filter(|(key, _)| {
+            declared.iter().any(|declared_key| declared_key == key)
+                && !desired.iter().any(|(desired_key, _)| desired_key == key)
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
     upserts.sort_by(|left, right| left.0.cmp(&right.0));
+    deletes.sort();
 
-    RuntimeStoreNameReconciliation { upserts }
+    RuntimeStoreNameReconciliation { deletes, upserts }
 }
 
 fn persist_runtime_env_store_name_entries(
@@ -3774,8 +3800,9 @@ fn persist_runtime_env_store_name_entries(
         ]);
     };
     let entries = runtime_env_store_name_entries(stores, service_id);
+    let declared = runtime_env_store_name_keys(stores, service_id);
     if dry_run {
-        let out = entries
+        let mut out = entries
             .iter()
             .map(|(key, value)| {
                 format!(
@@ -3783,6 +3810,16 @@ fn persist_runtime_env_store_name_entries(
                 )
             })
             .collect::<Vec<_>>();
+        out.extend(
+            declared
+                .iter()
+                .filter(|key| !entries.iter().any(|(entry_key, _)| entry_key == *key))
+                .map(|key| {
+                    format!(
+                        "would remove `{key}` from fastly config-store `{RUNTIME_ENV_STORE_NAME}` if a stale mapping is present"
+                    )
+                }),
+        );
         return Ok(out);
     }
 
@@ -3800,16 +3837,30 @@ fn persist_runtime_env_store_name_entries(
     };
     let current = read_config_store_entries(&runtime_env_store_id, cwd)?;
     let reconciliation = runtime_store_name_reconciliation(stores, service_id, &current);
-    if reconciliation.upserts.is_empty() {
+    if reconciliation.upserts.is_empty() && reconciliation.deletes.is_empty() {
         return Ok(Vec::new());
     }
 
     push_runtime_store_name_entries_with_committer(&reconciliation.upserts, |key, value| {
         create_config_store_entry_in(&runtime_env_store_id, key, value, cwd)
     })?;
+    for key in &reconciliation.deletes {
+        delete_config_store_entry_in(&runtime_env_store_id, key, cwd).map_err(|error| {
+            format!(
+                "fastly provision failed while deleting stale runtime store-name mapping `{key}`.\n  \
+                 The delete's outcome is UNKNOWN: Fastly may have committed it before the error, \
+                 and earlier mapping upserts may already have committed.\n  \
+                 Recovery: re-run the SAME `edgezero provision --adapter fastly` command with the same \
+                 `EDGEZERO__STORES__*__NAME` environment. Reconciliation rereads the current store and \
+                 is idempotent, so it will safely finish any remaining work.\n  \
+                 Failed: `{key}` (outcome unknown) -- {error}"
+            )
+        })?;
+    }
     Ok(vec![format!(
-        "reconciled store-name mappings for service `{service_id}` in fastly config-store `{RUNTIME_ENV_STORE_NAME}`: upserted {} mapping(s)",
-        reconciliation.upserts.len()
+        "reconciled store-name mappings for service `{service_id}` in fastly config-store `{RUNTIME_ENV_STORE_NAME}`: upserted {}, removed {} stale mapping(s)",
+        reconciliation.upserts.len(),
+        reconciliation.deletes.len()
     )])
 }
 
@@ -3942,16 +3993,17 @@ fn redact_describe_response(stdout: &str) -> String {
     )
 }
 
-/// Summarise a failing external command's stderr WITHOUT echoing it.
+/// Summarise a failing `fastly` invocation's stderr WITHOUT echoing it.
 ///
-/// The Fastly and curl stdin paths carry stored config values, so an error that
-/// quotes the payload back would put credentials straight into CI logs. Some
-/// classification paths still inspect stderr internally; only the user-facing
-/// string is redacted.
+/// The `describe` and `update --stdin` paths carry the stored config value, so
+/// a Fastly error that quotes the payload back would put credentials straight
+/// into CI logs — the same exposure as the stdout leak, via the failure branch.
+/// Not-found *classification* still inspects stderr internally; only the
+/// user-facing string is redacted.
 fn redact_stderr(stderr: &str) -> String {
     let len = stderr.trim().len();
     format!(
-        "{len} bytes suppressed (may contain sensitive data); re-run the command directly to inspect it"
+        "{len} bytes suppressed (may echo the stored config value); re-run the `fastly` command directly to inspect it"
     )
 }
 
@@ -4039,7 +4091,7 @@ fn classify_remote_config_store_with_cwd(
         return Err(format!(
             "`fastly config-store list --json` exited with status {}\nstderr: {}",
             output.status,
-            redact_stderr(&String::from_utf8_lossy(&output.stderr))
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     // Adopt main's strict UTF-8 gate (fail closed on undecodable stdout) but
@@ -4732,16 +4784,16 @@ fn run_fastly_capture(fastly_args: &[String], cwd: &Path) -> Result<String, Stri
                 format!("failed to run fastly CLI: {err}")
             }
         })?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
     if output.status.success() {
-        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
         Ok(combined)
     } else {
         Err(format!(
-            "`fastly` exited with status {}; command arguments and output suppressed (stdout {} bytes, stderr {} bytes)",
+            "`fastly {}` exited with status {}\n{}",
+            fastly_args.join(" "),
             output.status,
-            output.stdout.len(),
-            output.stderr.len()
+            combined.trim()
         ))
     }
 }
@@ -4793,19 +4845,18 @@ fn curl_config_capture(config: &str) -> Result<String, String> {
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `curl`: {err}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else if output.status.code() == Some(CURL_EXIT_TIMEOUT) {
         Err(format!(
             "`curl` timed out after connect-timeout {FASTLY_API_CONNECT_TIMEOUT_SECS}s / max-time {FASTLY_API_MAX_TIME_SECS}s: {}",
-            redact_stderr(&stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     } else {
         Err(format!(
             "`curl` exited with status {}: {}",
             output.status,
-            redact_stderr(&stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
@@ -6170,113 +6221,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn run_fastly_capture_redacts_failed_arguments_stdout_and_stderr() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        const ARG_SECRET: &str = "argument-secret-sentinel";
-        const STDOUT_SECRET: &str = "stdout-secret-sentinel";
-        const STDERR_SECRET: &str = "stderr-secret-sentinel";
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        let script_path = dir.path().join("fastly");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s' '{STDOUT_SECRET}'\nprintf '%s' '{STDERR_SECRET}' >&2\nexit 1\n"
-            ),
-        )
-        .expect("write fake fastly");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod fake fastly");
-        let _path = PathPrepend::new(dir.path());
-
-        let err = run_fastly_capture(
-            &[
-                "compute".to_owned(),
-                "update".to_owned(),
-                "--token".to_owned(),
-                ARG_SECRET.to_owned(),
-            ],
-            dir.path(),
-        )
-        .expect_err("nonzero fastly exit must fail");
-
-        assert!(!err.contains(ARG_SECRET), "argument leaked: {err}");
-        assert!(!err.contains(STDOUT_SECRET), "stdout leaked: {err}");
-        assert!(!err.contains(STDERR_SECRET), "stderr leaked: {err}");
-        assert!(
-            err.contains("suppressed"),
-            "error must explain that command output was suppressed: {err}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn provisioning_command_failures_redact_stderr() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        const STDERR_SECRET: &str = "provision-stderr-secret-sentinel";
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        let script_path = dir.path().join("fastly");
-        fs::write(
-            &script_path,
-            format!("#!/bin/sh\nprintf '%s' '{STDERR_SECRET}' >&2\nexit 1\n"),
-        )
-        .expect("write fake fastly");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod fake fastly");
-        let _path = PathPrepend::new(dir.path());
-
-        let create_err = create_fastly_store_in("kv", "sessions", dir.path())
-            .expect_err("failed store creation must error");
-        let lookup_err = classify_remote_config_store_in(RUNTIME_ENV_STORE_NAME, dir.path())
-            .expect_err("failed store lookup must error");
-
-        for err in [create_err, lookup_err] {
-            assert!(!err.contains(STDERR_SECRET), "stderr leaked: {err}");
-            assert!(
-                err.contains("suppressed"),
-                "error must explain that stderr was suppressed: {err}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn curl_config_failures_redact_token_bearing_stderr() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        const TOKEN_SECRET: &str = "curl-config-token-sentinel";
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        let script_path = dir.path().join("curl");
-        fs::write(
-            &script_path,
-            "#!/bin/sh\ncat >&2\nexit \"$FAKE_CURL_STATUS\"\n",
-        )
-        .expect("write fake curl");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod fake curl");
-        let _path = PathPrepend::new(dir.path());
-        let config = format!("header = \"Fastly-Key: {TOKEN_SECRET}\"\n");
-
-        for status in ["28", "1"] {
-            let _status = EnvOverride::set("FAKE_CURL_STATUS", status);
-            let err = curl_config_capture(&config).expect_err("nonzero curl exit must fail");
-            assert!(!err.contains(TOKEN_SECRET), "curl stderr leaked: {err}");
-            assert!(
-                err.contains("suppressed"),
-                "error must explain that curl stderr was suppressed: {err}"
-            );
-        }
-    }
-
     #[test]
     fn build_curl_probe_args_production_has_no_connect_to() {
         let args = build_curl_probe_args("example.com", "/", None, 10);
@@ -7042,10 +6986,10 @@ build = \"cargo build --release\"
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret + runtime-env = 4 status lines. Provision
-        // never infers mapping deletion from absent overrides. The staging twin
-        // is created and populated by a staged deploy, NOT by provision.
-        assert_eq!(out.len(), 4, "dry-run rows: {out:?}");
+        // 1 KV + 1 config + 1 secret + runtime-env + 3 possible stale-mapping
+        // removals = 7 status lines. The staging twin is created and populated by
+        // a staged deploy, NOT by provision, so it does not appear here.
+        assert_eq!(out.len(), 7, "dry-run rows: {out:?}");
         assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
         assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
@@ -7054,8 +6998,9 @@ build = \"cargo build --release\"
             "runtime-env store row: {out:?}",
         );
         assert!(
-            !out.iter().any(|row| row.contains("would remove")),
-            "dry-run must not infer mapping removal from absent overrides: {out:?}",
+            out.iter()
+                .any(|row| row.contains("EDGEZERO__SERVICES__SVC1__STORES__KV__SESSIONS__NAME")),
+            "dry-run reports possible stale mapping cleanup: {out:?}",
         );
         assert!(
             !out.iter()
@@ -7306,36 +7251,22 @@ build = \"cargo build --release\"
             "changed non-default mapping is upserted in the manifest directory: {log}"
         );
         assert!(
-            !log.contains("delete EDGEZERO__SERVICES__SVCA__STORES__SECRETS__DEFAULT__NAME")
-                && !log.contains("delete EDGEZERO__SERVICES__SVCB__STORES__KV__SESSIONS__NAME")
+            log.contains(&format!(
+                "delete EDGEZERO__SERVICES__SVCA__STORES__SECRETS__DEFAULT__NAME cwd={}",
+                manifest_dir.display()
+            )),
+            "stale mapping is removed in the manifest directory: {log}"
+        );
+        assert!(
+            !log.contains("delete EDGEZERO__SERVICES__SVCB__STORES__KV__SESSIONS__NAME")
                 && !log.contains("delete EDGEZERO__STORES__KV__SESSIONS__NAME")
                 && !log.contains("EDGEZERO__LOGGING__LEVEL="),
-            "defaulted, other-service, legacy, and unrelated entries are preserved: {log}"
+            "other services, legacy mappings, and unrelated runtime entries are preserved: {log}"
         );
         assert!(
-            out.iter().any(|line| line.contains("upserted 1")),
-            "status reports the explicit mapping upsert: {out:?}"
-        );
-    }
-
-    #[test]
-    fn runtime_store_name_reconciliation_preserves_mapping_when_override_is_absent() {
-        let kv = vec![ResolvedStoreId::from_logical("sessions")];
-        let stores = ProvisionStores {
-            config: &[],
-            kv: &kv,
-            secrets: &[],
-        };
-        let current = vec![(
-            "EDGEZERO__SERVICES__SVC1__STORES__KV__SESSIONS__NAME".to_owned(),
-            "production_sessions".to_owned(),
-        )];
-
-        let reconciliation = runtime_store_name_reconciliation(&stores, "SVC1", &current);
-
-        assert!(
-            reconciliation.upserts.is_empty(),
-            "an absent override must not replace or remove the current mapping"
+            out.iter()
+                .any(|line| line.contains("upserted 1, removed 1")),
+            "status reports both mutations: {out:?}"
         );
     }
 
@@ -7386,7 +7317,7 @@ build = \"cargo build --release\"
 
     #[cfg(unix)]
     #[test]
-    fn provision_does_not_delete_mapping_when_override_is_absent() {
+    fn provision_delete_failure_recommends_provision_recovery() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
@@ -7413,14 +7344,20 @@ build = \"cargo build --release\"
         let fake = fake_fastly_runtime_mapping_with_exits(&current, &oplog, 0, 1);
         let _path = PathPrepend::new(fake.path());
 
-        FastlyCliAdapter
+        let err = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
-            .expect("an absent override must not trigger the failing delete fake");
+            .expect_err("stale mapping delete fails");
+
+        assert!(err.contains("UNKNOWN"), "delete outcome is explicit: {err}");
+        assert!(
+            err.contains("edgezero provision --adapter fastly") && err.contains("idempotent"),
+            "recovery names the safe retry: {err}"
+        );
         let log = fs::read_to_string(&oplog).expect("oplog");
         assert!(
             log.contains("update EDGEZERO__SERVICES__SVC1__STORES__KV__SESSIONS__NAME")
-                && !log.contains("delete EDGEZERO__SERVICES__SVC1__STORES__SECRETS__DEFAULT__NAME"),
-            "the explicit mapping is upserted without deleting the defaulted mapping: {log}"
+                && log.contains("delete EDGEZERO__SERVICES__SVC1__STORES__SECRETS__DEFAULT__NAME"),
+            "the failure follows a committed upsert: {log}"
         );
     }
 

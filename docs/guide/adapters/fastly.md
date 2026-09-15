@@ -201,29 +201,12 @@ EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__KEY
 The runtime obtains `<SERVICE_ID>` from Fastly and translates these entries back
 to the portable `EDGEZERO__STORES__*` form. Legacy unscoped entries are ignored
 because they have no safe owner when the Config Store is linked to multiple
-services. Re-run `edgezero provision --adapter fastly` with each explicit
-non-default store-name override present to upsert its scoped `__NAME` entry;
-logical-default names need no stored mapping. Rewrite any manually managed
-adapter, logging, or `__KEY` entries under the service prefix. Provision writes
-only the selected service's namespace, so a non-default store-name mapping
-requires top-level `service_id` in `fastly.toml` or `FASTLY_SERVICE_ID`. If both
-are set, they must match.
-
-Provision never deletes a stored mapping merely because its override is absent,
-default-valued, or no longer declared. This avoids changing production routing
-when an environment variable is accidentally lost. To return one mapping to its
-logical default, upgrade every provisioning runner first, remove the override,
-then delete that exact key explicitly:
-
-```sh
-fastly config-store-entry delete \
-  --store-id=<EDGEZERO_RUNTIME_ENV_STORE_ID> \
-  --key=EDGEZERO__SERVICES__<SERVICE_ID>__STORES__<KIND>__<ID>__NAME
-```
-
-Use `CONFIG`, `KV`, or `SECRETS` for `<KIND>`. Older provisioning binaries can
-interpret a missing override as deletion, so removing overrides while a fleet
-still runs mixed versions is unsafe.
+services. Re-run `edgezero provision --adapter fastly` to write scoped `__NAME`
+entries, and rewrite any manually managed adapter, logging, or `__KEY` entries
+under the service prefix. Provision writes only the selected service's
+namespace; a non-default store-name mapping therefore requires top-level
+`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must
+match.
 
 Viceroy reports `0000000000000000000000` as its local service ID. Entries in a
 local `[local_server.config_stores.edgezero_runtime_env.contents]` block must
