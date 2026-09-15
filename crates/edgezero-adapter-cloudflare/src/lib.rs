@@ -123,3 +123,38 @@ pub async fn run_app<A: Hooks>(
     )
     .await
 }
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+/// Dispatch a caller-owned app with explicit store metadata.
+///
+/// Resolves configuration and request resources for this invocation without
+/// building or caching an app or installing logging. Pass metadata matching
+/// the app (normally `MyApp::stores()`). Retain only application-owned values;
+/// native handles and pending work belong to the request. Shared app state
+/// must support overlapping invocations.
+///
+/// # Errors
+/// Returns conversion or dispatch errors from the existing adapter boundary.
+#[inline]
+pub async fn dispatch_app(
+    app: &edgezero_core::app::App,
+    stores: StoresMetadata,
+    req: Request,
+    env: Env,
+    ctx: Context,
+) -> Result<Response, WorkerError> {
+    let env_config = env_config_from_worker(&env, stores);
+    request::dispatch_with_registries(
+        app,
+        req,
+        env,
+        ctx,
+        request::RegistryInputs {
+            config_meta: stores.config,
+            kv_meta: stores.kv,
+            secret_meta: stores.secrets,
+            env_config: &env_config,
+        },
+    )
+    .await
+}

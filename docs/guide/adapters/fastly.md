@@ -296,3 +296,83 @@ Configure the Fastly adapter in `edgezero.toml`. See [Configuration](/guide/conf
 
 - Learn about [Cloudflare Workers](/guide/adapters/cloudflare) as an alternative deployment target
 - Explore [Configuration](/guide/configuration) for manifest details
+
+## Reusing a sandbox and retaining an app
+
+Opt in with an ordinary `main` in place of the single-request `#[fastly::main]`:
+
+```rust
+use edgezero_adapter_fastly::{Serve, serve_app};
+use std::time::Duration;
+
+fn main() -> Result<(), fastly::Error> {
+    serve_app::<MyApp>(
+        Serve::new()
+            .with_max_requests(10)
+            .with_timeout(Duration::from_millis(500)),
+    ).into_result()
+}
+```
+
+`serve_app_with_request_extensions` additionally accepts an `FnMut` callback
+for fresh extensions on every request. The first callback initializes logging
+and builds the app. Each callback reads runtime configuration and constructs new
+store registries. App construction and `configure` execute once per retained
+owner; explicit work elsewhere still executes whenever the application calls it.
+
+Logging takes the first configuration snapshot, unless the app owns logging.
+An unavailable optional runtime configuration store disables logging for that
+sandbox, even if subsequent reads recover store selectors. It does not silently
+retry or reconfigure logging. The current overlay enables logging when an
+endpoint exists and uses `echo_stdout: true`. Applications requiring another
+initialization policy should use a custom SDK callback.
+
+SDK 0.12.1 exposes `with_max_requests`, `with_timeout`, `with_max_lifetime`, and
+`with_max_memory`. A value of zero disables the request-count or memory limit;
+it does not request zero callbacks or zero memory use. The lifetime limit is
+measured from `Serve` construction, including time before the first callback.
+Limits do not guarantee reuse; any request may start a fresh sandbox.
+Lifetime and memory checks occur between callbacks and cannot interrupt
+blocked application work. Before using a local memory limit, verify that the
+guest's memory-snapshot call succeeds: an unsupported snapshot conservatively
+ends the SDK loop. CPU clock observations are not reliable cross-run benchmarks.
+
+`ServeSummary::requests()` counts attempted callbacks, including a failed one.
+Record response commitment, guest completion, and client completion separately;
+a crash can prevent a final summary. Ordinary handler errors are rendered by the
+router. Errors escaping conversion, required store setup, stream collection, or
+error rendering retain the SDK's terminal error behavior. Constructor panics
+remain sandbox failures.
+
+### Custom dispatch and streaming
+
+The standard helper collects core response streams into a native response body.
+For progressive client streaming, mutable native requests, response-extension
+finalization, or post-send work, use `Serve::run` or `run_with_context` directly.
+Capture an ordinary `Option<App>` or an application-owned initialized-state value
+inside the callback. Initialize lazily so health checks can bypass expensive
+construction. Use `runtime_env_config` and `request::dispatch_with_registries`
+when standard translation suffices; otherwise retain the existing raw
+`into_core_request` and router dispatch path.
+
+For manual streaming, append every header value, commit once with
+`stream_to_client`, pump and flush chunks, then finish the stream. Handle errors
+after commitment locally: returning an error to the SDK can trigger another
+response attempt. Complete pending backend and post-send operations before the
+callback returns. Do not cache native store handles with the app.
+
+Use `Request::get_client_request_id()` for request correlation. `FASTLY_TRACE_ID`
+describes the sandbox and must not be treated as a unique request ID. If a native
+ID is unavailable, generate a request-local fallback and label its source. Do
+not retain correlation fields in app state or global logger configuration.
+
+Warning caches persist too. Their bounded recent-name sets can evict entries,
+so warnings can recur; suppressed warning counts are not failure counts.
+Dynamic-backend capacity is service-wide, and registrations may wait for capacity.
+A sandbox request limit alone does not bound origin diversity or request fan-out.
+
+The local fixtures are in `tests/fixtures/reusable-app`. Local reuse and streaming
+results do not establish deployed eviction frequency, endpoint-handle validity,
+resource accounting, or performance. Named endpoint delivery must be verified
+separately from echoed stdout. Roll back by restoring the original single-request
+entry point and removing retained state, not merely setting a request limit of one.

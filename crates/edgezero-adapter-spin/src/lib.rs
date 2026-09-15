@@ -122,3 +122,25 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullRespo
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
         .await
 }
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+/// Dispatch a caller-owned app with explicit store metadata.
+///
+/// Resolves configuration and request resources for this invocation without
+/// building or caching an app or installing logging. Pass metadata matching
+/// the app (normally `MyApp::stores()`). Retain only application-owned values;
+/// native handles and pending work belong to the request. Shared app state
+/// must support overlapping invocations.
+///
+/// # Errors
+/// Returns conversion or dispatch errors from the existing adapter boundary.
+#[inline]
+pub async fn dispatch_app(
+    app: &App,
+    stores: edgezero_core::app::StoresMetadata,
+    req: SpinRequest,
+) -> anyhow::Result<SpinFullResponse> {
+    let env = EnvConfig::from_env();
+    request::dispatch_with_registries(app, req, stores.config, stores.kv, stores.secrets, &env)
+        .await
+}

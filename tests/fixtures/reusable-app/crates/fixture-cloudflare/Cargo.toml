@@ -1,0 +1,15 @@
+[package]
+name = "fixture-cloudflare"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+fixture-core.workspace = true
+edgezero-core.workspace = true
+edgezero-adapter-cloudflare.workspace = true
+worker = "0.8"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

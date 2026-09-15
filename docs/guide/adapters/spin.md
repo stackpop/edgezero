@@ -257,3 +257,37 @@ Configure the Spin adapter in `edgezero.toml`. See
   pre-rewrite store schema
 - [Adapters overview](/guide/adapters/overview) — cross-adapter contracts
 - [Configuration](/guide/configuration) — full manifest reference
+
+## Retaining an application
+
+Use a concrete application-owned `OnceLock<App>` and call
+`edgezero_adapter_spin::dispatch_app(app, MyApp::stores(), req).await` on each
+invocation. This resolves fresh request resources with explicit metadata and does
+not install logging, construct an app, or cache native resources. Initialize any
+application logging before the cache's synchronous app constructor. Do not use a
+generic unkeyed static or hold a lock across an await.
+
+```rust
+use edgezero_core::app::{App, Hooks};
+use spin_sdk::{http::{IntoResponse, Request}, http_service};
+use std::sync::OnceLock;
+
+static APP: OnceLock<App> = OnceLock::new();
+
+#[http_service]
+async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+    let app = APP.get_or_init(MyApp::build_app);
+    edgezero_adapter_spin::dispatch_app(app, MyApp::stores(), req).await
+}
+```
+
+The pinned SDK 6 macro exports a P3 HTTP interface. The `wasm32-wasip2` Rust target
+name does not establish the component's HTTP lifecycle. Verify the emitted
+interface and host together; detect reuse/concurrency controls from the actual
+host's help output instead of assuming newer flags are available.
+
+Test both sequential reuse and overlapping invocations in the same instance.
+Different guest instances are not evidence of concurrent isolation. Keep
+request/response bodies and pending operations invocation-local. Existing
+response buffering and stream collection limits still apply. Restore `run_app`
+and remove the cache to roll back; default generated entry points are unchanged.

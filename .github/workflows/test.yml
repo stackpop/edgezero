@@ -65,6 +65,10 @@ jobs:
       - name: Nested AppConfig checker tests
         run: cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config
 
+      - name: Lifecycle fixture host tests
+        run: |
+          cargo test --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-harness -p fixture-core
+
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 
@@ -246,6 +250,10 @@ jobs:
         env:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --lib
+
+      - name: Fastly reusable HTTP smoke
+        if: matrix.adapter == 'fastly'
+        run: ./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime
 
       - name: Check ${{ matrix.adapter }} wasm target
         run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}

@@ -124,3 +124,53 @@ Adapters that fulfil these steps can be dropped into the EdgeZero CLI without re
 | [Cloudflare](/guide/adapters/cloudflare) | Cloudflare Workers  | `wasm32-unknown-unknown` | Stable |
 | [Spin](/guide/adapters/spin)             | Fermyon Spin        | `wasm32-wasip2`          | Stable |
 | [Axum](/guide/adapters/axum)             | Native (Tokio)      | Host                     | Stable |
+
+## Opt-in application retention
+
+Application ownership and request scheduling are separate. An `App` can be
+retained by its caller; each adapter still controls how requests arrive:
+
+| Adapter    | Existing default                         | Explicit retention                                            |
+| ---------- | ---------------------------------------- | ------------------------------------------------------------- |
+| Fastly     | Build for each single-request invocation | `serve_app` with an SDK `Serve`, or a custom `Serve` callback |
+| Cloudflare | Build on each fetch                      | Concrete application-owned cache and `dispatch_app`           |
+| Spin       | Build on each invocation                 | Concrete cache and `dispatch_app` on a compatible host        |
+| Axum       | Build once at server startup             | Already retains the router                                    |
+
+Retain owned settings, parsed objects, and bounded caches only when their
+staleness policy is acceptable. Keep native request handles, bodies, store
+registries, pending operations, and response effects request-local. `Send + Sync`
+and cloning do not prove host-resource validity. Shared `Arc` interiors remain
+shared; the framework does not reset them between requests. Registered app state
+continues to overwrite request extensions of the same type.
+
+Applications own refresh, invalidation, key rotation, initialization-failure
+policy, and workload benchmarks. Publish complete snapshots; overlapping requests
+keep the snapshot they acquired. Never put an unkeyed static in a generic cache
+function: that static would be shared between application types. Existing macros,
+manifest settings, and generated entry points keep their current behavior.
+
+### Preparing an application for retention
+
+Audit the values captured by handlers, middleware, and registered state before
+opting in. The framework creates fresh request resources but cannot inspect or
+clear application-owned interiors.
+
+| Risk                                       | Application mitigation                                                                                                                                                                                                                             |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request data survives into another request | Store identity, authorization results, bodies, and correlation IDs in request-local values or extensions. Use distinct types for request data and registered state; registered state wins on a type collision.                                     |
+| Settings or parsed keys become stale       | Keep them request-scoped until a refresh policy is defined. For retained values, build and validate a complete replacement snapshot, then publish it atomically. Decide whether refresh failure keeps the last valid snapshot or rejects requests. |
+| Caches grow without bound                  | Limit entries and retained bytes, expire or evict entries, and bound origin diversity. A sandbox request limit cannot bound allocation within one request.                                                                                         |
+| Concurrent requests mutate shared state    | Synchronize mutations and acquire an immutable snapshot per request. Release locks before awaiting provider work. Rust's `Send + Sync` bounds do not establish application-level isolation.                                                        |
+| Initialization or required bindings fail   | Surface the error and monitor repeated fresh-instance failures. In custom dispatch, convert a recoverable failure into one response only when the application defines that recovery policy. Avoid unlimited retries.                               |
+| Logging is installed twice                 | Choose one owner. With the Fastly helper, set `Hooks::owns_logging()` when application code installs the logger. First-snapshot logging is intentionally fixed; use custom dispatch for another policy.                                            |
+| A stream fails after commitment            | Finish or drop the streaming writer and settle request-owned pending work. Log the partial-response failure; do not attempt a replacement response after sending headers.                                                                          |
+
+Exercise cancellation as well as successful requests. The core regression tests
+drop a suspended request, verify its extension resources are released, and serve
+a fresh request through the same router. This does not cancel application-spawned
+background tasks or prove cleanup after a terminating provider trap.
+
+Roll out retention only after the application's isolation, refresh, and bounded
+memory workload checks pass. Provider eviction can force initialization on any
+request, so correctness must not depend on reaching the configured reuse limit.
