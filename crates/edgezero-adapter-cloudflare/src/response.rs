@@ -33,11 +33,20 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
 
     let mut cf_response = body_response.with_status(parts.status.as_u16());
     let headers = cf_response.headers_mut();
-    for (name, value) in &parts.headers {
-        if let Ok(value_str) = value.to_str() {
-            headers
-                .set(name.as_str(), value_str)
+    for name in parts.headers.keys() {
+        let mut first = true;
+        for value in parts.headers.get_all(name) {
+            if let Ok(value_str) = value.to_str() {
+                // Replace any body-generated default once, then retain every
+                // additional application value (especially Set-Cookie).
+                if first {
+                    headers.set(name.as_str(), value_str)
+                } else {
+                    headers.append(name.as_str(), value_str)
+                }
                 .map_err(EdgeError::internal)?;
+                first = false;
+            }
         }
     }
     Ok(cf_response)
