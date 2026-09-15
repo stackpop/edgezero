@@ -3,6 +3,9 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **Status:** Deterministic migration, hard-cut API removal, generated/demo alignment, and documentation gates are implemented on PR 275. Protected provider evidence remains external and does not promote `BestEffort` cells. The unchecked steps below are retained as the original implementation record.
+> **Superseded capability/batch surface:** The 2026-09-15 consumer-alignment plan owns the
+> current completion-order, cancellation, cache-bypass, authority-override, and Fastly lifecycle
+> hard cut. The matrices and commands below are historical.
 
 **Goal:** Migrate all remaining consumers, delete the legacy proxy API without aliases, publish capability/outbound documentation, and make every generated, example, adapter, WASM, host, and docs gate executable in CI.
 

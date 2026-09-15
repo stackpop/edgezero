@@ -83,7 +83,8 @@ The Axum adapter injects `AxumOutboundClient`, backed by `reqwest`. Application 
 portable client from `RequestContext::http_client()`; direct wiring and tests can construct the
 adapter client with `AxumOutboundClient::try_new()`.
 
-Axum provides native total deadlines, elastic phase budgeting, batch slot isolation, header
+Axum provides native total deadlines, completion-order batching, pending-future cancellation,
+batch slot isolation, cache bypass, wire-authority override, elastic phase budgeting, header
 fidelity, and streamed upload cancellation. Downstream responses run on a connection-local Hyper
 HTTP/1 executor, so portable non-`Send` streams remain lazy and are polled under Hyper demand.
 The connection supervisor enforces the absolute response-write deadline, but frame acceptance is

@@ -392,12 +392,16 @@ struct RuntimeStoreNameReconciliation {
 impl Adapter for FastlyCliAdapter {
     fn capability(&self, capability: Capability) -> CapabilitySupport {
         match capability {
-            Capability::IngressAdmission | Capability::OutboundHeaderFidelity => {
-                CapabilitySupport::Native
-            }
+            Capability::IngressAdmission
+            | Capability::OutboundAuthorityOverride
+            | Capability::OutboundCacheBypass
+            | Capability::OutboundHeaderFidelity => CapabilitySupport::Native,
             Capability::ConfigReadDeadlines
             | Capability::InboundReadDeadlines
             | Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundBatchCancellation
+            | Capability::OutboundBatchCompletionOrder
+            | Capability::OutboundBatchSlotIsolation
             | Capability::OutboundDeadlines
             | Capability::OutboundFlexiblePhaseBudget
             | Capability::OutboundHttp
@@ -405,7 +409,6 @@ impl Adapter for FastlyCliAdapter {
             | Capability::ResponseEgressBackpressure
             | Capability::ResponseEgressCompletion
             | Capability::ResponseWriteDeadlines
-            | Capability::SendAllSlotIsolation
             | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
             Capability::ConfigReadAllocationBounds
             | Capability::OutboundCompleteResourceAccounting
@@ -5716,9 +5719,22 @@ mod tests {
                 CapabilitySupport::BestEffort,
             ),
             (
-                Capability::SendAllSlotIsolation,
+                Capability::OutboundAuthorityOverride,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchCancellation,
                 CapabilitySupport::BestEffort,
             ),
+            (
+                Capability::OutboundBatchCompletionOrder,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::OutboundBatchSlotIsolation,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::OutboundCacheBypass, CapabilitySupport::Native),
             (
                 Capability::StreamedUploadDeadlines,
                 CapabilitySupport::BestEffort,

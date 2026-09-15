@@ -498,7 +498,7 @@ mod tests {
             ResponseEgressReport,
         };
         use edgezero_core::router::{RouteMetadata, RouteResolution};
-        use edgezero_core::time::{MonotonicClock, MonotonicInstant};
+        use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
         use futures::FutureExt as _;
         use futures::stream::{empty, poll_fn};
         use spin_sdk::http::{FromRequest as _, IntoRequest as _, Request as SpinRequest};
@@ -544,9 +544,20 @@ mod tests {
             let forward_request = OutboundRequest::get("https://example.com/")
                 .expect("request")
                 .stream_response();
-            let forward_results = block_on(forward_client.send_all(vec![forward_request]));
-            assert_eq!(forward_results.len(), 1);
-            let forward_result = forward_results.first().expect("single forward result");
+            let cutoff = Deadline::at_instant(
+                start
+                    .checked_add(Duration::from_secs(1))
+                    .expect("cutoff instant"),
+            );
+            let forward_results = block_on(
+                forward_client
+                    .start_batch_until(vec![forward_request], cutoff)
+                    .collect(),
+            );
+            assert_eq!(forward_results.slots.len(), 1);
+            let forward_result = forward_results.slots[0]
+                .as_ref()
+                .expect("single forward result");
             assert_eq!(forward_result.elapsed, Duration::from_millis(9));
             assert!(matches!(
                 forward_result.outcome,
@@ -561,9 +572,15 @@ mod tests {
             let backwards_request = OutboundRequest::get("https://example.com/")
                 .expect("request")
                 .stream_response();
-            let backwards_results = block_on(backwards_client.send_all(vec![backwards_request]));
-            assert_eq!(backwards_results.len(), 1);
-            let backwards_result = backwards_results.first().expect("single backwards result");
+            let backwards_results = block_on(
+                backwards_client
+                    .start_batch_until(vec![backwards_request], cutoff)
+                    .collect(),
+            );
+            assert_eq!(backwards_results.slots.len(), 1);
+            let backwards_result = backwards_results.slots[0]
+                .as_ref()
+                .expect("single backwards result");
             assert_eq!(backwards_result.elapsed, Duration::ZERO);
             assert!(matches!(
                 backwards_result.outcome,
@@ -572,7 +589,7 @@ mod tests {
         }
 
         #[test]
-        fn send_all_preserves_three_preflight_slots_in_input_order() {
+        fn batch_preserves_three_preflight_slots_in_input_order() {
             let now = MonotonicInstant::now();
             let client = SpinOutboundClient::with_clock(MonotonicClock::new(move || now));
             let streamed_upload = OutboundRequest::post("https://example.com/upload")
@@ -585,25 +602,40 @@ mod tests {
                 .expect("GET request")
                 .body(Body::stream(stream::iter([Bytes::new()])));
 
-            let results =
-                block_on(client.send_all(vec![streamed_upload, streamed_response, method_error]));
+            let results = block_on(
+                client
+                    .start_batch_until(
+                        vec![streamed_upload, streamed_response, method_error],
+                        Deadline::at_instant(
+                            now.checked_add(Duration::from_secs(1))
+                                .expect("cutoff instant"),
+                        ),
+                    )
+                    .collect(),
+            );
             let messages: Vec<_> = results
+                .slots
                 .iter()
-                .map(|slot| match &slot.outcome {
-                    Err(EdgeError::BadRequest { message }) => message.as_str(),
-                    other => panic!("expected preflight rejection, got {other:?}"),
-                })
+                .map(
+                    |slot| match &slot.as_ref().expect("resolved preflight slot").outcome {
+                        Err(EdgeError::BadRequest { message }) => message.as_str(),
+                        other => panic!("expected preflight rejection, got {other:?}"),
+                    },
+                )
                 .collect();
 
             assert_eq!(
                 messages,
                 [
-                    "send_all requires buffered request bodies; use send for a streamed upload",
-                    "send_all requires buffered responses; use send for a streamed response",
+                    "outbound batches require buffered request bodies; use send for a streamed upload",
+                    "outbound batches require buffered responses; use send for a streamed response",
                     "GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream",
                 ]
             );
-            assert!(results.iter().all(|slot| slot.elapsed == Duration::ZERO));
+            assert!(results.slots.iter().all(|slot| {
+                slot.as_ref()
+                    .is_some_and(|result| result.elapsed == Duration::ZERO)
+            }));
         }
 
         #[test]
@@ -618,10 +650,16 @@ mod tests {
                     .http_client()
                     .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
                 let request = OutboundRequest::get("https://example.com/")?.stream_response();
-                let results = client.send_all(vec![request]).await;
-                let result = results.first().ok_or_else(|| {
-                    EdgeError::internal(anyhow::anyhow!("missing outbound result"))
-                })?;
+                let results = client
+                    .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
+                    .await;
+                let result = results
+                    .slots
+                    .first()
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        EdgeError::internal(anyhow::anyhow!("missing outbound result"))
+                    })?;
                 Ok(result.elapsed.as_millis().to_string())
             }
 
@@ -1347,7 +1385,9 @@ mod tests {
 #[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
 mod outbound_contract_tests {
     use bytes::Bytes;
-    use edgezero_adapter_spin::outbound::validate_batch_request_for_test;
+    use edgezero_adapter_spin::outbound::{
+        validate_batch_request_for_test, validate_request_for_test,
+    };
     use edgezero_core::body::Body;
     use edgezero_core::http::{Method, Uri};
     use edgezero_core::outbound::OutboundRequest;
@@ -1362,7 +1402,7 @@ mod outbound_contract_tests {
     }
 
     #[test]
-    fn send_all_preflight_precedence_and_indices() {
+    fn batch_preflight_precedence_and_indices() {
         let requests = [
             request().body(Bytes::from_static(b"buffered")),
             request().body(Body::stream(stream::once(async {
@@ -1381,5 +1421,15 @@ mod outbound_contract_tests {
         assert!(outcomes[1].is_err(), "streamed upload keeps slot index 1");
         assert!(outcomes[2].is_err(), "streamed response keeps slot index 2");
         outcomes[3].as_ref().expect("buffered slot 3");
+    }
+
+    #[test]
+    fn authority_override_fails_before_spin_dispatch() {
+        let request = request()
+            .host_authority_override("virtual.example")
+            .expect("valid portable authority");
+
+        let error = validate_request_for_test(&request).expect_err("unsupported on Spin");
+        assert!(matches!(error, edgezero_core::EdgeError::BadRequest { .. }));
     }
 }

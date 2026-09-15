@@ -78,9 +78,13 @@ response completion, limits, and the guest-visible deadline race share one owner
 `spin.toml` files default `allowed_outbound_hosts` to `https://*:*`; cleartext requires an explicit
 manifest declaration.
 
-Spin exposes raw header bytes and supports isolated concurrent `send_all` slots. Deadline and
-streamed-upload cancellation remain BestEffort until host teardown has a documented observed
-bound, and provider phase-timer defaults may prevent a fully elastic budget. Downstream response
+Spin exposes raw header bytes and drives isolated batch slots in completion order. Cache bypass
+adds no synthetic origin header because the adapter owns no intermediary cache. A wire-authority
+override is rejected during preflight: WASI HTTP uses the same authority for connection routing,
+so Spin cannot preserve URI-owned routing and TLS identity while changing only the HTTP authority.
+Deadline, batch cancellation, and streamed-upload cancellation remain BestEffort until host
+teardown has a documented observed bound, and provider phase-timer defaults may prevent a fully
+elastic budget. Downstream response
 delivery owns the raw WASI response, body, and result writers in one coordinator and preserves
 lazy body production under host backpressure. Successful close is a host handoff, not proof of
 client receipt, so response-egress capabilities also remain BestEffort. See

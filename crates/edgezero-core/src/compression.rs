@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn decoder_carrier_restores_exact_edge_error() {
-        let expected = BudgetSource::BatchDeadline;
+        let expected = BudgetSource::RequestDeadline;
         let stream = source(vec![
             Ok(Bytes::from_static(&[0x1f, 0x8b])),
             Err(EdgeError::gateway_timeout_caused("late", expected)),

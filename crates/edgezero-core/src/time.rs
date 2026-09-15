@@ -127,6 +127,7 @@ impl Deadline {
 pub fn dispatch_budget(
     request: &OutboundRequest,
     now: MonotonicInstant,
+    batch_cutoff: Option<Deadline>,
 ) -> Result<DispatchBudget, EdgeError> {
     let inputs = request.budget_inputs();
     let deadline_from_duration = |duration: Duration| {
@@ -139,12 +140,17 @@ pub fn dispatch_budget(
         let far = now.checked_add(DEADLINE_FAR_FUTURE).unwrap_or(now);
         Deadline::at_instant(deadline.instant().min(far))
     });
+    let from_batch = batch_cutoff.map(|deadline| {
+        let far = now.checked_add(DEADLINE_FAR_FUTURE).unwrap_or(now);
+        Deadline::at_instant(deadline.instant().min(far))
+    });
     let from_default = (inputs.timeout.is_none() && inputs.deadline.is_none())
         .then(|| deadline_from_duration(DEFAULT_NO_DEADLINE_BUDGET));
 
     let (cause, deadline) = [
+        from_batch.map(|deadline| (BudgetSource::BatchCutoff, deadline)),
         from_timeout.map(|deadline| (BudgetSource::PerCallTimeout, deadline)),
-        from_caller.map(|deadline| (BudgetSource::BatchDeadline, deadline)),
+        from_caller.map(|deadline| (BudgetSource::RequestDeadline, deadline)),
         from_default.map(|deadline| (BudgetSource::Default, deadline)),
     ]
     .into_iter()

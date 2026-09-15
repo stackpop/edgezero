@@ -1575,6 +1575,7 @@ mod tests {
             "generated core must contain the outbound smoke sentinel",
         );
         for required in [
+            ".cache_policy(",
             ".max_request_body_bytes(",
             ".max_encoded_response_bytes(",
             ".max_decoded_response_bytes(",
@@ -1585,7 +1586,9 @@ mod tests {
             ".max_brotli_window_bits(",
             ".max_brotli_decoder_bytes(",
             ".timeout(",
-            "send_all(",
+            "send_all_until(",
+            "FanoutSlotOutcome::Unresolved",
+            "OutboundCachePolicy::Bypass",
             "slot.elapsed",
         ] {
             assert!(
@@ -1593,6 +1596,10 @@ mod tests {
                 "generated outbound example must contain `{required}`",
             );
         }
+        assert!(
+            !handlers.contains(".send_all("),
+            "generated outbound example must not retain the removed send_all API",
+        );
 
         let manifest =
             fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");

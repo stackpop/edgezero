@@ -68,28 +68,38 @@ dispatch. The client IP is carried across automatically; read it via
 `FastlyRequestContext` (see [Context Access](#context-access) below). Other
 Fastly-only signals that are readable only on the raw request
 (`get_tls_ja4()`, `get_client_h2_fingerprint()`) aren't reachable from handlers
-by default. Use `run_app_with_request_extensions`, which
-runs an app closure against a scratch `Extensions` **before** conversion and
-merges the values into the core request — so a `State`/extractor or middleware
-can read them:
+by default. Use `run_app_with_hooks`, which runs a request closure against a
+scratch `Extensions` **before** conversion and merges the values into the core
+request. Its response closure runs only for routed responses before egress
+policy and framing; EdgeZero retains delivery ownership:
 
 ```rust
 #[derive(Clone)]
 struct Ja4(String);
 
 pub fn main() -> Result<(), fastly::Error> {
-    edgezero_adapter_fastly::run_app_with_request_extensions::<App, _>(|raw, ext| {
-        if let Some(ja4) = raw.get_tls_ja4() {
-            ext.insert(Ja4(ja4.to_owned()));
-        }
-    })
+    edgezero_adapter_fastly::run_app_with_hooks::<App, _, _, ()>(
+        |raw, ext| {
+            if let Some(ja4) = raw.get_tls_ja4() {
+                ext.insert(Ja4(ja4.to_owned()));
+            }
+        },
+        |_response| (),
+    )
+    .map(|_post_send_state| ())
 }
 ```
 
-`run_app` is exactly `run_app_with_request_extensions::<App, _>(|_, _| {})`.
-The closure runs once per request; insert whatever typed values your handlers
-need, then read them in a handler via a custom extractor or
-`ctx.request().extensions().get::<Ja4>()`.
+The request closure runs once per routed request; insert whatever typed values
+your handlers need, then read them in a handler via a custom extractor or
+`ctx.request().extensions().get::<Ja4>()`. The optional state returned by
+`run_app_with_hooks` is available only after EdgeZero reaches its strongest
+terminal delivery boundary. Detached admission responses skip the response
+closure and return `None`.
+
+For fully manual wiring, `FastlyService::send_request_with_hooks` provides the
+same closed lifecycle for an already-received request. It does not expose a
+response-returning dispatch operation.
 
 ### Owning your own logging
 

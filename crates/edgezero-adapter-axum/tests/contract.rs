@@ -13,16 +13,16 @@ use async_stream::stream as async_body_stream;
 use axum::Router;
 use axum::body::Body;
 use axum::http::HeaderValue;
-use axum::http::header::{CONTENT_ENCODING, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, HOST, SET_COOKIE};
 use axum::response::Response;
 use axum::routing::get;
 use bytes::Bytes;
 use edgezero_adapter_axum::outbound::AxumOutboundClient;
 use edgezero_core::body::Body as CoreBody;
 use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason};
-use edgezero_core::http::{Method, StatusCode};
+use edgezero_core::http::{HeaderMap, Method, StatusCode};
 use edgezero_core::time::Deadline;
-use edgezero_core::{OutboundHttpClient as _, OutboundRequest, PROXY_HEADER};
+use edgezero_core::{OutboundCachePolicy, OutboundHttpClient as _, OutboundRequest, PROXY_HEADER};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
@@ -71,7 +71,7 @@ async fn redirect_response_is_not_followed() {
 }
 
 #[tokio::test]
-async fn send_all_reports_per_slot_elapsed() {
+async fn batch_collection_reports_per_slot_elapsed() {
     let origin = start_origin(Router::new().route("/", get(|| async { "ok" }))).await;
     let client = AxumOutboundClient::try_new().expect("client");
     let requests = vec![
@@ -85,15 +85,23 @@ async fn send_all_reports_per_slot_elapsed() {
         .expect("unreachable request"),
     ];
 
-    let results = client.send_all(requests).await;
+    let results = client
+        .start_batch_until(requests, Deadline::after(Duration::from_secs(1)))
+        .collect()
+        .await;
 
-    assert_eq!(results.len(), 2);
-    results[0]
+    assert_eq!(results.slots.len(), 2);
+    results.slots[0]
+        .as_ref()
+        .expect("reachable slot resolved")
         .outcome
         .as_ref()
         .expect("reachable slot succeeds");
     assert!(matches!(
-        results[1].outcome,
+        results.slots[1]
+            .as_ref()
+            .expect("unreachable slot resolved")
+            .outcome,
         Err(EdgeError::BadGateway {
             reason: BadGatewayReason::Unreachable,
             ..
@@ -102,7 +110,7 @@ async fn send_all_reports_per_slot_elapsed() {
 }
 
 #[tokio::test]
-async fn send_all_preflight_precedence_and_indices() {
+async fn batch_preflight_precedence_and_indices() {
     let client = AxumOutboundClient::try_new().expect("client");
     let streamed_upload = OutboundRequest::post("https://example.com/upload")
         .expect("upload request")
@@ -117,21 +125,28 @@ async fn send_all_preflight_precedence_and_indices() {
         .body(CoreBody::stream(stream::iter([bytes::Bytes::new()])));
 
     let results = client
-        .send_all(vec![streamed_upload, streamed_response, method_error])
+        .start_batch_until(
+            vec![streamed_upload, streamed_response, method_error],
+            Deadline::after(Duration::from_secs(1)),
+        )
+        .collect()
         .await;
 
     let messages: Vec<_> = results
+        .slots
         .iter()
-        .map(|slot| match &slot.outcome {
-            Err(EdgeError::BadRequest { message }) => message.as_str(),
-            other => panic!("expected preflight rejection, got {other:?}"),
-        })
+        .map(
+            |slot| match &slot.as_ref().expect("preflight slot resolved").outcome {
+                Err(EdgeError::BadRequest { message }) => message.as_str(),
+                other => panic!("expected preflight rejection, got {other:?}"),
+            },
+        )
         .collect();
     assert_eq!(
         messages,
         [
-            "send_all requires buffered request bodies; use send for a streamed upload",
-            "send_all requires buffered responses; use send for a streamed response",
+            "outbound batches require buffered request bodies; use send for a streamed upload",
+            "outbound batches require buffered responses; use send for a streamed response",
             "GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream",
         ]
     );
@@ -171,7 +186,7 @@ async fn buffered_response_deadline_covers_body_completion() {
 }
 
 #[tokio::test]
-async fn send_all_preserves_absolute_deadline_provenance() {
+async fn batch_preserves_request_deadline_provenance() {
     let origin = start_origin(Router::new().route(
         "/",
         get(|| async {
@@ -185,15 +200,115 @@ async fn send_all_preserves_absolute_deadline_provenance() {
         .expect("request")
         .deadline(Deadline::after(Duration::from_millis(10)));
 
-    let results = client.send_all(vec![request]).await;
+    let results = client
+        .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
+        .collect()
+        .await;
 
     assert!(matches!(
-        results[0].outcome,
+        results.slots[0]
+            .as_ref()
+            .expect("request deadline slot resolved")
+            .outcome,
         Err(EdgeError::GatewayTimeout {
-            cause: BudgetSource::BatchDeadline,
+            cause: BudgetSource::RequestDeadline,
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn batch_yields_complete_exchanges_in_completion_order() {
+    let origin = start_origin(
+        Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    sleep(Duration::from_millis(75)).await;
+                    "slow"
+                }),
+            )
+            .route("/fast", get(|| async { "fast" })),
+    )
+    .await;
+    let client = AxumOutboundClient::try_new().expect("client");
+    let requests = vec![
+        OutboundRequest::get(format!("{origin}/slow")).expect("slow request"),
+        OutboundRequest::get(format!("{origin}/fast")).expect("fast request"),
+    ];
+    let mut batch = client.start_batch_until(requests, Deadline::after(Duration::from_secs(1)));
+
+    let first = batch.next().await.expect("first completion");
+    let second = batch.next().await.expect("second completion");
+
+    assert_eq!(first.index, 1);
+    assert_eq!(second.index, 0);
+    assert!(batch.next().await.is_none());
+}
+
+#[tokio::test]
+async fn batch_cutoff_preserves_completed_slots_and_leaves_pending_none() {
+    let origin = start_origin(
+        Router::new()
+            .route("/fast", get(|| async { "fast" }))
+            .route(
+                "/slow",
+                get(|| async {
+                    sleep(Duration::from_millis(100)).await;
+                    "slow"
+                }),
+            ),
+    )
+    .await;
+    let client = AxumOutboundClient::try_new().expect("client");
+    let results = client
+        .start_batch_until(
+            vec![
+                OutboundRequest::get(format!("{origin}/fast")).expect("fast request"),
+                OutboundRequest::get(format!("{origin}/slow")).expect("slow request"),
+            ],
+            Deadline::after(Duration::from_millis(25)),
+        )
+        .collect()
+        .await;
+
+    assert!(results.slots[0].is_some());
+    assert!(results.slots[1].is_none());
+}
+
+#[tokio::test]
+async fn authority_override_changes_host_only_and_cache_bypass_adds_no_origin_header() {
+    let origin = start_origin(Router::new().route(
+        "/",
+        get(|headers: HeaderMap| async move {
+            let host = headers
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing");
+            let cache_control = headers
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("absent");
+            format!("{host}|{cache_control}")
+        }),
+    ))
+    .await;
+    let client = AxumOutboundClient::try_new().expect("client");
+    let request = OutboundRequest::get(format!("{origin}/"))
+        .expect("request")
+        .host_authority_override("virtual.example:8443")
+        .expect("authority override")
+        .cache_policy(OutboundCachePolicy::Bypass);
+
+    let body = client
+        .send(request)
+        .await
+        .expect("response")
+        .into_bytes_bounded(1_024)
+        .await
+        .expect("response body");
+
+    assert_eq!(body, "virtual.example:8443|absent");
 }
 
 #[tokio::test]

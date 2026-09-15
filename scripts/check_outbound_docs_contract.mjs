@@ -3,6 +3,10 @@
 import { readFileSync } from 'node:fs'
 
 const capabilityPath = 'docs/guide/capabilities.md'
+const proxyGuidePath = 'docs/guide/proxying.md'
+const fastlyGuidePath = 'docs/guide/adapters/fastly.md'
+const scaffoldReadmePath =
+  'crates/edgezero-cli/src/templates/root/README.md.hbs'
 const outboundCorePath = 'crates/edgezero-core/src/outbound.rs'
 const outboundSpecPath =
   'docs/superpowers/specs/2026-05-21-outbound-http-design.md'
@@ -71,6 +75,35 @@ const expectedConfigRows = [
 const expectedOutboundRows = [
   ['outbound-http', 'Native', 'Native', 'BestEffort', 'Native'],
   [
+    'outbound-authority-override',
+    'Native',
+    'BestEffort',
+    'Native',
+    'Unsupported',
+  ],
+  [
+    'outbound-batch-cancellation',
+    'Native',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+  ],
+  [
+    'outbound-batch-completion-order',
+    'Native',
+    'Native',
+    'BestEffort',
+    'Native',
+  ],
+  [
+    'outbound-batch-slot-isolation',
+    'Native',
+    'Native',
+    'BestEffort',
+    'Native',
+  ],
+  ['outbound-cache-bypass', 'Native', 'Native', 'Native', 'Native'],
+  [
     'outbound-complete-resource-accounting',
     'Unsupported',
     'Unsupported',
@@ -92,7 +125,6 @@ const expectedOutboundRows = [
     'BestEffort',
     'BestEffort',
   ],
-  ['send-all-slot-isolation', 'Native', 'Native', 'BestEffort', 'Native'],
   [
     'streamed-upload-deadlines',
     'Native',
@@ -330,6 +362,47 @@ for (const [name, expectedRows, actualRows] of matrices) {
   }
 }
 
+const hardCutSurfaces = [
+  [capabilityPath, capabilitySource],
+  [proxyGuidePath, readFileSync(proxyGuidePath, 'utf8')],
+  [fastlyGuidePath, readFileSync(fastlyGuidePath, 'utf8')],
+  [scaffoldReadmePath, readFileSync(scaffoldReadmePath, 'utf8')],
+]
+for (const [path, source] of hardCutSurfaces) {
+  for (const staleFragment of [
+    'HttpClient::send_all`',
+    '.send_all(',
+    'send-all-slot-isolation',
+    'run_app_with_request_extensions',
+  ]) {
+    if (source.includes(staleFragment)) {
+      fail(`${path} contains removed outbound API text: ${staleFragment}`)
+    }
+  }
+}
+for (const staleFragment of [
+  'harvests response bodies in input order',
+  'harvests responses in input order',
+]) {
+  if (capabilitySource.includes(staleFragment)) {
+    fail(
+      `${capabilityPath} contains stale Fastly batch behavior: ${staleFragment}`,
+    )
+  }
+}
+if (
+  !hardCutSurfaces[1][1].includes('start_batch_until') ||
+  !hardCutSurfaces[1][1].includes('send_all_until')
+) {
+  fail('outbound guide must document completion-order and ordered batch access')
+}
+if (
+  !hardCutSurfaces[2][1].includes('run_app_with_hooks') ||
+  !hardCutSurfaces[2][1].includes('send_request_with_hooks')
+) {
+  fail('Fastly guide must document the closed request/response lifecycle APIs')
+}
+
 let outboundSpecSource
 try {
   outboundSpecSource = readFileSync(outboundSpecPath, 'utf8')
@@ -359,6 +432,18 @@ for (const staleFragment of [
   'The current code (`proxy.rs',
   'crates/edgezero-adapter-spin/src/proxy.rs',
   '(`spin/proxy.rs`)',
+  'harvests every successfully dispatched `PendingRequest` via blocking `wait()`/`poll()`',
+  'cold registration, serial harvest, and streamed-upload cooperative checks',
+  'The target-neutral batch probe exercises both still-pending and later-ready harvest branches',
+  'send_all_preflight_precedence_and_indices',
+  'send_all_dispatches_every_slot_before_wait',
+  'ordered harvest',
+  'harvest-order',
+  'serial harvest',
+  'send_one_validated',
+  'exact eight outbound',
+  'all eight outbound',
+  'Fastly send_all_until adapter overhead',
 ]) {
   if (outboundSpecSource.includes(staleFragment)) {
     fail(

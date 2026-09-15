@@ -1,5 +1,9 @@
 # EdgeZero P0-C + P0-D — Fastly `run_app` dispatch fidelity + app-state injection
 
+> **Superseded lifecycle surface (2026-09-15):** The outbound design now specifies
+> `run_app_with_hooks` and `FastlyService::send_request_with_hooks`; the request-only hook named
+> below was removed in the hard cut. This document remains historical context.
+
 - **Status:** Draft for edgezero maintainer
 - **Date:** 2026-07-03
 - **Target repo:** `github.com/stackpop/edgezero` (`edgezero-adapter-fastly`, `edgezero-core`, `edgezero-macros`)

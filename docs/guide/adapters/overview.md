@@ -63,9 +63,12 @@ accessors. The pre-rewrite `Hooks::config_store()` hook is gone.
 Adapters implement `edgezero_core::outbound::OutboundHttpClient` and inject an `HttpClient` into
 each core request. Implementations must:
 
-- Implement both `send` and index-aligned `send_all`, including per-slot elapsed time
+- Implement `send` and the completion-driven `start_batch_until` driver; ordered collection is
+  provided once by core through `send_all_until`
 - Apply the shared request validation, hop-by-hop normalization, deadline, and response-body rules
 - Enforce independent request, encoded response, decoded response, final buffer, header, Brotli, and chunk-shape controls
+- Map typed cache-bypass and validated wire-authority policy without changing URI-owned routing,
+  TLS SNI, or certificate identity
 - Preserve typed deadline, transport, protocol, codec, and resource failures without message matching
 - Attach `x-edgezero-proxy: <adapter>` to completed outbound responses
 - Publish an exact static capability level for every outbound capability

@@ -139,6 +139,8 @@ impl Adapter for CloudflareCliAdapter {
         match capability {
             Capability::ConfigReadDeadlines
             | Capability::InboundReadDeadlines
+            | Capability::OutboundAuthorityOverride
+            | Capability::OutboundBatchCancellation
             | Capability::OutboundHeaderFidelity
             | Capability::OutboundDeadlines
             | Capability::ResponseEgressAbort
@@ -148,9 +150,11 @@ impl Adapter for CloudflareCliAdapter {
             | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
             Capability::IngressAdmission
             | Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundBatchCompletionOrder
+            | Capability::OutboundBatchSlotIsolation
+            | Capability::OutboundCacheBypass
             | Capability::OutboundFlexiblePhaseBudget
-            | Capability::OutboundHttp
-            | Capability::SendAllSlotIsolation => CapabilitySupport::Native,
+            | Capability::OutboundHttp => CapabilitySupport::Native,
             Capability::ConfigReadAllocationBounds
             | Capability::OutboundCompleteResourceAccounting
             | Capability::RawIngressFramingValidation
@@ -1283,7 +1287,23 @@ mod tests {
                 Capability::OutboundFlexiblePhaseBudget,
                 CapabilitySupport::Native,
             ),
-            (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
+            (
+                Capability::OutboundAuthorityOverride,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::OutboundBatchCancellation,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::OutboundBatchCompletionOrder,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchSlotIsolation,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundCacheBypass, CapabilitySupport::Native),
             (
                 Capability::StreamedUploadDeadlines,
                 CapabilitySupport::BestEffort,

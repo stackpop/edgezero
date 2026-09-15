@@ -1,5 +1,8 @@
 # Runtime SDK Hard-Cut Implementation Plan
 
+> **Status:** Implemented. Outbound batch capability names and APIs in this historical plan are
+> superseded by `2026-09-15-outbound-http-consumer-alignment.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to
 > implement this plan task by task. Apply `superpowers:test-driven-development` to every
 > behavioral change and `superpowers:verification-before-completion` before claiming success.

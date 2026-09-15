@@ -708,7 +708,7 @@ mod tests {
     use super::*;
     use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, request_builder};
     use crate::outbound::{
-        HttpClient, OutboundHttpClient, OutboundRequest, OutboundResponse, OutboundSlotResult,
+        HttpClient, OutboundBatch, OutboundHttpClient, OutboundRequest, OutboundResponse,
     };
     use crate::params::PathParams;
     use async_trait::async_trait;
@@ -743,8 +743,12 @@ mod tests {
             ))
         }
 
-        async fn send_all(&self, _requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
-            Vec::new()
+        fn start_batch_until(
+            &self,
+            requests: Vec<OutboundRequest>,
+            _cutoff: crate::Deadline,
+        ) -> OutboundBatch {
+            OutboundBatch::from_stream(requests.len(), stream::empty())
         }
     }
 

@@ -47,13 +47,15 @@ mod tests {
             .expect("request")
             .stream_response();
 
-        let results = block_on(client.send_all(vec![request]));
+        let results = block_on(
+            client
+                .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
+                .collect(),
+        );
 
-        assert_eq!(results[0].elapsed, Duration::from_millis(7));
-        assert!(matches!(
-            results[0].outcome,
-            Err(EdgeError::BadRequest { .. })
-        ));
+        let slot = results.slots[0].as_ref().expect("resolved slot");
+        assert_eq!(slot.elapsed, Duration::from_millis(7));
+        assert!(matches!(slot.outcome, Err(EdgeError::BadRequest { .. })));
     }
 
     #[test]
@@ -289,13 +291,13 @@ mod tests {
             let expired = map_spin_send_error_for_test(
                 &code,
                 Deadline::at_instant(now),
-                BudgetSource::BatchDeadline,
+                BudgetSource::RequestDeadline,
                 now,
             );
             assert!(matches!(
                 expired,
                 EdgeError::GatewayTimeout {
-                    cause: BudgetSource::BatchDeadline,
+                    cause: BudgetSource::RequestDeadline,
                     ..
                 }
             ));

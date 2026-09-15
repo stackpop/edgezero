@@ -2,30 +2,35 @@ use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::num::NonZeroU64;
+use core::task::Poll;
 use core::time::Duration;
 use edgezero_core::body::{Body, BodyStream};
 use edgezero_core::compression::{
     ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
 };
 use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
-use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
+use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
 use edgezero_core::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use edgezero_core::outbound::{
-    OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
-    OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
-    collect_response_stream, enforce_payload_content_length, insert_proxy_header,
+    OutboundBatch, OutboundBatchItem, OutboundHttpClient, OutboundRequest, OutboundRequestParts,
+    OutboundResponse, OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter,
+    ResponseMode, collect_response_stream, enforce_payload_content_length, insert_proxy_header,
     limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch, normalize_response_headers,
     rechunk_stream, validate_for_dispatch,
 };
-use edgezero_core::time::{DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
+use edgezero_core::time::{
+    Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
+};
 use futures_util::StreamExt as _;
-use futures_util::future::join_all;
+use futures_util::future::{FutureExt as _, LocalBoxFuture, poll_fn};
+use futures_util::stream::{FuturesUnordered, empty};
 use reqwest::header::HeaderMap as ReqwestHeaderMap;
 use reqwest::redirect::Policy;
 use std::sync::Arc;
 use tokio::time::timeout;
 
 /// Native outbound HTTP implementation used by the Axum adapter.
+#[derive(Clone)]
 pub struct AxumOutboundClient {
     client: Arc<reqwest::Client>,
     clock: MonotonicClock,
@@ -36,17 +41,13 @@ struct PreparedRequest {
     parts: OutboundRequestParts,
 }
 
-enum PreparedSlot {
-    Finished(OutboundSlotResult),
-    Pending(Box<PreparedRequest>),
-}
-
 impl AxumOutboundClient {
     async fn execute(&self, prepared: PreparedRequest) -> Result<OutboundResponse, EdgeError> {
         let PreparedRequest { budget, parts } = prepared;
         let OutboundRequestParts {
             body,
             mut headers,
+            host_authority_override,
             max_brotli_decoder_bytes,
             max_brotli_window_bits,
             max_chunk_bytes,
@@ -63,6 +64,10 @@ impl AxumOutboundClient {
 
         if !headers.contains_key(ACCEPT_ENCODING) {
             headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        }
+        if let Some(authority) = host_authority_override {
+            let value = HeaderValue::from_str(authority.as_str()).map_err(EdgeError::internal)?;
+            headers.insert(HOST, value);
         }
         let request_body =
             collect_request_body(body, max_request_body_bytes, budget, &self.clock).await?;
@@ -99,32 +104,34 @@ impl AxumOutboundClient {
         started_at: MonotonicInstant,
     ) -> Result<PreparedRequest, EdgeError> {
         validate_for_dispatch(&request)?;
-        Self::prepare_validated(request, started_at)
+        Self::prepare_validated(request, started_at, None)
     }
 
     fn prepare_batch(
         request: OutboundRequest,
         started_at: MonotonicInstant,
+        cutoff: Deadline,
     ) -> Result<PreparedRequest, EdgeError> {
         validate_for_dispatch(&request)?;
         if request.is_stream_body() {
             return Err(EdgeError::bad_request(
-                "send_all requires buffered request bodies; use send for a streamed upload",
+                "outbound batches require buffered request bodies; use send for a streamed upload",
             ));
         }
         if request.is_stream_response() {
             return Err(EdgeError::bad_request(
-                "send_all requires buffered responses; use send for a streamed response",
+                "outbound batches require buffered responses; use send for a streamed response",
             ));
         }
-        Self::prepare_validated(request, started_at)
+        Self::prepare_validated(request, started_at, Some(cutoff))
     }
 
     fn prepare_validated(
         mut request: OutboundRequest,
         started_at: MonotonicInstant,
+        batch_cutoff: Option<Deadline>,
     ) -> Result<PreparedRequest, EdgeError> {
-        let budget = dispatch_budget(&request, started_at)?;
+        let budget = dispatch_budget(&request, started_at, batch_cutoff)?;
         normalize_for_dispatch(&mut request)?;
         Ok(PreparedRequest {
             budget,
@@ -179,34 +186,71 @@ impl OutboundHttpClient for AxumOutboundClient {
     }
 
     #[inline]
-    async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
+    fn start_batch_until(&self, requests: Vec<OutboundRequest>, cutoff: Deadline) -> OutboundBatch {
         let batch_started_at = self.clock.now();
-        let preflight: Vec<PreparedSlot> = requests
-            .into_iter()
-            .map(|request| {
-                Self::prepare_batch(request, batch_started_at).map_or_else(
-                    |error| {
-                        PreparedSlot::Finished(finish_slot(
-                            batch_started_at,
-                            Err(error),
-                            &self.clock,
-                        ))
-                    },
-                    |prepared| PreparedSlot::Pending(Box::new(prepared)),
-                )
-            })
-            .collect();
+        let slot_count = requests.len();
+        if cutoff.is_expired_at(batch_started_at) {
+            return OutboundBatch::from_stream(slot_count, empty());
+        }
 
-        join_all(preflight.into_iter().map(|slot| async move {
-            match slot {
-                PreparedSlot::Pending(prepared) => {
-                    let outcome = self.execute(*prepared).await;
-                    finish_slot(batch_started_at, outcome, &self.clock)
+        let mut completed = Vec::new();
+        let pending_slots = FuturesUnordered::<LocalBoxFuture<'static, _>>::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            match Self::prepare_batch(request, batch_started_at, cutoff) {
+                Ok(prepared) => {
+                    let client = self.clone();
+                    pending_slots.push(
+                        async move {
+                            let outcome = client.execute(prepared).await;
+                            (index, client.clock.now(), outcome)
+                        }
+                        .boxed_local(),
+                    );
                 }
-                PreparedSlot::Finished(done) => done,
+                Err(error) => completed.push((index, self.clock.now(), Err(error))),
             }
-        }))
-        .await
+        }
+
+        let completions = stream! {
+            let mut pending = pending_slots;
+            poll_fn(|context| {
+                loop {
+                    match pending.poll_next_unpin(context) {
+                        Poll::Ready(Some(item)) => completed.push(item),
+                        Poll::Ready(None) | Poll::Pending => {
+                            return Poll::Ready(());
+                        }
+                    }
+                }
+            }).await;
+
+            for (index, completed_at, outcome) in completed {
+                let Some(item) = finish_batch_item(
+                    index,
+                    batch_started_at,
+                    completed_at,
+                    cutoff,
+                    outcome,
+                ) else {
+                    return;
+                };
+                yield item;
+            }
+
+            while let Some((index, completed_at, outcome)) = pending.next().await {
+                let Some(item) = finish_batch_item(
+                    index,
+                    batch_started_at,
+                    completed_at,
+                    cutoff,
+                    outcome,
+                ) else {
+                    return;
+                };
+                yield item;
+            }
+        };
+        OutboundBatch::from_stream(slot_count, completions)
     }
 }
 
@@ -296,13 +340,25 @@ fn deadline_stream(
     .boxed_local()
 }
 
-fn finish_slot(
+fn finish_batch_item(
+    index: usize,
     started_at: MonotonicInstant,
+    completed_at: MonotonicInstant,
+    cutoff: Deadline,
     outcome: Result<OutboundResponse, EdgeError>,
-    clock: &MonotonicClock,
-) -> OutboundSlotResult {
-    let completed_at = clock.now();
-    match completed_at.checked_duration_since(started_at) {
+) -> Option<OutboundBatchItem> {
+    if cutoff.is_expired_at(completed_at)
+        || matches!(
+            outcome,
+            Err(EdgeError::GatewayTimeout {
+                cause: BudgetSource::BatchCutoff,
+                ..
+            })
+        )
+    {
+        return None;
+    }
+    let result = match completed_at.checked_duration_since(started_at) {
         Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
         None => OutboundSlotResult::new(
             Duration::ZERO,
@@ -310,7 +366,8 @@ fn finish_slot(
                 "monotonic clock moved backwards during outbound dispatch"
             ))),
         ),
-    }
+    };
+    Some(OutboundBatchItem::new(index, result))
 }
 
 #[expect(
@@ -547,13 +604,14 @@ mod clock_tests {
             .expect("request")
             .stream_response();
 
-        let results = client.send_all(vec![request]).await;
+        let results = client
+            .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
+            .collect()
+            .await;
 
-        assert_eq!(results[0].elapsed, Duration::from_millis(9));
-        assert!(matches!(
-            results[0].outcome,
-            Err(EdgeError::BadRequest { .. })
-        ));
+        let slot = results.slots[0].as_ref().expect("resolved slot");
+        assert_eq!(slot.elapsed, Duration::from_millis(9));
+        assert!(matches!(slot.outcome, Err(EdgeError::BadRequest { .. })));
     }
 
     #[tokio::test]
@@ -568,13 +626,14 @@ mod clock_tests {
             .expect("request")
             .stream_response();
 
-        let results = client.send_all(vec![request]).await;
+        let results = client
+            .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
+            .collect()
+            .await;
 
-        assert_eq!(results[0].elapsed, Duration::ZERO);
-        assert!(matches!(
-            results[0].outcome,
-            Err(EdgeError::Internal { .. })
-        ));
+        let slot = results.slots[0].as_ref().expect("resolved slot");
+        assert_eq!(slot.elapsed, Duration::ZERO);
+        assert!(matches!(slot.outcome, Err(EdgeError::Internal { .. })));
     }
 
     #[test]

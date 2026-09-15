@@ -19,6 +19,8 @@ mod secret_store_compile_check {
 )]
 mod tests {
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use bytes::Bytes;
     use edgezero_adapter_fastly::context::FastlyRequestContext;
@@ -33,7 +35,6 @@ mod tests {
     use fastly::Request as FastlyRequest;
     use fastly::http::Method as FastlyMethod;
     use futures::{executor::block_on, stream};
-    use std::sync::Arc;
 
     struct FixedConfigStore(&'static str);
 
@@ -183,6 +184,113 @@ mod tests {
             block_on(response.into_body().into_bytes_bounded(64)).expect("response body"),
             Bytes::from_static(b"chunk-1chunk-2")
         );
+    }
+
+    #[test]
+    #[cfg(feature = "test-utils")]
+    fn closed_lifecycle_orders_hooks_and_returns_state_after_delivery() {
+        #[derive(Clone)]
+        struct HookValue(&'static str);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let handler_events = Arc::clone(&events);
+        let router = RouterService::builder()
+            .get("/hook", move |ctx: RequestContext| {
+                let request_events = Arc::clone(&handler_events);
+                async move {
+                    request_events.lock().expect("events").push("handler");
+                    let value = ctx
+                        .extensions()
+                        .get::<HookValue>()
+                        .map_or("missing", |value| value.0);
+                    Ok::<_, EdgeError>(value)
+                }
+            })
+            .build();
+        let app = App::new(router);
+        let request = fastly_request(FastlyMethod::GET, "/ignored", None);
+        let prepare_events = Arc::clone(&events);
+        let finalize_events = Arc::clone(&events);
+        let delivery_events = Arc::clone(&events);
+
+        let state = FastlyService::new(&app)
+            .run_request_with_hooks_for_test(
+                request,
+                move |raw, extensions| {
+                    prepare_events.lock().expect("events").push("prepare");
+                    raw.set_url("http://example.com/hook");
+                    extensions.insert(HookValue("visible"));
+                },
+                move |response| {
+                    finalize_events.lock().expect("events").push("finalize");
+                    *response.status_mut() = StatusCode::CREATED;
+                    response
+                        .headers_mut()
+                        .insert("x-finalized", "yes".parse().expect("header"));
+                    42_u8
+                },
+                move |envelope| {
+                    delivery_events.lock().expect("events").push("deliver");
+                    let response = envelope.into_response();
+                    assert_eq!(response.status(), StatusCode::CREATED);
+                    assert_eq!(
+                        response.headers().get("x-finalized"),
+                        Some(&"yes".parse().expect("header"))
+                    );
+                    assert_eq!(
+                        block_on(response.into_body().into_bytes_bounded(64))
+                            .expect("response body"),
+                        Bytes::from_static(b"visible")
+                    );
+                    Ok(())
+                },
+            )
+            .expect("closed lifecycle");
+
+        assert_eq!(state, Some(42));
+        assert_eq!(
+            *events.lock().expect("events"),
+            ["prepare", "handler", "finalize", "deliver"]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "test-utils")]
+    fn detached_ingress_response_skips_routed_response_hook() {
+        use edgezero_core::ingress::AdmissionDecision;
+
+        let mut app = build_test_app();
+        app.set_ingress_admission_policy(|_head| {
+            AdmissionDecision::Refuse(
+                response_builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::from("refused"))
+                    .expect("refusal"),
+            )
+        });
+        let finalized = Arc::new(AtomicUsize::new(0));
+        let finalized_hook = Arc::clone(&finalized);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_hook = Arc::clone(&delivered);
+
+        let state = FastlyService::new(&app)
+            .run_request_with_hooks_for_test(
+                fastly_request(FastlyMethod::GET, "/uri", None),
+                |_raw, _extensions| {},
+                move |_response| {
+                    finalized_hook.fetch_add(1, Ordering::SeqCst);
+                    7_u8
+                },
+                move |_envelope| {
+                    delivered_hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect("detached lifecycle");
+
+        assert_eq!(state, None);
+        assert_eq!(finalized.load(Ordering::SeqCst), 0);
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -802,17 +910,11 @@ mod tests {
     )
 )]
 mod outbound_contract_tests {
-    use std::cell::RefCell;
-    use std::ops::ControlFlow;
-
     use bytes::Bytes;
-    use edgezero_adapter_fastly::outbound::{
-        orchestrate_batch_for_test, validate_batch_request_for_test,
-    };
+    use edgezero_adapter_fastly::outbound::validate_batch_request_for_test;
     use edgezero_core::body::Body;
     use edgezero_core::http::{Method, Uri};
     use edgezero_core::outbound::OutboundRequest;
-    use futures::{executor::block_on, future::ready};
     use futures_util::stream;
 
     fn request() -> OutboundRequest {
@@ -842,79 +944,6 @@ mod outbound_contract_tests {
         assert_eq!(accepted, vec![true, false, false, true]);
     }
 
-    #[test]
-    fn send_all_dispatches_every_slot_before_wait() {
-        let events = RefCell::new(Vec::new());
-        let outcomes = block_on(orchestrate_batch_for_test(
-            0_usize..4_usize,
-            |index| {
-                events.borrow_mut().push(format!("dispatch:{index}"));
-                if index == 1 {
-                    Err(101_usize)
-                } else {
-                    Ok(index)
-                }
-            },
-            |index| {
-                events.borrow_mut().push(format!("wait:{index}"));
-                ready(index.saturating_add(10))
-            },
-            |index| ready(ControlFlow::Continue(index)),
-        ));
-
-        assert_eq!(
-            events.into_inner(),
-            [
-                "dispatch:0",
-                "dispatch:1",
-                "dispatch:2",
-                "dispatch:3",
-                "wait:0",
-                "wait:2",
-                "wait:3",
-            ]
-        );
-        assert_eq!(outcomes, [10, 101, 12, 13]);
-    }
-
-    #[test]
-    fn send_all_captures_later_ready_slots_during_earlier_harvest() {
-        let events = RefCell::new(Vec::new());
-        let outcomes = block_on(orchestrate_batch_for_test(
-            0_usize..3_usize,
-            |index| {
-                events.borrow_mut().push(format!("dispatch:{index}"));
-                Ok::<_, usize>(index)
-            },
-            |index| {
-                events.borrow_mut().push(format!("wait:{index}"));
-                ready(index.saturating_add(10))
-            },
-            |index| {
-                events.borrow_mut().push(format!("poll:{index}"));
-                ready(if index == 2 {
-                    ControlFlow::Break(12)
-                } else {
-                    ControlFlow::Continue(index)
-                })
-            },
-        ));
-
-        assert_eq!(
-            events.into_inner(),
-            [
-                "dispatch:0",
-                "dispatch:1",
-                "dispatch:2",
-                "wait:0",
-                "poll:1",
-                "poll:2",
-                "wait:1",
-            ]
-        );
-        assert_eq!(outcomes, [10, 11, 12]);
-    }
-
     #[cfg(all(feature = "fastly", target_arch = "wasm32"))]
     mod runtime_tests {
         use std::time::Duration;
@@ -924,6 +953,7 @@ mod outbound_contract_tests {
         };
         use edgezero_core::error::EdgeError;
         use edgezero_core::outbound::OutboundHttpClient as _;
+        use edgezero_core::time::Deadline;
         use futures::executor::block_on;
 
         use super::*;
@@ -935,17 +965,19 @@ mod outbound_contract_tests {
                 .body(Bytes::from_static(b"body"))
                 .timeout(Duration::from_secs(1));
 
-            let results = block_on(FastlyOutboundClient::new().send_all(vec![request]));
+            let results = block_on(
+                FastlyOutboundClient::new()
+                    .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
+                    .collect(),
+            );
+            let slot = results.slots[0].as_ref().expect("resolved slot");
 
-            let Err(EdgeError::Internal { source }) = &results[0].outcome else {
-                panic!(
-                    "expected dispatch-slack failure, got {:?}",
-                    results[0].outcome
-                );
+            let Err(EdgeError::Internal { source }) = &slot.outcome else {
+                panic!("expected dispatch-slack failure, got {:?}", slot.outcome);
             };
             assert_eq!(
                 source.to_string(),
-                "Fastly send_all adapter overhead between batch_now and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) exceeded BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration"
+                "Fastly batch adapter overhead between batch_now and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) exceeded BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration"
             );
         }
     }
