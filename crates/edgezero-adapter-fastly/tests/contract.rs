@@ -18,6 +18,8 @@ mod secret_store_compile_check {
     reason = "ingress contracts are grouped after the provider fixture tests"
 )]
 mod tests {
+    use std::io::Cursor;
+
     use bytes::Bytes;
     use edgezero_adapter_fastly::context::FastlyRequestContext;
     use edgezero_adapter_fastly::request::{FastlyService, into_core_request};
@@ -27,7 +29,7 @@ mod tests {
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{Method, Response, StatusCode, response_builder};
-    use edgezero_core::router::RouterService;
+    use edgezero_core::router::{RouteMetadata, RouterService};
     use fastly::Request as FastlyRequest;
     use fastly::http::Method as FastlyMethod;
     use futures::{executor::block_on, stream};
@@ -460,7 +462,7 @@ mod tests {
                 &app,
                 Method::GET,
                 "/too-long".parse().expect("URI"),
-                std::io::Cursor::new(Vec::<u8>::new()),
+                Cursor::new(Vec::<u8>::new()),
             )
             .expect("typed response");
             let response = complete_response(egress);
@@ -499,12 +501,10 @@ mod tests {
             assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             let observed = reports.lock().expect("reports lock");
             assert_eq!(observed.len(), 1);
-            assert_eq!(observed[0].outcome, ResponseEgressOutcome::HostHandoff);
+            let report = observed.first().expect("one report");
+            assert_eq!(report.outcome, ResponseEgressOutcome::HostHandoff);
             assert_eq!(
-                observed[0]
-                    .route
-                    .as_ref()
-                    .map(edgezero_core::router::RouteMetadata::pattern),
+                report.route.as_ref().map(RouteMetadata::pattern),
                 Some("/owned")
             );
         }
@@ -794,8 +794,16 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(feature = "test-utils")]
+#[cfg_attr(
+    all(feature = "fastly", target_arch = "wasm32"),
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "the target-runtime probe follows shared batch contracts"
+    )
+)]
 mod outbound_contract_tests {
     use std::cell::RefCell;
+    use std::ops::ControlFlow;
 
     use bytes::Bytes;
     use edgezero_adapter_fastly::outbound::{
@@ -851,6 +859,7 @@ mod outbound_contract_tests {
                 events.borrow_mut().push(format!("wait:{index}"));
                 ready(index.saturating_add(10))
             },
+            |index| ready(ControlFlow::Continue(index)),
         ));
 
         assert_eq!(
@@ -866,6 +875,44 @@ mod outbound_contract_tests {
             ]
         );
         assert_eq!(outcomes, [10, 101, 12, 13]);
+    }
+
+    #[test]
+    fn send_all_captures_later_ready_slots_during_earlier_harvest() {
+        let events = RefCell::new(Vec::new());
+        let outcomes = block_on(orchestrate_batch_for_test(
+            0_usize..3_usize,
+            |index| {
+                events.borrow_mut().push(format!("dispatch:{index}"));
+                Ok::<_, usize>(index)
+            },
+            |index| {
+                events.borrow_mut().push(format!("wait:{index}"));
+                ready(index.saturating_add(10))
+            },
+            |index| {
+                events.borrow_mut().push(format!("poll:{index}"));
+                ready(if index == 2 {
+                    ControlFlow::Break(12)
+                } else {
+                    ControlFlow::Continue(index)
+                })
+            },
+        ));
+
+        assert_eq!(
+            events.into_inner(),
+            [
+                "dispatch:0",
+                "dispatch:1",
+                "dispatch:2",
+                "wait:0",
+                "poll:1",
+                "poll:2",
+                "wait:1",
+            ]
+        );
+        assert_eq!(outcomes, [10, 11, 12]);
     }
 
     #[cfg(all(feature = "fastly", target_arch = "wasm32"))]

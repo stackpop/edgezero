@@ -1,9 +1,11 @@
 use std::io;
 use std::str;
 
-use async_compression::futures::bufread::{BrotliDecoder, GzipDecoder};
+use async_compression::futures::bufread::{BrotliDecoder as AsyncBrotliDecoder, GzipDecoder};
 use async_stream::stream;
 use bytes::Bytes;
+use compression_codecs::BrotliDecoder as PinnedBrotliCodec;
+use compression_core::util::PartialBuffer;
 use futures::io::AsyncReadExt as _;
 use futures_util::{StreamExt as _, TryStreamExt as _, stream as futures_stream};
 
@@ -13,6 +15,9 @@ use crate::http::HeaderMap;
 use crate::http::header::CONTENT_ENCODING;
 
 const BUFFER_SIZE: usize = 8 * 1024;
+
+const _: fn(brotli::BrotliResult) -> brotli_decompressor::BrotliResult = |result| result;
+const _: fn(PartialBuffer<&[u8]>) = consume_pinned_compression_core;
 
 /// Conservative non-window charge for the decoder implementation pinned by
 /// the workspace lockfiles.
@@ -47,6 +52,8 @@ pub enum ContentEncoding {
     Identity,
     Passthrough,
 }
+
+fn consume_pinned_compression_core(_buffer: PartialBuffer<&[u8]>) {}
 
 #[must_use]
 #[inline]
@@ -246,7 +253,8 @@ fn decode_brotli_payload(source: BodyStream, initial_chunks: Vec<Bytes>) -> Body
     stream! {
         let replayed_stream = futures_stream::iter(initial_chunks.into_iter().map(Ok)).chain(source);
         let reader = replayed_stream.map_err(edge_error_to_io).into_async_read();
-        let mut decoder = BrotliDecoder::new(reader);
+        let mut decoder =
+            AsyncBrotliDecoder::with_codec(reader, PinnedBrotliCodec::new());
         let mut buffer = vec![0_u8; BUFFER_SIZE];
 
         loop {
@@ -472,10 +480,7 @@ mod tests {
 
     #[test]
     fn brotli_decoder_memory_charge_is_pinned_and_checked() {
-        assert_eq!(
-            brotli_decoder_memory_charge(24_u8).unwrap(),
-            BROTLI_DECODER_FIXED_CHARGE_BYTES + (1_u64 << 24_u32)
-        );
+        assert_eq!(brotli_decoder_memory_charge(24_u8).unwrap(), 0x0200_0000);
         assert!(matches!(
             brotli_decoder_memory_charge(9),
             Err(EdgeError::BadRequest { .. })

@@ -827,6 +827,8 @@ dependencies = [
  "brotli",
  "brotli-decompressor",
  "bytes",
+ "compression-codecs",
+ "compression-core",
  "edgezero-macros",
  "flate2",
  "futures",

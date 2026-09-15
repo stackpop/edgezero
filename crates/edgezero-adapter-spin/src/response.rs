@@ -18,7 +18,9 @@ use edgezero_core::response_egress::{
     RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
     ResponseEgressFallbackDisposition, ResponseEgressOutcome, ResponseEgressPolicy,
 };
-use edgezero_core::response_egress_framing::{PreparedResponseEgress, prepare_response_egress};
+use edgezero_core::response_egress_framing::{
+    PreparedResponseEgress, prepare_response_egress, response_egress_source_error_category,
+};
 use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
 use futures_util::StreamExt as _;
 use futures_util::future::{FutureExt as _, LocalBoxFuture};
@@ -188,7 +190,13 @@ where
         let Some(item) = next else {
             break;
         };
-        let chunk = item.map_err(|_error| DeliveryError::Source)?;
+        let chunk = item.map_err(|error| {
+            log::warn!(
+                "response-egress Spin body source failed after commit: {}",
+                response_egress_source_error_category(&error)
+            );
+            DeliveryError::Source
+        })?;
         write_chunk(chunk.to_vec(), deadline, attempt, clock, io).await?;
     }
     io.finish(deadline, clock)
@@ -1009,7 +1017,8 @@ mod tests {
 
     fn new_attempt(observer: &RecordingObserver, now: MonotonicInstant) -> ResponseEgressAttempt {
         let headers = HeaderMap::new();
-        let head = ResponseEgressHead::new(StatusCode::OK, Version::HTTP_11, &headers, now, None);
+        let head =
+            ResponseEgressHead::new(StatusCode::OK, Version::HTTP_11, &headers, None, now, None);
         ResponseEgressAttempt::new(
             &head,
             now,

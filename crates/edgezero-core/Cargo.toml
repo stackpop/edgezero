@@ -16,7 +16,11 @@ anyhow = { workspace = true }
 async-compression = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
+brotli = { workspace = true }
+brotli-decompressor = { workspace = true }
 bytes = { workspace = true }
+compression-codecs = { workspace = true }
+compression-core = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
@@ -48,7 +52,5 @@ web-time = { workspace = true }
 test-utils = []
 
 [dev-dependencies]
-brotli = { workspace = true }
-brotli-decompressor = { workspace = true }
 flate2 = { workspace = true }
 tempfile = { workspace = true }

@@ -8,6 +8,8 @@ const outboundSpecPath =
   'docs/superpowers/specs/2026-05-21-outbound-http-design.md'
 const inboundSpecPath =
   'docs/superpowers/specs/2026-08-22-inbound-body-design.md'
+const responseEgressSpecPath =
+  'docs/superpowers/specs/2026-09-08-response-egress-design.md'
 const outboundImplementationIndexPath =
   'docs/superpowers/plans/2026-07-10-outbound-http-implementation.md'
 const spinPhasePath =
@@ -160,12 +162,12 @@ const expectedLimitRows = [
   ],
   [
     'max_response_header_bytes',
-    'Cumulative guest-visible header name/value bytes',
+    'Cumulative guest-visible header name/value bytes, including `x-edgezero-proxy`',
     'Unset',
   ],
   [
     'max_response_header_count',
-    'Cumulative guest-visible header fields',
+    'Cumulative guest-visible header fields, including `x-edgezero-proxy`',
     'Unset',
   ],
   [
@@ -399,10 +401,14 @@ for (const [path, source] of currentDocumentation) {
     'Viceroy 0.17.0',
     'viceroy 0.17.0',
     'Fastly SDK 0.12.1',
+    'Fastly 0.12.1',
+    'fastly v0.12.1',
+    'fastly = "=0.12.1"',
+    'fastly --precise 0.12.1',
     'Worker 0.8.3',
     'worker = "=0.8.3"',
     'worker --precise 0.8.3',
-    "worker v0\\.8\\.3",
+    'worker v0.8.3',
   ]) {
     if (source.includes(staleVersion)) {
       fail(`${path} contains stale runtime tooling: ${staleVersion}`)
@@ -420,6 +426,63 @@ if (
   outboundImplementationIndexSource.includes('all downstream phases stay')
 ) {
   fail('outbound implementation index still presents implemented phases as pending')
+}
+
+const cloudflarePhaseSource = currentDocumentation[1][1]
+for (const staleFragment of [
+  "Cloudflare's Native timing claim",
+  'Cloudflare: Native for HTTP, deadlines',
+  '| `outbound-deadlines` | Native | Native |',
+  '| `streamed-upload-deadlines` | Native | Native |',
+]) {
+  if (cloudflarePhaseSource.includes(staleFragment)) {
+    fail(
+      `${cloudflarePhasePath} contains stale Cloudflare capability text: ${staleFragment}`,
+    )
+  }
+}
+
+const migrationPhaseSource = currentDocumentation[4][1]
+for (const currentRow of [
+  '| `outbound-deadlines` | Native | BestEffort | BestEffort | BestEffort |',
+  '| `streamed-upload-deadlines` | Native | BestEffort | BestEffort | BestEffort |',
+  '| `lazy-streamed-response-passthrough` | Native | Native | BestEffort | BestEffort |',
+]) {
+  if (!migrationPhaseSource.includes(currentRow)) {
+    fail(`${migrationPhasePath} is missing current capability row: ${currentRow}`)
+  }
+}
+
+for (const dependency of [
+  'async-compression 0.4.43',
+  'brotli 8.0.4',
+  'brotli-decompressor 5.0.1',
+  'compression-codecs 0.4.38',
+  'compression-core 0.4.32',
+]) {
+  if (!outboundSpecSource.includes(`\`${dependency}\``)) {
+    fail(`outbound specification is missing audited dependency pin ${dependency}`)
+  }
+}
+if (
+  !outboundSpecSource.includes(
+    "including EdgeZero's synthetic `x-edgezero-proxy` marker",
+  )
+) {
+  fail('outbound specification does not include the proxy header in response caps')
+}
+
+const responseEgressSpecSource = readFileSync(responseEgressSpecPath, 'utf8')
+for (const requiredFragment of [
+  'pub struct ResponseEgressDeadline(Deadline);',
+  'ResponseEgressHead::application_deadline()',
+  'queue-through-egress',
+]) {
+  if (!responseEgressSpecSource.includes(requiredFragment)) {
+    fail(
+      `${responseEgressSpecPath} is missing application deadline contract: ${requiredFragment}`,
+    )
+  }
 }
 
 const limitsHeadingIndex = lines.findIndex(

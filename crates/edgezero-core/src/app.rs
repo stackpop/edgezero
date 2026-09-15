@@ -757,6 +757,7 @@ mod tests {
             StatusCode::OK,
             Version::HTTP_11,
             &headers,
+            None,
             request_start,
             Some(&route),
         );
@@ -804,6 +805,7 @@ mod tests {
             StatusCode::NO_CONTENT,
             Version::HTTP_11,
             &headers,
+            None,
             started_at,
             None,
         );

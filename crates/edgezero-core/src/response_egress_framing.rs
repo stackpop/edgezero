@@ -1,7 +1,7 @@
 use std::mem;
 
 use crate::body::{Body, BodyStream};
-use crate::error::EdgeError;
+use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError, ResponseLimitReason};
 use crate::http::header::{
     CONNECTION, CONTENT_LENGTH, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
     TRANSFER_ENCODING, UPGRADE,
@@ -202,6 +202,58 @@ pub fn response_egress_body_length_error(
         .copied()
 }
 
+/// Returns a fixed diagnostic category for a post-commit response body source failure.
+///
+/// The result never includes an application/provider message and is therefore safe for adapter
+/// logs after the response head has already been committed.
+#[must_use]
+#[doc(hidden)]
+#[inline]
+pub fn response_egress_source_error_category(error: &EdgeError) -> &'static str {
+    if let Some(length_error) = response_egress_body_length_error(error) {
+        return match length_error {
+            ResponseEgressBodyLengthError::Exceeded => "declared_length_exceeded",
+            ResponseEgressBodyLengthError::Incomplete => "declared_length_incomplete",
+        };
+    }
+    match error {
+        EdgeError::BadGateway { reason, .. } => match reason {
+            BadGatewayReason::Decode(decode) => match decode {
+                BadGatewayDecodeReason::Brotli => "bad_gateway_decode_brotli",
+                BadGatewayDecodeReason::Gzip => "bad_gateway_decode_gzip",
+                BadGatewayDecodeReason::Json => "bad_gateway_decode_json",
+            },
+            BadGatewayReason::Protocol => "bad_gateway_protocol",
+            BadGatewayReason::Transport => "bad_gateway_transport",
+            BadGatewayReason::Unreachable => "bad_gateway_unreachable",
+            BadGatewayReason::Unspecified => "bad_gateway_unspecified",
+        },
+        EdgeError::BadRequest { .. } => "bad_request",
+        EdgeError::ConfigOutOfDate { .. } => "config_out_of_date",
+        EdgeError::GatewayTimeout { .. } => "gateway_timeout",
+        EdgeError::Internal { .. } => "internal",
+        EdgeError::MethodNotAllowed { .. } => "method_not_allowed",
+        EdgeError::NotFound { .. } => "not_found",
+        EdgeError::NotImplemented { .. } => "not_implemented",
+        EdgeError::RequestHeaderFieldsTooLarge { .. } => "request_header_fields_too_large",
+        EdgeError::RequestTimeout { .. } => "request_timeout",
+        EdgeError::ResponseTooLarge { reason, .. } => match reason {
+            ResponseLimitReason::BrotliWindow => "response_too_large_brotli_window",
+            ResponseLimitReason::BufferedBody => "response_too_large_buffered_body",
+            ResponseLimitReason::DecodedBody => "response_too_large_decoded_body",
+            ResponseLimitReason::DecoderMemory => "response_too_large_decoder_memory",
+            ResponseLimitReason::EncodedBody => "response_too_large_encoded_body",
+            ResponseLimitReason::HeaderBytes => "response_too_large_header_bytes",
+            ResponseLimitReason::HeaderCount => "response_too_large_header_count",
+            ResponseLimitReason::Unspecified => "response_too_large_unspecified",
+        },
+        EdgeError::ServiceUnavailable { .. } => "service_unavailable",
+        EdgeError::StoreExtraction { .. } => "store_extraction",
+        EdgeError::UriTooLong { .. } => "uri_too_long",
+        EdgeError::Validation { .. } => "validation",
+    }
+}
+
 fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>, ResponseEgressFramingError> {
     let mut parsed = None;
     for header_value in headers.get_all(CONTENT_LENGTH) {
@@ -270,12 +322,12 @@ mod tests {
     use futures_util::stream::{self, poll_fn};
 
     use crate::body::Body;
-    use crate::error::EdgeError;
+    use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError};
     use crate::http::{Method, Response, StatusCode, response_builder};
 
     use super::{
         ResponseEgressBodyLengthError, ResponseEgressFramingError, prepare_response_egress,
-        response_egress_body_length_error,
+        response_egress_body_length_error, response_egress_source_error_category,
     };
 
     struct DropSignal(Rc<Cell<usize>>);
@@ -790,5 +842,33 @@ mod tests {
             tunnel_precedence_error,
             ResponseEgressFramingError::UnsupportedTunnel
         );
+    }
+
+    #[test]
+    fn source_error_diagnostics_are_typed_and_never_include_private_messages() {
+        let cases = [
+            (
+                EdgeError::internal(ResponseEgressBodyLengthError::Exceeded),
+                "declared_length_exceeded",
+            ),
+            (
+                EdgeError::bad_gateway_with_reason(
+                    "private token=secret",
+                    BadGatewayReason::Decode(BadGatewayDecodeReason::Brotli),
+                ),
+                "bad_gateway_decode_brotli",
+            ),
+            (
+                EdgeError::internal(anyhow::anyhow!("private token=secret")),
+                "internal",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let category = response_egress_source_error_category(&error);
+            assert_eq!(category, expected);
+            assert!(!category.contains("private"));
+            assert!(!category.contains("secret"));
+        }
     }
 }

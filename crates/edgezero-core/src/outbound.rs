@@ -163,26 +163,31 @@ impl ResponseHeaderLimiter {
     #[inline]
     pub fn observe(&mut self, headers: &HeaderMap) -> Result<(), EdgeError> {
         for (name, value) in headers {
-            let next_count = self
-                .observed_count
-                .checked_add(1)
-                .ok_or_else(|| response_limit_error(ResponseLimitReason::HeaderCount))?;
-            self.observed_count = next_count;
-            if self.max_count.is_some_and(|max| next_count > max) {
-                return Err(response_limit_error(ResponseLimitReason::HeaderCount));
-            }
+            self.observe_field(name, value)?;
+        }
+        Ok(())
+    }
 
-            let name_bytes = u64::try_from(name.as_str().len()).unwrap_or(u64::MAX);
-            let value_bytes = u64::try_from(value.as_bytes().len()).unwrap_or(u64::MAX);
-            let next_bytes = self
-                .observed_bytes
-                .checked_add(name_bytes)
-                .and_then(|total| total.checked_add(value_bytes))
-                .ok_or_else(|| response_limit_error(ResponseLimitReason::HeaderBytes))?;
-            self.observed_bytes = next_bytes;
-            if self.max_bytes.is_some_and(|max| next_bytes > max) {
-                return Err(response_limit_error(ResponseLimitReason::HeaderBytes));
-            }
+    fn observe_field(&mut self, name: &HeaderName, value: &HeaderValue) -> Result<(), EdgeError> {
+        let next_count = self
+            .observed_count
+            .checked_add(1)
+            .ok_or_else(|| response_limit_error(ResponseLimitReason::HeaderCount))?;
+        self.observed_count = next_count;
+        if self.max_count.is_some_and(|max| next_count > max) {
+            return Err(response_limit_error(ResponseLimitReason::HeaderCount));
+        }
+
+        let name_bytes = u64::try_from(name.as_str().len()).unwrap_or(u64::MAX);
+        let value_bytes = u64::try_from(value.as_bytes().len()).unwrap_or(u64::MAX);
+        let next_bytes = self
+            .observed_bytes
+            .checked_add(name_bytes)
+            .and_then(|total| total.checked_add(value_bytes))
+            .ok_or_else(|| response_limit_error(ResponseLimitReason::HeaderBytes))?;
+        self.observed_bytes = next_bytes;
+        if self.max_bytes.is_some_and(|max| next_bytes > max) {
+            return Err(response_limit_error(ResponseLimitReason::HeaderBytes));
         }
         Ok(())
     }
@@ -299,7 +304,11 @@ impl OutboundResponse {
     /// already-validated response cannot be assembled.
     #[inline]
     pub fn into_response(mut self) -> Result<Response, EdgeError> {
-        normalize_response_headers(&self.request_method, self.status, &mut self.headers)?;
+        let disposition =
+            normalize_response_headers(&self.request_method, self.status, &mut self.headers)?;
+        if disposition != ResponseBodyDisposition::Payload {
+            self.body = Body::empty();
+        }
         let mut builder = response_builder().status(self.status);
         for (name, value) in &self.headers {
             builder = builder.header(name, value);
@@ -823,6 +832,23 @@ pub fn enforce_payload_content_length(
     Ok(())
 }
 
+/// Accounts and inserts `EdgeZero`'s guest-visible adapter marker.
+///
+/// # Errors
+/// Returns a typed response-header limit error before insertion when the marker would exceed the
+/// configured cumulative byte or field-count cap.
+#[inline]
+pub fn insert_proxy_header(
+    headers: &mut HeaderMap,
+    limiter: &mut ResponseHeaderLimiter,
+    value: HeaderValue,
+) -> Result<(), EdgeError> {
+    let name = HeaderName::from_static(PROXY_HEADER);
+    limiter.observe_field(&name, &value)?;
+    headers.insert(name, value);
+    Ok(())
+}
+
 #[must_use]
 #[inline]
 pub fn limit_decoded_stream(stream: BodyStream, max: Option<u64>) -> BodyStream {
@@ -1317,10 +1343,9 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_MAX_BROTLI_DECODER_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
-        DEFAULT_OUTBOUND_REQUEST_BODY_BYTES, HttpClient, OutboundHttpClient, OutboundRequest,
-        OutboundResponse, OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter,
-        ResponseMode, collect_response_stream, enforce_payload_content_length,
+        HttpClient, OutboundHttpClient, OutboundRequest, OutboundResponse, OutboundSlotResult,
+        PROXY_HEADER, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
+        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
         limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
@@ -1328,6 +1353,14 @@ mod tests {
     struct MockClient {
         batch_calls: AtomicUsize,
         send_calls: AtomicUsize,
+    }
+
+    struct BodyDropSignal(Rc<Cell<usize>>);
+
+    impl Drop for BodyDropSignal {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_add(1));
+        }
     }
 
     #[async_trait(?Send)]
@@ -1760,36 +1793,45 @@ mod tests {
 
     #[test]
     fn rechunk_stream_is_lazy_and_ordered() {
-        let source = Body::from_stream(stream::iter([
-            Ok(Bytes::from_static(b"abcde")),
-            Ok(Bytes::new()),
-            Err(EdgeError::bad_gateway("source")),
-        ]))
+        let source_polls = Rc::new(Cell::new(0_u8));
+        let observed_polls = Rc::clone(&source_polls);
+        let source = Body::from_stream(stream::poll_fn(move |_context| {
+            let poll = source_polls.get();
+            source_polls.set(poll.saturating_add(1));
+            Poll::Ready(match poll {
+                0 => Some(Ok(Bytes::from_static(b"abcde"))),
+                1 => Some(Ok(Bytes::new())),
+                2 => Some(Err(EdgeError::bad_gateway("source"))),
+                _ => None,
+            })
+        }))
         .into_stream()
         .expect("stream");
         let mut chunks = rechunk_stream(source, NonZeroU64::new(2));
-        let values = block_on(async {
-            let mut values = Vec::new();
-            while let Some(item) = chunks.next().await {
-                match item {
-                    Ok(bytes) => values.push(bytes),
-                    Err(error) => {
-                        assert!(matches!(error, EdgeError::BadGateway { .. }));
-                        break;
-                    }
-                }
-            }
-            values
-        });
+        assert_eq!(observed_polls.get(), 0);
+
         assert_eq!(
-            values,
-            vec![
-                Bytes::from_static(b"ab"),
-                Bytes::from_static(b"cd"),
-                Bytes::from_static(b"e"),
-                Bytes::new(),
-            ]
+            block_on(chunks.next()).expect("first").expect("bytes"),
+            "ab"
         );
+        assert_eq!(observed_polls.get(), 1);
+        assert_eq!(
+            block_on(chunks.next()).expect("second").expect("bytes"),
+            "cd"
+        );
+        assert_eq!(observed_polls.get(), 1);
+        assert_eq!(block_on(chunks.next()).expect("third").expect("bytes"), "e");
+        assert_eq!(observed_polls.get(), 1);
+        assert_eq!(
+            block_on(chunks.next()).expect("empty").expect("bytes"),
+            Bytes::new()
+        );
+        assert_eq!(observed_polls.get(), 2);
+        assert!(matches!(
+            block_on(chunks.next()).expect("error"),
+            Err(EdgeError::BadGateway { .. })
+        ));
+        assert_eq!(observed_polls.get(), 3);
     }
 
     #[test]
@@ -1817,6 +1859,65 @@ mod tests {
                 ..
             }
         ));
+
+        let mut byte_limiter = ResponseHeaderLimiter::new(Some(11), Some(4));
+        byte_limiter.observe(&first).expect("first byte section");
+        byte_limiter.observe(&second).expect("second byte section");
+        let error = byte_limiter
+            .observe(&third)
+            .expect_err("cumulative byte limit");
+        assert!(matches!(
+            error,
+            EdgeError::ResponseTooLarge {
+                reason: ResponseLimitReason::HeaderBytes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn proxy_header_is_included_in_exact_byte_and_count_limits() {
+        let cases = [
+            ("axum", 20_u64),
+            ("cloudflare", 26_u64),
+            ("fastly", 22_u64),
+            ("spin", 20_u64),
+        ];
+
+        for (adapter, exact_bytes) in cases {
+            let value = HeaderValue::from_str(adapter).expect("adapter marker");
+            let mut exact_headers = HeaderMap::new();
+            let mut exact = ResponseHeaderLimiter::new(Some(exact_bytes), Some(1));
+            insert_proxy_header(&mut exact_headers, &mut exact, value.clone())
+                .expect("exact proxy header budget");
+            assert_eq!(exact_headers.get(PROXY_HEADER), Some(&value));
+
+            let mut byte_headers = HeaderMap::new();
+            let mut byte_limited =
+                ResponseHeaderLimiter::new(Some(exact_bytes.saturating_sub(1)), None);
+            let byte_error =
+                insert_proxy_header(&mut byte_headers, &mut byte_limited, value.clone())
+                    .expect_err("proxy header exceeds byte cap");
+            assert!(matches!(
+                byte_error,
+                EdgeError::ResponseTooLarge {
+                    reason: ResponseLimitReason::HeaderBytes,
+                    ..
+                }
+            ));
+
+            let mut count_headers = HeaderMap::new();
+            let mut count_limited = ResponseHeaderLimiter::new(None, Some(0));
+            let count_error = insert_proxy_header(&mut count_headers, &mut count_limited, value)
+                .expect_err("proxy header exceeds count cap");
+            assert!(matches!(
+                count_error,
+                EdgeError::ResponseTooLarge {
+                    reason: ResponseLimitReason::HeaderCount,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
@@ -1878,6 +1979,44 @@ mod tests {
         assert!(response.headers().get("x-private").is_none());
         assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
         assert!(response.into_body().is_stream());
+    }
+
+    #[test]
+    fn outbound_response_into_response_drops_bodyless_status_stream_without_polling() {
+        for (method, status, expected_content_length) in [
+            (Method::GET, StatusCode::EARLY_HINTS, None),
+            (Method::GET, StatusCode::NO_CONTENT, None),
+            (Method::GET, StatusCode::RESET_CONTENT, Some("0")),
+            (Method::GET, StatusCode::NOT_MODIFIED, None),
+            (Method::HEAD, StatusCode::OK, None),
+        ] {
+            let polls = Rc::new(Cell::new(0_usize));
+            let drops = Rc::new(Cell::new(0_usize));
+            let observed_polls = Rc::clone(&polls);
+            let observed_drops = Rc::clone(&drops);
+            let drop_signal = BodyDropSignal(observed_drops);
+            let body = Body::from_stream(stream::poll_fn(move |_| {
+                let _keep_signal_alive = &drop_signal;
+                observed_polls.set(observed_polls.get().saturating_add(1));
+                Poll::Ready(Some(Ok(Bytes::from_static(b"must-not-escape"))))
+            }));
+
+            let response = OutboundResponse::new(method, status, HeaderMap::new(), body)
+                .into_response()
+                .expect("bodyless response");
+
+            assert_eq!(polls.get(), 0, "{status}");
+            assert_eq!(drops.get(), 1, "{status}");
+            assert_eq!(response.body().as_bytes(), Some([].as_slice()), "{status}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok()),
+                expected_content_length,
+                "{status}"
+            );
+        }
     }
 
     #[test]
@@ -2370,19 +2509,13 @@ mod tests {
         let defaults = OutboundRequest::get("https://example.com")
             .expect("defaults")
             .into_parts();
-        assert_eq!(
-            defaults.max_brotli_decoder_bytes,
-            DEFAULT_MAX_BROTLI_DECODER_BYTES
-        );
+        assert_eq!(defaults.max_brotli_decoder_bytes, 0x0200_0000);
         assert_eq!(defaults.max_brotli_window_bits, 24);
-        assert_eq!(
-            defaults.max_request_body_bytes,
-            DEFAULT_OUTBOUND_REQUEST_BODY_BYTES
-        );
+        assert_eq!(defaults.max_request_body_bytes, 0x0080_0000);
         assert_eq!(
             defaults.response_mode,
             ResponseMode::Buffered {
-                max_bytes: DEFAULT_MAX_RESPONSE_BYTES
+                max_bytes: 0x0010_0000
             }
         );
         assert!(defaults.deadline.is_none());
@@ -2516,6 +2649,22 @@ mod tests {
             OutboundRequest::from_request(request, Uri::from_static("https://example.com/target"))
                 .expect("outbound request");
         assert_eq!(outbound.method(), &Method::POST);
+        assert_eq!(
+            outbound.headers().get("x-keep"),
+            Some(&HeaderValue::from_static("yes"))
+        );
+        for removed in [
+            "connection",
+            "x-remove",
+            "host",
+            "content-length",
+            "transfer-encoding",
+        ] {
+            assert!(
+                !outbound.headers().contains_key(removed),
+                "retained {removed}"
+            );
+        }
         assert_eq!(
             outbound.into_parts().body.as_bytes(),
             Some(b"payload".as_slice())

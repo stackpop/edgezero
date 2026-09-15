@@ -72,21 +72,33 @@ policy, and attempt. The adapter obtains one finite absolute deadline:
 pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug)]
+pub struct ResponseEgressDeadline(Deadline);
+
+#[derive(Clone, Copy, Debug)]
 pub struct ResponseEgressPolicy {
     pub write_deadline: Deadline,
 }
 ```
 
+An application that has already computed an absolute response deadline inserts
+`ResponseEgressDeadline` into the returned response extensions. `begin()` removes that
+extension, exposes its value through `ResponseEgressHead::application_deadline()`, and enforces
+the earlier of it and the callback-selected `write_deadline`. This carries a queue-through-egress
+budget without re-anchoring it at adapter conversion. The deadline must use the application's
+`MonotonicClock`; the demo and generated template derive it from `RequestContext::monotonic_clock()`.
+
 `App` owns a synchronous response-egress policy callback configured through
 `Hooks::configure`. The callback receives immutable response-head metadata plus the captured
-request start and optional route metadata; it cannot inspect, consume, or mutate the body.
+request start, optional route metadata, and optional application deadline; it cannot inspect,
+consume, or mutate the body.
 The portable default is
 `Deadline::at_instant(egress_started_at + DEFAULT_RESPONSE_WRITE_BUDGET)`.
 
 The adapter normalizes every callback result to no later than
 `egress_started_at + DEADLINE_FAR_FUTURE` using checked addition. An already-expired result is
 a valid immediate deadline. Arithmetic overflow while deriving the clamp fails before commit
-as `ConversionError`; it does not create an unbounded write.
+as `ConversionError`; it does not create an unbounded write. It then minimum-clamps that result
+against the optional response-carried deadline. Neither path can extend an application deadline.
 
 The deadline measures total response-egress time. It is never reset by response conversion,
 first-byte wait, source readiness, backpressure, chunk boundaries, flushes, close, finish, or

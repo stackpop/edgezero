@@ -31,7 +31,7 @@ mod exchange {
     use std::time::Duration;
 
     use async_stream::stream;
-    use edgezero_core::body::{Body, BodyStream};
+    use edgezero_core::body::BodyStream;
     use edgezero_core::error::EdgeError;
     use futures_util::{StreamExt as _, future::poll_fn};
 
@@ -71,10 +71,6 @@ mod exchange {
             connect: full_remaining,
             first_byte: full_remaining,
         }
-    }
-
-    pub(super) fn request_body_limit(_body: &Body, configured: u64) -> u64 {
-        configured
     }
 
     pub(super) fn should_emit_response_chunk(length: usize) -> bool {
@@ -235,8 +231,7 @@ use exchange::duration_nanos;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use exchange::{
     UploadCompletion, cooperate_after_response_read, cooperative_stream, cooperative_yield_once,
-    request_body_limit, request_timeouts, run_exchange, settle_reset_content,
-    should_emit_response_chunk,
+    request_timeouts, run_exchange, settle_reset_content, should_emit_response_chunk,
 };
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -256,8 +251,8 @@ mod spin_impl {
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
         OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
-        OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition, ResponseHeaderLimiter,
-        ResponseMode, collect_response_stream, enforce_payload_content_length,
+        OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
+        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
         limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
@@ -370,11 +365,14 @@ mod spin_impl {
             let (request, request_done) =
                 Request::new(fields, Some(contents), trailers, Some(options));
             set_request_target(&request, &method, &uri)?;
-            let request_body_limit = super::request_body_limit(&body, max_request_body_bytes);
-
             let exchange = async move {
-                let upload =
-                    pump_request_body(body, request_body_limit, writer, budget, self.clock.clone());
+                let upload = pump_request_body(
+                    body,
+                    max_request_body_bytes,
+                    writer,
+                    budget,
+                    self.clock.clone(),
+                );
                 let send = client::send(request);
                 run_exchange(send, upload, request_done, |error| {
                     map_spin_send_error(error, budget.deadline, budget.cause, self.clock.now())
@@ -652,7 +650,11 @@ mod spin_impl {
             ResponseHeaderLimiter::new(max_response_header_bytes, max_response_header_count);
         header_limiter.observe(&headers)?;
         let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
-        headers.insert(PROXY_HEADER, HeaderValue::from_static("spin"));
+        insert_proxy_header(
+            &mut headers,
+            &mut header_limiter,
+            HeaderValue::from_static("spin"),
+        )?;
 
         let native = response_stream(response, budget, clock.clone());
         if disposition == ResponseBodyDisposition::FramingBodyless {
@@ -1217,8 +1219,8 @@ mod exchange_tests {
 
     use super::{
         EdgeError, READY_ITEM_YIELD_QUOTA, UploadCompletion, cooperate_after_response_read,
-        cooperative_stream, cooperative_yield_once, duration_nanos, request_body_limit,
-        request_timeouts, run_exchange, settle_reset_content, should_emit_response_chunk,
+        cooperative_stream, cooperative_yield_once, duration_nanos, request_timeouts, run_exchange,
+        settle_reset_content, should_emit_response_chunk,
     };
 
     struct ScriptedFuture<Output> {
@@ -1311,19 +1313,6 @@ mod exchange_tests {
         assert_eq!(duration_nanos(Duration::from_nanos(1)), 1);
         assert_eq!(duration_nanos(Duration::from_nanos(999)), 999);
         assert_eq!(duration_nanos(Duration::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn request_body_limit_applies_to_buffered_and_streamed_bodies() {
-        use bytes::Bytes;
-        use edgezero_core::body::Body;
-        use futures_util::stream;
-
-        assert_eq!(
-            request_body_limit(&Body::from(Bytes::from_static(b"buffered")), 8),
-            8
-        );
-        assert_eq!(request_body_limit(&Body::stream(stream::empty()), 8), 8);
     }
 
     #[test]

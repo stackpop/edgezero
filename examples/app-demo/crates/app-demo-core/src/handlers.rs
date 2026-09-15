@@ -16,6 +16,7 @@ use edgezero_core::http::{self, Method, Response, StatusCode, Uri};
 use edgezero_core::outbound::{OutboundRequest, OutboundSlotResult};
 use edgezero_core::response::Text;
 use edgezero_core::time::Deadline;
+use edgezero_core::ResponseEgressDeadline;
 use futures::{stream, StreamExt as _};
 
 use crate::{config::AppDemoConfig, AdmissionLease};
@@ -190,7 +191,11 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
         .map(|(index, slot)| fanout_slot(index, slot))
         .collect::<Vec<_>>();
 
-    json_response(&output)
+    let mut response = json_response(&output)?;
+    response
+        .extensions_mut()
+        .insert(ResponseEgressDeadline::new(deadline));
+    Ok(response)
 }
 
 #[action]
@@ -682,12 +687,12 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         headers.insert("x-outbound-test", HeaderValue::from_static("preserved"));
-        Ok(OutboundResponse::new(
-            parts.method,
-            status,
-            headers,
-            Body::text("outbound-response"),
-        ))
+        let body = if status == StatusCode::NO_CONTENT {
+            Body::empty()
+        } else {
+            Body::text("outbound-response")
+        };
+        Ok(OutboundResponse::new(parts.method, status, headers, body))
     }
 
     #[test]
@@ -1184,6 +1189,10 @@ mod tests {
         let response = block_on(fanout(ctx)).expect("fanout response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "application/json");
+        assert!(response
+            .extensions()
+            .get::<ResponseEgressDeadline>()
+            .is_some());
         assert!(
             !String::from_utf8_lossy(response.body().as_bytes().expect("buffered"))
                 .contains("token@example.invalid")
@@ -1202,6 +1211,23 @@ mod tests {
         assert_eq!(payload[2]["outcome"]["kind"], "error");
         assert_eq!(payload[2]["outcome"]["category"], "gateway_timeout");
         assert_eq!(payload[2]["outcome"]["status"], 504_i64);
+    }
+
+    #[test]
+    fn outbound_fixture_settles_no_content_body_at_source() {
+        let request = OutboundRequest::get("https://example.com/status/204").expect("request");
+        let response = response_for(request.into_parts()).expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .into_response()
+                .expect("portable response")
+                .into_body()
+                .into_bytes()
+                .expect("buffered"),
+            Bytes::new()
+        );
     }
 
     #[test]

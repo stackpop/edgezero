@@ -81,16 +81,17 @@ pub use outbound::{
     DEFAULT_OUTBOUND_REQUEST_BODY_BYTES, HttpClient, OutboundHttpClient, OutboundRequest,
     OutboundRequestParts, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
     ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-    collect_response_stream_until_with_clock, enforce_payload_content_length, limit_decoded_stream,
-    limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
-    validate_for_dispatch,
+    collect_response_stream_until_with_clock, enforce_payload_content_length, insert_proxy_header,
+    limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch, normalize_response_headers,
+    rechunk_stream, validate_for_dispatch,
 };
 pub use response_egress::{
     DEFAULT_RESPONSE_WRITE_BUDGET, RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
-    ResponseEgressBeginFailure, ResponseEgressBodyKind, ResponseEgressEnvelope,
-    ResponseEgressFallbackDisposition, ResponseEgressHead, ResponseEgressObserver,
-    ResponseEgressObserverHandle, ResponseEgressOutcome, ResponseEgressPolicy,
-    ResponseEgressPolicyCallback, ResponseEgressReport, default_response_egress_policy,
+    ResponseEgressBeginFailure, ResponseEgressBodyKind, ResponseEgressDeadline,
+    ResponseEgressEnvelope, ResponseEgressFallbackDisposition, ResponseEgressHead,
+    ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressOutcome,
+    ResponseEgressPolicy, ResponseEgressPolicyCallback, ResponseEgressReport,
+    default_response_egress_policy,
 };
 pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
 pub use time::{

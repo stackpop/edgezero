@@ -15,7 +15,9 @@ use edgezero_core::response_egress::{
     RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
     ResponseEgressFallbackDisposition, ResponseEgressOutcome,
 };
-use edgezero_core::response_egress_framing::{PreparedResponseEgress, prepare_response_egress};
+use edgezero_core::response_egress_framing::{
+    PreparedResponseEgress, prepare_response_egress, response_egress_source_error_category,
+};
 use edgezero_core::time::{Deadline, MonotonicClock};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use tokio::sync::Notify;
@@ -441,7 +443,11 @@ impl HttpBody for AxumEgressBody {
                 }
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
-            Poll::Ready(Some(Err(_error))) => {
+            Poll::Ready(Some(Err(error))) => {
+                log::warn!(
+                    "response-egress Axum body source failed after commit: {}",
+                    response_egress_source_error_category(&error)
+                );
                 this.source = ResponseSource::Done;
                 this.fail(ResponseEgressOutcome::SourceError);
                 Poll::Ready(Some(Err(AxumBodyError(ResponseEgressOutcome::SourceError))))
@@ -642,6 +648,7 @@ mod tests {
             StatusCode::OK,
             Version::HTTP_11,
             &headers,
+            None,
             now,
             Some(&route),
         );
