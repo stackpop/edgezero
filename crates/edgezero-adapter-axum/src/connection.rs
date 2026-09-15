@@ -140,6 +140,7 @@ mod tests {
             StatusCode::OK,
             Version::HTTP_11,
             &headers,
+            None,
             started_at,
             Some(&route),
         );
@@ -335,8 +336,14 @@ mod tests {
             .expect("deadline");
         let frozen_clock = MonotonicClock::new(move || started_at);
         let headers = HeaderMap::new();
-        let head =
-            ResponseEgressHead::new(StatusCode::OK, Version::HTTP_11, &headers, started_at, None);
+        let head = ResponseEgressHead::new(
+            StatusCode::OK,
+            Version::HTTP_11,
+            &headers,
+            None,
+            started_at,
+            None,
+        );
         let attempt = ResponseEgressAttempt::new(
             &head,
             started_at,

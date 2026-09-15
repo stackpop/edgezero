@@ -265,8 +265,8 @@ For each adapter task: add only the named contract cases; run its exact Task 1 c
 - [ ] Add the generated Cloudflare adapter target check to CI:
   `(cd examples/app-demo && cargo check --offline --locked -p app-demo-adapter-cloudflare --no-default-features --features cloudflare --target wasm32-unknown-unknown)`.
 - [ ] Keep the workerd host suite and the trusted-environment deployed cancellation/timing probe as named CI jobs. Capability publication is blocked unless the recorded deployed job passes; native mocks or a credential-skipped zero-test result cannot substitute.
-- [ ] For fork PRs, run only non-secret native/browser/workerd jobs automatically. A maintainer reviews the exact commit, reproduces and pushes that tree to `refs/heads/outbound-probe-reviewed`, dispatches the protected workflow for its SHA, and records the successful workflow URL and SHA on the PR. A skipped or mismatched-SHA run cannot publish Cloudflare's Native timing/upload/lazy-stream cells.
-- [ ] Add table-driven capability tests and publish the overrides only now. Axum: Native for HTTP, header fidelity, deadlines, flexible phase budget, slot isolation, and upload deadlines; BestEffort for lazy response passthrough; Unsupported for complete resource accounting. Cloudflare: Native for HTTP, deadlines, flexible phase budget, slot isolation, upload deadlines, and lazy response passthrough; BestEffort for header fidelity; Unsupported for complete resource accounting. Both wildcard future capabilities to Unsupported.
+- [ ] For fork PRs, run only non-secret native/browser/workerd jobs automatically. A maintainer reviews the exact commit, reproduces and pushes that tree to `refs/heads/outbound-probe-reviewed`, dispatches the protected workflow for its SHA, and records the successful workflow URL and SHA on the PR. A skipped or mismatched-SHA run cannot promote Cloudflare's BestEffort timing/upload cells or its Native lazy-stream cell.
+- [ ] Add table-driven capability tests and publish the overrides only now. Axum: Native for HTTP, header fidelity, deadlines, flexible phase budget, slot isolation, upload deadlines, and lazy response passthrough; Unsupported for complete resource accounting. Cloudflare: Native for HTTP, flexible phase budget, slot isolation, and lazy response passthrough; BestEffort for deadlines, header fidelity, and upload deadlines; Unsupported for complete resource accounting. Both wildcard future capabilities to Unsupported.
 - [ ] Commit: `ci: enforce axum and cloudflare outbound contracts`.
 
 ## Phase Verification
@@ -297,4 +297,4 @@ For each adapter task: add only the named contract cases; run its exact Task 1 c
 - [ ] `(cd examples/app-demo && cargo test --locked --workspace --all-targets)`
 - [ ] `git diff --check`
 
-Expected result: Axum and Cloudflare no longer expose adapter `proxy` modules, publish their reviewed capability rows atomically with passing contracts, and Cloudflare's Native timing claim is backed by host-observed evidence.
+Expected result: Axum and Cloudflare no longer expose adapter `proxy` modules and publish their reviewed capability rows atomically with passing contracts. Cloudflare timing and upload remain `BestEffort` until matching-SHA host-observed evidence justifies promotion.

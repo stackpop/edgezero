@@ -15,6 +15,8 @@
 
 #[cfg(any(feature = "fastly", feature = "test-utils"))]
 use std::future::Future;
+#[cfg(feature = "test-utils")]
+use std::ops::ControlFlow;
 #[cfg(test)]
 use std::time::Duration;
 
@@ -158,8 +160,8 @@ mod fastly_impl {
     use edgezero_core::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
         OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
-        OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition, ResponseHeaderLimiter,
-        ResponseMode, collect_response_stream, enforce_payload_content_length,
+        OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
+        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
         limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
@@ -266,6 +268,7 @@ mod fastly_impl {
             &self,
             request: &OutboundRequest,
             budget: DispatchBudget,
+            batch_started_at: Option<MonotonicInstant>,
         ) -> Result<Backend, EdgeError> {
             let identity = backend_identity(request, budget)?;
             let name = backend_name(&identity);
@@ -300,7 +303,11 @@ mod fastly_impl {
                     builder = builder.check_certificate(cert_host);
                 }
             }
-            finish_backend_creation(builder.finish(), budget, &self.clock, |backend| {
+            let creation =
+                register_backend_with_batch_guard(batch_started_at, budget, &self.clock, || {
+                    builder.finish()
+                })?;
+            finish_backend_creation(creation, budget, &self.clock, |backend| {
                 let mut cache = self.backends.lock().map_err(|_poisoned| {
                     EdgeError::internal(anyhow::anyhow!("Fastly backend cache was poisoned"))
                 })?;
@@ -323,7 +330,7 @@ mod fastly_impl {
             started_at: MonotonicInstant,
         ) -> Result<PreparedRequest, EdgeError> {
             validate_for_dispatch(&request)?;
-            self.prepare_validated(request, started_at)
+            self.prepare_validated(request, started_at, false)
         }
 
         fn prepare_batch(
@@ -332,18 +339,20 @@ mod fastly_impl {
             started_at: MonotonicInstant,
         ) -> Result<PreparedRequest, EdgeError> {
             validate_batch_request(&request)?;
-            self.prepare_validated(request, started_at)
+            self.prepare_validated(request, started_at, true)
         }
 
         fn prepare_validated(
             &self,
             mut request: OutboundRequest,
             started_at: MonotonicInstant,
+            enforce_batch_slack: bool,
         ) -> Result<PreparedRequest, EdgeError> {
             let budget = dispatch_budget(&request, started_at)?;
             normalize_fastly_request(&mut request)?;
             budget_remaining(budget, &self.clock)?;
-            let backend = self.ensure_backend(&request, budget)?;
+            let backend =
+                self.ensure_backend(&request, budget, enforce_batch_slack.then_some(started_at))?;
             budget_remaining(budget, &self.clock)?;
             Ok(PreparedRequest {
                 backend,
@@ -622,12 +631,23 @@ mod fastly_impl {
     }
 
     fn ceil_millis(duration: Duration) -> u64 {
-        let rounded = duration
-            .checked_add(Duration::from_micros(999))
-            .unwrap_or(Duration::MAX);
-        u64::try_from(rounded.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1)
+        let rounded = duration.as_nanos().div_ceil(1_000_000);
+        u64::try_from(rounded).unwrap_or(u64::MAX).max(1)
+    }
+
+    fn register_backend_with_batch_guard<BackendValue, CreationError, Register>(
+        batch_started_at: Option<MonotonicInstant>,
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+        register: Register,
+    ) -> Result<Result<BackendValue, CreationError>, EdgeError>
+    where
+        Register: FnOnce() -> Result<BackendValue, CreationError>,
+    {
+        if let Some(started_at) = batch_started_at {
+            dispatch_guard(started_at, budget, clock)?;
+        }
+        Ok(register())
     }
 
     async fn finish_pending(
@@ -870,7 +890,11 @@ mod fastly_impl {
             ResponseHeaderLimiter::new(max_response_header_bytes, max_response_header_count);
         header_limiter.observe(&headers)?;
         let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
-        headers.insert(PROXY_HEADER, HeaderValue::from_static("fastly"));
+        insert_proxy_header(
+            &mut headers,
+            &mut header_limiter,
+            HeaderValue::from_static("fastly"),
+        )?;
         if disposition == ResponseBodyDisposition::FramingBodyless {
             return Ok(OutboundResponse::new_with_monotonic_clock(
                 request_method,
@@ -1230,6 +1254,7 @@ mod fastly_impl {
         use std::cell::Cell;
         use std::collections::VecDeque;
         use std::io::{Error, Write as _};
+        use std::mem::discriminant;
         use std::num::NonZeroU64;
         use std::sync::{Arc, Mutex};
         use std::thread;
@@ -1326,15 +1351,19 @@ mod fastly_impl {
                     .expect("request")
                     .body("invalid GET body")
             };
-            let single =
+            let single_outcome =
                 block_on(FastlyOutboundClient::with_clock(constant_clock(now)).send(invalid()));
             let mut batch = block_on(
                 FastlyOutboundClient::with_clock(constant_clock(now)).send_all(vec![invalid()]),
             );
-            let batched = batch.remove(0).outcome;
+            let batched_outcome = batch.remove(0).outcome;
 
-            assert!(matches!(single, Err(EdgeError::BadRequest { .. })));
-            assert!(matches!(batched, Err(EdgeError::BadRequest { .. })));
+            let (Err(single_error), Err(batched_error)) = (single_outcome, batched_outcome) else {
+                panic!("single and batch paths must return errors");
+            };
+            assert_eq!(discriminant(&single_error), discriminant(&batched_error));
+            assert_eq!(single_error.status(), batched_error.status());
+            assert_eq!(single_error.message(), batched_error.message());
         }
 
         #[test]
@@ -1441,12 +1470,33 @@ mod fastly_impl {
         }
 
         #[test]
-        fn ceil_millis_floors_and_saturates_without_wrapping() {
+        fn ceil_millis_rounds_up_and_saturates_without_wrapping() {
             assert_eq!(ceil_millis(Duration::ZERO), 1);
             assert_eq!(ceil_millis(Duration::from_nanos(1)), 1);
             assert_eq!(ceil_millis(Duration::from_micros(999)), 1);
+            assert_eq!(ceil_millis(Duration::from_millis(1)), 1);
+            assert_eq!(ceil_millis(Duration::from_nanos(1_000_001)), 2);
             assert_eq!(ceil_millis(Duration::from_micros(1_001)), 2);
             assert_eq!(ceil_millis(Duration::MAX), u64::MAX);
+        }
+
+        #[test]
+        fn heterogeneous_hosts_and_exact_budgets_have_distinct_backend_identities() {
+            let started_at = MonotonicInstant::now();
+            let first_budget = clock_budget(started_at, Duration::from_millis(1));
+            let second_budget = clock_budget(started_at, Duration::from_nanos(1_000_001));
+            let first_request =
+                OutboundRequest::get("https://first.example/path").expect("first request");
+            let second_request =
+                OutboundRequest::get("https://second.example/path").expect("second request");
+
+            let first = backend_identity(&first_request, first_budget).expect("first identity");
+            let second = backend_identity(&second_request, second_budget).expect("second identity");
+
+            assert_eq!(first.budget_ms, 1);
+            assert_eq!(second.budget_ms, 2);
+            assert_ne!(first, second);
+            assert_ne!(backend_name(&first), backend_name(&second));
         }
 
         #[test]
@@ -2064,6 +2114,43 @@ mod fastly_impl {
         }
 
         #[test]
+        fn cold_backend_registration_is_refused_before_more_synchronous_work() {
+            use edgezero_core::time::{BATCH_DISPATCH_SLACK_MAX, Deadline};
+
+            let started_at = MonotonicInstant::now();
+            let over_limit = started_at
+                .checked_add(BATCH_DISPATCH_SLACK_MAX + Duration::from_nanos(1))
+                .expect("past slack boundary");
+            let budget = DispatchBudget {
+                cause: BudgetSource::PerCallTimeout,
+                deadline: Deadline::at_instant(
+                    started_at
+                        .checked_add(Duration::from_secs(1))
+                        .expect("deadline instant"),
+                ),
+                duration: Duration::from_secs(1),
+            };
+            let clock = scripted_clock(vec![started_at, over_limit]);
+            let registrations = Cell::new(0_u8);
+            let register = || {
+                registrations.set(registrations.get().saturating_add(1));
+                Ok::<_, ()>(())
+            };
+
+            let first =
+                register_backend_with_batch_guard(Some(started_at), budget, &clock, register);
+            assert!(matches!(first, Ok(Ok(()))));
+            let second =
+                register_backend_with_batch_guard(Some(started_at), budget, &clock, register);
+            assert!(matches!(
+                second,
+                Err(EdgeError::Internal { source })
+                    if source.to_string() == DISPATCH_SLACK_MESSAGE
+            ));
+            assert_eq!(registrations.get(), 1);
+        }
+
+        #[test]
         #[expect(
             clippy::too_many_lines,
             reason = "the pinned SDK cause table intentionally constructs every known variant"
@@ -2230,13 +2317,6 @@ enum BatchDispatch<Pending, Output> {
 }
 
 #[cfg(any(feature = "fastly", feature = "test-utils"))]
-#[cfg_attr(
-    not(feature = "fastly"),
-    expect(
-        dead_code,
-        reason = "native test utilities leave target-only ready polling unconstructed"
-    )
-)]
 enum BatchProbe<Pending, Output> {
     Done(Output),
     Pending(Pending),
@@ -2353,6 +2433,8 @@ pub async fn orchestrate_batch_for_test<
     Dispatch,
     Harvest,
     HarvestFuture,
+    Probe,
+    ProbeFuture,
     Item,
     Pending,
     Output,
@@ -2360,12 +2442,15 @@ pub async fn orchestrate_batch_for_test<
     items: Items,
     mut dispatch: Dispatch,
     harvest: Harvest,
+    mut probe: Probe,
 ) -> Vec<Output>
 where
     Items: IntoIterator<Item = Item>,
     Dispatch: FnMut(Item) -> Result<Pending, Output>,
     Harvest: FnMut(Pending) -> HarvestFuture,
     HarvestFuture: Future<Output = Output>,
+    Probe: FnMut(Pending) -> ProbeFuture,
+    ProbeFuture: Future<Output = ControlFlow<Output, Pending>>,
     Output: Default,
 {
     orchestrate_batch(
@@ -2375,7 +2460,15 @@ where
             Err(output) => BatchDispatch::Done(output),
         },
         harvest,
-        |pending| async move { BatchProbe::Pending(pending) },
+        move |pending| {
+            let outcome = probe(pending);
+            async move {
+                match outcome.await {
+                    ControlFlow::Break(output) => BatchProbe::Done(output),
+                    ControlFlow::Continue(still_pending) => BatchProbe::Pending(still_pending),
+                }
+            }
+        },
         Output::default,
     )
     .await

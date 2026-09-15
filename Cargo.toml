@@ -40,6 +40,8 @@ brotli = "=8.0.4"
 brotli-decompressor = "=5.0.1"
 bytes = "1"
 chrono = "0.4"
+compression-codecs = { version = "=0.4.38", features = ["brotli"] }
+compression-core = "=0.4.32"
 ctor = "1.0"
 edgezero-adapter = { path = "crates/edgezero-adapter" }
 edgezero-adapter-axum = { path = "crates/edgezero-adapter-axum", default-features = false }

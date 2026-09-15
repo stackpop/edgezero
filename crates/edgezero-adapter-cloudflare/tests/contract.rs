@@ -490,7 +490,7 @@ mod tests {
             ResponseEgressEnvelope, ResponseEgressObserver, ResponseEgressOutcome,
             ResponseEgressReport,
         };
-        use edgezero_core::router::RouteResolution;
+        use edgezero_core::router::{RouteMetadata, RouteResolution};
         use futures::future::poll_fn as poll_future;
         use futures::stream::poll_fn;
         use worker::{Delay, Response as CfResponse};
@@ -679,7 +679,7 @@ mod tests {
                 &app,
                 Method::GET,
                 "/too-long".parse().expect("URI"),
-                futures::stream::empty::<Result<Bytes, io::Error>>(),
+                stream::empty::<Result<Bytes, io::Error>>(),
             )
             .await
             .expect("typed response");
@@ -720,19 +720,19 @@ mod tests {
             assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             let observed = reports.lock().expect("reports lock");
             assert_eq!(observed.len(), 1);
-            assert_eq!(observed[0].outcome, ResponseEgressOutcome::HostHandoff);
+            let report = observed.first().expect("one report");
+            assert_eq!(report.outcome, ResponseEgressOutcome::HostHandoff);
             assert_eq!(
-                observed[0]
-                    .route
-                    .as_ref()
-                    .map(edgezero_core::router::RouteMetadata::pattern),
+                report.route.as_ref().map(RouteMetadata::pattern),
                 Some("/owned")
             );
         }
 
         fn capture_response(envelope: ResponseEgressEnvelope) -> Response {
-            let Ok((prepared, _policy, mut attempt, clock)) = envelope.begin() else {
-                panic!("test egress envelope must prepare");
+            let result = envelope.begin();
+            assert!(result.is_ok(), "test egress envelope must prepare");
+            let Ok((prepared, _policy, mut attempt, clock)) = result else {
+                return Response::new(Body::empty());
             };
             assert!(attempt.begin_writing());
             assert!(attempt.terminate(ResponseEgressOutcome::HostHandoff, clock.now()));
@@ -797,7 +797,7 @@ mod tests {
                     &body_polls,
                 );
 
-                let response = dispatch_ingress_stream_for_test(
+                let envelope = dispatch_ingress_stream_for_test(
                     &app,
                     Method::POST,
                     path.parse().expect("URI"),
@@ -805,7 +805,7 @@ mod tests {
                 )
                 .await
                 .expect("response");
-                let response = capture_response(response);
+                let response = capture_response(envelope);
 
                 assert_eq!(response.status(), expected_status);
                 assert_eq!(body_polls.load(Ordering::SeqCst), 3);

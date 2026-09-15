@@ -497,7 +497,7 @@ mod tests {
             ResponseEgressEnvelope, ResponseEgressObserver, ResponseEgressOutcome,
             ResponseEgressReport,
         };
-        use edgezero_core::router::RouteResolution;
+        use edgezero_core::router::{RouteMetadata, RouteResolution};
         use edgezero_core::time::{MonotonicClock, MonotonicInstant};
         use futures::FutureExt as _;
         use futures::stream::{empty, poll_fn};
@@ -968,12 +968,10 @@ mod tests {
             assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             let observed = reports.lock().expect("reports lock");
             assert_eq!(observed.len(), 1);
-            assert_eq!(observed[0].outcome, ResponseEgressOutcome::HostHandoff);
+            let report = observed.first().expect("one report");
+            assert_eq!(report.outcome, ResponseEgressOutcome::HostHandoff);
             assert_eq!(
-                observed[0]
-                    .route
-                    .as_ref()
-                    .map(edgezero_core::router::RouteMetadata::pattern),
+                report.route.as_ref().map(RouteMetadata::pattern),
                 Some("/owned")
             );
         }
@@ -1002,14 +1000,14 @@ mod tests {
                     None,
                 );
 
-                let response = block_on(dispatch_ingress_stream_for_test(
+                let envelope = block_on(dispatch_ingress_stream_for_test(
                     &app,
                     Method::POST,
                     path.parse().expect("URI"),
                     source,
                 ))
                 .expect("response");
-                let response = capture_response(response);
+                let response = capture_response(envelope);
 
                 assert_eq!(response.status(), expected_status);
                 assert_eq!(body_polls.load(Ordering::SeqCst), 3);
@@ -1148,7 +1146,7 @@ mod tests {
                 matched_body_app(Duration::from_millis(100), &grant_drops);
             let source = pending_stream(&grant_drops, &source_drops, &body_polls);
 
-            let response = block_on(dispatch_ingress_stream_with_timer_for_test(
+            let envelope = block_on(dispatch_ingress_stream_with_timer_for_test(
                 &app,
                 Method::POST,
                 "/body".parse().expect("URI"),
@@ -1156,7 +1154,7 @@ mod tests {
                 |_remaining| deadline_timer(),
             ))
             .expect("Spin response");
-            let response = capture_response(response);
+            let response = capture_response(envelope);
 
             assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
             assert_eq!(
@@ -1190,7 +1188,7 @@ mod tests {
                 None,
             );
 
-            let response = block_on(dispatch_ingress_stream_with_timer_for_test(
+            let envelope = block_on(dispatch_ingress_stream_with_timer_for_test(
                 &app,
                 Method::POST,
                 "/body".parse().expect("URI"),
@@ -1198,7 +1196,7 @@ mod tests {
                 |_remaining| ready(()),
             ))
             .expect("Spin response");
-            let response = capture_response(response);
+            let response = capture_response(envelope);
 
             assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
             assert_eq!(body_polls.load(Ordering::SeqCst), 0);
@@ -1268,14 +1266,14 @@ mod tests {
                     None,
                 );
 
-                let response = block_on(dispatch_ingress_stream_for_test(
+                let envelope = block_on(dispatch_ingress_stream_for_test(
                     &app,
                     Method::POST,
                     path.parse().expect("URI"),
                     source,
                 ))
                 .expect("response");
-                let response = capture_response(response);
+                let response = capture_response(envelope);
 
                 let mut expected_headers = HeaderMap::new();
                 expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));

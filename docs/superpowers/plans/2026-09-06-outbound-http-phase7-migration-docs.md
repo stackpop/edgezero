@@ -137,14 +137,14 @@ rg -n 'Body::from_stream|Body::from_external_stream|Body::Stream|Self::Stream|\.
 | `outbound-http` | Native | Native | BestEffort | Native |
 | `outbound-complete-resource-accounting` | Unsupported | Unsupported | Unsupported | Unsupported |
 | `outbound-header-fidelity` | Native | BestEffort | Native | Native |
-| `outbound-deadlines` | Native | Native | BestEffort | BestEffort |
+| `outbound-deadlines` | Native | BestEffort | BestEffort | BestEffort |
 | `outbound-flexible-phase-budget` | Native | Native | BestEffort | BestEffort |
 | `send-all-slot-isolation` | Native | Native | BestEffort | Native |
-| `streamed-upload-deadlines` | Native | Native | BestEffort | BestEffort |
-| `lazy-streamed-response-passthrough` | BestEffort | Native | BestEffort | BestEffort |
+| `streamed-upload-deadlines` | Native | BestEffort | BestEffort | BestEffort |
+| `lazy-streamed-response-passthrough` | Native | Native | BestEffort | BestEffort |
 
 - [ ] Explain that Cloudflare manual upstream fetch encoding and downstream encoded passthrough are distinct controls.
-- [ ] Explain 16 MiB downstream conversion fallback on Axum/Fastly/Spin and Native lazy passthrough only on Cloudflare.
+- [ ] Explain the bounded fallback used for precommit conversion failures and Native lazy passthrough on Axum and Cloudflare.
 - [ ] Explain that the body/header/window/decoder-state controls bound named guest-visible terms, `max_chunk_bytes` shapes emitted items without limiting source allocation, and complete pre-admission process/isolate accounting is Unsupported on every current adapter because provider parser, field-section, native chunk, allocator, and host-copy terms remain opaque.
 - [ ] Before editing prose, expand `scripts/check_outbound_legacy_api.sh` to scan `docs/guide`, `README.md`, `CLAUDE.md`, `TODO.md`, root `Cargo.toml`, and `.claude/agents/code-architect.md` in addition to its existing code/template roots, adding `*.md` and `*.toml` globs. Using explicit active-source roots excludes internal history under `docs/superpowers/specs` and `docs/superpowers/plans`. Run it and require the expected stale-document failure.
 - [ ] Add exactly one sidebar item whose link is `/guide/capabilities`; verify all internal links/anchors.

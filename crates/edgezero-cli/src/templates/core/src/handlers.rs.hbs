@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use edgezero_core::ResponseEgressDeadline;
 use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
@@ -164,7 +165,11 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
         .map(|(index, slot)| fanout_slot(index, slot))
         .collect::<Vec<_>>();
 
-    json_response(&output)
+    let mut response = json_response(&output)?;
+    response
+        .extensions_mut()
+        .insert(ResponseEgressDeadline::new(deadline));
+    Ok(response)
 }
 
 #[action]
@@ -481,6 +486,12 @@ mod tests {
         let response = block_on(fanout(ctx)).expect("fanout response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "application/json");
+        assert!(
+            response
+                .extensions()
+                .get::<ResponseEgressDeadline>()
+                .is_some()
+        );
         assert!(
             !String::from_utf8_lossy(response.body().as_bytes().expect("buffered"))
                 .contains("token@example.invalid")

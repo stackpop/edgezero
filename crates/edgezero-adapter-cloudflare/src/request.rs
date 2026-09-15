@@ -32,6 +32,8 @@ use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
 use futures::executor::block_on;
 use futures_util::future::{Either, select};
 #[cfg(feature = "test-utils")]
+use futures_util::stream::Empty;
+#[cfg(feature = "test-utils")]
 use futures_util::stream::poll_fn;
 use futures_util::stream::{LocalBoxStream, once, unfold};
 use futures_util::{StreamExt as _, TryStreamExt as _};
@@ -495,7 +497,7 @@ pub async fn dispatch_ingress_source_error_for_test(
         core_request,
         Stores::default(),
         request_start,
-        || -> Result<futures_util::stream::Empty<Result<Bytes, io::Error>>, EdgeError> {
+        || -> Result<Empty<Result<Bytes, io::Error>>, EdgeError> {
             Err(EdgeError::internal(anyhow::anyhow!(
                 "cloudflare source construction failed"
             )))

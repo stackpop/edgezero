@@ -17,7 +17,9 @@ use edgezero_core::response_egress::{
     RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
     ResponseEgressFallbackDisposition, ResponseEgressOutcome, ResponseEgressPolicy,
 };
-use edgezero_core::response_egress_framing::{PreparedResponseEgress, prepare_response_egress};
+use edgezero_core::response_egress_framing::{
+    PreparedResponseEgress, prepare_response_egress, response_egress_source_error_category,
+};
 use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
 use futures::executor;
 use futures_util::StreamExt as _;
@@ -476,7 +478,13 @@ where
                 Some(Ok(bytes)) => {
                     write_chunk(bytes.as_ref(), sink, deadline, attempt, clock)?;
                 }
-                Some(Err(_error)) => return Err(DeliveryError::Source),
+                Some(Err(error)) => {
+                    log::warn!(
+                        "response-egress Fastly body source failed after commit: {}",
+                        response_egress_source_error_category(&error)
+                    );
+                    return Err(DeliveryError::Source);
+                }
                 None => return Ok(()),
             }
         },
@@ -737,7 +745,8 @@ mod tests {
 
     fn attempt(observer: &RecordingObserver, now: MonotonicInstant) -> ResponseEgressAttempt {
         let headers = HeaderMap::new();
-        let head = ResponseEgressHead::new(StatusCode::OK, Version::HTTP_11, &headers, now, None);
+        let head =
+            ResponseEgressHead::new(StatusCode::OK, Version::HTTP_11, &headers, None, now, None);
         ResponseEgressAttempt::new(
             &head,
             now,

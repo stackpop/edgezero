@@ -131,9 +131,13 @@ not included. These limitations block whole-response-lifetime certification.
     Current provider APIs do not expose or bound every term, so all adapters report
     `Unsupported`. The narrower EdgeZero-owned limits below still apply.
 
-¹ Fastly cannot preempt cold dynamic-backend registration or guest-to-origin writes. Its
-receive timers and absolute checks still cover the documented warm, response-read portions,
-but they are not one end-to-end wall-clock guarantee.
+¹ Fastly cannot preempt cold dynamic-backend registration or guest-to-origin writes. Before a
+cache-miss registration in `send_all`, EdgeZero checks the absolute deadline and 25 ms dispatch
+slack so an already-delayed later slot does not begin another synchronous registration. A first
+cold registration that passes that check can still block. Receive timers and absolute checks
+cover the documented warm, response-read portions, but they are not one end-to-end wall-clock
+guarantee. Exact ceiled-millisecond budgets are part of backend identity, so heterogeneous hosts
+or budgets may require multiple registrations.
 
 ² Fastly checks the absolute deadline between streamed upload chunks, but it cannot preempt a
 stalled source pull or host write.
@@ -192,17 +196,17 @@ not require provider host registration.
 
 Each `OutboundRequest` owns independent limits:
 
-| Control                      | Scope                                                   | Default |
-| ---------------------------- | ------------------------------------------------------- | ------- |
-| `max_request_body_bytes`     | Buffered or streamed request bytes                      | 8 MiB   |
-| `max_encoded_response_bytes` | Upstream transport bytes before decoding                | Unset   |
-| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/Brotli output         | Unset   |
-| `max_response_bytes`         | Final buffered response, including raw passthrough      | 1 MiB   |
-| `max_response_header_bytes`  | Cumulative guest-visible header name/value bytes        | Unset   |
-| `max_response_header_count`  | Cumulative guest-visible header fields                  | Unset   |
-| `max_brotli_window_bits`     | Brotli stream header checked before decoder allocation  | 24      |
-| `max_brotli_decoder_bytes`   | Pinned policy charge for Brotli decoder state           | 32 MiB  |
-| `max_chunk_bytes`            | Maximum emitted item size after decoding or passthrough | Unset   |
+| Control                      | Scope                                                                          | Default |
+| ---------------------------- | ------------------------------------------------------------------------------ | ------- |
+| `max_request_body_bytes`     | Buffered or streamed request bytes                                             | 8 MiB   |
+| `max_encoded_response_bytes` | Upstream transport bytes before decoding                                       | Unset   |
+| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/Brotli output                                | Unset   |
+| `max_response_bytes`         | Final buffered response, including raw passthrough                             | 1 MiB   |
+| `max_response_header_bytes`  | Cumulative guest-visible header name/value bytes, including `x-edgezero-proxy` | Unset   |
+| `max_response_header_count`  | Cumulative guest-visible header fields, including `x-edgezero-proxy`           | Unset   |
+| `max_brotli_window_bits`     | Brotli stream header checked before decoder allocation                         | 24      |
+| `max_brotli_decoder_bytes`   | Pinned policy charge for Brotli decoder state                                  | 32 MiB  |
+| `max_chunk_bytes`            | Maximum emitted item size after decoding or passthrough                        | Unset   |
 
 The encoded counter applies to every response path. The decoded counter applies to identity
 and gzip/Brotli data decoded by EdgeZero, but not to unknown, stacked, parameterized, or other

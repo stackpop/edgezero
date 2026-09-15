@@ -15,6 +15,28 @@ pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
 /// Internal safety budget used only when transmitting a bounded precommit fallback.
 pub const RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET: Duration = Duration::from_secs(1);
 
+/// Application-selected absolute upper bound for one response's egress lifetime.
+///
+/// Insert this value into the response extensions before returning the response. `EdgeZero`
+/// exposes it to the egress policy callback and enforces the earlier of this deadline and the
+/// callback-selected write deadline.
+#[derive(Clone, Copy, Debug)]
+pub struct ResponseEgressDeadline(Deadline);
+
+impl ResponseEgressDeadline {
+    #[must_use]
+    #[inline]
+    pub fn deadline(self) -> Deadline {
+        self.0
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn new(deadline: Deadline) -> Self {
+        Self(deadline)
+    }
+}
+
 /// One finite absolute deadline selected for a response-conversion attempt.
 #[derive(Clone, Copy, Debug)]
 pub struct ResponseEgressPolicy {
@@ -49,6 +71,7 @@ impl ResponseEgressPolicy {
 /// This type deliberately has no response-body or mutation access.
 #[derive(Clone, Copy, Debug)]
 pub struct ResponseEgressHead<'head> {
+    application_deadline: Option<Deadline>,
     headers: &'head HeaderMap,
     request_start: MonotonicInstant,
     route: Option<&'head RouteMetadata>,
@@ -57,6 +80,12 @@ pub struct ResponseEgressHead<'head> {
 }
 
 impl<'head> ResponseEgressHead<'head> {
+    #[must_use]
+    #[inline]
+    pub fn application_deadline(&self) -> Option<Deadline> {
+        self.application_deadline
+    }
+
     #[must_use]
     #[inline]
     pub fn headers(&self) -> &'head HeaderMap {
@@ -70,10 +99,12 @@ impl<'head> ResponseEgressHead<'head> {
         status: StatusCode,
         version: Version,
         headers: &'head HeaderMap,
+        application_deadline: Option<Deadline>,
         request_start: MonotonicInstant,
         route: Option<&'head RouteMetadata>,
     ) -> Self {
         Self {
+            application_deadline,
             headers,
             request_start,
             route,
@@ -214,7 +245,7 @@ impl ResponseEgressEnvelope {
     /// compiled with panic-abort cannot contain application callback panics.
     #[inline]
     pub fn begin(
-        self,
+        mut self,
     ) -> Result<
         (
             PreparedResponseEgress,
@@ -225,10 +256,16 @@ impl ResponseEgressEnvelope {
         Box<ResponseEgressBeginFailure>,
     > {
         let egress_started_at = self.clock.now();
+        let application_deadline = self
+            .response
+            .extensions_mut()
+            .remove::<ResponseEgressDeadline>()
+            .map(ResponseEgressDeadline::deadline);
         let head = ResponseEgressHead::new(
             self.response.status(),
             self.response.version(),
             self.response.headers(),
+            application_deadline,
             self.request_start,
             self.route.as_ref(),
         );
@@ -254,6 +291,16 @@ impl ResponseEgressEnvelope {
                 }));
             }
         };
+        let bounded_policy = ResponseEgressPolicy {
+            write_deadline: Deadline::at_instant(application_deadline.map_or(
+                normalized_policy.write_deadline.instant(),
+                |deadline| {
+                    deadline
+                        .instant()
+                        .min(normalized_policy.write_deadline.instant())
+                },
+            )),
+        };
         let Ok(prepared) = prepare_response_egress(&self.request_method, self.response) else {
             log::error!("response-egress framing validation failed before commit");
             return Err(Box::new(ResponseEgressBeginFailure {
@@ -262,7 +309,7 @@ impl ResponseEgressEnvelope {
                 clock: self.clock,
             }));
         };
-        Ok((prepared, normalized_policy, attempt, self.clock))
+        Ok((prepared, bounded_policy, attempt, self.clock))
     }
 
     pub(crate) fn detached(
@@ -632,6 +679,7 @@ mod tests {
             StatusCode::CREATED,
             Version::HTTP_2,
             headers,
+            None,
             request_start,
             route,
         )
@@ -1125,5 +1173,66 @@ mod tests {
             attempt.finish_fallback(ResponseEgressFallbackDisposition::Aborted, request_start,)
         );
         assert_eq!(observer.reports().len(), 1);
+    }
+
+    #[test]
+    fn response_carried_deadline_is_visible_to_policy_and_clamps_write_lifetime() {
+        let observer = RecordingObserver::default();
+        let request_start = MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_millis(10))
+            .expect("egress start");
+        let application_deadline = Deadline::at_instant(
+            request_start
+                .checked_add(Duration::from_millis(50))
+                .expect("application deadline"),
+        );
+        let callback_deadline = Deadline::at_instant(
+            request_start
+                .checked_add(Duration::from_millis(100))
+                .expect("callback deadline"),
+        );
+        let mut response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::from("body"))
+            .expect("response");
+        response
+            .extensions_mut()
+            .insert(ResponseEgressDeadline::new(application_deadline));
+        let envelope = ResponseEgressEnvelope::new(
+            response,
+            request_start,
+            None,
+            Method::GET,
+            Arc::new(move |head, observed_start| {
+                assert_eq!(observed_start, egress_started_at);
+                assert_eq!(
+                    head.application_deadline()
+                        .map(|deadline| deadline.instant()),
+                    Some(application_deadline.instant())
+                );
+                ResponseEgressPolicy {
+                    write_deadline: callback_deadline,
+                }
+            }),
+            ResponseEgressObserverHandle::new(observer),
+            MonotonicClock::new(move || egress_started_at),
+        );
+
+        let Ok((prepared, policy, _attempt, _clock)) = envelope.begin() else {
+            panic!("egress preparation failed");
+        };
+
+        assert_eq!(
+            policy.write_deadline.instant(),
+            application_deadline.instant()
+        );
+        assert!(
+            prepared
+                .into_response()
+                .extensions()
+                .get::<ResponseEgressDeadline>()
+                .is_none()
+        );
     }
 }

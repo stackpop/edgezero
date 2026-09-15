@@ -1,5 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Display;
+#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
+use std::io::Cursor;
 use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::Poll;
@@ -756,7 +758,7 @@ pub fn dispatch_ingress_source_error_for_test(
         core_request,
         Stores::default(),
         request_start,
-        || -> Result<std::io::Cursor<Vec<u8>>, EdgeError> {
+        || -> Result<Cursor<Vec<u8>>, EdgeError> {
             Err(EdgeError::internal(anyhow::anyhow!(
                 "fastly source construction failed"
             )))

@@ -184,7 +184,9 @@ pub trait OutboundHttpClient: Send + Sync {
  /// headers* (e.g. a proxy-forward via `into_response` that the platform
  /// coordinator has begun sending), HTTP no longer allows a status change.
  /// The adapter response coordinator then requests the strongest platform-supported
- /// downstream-body abort and logs the originating `EdgeError`; clients observe an
+ /// downstream-body abort and logs only a fixed typed category for the originating
+ /// `EdgeError`; provider/application messages and request data are never interpolated.
+ /// Clients observe an
  /// incomplete response rather than a synthetic 502/504. Exact wire behavior (for example,
  /// a connection close or stream reset) is platform/protocol behavior and must be
  /// characterized, not universally asserted. The separate response-egress contract in
@@ -2878,8 +2880,8 @@ passthrough representation:
 | `max_brotli_decoder_bytes(u64)` | `DEFAULT_MAX_BROTLI_DECODER_BYTES = 32 MiB` | conservative decoder-state charge `BROTLI_DECODER_FIXED_CHARGE_BYTES + 2^WBITS`, checked before decoder construction | `ResponseLimitReason::DecoderMemory` |
 | `max_encoded_response_bytes(u64)` | unset | cumulative guest-visible body bytes before content decoding | `ResponseLimitReason::EncodedBody` |
 | `max_decoded_response_bytes(u64)` | unset | cumulative identity or EdgeZero-decoded gzip/Brotli output; never raw passthrough | `ResponseLimitReason::DecodedBody` |
-| `max_response_header_bytes(u64)` | unset | sum of each guest-visible field name length plus value length | `ResponseLimitReason::HeaderBytes` |
-| `max_response_header_count(u64)` | unset | guest-visible name/value entries, including repeated values | `ResponseLimitReason::HeaderCount` |
+| `max_response_header_bytes(u64)` | unset | sum of each guest-visible field name length plus value length, including EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderBytes` |
+| `max_response_header_count(u64)` | unset | guest-visible name/value entries, including repeated values and EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderCount` |
 | `max_brotli_window_bits(u8)` | `DEFAULT_MAX_BROTLI_WINDOW_BITS = 24` | advertised Brotli window bits, valid configured range `10..=30` | `ResponseLimitReason::BrotliWindow` |
 | `max_chunk_bytes(NonZeroU64)` | unset | each app-visible `Body::Stream` item after decode or passthrough | no overflow; items are split lazily |
 | `max_response_bytes(u64)` | `DEFAULT_MAX_RESPONSE_BYTES = 1 MiB` | final bytes collected into `Body::Once`, regardless of coding disposition | `ResponseLimitReason::BufferedBody` |
@@ -2903,7 +2905,8 @@ These are per-response controls, not aggregate batch limits.
    only workerd's already-materialized strings and merged non-`set-cookie` entries. No
    adapter claims these limits prevent provider/SDK allocation, parsing of an informational
    block or trailer the SDK does not expose, or a host-side rejection that occurs before
-   metadata reaches the guest.
+   metadata reaches the guest. After normalization, account EdgeZero's synthetic
+   `x-edgezero-proxy: <adapter>` field against the same cumulative limiter before inserting it.
 2. Apply bodyless/205 disposition. Framing-bodyless responses do not consume a body or
    invoke body/window limits. A visible normalized `Content-Length` greater than a configured
    encoded cap rejects a payload-bearing response before reading, including compressed
@@ -2930,7 +2933,12 @@ These are per-response controls, not aggregate batch limits.
    `brotli_decoder_memory_charge(WBITS) = BROTLI_DECODER_FIXED_CHARGE_BYTES + 2^WBITS`
    with checked `u64` arithmetic. `BROTLI_DECODER_FIXED_CHARGE_BYTES` is 16 MiB and covers
    the pinned Rust decoder's non-ring state; `2^WBITS` charges its maximum ring window. The
-   implementation plan pins and source-audits the decoder graph, records every allocation
+   normal dependency graph is pinned exactly to `async-compression 0.4.43`, `brotli 8.0.4`,
+   `brotli-decompressor 5.0.1`, `compression-codecs 0.4.38`, and
+   `compression-core 0.4.32`. Core constructs `async_compression`'s reader with the explicitly
+   pinned `compression_codecs::BrotliDecoder`, and CI runs
+   `scripts/check_brotli_dependency_contract.mjs` against both root and demo lockfiles. The
+   implementation plan source-audits that decoder graph, records every allocation
    family included in the 16 MiB constant, and runs an allocation-tracking adversarial
    corpus for every supported WBITS. A dependency upgrade must repeat that audit and may
    raise the constant; it may not retain the old charge on test evidence alone. Reject with
@@ -3413,10 +3421,11 @@ For a zero-length request body on the warm path, the dispatch/headers and respon
 portions have the documented deterministic overshoot bounds below (common-case
 `total_ms ≥ 4` phase split; the sub-4 ms branch adds `total_ms`, see §4.3 "Net guarantee").
 Separately, the **FIRST request to a new host** calls `Backend::builder(..).finish()`, a synchronous host
-call that can block waiting for a service-wide dynamic-backend slot. Nothing guest-side
-can preempt it, so it may overshoot the deadline *before* the `BATCH_DISPATCH_SLACK_MAX`
-check (which runs immediately before `send_async`, i.e. after `finish()` has returned)
-ever executes; on that path the guard checks the **absolute deadline FIRST** and returns an
+call that can block waiting for a service-wide dynamic-backend slot. In `send_all`, a cache miss
+checks the absolute deadline and `BATCH_DISPATCH_SLACK_MAX` before entering `finish()`, which
+prevents an already-delayed later slot from starting another registration. Nothing guest-side
+can preempt a registration after it starts, so it may still overshoot before the post-registration
+guard executes; on that path the guard checks the **absolute deadline FIRST** and returns an
 **attributed `gateway_timeout` (504)** — a `finish()` that returns past the deadline is a
 genuine expiry, not an EdgeZero bug (`internal` is reserved for slack exceeded *while time
 remains*, §4.3). Either way the wall-clock overshoot happened, so the capability is still
@@ -3431,19 +3440,19 @@ bounds below.
 (cached); they do not bound request-body transmission.** On the
 **first** request to a new host, `Backend::builder(..).finish()` — a
 synchronous host call that can block waiting for a service-wide dynamic-backend slot —
-may overshoot *before* the `BATCH_DISPATCH_SLACK_MAX` check (which runs immediately before
-`send_async`, i.e. after `finish()` has returned) executes. On that path the guard checks
+may overshoot after the batch pre-registration guard admits it and before the post-registration
+guard immediately ahead of `send_async`. On that path the latter guard checks
 the deadline first and returns an **attributed `gateway_timeout` (504)** for the actual
 expiry (not `internal`); the wall-clock was still overshot, which is exactly why the
 capability is `BestEffort` and not `BoundedCooperative` — see §4.3
 *Honesty note — what the guard can and
 cannot do*.
 - **Single `send`** — `now` is snapshotted inline so there is no batch drift,
-  but the **same `BATCH_DISPATCH_SLACK_MAX` guard** applies to the gap between
+  and the post-registration **`BATCH_DISPATCH_SLACK_MAX` guard** applies to the gap between
   `dispatch_budget(req, now)` and `send_async` (backend lookup, possible
   `Backend::builder().finish()`, SDK request construction; see §4.3). Worst-case
-  dispatch+headers overshoot is `BATCH_DISPATCH_SLACK_MAX + ms_rounding` (the
-  same bound as `send_all`); the window is typically narrower because there's
+  warm-path dispatch+headers overshoot is `BATCH_DISPATCH_SLACK_MAX + ms_rounding`; the
+  window is typically narrower than `send_all` because there's
   no per-slot harvest loop. Response-body phase overshoot ≤ one between-bytes-timeout
   interval (§3.3.4). For a non-empty buffered or streamed request body, the upload write
   remains unbounded and sits outside these finite terms. **Streamed-upload-specific
@@ -4900,7 +4909,11 @@ async fn send_all(
   fan-out each distinct budget gets its own backend, by design. Per-handler
   backend count is bounded by `unique(host, port, tls, budget_ms)` tuples; apps
   that mix wildly varying budgets should be aware of the dynamic-backend limit on
-  their Fastly service.
+  their Fastly service. Because Fastly dispatch is sequential, a multi-host or
+  heterogeneous-budget batch may require several synchronous registrations. If an earlier
+  registration or adapter work consumes more than the 25 ms dispatch slack while a later
+  slot's deadline remains live, the later cache miss fails as `Internal` at the
+  pre-registration guard without invoking another `finish()` host call.
 
   **Dispatch-overhead slack — hard-bounded for a CACHED backend, fail-closed-*detected*
   for first-time registration** (see the honesty note after the bullets). Because `batch_now` is captured
@@ -4918,7 +4931,9 @@ async fn send_all(
   - The adapter caps `(now_at_send_async − batch_now)` at
     `pub const BATCH_DISPATCH_SLACK_MAX: Duration = Duration::from_millis(25);`
     (defined alongside `DEADLINE_FAR_FUTURE` in `src/time.rs`, §7).
-  - Before each slot's `send_async`, the adapter checks two things **in this order**:
+  - On a `send_all` cache miss, the adapter performs this check before synchronous backend
+    registration. Every slot performs it again immediately before `send_async`. Each check
+    evaluates two things **in this order**:
     **(1) the absolute deadline FIRST** — `if budget.deadline.is_expired() { return
     Err(EdgeError::gateway_timeout_caused("deadline expired during Fastly dispatch",
     budget.cause)); }`. A cold `Backend::builder(..).finish()` can block past the deadline
@@ -4943,10 +4958,12 @@ async fn send_all(
   - The cooperative `budget.deadline.is_expired()` check during body drain still
     catches body-phase overshoot per §3.3.4 (one between-bytes-timeout bound).
 
-  **Honesty note — what the guard can and cannot do.** The check above runs
-  *immediately before* `send_async`, i.e. **after** any `Backend::builder(..).finish()`
-  in this slot has already returned. It therefore **detects** an overshoot; it cannot
-  **preempt** one. That distinction splits the claim in two:
+  **Honesty note — what the guard can and cannot do.** `send_all` checks both before a cold
+  `Backend::builder(..).finish()` and immediately before `send_async`; single `send` retains
+  the latter check. The pre-registration check prevents later heterogeneous host/budget slots
+  from beginning more synchronous registrations once earlier adapter work has exhausted the
+  dispatch slack. It cannot preempt the first admitted `finish()` after that host call starts.
+  The post-registration check detects any overshoot. That distinction splits the claim in two:
 
   - **Cache hit (no `finish()` call).** The measured interval is pure adapter compute —
     preflight, a map lookup, SDK setup. It is genuinely bounded, and the setup/arming
@@ -4956,7 +4973,7 @@ async fn send_all(
   - **First-time dynamic-backend registration.** `finish()` is a **synchronous host
     call that can block** — Fastly may make it wait for a service-wide dynamic-backend
     slot. Nothing guest-side can interrupt it. If it blocks past the deadline, the
-    wall-clock overshoot has *already happened* by the time the guard runs — so the guard
+    wall-clock overshoot has *already happened* by the time the post-registration guard runs — so it
     **checks the absolute deadline FIRST and returns an attributed `gateway_timeout` (504)**
     (the honest outcome for a real expiry). It does **not** call this `internal`: `internal`
     is reserved for the *other* case — adapter overhead exceeding the slack **while the
@@ -5106,7 +5123,9 @@ async fn send_all(
        explicit identity comparison here. Release the borrow. §5.4 has a row that
        exercises this path via an injectable hash collision under the `test-utils` feature
        (**not** `#[cfg(test)]` — see §5.5 *Executable test seams*).
-  3. Otherwise (name is absent), **release the lock**, then call
+  3. Otherwise (name is absent), **release the lock**. For `send_all`, run the absolute
+     deadline-then-dispatch-slack guard before starting more synchronous work; if it fails,
+     return the typed timeout or `Internal` without registering a backend. Then call
      `Backend::builder(..).finish()`. The lock is **not** held across this host call:
      `finish()` registers a dynamic backend and can block waiting for a service-wide
      backend slot (see *Dispatch-phase deadline honesty* below), and holding a lock
@@ -6248,7 +6267,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 | Streamed request deadline boundary | Axum and Cloudflare check expiry before every pull and after every ready source result. Fake-time streams cover a chunk, EOF, and source error becoming ready exactly at expiry, plus always-ready empty chunks. Cloudflare's clock fixture remains frozen until the injected host-event yield completes: assert the ready-item quota is finite/nonzero and no greater than 64, survives polls/stream yields, counts empty items, and permits no next item before the quota-triggered host yield. Ready-only terminal success/error/cap paths also yield before their expiry decision. Assert attributed 504 without reanchoring the deadline. |
 | Cloudflare decoder fairness | With the same frozen clock, test ready-empty raw input that never produces decoded output, continuously ready decoded output, and native-EOF validation after codec completion. Both input and output quotas force host-event progress; terminal EOF/error and adapter-owned cap decisions at expiry yield attributed 504. Generic streamed-consumer caps after a within-budget yield retain §3.4.1's narrower ownership rule. Dropping during a host yield cleans up the owned subrequest guard. An independently advancing fake clock alone cannot establish these invariants. |
 | Timeout provenance | Each adapter's actual timed-out result covers timeout-wins, deadline-wins, and synthetic-default input selection in single send, buffered fan-out, and streamed error chunks; no adapter emits a bare un-attributed timeout **for an EdgeZero-owned budget timer**. Spin separately proves that an early WASI provider timeout is 504 with `BudgetSource::Unspecified`, while an error observed at/after absolute expiry is attributed to the selected budget. Fastly proves configured connection/response phase timers retain the selected cause, an early unconfigured DNS timeout is `Unspecified`, and absolute expiry wins every simultaneous result. |
-| Fastly stages | Backend identity/canonical host/TLS/SNI inputs, phase-timer rounding, cold registration, serial harvest, and streamed-upload cooperative checks match §4.3. The feature-gated overhead seam proves the slack invariant. `SendFailure` distinguishes budgeted phase timeout from unconfigured provider timeout; both map to 504, with the exact provenance boundary above. Pre-response DNS/connect/TLS establishment -> 502 reason `Unreachable`, later transport -> 502 reason `Transport`, upstream protocol -> 502 reason `Protocol`, unknown/registration rejection -> 502 reason `Unspecified`, local invariants -> 500, and the separately named Fastly platform-internal class -> 500. SDK-gated in-crate tests construct every known `SendErrorCause` and assert both `cause_to_failure` and composed status/kind/reason, including before/at/after deadline provenance; the Fastly WASM `--lib` gate executes them. Only hypothetical future variants remain compile/review coverage. |
+| Fastly stages | Backend identity/canonical host/TLS/SNI inputs, true ceil-to-millisecond phase rounding, cold registration, serial harvest, and streamed-upload cooperative checks match §4.3. Heterogeneous-host/budget tests prove distinct backend identities; a scripted cold-registration test proves an over-slack later cache miss is rejected before another registration. The target-neutral batch probe exercises both still-pending and later-ready harvest branches. The feature-gated overhead seam proves the final arming guard. `SendFailure` distinguishes budgeted phase timeout from unconfigured provider timeout; both map to 504, with the exact provenance boundary above. Pre-response DNS/connect/TLS establishment -> 502 reason `Unreachable`, later transport -> 502 reason `Transport`, upstream protocol -> 502 reason `Protocol`, unknown/registration rejection -> 502 reason `Unspecified`, local invariants -> 500, and the separately named Fastly platform-internal class -> 500. SDK-gated in-crate tests construct every known `SendErrorCause` and assert both `cause_to_failure` and composed status/kind/reason, including before/at/after deadline provenance; the Fastly WASM `--lib` gate executes them. Only hypothetical future variants remain compile/review coverage. |
 | Fastly upload finalization | Empty-source EOF and multi-chunk success call `finish()` exactly once before response wait. Source/cap failure and pre-finish expiry drop both handles without finishing; a typed source error is preserved. Write/flush/finish errors within budget are 502; success or failure returning at expiry is attributed 504. A finish failure or post-finish expiry never waits on `PendingRequest`, and dropping the send future settles its owned handles without successful finalization. Tests use the production upload driver with a scripted writer/pending-handle seam; they do not claim a finite host-write bound. |
 | Spin request protocol | Exercise every `run_exchange` transition and ownership boundary: after full upload, `send` continues to be polled but a ready result is retained until `request_done` succeeds; a `request_done` error wins over that stored result and is mapped; reader-gone retains but never polls `request_done` until `send` resolves, then drops it before response conversion; send-first drops all request handles; clean EOF/reader-gone writes `Ok(None)` trailers; source/cap/deadline failure leaves the default `Err`. Biased simultaneous readiness makes an already-ready pump failure beat `send`, while send ready before a later source failure remains authoritative. An always-ready empty-chunk source yields between chunks so send/timer polling cannot starve, and no request-side handle enters a streamed response wrapper. The target-neutral injected RequestOptions suite covers all setters accepted, any setter NotSupported (warn once and retain the outer race), Immutable, and Other. The real SDK-resource suite invokes each setter and asserts only the pinned host's actual result. |
 | Spin response protocol | `consume_body` receives the caller-result reader; stream/trailer handles retain the writer; clean EOF/trailers writes `Ok`; body/decode/deadline failure writes or defaults to `Err`; no handle is dropped before its terminal branch. Ready-empty raw input and continuously ready decoded output hit finite input/output quotas, return `Pending`, poll the outer timer/siblings, and retain counters across calls. |
