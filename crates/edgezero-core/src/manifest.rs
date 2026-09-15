@@ -89,6 +89,11 @@ pub enum Capability {
     InboundReadDeadlines,
     IngressAdmission,
     LazyStreamedResponsePassthrough,
+    OutboundAuthorityOverride,
+    OutboundBatchCancellation,
+    OutboundBatchCompletionOrder,
+    OutboundBatchSlotIsolation,
+    OutboundCacheBypass,
     OutboundCompleteResourceAccounting,
     OutboundDeadlines,
     OutboundFlexiblePhaseBudget,
@@ -100,7 +105,6 @@ pub enum Capability {
     ResponseEgressBackpressure,
     ResponseEgressCompletion,
     ResponseWriteDeadlines,
-    SendAllSlotIsolation,
     StreamedUploadDeadlines,
 }
 
@@ -122,6 +126,11 @@ impl Capability {
             Self::InboundReadDeadlines => "inbound-read-deadlines",
             Self::IngressAdmission => "ingress-admission",
             Self::LazyStreamedResponsePassthrough => "lazy-streamed-response-passthrough",
+            Self::OutboundAuthorityOverride => "outbound-authority-override",
+            Self::OutboundBatchCancellation => "outbound-batch-cancellation",
+            Self::OutboundBatchCompletionOrder => "outbound-batch-completion-order",
+            Self::OutboundBatchSlotIsolation => "outbound-batch-slot-isolation",
+            Self::OutboundCacheBypass => "outbound-cache-bypass",
             Self::OutboundCompleteResourceAccounting => "outbound-complete-resource-accounting",
             Self::OutboundDeadlines => "outbound-deadlines",
             Self::OutboundFlexiblePhaseBudget => "outbound-flexible-phase-budget",
@@ -133,7 +142,6 @@ impl Capability {
             Self::ResponseEgressBackpressure => "response-egress-backpressure",
             Self::ResponseEgressCompletion => "response-egress-completion",
             Self::ResponseWriteDeadlines => "response-write-deadlines",
-            Self::SendAllSlotIsolation => "send-all-slot-isolation",
             Self::StreamedUploadDeadlines => "streamed-upload-deadlines",
         }
     }
@@ -1645,6 +1653,11 @@ required = [
     "inbound-read-deadlines",
     "ingress-admission",
     "lazy-streamed-response-passthrough",
+    "outbound-authority-override",
+    "outbound-batch-cancellation",
+    "outbound-batch-completion-order",
+    "outbound-batch-slot-isolation",
+    "outbound-cache-bypass",
     "outbound-complete-resource-accounting",
     "outbound-deadlines",
     "outbound-flexible-phase-budget",
@@ -1656,7 +1669,6 @@ required = [
     "response-egress-backpressure",
     "response-egress-completion",
     "response-write-deadlines",
-    "send-all-slot-isolation",
     "streamed-upload-deadlines",
 ]
 optional = []
@@ -1671,6 +1683,11 @@ hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
             Capability::InboundReadDeadlines,
             Capability::IngressAdmission,
             Capability::LazyStreamedResponsePassthrough,
+            Capability::OutboundAuthorityOverride,
+            Capability::OutboundBatchCancellation,
+            Capability::OutboundBatchCompletionOrder,
+            Capability::OutboundBatchSlotIsolation,
+            Capability::OutboundCacheBypass,
             Capability::OutboundCompleteResourceAccounting,
             Capability::OutboundDeadlines,
             Capability::OutboundFlexiblePhaseBudget,
@@ -1682,7 +1699,6 @@ hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
             Capability::ResponseEgressBackpressure,
             Capability::ResponseEgressCompletion,
             Capability::ResponseWriteDeadlines,
-            Capability::SendAllSlotIsolation,
             Capability::StreamedUploadDeadlines,
         ];
         assert_eq!(loader.manifest().capabilities.required, expected);
@@ -1701,6 +1717,11 @@ hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
             "inbound-read-deadlines",
             "ingress-admission",
             "lazy-streamed-response-passthrough",
+            "outbound-authority-override",
+            "outbound-batch-cancellation",
+            "outbound-batch-completion-order",
+            "outbound-batch-slot-isolation",
+            "outbound-cache-bypass",
             "outbound-complete-resource-accounting",
             "outbound-deadlines",
             "outbound-flexible-phase-budget",
@@ -1712,7 +1733,6 @@ hosts = ["*", "HTTPS://Example.COM", "api.example.com:8443"]
             "response-egress-backpressure",
             "response-egress-completion",
             "response-write-deadlines",
-            "send-all-slot-isolation",
             "streamed-upload-deadlines",
         ]) {
             assert_eq!(capability.as_str(), expected_name);

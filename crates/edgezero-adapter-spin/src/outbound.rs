@@ -237,6 +237,7 @@ use exchange::{
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod spin_impl {
     use std::num::NonZeroU64;
+    use std::task::Poll;
     use std::time::Duration;
 
     use async_stream::stream;
@@ -246,20 +247,22 @@ mod spin_impl {
     use edgezero_core::compression::{
         ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
     };
-    use edgezero_core::error::{BadGatewayReason, EdgeError};
+    use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
-        OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
-        OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
-        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
-        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
-        normalize_response_headers, rechunk_stream, validate_for_dispatch,
+        OutboundBatch, OutboundBatchItem, OutboundHttpClient, OutboundRequest,
+        OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseBodyDisposition,
+        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
+        enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
+        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
     };
-    use edgezero_core::time::{DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget};
+    use edgezero_core::time::{
+        Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
+    };
     use futures_util::StreamExt as _;
-    use futures_util::future::{Either, join_all, select};
-    use futures_util::stream::once;
+    use futures_util::future::{Either, FutureExt as _, LocalBoxFuture, poll_fn, select};
+    use futures_util::stream::{FuturesUnordered, empty, once};
     use spin_sdk::time::sleep;
     use spin_sdk::wasip3::http::client;
     use spin_sdk::wasip3::http::types::{
@@ -279,6 +282,7 @@ mod spin_impl {
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
 
     /// Native outbound HTTP implementation for Spin's WASI HTTP 0.3 host.
+    #[derive(Clone)]
     pub struct SpinOutboundClient {
         clock: MonotonicClock,
     }
@@ -286,11 +290,6 @@ mod spin_impl {
     struct PreparedRequest {
         budget: DispatchBudget,
         parts: OutboundRequestParts,
-    }
-
-    enum PreparedSlot {
-        Finished(OutboundSlotResult),
-        Pending(Box<PreparedRequest>),
     }
 
     impl SpinOutboundClient {
@@ -312,23 +311,25 @@ mod spin_impl {
             request: OutboundRequest,
             started_at: MonotonicInstant,
         ) -> Result<PreparedRequest, EdgeError> {
-            validate_for_dispatch(&request)?;
-            Self::prepare_validated(request, started_at)
+            super::validate_request(&request)?;
+            Self::prepare_validated(request, started_at, None)
         }
 
         fn prepare_batch(
             request: OutboundRequest,
             started_at: MonotonicInstant,
+            cutoff: Deadline,
         ) -> Result<PreparedRequest, EdgeError> {
             super::validate_batch_request(&request)?;
-            Self::prepare_validated(request, started_at)
+            Self::prepare_validated(request, started_at, Some(cutoff))
         }
 
         fn prepare_validated(
             mut request: OutboundRequest,
             started_at: MonotonicInstant,
+            batch_cutoff: Option<Deadline>,
         ) -> Result<PreparedRequest, EdgeError> {
-            let budget = dispatch_budget(&request, started_at)?;
+            let budget = dispatch_budget(&request, started_at, batch_cutoff)?;
             normalize_for_dispatch(&mut request)?;
             Ok(PreparedRequest {
                 budget,
@@ -416,34 +417,75 @@ mod spin_impl {
         }
 
         #[inline]
-        async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
+        fn start_batch_until(
+            &self,
+            requests: Vec<OutboundRequest>,
+            cutoff: Deadline,
+        ) -> OutboundBatch {
             let batch_started_at = self.clock.now();
-            let preflight: Vec<PreparedSlot> = requests
-                .into_iter()
-                .map(|request| {
-                    Self::prepare_batch(request, batch_started_at).map_or_else(
-                        |error| {
-                            PreparedSlot::Finished(finish_slot(
-                                batch_started_at,
-                                Err(error),
-                                &self.clock,
-                            ))
-                        },
-                        |prepared| PreparedSlot::Pending(Box::new(prepared)),
-                    )
-                })
-                .collect();
+            let slot_count = requests.len();
+            if cutoff.is_expired_at(batch_started_at) {
+                return OutboundBatch::from_stream(slot_count, empty());
+            }
 
-            join_all(preflight.into_iter().map(|slot| async move {
-                match slot {
-                    PreparedSlot::Pending(prepared) => {
-                        let outcome = self.execute(*prepared).await;
-                        finish_slot(batch_started_at, outcome, &self.clock)
+            let mut completed = Vec::new();
+            let pending_slots = FuturesUnordered::<LocalBoxFuture<'static, _>>::new();
+            for (index, request) in requests.into_iter().enumerate() {
+                match Self::prepare_batch(request, batch_started_at, cutoff) {
+                    Ok(prepared) => {
+                        let client = self.clone();
+                        pending_slots.push(
+                            async move {
+                                let outcome = client.execute(prepared).await;
+                                (index, client.clock.now(), outcome)
+                            }
+                            .boxed_local(),
+                        );
                     }
-                    PreparedSlot::Finished(done) => done,
+                    Err(error) => completed.push((index, self.clock.now(), Err(error))),
                 }
-            }))
-            .await
+            }
+
+            let completions = stream! {
+                let mut pending = pending_slots;
+                poll_fn(|context| {
+                    loop {
+                        match pending.poll_next_unpin(context) {
+                            Poll::Ready(Some(item)) => completed.push(item),
+                            Poll::Ready(None) | Poll::Pending => {
+                                return Poll::Ready(());
+                            }
+                        }
+                    }
+                }).await;
+
+                for (index, completed_at, outcome) in completed {
+                    let Some(item) = finish_batch_item(
+                        index,
+                        batch_started_at,
+                        completed_at,
+                        cutoff,
+                        outcome,
+                    ) else {
+                        return;
+                    };
+                    yield item;
+                }
+
+                while let Some((index, completed_at, outcome)) = pending.next().await {
+                    let Some(item) = finish_batch_item(
+                        index,
+                        batch_started_at,
+                        completed_at,
+                        cutoff,
+                        outcome,
+                    ) else {
+                        return;
+                    };
+                    yield item;
+                }
+            };
+            OutboundBatch::from_stream(slot_count, completions)
         }
     }
 
@@ -889,13 +931,25 @@ mod spin_impl {
             .ok_or_else(|| timeout_error(budget.cause))
     }
 
-    fn finish_slot(
+    fn finish_batch_item(
+        index: usize,
         started_at: MonotonicInstant,
+        completed_at: MonotonicInstant,
+        cutoff: Deadline,
         outcome: Result<OutboundResponse, EdgeError>,
-        clock: &MonotonicClock,
-    ) -> OutboundSlotResult {
-        let completed_at = clock.now();
-        match completed_at.checked_duration_since(started_at) {
+    ) -> Option<OutboundBatchItem> {
+        if cutoff.is_expired_at(completed_at)
+            || matches!(
+                outcome,
+                Err(EdgeError::GatewayTimeout {
+                    cause: BudgetSource::BatchCutoff,
+                    ..
+                })
+            )
+        {
+            return None;
+        }
+        let result = match completed_at.checked_duration_since(started_at) {
             Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
             None => OutboundSlotResult::new(
                 Duration::ZERO,
@@ -903,7 +957,8 @@ mod spin_impl {
                     "monotonic clock moved backwards during outbound dispatch"
                 ))),
             ),
-        }
+        };
+        Some(OutboundBatchItem::new(index, result))
     }
 
     /// Runs request-option, response-clock, and fairness checks in the hosted contract binary.
@@ -918,7 +973,8 @@ mod spin_impl {
         let Ok(request) = OutboundRequest::get("https://example.com/") else {
             return false;
         };
-        let Ok(budget) = dispatch_budget(&request.timeout(Duration::from_millis(10)), start) else {
+        let Ok(budget) = dispatch_budget(&request.timeout(Duration::from_millis(10)), start, None)
+        else {
             return false;
         };
         let observed = start.checked_add(Duration::from_millis(3)).unwrap_or(start);
@@ -1003,13 +1059,22 @@ mod spin_impl {
                 .expect("request")
                 .stream_response();
 
-            let results = block_on(client.send_all(vec![request]));
+            let results = block_on(
+                client
+                    .start_batch_until(
+                        vec![request],
+                        Deadline::at_instant(
+                            start
+                                .checked_add(Duration::from_secs(1))
+                                .expect("cutoff instant"),
+                        ),
+                    )
+                    .collect(),
+            );
 
-            assert_eq!(results[0].elapsed, Duration::from_millis(9));
-            assert!(matches!(
-                results[0].outcome,
-                Err(EdgeError::BadRequest { .. })
-            ));
+            let slot = results.slots[0].as_ref().expect("resolved slot");
+            assert_eq!(slot.elapsed, Duration::from_millis(9));
+            assert!(matches!(slot.outcome, Err(EdgeError::BadRequest { .. })));
         }
 
         #[test]
@@ -1023,13 +1088,22 @@ mod spin_impl {
                 .expect("request")
                 .stream_response();
 
-            let results = block_on(client.send_all(vec![request]));
+            let results = block_on(
+                client
+                    .start_batch_until(
+                        vec![request],
+                        Deadline::at_instant(
+                            start
+                                .checked_add(Duration::from_secs(1))
+                                .expect("cutoff instant"),
+                        ),
+                    )
+                    .collect(),
+            );
 
-            assert_eq!(results[0].elapsed, Duration::ZERO);
-            assert!(matches!(
-                results[0].outcome,
-                Err(EdgeError::Internal { .. })
-            ));
+            let slot = results.slots[0].as_ref().expect("resolved slot");
+            assert_eq!(slot.elapsed, Duration::ZERO);
+            assert!(matches!(slot.outcome, Err(EdgeError::Internal { .. })));
         }
 
         #[test]
@@ -1168,15 +1242,26 @@ fn timeout_error(cause: BudgetSource) -> EdgeError {
 
 #[cfg(any(feature = "test-utils", all(feature = "spin", target_arch = "wasm32")))]
 fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
-    validate_for_dispatch(request)?;
+    validate_request(request)?;
     if request.is_stream_body() {
         return Err(EdgeError::bad_request(
-            "send_all requires buffered request bodies; use send for a streamed upload",
+            "outbound batches require buffered request bodies; use send for a streamed upload",
         ));
     }
     if request.is_stream_response() {
         return Err(EdgeError::bad_request(
-            "send_all requires buffered responses; use send for a streamed response",
+            "outbound batches require buffered responses; use send for a streamed response",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "test-utils", all(feature = "spin", target_arch = "wasm32")))]
+fn validate_request(request: &OutboundRequest) -> Result<(), EdgeError> {
+    validate_for_dispatch(request)?;
+    if request.has_host_authority_override() {
+        return Err(EdgeError::bad_request(
+            "Spin cannot separate the outbound Host authority from the connection target",
         ));
     }
     Ok(())
@@ -1190,6 +1275,16 @@ fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
 #[inline]
 pub fn validate_batch_request_for_test(request: &OutboundRequest) -> Result<(), EdgeError> {
     validate_batch_request(request)
+}
+
+/// Runs the target-neutral Spin request policy before any provider dispatch.
+///
+/// # Errors
+/// Returns the same portable validation or unsupported-authority error as production dispatch.
+#[cfg(feature = "test-utils")]
+#[inline]
+pub fn validate_request_for_test(request: &OutboundRequest) -> Result<(), EdgeError> {
+    validate_request(request)
 }
 
 /// Exposes the real pinned SDK classifier to WASI resource contract tests.

@@ -14,6 +14,7 @@ use std::pin::Pin;
 
 use http::request::{Builder as HttpRequestBuilder, Parts as HttpRequestParts};
 use http::response::Builder as HttpResponseBuilder;
+use http::uri::Authority as HttpAuthority;
 
 use crate::body::Body;
 use crate::error::EdgeError;
@@ -23,6 +24,7 @@ use crate::error::EdgeError;
 // `Builder` types are exposed via `pub type` aliases (not `pub use`) so
 // only the `header` re-export remains, scoped to its own child module.
 pub type Extensions = http::Extensions;
+pub type Authority = HttpAuthority;
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Response, EdgeError>> + 'static>>;
 pub type HeaderMap = http::HeaderMap;
 pub type HeaderName = header::HeaderName;

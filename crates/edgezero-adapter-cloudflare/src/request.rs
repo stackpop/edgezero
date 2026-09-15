@@ -922,9 +922,13 @@ mod tests {
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
             let request =
                 OutboundRequest::get("https://example.com/")?.body(Body::from("invalid GET body"));
-            let results = client.send_all(vec![request]).await;
+            let results = client
+                .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
+                .await;
             let result = results
+                .slots
                 .first()
+                .and_then(Option::as_ref)
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing outbound result")))?;
             if !matches!(&result.outcome, Err(EdgeError::BadRequest { .. })) {
                 return Err(EdgeError::internal(anyhow::anyhow!(

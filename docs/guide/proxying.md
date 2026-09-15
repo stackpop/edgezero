@@ -14,7 +14,7 @@ use edgezero_core::action;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response, Uri};
-use edgezero_core::outbound::OutboundRequest;
+use edgezero_core::outbound::{OutboundCachePolicy, OutboundRequest};
 use std::num::NonZeroU64;
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ async fn forward_with_auth(
         .map_err(|_| EdgeError::bad_request("invalid upstream URI"))?;
 
     let mut request = OutboundRequest::from_request(ctx.into_request(), target)?
+        .cache_policy(OutboundCachePolicy::Bypass)
         .timeout(Duration::from_secs(2))
         .max_request_body_bytes(256 * 1024)
         .max_encoded_response_bytes(2 * 1024 * 1024)
@@ -63,11 +64,12 @@ forwarding an inbound request and performs the same target validation and hop-by
 normalization immediately.
 
 ```rust
-use edgezero_core::outbound::OutboundRequest;
+use edgezero_core::outbound::{OutboundCachePolicy, OutboundRequest};
 use std::num::NonZeroU64;
 use std::time::Duration;
 
 let request = OutboundRequest::post("https://api.example.com/events")?
+    .cache_policy(OutboundCachePolicy::Bypass)
     .timeout(Duration::from_secs(2))
     .max_request_body_bytes(256 * 1024)
     .max_encoded_response_bytes(2 * 1024 * 1024)
@@ -84,6 +86,11 @@ let response = client.send(request).await?;
 let decoded: ApiResponse = response.json()?;
 ```
 
+`host_authority_override("virtual.example:8443")` changes only the outgoing HTTP authority. The
+request URI still selects the connection destination, TLS SNI, and certificate identity. Axum and
+Fastly support that separation, Cloudflare is BestEffort pending a deployed wire probe, and Spin
+rejects the override during preflight.
+
 Buffered response mode is the default. Call `stream_response()` for a streamed response and
 consume `response.into_body()` while its absolute request deadline is still active. Use
 `into_bytes_bounded`, `into_bytes_bounded_until`, or `json_bounded_until` when application code
@@ -95,23 +102,27 @@ backing allocation, and a provider SDK may allocate the source chunk before Edge
 
 ## Batch Requests
 
-`send_all` accepts buffered request bodies and buffered response mode only. It returns an
-index-aligned `Vec<OutboundSlotResult>` rather than failing the whole batch:
+`start_batch_until` accepts buffered request bodies and buffered response mode only. It yields
+terminal slots in observed completion order while retaining each original input index. This lets
+an application keep completed results when its own cutoff wins:
 
 ```rust
-let slots = client.send_all(requests).await;
-for slot in slots {
-    match slot.outcome {
-        Ok(response) => record_success(slot.elapsed, response.status()),
-        Err(error) => record_failure(slot.elapsed, error),
+use edgezero_core::time::Deadline;
+
+let mut batch = client.start_batch_until(requests, Deadline::after(Duration::from_secs(2)));
+while let Some(item) = batch.next().await {
+    match item.result.outcome {
+        Ok(response) => record_success(item.index, item.result.elapsed, response.status()),
+        Err(error) => record_failure(item.index, item.result.elapsed, error),
     }
 }
 ```
 
-Every slot is timed from the batch method-entry snapshot through its own terminal observation,
-including preflight and body buffering. It is not pure network RTT. Bound the request count and
-every per-request body limit; EdgeZero intentionally has no global batch-concurrency or memory
-cap.
+`send_all_until` collects the same driver into an index-aligned
+`Vec<Option<OutboundSlotResult>>`; `None` means that slot was unresolved at cutoff. Every terminal
+slot is timed from the batch method-entry snapshot through its own terminal observation, including
+preflight and body buffering. It is not pure network RTT. Bound the request count and every
+per-request body limit; EdgeZero intentionally has no global batch-concurrency or memory cap.
 
 ## Platform Behavior
 

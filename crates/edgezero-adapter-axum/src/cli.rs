@@ -143,12 +143,16 @@ impl Adapter for AxumCliAdapter {
             | Capability::ResponseWriteDeadlines => CapabilitySupport::BestEffort,
             Capability::InboundReadDeadlines
             | Capability::IngressAdmission
+            | Capability::OutboundAuthorityOverride
+            | Capability::OutboundBatchCancellation
+            | Capability::OutboundBatchCompletionOrder
+            | Capability::OutboundBatchSlotIsolation
+            | Capability::OutboundCacheBypass
             | Capability::OutboundDeadlines
             | Capability::OutboundFlexiblePhaseBudget
             | Capability::OutboundHeaderFidelity
             | Capability::OutboundHttp
             | Capability::LazyStreamedResponsePassthrough
-            | Capability::SendAllSlotIsolation
             | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
             Capability::ConfigReadAllocationBounds
             | Capability::OutboundCompleteResourceAccounting
@@ -817,7 +821,23 @@ mod tests {
                 Capability::OutboundFlexiblePhaseBudget,
                 CapabilitySupport::Native,
             ),
-            (Capability::SendAllSlotIsolation, CapabilitySupport::Native),
+            (
+                Capability::OutboundAuthorityOverride,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchCancellation,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchCompletionOrder,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchSlotIsolation,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundCacheBypass, CapabilitySupport::Native),
             (
                 Capability::StreamedUploadDeadlines,
                 CapabilitySupport::Native,

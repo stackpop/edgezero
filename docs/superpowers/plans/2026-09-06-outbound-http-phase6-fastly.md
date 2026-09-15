@@ -3,6 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **Status:** Deterministic implementation is complete on PR 275. Protected deployed-provider characterization remains an external promotion gate, so Fastly limitations remain `BestEffort`. The unchecked steps below are retained as the original implementation record.
+> **Superseded batch/lifecycle API:** The 2026-09-15 consumer-alignment plan replaces this
+> plan's ordered-harvest API and test sentinels. Retain the text only as implementation history.
 
 **Goal:** Implement Fastly outbound HTTP with dispatch-all-before-wait fan-out, deterministic dynamic backends, host timer derivation, typed errors, streamed upload ownership, and bounded downstream conversion.
 

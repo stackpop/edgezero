@@ -15,7 +15,7 @@ This workspace demonstrates a multi-target EdgeZero app.
 - `POST /echo` - echoes JSON payloads
 - `GET /admission` - confirms route-aware admission and one-time grant consumption
 - `GET|POST /proxy/{*rest}` - sends the request to `API_BASE_URL`, falling back to a 501 when the active adapter does not inject an outbound HTTP client
-- `POST /fanout` - sends up to eight relative paths concurrently and returns index-aligned status, error category, and per-slot elapsed milliseconds
+- `POST /fanout` - attempts up to eight relative paths before harvest and returns index-aligned status, error category, unresolved state, and per-slot elapsed milliseconds
 
 ## Outbound HTTP
 
@@ -28,14 +28,16 @@ capability check passes. See the
 [capability guide](https://stackpop.github.io/edgezero/guide/capabilities) for
 the current support matrix and deployment prerequisites.
 
-Both outbound examples set a 5-second timeout, a 1 MiB request-body cap,
+Both outbound examples bypass adapter-managed caches and set a 5-second timeout, a 1 MiB request-body cap,
 independent 2 MiB encoded / 1 MiB decoded / 2 MiB final-buffer response caps,
 64 KiB / 100-field response-header caps, and explicit Brotli window and decoder
 memory limits. `/fanout` also gives every slot one shared absolute deadline and
-returns the adapter-recorded elapsed time for that slot. This elapsed value
+returns the adapter-recorded elapsed time for each terminal slot. This elapsed value
 includes EdgeZero and provider processing rather than representing pure wire
 RTT. Cross-slot timing isolation is adapter-dependent; deployments that require
-it must declare `send-all-slot-isolation` as a required capability.
+it must declare `outbound-batch-slot-isolation` as a required capability. Applications
+that retain partial results after cancellation should also require the appropriate
+`outbound-batch-completion-order` and `outbound-batch-cancellation` support levels.
 
 ## Dev
 

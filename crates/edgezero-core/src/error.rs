@@ -36,9 +36,10 @@ pub enum BadGatewayReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BudgetSource {
-    BatchDeadline,
+    BatchCutoff,
     Default,
     PerCallTimeout,
+    RequestDeadline,
     Unspecified,
 }
 
@@ -702,7 +703,7 @@ mod tests {
                 "gateway timeout",
             ),
             (
-                EdgeError::gateway_timeout_caused("late", BudgetSource::BatchDeadline),
+                EdgeError::gateway_timeout_caused("late", BudgetSource::RequestDeadline),
                 504_u16,
                 "gateway_timeout",
                 "gateway timeout",
@@ -1060,9 +1061,10 @@ mod tests {
     #[test]
     fn gateway_timeout_caused_preserves_cause() {
         for expected in [
-            BudgetSource::BatchDeadline,
+            BudgetSource::BatchCutoff,
             BudgetSource::Default,
             BudgetSource::PerCallTimeout,
+            BudgetSource::RequestDeadline,
             BudgetSource::Unspecified,
         ] {
             let EdgeError::GatewayTimeout { cause, .. } =

@@ -1,5 +1,8 @@
 # EdgeZero P0-C — Fastly `run_app` Dispatch Fidelity Implementation Plan
 
+> **Status:** Implemented and superseded. The 2026-09-15 consumer-alignment plan replaces the
+> request-only Fastly hook below with the closed request/response lifecycle API.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Bring Fastly's `run_app` to parity with hand-written custom dispatch: preserve multi-value response headers (`Set-Cookie`), let an app opt out of the adapter's logger init, and add a pre-dispatch hook that reads raw-`fastly::Request` signals (JA4 / H2 / client IP) into the core request's extensions.

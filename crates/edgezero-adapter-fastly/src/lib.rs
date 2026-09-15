@@ -35,7 +35,7 @@ use edgezero_core::app::StoresMetadata;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
-use edgezero_core::http::Extensions;
+use edgezero_core::http::{Extensions, Response};
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
@@ -169,23 +169,28 @@ pub fn init_logger(
 #[cfg(feature = "fastly")]
 #[inline]
 pub fn run_app<A: Hooks>() -> Result<(), fastly::Error> {
-    run_app_with_request_extensions::<A, _>(|_req, _extensions| {})
+    run_app_with_hooks::<A, _, _, ()>(|_req, _extensions| {}, |_response| ()).map(|_state| ())
 }
 
-/// Like [`run_app`], but runs `extend` against a scratch
-/// [`Extensions`] populated from the raw
-/// `fastly::Request` (TLS JA4, H2 fingerprint, client IP, …) before the request
-/// is converted; the scratch values are merged into the core request's
-/// extensions and are visible to middleware and the `State`/extractor layer.
+/// Runs the manifest-wired app through Fastly's closed request/response lifecycle.
+///
+/// `prepare` borrows the raw request and extension bag before conversion. `finalize` borrows only
+/// routed responses before response-egress policy and framing. `EdgeZero` retains transmission
+/// ownership; routed hook state is returned only after terminal delivery, while detached ingress
+/// responses skip `finalize` and return `None`.
 ///
 /// # Errors
 /// Returns an error if logger setup fails or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app_with_request_extensions<A, F>(extend: F) -> Result<(), fastly::Error>
+pub fn run_app_with_hooks<A, Prepare, Finalize, State>(
+    prepare: Prepare,
+    finalize: Finalize,
+) -> Result<Option<State>, fastly::Error>
 where
     A: Hooks,
-    F: FnOnce(&fastly::Request, &mut Extensions),
+    Prepare: FnOnce(&mut fastly::Request, &mut Extensions),
+    Finalize: FnOnce(&mut Response) -> State,
 {
     init_fastly_abi();
     let stores = A::stores();
@@ -196,7 +201,7 @@ where
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
     let app = A::build_app();
-    request::send_with_registries(&app, stores, &env, extend)
+    request::send_with_registries_and_hooks(&app, stores, &env, prepare, finalize)
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
@@ -212,7 +217,7 @@ where
 /// read because they have no safe owner when this Config Store is linked to more
 /// than one service. The returned [`EnvConfig`] contains canonical unscoped keys.
 ///
-/// [`run_app`] and [`run_app_with_request_extensions`] call this themselves.
+/// [`run_app`] and [`run_app_with_hooks`] call this themselves.
 /// [`run_app_with_config`] does NOT, and neither does a hand-built
 /// [`FastlyService`](request::FastlyService). A custom entry point on either path
 /// must call this explicitly.
@@ -308,7 +313,7 @@ fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
 /// [`EnvConfig`] overlay: the store name comes directly from
 /// `config_store_name`, and its default key is always `"default"`, so staged or
 /// overridden `__NAME` / `__KEY` selectors are ignored. Use
-/// [`runtime_env_config`] with [`request::send_with_registries`] for the
+/// [`runtime_env_config`] with [`request::send_with_registries_and_hooks`] for the
 /// same selector resolution as [`run_app`]. KV is not auto-injected on this
 /// path; chain `.with_kv(name)` on a [`request::FastlyService`] builder if you
 /// need KV alongside the config store.

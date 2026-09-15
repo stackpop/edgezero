@@ -464,8 +464,15 @@ mod tests {
                 .http_client()
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
             let request = OutboundRequest::get("https://example.com/")?.stream_response();
-            let results = client.send_all(vec![request]).await;
-            Ok(results[0].elapsed.as_millis().to_string())
+            let results = client
+                .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
+                .await;
+            Ok(results.slots[0]
+                .as_ref()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("unresolved HTTP slot")))?
+                .elapsed
+                .as_millis()
+                .to_string())
         }
 
         let start = MonotonicInstant::now();

@@ -6,7 +6,7 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::extractor::{Headers, Json, Path};
 use edgezero_core::http::{self, Method, Response, StatusCode, Uri};
-use edgezero_core::outbound::{OutboundRequest, OutboundSlotResult};
+use edgezero_core::outbound::{OutboundCachePolicy, OutboundRequest, OutboundSlotResult};
 use edgezero_core::response::Text;
 use edgezero_core::time::Deadline;
 use futures::{StreamExt as _, stream};
@@ -55,7 +55,7 @@ struct FanoutRequest {
 
 #[derive(serde::Serialize)]
 struct FanoutSlot {
-    elapsed_ms: u128,
+    elapsed_ms: Option<u128>,
     index: usize,
     outcome: FanoutSlotOutcome,
 }
@@ -65,6 +65,7 @@ struct FanoutSlot {
 enum FanoutSlotOutcome {
     Error { category: &'static str, status: u16 },
     Response { status: u16 },
+    Unresolved,
 }
 
 #[derive(serde::Deserialize)]
@@ -158,8 +159,9 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
             Ok(outbound_policy(OutboundRequest::new(Method::GET, target)?).deadline(deadline))
         })
         .collect::<Result<Vec<_>, EdgeError>>()?;
-    let slots = client.send_all(requests).await;
+    let slots = client.send_all_until(requests, deadline).await;
     let output = slots
+        .slots
         .into_iter()
         .enumerate()
         .map(|(index, slot)| fanout_slot(index, slot))
@@ -219,25 +221,35 @@ fn error_category(status: StatusCode) -> &'static str {
     }
 }
 
-fn fanout_slot(index: usize, slot: OutboundSlotResult) -> FanoutSlot {
-    let outcome = match slot.outcome {
-        Ok(response) => FanoutSlotOutcome::Response {
-            status: response.status().as_u16(),
+fn fanout_slot(index: usize, slot_result: Option<OutboundSlotResult>) -> FanoutSlot {
+    match slot_result {
+        Some(slot) => {
+            let outcome = match slot.outcome {
+                Ok(response) => FanoutSlotOutcome::Response {
+                    status: response.status().as_u16(),
+                },
+                Err(error) => FanoutSlotOutcome::Error {
+                    category: error_category(error.status()),
+                    status: error.status().as_u16(),
+                },
+            };
+            FanoutSlot {
+                elapsed_ms: Some(slot.elapsed.as_millis()),
+                index,
+                outcome,
+            }
+        }
+        None => FanoutSlot {
+            elapsed_ms: None,
+            index,
+            outcome: FanoutSlotOutcome::Unresolved,
         },
-        Err(error) => FanoutSlotOutcome::Error {
-            category: error_category(error.status()),
-            status: error.status().as_u16(),
-        },
-    };
-    FanoutSlot {
-        elapsed_ms: slot.elapsed.as_millis(),
-        index,
-        outcome,
     }
 }
 
 fn outbound_policy(request: OutboundRequest) -> OutboundRequest {
     request
+        .cache_policy(OutboundCachePolicy::Bypass)
         .max_brotli_decoder_bytes(MAX_BROTLI_DECODER_BYTES)
         .max_brotli_window_bits(MAX_BROTLI_WINDOW_BITS)
         .max_decoded_response_bytes(MAX_DECODED_RESPONSE_BYTES)
@@ -298,8 +310,8 @@ mod tests {
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{HeaderMap, Method, StatusCode, Uri, request_builder};
     use edgezero_core::outbound::{
-        HttpClient, OutboundHttpClient, OutboundRequestParts, OutboundResponse, OutboundSlotResult,
-        ResponseMode,
+        HttpClient, OutboundBatch, OutboundBatchItem, OutboundHttpClient, OutboundRequestParts,
+        OutboundResponse, OutboundSlotResult, ResponseMode,
     };
     use edgezero_core::params::PathParams;
     use edgezero_core::response::IntoResponse as _;
@@ -321,28 +333,40 @@ mod tests {
             response_for(parts)
         }
 
-        async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
-            let mut deadline = None;
-            let mut results = Vec::with_capacity(requests.len());
+        fn start_batch_until(
+            &self,
+            requests: Vec<OutboundRequest>,
+            cutoff: Deadline,
+        ) -> OutboundBatch {
+            let mut observed_deadline = None;
+            let slot_count = requests.len();
+            let mut results = Vec::with_capacity(slot_count);
             for (index, request) in requests.into_iter().enumerate() {
                 let parts = request.into_parts();
                 assert_outbound_policy(&parts);
                 let slot_deadline = parts.deadline.expect("batch deadline");
-                if let Some(expected) = deadline {
+                if let Some(expected) = observed_deadline {
                     assert_eq!(slot_deadline.instant(), expected);
                 } else {
-                    deadline = Some(slot_deadline.instant());
+                    observed_deadline = Some(slot_deadline.instant());
                 }
                 let elapsed = Duration::from_millis(
                     u64::try_from(index).expect("slot index").saturating_add(1),
                 );
-                results.push(OutboundSlotResult::new(elapsed, response_for(parts)));
+                results.push(OutboundBatchItem::new(
+                    index,
+                    OutboundSlotResult::new(elapsed, response_for(parts)),
+                ));
             }
-            results
+            if let Some(batch_deadline) = observed_deadline {
+                assert_eq!(batch_deadline, cutoff.instant());
+            }
+            OutboundBatch::from_stream(slot_count, stream::iter(results))
         }
     }
 
     fn assert_outbound_policy(parts: &OutboundRequestParts) {
+        assert_eq!(parts.cache_policy, OutboundCachePolicy::Bypass);
         assert_eq!(parts.timeout, Some(OUTBOUND_REQUEST_TIMEOUT));
         assert_eq!(
             parts.max_request_body_bytes,
@@ -382,7 +406,7 @@ mod tests {
         if parts.uri.path() == "/fail" {
             return Err(EdgeError::gateway_timeout_caused(
                 "provider URL https://user:token@example.invalid",
-                BudgetSource::BatchDeadline,
+                BudgetSource::RequestDeadline,
             ));
         }
 

@@ -39,4 +39,17 @@ scan \
   '#\[fastly::main\]' \
   crates/edgezero-adapter-fastly/src/templates examples/app-demo docs/guide README.md || failed=1
 
+# The completion-driven hard cut removes the terminal-vector-only API and the
+# request-extension-only Fastly lifecycle. The generator's negative assertion
+# intentionally contains `.send_all(` and is excluded here.
+scan \
+  '\.send_all\(|SendAllSlotIsolation|send-all-slot-isolation|run_app_with_request_extensions' \
+  crates examples/app-demo docs/guide README.md CLAUDE.md TODO.md \
+  ':(exclude)crates/edgezero-cli/src/generator.rs' || failed=1
+
+# Generated/demo Fastly entrypoints must delegate transmission to EdgeZero.
+scan \
+  'stream_to_client|send_to_client|send_with_registries' \
+  crates/edgezero-adapter-fastly/src/templates examples/app-demo/crates/app-demo-adapter-fastly || failed=1
+
 exit "$failed"

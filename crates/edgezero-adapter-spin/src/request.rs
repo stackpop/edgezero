@@ -854,9 +854,18 @@ mod synthesis_tests {
             .expect("request")
             .stream_response();
 
-        let results = block_on(client.send_all(vec![outbound_request]));
+        let results = block_on(client.send_all_until(
+            vec![outbound_request],
+            Deadline::after(Duration::from_secs(1)),
+        ));
 
-        assert_eq!(results[0].elapsed, Duration::from_millis(7));
+        assert_eq!(
+            results.slots[0]
+                .as_ref()
+                .expect("resolved outbound slot")
+                .elapsed,
+            Duration::from_millis(7)
+        );
     }
 
     #[test]

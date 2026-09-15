@@ -1,3 +1,4 @@
+use std::iter;
 use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::str;
@@ -8,6 +9,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt as _;
+use futures_util::stream::{LocalBoxStream, Stream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
@@ -20,7 +22,7 @@ use crate::http::header::{
     PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use crate::http::{
-    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
+    Authority, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
     response_builder,
 };
 use crate::time::{Deadline, MonotonicClock};
@@ -40,8 +42,10 @@ pub(crate) struct BudgetInputs {
 #[derive(Debug)]
 pub struct OutboundRequest {
     body: Body,
+    cache_policy: OutboundCachePolicy,
     deadline: Option<Deadline>,
     headers: HeaderMap,
+    host_authority_override: Option<Authority>,
     max_brotli_decoder_bytes: u64,
     max_brotli_window_bits: u8,
     max_chunk_bytes: Option<NonZeroU64>,
@@ -60,8 +64,10 @@ pub struct OutboundRequest {
 #[non_exhaustive]
 pub struct OutboundRequestParts {
     pub body: Body,
+    pub cache_policy: OutboundCachePolicy,
     pub deadline: Option<Deadline>,
     pub headers: HeaderMap,
+    pub host_authority_override: Option<Authority>,
     pub max_brotli_decoder_bytes: u64,
     pub max_brotli_window_bits: u8,
     pub max_chunk_bytes: Option<NonZeroU64>,
@@ -82,9 +88,110 @@ pub enum ResponseMode {
     Streamed,
 }
 
+/// Controls use of an adapter-managed intermediary cache for one request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutboundCachePolicy {
+    Bypass,
+    #[default]
+    PlatformDefault,
+}
+
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Arc<dyn OutboundHttpClient>,
+}
+
+/// One terminal batch slot paired with its original request index.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct OutboundBatchItem {
+    pub index: usize,
+    pub result: OutboundSlotResult,
+}
+
+/// Ordered terminal batch slots. `None` identifies a slot unresolved at the batch cutoff.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct OutboundBatchResults {
+    pub slots: Vec<Option<OutboundSlotResult>>,
+}
+
+/// Adapter-owned outbound work observed in completion order.
+pub struct OutboundBatch {
+    stream: LocalBoxStream<'static, OutboundBatchItem>,
+    unresolved: Vec<bool>,
+}
+
+impl OutboundBatch {
+    /// Stops observation, drops adapter-owned pending work, and returns unresolved indices.
+    #[must_use]
+    #[inline]
+    pub fn cancel(self) -> Vec<usize> {
+        let Self { stream, unresolved } = self;
+        drop(stream);
+        unresolved
+            .iter()
+            .enumerate()
+            .filter_map(|(index, is_unresolved)| is_unresolved.then_some(index))
+            .collect()
+    }
+
+    /// Drives the batch to its adapter-defined cutoff and restores input index order.
+    #[inline]
+    pub async fn collect(mut self) -> OutboundBatchResults {
+        let mut slots = iter::repeat_with(|| None)
+            .take(self.unresolved.len())
+            .collect::<Vec<_>>();
+        while let Some(item) = self.next().await {
+            if let Some(slot) = slots.get_mut(item.index) {
+                *slot = Some(item.result);
+            }
+        }
+        OutboundBatchResults { slots }
+    }
+
+    /// Builds a batch from an adapter-owned completion stream.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn from_stream<StreamValue>(slot_count: usize, stream: StreamValue) -> Self
+    where
+        StreamValue: Stream<Item = OutboundBatchItem> + 'static,
+    {
+        Self {
+            stream: stream.boxed_local(),
+            unresolved: vec![true; slot_count],
+        }
+    }
+
+    /// Returns the next newly terminal slot in adapter-observed completion order.
+    ///
+    /// Cancelling the returned future does not consume a ready slot. An adapter stream ending
+    /// before every slot resolves leaves those slots unresolved for [`Self::collect`] or
+    /// [`Self::cancel`].
+    #[inline]
+    pub async fn next(&mut self) -> Option<OutboundBatchItem> {
+        while let Some(item) = self.stream.next().await {
+            let Some(unresolved) = self.unresolved.get_mut(item.index) else {
+                continue;
+            };
+            if !*unresolved {
+                continue;
+            }
+            *unresolved = false;
+            return Some(item);
+        }
+        None
+    }
+}
+
+impl OutboundBatchItem {
+    /// Pairs one terminal result with its original request index.
+    #[must_use]
+    #[inline]
+    pub fn new(index: usize, result: OutboundSlotResult) -> Self {
+        Self { index, result }
+    }
 }
 
 #[async_trait(?Send)]
@@ -95,12 +202,13 @@ pub trait OutboundHttpClient: Send + Sync {
     /// Returns a typed request, transport, deadline, or response-policy failure.
     async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError>;
 
-    /// Attempts every eligible request before harvesting terminal results.
+    /// Starts buffered batch work under one absolute observation cutoff.
     ///
-    /// Results remain index-aligned with `requests`. Axum, Cloudflare, and Spin drive complete
-    /// exchanges concurrently; Fastly dispatches sequentially before ordered harvest, so callers
-    /// requiring cross-slot timing isolation must require the corresponding capability.
-    async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult>;
+    /// Every eligible request is attempted before the adapter waits for transport completion.
+    /// The returned batch yields terminal results in observed completion order with original input
+    /// indices. Dropping it stops observation and applies the adapter's strongest available
+    /// teardown without undoing already-issued network side effects.
+    fn start_batch_until(&self, requests: Vec<OutboundRequest>, cutoff: Deadline) -> OutboundBatch;
 }
 
 #[derive(Debug)]
@@ -114,7 +222,7 @@ pub struct OutboundResponse {
 
 #[derive(Debug)]
 #[non_exhaustive]
-/// One index-aligned terminal result returned by [`OutboundHttpClient::send_all`].
+/// One terminal result produced by an outbound batch slot.
 pub struct OutboundSlotResult {
     /// Time from the batch's shared method-entry snapshot until this slot became terminal.
     pub elapsed: Duration,
@@ -208,9 +316,24 @@ impl HttpClient {
         self.inner.send(request).await
     }
 
+    /// Collects a completion-driven batch into original request order.
     #[inline]
-    pub async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
-        self.inner.send_all(requests).await
+    pub async fn send_all_until(
+        &self,
+        requests: Vec<OutboundRequest>,
+        cutoff: Deadline,
+    ) -> OutboundBatchResults {
+        self.start_batch_until(requests, cutoff).collect().await
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn start_batch_until(
+        &self,
+        requests: Vec<OutboundRequest>,
+        cutoff: Deadline,
+    ) -> OutboundBatch {
+        self.inner.start_batch_until(requests, cutoff)
     }
 
     #[inline]
@@ -446,6 +569,13 @@ impl OutboundRequest {
 
     #[must_use]
     #[inline]
+    pub fn cache_policy(mut self, policy: OutboundCachePolicy) -> Self {
+        self.cache_policy = policy;
+        self
+    }
+
+    #[must_use]
+    #[inline]
     pub fn cert_host(&self) -> Option<&str> {
         (self.uri.scheme_str() == Some("https")).then(|| self.host_name())
     }
@@ -467,8 +597,13 @@ impl OutboundRequest {
         let canonical_uri = canonicalize_typed_uri(&parts.uri)?;
         Ok(Self {
             body: parts.body,
+            cache_policy: parts.cache_policy,
             deadline: parts.deadline,
             headers: parts.headers,
+            host_authority_override: parts
+                .host_authority_override
+                .map(validate_host_authority_override)
+                .transpose()?,
             max_brotli_decoder_bytes: parts.max_brotli_decoder_bytes,
             max_brotli_window_bits: parts.max_brotli_window_bits,
             max_chunk_bytes: parts.max_chunk_bytes,
@@ -518,6 +653,12 @@ impl OutboundRequest {
         Self::from_raw(Method::GET, uri.as_ref())
     }
 
+    #[must_use]
+    #[inline]
+    pub fn has_host_authority_override(&self) -> bool {
+        self.host_authority_override.is_some()
+    }
+
     /// Appends one validated header value.
     ///
     /// # Errors
@@ -559,10 +700,25 @@ impl OutboundRequest {
 
     #[must_use]
     #[inline]
-    pub fn host_authority(&self) -> String {
-        self.uri
-            .authority()
-            .map_or_else(String::new, |authority| authority.as_str().to_owned())
+    pub fn host_authority(&self) -> &str {
+        self.host_authority_override.as_ref().map_or_else(
+            || self.uri.authority().map_or("", Authority::as_str),
+            Authority::as_str,
+        )
+    }
+
+    /// Overrides only the outgoing HTTP authority while preserving the URI connection identity.
+    ///
+    /// # Errors
+    /// Returns [`EdgeError::BadRequest`] unless `authority` is a host or host-and-port value with
+    /// bracketed IPv6 and no user information, scheme, path, query, fragment, or controls.
+    #[inline]
+    pub fn host_authority_override(mut self, authority: &str) -> Result<Self, EdgeError> {
+        let parsed = authority
+            .parse::<Authority>()
+            .map_err(|_error| invalid_host_authority_override())?;
+        self.host_authority_override = Some(validate_host_authority_override(parsed)?);
+        Ok(self)
     }
 
     #[must_use]
@@ -579,8 +735,10 @@ impl OutboundRequest {
     pub fn into_parts(self) -> OutboundRequestParts {
         OutboundRequestParts {
             body: self.body,
+            cache_policy: self.cache_policy,
             deadline: self.deadline,
             headers: self.headers,
+            host_authority_override: self.host_authority_override,
             max_brotli_decoder_bytes: self.max_brotli_decoder_bytes,
             max_brotli_window_bits: self.max_brotli_window_bits,
             max_chunk_bytes: self.max_chunk_bytes,
@@ -765,8 +923,10 @@ impl OutboundRequest {
     fn with_canonical_uri(method: Method, uri: Uri) -> Self {
         Self {
             body: Body::empty(),
+            cache_policy: OutboundCachePolicy::PlatformDefault,
             deadline: None,
             headers: HeaderMap::new(),
+            host_authority_override: None,
             max_brotli_decoder_bytes: DEFAULT_MAX_BROTLI_DECODER_BYTES,
             max_brotli_window_bits: 24,
             max_chunk_bytes: None,
@@ -783,6 +943,26 @@ impl OutboundRequest {
             uri,
         }
     }
+}
+
+fn invalid_host_authority_override() -> EdgeError {
+    EdgeError::bad_request("invalid outbound host authority override")
+}
+
+fn validate_host_authority_override(authority: Authority) -> Result<Authority, EdgeError> {
+    let raw = authority.as_str();
+    let host = authority.host();
+    let unbracketed_ipv6 = raw.bytes().filter(|byte| *byte == b':').count() > 1
+        && !(raw.starts_with('[') && raw.contains(']'));
+    if raw.is_empty()
+        || host.is_empty()
+        || raw.contains('@')
+        || unbracketed_ipv6
+        || HeaderValue::from_str(raw).is_err()
+    {
+        return Err(invalid_host_authority_override());
+    }
+    Ok(authority)
 }
 
 /// Collects a response stream under the final buffered-body cap.
@@ -1319,16 +1499,19 @@ mod tests {
     )]
 
     use std::cell::Cell;
+    use std::future::Future as _;
     use std::num::NonZeroU64;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::Poll;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::executor::block_on;
+    use futures::pin_mut;
+    use futures::task::noop_waker_ref;
     use futures_util::{StreamExt as _, stream};
 
     use crate::body::Body;
@@ -1336,18 +1519,21 @@ mod tests {
     use crate::error::{
         BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
     };
-    use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, request_builder};
+    use crate::http::{
+        Authority, HeaderMap, HeaderValue, Method, StatusCode, Uri, request_builder,
+    };
     use crate::time::{
         DEADLINE_FAR_FUTURE, DEFAULT_NO_DEADLINE_BUDGET, Deadline, MonotonicClock,
         MonotonicInstant, dispatch_budget,
     };
 
     use super::{
-        HttpClient, OutboundHttpClient, OutboundRequest, OutboundResponse, OutboundSlotResult,
-        PROXY_HEADER, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
-        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
-        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
-        normalize_response_headers, rechunk_stream, validate_for_dispatch,
+        HttpClient, OutboundBatch, OutboundBatchItem, OutboundCachePolicy, OutboundHttpClient,
+        OutboundRequest, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
+        ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
+        enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
+        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
+        validate_for_dispatch,
     };
 
     struct MockClient {
@@ -1375,30 +1561,40 @@ mod tests {
             ))
         }
 
-        async fn send_all(&self, requests: Vec<OutboundRequest>) -> Vec<OutboundSlotResult> {
+        fn start_batch_until(
+            &self,
+            requests: Vec<OutboundRequest>,
+            _cutoff: Deadline,
+        ) -> OutboundBatch {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
-            requests
+            let slot_count = requests.len();
+            let mut items = requests
                 .into_iter()
                 .enumerate()
-                .map(|(index, request)| OutboundSlotResult {
-                    elapsed: Duration::from_millis(
-                        u64::try_from(index)
-                            .expect("index")
-                            .checked_add(1)
-                            .expect("elapsed"),
-                    ),
-                    outcome: if request.method() == Method::DELETE {
-                        Err(EdgeError::bad_gateway("mock failure"))
-                    } else {
-                        Ok(OutboundResponse::new(
-                            request.method().clone(),
-                            StatusCode::OK,
-                            HeaderMap::new(),
-                            Body::empty(),
-                        ))
+                .map(|(index, request)| OutboundBatchItem {
+                    index,
+                    result: OutboundSlotResult {
+                        elapsed: Duration::from_millis(
+                            u64::try_from(index)
+                                .expect("index")
+                                .checked_add(1)
+                                .expect("elapsed"),
+                        ),
+                        outcome: if request.method() == Method::DELETE {
+                            Err(EdgeError::bad_gateway("mock failure"))
+                        } else {
+                            Ok(OutboundResponse::new(
+                                request.method().clone(),
+                                StatusCode::OK,
+                                HeaderMap::new(),
+                                Body::empty(),
+                            ))
+                        },
                     },
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            items.reverse();
+            OutboundBatch::from_stream(slot_count, stream::iter(items))
         }
     }
 
@@ -1446,11 +1642,11 @@ mod tests {
         let expired = OutboundRequest::get("https://example.com")
             .expect("request")
             .deadline(Deadline::at_instant(now));
-        let error = dispatch_budget(&expired, now).expect_err("expired");
+        let error = dispatch_budget(&expired, now, None).expect_err("expired");
         assert!(matches!(
             error,
             EdgeError::GatewayTimeout {
-                cause: BudgetSource::BatchDeadline,
+                cause: BudgetSource::RequestDeadline,
                 ..
             }
         ));
@@ -1459,7 +1655,7 @@ mod tests {
             .expect("request")
             .timeout(Duration::ZERO)
             .deadline(Deadline::at_instant(now));
-        let error = dispatch_budget(&tied, now).expect_err("zero tie");
+        let error = dispatch_budget(&tied, now, None).expect_err("zero tie");
         assert!(matches!(
             error,
             EdgeError::GatewayTimeout {
@@ -1474,7 +1670,7 @@ mod tests {
         let now = MonotonicInstant::now();
 
         let default = OutboundRequest::get("https://example.com").expect("request");
-        let budget = dispatch_budget(&default, now).expect("default budget");
+        let budget = dispatch_budget(&default, now, None).expect("default budget");
         assert_eq!(budget.cause, BudgetSource::Default);
         assert_eq!(budget.duration, DEFAULT_NO_DEADLINE_BUDGET);
         assert_eq!(
@@ -1486,7 +1682,7 @@ mod tests {
         let timeout = OutboundRequest::get("https://example.com")
             .expect("request")
             .timeout(Duration::from_secs(3));
-        let budget = dispatch_budget(&timeout, now).expect("timeout budget");
+        let budget = dispatch_budget(&timeout, now, None).expect("timeout budget");
         assert_eq!(budget.cause, BudgetSource::PerCallTimeout);
         assert_eq!(budget.duration, Duration::from_secs(3));
 
@@ -1497,8 +1693,8 @@ mod tests {
         let request = OutboundRequest::get("https://example.com")
             .expect("request")
             .deadline(deadline);
-        let budget = dispatch_budget(&request, now).expect("deadline budget");
-        assert_eq!(budget.cause, BudgetSource::BatchDeadline);
+        let budget = dispatch_budget(&request, now, None).expect("deadline budget");
+        assert_eq!(budget.cause, BudgetSource::RequestDeadline);
         assert_eq!(budget.duration, Duration::from_secs(4));
         assert_eq!(budget.deadline.instant(), deadline.instant());
 
@@ -1506,7 +1702,7 @@ mod tests {
             .expect("request")
             .timeout(Duration::from_secs(2))
             .deadline(deadline);
-        let budget = dispatch_budget(&timeout_wins, now).expect("timeout wins");
+        let budget = dispatch_budget(&timeout_wins, now, None).expect("timeout wins");
         assert_eq!(budget.cause, BudgetSource::PerCallTimeout);
         assert_eq!(budget.duration, Duration::from_secs(2));
 
@@ -1514,8 +1710,8 @@ mod tests {
             .expect("request")
             .timeout(Duration::from_secs(5))
             .deadline(deadline);
-        let budget = dispatch_budget(&deadline_wins, now).expect("deadline wins");
-        assert_eq!(budget.cause, BudgetSource::BatchDeadline);
+        let budget = dispatch_budget(&deadline_wins, now, None).expect("deadline wins");
+        assert_eq!(budget.cause, BudgetSource::RequestDeadline);
         assert_eq!(budget.duration, Duration::from_secs(4));
 
         let tied_deadline = Deadline::at_instant(
@@ -1526,13 +1722,13 @@ mod tests {
             .expect("request")
             .timeout(Duration::from_secs(5))
             .deadline(tied_deadline);
-        let budget = dispatch_budget(&tied, now).expect("equal budget");
+        let budget = dispatch_budget(&tied, now, None).expect("equal budget");
         assert_eq!(budget.cause, BudgetSource::PerCallTimeout);
 
         let huge_timeout = OutboundRequest::get("https://example.com")
             .expect("request")
             .timeout(Duration::MAX);
-        let budget = dispatch_budget(&huge_timeout, now).expect("clamped timeout");
+        let budget = dispatch_budget(&huge_timeout, now, None).expect("clamped timeout");
         assert_eq!(budget.duration, DEADLINE_FAR_FUTURE);
 
         let far_deadline = Deadline::at_instant(
@@ -1542,9 +1738,34 @@ mod tests {
         let far = OutboundRequest::get("https://example.com")
             .expect("request")
             .deadline(far_deadline);
-        let budget = dispatch_budget(&far, now).expect("clamped deadline");
+        let budget = dispatch_budget(&far, now, None).expect("clamped deadline");
         assert_eq!(budget.duration, DEADLINE_FAR_FUTURE);
-        assert_eq!(budget.cause, BudgetSource::BatchDeadline);
+        assert_eq!(budget.cause, BudgetSource::RequestDeadline);
+
+        let cutoff = Deadline::at_instant(
+            now.checked_add(Duration::from_secs(1))
+                .expect("cutoff instant"),
+        );
+        let budget = dispatch_budget(&default, now, Some(cutoff)).expect("batch cutoff");
+        assert_eq!(budget.cause, BudgetSource::BatchCutoff);
+        assert_eq!(budget.deadline.instant(), cutoff.instant());
+
+        let cutoff_tie = OutboundRequest::get("https://example.com")
+            .expect("request")
+            .timeout(Duration::from_secs(1))
+            .deadline(cutoff);
+        let budget = dispatch_budget(&cutoff_tie, now, Some(cutoff)).expect("cutoff tie");
+        assert_eq!(budget.cause, BudgetSource::BatchCutoff);
+
+        let error = dispatch_budget(&default, now, Some(Deadline::at_instant(now)))
+            .expect_err("cutoff equality is expired");
+        assert!(matches!(
+            error,
+            EdgeError::GatewayTimeout {
+                cause: BudgetSource::BatchCutoff,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1613,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn http_client_delegates_send_and_send_all() {
+    fn http_client_delegates_send_and_empty_batch_collection() {
         let client = HttpClient::with_client(MockClient {
             batch_calls: AtomicUsize::new(0),
             send_calls: AtomicUsize::new(0),
@@ -1630,12 +1851,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(response.body().as_bytes(), Some(b"single".as_slice()));
 
-        let empty = block_on(client.send_all(Vec::new()));
-        assert!(empty.is_empty());
+        let empty =
+            block_on(client.send_all_until(Vec::new(), Deadline::after(Duration::from_secs(1))));
+        assert!(empty.slots.is_empty());
     }
 
     #[test]
-    fn http_client_preserves_per_slot_elapsed() {
+    fn batch_next_yields_completion_order_and_collection_restores_input_order() {
         let client = HttpClient::with_client(MockClient {
             batch_calls: AtomicUsize::new(0),
             send_calls: AtomicUsize::new(0),
@@ -1647,17 +1869,112 @@ mod tests {
             OutboundRequest::post("https://example.com/three").expect("three"),
         ];
 
-        let results = block_on(client.send_all(requests));
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].elapsed, Duration::from_millis(1));
-        assert_eq!(results[1].elapsed, Duration::from_millis(2));
-        assert_eq!(results[2].elapsed, Duration::from_millis(3));
-        results[0].outcome.as_ref().expect("first slot success");
+        let cutoff = Deadline::after(Duration::from_secs(1));
+        let mut batch = client.start_batch_until(requests, cutoff);
+        let first = block_on(batch.next()).expect("first completion");
+        assert_eq!(first.index, 2);
+        assert_eq!(first.result.elapsed, Duration::from_millis(3));
+        let second = block_on(batch.next()).expect("second completion");
+        assert_eq!(second.index, 1);
         assert!(matches!(
-            results[1].outcome,
+            second.result.outcome,
             Err(EdgeError::BadGateway { .. })
         ));
-        results[2].outcome.as_ref().expect("third slot success");
+        let third = block_on(batch.next()).expect("third completion");
+        assert_eq!(third.index, 0);
+        assert!(block_on(batch.next()).is_none());
+
+        let requests = vec![
+            OutboundRequest::get("https://example.com/one").expect("one"),
+            OutboundRequest::new(Method::DELETE, Uri::from_static("https://example.com/two"))
+                .expect("two"),
+            OutboundRequest::post("https://example.com/three").expect("three"),
+        ];
+        let results = block_on(client.send_all_until(requests, cutoff));
+        assert_eq!(results.slots.len(), 3);
+        assert_eq!(
+            results.slots[0].as_ref().expect("first slot").elapsed,
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            results.slots[1].as_ref().expect("second slot").elapsed,
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            results.slots[2].as_ref().expect("third slot").elapsed,
+            Duration::from_millis(3)
+        );
+        results.slots[0]
+            .as_ref()
+            .expect("first slot")
+            .outcome
+            .as_ref()
+            .expect("first slot success");
+        assert!(matches!(
+            results.slots[1].as_ref().expect("second slot").outcome,
+            Err(EdgeError::BadGateway { .. })
+        ));
+        results.slots[2]
+            .as_ref()
+            .expect("third slot")
+            .outcome
+            .as_ref()
+            .expect("third slot success");
+    }
+
+    #[test]
+    fn batch_next_is_cancellation_safe_and_cancel_reports_unresolved_indices() {
+        fn poll_next_once(batch: &mut OutboundBatch) -> Poll<Option<OutboundBatchItem>> {
+            let next = batch.next();
+            pin_mut!(next);
+            let waker = noop_waker_ref();
+            let mut context = Context::from_waker(waker);
+            next.as_mut().poll(&mut context)
+        }
+
+        let poll_count = Rc::new(Cell::new(0_u8));
+        let observed_poll_count = Rc::clone(&poll_count);
+        let source = stream::poll_fn(move |_context| {
+            let current = observed_poll_count.get();
+            observed_poll_count.set(current.saturating_add(1));
+            if current == 1 {
+                Poll::Ready(Some(OutboundBatchItem {
+                    index: 1,
+                    result: OutboundSlotResult::new(
+                        Duration::from_millis(2),
+                        Err(EdgeError::bad_gateway("second")),
+                    ),
+                }))
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut batch = OutboundBatch::from_stream(3, source);
+
+        assert!(poll_next_once(&mut batch).is_pending());
+
+        let item = block_on(batch.next()).expect("item survives cancelled next future");
+        assert_eq!(item.index, 1);
+        assert_eq!(batch.cancel(), vec![0, 2]);
+    }
+
+    #[test]
+    fn batch_collection_marks_slots_missing_when_driver_ends_before_completion() {
+        let batch = OutboundBatch::from_stream(
+            3,
+            stream::iter([OutboundBatchItem {
+                index: 2,
+                result: OutboundSlotResult::new(
+                    Duration::from_millis(3),
+                    Err(EdgeError::bad_gateway("third")),
+                ),
+            }]),
+        );
+
+        let results = block_on(batch.collect());
+        assert!(results.slots[0].is_none());
+        assert!(results.slots[1].is_none());
+        assert!(results.slots[2].is_some());
     }
 
     #[test]
@@ -2457,9 +2774,12 @@ mod tests {
         let request = OutboundRequest::post("https://example.com/items")
             .expect("request")
             .body("payload")
+            .cache_policy(OutboundCachePolicy::Bypass)
             .deadline(deadline)
             .header("x-test", "one")
             .expect("header")
+            .host_authority_override("[2001:db8::1]:8443")
+            .expect("authority override")
             .max_brotli_decoder_bytes(40 * 1024 * 1024)
             .max_brotli_window_bits(23)
             .max_chunk_bytes(NonZeroU64::new(4096).expect("nonzero"))
@@ -2474,6 +2794,14 @@ mod tests {
         let parts = request.into_parts();
         assert_eq!(parts.method, Method::POST);
         assert_eq!(parts.uri, Uri::from_static("https://example.com/items"));
+        assert_eq!(parts.cache_policy, OutboundCachePolicy::Bypass);
+        assert_eq!(
+            parts
+                .host_authority_override
+                .as_ref()
+                .map(Authority::as_str),
+            Some("[2001:db8::1]:8443")
+        );
         assert_eq!(parts.body.as_bytes(), Some(b"payload".as_slice()));
         assert_eq!(
             parts.deadline.expect("deadline").instant(),
@@ -2501,6 +2829,10 @@ mod tests {
 
         let request = OutboundRequest::from_parts(parts).expect("round trip");
         assert_eq!(request.method(), &Method::POST);
+        assert_eq!(request.host_authority(), "[2001:db8::1]:8443");
+        assert_eq!(request.backend_target(), "example.com:443");
+        assert_eq!(request.sni_hostname(), Some("example.com"));
+        assert_eq!(request.cert_host(), Some("example.com"));
         assert_eq!(
             request.uri(),
             &Uri::from_static("https://example.com/items")
@@ -2512,6 +2844,8 @@ mod tests {
         assert_eq!(defaults.max_brotli_decoder_bytes, 0x0200_0000);
         assert_eq!(defaults.max_brotli_window_bits, 24);
         assert_eq!(defaults.max_request_body_bytes, 0x0080_0000);
+        assert_eq!(defaults.cache_policy, OutboundCachePolicy::PlatformDefault);
+        assert!(defaults.host_authority_override.is_none());
         assert_eq!(
             defaults.response_mode,
             ResponseMode::Buffered {
@@ -2524,6 +2858,46 @@ mod tests {
         assert!(defaults.max_response_header_bytes.is_none());
         assert!(defaults.max_response_header_count.is_none());
         assert!(defaults.timeout.is_none());
+    }
+
+    #[test]
+    fn outbound_request_policy_accepts_only_http_authorities() {
+        for authority in [
+            "api.example.com",
+            "api.example.com:8443",
+            "192.0.2.1:8080",
+            "[2001:db8::1]",
+            "[2001:db8::1]:8443",
+        ] {
+            let request = OutboundRequest::get("https://origin.example/resource")
+                .expect("request")
+                .host_authority_override(authority)
+                .expect("valid authority");
+            assert!(request.has_host_authority_override());
+            assert_eq!(request.host_authority(), authority);
+            assert_eq!(request.backend_target(), "origin.example:443");
+            assert_eq!(request.sni_hostname(), Some("origin.example"));
+            assert_eq!(request.cert_host(), Some("origin.example"));
+        }
+
+        for invalid in [
+            "",
+            "user@api.example.com",
+            "https://api.example.com",
+            "api.example.com/path",
+            "api example.com",
+            "api.example.com\r\nx-added: value",
+            "2001:db8::1",
+        ] {
+            let error = OutboundRequest::get("https://origin.example")
+                .expect("request")
+                .host_authority_override(invalid)
+                .expect_err("invalid authority");
+            assert_eq!(
+                bad_request_message(error),
+                "invalid outbound host authority override"
+            );
+        }
     }
 
     #[test]

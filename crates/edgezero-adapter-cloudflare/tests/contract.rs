@@ -49,7 +49,7 @@ mod tests {
     use edgezero_core::http::{Method, Response, StatusCode, response_builder};
     use edgezero_core::outbound::{OutboundHttpClient as _, OutboundRequest};
     use edgezero_core::router::RouterService;
-    use edgezero_core::time::{MonotonicClock, MonotonicInstant};
+    use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures::stream;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
     use worker::js_sys::{Function, Object, Reflect};
@@ -332,9 +332,22 @@ mod tests {
         let forward_request = OutboundRequest::get("https://example.com/")
             .expect("request")
             .stream_response();
-        let forward_results = forward_client.send_all(vec![forward_request]).await;
-        assert_eq!(forward_results.len(), 1);
-        let forward_result = forward_results.first().expect("single forward result");
+        let cutoff = Deadline::at_instant(
+            start
+                .checked_add(Duration::from_secs(1))
+                .expect("cutoff instant"),
+        );
+        let forward_results = forward_client
+            .start_batch_until(vec![forward_request], cutoff)
+            .collect()
+            .await;
+        assert_eq!(forward_results.slots.len(), 1);
+        let forward_result = forward_results
+            .slots
+            .first()
+            .expect("forward result slot")
+            .as_ref()
+            .expect("single forward result");
         assert_eq!(forward_result.elapsed, Duration::from_millis(9));
         assert!(matches!(
             forward_result.outcome,
@@ -349,9 +362,17 @@ mod tests {
         let backwards_request = OutboundRequest::get("https://example.com/")
             .expect("request")
             .stream_response();
-        let backwards_results = backwards_client.send_all(vec![backwards_request]).await;
-        assert_eq!(backwards_results.len(), 1);
-        let backwards_result = backwards_results.first().expect("single backwards result");
+        let backwards_results = backwards_client
+            .start_batch_until(vec![backwards_request], cutoff)
+            .collect()
+            .await;
+        assert_eq!(backwards_results.slots.len(), 1);
+        let backwards_result = backwards_results
+            .slots
+            .first()
+            .expect("backwards result slot")
+            .as_ref()
+            .expect("single backwards result");
         assert_eq!(backwards_result.elapsed, Duration::ZERO);
         assert!(matches!(
             backwards_result.outcome,
@@ -360,7 +381,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn send_all_preserves_three_preflight_slots_in_input_order() {
+    async fn batch_preserves_three_preflight_slots_in_input_order() {
         let now = MonotonicInstant::now();
         let client = CloudflareOutboundClient::with_clock(MonotonicClock::new(move || now));
         let streamed_upload = OutboundRequest::post("https://example.com/upload")
@@ -374,27 +395,44 @@ mod tests {
             .body(Body::stream(stream::iter([Bytes::new()])));
 
         let results = client
-            .send_all(vec![streamed_upload, streamed_response, method_error])
+            .start_batch_until(
+                vec![streamed_upload, streamed_response, method_error],
+                Deadline::at_instant(
+                    now.checked_add(Duration::from_secs(1))
+                        .expect("cutoff instant"),
+                ),
+            )
+            .collect()
             .await;
         let messages: Vec<_> = results
+            .slots
             .iter()
-            .map(|slot| match &slot.outcome {
-                Err(EdgeError::BadRequest { message }) => Some(message.as_str()),
-                _ => None,
-            })
+            .map(
+                |slot| match &slot.as_ref().expect("resolved preflight slot").outcome {
+                    Err(EdgeError::BadRequest { message }) => Some(message.as_str()),
+                    _ => None,
+                },
+            )
             .collect();
 
         assert_eq!(
             messages,
             [
-                Some("send_all requires buffered request bodies; use send for a streamed upload"),
-                Some("send_all requires buffered responses; use send for a streamed response"),
+                Some(
+                    "outbound batches require buffered request bodies; use send for a streamed upload"
+                ),
+                Some(
+                    "outbound batches require buffered responses; use send for a streamed response"
+                ),
                 Some(
                     "GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream"
                 ),
             ]
         );
-        assert!(results.iter().all(|slot| slot.elapsed == Duration::ZERO));
+        assert!(results.slots.iter().all(|slot| {
+            slot.as_ref()
+                .is_some_and(|result| result.elapsed == Duration::ZERO)
+        }));
     }
 
     #[wasm_bindgen_test]
@@ -405,9 +443,13 @@ mod tests {
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
             let request =
                 OutboundRequest::get("https://example.com/")?.body(Body::from("invalid GET body"));
-            let results = client.send_all(vec![request]).await;
+            let results = client
+                .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
+                .await;
             let result = results
+                .slots
                 .first()
+                .and_then(Option::as_ref)
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing outbound result")))?;
             if !matches!(&result.outcome, Err(EdgeError::BadRequest { .. })) {
                 return Err(EdgeError::internal(anyhow::anyhow!(
@@ -1045,7 +1087,7 @@ mod native_tests {
         }
 
         #[test]
-        fn send_all_preflight_precedence_and_indices() {
+        fn batch_preflight_precedence_and_indices() {
             let streamed_upload = OutboundRequest::post("https://example.com/upload")
                 .expect("request")
                 .body(Body::stream(stream::iter([Bytes::from_static(b"body")])));
@@ -1062,8 +1104,8 @@ mod native_tests {
                     .map(|request| message(validate_batch_request_for_test(request)))
                     .collect::<Vec<_>>(),
                 [
-                    Some("send_all requires buffered request bodies; use send for a streamed upload".to_owned()),
-                    Some("send_all requires buffered responses; use send for a streamed response".to_owned()),
+                    Some("outbound batches require buffered request bodies; use send for a streamed upload".to_owned()),
+                    Some("outbound batches require buffered responses; use send for a streamed response".to_owned()),
                     Some("GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream".to_owned()),
                 ]
             );
@@ -1085,7 +1127,7 @@ mod native_tests {
         fn worker_budget_timeouts_preserve_every_selected_source() {
             for selected in [
                 BudgetSource::PerCallTimeout,
-                BudgetSource::BatchDeadline,
+                BudgetSource::RequestDeadline,
                 BudgetSource::Default,
             ] {
                 assert!(matches!(

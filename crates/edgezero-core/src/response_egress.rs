@@ -362,6 +362,14 @@ impl ResponseEgressEnvelope {
     pub fn request_method(&self) -> &Method {
         &self.request_method
     }
+
+    /// Borrows the application response before egress policy and framing are evaluated.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn response_mut(&mut self) -> &mut Response {
+        &mut self.response
+    }
 }
 
 impl ResponseEgressObserverHandle {
@@ -1233,6 +1241,54 @@ mod tests {
                 .extensions()
                 .get::<ResponseEgressDeadline>()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn adapter_response_hook_runs_before_policy_and_framing() {
+        let request_start = MonotonicInstant::now();
+        let observed_status = Arc::new(Mutex::new(None));
+        let policy_status = Arc::clone(&observed_status);
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::from("body"))
+            .expect("response");
+        let mut envelope = ResponseEgressEnvelope::new(
+            response,
+            request_start,
+            None,
+            Method::HEAD,
+            Arc::new(move |head, started_at| {
+                *policy_status.lock().expect("policy status") = Some(head.status());
+                ResponseEgressPolicy {
+                    write_deadline: Deadline::at_instant(
+                        started_at
+                            .checked_add(Duration::from_secs(1))
+                            .expect("write deadline"),
+                    ),
+                }
+            }),
+            ResponseEgressObserverHandle::default(),
+            MonotonicClock::new(move || request_start),
+        );
+
+        *envelope.response_mut().status_mut() = StatusCode::CREATED;
+        let Ok((prepared, _policy, _attempt, _clock)) = envelope.begin() else {
+            panic!("egress preparation failed");
+        };
+        let prepared_response = prepared.into_response();
+
+        assert_eq!(
+            *observed_status.lock().expect("observed status"),
+            Some(StatusCode::CREATED)
+        );
+        assert_eq!(prepared_response.status(), StatusCode::CREATED);
+        assert!(
+            prepared_response
+                .into_body()
+                .into_bytes()
+                .expect("buffered body")
+                .is_empty()
         );
     }
 }

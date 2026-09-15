@@ -105,7 +105,10 @@ body is passed through to the downstream response, the response converter separa
 manual response-body encoding so Workers does not encode it again. These are two distinct
 controls. The abort path is implemented, but outbound and streamed-upload deadlines remain
 BestEffort until a deployed host-observed cancellation fixture proves a finite bound. Cloudflare
-and Axum have Native lazy streamed response passthrough;
+drives batch slots in completion order, maps cache bypass to `NoStore`, and applies a validated
+wire-authority override. The platform has not yet proved finite abort teardown or that its final
+wire request preserves authority independently from the connection target, so cancellation and
+authority override remain BestEffort. Cloudflare and Axum have Native lazy streamed response passthrough;
 raw header octets and original non-`set-cookie` field boundaries remain unavailable, so header
 fidelity is BestEffort. See [Capabilities](/guide/capabilities).
 

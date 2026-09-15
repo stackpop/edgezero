@@ -3,6 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **Status:** Implemented on PR 275. The unchecked steps below are retained as the original implementation record, not current readiness state.
+> **Superseded batch API:** The 2026-09-15 consumer-alignment plan replaces this plan's
+> `send_all` surface and budget names. Do not use its batch snippets as current API guidance.
 
 **Goal:** Add the runtime-independent outbound request, response, client, URL, and dispatch-budget value layer specified in §§3.1-3.3 of the outbound design.
 

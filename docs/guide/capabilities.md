@@ -116,11 +116,15 @@ not included. These limitations block whole-response-lifetime certification.
 | Capability                              | Axum                              | Cloudflare                        | Fastly                            | Spin                              |
 | --------------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- |
 | `outbound-http`                         | Native                            | Native                            | BestEffort⁹                       | Native                            |
+| `outbound-authority-override`           | Native                            | BestEffort⁸                       | Native                            | Unsupported[^spin-authority]      |
+| `outbound-batch-cancellation`           | Native                            | BestEffort⁸                       | BestEffort⁴                       | BestEffort⁸                       |
+| `outbound-batch-completion-order`       | Native                            | Native                            | BestEffort⁴                       | Native                            |
+| `outbound-batch-slot-isolation`         | Native                            | Native                            | BestEffort⁴                       | Native                            |
+| `outbound-cache-bypass`                 | Native                            | Native                            | Native                            | Native                            |
 | `outbound-complete-resource-accounting` | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] | Unsupported[^resource-accounting] |
 | `outbound-header-fidelity`              | Native                            | BestEffort⁸                       | Native                            | Native                            |
 | `outbound-deadlines`                    | Native                            | BestEffort⁸                       | BestEffort¹                       | BestEffort⁸                       |
 | `outbound-flexible-phase-budget`        | Native                            | Native                            | BestEffort⁵                       | BestEffort⁵                       |
-| `send-all-slot-isolation`               | Native                            | Native                            | BestEffort⁴                       | Native                            |
 | `streamed-upload-deadlines`             | Native                            | BestEffort⁸                       | BestEffort²                       | BestEffort⁸                       |
 | `lazy-streamed-response-passthrough`    | Native³                           | Native                            | BestEffort⁶                       | BestEffort⁷                       |
 
@@ -131,8 +135,13 @@ not included. These limitations block whole-response-lifetime certification.
     Current provider APIs do not expose or bound every term, so all adapters report
     `Unsupported`. The narrower EdgeZero-owned limits below still apply.
 
+[^spin-authority]:
+    Spin's WASI HTTP authority also selects the connection target. An explicit HTTP authority
+    override is rejected before body polling or provider dispatch because the adapter cannot
+    preserve the required routing/TLS separation.
+
 ¹ Fastly cannot preempt cold dynamic-backend registration or guest-to-origin writes. Before a
-cache-miss registration in `send_all`, EdgeZero checks the absolute deadline and 25 ms dispatch
+cache-miss registration in `start_batch_until`, EdgeZero checks the absolute deadline and 25 ms dispatch
 slack so an already-delayed later slot does not begin another synchronous registration. A first
 cold registration that passes that check can still block. Receive timers and absolute checks
 cover the documented warm, response-read portions, but they are not one end-to-end wall-clock
@@ -147,9 +156,10 @@ payload frame at a time under Hyper demand. Unit and raw-socket tests prove firs
 before source EOF. Socket/client completion remains separately BestEffort under the response-egress
 capabilities above.
 
-⁴ Fastly dispatches slots sequentially and harvests response bodies in input order. Cold
-backend registration can delay a later dispatch; unresolved uploads or an earlier body drain
-can delay a sibling's terminal observation.
+⁴ Fastly dispatches slots sequentially, selects ready pending handles within provider-bounded
+groups, and drains each selected response body synchronously. Cold backend registration can delay
+a later dispatch; a selected body drain can delay a sibling's terminal observation, and a ready
+handle outside the active selection group can remain temporarily unobserved.
 
 ⁵ Fastly divides a total budget among provider phase timers. Spin's host may reject phase
 timer settings and retain opaque defaults. Neither can promise one fully elastic pool.
@@ -219,7 +229,7 @@ the source chunk. Header controls cover guest-visible fields, not opaque parser 
 informational blocks that the SDK hides, or provider-owned trailers. These exclusions are why
 `outbound-complete-resource-accounting` is `Unsupported` on every current adapter.
 
-For `send_all`, bound both the number of requests and every per-slot cap. Core-retained payload
+For a buffered batch, bound both the number of requests and every per-slot cap. Core-retained payload
 is approximately the sum of buffered request bodies, configured final response caps, and one
 current chunk per actively draining slot. Adapter staging and host/runtime copies are outside
 that formula.
@@ -239,8 +249,12 @@ wire `Content-Length`, because Workers owns final framing.
 
 ## Batch Timing
 
-`HttpClient::send_all` returns one `OutboundSlotResult` per input in the same order. Each slot
-contains its own `elapsed` and `outcome`; one failure does not erase sibling outcomes.
+`HttpClient::start_batch_until` returns an adapter-owned `OutboundBatch`. Calling `next()` yields
+each terminal slot at most once in observed completion order, paired with its original input index.
+Callers can therefore retain completed results and cancel unresolved work at an application
+deadline. `HttpClient::send_all_until` is the ordered collector over that same driver; it returns
+one `Option<OutboundSlotResult>` per input, where only a slot unresolved at cutoff is `None`.
+One failure does not erase sibling outcomes.
 `elapsed` starts at the single method-entry monotonic snapshot and ends when that slot becomes
 terminal, including preflight validation, adapter setup, provider queueing, upload, headers,
 buffered body drain, and any delayed guest observation. It is not pure transport RTT.
@@ -255,13 +269,15 @@ streams remain in one clock domain. Explicit low-level outbound constructors use
 clock. A backwards injected clock cannot enlarge the method-entry budget; backwards elapsed
 sampling fails closed as an internal slot outcome with zero elapsed.
 
-Axum, Cloudflare, and Spin drive complete eligible exchanges concurrently. Fastly records each
-slot when it is observed during sequential dispatch/harvest, so the value can include sibling
-delay; the `send-all-slot-isolation` matrix row exposes that distinction.
+Axum, Cloudflare, and Spin drive complete eligible exchanges concurrently. Fastly dispatches
+eligible requests before selecting pending handles, but guest dispatch is sequential and body
+drain remains observation-bound; a slot's elapsed value can therefore include sibling delay.
+The `outbound-batch-slot-isolation` and `outbound-batch-completion-order` rows expose those
+distinctions.
 
-`send_all` accepts buffered request bodies and buffered response mode only. Use `send` for a
-streamed upload or response, and consume a streamed response body inside the same concurrent
-task that issued it.
+Batch APIs accept buffered request bodies and buffered response mode only. Use `send` for a
+streamed upload or response, and consume a streamed response body inside the same concurrent task
+that issued it.
 
 ## Missing Client
 
