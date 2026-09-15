@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 
 const expected = new Map([
   ['async-compression', '0.4.43'],
@@ -22,6 +23,31 @@ function metadata(workspace) {
     { cwd: workspace, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
   )
   return JSON.parse(output)
+}
+
+function auditWorkflowFetchOrder() {
+  const workflow = readFileSync('.github/workflows/test.yml', 'utf8')
+  const lines = workflow.split('\n').map((line) => line.trim())
+  const commandIndex = (command) =>
+    lines.findIndex((line) => line === command || line === `run: ${command}`)
+  const rootFetch = commandIndex('cargo fetch --locked')
+  const demoFetch = commandIndex(
+    'cargo fetch --locked --manifest-path examples/app-demo/Cargo.toml',
+  )
+  const audit = commandIndex('node scripts/check_brotli_dependency_contract.mjs')
+
+  if (
+    rootFetch === -1 ||
+    demoFetch === -1 ||
+    audit === -1 ||
+    rootFetch >= audit ||
+    demoFetch >= audit
+  ) {
+    fail(
+      'workflow',
+      'root and app-demo locked fetches must run before the offline dependency audit',
+    )
+  }
 }
 
 function audit(workspace) {
@@ -73,6 +99,7 @@ function audit(workspace) {
   }
 }
 
+auditWorkflowFetchOrder()
 audit('.')
 audit('examples/app-demo')
 

@@ -48,7 +48,9 @@ jobs:
         run: rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown
 
       - name: Fetch dependencies (locked)
-        run: cargo fetch --locked
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path examples/app-demo/Cargo.toml
 
       - name: No placeholder pins
         run: ./scripts/check_no_placeholder_pins.sh
