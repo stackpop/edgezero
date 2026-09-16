@@ -2104,7 +2104,7 @@ mod tests {
 
         let results = block_on(batch.collect()).expect("valid cutoff");
         assert_eq!(results.termination, OutboundBatchTermination::Cutoff);
-        assert!(results.slots[0].is_none());
+        assert!(matches!(results.slots.first(), Some(None)));
         assert!(results.slots[1].is_none());
         assert!(results.slots[2].is_some());
     }
