@@ -2,7 +2,7 @@
 
 **Status:** Revised plan (layered, adapter-independent)
 
-**Spec:** `docs/superpowers/specs/edgezero-deploy-github-action.md`
+**Spec:** `docs/superpowers/specs/2026-07-08-edgezero-deploy-github-actions-design.md`
 
 ## Scope
 
