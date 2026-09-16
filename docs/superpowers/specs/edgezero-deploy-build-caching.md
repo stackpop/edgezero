@@ -2,9 +2,10 @@
 
 **Status:** Design (proposed) — v6.14 (sccache pivot)
 
-**Related:** `docs/specs/edgezero-deploy-github-action.md`,
-`docs/specs/edgezero-deploy-action-implementation-plan.md`,
-`docs/specs/edgezero-deploy-adoption-guide.md`, `docs/guide/deploy-github-actions.md`
+**Related:** `docs/superpowers/specs/edgezero-deploy-github-action.md`,
+`docs/superpowers/specs/edgezero-deploy-action-implementation-plan.md`,
+`docs/superpowers/specs/edgezero-deploy-adoption-guide.md`,
+`docs/guide/deploy-github-actions.md`
 
 ## 1. Problem
 

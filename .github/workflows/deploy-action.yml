@@ -23,7 +23,7 @@ on:
       - crates/edgezero-core/**
       - crates/edgezero-macros/**
       - docs/guide/deploy-github-actions.md
-      - docs/specs/**
+      - docs/superpowers/specs/edgezero-deploy-*.md
   push:
     branches: [main]
     paths:
@@ -47,7 +47,7 @@ on:
       - crates/edgezero-core/**
       - crates/edgezero-macros/**
       - docs/guide/deploy-github-actions.md
-      - docs/specs/**
+      - docs/superpowers/specs/edgezero-deploy-*.md
 
 permissions:
   contents: read
