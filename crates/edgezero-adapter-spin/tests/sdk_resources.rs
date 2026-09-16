@@ -51,7 +51,8 @@ mod tests {
             client
                 .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
                 .collect(),
-        );
+        )
+        .expect("valid batch driver");
 
         let slot = results.slots[0].as_ref().expect("resolved slot");
         assert_eq!(slot.elapsed, Duration::from_millis(7));

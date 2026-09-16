@@ -924,7 +924,7 @@ mod tests {
                 OutboundRequest::get("https://example.com/")?.body(Body::from("invalid GET body"));
             let results = client
                 .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
-                .await;
+                .await?;
             let result = results
                 .slots
                 .first()

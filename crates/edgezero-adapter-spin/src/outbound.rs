@@ -251,9 +251,9 @@ mod spin_impl {
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
-        OutboundBatch, OutboundBatchItem, OutboundHttpClient, OutboundRequest,
-        OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseBodyDisposition,
-        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
+        OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundHttpClient,
+        OutboundRequest, OutboundRequestParts, OutboundResponse, OutboundSlotResult,
+        ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
         enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
         limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
     };
@@ -262,7 +262,7 @@ mod spin_impl {
     };
     use futures_util::StreamExt as _;
     use futures_util::future::{Either, FutureExt as _, LocalBoxFuture, poll_fn, select};
-    use futures_util::stream::{FuturesUnordered, empty, once};
+    use futures_util::stream::{FuturesUnordered, once};
     use spin_sdk::time::sleep;
     use spin_sdk::wasip3::http::client;
     use spin_sdk::wasip3::http::types::{
@@ -425,7 +425,7 @@ mod spin_impl {
             let batch_started_at = self.clock.now();
             let slot_count = requests.len();
             if cutoff.is_expired_at(batch_started_at) {
-                return OutboundBatch::from_stream(slot_count, empty());
+                return OutboundBatch::cutoff(slot_count);
             }
 
             let mut completed = Vec::new();
@@ -467,9 +467,10 @@ mod spin_impl {
                         cutoff,
                         outcome,
                     ) else {
+                        yield OutboundBatchDriverEvent::Cutoff;
                         return;
                     };
-                    yield item;
+                    yield OutboundBatchDriverEvent::Item(item);
                 }
 
                 while let Some((index, completed_at, outcome)) = pending.next().await {
@@ -480,12 +481,13 @@ mod spin_impl {
                         cutoff,
                         outcome,
                     ) else {
+                        yield OutboundBatchDriverEvent::Cutoff;
                         return;
                     };
-                    yield item;
+                    yield OutboundBatchDriverEvent::Item(item);
                 }
             };
-            OutboundBatch::from_stream(slot_count, completions)
+            OutboundBatch::from_driver(slot_count, completions)
         }
     }
 
@@ -1070,7 +1072,8 @@ mod spin_impl {
                         ),
                     )
                     .collect(),
-            );
+            )
+            .expect("valid batch driver");
 
             let slot = results.slots[0].as_ref().expect("resolved slot");
             assert_eq!(slot.elapsed, Duration::from_millis(9));
@@ -1099,7 +1102,8 @@ mod spin_impl {
                         ),
                     )
                     .collect(),
-            );
+            )
+            .expect("valid batch driver");
 
             let slot = results.slots[0].as_ref().expect("resolved slot");
             assert_eq!(slot.elapsed, Duration::ZERO);

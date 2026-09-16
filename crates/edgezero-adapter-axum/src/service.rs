@@ -466,7 +466,7 @@ mod tests {
             let request = OutboundRequest::get("https://example.com/")?.stream_response();
             let results = client
                 .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
-                .await;
+                .await?;
             Ok(results.slots[0]
                 .as_ref()
                 .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("unresolved HTTP slot")))?

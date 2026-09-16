@@ -22,7 +22,10 @@ use edgezero_core::body::Body as CoreBody;
 use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason};
 use edgezero_core::http::{HeaderMap, Method, StatusCode};
 use edgezero_core::time::Deadline;
-use edgezero_core::{OutboundCachePolicy, OutboundHttpClient as _, OutboundRequest, PROXY_HEADER};
+use edgezero_core::{
+    OutboundBatchNext, OutboundBatchTermination, OutboundCachePolicy, OutboundHttpClient as _,
+    OutboundRequest, PROXY_HEADER,
+};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
@@ -88,9 +91,11 @@ async fn batch_collection_reports_per_slot_elapsed() {
     let results = client
         .start_batch_until(requests, Deadline::after(Duration::from_secs(1)))
         .collect()
-        .await;
+        .await
+        .expect("valid batch driver");
 
     assert_eq!(results.slots.len(), 2);
+    assert_eq!(results.termination, OutboundBatchTermination::Completed);
     results.slots[0]
         .as_ref()
         .expect("reachable slot resolved")
@@ -130,7 +135,10 @@ async fn batch_preflight_precedence_and_indices() {
             Deadline::after(Duration::from_secs(1)),
         )
         .collect()
-        .await;
+        .await
+        .expect("valid batch driver");
+
+    assert_eq!(results.termination, OutboundBatchTermination::Completed);
 
     let messages: Vec<_> = results
         .slots
@@ -203,7 +211,10 @@ async fn batch_preserves_request_deadline_provenance() {
     let results = client
         .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
         .collect()
-        .await;
+        .await
+        .expect("valid batch driver");
+
+    assert_eq!(results.termination, OutboundBatchTermination::Completed);
 
     assert!(matches!(
         results.slots[0]
@@ -238,12 +249,19 @@ async fn batch_yields_complete_exchanges_in_completion_order() {
     ];
     let mut batch = client.start_batch_until(requests, Deadline::after(Duration::from_secs(1)));
 
-    let first = batch.next().await.expect("first completion");
-    let second = batch.next().await.expect("second completion");
+    let OutboundBatchNext::Item(first) = batch.next().await.expect("valid batch driver") else {
+        panic!("expected first completion");
+    };
+    let OutboundBatchNext::Item(second) = batch.next().await.expect("valid batch driver") else {
+        panic!("expected second completion");
+    };
 
     assert_eq!(first.index, 1);
     assert_eq!(second.index, 0);
-    assert!(batch.next().await.is_none());
+    assert!(matches!(
+        batch.next().await.expect("valid batch driver"),
+        OutboundBatchNext::Finished(OutboundBatchTermination::Completed)
+    ));
 }
 
 #[tokio::test]
@@ -270,8 +288,10 @@ async fn batch_cutoff_preserves_completed_slots_and_leaves_pending_none() {
             Deadline::after(Duration::from_millis(25)),
         )
         .collect()
-        .await;
+        .await
+        .expect("valid batch driver");
 
+    assert_eq!(results.termination, OutboundBatchTermination::Cutoff);
     assert!(results.slots[0].is_some());
     assert!(results.slots[1].is_none());
 }

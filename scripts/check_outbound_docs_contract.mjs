@@ -396,6 +396,17 @@ if (
 ) {
   fail('outbound guide must document completion-order and ordered batch access')
 }
+for (const requiredFragment of [
+  'OutboundBatchNext::Item',
+  'OutboundBatchNext::Finished',
+  'OutboundBatchTermination::Completed',
+  'OutboundBatchTermination::Cutoff',
+  'send_all_until(requests, cutoff).await?',
+]) {
+  if (!hardCutSurfaces[1][1].includes(requiredFragment)) {
+    fail(`${proxyGuidePath} is missing typed batch contract: ${requiredFragment}`)
+  }
+}
 if (
   !hardCutSurfaces[2][1].includes('run_app_with_hooks') ||
   !hardCutSurfaces[2][1].includes('send_request_with_hooks')
@@ -444,11 +455,25 @@ for (const staleFragment of [
   'exact eight outbound',
   'all eight outbound',
   'Fastly send_all_until adapter overhead',
+  'pub async fn next(&mut self) -> Option<OutboundBatchItem>',
+  'pub async fn collect(self) -> OutboundBatchResults',
+  'OutboundBatch::from_stream',
 ]) {
   if (outboundSpecSource.includes(staleFragment)) {
     fail(
       `outbound specification contains stale implementation text: ${staleFragment}`,
     )
+  }
+}
+for (const requiredFragment of [
+  'pub enum OutboundBatchTermination',
+  'pub enum OutboundBatchNext',
+  'Result<OutboundBatchResults, EdgeError>',
+  'premature driver EOF',
+  'duplicate or out-of-range',
+]) {
+  if (!outboundSpecSource.includes(requiredFragment)) {
+    fail(`outbound specification is missing typed batch contract: ${requiredFragment}`)
   }
 }
 

@@ -107,22 +107,35 @@ terminal slots in observed completion order while retaining each original input 
 an application keep completed results when its own cutoff wins:
 
 ```rust
+use edgezero_core::{EdgeError, OutboundBatchNext, OutboundBatchTermination};
 use edgezero_core::time::Deadline;
 
-let mut batch = client.start_batch_until(requests, Deadline::after(Duration::from_secs(2)));
-while let Some(item) = batch.next().await {
-    match item.result.outcome {
-        Ok(response) => record_success(item.index, item.result.elapsed, response.status()),
-        Err(error) => record_failure(item.index, item.result.elapsed, error),
+let cutoff = Deadline::after(Duration::from_secs(2));
+let mut batch = client.start_batch_until(requests, cutoff);
+let termination = loop {
+    match batch.next().await? {
+        OutboundBatchNext::Item(item) => match item.result.outcome {
+            Ok(response) => record_success(item.index, item.result.elapsed, response.status()),
+            Err(error) => record_failure(item.index, item.result.elapsed, error),
+        },
+        OutboundBatchNext::Finished(termination) => break termination,
+        _ => return Err(EdgeError::internal(anyhow::anyhow!("unsupported batch event"))),
     }
-}
+};
+assert!(matches!(
+    termination,
+    OutboundBatchTermination::Completed | OutboundBatchTermination::Cutoff
+));
 ```
 
-`send_all_until` collects the same driver into an index-aligned
-`Vec<Option<OutboundSlotResult>>`; `None` means that slot was unresolved at cutoff. Every terminal
-slot is timed from the batch method-entry snapshot through its own terminal observation, including
-preflight and body buffering. It is not pure network RTT. Bound the request count and every
-per-request body limit; EdgeZero intentionally has no global batch-concurrency or memory cap.
+`let results = client.send_all_until(requests, cutoff).await?;` collects the same driver into an
+index-aligned `Vec<Option<OutboundSlotResult>>` plus `results.termination`. `Completed` guarantees
+every slot is present. Only `Cutoff` permits `None`, meaning that slot was unresolved when the
+method cutoff won. A premature or malformed adapter driver returns a batch-level internal error;
+it never degrades into timeout-like missing slots. Every terminal slot is timed from the batch
+method-entry snapshot through its own terminal observation, including preflight and body
+buffering. It is not pure network RTT. Bound the request count and every per-request body limit;
+EdgeZero intentionally has no global batch-concurrency or memory cap.
 
 ## Platform Behavior
 

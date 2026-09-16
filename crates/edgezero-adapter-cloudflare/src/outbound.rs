@@ -107,19 +107,19 @@ mod worker_impl {
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
     use edgezero_core::outbound::{
-        OutboundBatch, OutboundBatchItem, OutboundCachePolicy, OutboundHttpClient, OutboundRequest,
-        OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseBodyDisposition,
-        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-        enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
-        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
-        validate_for_dispatch,
+        OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundCachePolicy,
+        OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
+        OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
+        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
+        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
+        normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
     use edgezero_core::time::{
         Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
     };
     use futures_util::StreamExt as _;
     use futures_util::future::{Either, FutureExt as _, LocalBoxFuture, poll_fn, select};
-    use futures_util::stream::{FuturesUnordered, empty};
+    use futures_util::stream::FuturesUnordered;
     use worker::js_sys::{Function, Reflect, Uint8Array, global};
     use worker::wasm_bindgen::closure::Closure;
     use worker::wasm_bindgen::{JsCast as _, JsValue};
@@ -372,7 +372,7 @@ mod worker_impl {
             let batch_started_at = self.clock.now();
             let slot_count = requests.len();
             if cutoff.is_expired_at(batch_started_at) {
-                return OutboundBatch::from_stream(slot_count, empty());
+                return OutboundBatch::cutoff(slot_count);
             }
 
             let mut completed = Vec::new();
@@ -412,9 +412,10 @@ mod worker_impl {
                         cutoff,
                         outcome,
                     ) else {
+                        yield OutboundBatchDriverEvent::Cutoff;
                         return;
                     };
-                    yield item;
+                    yield OutboundBatchDriverEvent::Item(item);
                 }
 
                 while let Some((index, completed_at, outcome)) = pending.next().await {
@@ -425,12 +426,13 @@ mod worker_impl {
                         cutoff,
                         outcome,
                     ) else {
+                        yield OutboundBatchDriverEvent::Cutoff;
                         return;
                     };
-                    yield item;
+                    yield OutboundBatchDriverEvent::Item(item);
                 }
             };
-            OutboundBatch::from_stream(slot_count, completions)
+            OutboundBatch::from_driver(slot_count, completions)
         }
     }
 
@@ -1140,7 +1142,8 @@ mod worker_impl {
                     ),
                 )
                 .collect()
-                .await;
+                .await
+                .expect("valid batch driver");
 
             let slot = results.slots[0].as_ref().expect("resolved slot");
             assert_eq!(slot.elapsed, Duration::from_millis(9));
@@ -1168,7 +1171,8 @@ mod worker_impl {
                     ),
                 )
                 .collect()
-                .await;
+                .await
+                .expect("valid batch driver");
 
             let slot = results.slots[0].as_ref().expect("resolved slot");
             assert_eq!(slot.elapsed, Duration::ZERO);

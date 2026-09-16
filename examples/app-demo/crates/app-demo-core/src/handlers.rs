@@ -13,7 +13,9 @@ use edgezero_core::extractor::{
     AppConfig, Headers, Json, Kv, Path, Query, Secrets, State, ValidatedPath,
 };
 use edgezero_core::http::{self, Method, Response, StatusCode, Uri};
-use edgezero_core::outbound::{OutboundCachePolicy, OutboundRequest, OutboundSlotResult};
+use edgezero_core::outbound::{
+    OutboundBatchTermination, OutboundCachePolicy, OutboundRequest, OutboundSlotResult,
+};
 use edgezero_core::response::Text;
 use edgezero_core::time::Deadline;
 use edgezero_core::ResponseEgressDeadline;
@@ -185,13 +187,14 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
             Ok(outbound_policy(OutboundRequest::new(Method::GET, target)?).deadline(deadline))
         })
         .collect::<Result<Vec<_>, EdgeError>>()?;
-    let slots = client.send_all_until(requests, deadline).await;
+    let slots = client.send_all_until(requests, deadline).await?;
+    let termination = slots.termination;
     let output = slots
         .slots
         .into_iter()
         .enumerate()
-        .map(|(index, slot)| fanout_slot(index, slot))
-        .collect::<Vec<_>>();
+        .map(|(index, slot)| fanout_slot(index, slot, termination))
+        .collect::<Result<Vec<_>, EdgeError>>()?;
 
     let mut response = json_response(&output)?;
     response
@@ -227,7 +230,11 @@ fn error_category(status: StatusCode) -> &'static str {
     }
 }
 
-fn fanout_slot(index: usize, slot_result: Option<OutboundSlotResult>) -> FanoutSlot {
+fn fanout_slot(
+    index: usize,
+    slot_result: Option<OutboundSlotResult>,
+    termination: OutboundBatchTermination,
+) -> Result<FanoutSlot, EdgeError> {
     match slot_result {
         Some(slot) => {
             let outcome = match slot.outcome {
@@ -239,17 +246,23 @@ fn fanout_slot(index: usize, slot_result: Option<OutboundSlotResult>) -> FanoutS
                     status: error.status().as_u16(),
                 },
             };
-            FanoutSlot {
+            Ok(FanoutSlot {
                 elapsed_ms: Some(slot.elapsed.as_millis()),
                 index,
                 outcome,
-            }
+            })
         }
-        None => FanoutSlot {
+        None if termination == OutboundBatchTermination::Cutoff => Ok(FanoutSlot {
             elapsed_ms: None,
             index,
             outcome: FanoutSlotOutcome::Unresolved,
-        },
+        }),
+        None if termination == OutboundBatchTermination::Completed => Err(EdgeError::internal(
+            IoError::other("completed outbound batch contained an unresolved slot"),
+        )),
+        None => Err(EdgeError::internal(IoError::other(
+            "outbound batch contained an unresolved slot for an unsupported termination reason",
+        ))),
     }
 }
 
@@ -503,8 +516,8 @@ mod tests {
     use edgezero_core::http::{request_builder, HeaderMap, Method, StatusCode, Uri};
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::outbound::{
-        HttpClient, OutboundBatch, OutboundBatchItem, OutboundHttpClient, OutboundRequestParts,
-        OutboundResponse, OutboundSlotResult, ResponseMode,
+        HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundHttpClient,
+        OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseMode,
     };
     use edgezero_core::params::PathParams;
     use edgezero_core::response::IntoResponse as _;
@@ -639,7 +652,10 @@ mod tests {
             if let Some(batch_deadline) = observed_deadline {
                 assert_eq!(batch_deadline, cutoff.instant());
             }
-            OutboundBatch::from_stream(slot_count, stream::iter(results))
+            OutboundBatch::from_driver(
+                slot_count,
+                stream::iter(results.into_iter().map(OutboundBatchDriverEvent::Item)),
+            )
         }
     }
 

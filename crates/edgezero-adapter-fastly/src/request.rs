@@ -989,7 +989,7 @@ mod synthesis_tests {
                 edgezero_core::OutboundRequest::get("https://example.com/")?.stream_response();
             let results = client
                 .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
-                .await;
+                .await?;
             let elapsed = results
                 .slots
                 .into_iter()
