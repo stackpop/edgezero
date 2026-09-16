@@ -255,6 +255,11 @@ pub struct DeployArgs {
     /// staging-intended deploy to PRODUCTION.
     #[arg(last = true)]
     pub adapter_args: Vec<String>,
+    /// Canonical root of an already-extracted immutable application release.
+    /// The generic CLI confines the loaded application manifest to this root;
+    /// the selected adapter validates its own release metadata.
+    #[arg(long)]
+    pub application_release: Option<PathBuf>,
     /// Platform service id the deploy targets. Consumed by the Fastly
     /// staging lifecycle: production deploy passes it
     /// through to `fastly compute deploy` and resolves the activated
@@ -566,10 +571,9 @@ pub struct ConfigPushArgs {
     /// key the live service reads. Production and staging may select the same or
     /// different physical stores. The same `--staging` verb
     /// `deploy`/`healthcheck`/`rollback` use. Mutually exclusive with `--key`: the
-    /// staging key is derived from the
-    /// store's logical id because that is what the staging selector store (created
-    /// and linked by a staged deploy) points a staged version at, so an explicit
-    /// key would be written where nothing reads it.
+    /// staging key is derived from the store's logical id so the staged
+    /// deployment descriptor and the pushed entry select the same key; an
+    /// explicit key would be written where nothing reads it.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to push to. Defaults to the
@@ -800,6 +804,30 @@ mod tests {
         };
         assert_eq!(adapter, "fastly");
         assert_eq!(adapter_args, vec!["--flag", "value"]);
+    }
+
+    #[test]
+    fn deploy_parses_application_release_before_passthrough_boundary() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--application-release",
+            "/tmp/application-release",
+            "--",
+            "--comment",
+            "publisher deploy",
+        ])
+        .expect("parse deploy");
+        let Command::Deploy(deploy) = args.cmd else {
+            panic!("expected Command::Deploy");
+        };
+        assert_eq!(
+            deploy.application_release,
+            Some(PathBuf::from("/tmp/application-release"))
+        );
+        assert_eq!(deploy.adapter_args, ["--comment", "publisher deploy"]);
     }
 
     #[test]

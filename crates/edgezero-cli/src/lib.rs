@@ -67,7 +67,7 @@ use std::env;
 #[cfg(feature = "cli")]
 use std::io::ErrorKind;
 #[cfg(feature = "cli")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI output logger: prints `record.args()` verbatim with no
 /// timestamps, levels, or module prefixes — the CLI's output IS
@@ -208,8 +208,15 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
             Ok(path) => (path.map(PathBuf::from), None),
             Err(err) => (None, Some(err)),
         };
+    let application_manifest_path = loaded_application_manifest_path(manifest.as_ref())?;
+    let application_release_root = resolve_application_release_root(
+        args.application_release.as_deref(),
+        application_manifest_path.as_deref(),
+    )?;
     let context = AdapterDeployContext {
         adapter_manifest_path,
+        application_manifest_path,
+        application_release_root,
         service_id: args.service_id.clone(),
         stores: deploy_stores,
         staging: args.staging,
@@ -223,6 +230,62 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         manifest.as_ref(),
         &args.adapter_args,
     )
+}
+
+#[cfg(feature = "cli")]
+fn loaded_application_manifest_path(
+    loader: Option<&ManifestLoader>,
+) -> Result<Option<PathBuf>, String> {
+    if loader.is_none() {
+        return Ok(None);
+    }
+    let path = env::var("EDGEZERO_MANIFEST")
+        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
+    let canonical = path.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve loaded application manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(format!(
+            "loaded application manifest {} is not a regular file",
+            canonical.display()
+        ));
+    }
+    Ok(Some(canonical))
+}
+
+#[cfg(feature = "cli")]
+fn resolve_application_release_root(
+    requested_root: Option<&Path>,
+    application_manifest: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(requested_root_path) = requested_root else {
+        return Ok(None);
+    };
+    let root = requested_root_path.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve application release root {}: {error}",
+            requested_root_path.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "application release root {} is not a directory",
+            root.display()
+        ));
+    }
+    let manifest = application_manifest
+        .ok_or_else(|| "--application-release requires a loaded application manifest".to_owned())?;
+    if !manifest.starts_with(&root) {
+        return Err(format!(
+            "loaded application manifest {} is outside application release root {}",
+            manifest.display(),
+            root.display()
+        ));
+    }
+    Ok(Some(root))
 }
 
 /// Resolve the absolute path of the adapter's platform manifest
@@ -707,6 +770,7 @@ mod tests {
 
         let args = DeployArgs {
             adapter: "fastly".to_owned(),
+            application_release: None,
             adapter_args: vec!["--non-interactive".to_owned()],
             service_id: Some("SVC1".to_owned()),
             staging: false,
@@ -737,6 +801,7 @@ mod tests {
 
         let err = run_deploy(&DeployArgs {
             adapter: "fastly".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             service_id: Some("SVC1".to_owned()),
             staging: true,
@@ -775,6 +840,7 @@ mod tests {
 
         run_deploy(&DeployArgs {
             adapter: "unregistered_test".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             service_id: None,
             staging: false,
@@ -843,6 +909,7 @@ deploy = "touch '{}'"
 
         run_deploy(&DeployArgs {
             adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             service_id: None,
             staging: false,
@@ -878,6 +945,83 @@ deploy = "touch '{}'"
                 "from-manifest".to_owned()
             )])
         );
+        assert_eq!(
+            deployed_context.application_manifest_path,
+            Some(
+                manifest_path
+                    .canonicalize()
+                    .expect("canonical app manifest")
+            )
+        );
+        assert!(deployed_context.application_release_root.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_receives_confined_application_release_paths() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let release = TempDir::new().expect("release root");
+        let adapter_dir = release.path().join("adapter");
+        fs::create_dir_all(&adapter_dir).expect("adapter directory");
+        let adapter_manifest = adapter_dir.join("fastly.toml");
+        fs::write(&adapter_manifest, "name = \"recording\"\n").expect("adapter manifest");
+        let manifest_path = release.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            "[app]\nname = \"demo\"\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"adapter/fastly.toml\"\n",
+        )
+        .expect("application manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: Some(release.path().to_path_buf()),
+            ..DeployArgs::default()
+        })
+        .expect("managed release deploy");
+
+        let context = DEPLOY_CONTEXT
+            .lock()
+            .expect("deploy context lock")
+            .clone()
+            .expect("deploy context");
+        assert_eq!(
+            context.application_release_root,
+            Some(release.path().canonicalize().unwrap())
+        );
+        assert_eq!(
+            context.application_manifest_path,
+            Some(manifest_path.canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_rejects_application_manifest_outside_release_root() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let release = TempDir::new().expect("release root");
+        let application = TempDir::new().expect("application root");
+        let manifest_path = application.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            "[app]\nname = \"demo\"\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\n",
+        )
+        .expect("application manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let error = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: Some(release.path().to_path_buf()),
+            ..DeployArgs::default()
+        })
+        .expect_err("application manifest must be confined to release");
+
+        assert!(error.contains("outside application release"), "{error}");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(not(windows))]
@@ -901,6 +1045,7 @@ deploy = "touch '{}'"
 
         let err = run_deploy(&DeployArgs {
             adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             service_id: None,
             staging: false,
@@ -944,6 +1089,7 @@ deploy = "touch '{}'"
 
         run_deploy(&DeployArgs {
             adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             service_id: None,
             staging: false,
@@ -982,6 +1128,7 @@ deploy = "touch '{}'"
 
         let err = run_deploy(&DeployArgs {
             adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             service_id: None,
             staging: false,
@@ -1021,6 +1168,7 @@ deploy = "touch '{}'"
 
         let err = run_deploy(&DeployArgs {
             adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             service_id: None,
             staging: false,
@@ -1095,6 +1243,7 @@ deploy = "touch '{}'"
 
         run_deploy(&DeployArgs {
             adapter: "fastly".to_owned(),
+            application_release: None,
             adapter_args: vec!["--non-interactive".to_owned()],
             service_id: Some("SVC1".to_owned()),
             staging: false,
@@ -1119,6 +1268,7 @@ deploy = "touch '{}'"
         for flag in ["--stage", "--staging", "--stage=true", "--staging=1"] {
             let args = DeployArgs {
                 adapter: "fastly".to_owned(),
+                application_release: None,
                 adapter_args: vec![flag.to_owned()],
                 service_id: Some("SVC1".to_owned()),
                 staging: false,
@@ -1178,6 +1328,7 @@ deploy = "touch '{}'"
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
         let args = DeployArgs {
             adapter: "fastly".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             // No service id → the production version-emit step is
             // skipped, so this test exercises only the

@@ -1,5 +1,10 @@
+#![expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "the Task 5 read-only plan is kept as one cohesive block ahead of the legacy deploy implementation it will replace in Task 6"
+)]
+
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -20,7 +25,8 @@ use crate::chunked_config::{
     prior_chunk_keys, resolve_fastly_config_value_typed, sha256_hex, value_announces_our_kind,
     value_is_future_format, value_is_inert_foreign, verify_writer_split_layout,
 };
-use crate::runtime_descriptor::validated_deploy_env;
+use crate::release::{VerifiedApplicationRelease, verify_application_release};
+use crate::runtime_descriptor::{RuntimeDescriptor, runtime_descriptor_key, validated_deploy_env};
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
@@ -191,6 +197,839 @@ struct ManagedDeployArgs {
     comment: Option<String>,
     globals: Vec<String>,
     package: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ReleaseManagedDeployArgs {
+    comment: Option<String>,
+    globals: Vec<String>,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these independent booleans are the Fastly version API's exact typed state fields"
+)]
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
+struct ServiceVersionRecord {
+    #[serde(alias = "Active")]
+    active: bool,
+    #[serde(alias = "Deployed")]
+    deployed: bool,
+    #[serde(alias = "Environments")]
+    environments: Vec<ServiceEnvironmentRecord>,
+    #[serde(alias = "Locked")]
+    locked: bool,
+    #[serde(alias = "Number")]
+    number: u64,
+    #[serde(alias = "Staging")]
+    staging: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
+struct ServiceEnvironmentRecord {
+    #[serde(alias = "ServiceVersion")]
+    active_version: u64,
+    #[serde(alias = "Name")]
+    name: String,
+    #[serde(alias = "ServiceID")]
+    service_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VersionSource {
+    Active(u64),
+    InitialDraft(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishTarget {
+    Production,
+    Staging,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Task 5 records the initial draft snapshot for Task 6 consumption"
+    )
+)]
+#[derive(Debug)]
+struct InitialDraftSnapshot {
+    backends: serde_json::Value,
+    domains: serde_json::Value,
+    links: serde_json::Value,
+    logging: serde_json::Value,
+    metadata: serde_json::Value,
+    settings: serde_json::Value,
+    version: ServiceVersionRecord,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Task 5 records the editable version source for Task 6 consumption"
+    )
+)]
+#[derive(Debug)]
+enum EditableVersionSource {
+    CloneActive { active_version: u64 },
+    InitialDraft(Box<InitialDraftSnapshot>),
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Task 5 builds the complete read-only plan; Task 6 routes deployment through it"
+    )
+)]
+#[derive(Debug)]
+struct ManagedDeployPlan {
+    arguments: ReleaseManagedDeployArgs,
+    descriptor_json: String,
+    desired_links: Vec<DesiredResourceLink>,
+    environment: EnvConfig,
+    inventories: ResourceInventories,
+    links: LinkReconciliation,
+    package_sha256: String,
+    prior_descriptor: Option<RuntimeDescriptor>,
+    release: VerifiedApplicationRelease,
+    runtime_store_id: String,
+    service_id: String,
+    source_links: Vec<ExistingResourceLink>,
+    target: PublishTarget,
+    version_source: EditableVersionSource,
+    versions: Vec<ServiceVersionRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ResourceKind {
+    Config,
+    Kv,
+    Secret,
+}
+
+impl ResourceKind {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Config => "Config Store",
+            Self::Kv => "KV Store",
+            Self::Secret => "Secret Store",
+        }
+    }
+
+    fn runtime_name(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Kv => "kv",
+            Self::Secret => "secrets",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DesiredResourceLink {
+    alias: String,
+    kind: ResourceKind,
+    logical_id: Option<String>,
+    resource_id: String,
+    selected_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExistingResourceLink {
+    alias: String,
+    link_id: String,
+    resource_id: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LinkReconciliation {
+    create: Vec<DesiredResourceLink>,
+    delete_link_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StoreInventory {
+    by_name: BTreeMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PaginatedStoreInventoryPage {
+    #[serde(alias = "Data")]
+    data: Vec<PaginatedStoreInventoryRecord>,
+    #[serde(alias = "Meta")]
+    meta: PaginatedStoreInventoryMeta,
+}
+
+#[derive(serde::Deserialize)]
+struct PaginatedStoreInventoryRecord {
+    #[serde(alias = "StoreID")]
+    id: String,
+    #[serde(alias = "Name")]
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PaginatedStoreInventoryMeta {
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExactConfigStoreItemResponse {
+    item_value: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResourceInventories {
+    config: StoreInventory,
+    kind_by_resource_id: BTreeMap<String, ResourceKind>,
+    kv: StoreInventory,
+    secret: StoreInventory,
+}
+
+impl ResourceInventories {
+    fn contains_resource_id(&self, resource_id: &str) -> bool {
+        self.kind_by_resource_id.contains_key(resource_id)
+    }
+
+    fn for_kind(&self, kind: ResourceKind) -> &StoreInventory {
+        match kind {
+            ResourceKind::Config => &self.config,
+            ResourceKind::Kv => &self.kv,
+            ResourceKind::Secret => &self.secret,
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the pure JSON constructor is retained for clean-cutover planner tests"
+        )
+    )]
+    fn from_json(raw_config: &str, raw_kv: &str, raw_secret: &str) -> Result<Self, String> {
+        let config = parse_store_inventory(ResourceKind::Config, raw_config)?;
+        let kv = parse_store_inventory(ResourceKind::Kv, raw_kv)?;
+        let secret = parse_store_inventory(ResourceKind::Secret, raw_secret)?;
+        Self::from_inventories(config, kv, secret)
+    }
+
+    fn from_inventories(
+        config: StoreInventory,
+        kv: StoreInventory,
+        secret: StoreInventory,
+    ) -> Result<Self, String> {
+        let mut kind_by_resource_id = BTreeMap::new();
+        for (kind, inventory) in [
+            (ResourceKind::Config, &config),
+            (ResourceKind::Kv, &kv),
+            (ResourceKind::Secret, &secret),
+        ] {
+            for resource_id in inventory.by_name.values() {
+                if let Some(prior_kind) = kind_by_resource_id.insert(resource_id.clone(), kind) {
+                    return Err(format!(
+                        "Fastly resource id `{resource_id}` appears in both {} and {} inventories; resource kind is ambiguous",
+                        prior_kind.display_name(),
+                        kind.display_name()
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            config,
+            kind_by_resource_id,
+            kv,
+            secret,
+        })
+    }
+
+    fn resolve(&self, kind: ResourceKind, name: &str) -> Result<String, String> {
+        self.for_kind(kind)
+            .by_name
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "selected Fastly {} `{name}` does not exist in the complete provider inventory",
+                    kind.display_name()
+                )
+            })
+    }
+}
+
+fn parse_store_inventory(kind: ResourceKind, raw: &str) -> Result<StoreInventory, String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        format!(
+            "failed to parse Fastly {} inventory as JSON: {error}",
+            kind.display_name()
+        )
+    })?;
+    let rows = parsed.as_array().ok_or_else(|| {
+        format!(
+            "Fastly {} inventory must be one complete bare JSON array; paginated or enveloped results are not accepted",
+            kind.display_name()
+        )
+    })?;
+    let mut records = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let object = row.as_object().ok_or_else(|| {
+            format!(
+                "Fastly {} inventory record #{index} is not an object",
+                kind.display_name()
+            )
+        })?;
+        let field = |name| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|field_value| !field_value.is_empty())
+        };
+        let (Some(name), Some(id)) = (field("name"), field("id")) else {
+            return Err(format!(
+                "Fastly {} inventory record #{index} requires non-empty string `name` and `id` fields",
+                kind.display_name()
+            ));
+        };
+        records.push((name.to_owned(), id.to_owned()));
+    }
+    store_inventory_from_records(kind, records)
+}
+
+fn store_inventory_from_records(
+    kind: ResourceKind,
+    records: impl IntoIterator<Item = (String, String)>,
+) -> Result<StoreInventory, String> {
+    let mut by_name = BTreeMap::new();
+    let mut ids = BTreeSet::new();
+    for (index, (name, id)) in records.into_iter().enumerate() {
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(format!(
+                "Fastly {} inventory record #{index} has invalid resource id",
+                kind.display_name()
+            ));
+        }
+        if name.is_empty()
+            || name.chars().all(char::is_whitespace)
+            || name.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "Fastly {} inventory record #{index} has invalid store name",
+                kind.display_name()
+            ));
+        }
+        if by_name.insert(name.clone(), id.clone()).is_some() {
+            return Err(format!(
+                "Fastly {} inventory contains duplicate name `{name}`",
+                kind.display_name()
+            ));
+        }
+        if !ids.insert(id.clone()) {
+            return Err(format!(
+                "Fastly {} inventory contains duplicate resource id `{id}`",
+                kind.display_name()
+            ));
+        }
+    }
+    Ok(StoreInventory { by_name })
+}
+
+fn percent_encode_query_value(value: &str) -> Result<String, String> {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}")
+                .map_err(|error| format!("failed to encode Fastly pagination cursor: {error}"))?;
+        }
+    }
+    Ok(encoded)
+}
+
+fn collect_paginated_store_inventory(
+    kind: ResourceKind,
+    first_path: &str,
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<StoreInventory, String> {
+    let mut path = first_path.to_owned();
+    let mut seen_cursors = BTreeSet::new();
+    let mut records = Vec::new();
+    loop {
+        let raw = fetch(&path)?;
+        let page: PaginatedStoreInventoryPage = serde_json::from_str(&raw).map_err(|_error| {
+            format!(
+                "Fastly {} inventory page has an invalid paginated response shape (payload redacted)",
+                kind.display_name()
+            )
+        })?;
+        records.extend(page.data.into_iter().map(|record| (record.name, record.id)));
+        let Some(cursor) = page.meta.next_cursor.filter(|cursor| !cursor.is_empty()) else {
+            break;
+        };
+        if !seen_cursors.insert(cursor.clone()) {
+            return Err(format!(
+                "Fastly {} inventory repeated a pagination cursor; completeness cannot be proven",
+                kind.display_name()
+            ));
+        }
+        path = format!(
+            "{first_path}&cursor={}",
+            percent_encode_query_value(&cursor)?
+        );
+    }
+    store_inventory_from_records(kind, records)
+}
+
+fn fetch_complete_paginated_store_inventory(
+    kind: ResourceKind,
+    endpoint: &str,
+    token: &str,
+) -> Result<StoreInventory, String> {
+    let first_path = format!("{endpoint}?limit=100");
+    collect_paginated_store_inventory(kind, &first_path, |path| fastly_api_get(path, token))
+}
+
+fn desired_resource_links(
+    stores: &RuntimeStoreIds,
+    environment: &EnvConfig,
+    inventories: &ResourceInventories,
+) -> Result<Vec<DesiredResourceLink>, String> {
+    let mut desired_by_alias = BTreeMap::<String, DesiredResourceLink>::new();
+    let runtime_id = inventories.resolve(ResourceKind::Config, RUNTIME_ENV_STORE_NAME)?;
+    desired_by_alias.insert(
+        RUNTIME_ENV_STORE_NAME.to_owned(),
+        DesiredResourceLink {
+            logical_id: None,
+            kind: ResourceKind::Config,
+            alias: RUNTIME_ENV_STORE_NAME.to_owned(),
+            selected_name: RUNTIME_ENV_STORE_NAME.to_owned(),
+            resource_id: runtime_id,
+        },
+    );
+
+    for (kind, logical_ids) in [
+        (ResourceKind::Config, &stores.config),
+        (ResourceKind::Kv, &stores.kv),
+        (ResourceKind::Secret, &stores.secrets),
+    ] {
+        for logical_id in logical_ids {
+            let selected_name = environment.store_name(kind.runtime_name(), logical_id);
+            if selected_name == RUNTIME_ENV_STORE_NAME {
+                return Err(format!(
+                    "selected {} store for `{logical_id}` cannot use the reserved Fastly resource-link alias `{RUNTIME_ENV_STORE_NAME}`",
+                    kind.runtime_name()
+                ));
+            }
+            let resource_id = inventories.resolve(kind, &selected_name)?;
+            let desired = DesiredResourceLink {
+                logical_id: Some(logical_id.clone()),
+                kind,
+                alias: selected_name.clone(),
+                selected_name: selected_name.clone(),
+                resource_id,
+            };
+            if let Some(prior) = desired_by_alias.get(&selected_name) {
+                if prior.resource_id != desired.resource_id || prior.kind != desired.kind {
+                    return Err(format!(
+                        "Fastly resource-link alias `{selected_name}` is selected by different resources or store kinds"
+                    ));
+                }
+                continue;
+            }
+            desired_by_alias.insert(selected_name, desired);
+        }
+    }
+    Ok(desired_by_alias.into_values().collect())
+}
+
+fn plan_link_reconciliation(
+    desired: &[DesiredResourceLink],
+    existing: &[ExistingResourceLink],
+    prior_managed_aliases: Option<&BTreeSet<String>>,
+    inventories: &ResourceInventories,
+) -> Result<LinkReconciliation, String> {
+    let mut desired_by_alias = BTreeMap::new();
+    for link in desired {
+        if desired_by_alias.insert(link.alias.as_str(), link).is_some() {
+            return Err(format!(
+                "desired Fastly resource-link alias `{}` is duplicated",
+                link.alias
+            ));
+        }
+    }
+    let mut existing_by_alias = BTreeMap::new();
+    let mut existing_ids = BTreeSet::new();
+    for link in existing {
+        if !existing_ids.insert(link.link_id.as_str()) {
+            return Err(format!(
+                "Fastly resource-link inventory contains duplicate link id `{}`",
+                link.link_id
+            ));
+        }
+        if existing_by_alias
+            .insert(link.alias.as_str(), link)
+            .is_some()
+        {
+            return Err(format!(
+                "Fastly resource-link inventory contains duplicate alias `{}`",
+                link.alias
+            ));
+        }
+    }
+
+    let mut create = Vec::new();
+    for desired_link in desired {
+        match existing_by_alias.get(desired_link.alias.as_str()) {
+            Some(existing_link) if existing_link.resource_id == desired_link.resource_id => {}
+            Some(existing_link) => {
+                return Err(format!(
+                    "Fastly resource-link alias collision for `{}`: existing resource `{}` differs from desired resource `{}`",
+                    desired_link.alias, existing_link.resource_id, desired_link.resource_id
+                ));
+            }
+            None => create.push(desired_link.clone()),
+        }
+    }
+
+    let mut delete_link_ids = existing
+        .iter()
+        .filter(|link| !desired_by_alias.contains_key(link.alias.as_str()))
+        .filter(|link| match prior_managed_aliases {
+            Some(aliases) => aliases.contains(&link.alias),
+            None => inventories.contains_resource_id(&link.resource_id),
+        })
+        .map(|link| link.link_id.clone())
+        .collect::<Vec<_>>();
+    delete_link_ids.sort();
+    create.sort_by(|left, right| left.alias.cmp(&right.alias));
+    Ok(LinkReconciliation {
+        create,
+        delete_link_ids,
+    })
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Task 5 leaves the completed plan builder unrouted until Task 6"
+    )
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the read-only checkpoint intentionally assembles every validated input into one reviewable plan"
+)]
+fn build_managed_deploy_plan(
+    context: &AdapterDeployContext,
+    args: &[String],
+) -> Result<ManagedDeployPlan, String> {
+    let arguments = parse_release_managed_deploy_args(args)?;
+    let target = if context.staging {
+        PublishTarget::Staging
+    } else {
+        PublishTarget::Production
+    };
+    let environment = effective_deploy_environment(context)?;
+    let release_root = context
+        .application_release_root
+        .as_deref()
+        .ok_or_else(|| "managed Fastly deployment requires --application-release".to_owned())?;
+    let application_manifest = context
+        .application_manifest_path
+        .as_deref()
+        .ok_or_else(|| {
+            "managed Fastly deployment requires the exact loaded application manifest path"
+                .to_owned()
+        })?;
+    let adapter_manifest = context.adapter_manifest_path.as_deref().ok_or_else(|| {
+        "managed Fastly deployment requires the exact referenced Fastly manifest path".to_owned()
+    })?;
+    let release = verify_application_release(release_root, application_manifest, adapter_manifest)?;
+    let service_id = resolve_managed_plan_service_id(context, &release)?;
+    let token = require_token()?;
+    if token.is_empty() {
+        return Err(format!(
+            "{FASTLY_API_TOKEN_ENV} must be non-empty in the environment"
+        ));
+    }
+
+    let stores = RuntimeStoreIds::from(&context.stores);
+    let descriptor = RuntimeDescriptor::from_environment(
+        &environment,
+        &stores.config,
+        &stores.kv,
+        &stores.secrets,
+    )
+    .map_err(|error| format!("invalid Fastly runtime descriptor: {error}"))?;
+    let descriptor_json = descriptor
+        .canonical_json()
+        .map_err(|error| format!("invalid Fastly runtime descriptor: {error}"))?;
+    let cwd = release
+        .adapter_manifest()
+        .parent()
+        .ok_or_else(|| "verified Fastly manifest has no parent directory".to_owned())?;
+
+    let raw_config_inventory = run_fastly_json_capture(&["config-store", "list", "--json"], cwd)?;
+    let config_inventory = parse_store_inventory(ResourceKind::Config, &raw_config_inventory)?;
+    let kv_inventory =
+        fetch_complete_paginated_store_inventory(ResourceKind::Kv, "/resources/stores/kv", &token)?;
+    let secret_inventory = fetch_complete_paginated_store_inventory(
+        ResourceKind::Secret,
+        "/resources/stores/secret",
+        &token,
+    )?;
+    let inventories =
+        ResourceInventories::from_inventories(config_inventory, kv_inventory, secret_inventory)?;
+    let runtime_store_id = inventories.resolve(ResourceKind::Config, RUNTIME_ENV_STORE_NAME)?;
+    let desired_links = desired_resource_links(&stores, &environment, &inventories)?;
+
+    let versions_raw = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
+    let versions = parse_service_versions(&versions_raw)?;
+    let selected_source = select_version_source(&versions)?;
+    let source_version = match selected_source {
+        VersionSource::Active(version) | VersionSource::InitialDraft(version) => version,
+    };
+    let links_raw = run_fastly_json_capture(
+        &[
+            "resource-link",
+            "list",
+            &format!("--service-id={service_id}"),
+            &format!("--version={source_version}"),
+            "--json",
+        ],
+        cwd,
+    )?;
+    let (source_links, links_snapshot) = parse_resource_links(&links_raw)?;
+
+    let descriptor_key = runtime_descriptor_key(&service_id, source_version);
+    let prior_descriptor = read_exact_prior_descriptor(&runtime_store_id, &descriptor_key, &token)?;
+    let prior_aliases = prior_descriptor
+        .as_ref()
+        .map(RuntimeDescriptor::managed_store_aliases)
+        .transpose()
+        .map_err(|error| format!("invalid prior Fastly runtime descriptor: {error}"))?;
+    let links = plan_link_reconciliation(
+        &desired_links,
+        &source_links,
+        prior_aliases.as_ref(),
+        &inventories,
+    )?;
+
+    let version_source = match selected_source {
+        VersionSource::Active(active_version) => {
+            EditableVersionSource::CloneActive { active_version }
+        }
+        VersionSource::InitialDraft(draft_version) => {
+            let version = versions
+                .iter()
+                .find(|version| version.number == draft_version)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("selected initial draft version {draft_version} disappeared")
+                })?;
+            let metadata = exact_version_metadata(&versions_raw, draft_version)?;
+            EditableVersionSource::InitialDraft(Box::new(snapshot_initial_draft(
+                &service_id,
+                version,
+                metadata,
+                links_snapshot,
+                &token,
+            )?))
+        }
+    };
+    let package_sha256 = release.package_sha256().to_owned();
+
+    Ok(ManagedDeployPlan {
+        arguments,
+        descriptor_json,
+        desired_links,
+        environment,
+        inventories,
+        links,
+        package_sha256,
+        prior_descriptor,
+        release,
+        runtime_store_id,
+        service_id,
+        source_links,
+        target,
+        version_source,
+        versions,
+    })
+}
+
+fn resolve_managed_plan_service_id(
+    context: &AdapterDeployContext,
+    release: &VerifiedApplicationRelease,
+) -> Result<String, String> {
+    if let Some(service_id) = context.service_id.as_deref() {
+        validate_service_id(service_id)?;
+        return Ok(service_id.to_owned());
+    }
+    effective_fastly_service_id(release.adapter_manifest())?
+        .map(|selected| selected.id)
+        .ok_or_else(|| {
+            format!(
+                "managed Fastly deployment requires a service id in typed context, the verified Fastly manifest, or {FASTLY_SERVICE_ID_ENV}"
+            )
+        })
+}
+
+fn run_fastly_json_capture(args: &[&str], cwd: &Path) -> Result<String, String> {
+    let output = Command::new("fastly")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to run read-only Fastly command: {error}")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "read-only `fastly {}` exited with status {}\nstderr: {}",
+            args.join(" "),
+            output.status,
+            redact_stderr(&String::from_utf8_lossy(&output.stderr))
+        ));
+    }
+    strict_stdout(output.stdout, "read-only Fastly JSON command")
+}
+
+fn parse_resource_links(
+    raw: &str,
+) -> Result<(Vec<ExistingResourceLink>, serde_json::Value), String> {
+    let snapshot: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to parse Fastly resource-link inventory: {error}"))?;
+    let rows = snapshot.as_array().ok_or_else(|| {
+        "Fastly resource-link inventory must be one complete bare JSON array".to_owned()
+    })?;
+    let mut links = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let object = row.as_object().ok_or_else(|| {
+            format!("Fastly resource-link inventory record #{index} is not an object")
+        })?;
+        let required = |field: &str| {
+            object
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "Fastly resource-link inventory record #{index} requires non-empty string `{field}`"
+                    )
+                })
+        };
+        links.push(ExistingResourceLink {
+            link_id: required("id")?,
+            alias: required("name")?,
+            resource_id: required("resource_id")?,
+        });
+    }
+    Ok((links, snapshot))
+}
+
+fn read_exact_prior_descriptor(
+    store_id: &str,
+    key: &str,
+    token: &str,
+) -> Result<Option<RuntimeDescriptor>, String> {
+    let path = format!("/resources/stores/config/{store_id}/item/{key}");
+    fastly_api_get_optional(&path, token)?
+        .map(|raw| parse_exact_config_store_item_descriptor(&raw))
+        .transpose()
+}
+
+fn parse_exact_config_store_item_descriptor(raw: &str) -> Result<RuntimeDescriptor, String> {
+    let response: ExactConfigStoreItemResponse = serde_json::from_str(raw).map_err(|_error| {
+        "Fastly exact Config Store item response is unreadable or malformed (payload redacted)"
+            .to_owned()
+    })?;
+    RuntimeDescriptor::parse(&response.item_value).map_err(|_error| {
+        "Fastly exact Config Store item contains an invalid runtime descriptor (payload redacted)"
+            .to_owned()
+    })
+}
+
+fn snapshot_initial_draft(
+    service_id: &str,
+    version: ServiceVersionRecord,
+    metadata: serde_json::Value,
+    links: serde_json::Value,
+    token: &str,
+) -> Result<InitialDraftSnapshot, String> {
+    let base = format!("/service/{service_id}/version/{}", version.number);
+    let domains = parse_snapshot_array(
+        "domains",
+        &fastly_api_get(&format!("{base}/domain"), token)?,
+    )?;
+    let backends = parse_snapshot_array(
+        "backends",
+        &fastly_api_get(&format!("{base}/backend"), token)?,
+    )?;
+    let logging = parse_snapshot_array(
+        "logging",
+        &fastly_api_get(&format!("{base}/logging"), token)?,
+    )?;
+    let settings = parse_snapshot_object(
+        "settings",
+        &fastly_api_get(&format!("{base}/settings"), token)?,
+    )?;
+    Ok(InitialDraftSnapshot {
+        backends,
+        domains,
+        links,
+        logging,
+        metadata,
+        settings,
+        version,
+    })
+}
+
+fn exact_version_metadata(raw: &str, number: u64) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to preserve Fastly version metadata: {error}"))?;
+    value
+        .as_array()
+        .and_then(|versions| {
+            versions.iter().find(|version| {
+                version.get("number").and_then(serde_json::Value::as_u64) == Some(number)
+            })
+        })
+        .cloned()
+        .ok_or_else(|| format!("selected Fastly version {number} has no exact metadata record"))
+}
+
+fn parse_snapshot_array(label: &str, raw: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to parse initial draft {label} snapshot: {error}"))?;
+    if !value.is_array() {
+        return Err(format!(
+            "initial draft {label} snapshot must be a complete JSON array"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_snapshot_object(label: &str, raw: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to parse initial draft {label} snapshot: {error}"))?;
+    if !value.is_object() {
+        return Err(format!(
+            "initial draft {label} snapshot must be a complete JSON object"
+        ));
+    }
+    Ok(value)
 }
 
 /// Outcome of scanning `fastly config-store list --json` for a
@@ -633,21 +1472,15 @@ impl Adapter for FastlyCliAdapter {
             // path: if `service_id` is set in fastly.toml, the
             // `[setup.config_stores.edgezero_runtime_env]` table won't
             // be re-applied by the next `fastly compute deploy`, so the
-            // runtime can't open the store. Emit the resource-link
-            // remediation alongside the populate-keys hint.
+            // runtime can't open the store. Emit only the resource-link
+            // remediation; deployment owns every descriptor entry.
             let post_create_note = resource_link_note(
                 selected_service.as_ref(),
                 runtime_env_kind,
                 runtime_env_name,
             );
-            // NB: this store is what the ACTIVE (production) service reads. The
-            // example must never point it at a staging key — following that would
-            // make production serve staged config. Staged versions get their own
-            // selector via `edgezero_runtime_env_staging`, wired automatically by
-            // a staged deploy; nothing here should be edited to stage config.
-            let production_selector_key = canonical_runtime_env_key_for("app_config");
             let mut line = format!(
-                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  Runtime store selectors are applied by deploy from its selected environment. Config stores still select their logical id as the default key.\n  To point PRODUCTION at a different config key manually, and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key={production_selector_key} --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero version-scoped runtime descriptor store); appended setup tables to {}\n  Deployment writes the complete runtime descriptor for each service version.",
                 fastly_path.display()
             );
             if let Some(note) = post_create_note {
@@ -658,13 +1491,6 @@ impl Adapter for FastlyCliAdapter {
         } else {
             // Already declared; nothing to do.
         }
-
-        // The STAGING twin of the runtime-override store is created and
-        // populated entirely by a staged deploy (see
-        // `relink_runtime_env_for_staging` → `mirror_production_to_staging`), so
-        // it always mirrors production's CURRENT overrides. Provision does not
-        // touch it: a twin populated here would drift the moment an operator
-        // edited a production override.
 
         if out.is_empty() {
             out.push("fastly has no declared stores to provision".to_owned());
@@ -4496,6 +5322,50 @@ fn parse_managed_deploy_args(args: &[String]) -> Result<ManagedDeployArgs, Strin
     Ok(parsed)
 }
 
+fn parse_release_managed_deploy_args(args: &[String]) -> Result<ReleaseManagedDeployArgs, String> {
+    scan_reserved_deploy_args(args)?;
+    let mut parsed = ReleaseManagedDeployArgs {
+        comment: None,
+        globals: Vec::new(),
+    };
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--comment" {
+            let value = detached_managed_deploy_value(args, index, "--comment")?;
+            set_managed_deploy_value(&mut parsed.comment, "--comment", value)?;
+            index = index.saturating_add(2);
+        } else if let Some(value) = arg.strip_prefix("--comment=") {
+            set_managed_deploy_value(&mut parsed.comment, "--comment", value)?;
+            index = index.saturating_add(1);
+        } else if arg == "--package"
+            || arg == "-p"
+            || arg.starts_with("--package=")
+            || (arg.starts_with("-p") && arg.len() > 2)
+        {
+            return Err(
+                "Fastly deploy argument `--package/-p` is owned by the immutable application release"
+                    .to_owned(),
+            );
+        } else if MANAGED_DEPLOY_GLOBAL_BOOL_FLAGS.contains(&arg.as_str()) {
+            parsed.globals.push(arg.clone());
+            index = index.saturating_add(1);
+        } else if let Some((flag, _)) = arg.split_once('=')
+            && MANAGED_DEPLOY_GLOBAL_BOOL_FLAGS.contains(&flag)
+        {
+            return Err(format!(
+                "Fastly boolean deploy argument `{flag}` does not accept a value"
+            ));
+        } else if arg.starts_with('-') {
+            return Err(format!("unsupported Fastly deploy argument {arg:?}"));
+        } else {
+            return Err(format!(
+                "unexpected positional Fastly deploy argument {arg:?}"
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
 /// Resolve the target service id from `--service-id` or, failing that,
 /// `FASTLY_SERVICE_ID`.
 fn resolve_service_id(args: &[String]) -> Result<String, String> {
@@ -4635,69 +5505,101 @@ fn parse_canonical_version_line(lower: &str) -> Option<u64> {
 /// `Ok(Some(n))` — exactly one version is active. `Ok(None)` — the list parsed
 /// but NO version is active (a first-ever deploy; the caller records an empty
 /// rollback target and proceeds). `Err(_)` — the payload could not be parsed as
-/// a version list, OR it is MALFORMED (a non-boolean `active` on ANY entry, an
-/// `active: true` entry whose `number` is missing or not an unsigned integer, or
-/// MORE THAN ONE active version). All are OPERATIONAL failures the caller must
+/// a version list, OR it is MALFORMED (a selection/safety field is missing or
+/// has the wrong type, or MORE THAN ONE active version exists). All are
+/// OPERATIONAL failures the caller must
 /// NOT silently treat as "no active version" — otherwise a garbled or ambiguous
 /// response would fail open and let a production deploy proceed with no rollback
 /// target.
 ///
 /// The ENTIRE list is scanned (not short-circuited at the first active entry) so
-/// that a malformed `active` field or a second active version anywhere in the
-/// response is caught rather than ignored.
+/// that a malformed field or a second active version anywhere in the response
+/// is caught rather than ignored.
 fn resolve_active_version(json: &str) -> Result<Option<u64>, String> {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|err| format!("failed to parse the Fastly version list as JSON: {err}"))?;
-    let array = value.as_array().ok_or_else(|| {
-        "the Fastly version list was not a JSON array; the API may have changed its schema"
-            .to_owned()
-    })?;
-    // A real Fastly service always has at least an initial (inactive) version, so
-    // an EMPTY list is an invalid response — fail closed rather than read it as a
-    // legitimate "no active version yet" (first deploy).
-    if array.is_empty() {
-        return Err(
-            "the Fastly version list is empty; a service always has at least an initial version, so this response cannot be trusted".to_owned()
-        );
-    }
+    let versions = parse_service_versions(json)?;
     let mut active_version: Option<u64> = None;
-    for entry in array {
-        // EVERY entry must be a well-formed version object with an unsigned
-        // integer `number` — Fastly includes it on every version. A `null`, a
-        // non-object, or a missing/non-integer `number` means the response
-        // cannot be trusted; treating such an entry as merely "not active" would
-        // let a garbled payload read as "no active version" (fail open).
-        let Some(object) = entry.as_object() else {
-            return Err(format!(
-                "a Fastly version list element is not an object; the API may have changed its schema. Element: {entry}"
-            ));
-        };
-        let number = object.get("number").and_then(serde_json::Value::as_u64).ok_or_else(|| {
-            format!(
-                "a Fastly version entry has no unsigned-integer `number`; the API may have changed its schema. Entry: {entry}"
-            )
-        })?;
-        // `active` is optional (an omitted field means not active), but a PRESENT
-        // non-boolean is schema drift.
-        let active = match object.get("active") {
-            None => false,
-            Some(active_field) => active_field.as_bool().ok_or_else(|| {
-                format!(
-                    "a Fastly version entry has a non-boolean `active` field; the API may have changed its schema. Entry: {entry}"
-                )
-            })?,
-        };
-        if active {
+    for version in versions {
+        if version.active {
             if active_version.is_some() {
                 return Err(format!(
-                    "the Fastly version list reports more than one active version ({} and {number}); the response is ambiguous, refusing to pick one",
-                    active_version.unwrap_or_default()
+                    "the Fastly version list reports more than one active version ({} and {}); the response is ambiguous, refusing to pick one",
+                    active_version.unwrap_or_default(),
+                    version.number,
                 ));
             }
-            active_version = Some(number);
+            active_version = Some(version.number);
         }
     }
     Ok(active_version)
+}
+
+fn parse_service_versions(json: &str) -> Result<Vec<ServiceVersionRecord>, String> {
+    let versions: Vec<ServiceVersionRecord> = serde_json::from_str(json)
+        .map_err(|error| format!("failed to parse the Fastly version list as JSON: {error}"))?;
+    if versions.is_empty() {
+        return Err(
+            "the Fastly version list is empty; a service always has at least an initial version, so this response cannot be trusted".to_owned(),
+        );
+    }
+    let mut numbers = HashSet::with_capacity(versions.len());
+    for version in &versions {
+        if !numbers.insert(version.number) {
+            return Err(format!(
+                "the Fastly version list contains duplicate version number {}; refusing an ambiguous response",
+                version.number
+            ));
+        }
+        for environment in &version.environments {
+            if environment.name.is_empty() || environment.service_id.is_empty() {
+                return Err(format!(
+                    "Fastly version {} contains an incomplete environment record",
+                    version.number
+                ));
+            }
+        }
+    }
+    Ok(versions)
+}
+
+fn select_version_source(versions: &[ServiceVersionRecord]) -> Result<VersionSource, String> {
+    let active_versions = versions
+        .iter()
+        .filter(|version| version.active)
+        .collect::<Vec<_>>();
+    if active_versions.len() > 1 {
+        return Err("the Fastly version list reports more than one active version".to_owned());
+    }
+    if let Some(active_version) = active_versions.first() {
+        return Ok(VersionSource::Active(active_version.number));
+    }
+
+    let highest = versions
+        .iter()
+        .map(|version| version.number)
+        .max()
+        .ok_or_else(|| "the Fastly version list is empty".to_owned())?;
+    let drafts = versions
+        .iter()
+        .filter(|version| {
+            !version.active
+                && !version.locked
+                && !version.staging
+                && !version.deployed
+                && version.environments.is_empty()
+        })
+        .collect::<Vec<_>>();
+    let [draft] = drafts.as_slice() else {
+        return Err(format!(
+            "first deployment requires exactly one unlocked, inactive, unstaged draft; found {}",
+            drafts.len()
+        ));
+    };
+    if draft.number != highest {
+        return Err(format!(
+            "first deployment requires the highest service version ({highest}) to be the initialized editable draft"
+        ));
+    }
+    Ok(VersionSource::InitialDraft(draft.number))
 }
 
 /// Best-effort staleness guard for a production rollback: the version being
@@ -5094,6 +5996,33 @@ fn fastly_api_get(path: &str, token: &str) -> Result<String, String> {
     Ok(body.to_owned())
 }
 
+/// Read one exact Fastly API resource, treating only an authoritative HTTP 404
+/// as absence. The response body is returned for 2xx and never included in an
+/// error because a Config Store item can contain runtime configuration.
+fn fastly_api_get_optional(path: &str, token: &str) -> Result<Option<String>, String> {
+    let header = curl_quote(&format!("Fastly-Key: {token}"));
+    let url = curl_quote(&format!("https://api.fastly.com{path}"));
+    let config = format!("header = {header}\nurl = {url}\nwrite-out = \"\\n%{{http_code}}\"\n");
+    let out = curl_config_capture(&config)
+        .map_err(|error| format!("Fastly API exact GET {path} failed: {error}"))?;
+    let (body, status_line) = out
+        .rsplit_once('\n')
+        .ok_or_else(|| format!("Fastly API exact GET {path}: no HTTP status in curl output"))?;
+    let status: u16 = status_line.trim().parse().map_err(|error| {
+        format!(
+            "Fastly API exact GET {path}: could not parse the HTTP status {:?}: {error}",
+            status_line.trim()
+        )
+    })?;
+    match status {
+        200..=299 => Ok(Some(body.to_owned())),
+        404 => Ok(None),
+        _ => Err(format!(
+            "Fastly API exact GET {path} returned HTTP {status}"
+        )),
+    }
+}
+
 /// `PUT https://api.fastly.com<path>` with the `Fastly-Key` header;
 /// returns the HTTP status, erroring on non-2xx. Fastly's version
 /// activate/deactivate endpoints require `PUT` (not `POST`). Header and
@@ -5122,6 +6051,8 @@ fn fastly_api_put(path: &str, token: &str) -> Result<u16, String> {
 fn legacy_deploy_context(args: &[String], staging: bool) -> AdapterDeployContext {
     AdapterDeployContext {
         adapter_manifest_path: arg_value(args, "--manifest-path").map(PathBuf::from),
+        application_manifest_path: None,
+        application_release_root: None,
         service_id: arg_value(args, "--service-id").map(str::to_owned),
         stores: DeployStoreIds::default(),
         staging,
@@ -5993,6 +6924,62 @@ mod tests {
     }
 
     #[test]
+    fn deploy_plan_final_argument_parser_accepts_comment_and_global_booleans() {
+        let parsed = parse_release_managed_deploy_args(&owned(&[
+            "--comment=publisher deployment",
+            "--accept-defaults",
+            "-d",
+            "--auto-yes",
+            "-y",
+            "--debug-mode",
+            "--non-interactive",
+            "-i",
+            "--quiet",
+            "-q",
+            "--verbose",
+            "-v",
+        ]))
+        .expect("final managed argument forms");
+        assert_eq!(parsed.comment.as_deref(), Some("publisher deployment"));
+        assert_eq!(
+            parsed.globals,
+            owned(&[
+                "--accept-defaults",
+                "-d",
+                "--auto-yes",
+                "-y",
+                "--debug-mode",
+                "--non-interactive",
+                "-i",
+                "--quiet",
+                "-q",
+                "--verbose",
+                "-v"
+            ])
+        );
+
+        let detached =
+            parse_release_managed_deploy_args(&owned(&["--comment", "publisher deployment"]))
+                .expect("detached comment form");
+        assert_eq!(detached.comment.as_deref(), Some("publisher deployment"));
+    }
+
+    #[test]
+    fn deploy_plan_final_argument_parser_rejects_every_package_spelling() {
+        for args in [
+            owned(&["--package", "app.tar.gz"]),
+            owned(&["--package=app.tar.gz"]),
+            owned(&["-p", "app.tar.gz"]),
+            owned(&["-p=app.tar.gz"]),
+            owned(&["-papp.tar.gz"]),
+        ] {
+            let error = parse_release_managed_deploy_args(&args)
+                .expect_err("the immutable release owns the package path");
+            assert!(error.contains("--package/-p"), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
     fn deploy_arg_parser_rejects_every_unconsumed_or_ambiguous_token() {
         for args in [
             owned(&["--unknown"]),
@@ -6147,6 +7134,8 @@ mod tests {
         let _no_parent_selector = EnvOverride::remove(selector);
         let context = AdapterDeployContext {
             adapter_manifest_path: Some(manifest),
+            application_manifest_path: None,
+            application_release_root: None,
             service_id: Some("SVC1".to_owned()),
             staging: true,
             stores: DeployStoreIds {
@@ -6656,18 +7645,1249 @@ mod tests {
     #[test]
     fn parse_active_version_finds_active_entry() {
         let json = r#"[
-            {"number": 1, "active": false},
-            {"number": 2, "active": true},
-            {"number": 3, "active": false}
+            {"number":1,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[]},
+            {"number":2,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]},
+            {"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}
         ]"#;
         assert_eq!(resolve_active_version(json), Ok(Some(2)));
+    }
+
+    #[test]
+    fn deploy_plan_version_source_parses_state_and_selects_active() {
+        let versions = parse_service_versions(
+            r#"[
+                {"number":1,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":2,"name":"production","service_id":"SVC1"}]},
+                {"number":2,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":2,"name":"production","service_id":"SVC1"}]}
+            ]"#,
+        )
+        .expect("typed version list");
+        assert_eq!(versions[1].number, 2);
+        assert!(versions[1].active);
+        assert!(versions[1].locked);
+        assert!(versions[1].deployed);
+        assert_eq!(versions[1].environments[0].name, "production");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::Active(2))
+        );
+    }
+
+    #[test]
+    fn deploy_plan_version_source_parses_complete_fastly_api_records() {
+        let versions = parse_service_versions(
+            r#"[{
+                "active":true,
+                "comment":"publisher release",
+                "created_at":"2026-09-16T00:00:00Z",
+                "deployed":true,
+                "environments":[{
+                    "active_version":7,
+                    "name":"production",
+                    "service_id":"SVC1"
+                }],
+                "locked":true,
+                "number":7,
+                "service_id":"SVC1",
+                "staging":false,
+                "testing":false,
+                "updated_at":"2026-09-16T00:00:00Z"
+            }]"#,
+        )
+        .expect("authoritative Fastly API version list");
+        assert_eq!(versions[0].environments[0].active_version, 7);
+        assert_eq!(versions[0].environments[0].name, "production");
+        assert_eq!(versions[0].environments[0].service_id, "SVC1");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::Active(7))
+        );
+    }
+
+    #[test]
+    fn version_source_parses_fastly_cli_15_1_capitalized_records() {
+        let versions = parse_service_versions(
+            r#"[{
+                "Active":true,
+                "Comment":"publisher release",
+                "Deployed":true,
+                "Environments":[{
+                    "ServiceVersion":7,
+                    "Name":"production",
+                    "ServiceID":"SVC1"
+                }],
+                "Locked":true,
+                "Number":7,
+                "ServiceID":"SVC1",
+                "Staging":false,
+                "Testing":false
+            }]"#,
+        )
+        .expect("Fastly CLI 15.1 version JSON");
+        assert_eq!(versions[0].environments[0].name, "production");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::Active(7))
+        );
+    }
+
+    #[test]
+    fn deploy_plan_version_source_rejects_every_missing_safety_field() {
+        const VERSION_NUMBER: u64 = 1;
+
+        let complete = serde_json::json!({
+            "active": false,
+            "deployed": false,
+            "environments": [],
+            "locked": false,
+            "number": VERSION_NUMBER,
+            "staging": false
+        });
+        for field in [
+            "active",
+            "deployed",
+            "environments",
+            "locked",
+            "number",
+            "staging",
+        ] {
+            let mut record = complete.clone();
+            record
+                .as_object_mut()
+                .expect("version object")
+                .remove(field);
+            let raw = serde_json::json!([record]).to_string();
+            parse_service_versions(&raw).expect_err(&format!("missing `{field}` must fail closed"));
+        }
+    }
+
+    #[test]
+    fn deploy_plan_version_source_selects_unique_initialized_draft() {
+        let versions = parse_service_versions(
+            r#"[
+                {"number":1,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[]},
+                {"number":2,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}
+            ]"#,
+        )
+        .expect("typed version list");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::InitialDraft(2))
+        );
+    }
+
+    #[test]
+    fn deploy_plan_version_source_rejects_missing_duplicate_and_malformed_versions() {
+        for invalid in [
+            "[]",
+            r#"[{"number":1},{"number":1}]"#,
+            r#"[{"number":"1"}]"#,
+            r#"[{"number":1,"active":"false"}]"#,
+            r#"[{"number":1,"locked":"false"}]"#,
+            r#"[{"number":1,"staging":"false"}]"#,
+            r#"[{"number":1,"deployed":"false"}]"#,
+            r#"[{"number":1,"environments":"staging"}]"#,
+        ] {
+            assert!(
+                parse_service_versions(invalid).is_err(),
+                "invalid version list must fail: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_plan_version_source_rejects_unsafe_or_ambiguous_first_drafts() {
+        for invalid in [
+            r#"[{"number":1,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]},{"number":2,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[]}]"#,
+            r#"[{"number":1,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]},{"number":2,"active":false,"locked":false,"staging":true,"deployed":false,"environments":[]}]"#,
+            r#"[{"number":1,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]},{"number":2,"active":false,"locked":false,"staging":false,"deployed":true,"environments":[]}]"#,
+            r#"[{"number":1,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]},{"number":2,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":2,"name":"staging","service_id":"SVC1"}]}]"#,
+            r#"[{"number":1,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]},{"number":2,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}]"#,
+        ] {
+            let versions = parse_service_versions(invalid).expect("well-formed versions");
+            assert!(
+                select_version_source(&versions).is_err(),
+                "unsafe first-deploy source must fail: {invalid}"
+            );
+        }
+    }
+
+    fn deploy_plan_inventories() -> ResourceInventories {
+        ResourceInventories::from_json(
+            r#"[
+                {"id":"RUNTIME","name":"edgezero_runtime_env"},
+                {"id":"CONFIG_A","name":"config-a"},
+                {"id":"CONFIG_B","name":"config-b"}
+            ]"#,
+            r#"[{"id":"KV_A","name":"kv-a"}]"#,
+            r#"[{"id":"SECRET_A","name":"secret-a"}]"#,
+        )
+        .expect("valid inventories")
+    }
+
+    fn deploy_plan_desired_links() -> Vec<DesiredResourceLink> {
+        let environment = EnvConfig::from_vars([
+            ("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "config-a"),
+            ("EDGEZERO__STORES__CONFIG__FEATURE_FLAGS__NAME", "config-a"),
+            ("EDGEZERO__STORES__KV__SESSIONS__NAME", "kv-a"),
+            ("EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME", "secret-a"),
+        ]);
+        desired_resource_links(
+            &RuntimeStoreIds {
+                config: vec!["app_config".to_owned(), "feature_flags".to_owned()],
+                kv: vec!["sessions".to_owned()],
+                secrets: vec!["credentials".to_owned()],
+            },
+            &environment,
+            &deploy_plan_inventories(),
+        )
+        .expect("desired links")
+    }
+
+    #[test]
+    fn deploy_plan_builds_exact_kind_isolated_desired_links() {
+        let desired = deploy_plan_desired_links();
+        assert_eq!(
+            desired,
+            vec![
+                DesiredResourceLink {
+                    logical_id: Some("app_config".to_owned()),
+                    kind: ResourceKind::Config,
+                    alias: "config-a".to_owned(),
+                    selected_name: "config-a".to_owned(),
+                    resource_id: "CONFIG_A".to_owned(),
+                },
+                DesiredResourceLink {
+                    logical_id: None,
+                    kind: ResourceKind::Config,
+                    alias: "edgezero_runtime_env".to_owned(),
+                    selected_name: "edgezero_runtime_env".to_owned(),
+                    resource_id: "RUNTIME".to_owned(),
+                },
+                DesiredResourceLink {
+                    logical_id: Some("sessions".to_owned()),
+                    kind: ResourceKind::Kv,
+                    alias: "kv-a".to_owned(),
+                    selected_name: "kv-a".to_owned(),
+                    resource_id: "KV_A".to_owned(),
+                },
+                DesiredResourceLink {
+                    logical_id: Some("credentials".to_owned()),
+                    kind: ResourceKind::Secret,
+                    alias: "secret-a".to_owned(),
+                    selected_name: "secret-a".to_owned(),
+                    resource_id: "SECRET_A".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deploy_plan_preserves_already_correct_and_shared_links() {
+        let desired = deploy_plan_desired_links();
+        assert_eq!(
+            desired
+                .iter()
+                .filter(|link| link.alias == "config-a")
+                .count(),
+            1,
+            "two logical ids selecting one physical store must collapse to one link"
+        );
+        let existing = desired
+            .iter()
+            .enumerate()
+            .map(|(index, link)| ExistingResourceLink {
+                link_id: format!("LINK_{index}"),
+                alias: link.alias.clone(),
+                resource_id: link.resource_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let reconciliation = plan_link_reconciliation(
+            &desired,
+            &existing,
+            Some(&BTreeSet::new()),
+            &deploy_plan_inventories(),
+        )
+        .expect("already correct links");
+        assert!(reconciliation.delete_link_ids.is_empty());
+        assert!(reconciliation.create.is_empty());
+    }
+
+    #[test]
+    fn deploy_plan_rejects_declared_store_using_reserved_runtime_alias() {
+        let inventories = deploy_plan_inventories();
+        for (kind, stores, variable) in [
+            (
+                ResourceKind::Config,
+                RuntimeStoreIds {
+                    config: vec!["app".to_owned()],
+                    kv: Vec::new(),
+                    secrets: Vec::new(),
+                },
+                "EDGEZERO__STORES__CONFIG__APP__NAME",
+            ),
+            (
+                ResourceKind::Kv,
+                RuntimeStoreIds {
+                    config: Vec::new(),
+                    kv: vec!["app".to_owned()],
+                    secrets: Vec::new(),
+                },
+                "EDGEZERO__STORES__KV__APP__NAME",
+            ),
+            (
+                ResourceKind::Secret,
+                RuntimeStoreIds {
+                    config: Vec::new(),
+                    kv: Vec::new(),
+                    secrets: vec!["app".to_owned()],
+                },
+                "EDGEZERO__STORES__SECRETS__APP__NAME",
+            ),
+        ] {
+            let environment = EnvConfig::from_vars([(variable, RUNTIME_ENV_STORE_NAME)]);
+            let error = desired_resource_links(&stores, &environment, &inventories)
+                .expect_err("the runtime descriptor alias is reserved");
+            assert!(
+                error.contains(RUNTIME_ENV_STORE_NAME) && error.contains(kind.runtime_name()),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_plan_rejects_alias_collision_with_different_resource() {
+        let desired = deploy_plan_desired_links();
+        let existing = vec![ExistingResourceLink {
+            link_id: "COLLISION".to_owned(),
+            alias: "config-a".to_owned(),
+            resource_id: "CONFIG_B".to_owned(),
+        }];
+        let error = plan_link_reconciliation(
+            &desired,
+            &existing,
+            Some(&BTreeSet::new()),
+            &deploy_plan_inventories(),
+        )
+        .expect_err("alias collisions fail closed");
+        assert!(
+            error.contains("config-a") && error.contains("collision"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn deploy_plan_deletes_stale_descriptor_alias_after_store_removal_or_rename() {
+        let desired = deploy_plan_desired_links();
+        let prior = RuntimeDescriptor::from_entries(BTreeMap::from([(
+            "EDGEZERO__STORES__CONFIG__REMOVED_LOGICAL_ID__NAME".to_owned(),
+            "config-b".to_owned(),
+        )]))
+        .expect("prior descriptor");
+        let prior_aliases = prior.managed_store_aliases().expect("managed aliases");
+        let existing = vec![ExistingResourceLink {
+            link_id: "STALE".to_owned(),
+            alias: "config-b".to_owned(),
+            resource_id: "CONFIG_B".to_owned(),
+        }];
+        let reconciliation = plan_link_reconciliation(
+            &desired,
+            &existing,
+            Some(&prior_aliases),
+            &deploy_plan_inventories(),
+        )
+        .expect("stale alias plan");
+        assert_eq!(reconciliation.delete_link_ids, ["STALE"]);
+        assert!(
+            !reconciliation
+                .create
+                .iter()
+                .any(|link| link.alias == "config-b")
+        );
+    }
+
+    #[test]
+    fn clean_cutover_removes_all_undesired_store_kinds_and_preserves_unrelated_links() {
+        let inventories = deploy_plan_inventories();
+        let desired = deploy_plan_desired_links();
+        let existing = vec![
+            ExistingResourceLink {
+                link_id: "OLD_CONFIG".to_owned(),
+                alias: "old-config".to_owned(),
+                resource_id: "CONFIG_B".to_owned(),
+            },
+            ExistingResourceLink {
+                link_id: "OLD_KV".to_owned(),
+                alias: "old-kv".to_owned(),
+                resource_id: "KV_A".to_owned(),
+            },
+            ExistingResourceLink {
+                link_id: "OLD_SECRET".to_owned(),
+                alias: "old-secret".to_owned(),
+                resource_id: "SECRET_A".to_owned(),
+            },
+            ExistingResourceLink {
+                link_id: "BACKEND_RESOURCE".to_owned(),
+                alias: "unrelated".to_owned(),
+                resource_id: "NOT_A_STORE".to_owned(),
+            },
+        ];
+        let plan = plan_link_reconciliation(&desired, &existing, None, &inventories)
+            .expect("clean cutover plan");
+        assert_eq!(plan.delete_link_ids, ["OLD_CONFIG", "OLD_KV", "OLD_SECRET"]);
+        assert!(
+            !plan
+                .delete_link_ids
+                .iter()
+                .any(|id| id == "BACKEND_RESOURCE")
+        );
+    }
+
+    #[test]
+    fn deploy_plan_rejects_cross_kind_aliases_and_resource_ids() {
+        let aliases = ResourceInventories::from_json(
+            r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"CONFIG","name":"shared"}]"#,
+            r#"[{"id":"KV","name":"shared"}]"#,
+            "[]",
+        )
+        .expect("kind-specific inventories");
+        let environment = EnvConfig::from_vars([
+            ("EDGEZERO__STORES__CONFIG__APP__NAME", "shared"),
+            ("EDGEZERO__STORES__KV__CACHE__NAME", "shared"),
+        ]);
+        let error = desired_resource_links(
+            &RuntimeStoreIds {
+                config: vec!["app".to_owned()],
+                kv: vec!["cache".to_owned()],
+                secrets: Vec::new(),
+            },
+            &environment,
+            &aliases,
+        )
+        .expect_err("same alias for different kinds is ambiguous");
+        assert!(error.contains("shared"), "{error}");
+
+        let resource_id_error = ResourceInventories::from_json(
+            r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"SAME","name":"config"}]"#,
+            r#"[{"id":"SAME","name":"kv"}]"#,
+            "[]",
+        )
+        .expect_err("cross-kind resource id collision");
+        assert!(
+            resource_id_error.contains("SAME") && resource_id_error.contains("kind"),
+            "{resource_id_error}"
+        );
+    }
+
+    #[test]
+    fn clean_cutover_rejects_incomplete_malformed_and_duplicate_inventories() {
+        for (config, kv, secrets) in [
+            (r#"{"items":[],"next_cursor":"more"}"#, "[]", "[]"),
+            (r#"[{"name":"missing-id"}]"#, "[]", "[]"),
+            (
+                r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"DUP","name":"one"},{"id":"DUP","name":"two"}]"#,
+                "[]",
+                "[]",
+            ),
+            (
+                r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"ONE","name":"duplicate"},{"id":"TWO","name":"duplicate"}]"#,
+                "[]",
+                "[]",
+            ),
+            (
+                r#"[{"id":"../ESCAPE","name":"edgezero_runtime_env"}]"#,
+                "[]",
+                "[]",
+            ),
+        ] {
+            assert!(
+                ResourceInventories::from_json(config, kv, secrets).is_err(),
+                "invalid inventory must fail before planning: {config}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_plan_kv_inventory_accepts_fastly_cli_15_1_shape_and_collects_every_page() {
+        let mut requested = Vec::new();
+        let inventory = collect_paginated_store_inventory(
+            ResourceKind::Kv,
+            "/resources/stores/kv?limit=100",
+            |path| {
+                requested.push(path.to_owned());
+                match requested.len() {
+                    1 => Ok(r#"{
+                        "Data":[{
+                            "CreatedAt":"2026-09-16T00:00:00Z",
+                            "Name":"kv-a",
+                            "StoreID":"KV_A",
+                            "UpdatedAt":"2026-09-16T00:00:00Z"
+                        }],
+                        "Meta":{"limit":"1","next_cursor":"page+/="}
+                    }"#
+                    .to_owned()),
+                    2 => Ok(r#"{
+                        "data":[{"id":"KV_B","name":"kv-b"}],
+                        "meta":{"limit":100}
+                    }"#
+                    .to_owned()),
+                    _ => panic!("unexpected third inventory page"),
+                }
+            },
+        )
+        .expect("complete KV inventory");
+
+        assert_eq!(
+            requested,
+            [
+                "/resources/stores/kv?limit=100",
+                "/resources/stores/kv?limit=100&cursor=page%2B%2F%3D"
+            ]
+        );
+        assert_eq!(inventory.by_name["kv-a"], "KV_A");
+        assert_eq!(inventory.by_name["kv-b"], "KV_B");
+    }
+
+    #[test]
+    fn deploy_plan_paginated_inventory_rejects_incomplete_or_ambiguous_pages() {
+        for malformed in [
+            r#"[{"id":"KV_A","name":"kv-a"}]"#,
+            r#"{"data":[],"meta":"missing"}"#,
+            r#"{"data":[{"id":"KV_A"}],"meta":{}}"#,
+        ] {
+            let error = collect_paginated_store_inventory(
+                ResourceKind::Kv,
+                "/resources/stores/kv?limit=100",
+                |_| Ok(malformed.to_owned()),
+            )
+            .expect_err("incomplete page must fail closed");
+            assert!(error.contains("payload redacted"), "{error}");
+        }
+
+        let repeated = collect_paginated_store_inventory(
+            ResourceKind::Kv,
+            "/resources/stores/kv?limit=100",
+            |_| {
+                Ok(
+                    r#"{"data":[{"id":"KV_A","name":"kv-a"}],"meta":{"next_cursor":"same"}}"#
+                        .to_owned(),
+                )
+            },
+        )
+        .expect_err("repeated cursor must not loop or claim completeness");
+        assert!(repeated.contains("repeated"), "{repeated}");
+
+        let mut page = 0_u8;
+        let duplicate = collect_paginated_store_inventory(
+            ResourceKind::Kv,
+            "/resources/stores/kv?limit=100",
+            |_| {
+                page = page.saturating_add(1);
+                if page == 1 {
+                    Ok(
+                        r#"{"data":[{"id":"KV_A","name":"kv-a"}],"meta":{"next_cursor":"two"}}"#
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(r#"{"data":[{"id":"KV_A","name":"kv-b"}],"meta":{}}"#.to_owned())
+                }
+            },
+        )
+        .expect_err("duplicate resource id across pages must fail closed");
+        assert!(duplicate.contains("duplicate resource id"), "{duplicate}");
+    }
+
+    #[test]
+    fn deploy_plan_inventories_reject_missing_and_empty_resource_ids() {
+        let missing = collect_paginated_store_inventory(
+            ResourceKind::Kv,
+            "/resources/stores/kv?limit=100",
+            |_| Ok(r#"{"Data":[{"Name":"kv-a"}],"Meta":{}}"#.to_owned()),
+        )
+        .expect_err("provider-shaped records with no resource id must fail closed");
+        assert!(missing.contains("payload redacted"), "{missing}");
+
+        let empty = collect_paginated_store_inventory(
+            ResourceKind::Secret,
+            "/resources/stores/secret?limit=100",
+            |_| Ok(r#"{"Data":[{"StoreID":"","Name":"secret-a"}],"Meta":{}}"#.to_owned()),
+        )
+        .expect_err("provider-shaped records with an empty resource id must fail closed");
+        assert!(empty.contains("invalid resource id"), "{empty}");
+
+        let empty_config =
+            parse_store_inventory(ResourceKind::Config, r#"[{"id":"","name":"config-a"}]"#)
+                .expect_err("bare-array records with an empty resource id must fail closed");
+        assert!(
+            empty_config.contains("non-empty string `name` and `id`"),
+            "{empty_config}"
+        );
+    }
+
+    #[test]
+    fn deploy_plan_exact_descriptor_requires_item_wrapper_and_redacts_unreadable_payloads() {
+        const SENTINEL: &str = "DO_NOT_LEAK_DESCRIPTOR_PAYLOAD";
+
+        let descriptor = RuntimeDescriptor::from_entries(BTreeMap::from([(
+            "EDGEZERO__LOGGING__LEVEL".to_owned(),
+            "debug".to_owned(),
+        )]))
+        .expect("descriptor");
+        let descriptor_json = descriptor.canonical_json().expect("descriptor JSON");
+        let wrapped = serde_json::json!({
+            "item_key": "EDGEZERO__SERVICES__SVC1__VERSIONS__7__ENV_V1",
+            "item_value": descriptor_json,
+            "store_id": "RUNTIME"
+        })
+        .to_string();
+        let parsed =
+            parse_exact_config_store_item_descriptor(&wrapped).expect("wrapped descriptor");
+        assert_eq!(
+            parsed.canonical_json().expect("parsed descriptor JSON"),
+            descriptor_json
+        );
+
+        for unreadable in [
+            SENTINEL.to_owned(),
+            serde_json::json!({"item_value": 42_i32, "secret": SENTINEL}).to_string(),
+            serde_json::json!({"secret": SENTINEL}).to_string(),
+        ] {
+            let error = parse_exact_config_store_item_descriptor(&unreadable)
+                .expect_err("malformed Config Store item wrapper");
+            assert!(!error.contains(SENTINEL), "payload leaked: {error}");
+            assert!(error.contains("payload redacted"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_plan_exact_descriptor_accepts_wrapped_2xx_and_only_404_is_absence() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const SENTINEL: &str = "DO_NOT_LEAK_CONFIG_STORE_RESPONSE";
+
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fake = tempdir().expect("fake curl directory");
+        let response = fake.path().join("response");
+        let curl = fake.path().join("curl");
+        fs::write(
+            &curl,
+            format!("#!/bin/sh\ncat >/dev/null\ncat '{}'\n", response.display()),
+        )
+        .expect("curl fake");
+        let mut permissions = fs::metadata(&curl).expect("curl metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&curl, permissions).expect("curl executable");
+        let _path = PathPrepend::new(fake.path());
+
+        let descriptor = RuntimeDescriptor::from_entries(BTreeMap::from([(
+            "EDGEZERO__LOGGING__LEVEL".to_owned(),
+            "debug".to_owned(),
+        )]))
+        .expect("descriptor")
+        .canonical_json()
+        .expect("descriptor JSON");
+        fs::write(
+            &response,
+            format!("{}\n200", serde_json::json!({"item_value": descriptor})),
+        )
+        .expect("valid response");
+        assert!(
+            read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
+                .expect("valid wrapped 2xx")
+                .is_some()
+        );
+
+        fs::write(&response, format!("{SENTINEL}\n204")).expect("unreadable 2xx response");
+        let unreadable = read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
+            .expect_err("unreadable 2xx must fail closed");
+        assert!(!unreadable.contains(SENTINEL), "{unreadable}");
+
+        fs::write(&response, format!("{SENTINEL}\n404")).expect("404 response");
+        assert!(
+            read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
+                .expect("404 is authoritative absence")
+                .is_none()
+        );
+
+        fs::write(&response, format!("{SENTINEL}\n403")).expect("403 response");
+        let forbidden = read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
+            .expect_err("non-404 must not be absence");
+        assert!(!forbidden.contains(SENTINEL), "{forbidden}");
+        assert!(forbidden.contains("HTTP 403"), "{forbidden}");
+    }
+
+    #[cfg(unix)]
+    struct DeployPlanReleaseFixture {
+        root: tempfile::TempDir,
+        application_manifest: PathBuf,
+        adapter_manifest: PathBuf,
+        package_digest: String,
+    }
+
+    #[cfg(unix)]
+    fn deploy_plan_release_fixture() -> DeployPlanReleaseFixture {
+        let root = tempdir().expect("release root");
+        for directory in ["bin", "package", "adapter"] {
+            fs::create_dir_all(root.path().join(directory)).expect("release directory");
+        }
+        let application_manifest = root.path().join("edgezero.toml");
+        let adapter_manifest = root.path().join("adapter/fastly.toml");
+        let members = [
+            ("bin/edgezero", b"application cli".as_slice()),
+            ("package/app.tar.gz", b"immutable package".as_slice()),
+            (
+                "edgezero.toml",
+                b"[app]\nname = \"demo\"\n[adapters.fastly.adapter]\nmanifest = \"adapter/fastly.toml\"\n"
+                    .as_slice(),
+            ),
+            (
+                "adapter/fastly.toml",
+                b"manifest_version = 3\nname = \"demo\"\n".as_slice(),
+            ),
+        ];
+        for (path, bytes) in members {
+            fs::write(root.path().join(path), bytes).expect("release member");
+        }
+        let digest = |path: &str| {
+            sha256_hex(&fs::read(root.path().join(path)).expect("release member bytes"))
+        };
+        let package_digest = digest("package/app.tar.gz");
+        fs::write(
+            root.path().join("release.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "format": 1_u64,
+                "source_revision": "a".repeat(40),
+                "adapter": "fastly",
+                "app_cli": {"path": "bin/edgezero", "sha256": digest("bin/edgezero")},
+                "package": {"path": "package/app.tar.gz", "sha256": package_digest},
+                "manifests": {
+                    "edgezero": {"path": "edgezero.toml", "sha256": digest("edgezero.toml")},
+                    "adapter": {"path": "adapter/fastly.toml", "sha256": digest("adapter/fastly.toml")}
+                }
+            }))
+            .expect("release metadata"),
+        )
+        .expect("release metadata file");
+        DeployPlanReleaseFixture {
+            root,
+            application_manifest,
+            adapter_manifest,
+            package_digest,
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_managed_plan_provider(
+        versions: &str,
+        links: &str,
+        prior_descriptor: Option<&str>,
+        config_inventory: &str,
+        operation_log: &Path,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fake = tempdir().expect("provider fake");
+        for (name, body) in [
+            ("versions.json", versions),
+            ("links.json", links),
+            ("config.json", config_inventory),
+            (
+                "kv-page-1.json",
+                r#"{"data":[{"id":"KV_A","name":"kv-a"},{"id":"KV_B","name":"kv-b"}],"meta":{"limit":2,"next_cursor":"page-two"}}"#,
+            ),
+            (
+                "kv-page-2.json",
+                r#"{"data":[{"id":"KV_OLD","name":"kv-old"}],"meta":{"limit":100}}"#,
+            ),
+            (
+                "secret-page.json",
+                r#"{"data":[{"id":"SECRET_A","name":"secret-a"},{"id":"SECRET_B","name":"secret-b"},{"id":"SECRET_OLD","name":"secret-old"}],"meta":{"limit":100}}"#,
+            ),
+        ] {
+            fs::write(fake.path().join(name), body).expect("provider payload");
+        }
+        let descriptor_response = prior_descriptor.map_or_else(
+            || "printf '\\n404'".to_owned(),
+            |descriptor| {
+                fs::write(
+                    fake.path().join("descriptor.json"),
+                    serde_json::json!({
+                        "item_key": "EDGEZERO__SERVICES__SVC1__VERSIONS__7__ENV_V1",
+                        "item_value": descriptor,
+                        "store_id": "RUNTIME"
+                    })
+                    .to_string(),
+                )
+                .expect("descriptor response file");
+                format!(
+                    "cat '{}'; printf '\\n200'",
+                    fake.path().join("descriptor.json").display()
+                )
+            },
+        );
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+if [ "$1 $2" = "config-store list" ]; then cat '{config}'; exit 0; fi
+if [ "$1 $2" = "resource-link list" ]; then cat '{links}'; exit 0; fi
+echo 'unexpected provider command' >&2
+exit 1
+"#,
+            log = operation_log.display(),
+            config = fake.path().join("config.json").display(),
+            links = fake.path().join("links.json").display(),
+        );
+        let fastly = fake.path().join("fastly");
+        fs::write(&fastly, script).expect("fastly fake");
+        let mut fastly_permissions = fs::metadata(&fastly)
+            .expect("fastly metadata")
+            .permissions();
+        fastly_permissions.set_mode(0o755);
+        fs::set_permissions(&fastly, fastly_permissions).expect("fastly executable");
+
+        let curl = fake.path().join("curl");
+        fs::write(
+            &curl,
+            format!(
+                r#"#!/bin/sh
+config=$(cat)
+printf '%s\n' "$config" | while IFS= read -r line; do case "$line" in url*) printf 'curl %s\n' "$line";; esac; done >> '{log}'
+case "$config" in
+  *'/resources/stores/kv?limit=100&cursor=page-two'*) cat '{kv_page_2}'; printf '\n200';;
+  *'/resources/stores/kv?limit=100'*) cat '{kv_page_1}'; printf '\n200';;
+  *'/resources/stores/secret?limit=100'*) cat '{secret_page}'; printf '\n200';;
+  *'/service/SVC1/version"'*) cat '{versions}'; printf '\n200';;
+  *'/resources/stores/config/RUNTIME/item/EDGEZERO__SERVICES__SVC1__VERSIONS__'*) {descriptor_response};;
+  *'/domain'*) printf '[{{"name":"example.com"}}]\n200';;
+  *'/backend'*) printf '[{{"name":"origin","address":"origin.example.com"}}]\n200';;
+  *'/logging'*) printf '[{{"name":"logs","placement":"none"}}]\n200';;
+  *'/settings'*) printf '{{"general.default_host":"origin.example.com"}}\n200';;
+  *) printf '{{"error":"unexpected"}}\n500';;
+esac
+"#,
+                log = operation_log.display(),
+                kv_page_1 = fake.path().join("kv-page-1.json").display(),
+                kv_page_2 = fake.path().join("kv-page-2.json").display(),
+                secret_page = fake.path().join("secret-page.json").display(),
+                versions = fake.path().join("versions.json").display(),
+            ),
+        )
+        .expect("curl fake");
+        let mut curl_permissions = fs::metadata(&curl).expect("curl metadata").permissions();
+        curl_permissions.set_mode(0o755);
+        fs::set_permissions(&curl, curl_permissions).expect("curl executable");
+        fake
+    }
+
+    #[cfg(unix)]
+    fn managed_plan_context(fixture: &DeployPlanReleaseFixture) -> AdapterDeployContext {
+        AdapterDeployContext {
+            adapter_manifest_path: Some(fixture.adapter_manifest.clone()),
+            application_manifest_path: Some(fixture.application_manifest.clone()),
+            application_release_root: Some(fixture.root.path().to_path_buf()),
+            service_id: Some("SVC1".to_owned()),
+            staging: true,
+            stores: DeployStoreIds {
+                config: vec!["app".to_owned()],
+                kv: vec!["cache".to_owned()],
+                secrets: vec!["credentials".to_owned()],
+            },
+            variable_defaults: BTreeMap::from([
+                (
+                    "EDGEZERO__STORES__CONFIG__APP__NAME".to_owned(),
+                    "config-a".to_owned(),
+                ),
+                (
+                    "EDGEZERO__STORES__CONFIG__APP__KEY".to_owned(),
+                    "publisher-a".to_owned(),
+                ),
+                (
+                    "EDGEZERO__STORES__KV__CACHE__NAME".to_owned(),
+                    "kv-a".to_owned(),
+                ),
+                (
+                    "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME".to_owned(),
+                    "secret-a".to_owned(),
+                ),
+            ]),
+        }
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "the integration assertion reviews every immutable plan component and forbidden mutation in one scenario"
+    )]
+    #[test]
+    fn deploy_plan_builds_complete_read_only_active_version_plan() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fixture = deploy_plan_release_fixture();
+        let log_directory = tempdir().expect("provider log directory");
+        let log = log_directory.path().join("provider.log");
+        let prior = RuntimeDescriptor::from_entries(BTreeMap::from([(
+            "EDGEZERO__STORES__KV__REMOVED__NAME".to_owned(),
+            "kv-old".to_owned(),
+        )]))
+        .expect("prior descriptor")
+        .canonical_json()
+        .expect("prior descriptor json");
+        let fake = fake_managed_plan_provider(
+            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":7,"name":"production","service_id":"SVC1"}]}]"#,
+            r#"[
+                {"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"},
+                {"id":"LINK_CONFIG","name":"config-a","resource_id":"CONFIG_A"},
+                {"id":"LINK_OLD_KV","name":"kv-old","resource_id":"KV_OLD"},
+                {"id":"LINK_BACKEND","name":"backend-resource","resource_id":"NOT_A_STORE"}
+            ]"#,
+            Some(&prior),
+            r#"[
+                {"id":"RUNTIME","name":"edgezero_runtime_env"},
+                {"id":"CONFIG_A","name":"config-a"}
+            ]"#,
+            &log,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+        let plan = build_managed_deploy_plan(
+            &managed_plan_context(&fixture),
+            &owned(&["--comment=publisher release", "--quiet"]),
+        )
+        .expect("complete plan");
+
+        assert_eq!(plan.service_id, "SVC1");
+        assert_eq!(plan.target, PublishTarget::Staging);
+        assert_eq!(plan.arguments.comment.as_deref(), Some("publisher release"));
+        assert_eq!(plan.arguments.globals, ["--quiet"]);
+        assert_eq!(plan.environment.store_key("config", "app"), "publisher-a");
+        assert_eq!(plan.package_sha256, fixture.package_digest);
+        assert_eq!(
+            plan.release.root(),
+            fixture.root.path().canonicalize().expect("canonical root")
+        );
+        assert_eq!(
+            plan.release.application_cli(),
+            fixture
+                .root
+                .path()
+                .join("bin/edgezero")
+                .canonicalize()
+                .expect("canonical application CLI")
+        );
+        assert_eq!(
+            plan.release.package(),
+            fixture
+                .root
+                .path()
+                .join("package/app.tar.gz")
+                .canonicalize()
+                .expect("canonical package")
+        );
+        assert_eq!(
+            plan.release.application_manifest(),
+            fixture
+                .application_manifest
+                .canonicalize()
+                .expect("canonical application manifest")
+        );
+        assert_eq!(
+            plan.release.adapter_manifest(),
+            fixture
+                .adapter_manifest
+                .canonicalize()
+                .expect("canonical adapter manifest")
+        );
+        assert_eq!(plan.release.source_revision(), "a".repeat(40));
+        assert!(matches!(
+            plan.version_source,
+            EditableVersionSource::CloneActive { active_version: 7 }
+        ));
+        assert_eq!(plan.runtime_store_id, "RUNTIME");
+        assert_eq!(
+            plan.inventories
+                .resolve(ResourceKind::Secret, "secret-a")
+                .expect("selected secret"),
+            "SECRET_A"
+        );
+        assert!(plan.descriptor_json.contains("publisher-a"));
+        assert_eq!(plan.desired_links.len(), 4);
+        assert_eq!(plan.source_links.len(), 4);
+        assert_eq!(plan.versions.len(), 1);
+        assert!(plan.prior_descriptor.is_some());
+        assert_eq!(plan.links.delete_link_ids, ["LINK_OLD_KV"]);
+        assert_eq!(
+            plan.links
+                .create
+                .iter()
+                .map(|link| link.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["kv-a", "secret-a"]
+        );
+
+        let operations = fs::read_to_string(&log).expect("provider command log");
+        assert!(
+            operations.contains("EDGEZERO__SERVICES__SVC1__VERSIONS__7__ENV_V1"),
+            "{operations}"
+        );
+        for forbidden in [
+            " create",
+            " update",
+            " delete",
+            " activate",
+            " stage",
+            "EDGEZERO__SERVICES__SVC1__ADAPTER",
+            "EDGEZERO__SERVICES__SVC1__LOGGING",
+            "EDGEZERO__SERVICES__SVC1__STORES",
+            "EDGEZERO__STORES__",
+            "edgezero_runtime_env_staging_SVC1",
+            "kv-store list",
+            "secret-store list",
+            "service-version list",
+        ] {
+            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_plan_runtime_configuration_cannot_select_different_release_members() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fixture = deploy_plan_release_fixture();
+        let log_directory = tempdir().expect("provider log directory");
+        let log = log_directory.path().join("provider.log");
+        let fake = fake_managed_plan_provider(
+            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":7,"name":"production","service_id":"SVC1"}]}]"#,
+            r#"[{"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"}]"#,
+            None,
+            r#"[
+                {"id":"RUNTIME","name":"edgezero_runtime_env"},
+                {"id":"CONFIG_A","name":"config-a"},
+                {"id":"CONFIG_B","name":"config-b"}
+            ]"#,
+            &log,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+
+        let publisher_a = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
+            .expect("publisher A plan");
+        let mut publisher_b_context = managed_plan_context(&fixture);
+        publisher_b_context.variable_defaults.extend([
+            (
+                "EDGEZERO__STORES__CONFIG__APP__NAME".to_owned(),
+                "config-b".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__APP__KEY".to_owned(),
+                "publisher-b".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__KV__CACHE__NAME".to_owned(),
+                "kv-b".to_owned(),
+            ),
+            (
+                "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME".to_owned(),
+                "secret-b".to_owned(),
+            ),
+        ]);
+        let publisher_b =
+            build_managed_deploy_plan(&publisher_b_context, &[]).expect("publisher B plan");
+
+        assert_eq!(publisher_a.package_sha256, publisher_b.package_sha256);
+        assert_eq!(publisher_a.release.package(), publisher_b.release.package());
+        assert_eq!(
+            publisher_a.release.application_cli(),
+            publisher_b.release.application_cli()
+        );
+        assert_eq!(
+            publisher_a.release.application_manifest(),
+            publisher_b.release.application_manifest()
+        );
+        assert_eq!(
+            publisher_a.release.adapter_manifest(),
+            publisher_b.release.adapter_manifest()
+        );
+        assert_ne!(publisher_a.descriptor_json, publisher_b.descriptor_json);
+        assert!(publisher_a.descriptor_json.contains("publisher-a"));
+        assert!(publisher_b.descriptor_json.contains("publisher-b"));
+        assert_eq!(
+            publisher_a
+                .desired_links
+                .iter()
+                .map(|link| link.selected_name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["config-a", "edgezero_runtime_env", "kv-a", "secret-a"])
+        );
+        assert_eq!(
+            publisher_b
+                .desired_links
+                .iter()
+                .map(|link| link.selected_name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["config-b", "edgezero_runtime_env", "kv-b", "secret-b"])
+        );
+
+        let operations = fs::read_to_string(&log).expect("provider command log");
+        for forbidden in [
+            " create",
+            " update",
+            " delete",
+            "EDGEZERO__STORES__",
+            "EDGEZERO__SERVICES__SVC1__ADAPTER",
+            "EDGEZERO__SERVICES__SVC1__LOGGING",
+            "EDGEZERO__SERVICES__SVC1__STORES",
+            "edgezero_runtime_env_staging_SVC1",
+        ] {
+            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_plan_store_free_kv_selection_still_classifies_inherited_kv_from_all_pages() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fixture = deploy_plan_release_fixture();
+        let log_directory = tempdir().expect("provider log directory");
+        let log = log_directory.path().join("provider.log");
+        let fake = fake_managed_plan_provider(
+            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#,
+            r#"[
+                {"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"},
+                {"id":"LINK_OLD_KV","name":"kv-old","resource_id":"KV_OLD"}
+            ]"#,
+            None,
+            r#"[
+                {"id":"RUNTIME","name":"edgezero_runtime_env"},
+                {"id":"CONFIG_A","name":"config-a"}
+            ]"#,
+            &log,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+        let mut context = managed_plan_context(&fixture);
+        context.stores.kv.clear();
+        context
+            .variable_defaults
+            .remove("EDGEZERO__STORES__KV__CACHE__NAME");
+
+        let plan = build_managed_deploy_plan(&context, &[]).expect("plan without declared KV");
+        assert_eq!(plan.links.delete_link_ids, ["LINK_OLD_KV"]);
+        assert!(
+            plan.desired_links
+                .iter()
+                .all(|link| link.kind != ResourceKind::Kv)
+        );
+        let operations = fs::read_to_string(&log).expect("provider command log");
+        assert!(
+            operations.contains("/resources/stores/kv?limit=100&cursor=page-two"),
+            "the inherited KV exists only on page two: {operations}"
+        );
+        assert!(!operations.contains("kv-store list"), "{operations}");
+        for forbidden in [
+            "EDGEZERO__STORES__",
+            "EDGEZERO__SERVICES__SVC1__ADAPTER",
+            "EDGEZERO__SERVICES__SVC1__LOGGING",
+            "EDGEZERO__SERVICES__SVC1__STORES",
+            "edgezero_runtime_env_staging_SVC1",
+        ] {
+            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_plan_snapshots_initialized_first_draft_without_blank_version() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fixture = deploy_plan_release_fixture();
+        let log = fixture.root.path().join("provider.log");
+        let fake = fake_managed_plan_provider(
+            r#"[{"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[],"comment":"initialized through Fastly UI"}]"#,
+            r#"[{"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"}]"#,
+            None,
+            r#"[
+                {"id":"RUNTIME","name":"edgezero_runtime_env"},
+                {"id":"CONFIG_A","name":"config-a"}
+            ]"#,
+            &log,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+        let plan = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
+            .expect("initialized draft plan");
+        let EditableVersionSource::InitialDraft(snapshot) = plan.version_source else {
+            panic!("expected initialized draft snapshot");
+        };
+        assert_eq!(snapshot.version.number, 3);
+        assert_eq!(
+            snapshot.metadata["comment"],
+            "initialized through Fastly UI"
+        );
+        assert_eq!(snapshot.domains[0]["name"], "example.com");
+        assert_eq!(snapshot.backends[0]["name"], "origin");
+        assert_eq!(snapshot.logging[0]["name"], "logs");
+        assert_eq!(
+            snapshot.settings["general.default_host"],
+            "origin.example.com"
+        );
+        assert_eq!(snapshot.links[0]["id"], "LINK_RUNTIME");
+        let operations = fs::read_to_string(&log).expect("provider command log");
+        assert!(operations.contains("/version/3/settings"), "{operations}");
+        assert!(
+            !operations.contains("config-store-entry"),
+            "descriptor absence must use only its exact API lookup: {operations}"
+        );
+        assert!(!operations.contains(" create"), "{operations}");
+        assert!(!operations.contains(" update"), "{operations}");
+        assert!(!operations.contains(" delete"), "{operations}");
+        for forbidden in [
+            "EDGEZERO__STORES__",
+            "EDGEZERO__SERVICES__SVC1__ADAPTER",
+            "EDGEZERO__SERVICES__SVC1__LOGGING",
+            "EDGEZERO__SERVICES__SVC1__STORES",
+            "edgezero_runtime_env_staging_SVC1",
+        ] {
+            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_plan_inventory_failure_performs_no_mutation_or_legacy_lookup() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fixture = deploy_plan_release_fixture();
+        let log = fixture.root.path().join("provider.log");
+        let fake = fake_managed_plan_provider(
+            r#"[{"number":7,"active":true}]"#,
+            "[]",
+            None,
+            r#"{"items":[],"next_cursor":"not-complete"}"#,
+            &log,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+        let error = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
+            .expect_err("incomplete inventory must fail closed");
+        assert!(error.contains("bare JSON array"), "{error}");
+        let operations = fs::read_to_string(&log).expect("provider command log");
+        for forbidden in [
+            " create",
+            " update",
+            " delete",
+            "EDGEZERO__SERVICES__SVC1__ADAPTER",
+            "EDGEZERO__SERVICES__SVC1__LOGGING",
+            "EDGEZERO__SERVICES__SVC1__STORES",
+            "EDGEZERO__STORES__",
+            "edgezero_runtime_env_staging_SVC1",
+        ] {
+            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
+        }
     }
 
     #[test]
     fn parse_active_version_none_when_no_active() {
         // A parsed list with no active version is `Ok(None)` — confirmed
         // no active version (first deploy), NOT an operational failure.
-        let json = r#"[{"number": 1, "active": false}]"#;
+        let json = r#"[{"number":1,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}]"#;
         assert_eq!(resolve_active_version(json), Ok(None));
     }
 
@@ -6699,7 +8919,7 @@ mod tests {
         resolve_active_version(r#"[{"active":true,"number":9},{"active":"nope"}]"#)
             .expect_err("a non-boolean `active` AFTER the active entry is still schema drift");
         // More than one active version is ambiguous — refuse rather than pick one.
-        resolve_active_version(r#"[{"active":true,"number":9},{"active":true,"number":10}]"#)
+        resolve_active_version(r#"[{"active":true,"number":9,"locked":true,"staging":false,"deployed":true,"environments":[]},{"active":true,"number":10,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#)
             .expect_err("two active versions must error as ambiguous");
         // EVERY element must be a version object with a numeric `number` — a
         // garbled entry must fail closed, not be skipped as "not active".
@@ -6708,12 +8928,16 @@ mod tests {
         resolve_active_version("[{}]").expect_err("an entry with no `number` must error");
         resolve_active_version(r#"[{"number":"invalid"}]"#)
             .expect_err("a non-numeric `number` must error");
-        // An omitted `active` field means "not active" (not an error), as long
-        // as the entry is otherwise a well-formed version object.
-        assert_eq!(resolve_active_version(r#"[{"number":42}]"#), Ok(None));
+        // Every safety field is mandatory; omission is schema drift.
+        resolve_active_version(
+            r#"[{"number":42,"locked":false,"staging":false,"deployed":false,"environments":[]}]"#,
+        )
+        .expect_err("an omitted active field must fail closed");
         // Sanity: a well-formed list still resolves.
         assert_eq!(
-            resolve_active_version(r#"[{"active":false,"number":1},{"active":true,"number":2}]"#),
+            resolve_active_version(
+                r#"[{"active":false,"number":1,"locked":true,"staging":false,"deployed":true,"environments":[]},{"active":true,"number":2,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#
+            ),
             Ok(Some(2))
         );
     }
@@ -6733,8 +8957,8 @@ mod tests {
 
     #[test]
     fn active_version_or_require_enforces_require_active() {
-        let active = r#"[{"active":true,"number":5}]"#;
-        let none = r#"[{"active":false,"number":5}]"#;
+        let active = r#"[{"active":true,"number":5,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#;
+        let none = r#"[{"active":false,"number":5,"locked":false,"staging":false,"deployed":false,"environments":[]}]"#;
 
         // A resolvable active version is returned regardless of the flag.
         assert_eq!(active_version_or_require(active, false, "svc"), Ok(Some(5)));
@@ -7717,6 +9941,45 @@ build = \"cargo build --release\"
             .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
             .expect("no-store provision is fine");
         assert_eq!(out, vec!["fastly has no declared stores to provision"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_runtime_store_emits_no_selector_write_or_twin_guidance() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("fastly.toml"), "name = \"demo\"\n").expect("manifest");
+        let operation_log = dir.path().join("operations.log");
+        let fake = fake_fastly_runtime_mapping(&[], &operation_log);
+        let _path = PathPrepend::new(fake.path());
+        let out = FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ProvisionStores {
+                    config: &[],
+                    kv: &[],
+                    secrets: &[],
+                },
+                false,
+            )
+            .expect("runtime descriptor store provision");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("version-scoped runtime descriptor store"));
+        for forbidden in ["config-store-entry", "selector", "staging twin", "_staging"] {
+            assert!(!out[0].contains(forbidden), "{forbidden}: {}", out[0]);
+        }
+        let operations = fs::read_to_string(&operation_log).expect("operation log");
+        assert_eq!(
+            operations
+                .lines()
+                .filter(|line| line.contains("store-create"))
+                .count(),
+            1,
+            "{operations}"
+        );
+        assert!(!operations.contains("config-store-entry"), "{operations}");
     }
 
     #[cfg(unix)]
@@ -10095,6 +12358,8 @@ echo 'unexpected' >&2; exit 1
         args.extend(extra.iter().map(|arg| (*arg).to_owned()));
         let context = AdapterDeployContext {
             adapter_manifest_path: Some(manifest),
+            application_manifest_path: None,
+            application_release_root: None,
             service_id: Some("SVC1".to_owned()),
             stores,
             staging: true,
@@ -11716,6 +13981,8 @@ echo 'unexpected' >&2; exit 1
 
         let context = AdapterDeployContext {
             adapter_manifest_path: Some(app.path().join("fastly.toml")),
+            application_manifest_path: None,
+            application_release_root: None,
             service_id: Some("SVC1".to_owned()),
             stores: DeployStoreIds {
                 config: vec!["app_config".to_owned()],
@@ -11788,6 +14055,8 @@ echo 'unexpected' >&2; exit 1
 
         let context = AdapterDeployContext {
             adapter_manifest_path: Some(app.path().join("fastly.toml")),
+            application_manifest_path: None,
+            application_release_root: None,
             service_id: Some("SVC1".to_owned()),
             stores: DeployStoreIds {
                 config: vec!["app_config".to_owned()],
@@ -11841,6 +14110,8 @@ echo 'unexpected' >&2; exit 1
 
         let context = AdapterDeployContext {
             adapter_manifest_path: Some(app.path().join("fastly.toml")),
+            application_manifest_path: None,
+            application_release_root: None,
             service_id: Some("SVC1".to_owned()),
             stores: DeployStoreIds {
                 config: vec!["app_config".to_owned()],

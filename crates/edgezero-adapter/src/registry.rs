@@ -75,6 +75,10 @@ pub enum DeployOwnership {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdapterDeployContext {
     pub adapter_manifest_path: Option<PathBuf>,
+    /// Exact application manifest loaded by the generic CLI.
+    pub application_manifest_path: Option<PathBuf>,
+    /// Canonical root of an extracted immutable application release.
+    pub application_release_root: Option<PathBuf>,
     pub service_id: Option<String>,
     pub staging: bool,
     pub stores: DeployStoreIds,
@@ -786,6 +790,8 @@ mod tests {
             FIRST.preflight_deploy(&context, &[]).unwrap(),
             DeployOwnership::ManifestCommand
         );
+        assert!(context.application_manifest_path.is_none());
+        assert!(context.application_release_root.is_none());
         assert!(context.variable_defaults.is_empty());
     }
 

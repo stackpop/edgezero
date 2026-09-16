@@ -7,7 +7,9 @@ use edgezero_core::env_config::EnvConfig;
 use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(any(feature = "cli", test))]
+use std::collections::BTreeSet;
 #[cfg(any(feature = "fastly", test))]
 use std::error::Error;
 use std::fmt;
@@ -106,13 +108,7 @@ impl RuntimeDescriptor {
         Ok(json)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the deployment-side descriptor writer lands in a subsequent task"
-        )
-    )]
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn from_entries(
         entries: BTreeMap<String, String>,
     ) -> Result<Self, RuntimeDescriptorError> {
@@ -121,13 +117,55 @@ impl RuntimeDescriptor {
         Ok(descriptor)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "deployment-side alias cleanup lands in a subsequent task"
-        )
-    )]
+    #[cfg(feature = "cli")]
+    pub(crate) fn from_environment(
+        environment: &EnvConfig,
+        config_ids: &[String],
+        kv_ids: &[String],
+        secret_ids: &[String],
+    ) -> Result<Self, RuntimeDescriptorError> {
+        let mut entries = BTreeMap::new();
+        for (key, segments) in [
+            ("EDGEZERO__ADAPTER__HOST", &["adapter", "host"][..]),
+            ("EDGEZERO__ADAPTER__PORT", &["adapter", "port"][..]),
+            ("EDGEZERO__LOGGING__LEVEL", &["logging", "level"][..]),
+            ("EDGEZERO__LOGGING__ENDPOINT", &["logging", "endpoint"][..]),
+            (
+                "EDGEZERO__LOGGING__USE_FASTLY_LOGGER",
+                &["logging", "use_fastly_logger"][..],
+            ),
+            (
+                "EDGEZERO__LOGGING__ECHO_STDOUT",
+                &["logging", "echo_stdout"][..],
+            ),
+        ] {
+            if let Some(value) = environment.get(segments) {
+                entries.insert(key.to_owned(), value.to_owned());
+            }
+        }
+        for (kind, ids) in [
+            ("CONFIG", config_ids),
+            ("KV", kv_ids),
+            ("SECRETS", secret_ids),
+        ] {
+            for id in ids {
+                let canonical_id = id.to_ascii_uppercase();
+                entries.insert(
+                    format!("EDGEZERO__STORES__{kind}__{canonical_id}__NAME"),
+                    environment.store_name(&kind.to_ascii_lowercase(), id),
+                );
+                if kind == "CONFIG" {
+                    entries.insert(
+                        format!("EDGEZERO__STORES__CONFIG__{canonical_id}__KEY"),
+                        environment.store_key("config", id),
+                    );
+                }
+            }
+        }
+        Self::from_entries(entries)
+    }
+
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn managed_store_aliases(&self) -> Result<BTreeSet<String>, RuntimeDescriptorError> {
         let mut aliases = BTreeSet::new();
         for (key, value) in &self.entries {
@@ -394,6 +432,7 @@ fn validated_env_from_entries(
     Ok(EnvConfig::from_vars(entries.iter()))
 }
 
+#[cfg(any(feature = "cli", test))]
 fn is_managed_store_name_key(key: &str) -> bool {
     let mut segments = key.split("__");
     matches!(segments.next(), Some("EDGEZERO"))
@@ -823,6 +862,49 @@ mod tests {
         assert_eq!(
             runtime_descriptor_key("SvcA1", 43),
             "EDGEZERO__SERVICES__SvcA1__VERSIONS__43__ENV_V1"
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn deploy_plan_descriptor_captures_fixed_values_and_all_store_selections() {
+        let environment = EnvConfig::from_vars([
+            ("EDGEZERO__ADAPTER__PORT", "8080"),
+            ("EDGEZERO__LOGGING__LEVEL", "debug"),
+            ("EDGEZERO__STORES__CONFIG__APP__NAME", "app-prod"),
+            ("EDGEZERO__STORES__CONFIG__APP__KEY", "publisher-a"),
+            ("EDGEZERO__STORES__KV__CACHE__NAME", "cache-prod"),
+            ("EDGEZERO__STORES__SECRETS__TOKEN__NAME", "token-prod"),
+        ]);
+        let descriptor = RuntimeDescriptor::from_environment(
+            &environment,
+            &["app".to_owned()],
+            &["cache".to_owned()],
+            &["token".to_owned()],
+        )
+        .expect("descriptor");
+        assert_eq!(
+            descriptor.entries,
+            BTreeMap::from([
+                ("EDGEZERO__ADAPTER__PORT".to_owned(), "8080".to_owned()),
+                ("EDGEZERO__LOGGING__LEVEL".to_owned(), "debug".to_owned(),),
+                (
+                    "EDGEZERO__STORES__CONFIG__APP__KEY".to_owned(),
+                    "publisher-a".to_owned(),
+                ),
+                (
+                    "EDGEZERO__STORES__CONFIG__APP__NAME".to_owned(),
+                    "app-prod".to_owned(),
+                ),
+                (
+                    "EDGEZERO__STORES__KV__CACHE__NAME".to_owned(),
+                    "cache-prod".to_owned(),
+                ),
+                (
+                    "EDGEZERO__STORES__SECRETS__TOKEN__NAME".to_owned(),
+                    "token-prod".to_owned(),
+                ),
+            ])
         );
     }
 

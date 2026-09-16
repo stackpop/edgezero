@@ -514,7 +514,9 @@ PR #344
 `EDGEZERO__SERVICES__<SERVICE_ID>__<ADAPTER|LOGGING|STORES>__...` keys, unscoped
 canonical selector entries, or `edgezero_runtime_env_staging_<service-id>` stores,
 while still requiring the new `__VERSIONS__<VERSION>__ENV_V1` descriptor operation.
-Delete the scoped selector persistence helpers and their tests while retaining
+These assertions apply to the new read-only plan. Retain the currently invoked legacy
+deploy helpers at this green checkpoint; Task 6 deletes them in the same change that
+routes every managed deployment through the complete replacement state machine. Keep
 optional typed Secret Store support.
 
 Add provisioning tests proving it creates/configures only the one
@@ -563,19 +565,21 @@ Add provider-neutral application-manifest and extracted-release-root paths to
 `AdapterDeployContext`. Add a top-level typed
 `deploy --application-release <path>` option; the generic CLI only resolves and
 confines the path and records the exact manifest it loaded. Add a
-strict Fastly release parser/verifier in `release.rs`. The Fastly adapter must require
-the release for adapter-managed ownership, confirm that its recorded `edgezero.toml`
-is the manifest the CLI loaded and that the recorded Fastly manifest is the referenced
-adapter manifest, verify every digest, and derive the package path and digest from the
-release. Change the final managed parser to reject every caller-supplied `--package`/`-p`
-spelling. Fastly preflight must select `AdapterManaged` whenever a release is present,
-including store-free production, so the action has no manifest-command build escape.
-Keep unregistered adapters and direct store-free Fastly CLI calls without a release
-unchanged.
+strict Fastly release parser/verifier in `release.rs`. The verifier confirms that its
+recorded `edgezero.toml` is the manifest the CLI loaded and that the recorded Fastly
+manifest is the referenced adapter manifest, verifies every digest, and derives the
+package path and digest from the release. Add the final managed-argument parser that
+rejects every caller-supplied `--package`/`-p` spelling, but do not route deployment
+through it yet. Keep Fastly's current ownership result and deploy routing unchanged at
+this checkpoint. Task 6 atomically switches release-backed deployment to
+`AdapterManaged`, requires the verified release, installs this final parser, and routes
+the call through the complete state machine. Keep unregistered adapters and direct
+store-free Fastly CLI calls without a release unchanged.
 
 - [ ] **Step 8: Resolve the complete plan without mutations**
 
-Before `compute update`, resolve and validate:
+Implement the read-only plan builder that Task 6 will run before `compute update`. It
+resolves and validates:
 
 1. service ID, token, target, args, and effective environment;
 2. the immutable application-release metadata, package, `edgezero.toml`, and Fastly
@@ -608,10 +612,11 @@ that descriptor. When it does not exist, classify the source version's linked Co
 KV, and Secret Store resources from the complete provider resource-ID inventories and
 plan deletion of every inherited store link absent from the desired set. Preserve
 links absent from all three inventories. Fail closed on incomplete commands, malformed
-records, duplicate IDs, or cross-kind ambiguity. Remove the PR #344 scoped selector
-persistence/read helpers and the unscoped/twin selector inventory code; do not issue
-provider calls for legacy entries or twins. Remove provisioning output that tells
-operators to maintain unscoped selectors or staging twins.
+records, duplicate IDs, or cross-kind ambiguity. The new plan must not issue provider
+calls for PR #344 scoped selectors, unscoped selectors, or staging twins. Retain the
+currently invoked legacy deployment implementation until Task 6 can replace its full
+path atomically. Remove provisioning output that tells operators to maintain unscoped
+selectors or staging twins.
 
 - [ ] **Step 10: Run plan and parser tests**
 
@@ -705,6 +710,11 @@ Change Fastly's `preflight_deploy` ownership result to `AdapterManaged` exactly 
 In the same implementation change, route those calls into the complete state machine
 below; do not leave a checkpoint where managed ownership reaches the legacy production,
 manifest-command build, or twin lifecycle.
+
+Once that routing is installed, delete the replaced PR #344 scoped/unscoped selector
+persistence and read helpers, staging-twin inventory and reconciliation helpers, and
+their obsolete tests. The new descriptor and resource-link state machine is then the
+only managed Fastly deployment path.
 
 Require the verified package from the immutable application release; managed deploy
 must not have a build fallback. For an active service, run `fastly compute update

@@ -17,6 +17,8 @@ pub mod key_value_store;
 pub mod logger;
 #[cfg(feature = "fastly")]
 pub mod proxy;
+#[cfg(feature = "cli")]
+pub(crate) mod release;
 #[cfg(feature = "fastly")]
 pub mod request;
 #[cfg(feature = "fastly")]
@@ -51,9 +53,8 @@ use edgezero_core::manifest::ResolvedLoggingConfig;
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
 /// overrides.
 ///
-/// The fixed name is load-bearing: a staged deploy creates a per-service
-/// staging twin and links it into the staged version under THIS name, which is
-/// how the runtime resolves staged selectors without knowing the twin exists.
+/// The fixed store holds one immutable runtime descriptor per Fastly service
+/// version. Each version links this store under the same reserved name.
 pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
 
 /// Errors produced while serializing, parsing, or validating a Fastly runtime
