@@ -250,11 +250,14 @@ wire `Content-Length`, because Workers owns final framing.
 ## Batch Timing
 
 `HttpClient::start_batch_until` returns an adapter-owned `OutboundBatch`. Calling `next()` yields
-each terminal slot at most once in observed completion order, paired with its original input index.
-Callers can therefore retain completed results and cancel unresolved work at an application
-deadline. `HttpClient::send_all_until` is the ordered collector over that same driver; it returns
-one `Option<OutboundSlotResult>` per input, where only a slot unresolved at cutoff is `None`.
-One failure does not erase sibling outcomes.
+`OutboundBatchNext::Item` for each terminal slot at most once in observed completion order, paired
+with its original input index, followed by `Finished(Completed)` or `Finished(Cutoff)`. Callers can
+therefore retain completed results and cancel unresolved work at an application deadline.
+`HttpClient::send_all_until` is the fallible ordered collector over that same driver; it returns
+one `Option<OutboundSlotResult>` per input plus the typed termination reason. `Completed` guarantees
+all slots are present. Only `Cutoff` permits `None`. Premature EOF, duplicate indices, and
+out-of-range indices are batch-level internal errors rather than unresolved slots. One slot failure
+does not erase sibling outcomes.
 `elapsed` starts at the single method-entry monotonic snapshot and ends when that slot becomes
 terminal, including preflight validation, adapter setup, provider queueing, upload, headers,
 buffered body drain, and any delayed guest observation. It is not pure transport RTT.

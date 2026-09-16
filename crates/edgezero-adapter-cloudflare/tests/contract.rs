@@ -340,7 +340,12 @@ mod tests {
         let forward_results = forward_client
             .start_batch_until(vec![forward_request], cutoff)
             .collect()
-            .await;
+            .await
+            .expect("valid batch driver");
+        assert_eq!(
+            forward_results.termination,
+            edgezero_core::OutboundBatchTermination::Completed
+        );
         assert_eq!(forward_results.slots.len(), 1);
         let forward_result = forward_results
             .slots
@@ -365,7 +370,12 @@ mod tests {
         let backwards_results = backwards_client
             .start_batch_until(vec![backwards_request], cutoff)
             .collect()
-            .await;
+            .await
+            .expect("valid batch driver");
+        assert_eq!(
+            backwards_results.termination,
+            edgezero_core::OutboundBatchTermination::Completed
+        );
         assert_eq!(backwards_results.slots.len(), 1);
         let backwards_result = backwards_results
             .slots
@@ -378,6 +388,25 @@ mod tests {
             backwards_result.outcome,
             Err(EdgeError::Internal { .. })
         ));
+    }
+
+    #[wasm_bindgen_test]
+    async fn already_expired_batch_reports_cutoff() {
+        let now = MonotonicInstant::now();
+        let client = CloudflareOutboundClient::with_clock(MonotonicClock::new(move || now));
+        let request = OutboundRequest::get("https://example.com/").expect("request");
+
+        let results = client
+            .start_batch_until(vec![request], Deadline::at_instant(now))
+            .collect()
+            .await
+            .expect("valid batch driver");
+
+        assert_eq!(
+            results.termination,
+            edgezero_core::OutboundBatchTermination::Cutoff
+        );
+        assert!(results.slots[0].is_none());
     }
 
     #[wasm_bindgen_test]
@@ -403,7 +432,12 @@ mod tests {
                 ),
             )
             .collect()
-            .await;
+            .await
+            .expect("valid batch driver");
+        assert_eq!(
+            results.termination,
+            edgezero_core::OutboundBatchTermination::Completed
+        );
         let messages: Vec<_> = results
             .slots
             .iter()
@@ -445,7 +479,7 @@ mod tests {
                 OutboundRequest::get("https://example.com/")?.body(Body::from("invalid GET body"));
             let results = client
                 .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
-                .await;
+                .await?;
             let result = results
                 .slots
                 .first()

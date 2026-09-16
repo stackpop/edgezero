@@ -857,7 +857,8 @@ mod synthesis_tests {
         let results = block_on(client.send_all_until(
             vec![outbound_request],
             Deadline::after(Duration::from_secs(1)),
-        ));
+        ))
+        .expect("valid batch driver");
 
         assert_eq!(
             results.slots[0]

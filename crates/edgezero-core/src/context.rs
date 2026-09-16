@@ -708,7 +708,8 @@ mod tests {
     use super::*;
     use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, request_builder};
     use crate::outbound::{
-        HttpClient, OutboundBatch, OutboundHttpClient, OutboundRequest, OutboundResponse,
+        HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundHttpClient, OutboundRequest,
+        OutboundResponse,
     };
     use crate::params::PathParams;
     use async_trait::async_trait;
@@ -748,7 +749,11 @@ mod tests {
             requests: Vec<OutboundRequest>,
             _cutoff: crate::Deadline,
         ) -> OutboundBatch {
-            OutboundBatch::from_stream(requests.len(), stream::empty())
+            let slot_count = requests.len();
+            OutboundBatch::from_driver(
+                slot_count,
+                stream::iter((slot_count != 0).then_some(OutboundBatchDriverEvent::Cutoff)),
+            )
         }
     }
 

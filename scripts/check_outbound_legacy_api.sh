@@ -47,6 +47,12 @@ scan \
   crates examples/app-demo docs/guide README.md CLAUDE.md TODO.md \
   ':(exclude)crates/edgezero-cli/src/generator.rs' || failed=1
 
+# Batch termination is explicit. Adapter drivers cannot use stream EOF as a
+# cutoff signal, and callers cannot interpret every missing item as timeout.
+scan \
+  'OutboundBatch::from_stream|while[[:space:]]+let[[:space:]]+Some\([^)]*\)[[:space:]]*=[[:space:]]*batch\.next\(\)\.await|send_all_until\(.*\)\.await\.slots' \
+  crates examples/app-demo docs/guide README.md CLAUDE.md TODO.md || failed=1
+
 # Generated/demo Fastly entrypoints must delegate transmission to EdgeZero.
 scan \
   'stream_to_client|send_to_client|send_with_registries' \

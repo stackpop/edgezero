@@ -969,6 +969,11 @@ mod outbound_contract_tests {
                 FastlyOutboundClient::new()
                     .start_batch_until(vec![request], Deadline::after(Duration::from_secs(1)))
                     .collect(),
+            )
+            .expect("valid batch driver");
+            assert_eq!(
+                results.termination,
+                edgezero_core::OutboundBatchTermination::Completed
             );
             let slot = results.slots[0].as_ref().expect("resolved slot");
 
@@ -979,6 +984,27 @@ mod outbound_contract_tests {
                 source.to_string(),
                 "Fastly batch adapter overhead between batch_now and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) exceeded BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration"
             );
+        }
+
+        #[test]
+        fn already_expired_batch_reports_cutoff() {
+            let now = edgezero_core::MonotonicInstant::now();
+            let client =
+                FastlyOutboundClient::with_clock(edgezero_core::MonotonicClock::new(move || now));
+            let request = request().body(Bytes::from_static(b"body"));
+
+            let results = block_on(
+                client
+                    .start_batch_until(vec![request], Deadline::at_instant(now))
+                    .collect(),
+            )
+            .expect("valid batch driver");
+
+            assert_eq!(
+                results.termination,
+                edgezero_core::OutboundBatchTermination::Cutoff
+            );
+            assert!(results.slots[0].is_none());
         }
     }
 }

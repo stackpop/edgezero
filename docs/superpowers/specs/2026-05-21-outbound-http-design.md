@@ -162,23 +162,40 @@ pub struct OutboundBatchItem {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct OutboundBatchResults {
-    /// Index-aligned with the input. `None` means unresolved when the cutoff won.
+    /// Index-aligned with the input. `None` is valid only with `Cutoff` termination.
     pub slots: Vec<Option<OutboundSlotResult>>,
+    pub termination: OutboundBatchTermination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum OutboundBatchTermination {
+    /// Every input slot produced exactly one terminal result.
+    Completed,
+    /// The method-level cutoff won while one or more slots remained unresolved.
+    Cutoff,
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum OutboundBatchNext {
+    Finished(OutboundBatchTermination),
+    Item(OutboundBatchItem),
 }
 
 /// Adapter-owned completion driver. The transport and pending handles remain opaque.
 pub struct OutboundBatch { /* private */ }
 
 impl OutboundBatch {
-    /// Returns the next observed terminal item, or `None` after completion/cutoff.
+    /// Returns the next observed terminal item or the explicit termination reason.
     /// Cancelling this future does not consume or lose a ready item.
-    pub async fn next(&mut self) -> Option<OutboundBatchItem>;
+    pub async fn next(&mut self) -> Result<OutboundBatchNext, EdgeError>;
 
     /// Stops observation, applies strongest-available teardown, and returns unresolved indices.
     pub fn cancel(self) -> Vec<usize>;
 
     /// Collects terminal items into the original input order until completion/cutoff.
-    pub async fn collect(self) -> OutboundBatchResults;
+    pub async fn collect(self) -> Result<OutboundBatchResults, EdgeError>;
 }
 
 #[async_trait(?Send)]
@@ -348,12 +365,16 @@ pub trait OutboundHttpClient: Send + Sync {
 
 Both `send` and `start_batch_until` are required on the trait. Each adapter implements both and
 shares its single-request preparation and buffered response processing with its batch driver.
-`next()` yields every observed terminal item at most once. If its future is dropped before it
-returns, no item is consumed. The method-level cutoff wins equality; once the adapter clock is at
-or past the cutoff, no newly observed success is yielded. Dropping the batch is equivalent to
-`cancel()` with the returned unresolved-index report discarded. Cancellation stops observation
-and triggers strongest-available teardown, but does not claim that already-issued network side
-effects were undone.
+`next()` yields every observed terminal item at most once and then returns
+`Finished(Completed)` or `Finished(Cutoff)`. If its future is dropped before it returns, no item is
+consumed. The method-level cutoff wins equality; once the adapter clock is at or past the cutoff,
+no newly observed success is yielded. Adapter drivers signal cutoff explicitly. Stream EOF is
+valid only after all input indices have emitted; premature driver EOF, a duplicate or out-of-range
+index, or polling after an invariant failure returns `EdgeError::Internal` rather than fabricating
+timeout-like unresolved slots. Dropping the batch is equivalent to `cancel()` with the returned
+unresolved-index report discarded. Cancellation stops observation and triggers
+strongest-available teardown, but does not claim that already-issued network side effects were
+undone.
 
 #### 3.1.2 App-facing handle
 
@@ -378,17 +399,19 @@ impl HttpClient {
         &self,
         reqs: Vec<OutboundRequest>,
         cutoff: Deadline,
-    ) -> OutboundBatchResults;
+    ) -> Result<OutboundBatchResults, EdgeError>;
     pub fn with_client<C: OutboundHttpClient + 'static>(client: C) -> Self;
 }
 ```
 
 `HttpClient::send_all_until` is exactly
 `self.start_batch_until(reqs, cutoff).collect().await`; it is not a second adapter operation.
-Its `slots` vector always has the input length. A slot rejected during preflight is
-`Some(OutboundSlotResult { outcome: Err(..), .. })`; `None` means only that the slot had not
-become terminal before the method-level cutoff. The hard cut retains no deadline-free
-`send_all` alias.
+On success, its `slots` vector always has the input length. A slot rejected during preflight is
+`Some(OutboundSlotResult { outcome: Err(..), .. })`. `None` is legal only when `termination` is
+`OutboundBatchTermination::Cutoff` and means that the slot had not become terminal before the
+method-level cutoff. `Completed` guarantees every slot is `Some`. A malformed adapter driver is a
+batch-level `EdgeError::Internal`, not a successful collection. The hard cut retains no
+deadline-free `send_all` alias.
 
 Obtained from the context:
 
@@ -1613,24 +1636,29 @@ contains the original input index and one terminal `OutboundSlotResult`; complet
 becomes request identity.
 
 `OutboundBatch::next()` lets an application parse or otherwise consume a fast terminal response
-while slower siblings are still pending. This is materially different from returning only a
-terminal vector: work performed between completions remains inside the caller's shared deadline.
-Dropping a pending `next()` future is safe and does not consume a ready item. Each index is
-emitted at most once. `cancel()` ends observation immediately, returns every index that was not
-already emitted, and invokes the strongest nonblocking teardown available to the adapter. The
-caller retains items it already received, which is the portable partial-result-on-cancellation
-contract.
+while slower siblings are still pending. It returns `OutboundBatchNext::Item` for each observed
+slot and then `OutboundBatchNext::Finished(Completed | Cutoff)`. This is materially different from
+returning only a terminal vector: work performed between completions remains inside the caller's
+shared deadline. Dropping a pending `next()` future is safe and does not consume a ready item. Each
+index is emitted at most once. `cancel()` ends observation immediately, returns every index that
+was not already emitted, and invokes the strongest nonblocking teardown available to the adapter.
+The caller retains items it already received, which is the portable
+partial-result-on-cancellation contract.
 
 The driver owns the method-level absolute cutoff. Before accepting a provider completion it
 samples the same injected clock used for request budgets. Equality is expired. When the cutoff
 wins, the driver stops yielding new terminal results, tears down or abandons unresolved work, and
-ends. A response that was provider-ready but not observable before a blocking provider primitive
-returned remains unresolved; capability rows make that limitation explicit.
+emits an explicit cutoff event. A response that was provider-ready but not observable before a
+blocking provider primitive returned remains unresolved; capability rows make that limitation
+explicit. Core infers normal completion only after every input index emits exactly once. A
+premature driver EOF and duplicate or out-of-range indices are invariant failures returned as
+`EdgeError::Internal`; they never become `Cutoff` or `None` slots.
 
-`HttpClient::send_all_until` is the simple ordered view. It constructs the batch and calls
-`collect()`. The returned `OutboundBatchResults.slots` always has the input length. Preflight and
-other terminal failures are `Some`; only work unresolved when the method cutoff won is `None`.
-There is no second adapter collector and no compatibility `send_all` method.
+`HttpClient::send_all_until` is the simple ordered view. It constructs the batch, calls
+`collect()`, and propagates any batch-level error. A successful `OutboundBatchResults.slots` always
+has the input length. Preflight and other terminal failures are `Some`; only work unresolved when
+the method cutoff won is `None`, and only when `termination == Cutoff`. `Completed` guarantees no
+missing slots. There is no second adapter collector and no compatibility `send_all` method.
 
 | Adapter | `start_batch_until` mechanism | Completion/cancellation quality |
 | --- | --- | --- |
@@ -2831,7 +2859,8 @@ the third plus `ResponseLimitReason` in the same mechanical style.
 | Outbound response over a body/header/window resource limit | `response_too_large`, typed `ResponseLimitReason` (§3.4.5) | 502 |
 | Outbound response body not valid JSON, gzip, or Brotli / `json::<T>` called on a streamed body | `bad_gateway`, reason `Decode(Json/Gzip/Brotli)` for malformed content and `Protocol` for invalid API state | 502 |
 | Outbound per-request timeout or request deadline exceeded | `gateway_timeout` (carries `budget.cause`: per-call vs request deadline — §3.3.2) | 504 |
-| Batch method cutoff reached | slot remains unresolved (`None` in ordered collection); no synthetic terminal error is emitted | n/a |
+| Batch method cutoff reached | collection terminates as `Cutoff`; unresolved slots are `None`; no synthetic terminal slot error is emitted | n/a |
+| Malformed batch driver | batch-level `Internal` for premature EOF or duplicate/out-of-range index; never represented as `None` | 500 |
 | Outbound completed with a non-2xx status | **not an error** — `Ok(OutboundResponse)` | app decides |
 
 The non-2xx rule is load-bearing: a target returning 204/400/500 is a normal fan-out batch
@@ -4742,7 +4771,7 @@ fn start_batch_until(
     let batch_started_at = self.clock.now();
     let slot_count = requests.len();
     if cutoff.is_expired_at(batch_started_at) {
-        return OutboundBatch::from_stream(slot_count, stream::empty());
+        return OutboundBatch::cutoff(slot_count);
     }
 
     // Validate and synchronously issue every eligible request before selecting any response.
@@ -4751,6 +4780,7 @@ fn start_batch_until(
     // when it is observed before the method cutoff.
     let mut completed = Vec::new();
     let mut pending = Vec::new();
+    let mut cutoff_reached = false;
     for (index, request) in requests.into_iter().enumerate() {
         match self.prepare_batch(request, batch_started_at, cutoff)
             .and_then(|prepared| self.dispatch_batch_slot(index, prepared))
@@ -4764,6 +4794,7 @@ fn start_batch_until(
                     cutoff,
                     Err(error),
                 ) else {
+                    cutoff_reached = true;
                     break;
                 };
                 completed.push(item);
@@ -4772,9 +4803,13 @@ fn start_batch_until(
     }
 
     let clock = self.clock.clone();
-    OutboundBatch::from_stream(slot_count, stream! {
+    OutboundBatch::from_driver(slot_count, stream! {
         for item in completed {
-            yield item;
+            yield OutboundBatchDriverEvent::Item(item);
+        }
+        if cutoff_reached {
+            yield OutboundBatchDriverEvent::Cutoff;
+            return;
         }
         while !pending.is_empty() && !cutoff.is_expired_at(clock.now()) {
             // `select_pending_slot` calls `select_handles`, restores metadata by raw handle
@@ -4791,9 +4826,13 @@ fn start_batch_until(
                 cutoff,
                 outcome,
             ) else {
+                yield OutboundBatchDriverEvent::Cutoff;
                 return;
             };
-            yield item;
+            yield OutboundBatchDriverEvent::Item(item);
+        }
+        if !pending.is_empty() {
+            yield OutboundBatchDriverEvent::Cutoff;
         }
     })
 }
@@ -4814,7 +4853,9 @@ fn start_batch_until(
   and stops guest observation, but Fastly exposes no finite host-cancellation proof for those
   already-issued requests. A selected response body is still drained synchronously, so cancellation
   cannot preempt a blocking host body read. A sibling request deadline never actively cancels
-  another slot; cutoff or selection failure ends the driver and leaves remaining slots unresolved.
+  another slot. A cutoff ends the driver and leaves remaining slots unresolved; a provider-selection
+  failure that prevents the driver from preserving its slot invariants is a batch-level `Internal`
+  error and is never represented as unresolved work.
 - **Dynamic backends.** Arbitrary HTTPS hosts use Fastly dynamic backends
   (`Backend::builder`). Per Fastly's
   [`BackendBuilder` docs](https://docs.rs/fastly/latest/fastly/backend/struct.BackendBuilder.html),
@@ -6253,9 +6294,11 @@ Required coverage:
   `reason` for either variant.
 - `HttpClient::start_batch_until` delegates the complete input and cutoff to its injected client.
   `HttpClient::send_all_until` collects that same driver into index-aligned `Option` slots,
-  including empty input, mixed success/error results, and unresolved-at-cutoff slots. These
-  core/mock tests establish handle delegation and collection only; adapter batch behavior is
-  required separately by the Tier 2 batch row.
+  including empty input, mixed success/error results, and unresolved-at-cutoff slots. Tests assert
+  `Completed` for complete and empty batches, `Cutoff` for explicit cutoff, and batch-level
+  `Internal` for premature EOF and duplicate or out-of-range indices. `None` occurs only with
+  `Cutoff`. These core/mock tests establish handle delegation and collection only; adapter batch
+  behavior is required separately by the Tier 2 batch row.
 - Shared preflight tests pin the GET/HEAD streamed-body diagnostic. Tier 2 verifies each
   adapter invokes that validator before its batch-only streamed-body rejection.
 - Buffered and streamed response drains enforce caps and deadlines, recheck after EOF, and

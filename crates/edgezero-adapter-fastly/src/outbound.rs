@@ -155,12 +155,12 @@ mod fastly_impl {
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
     use edgezero_core::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
-        OutboundBatch, OutboundBatchItem, OutboundCachePolicy, OutboundHttpClient, OutboundRequest,
-        OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseBodyDisposition,
-        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-        enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
-        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
-        validate_for_dispatch,
+        OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundCachePolicy,
+        OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
+        OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
+        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
+        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
+        normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
     use edgezero_core::time::{
         BATCH_DISPATCH_SLACK_MAX, Deadline, DispatchBudget, MonotonicClock, MonotonicInstant,
@@ -174,7 +174,6 @@ mod fastly_impl {
         Backend, Body as FastlyBody, Request as FastlyRequest, Response as FastlyResponse,
     };
     use futures_util::StreamExt as _;
-    use futures_util::stream::empty;
     use sha2::{Digest as _, Sha256};
 
     use super::{reassociate_selection, timeout_error, validate_batch_request};
@@ -528,11 +527,12 @@ mod fastly_impl {
             let batch_started_at = self.clock.now();
             let slot_count = requests.len();
             if cutoff.is_expired_at(batch_started_at) {
-                return OutboundBatch::from_stream(slot_count, empty());
+                return OutboundBatch::cutoff(slot_count);
             }
 
             let mut completed = Vec::new();
             let mut pending = Vec::new();
+            let mut cutoff_reached = false;
             for (index, request) in requests.into_iter().enumerate() {
                 let prepared = self
                     .prepare_batch(request, batch_started_at, cutoff)
@@ -548,6 +548,7 @@ mod fastly_impl {
                             cutoff,
                             Err(error),
                         ) else {
+                            cutoff_reached = true;
                             break;
                         };
                         completed.push(item);
@@ -558,7 +559,12 @@ mod fastly_impl {
             let clock = self.clock.clone();
             let completions = stream! {
                 for item in completed {
-                    yield item;
+                    yield OutboundBatchDriverEvent::Item(item);
+                }
+
+                if cutoff_reached {
+                    yield OutboundBatchDriverEvent::Cutoff;
+                    return;
                 }
 
                 while !pending.is_empty() && !cutoff.is_expired_at(clock.now()) {
@@ -575,12 +581,17 @@ mod fastly_impl {
                         cutoff,
                         outcome,
                     ) else {
+                        yield OutboundBatchDriverEvent::Cutoff;
                         return;
                     };
-                    yield item;
+                    yield OutboundBatchDriverEvent::Item(item);
+                }
+
+                if !pending.is_empty() {
+                    yield OutboundBatchDriverEvent::Cutoff;
                 }
             };
-            OutboundBatch::from_stream(slot_count, completions)
+            OutboundBatch::from_driver(slot_count, completions)
         }
     }
 
@@ -1395,7 +1406,8 @@ mod fastly_impl {
                         ),
                     )
                     .collect(),
-            );
+            )
+            .expect("valid batch driver");
             let slot = results.slots[0].as_ref().expect("resolved slot");
 
             assert_eq!(slot.elapsed, Duration::from_millis(9));
@@ -1433,7 +1445,8 @@ mod fastly_impl {
                         ),
                     )
                     .collect(),
-            );
+            )
+            .expect("valid batch driver");
             let first_slot = results.slots[0].as_ref().expect("first resolved slot");
             let second_slot = results.slots[1].as_ref().expect("second resolved slot");
 
@@ -1468,7 +1481,8 @@ mod fastly_impl {
                         ),
                     )
                     .collect(),
-            );
+            )
+            .expect("valid batch driver");
             let batched_outcome = batch
                 .slots
                 .into_iter()
@@ -1507,7 +1521,8 @@ mod fastly_impl {
                         ),
                     )
                     .collect(),
-            );
+            )
+            .expect("valid batch driver");
             let slot = results.slots[0].as_ref().expect("resolved slot");
 
             assert_eq!(slot.elapsed, Duration::ZERO);

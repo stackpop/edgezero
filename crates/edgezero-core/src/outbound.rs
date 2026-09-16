@@ -9,7 +9,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt as _;
-use futures_util::stream::{LocalBoxStream, Stream};
+use futures_util::stream::{LocalBoxStream, Stream, iter};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
@@ -109,16 +109,51 @@ pub struct OutboundBatchItem {
     pub result: OutboundSlotResult,
 }
 
-/// Ordered terminal batch slots. `None` identifies a slot unresolved at the batch cutoff.
+/// Ordered terminal batch slots and the reason collection stopped.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct OutboundBatchResults {
+    /// Index-aligned terminal results. `None` is valid only when termination is
+    /// [`OutboundBatchTermination::Cutoff`].
     pub slots: Vec<Option<OutboundSlotResult>>,
+    /// Why the batch stopped producing terminal results.
+    pub termination: OutboundBatchTermination,
+}
+
+/// Why an outbound batch stopped producing terminal slot results.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum OutboundBatchTermination {
+    /// Every input slot produced exactly one terminal result.
+    Completed,
+    /// The method-level observation cutoff won while one or more slots remained unresolved.
+    Cutoff,
+}
+
+/// One observable step from an outbound batch.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum OutboundBatchNext {
+    /// The batch reached its normal or cutoff terminal state.
+    Finished(OutboundBatchTermination),
+    /// One newly terminal slot.
+    Item(OutboundBatchItem),
+}
+
+/// Adapter-to-core batch driver protocol.
+#[doc(hidden)]
+pub enum OutboundBatchDriverEvent {
+    /// The method-level observation cutoff won before every slot became terminal.
+    Cutoff,
+    /// One newly terminal slot from an adapter driver.
+    Item(OutboundBatchItem),
 }
 
 /// Adapter-owned outbound work observed in completion order.
 pub struct OutboundBatch {
-    stream: LocalBoxStream<'static, OutboundBatchItem>,
+    poisoned: bool,
+    stream: LocalBoxStream<'static, OutboundBatchDriverEvent>,
+    termination: Option<OutboundBatchTermination>,
     unresolved: Vec<bool>,
 }
 
@@ -127,7 +162,9 @@ impl OutboundBatch {
     #[must_use]
     #[inline]
     pub fn cancel(self) -> Vec<usize> {
-        let Self { stream, unresolved } = self;
+        let Self {
+            stream, unresolved, ..
+        } = self;
         drop(stream);
         unresolved
             .iter()
@@ -136,52 +173,106 @@ impl OutboundBatch {
             .collect()
     }
 
-    /// Drives the batch to its adapter-defined cutoff and restores input index order.
+    /// Drives the batch to normal completion or cutoff and restores input index order.
+    ///
+    /// # Errors
+    /// Returns an internal error if the adapter driver ends prematurely or emits an invalid or
+    /// duplicate slot index.
     #[inline]
-    pub async fn collect(mut self) -> OutboundBatchResults {
+    pub async fn collect(mut self) -> Result<OutboundBatchResults, EdgeError> {
         let mut slots = iter::repeat_with(|| None)
             .take(self.unresolved.len())
             .collect::<Vec<_>>();
-        while let Some(item) = self.next().await {
-            if let Some(slot) = slots.get_mut(item.index) {
-                *slot = Some(item.result);
+        loop {
+            match self.next().await? {
+                OutboundBatchNext::Item(item) => {
+                    let slot = slots.get_mut(item.index).ok_or_else(|| {
+                        batch_driver_error("validated outbound batch index became invalid")
+                    })?;
+                    *slot = Some(item.result);
+                }
+                OutboundBatchNext::Finished(termination) => {
+                    return Ok(OutboundBatchResults { slots, termination });
+                }
             }
         }
-        OutboundBatchResults { slots }
     }
 
-    /// Builds a batch from an adapter-owned completion stream.
+    /// Builds an already-cut-off batch without polling adapter transport work.
     #[doc(hidden)]
     #[must_use]
     #[inline]
-    pub fn from_stream<StreamValue>(slot_count: usize, stream: StreamValue) -> Self
+    pub fn cutoff(slot_count: usize) -> Self {
+        Self::from_driver(slot_count, iter([OutboundBatchDriverEvent::Cutoff]))
+    }
+
+    /// Builds a batch from an adapter-owned driver stream.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn from_driver<StreamValue>(slot_count: usize, stream: StreamValue) -> Self
     where
-        StreamValue: Stream<Item = OutboundBatchItem> + 'static,
+        StreamValue: Stream<Item = OutboundBatchDriverEvent> + 'static,
     {
         Self {
+            poisoned: false,
             stream: stream.boxed_local(),
+            termination: (slot_count == 0).then_some(OutboundBatchTermination::Completed),
             unresolved: vec![true; slot_count],
         }
     }
 
-    /// Returns the next newly terminal slot in adapter-observed completion order.
+    /// Returns the next newly terminal slot or the typed batch termination reason.
     ///
-    /// Cancelling the returned future does not consume a ready slot. An adapter stream ending
-    /// before every slot resolves leaves those slots unresolved for [`Self::collect`] or
-    /// [`Self::cancel`].
+    /// Cancelling the returned future does not consume a ready slot.
+    ///
+    /// # Errors
+    /// Returns an internal error if the adapter driver ends prematurely or emits an invalid or
+    /// duplicate slot index.
     #[inline]
-    pub async fn next(&mut self) -> Option<OutboundBatchItem> {
-        while let Some(item) = self.stream.next().await {
-            let Some(unresolved) = self.unresolved.get_mut(item.index) else {
-                continue;
-            };
-            if !*unresolved {
-                continue;
-            }
-            *unresolved = false;
-            return Some(item);
+    pub async fn next(&mut self) -> Result<OutboundBatchNext, EdgeError> {
+        if self.poisoned {
+            return Err(batch_driver_error(
+                "outbound batch driver was polled after an invariant failure",
+            ));
         }
-        None
+        if let Some(termination) = self.termination {
+            return Ok(OutboundBatchNext::Finished(termination));
+        }
+
+        match self.stream.next().await {
+            Some(OutboundBatchDriverEvent::Item(item)) => {
+                let Some(unresolved) = self.unresolved.get_mut(item.index) else {
+                    self.poisoned = true;
+                    return Err(batch_driver_error(
+                        "outbound batch driver emitted an out-of-range slot index",
+                    ));
+                };
+                if !*unresolved {
+                    self.poisoned = true;
+                    return Err(batch_driver_error(
+                        "outbound batch driver emitted a duplicate slot index",
+                    ));
+                }
+                *unresolved = false;
+                if !self.unresolved.iter().any(|is_unresolved| *is_unresolved) {
+                    self.termination = Some(OutboundBatchTermination::Completed);
+                }
+                Ok(OutboundBatchNext::Item(item))
+            }
+            Some(OutboundBatchDriverEvent::Cutoff) => {
+                self.termination = Some(OutboundBatchTermination::Cutoff);
+                Ok(OutboundBatchNext::Finished(
+                    OutboundBatchTermination::Cutoff,
+                ))
+            }
+            None => {
+                self.poisoned = true;
+                Err(batch_driver_error(
+                    "outbound batch driver ended before every slot resolved",
+                ))
+            }
+        }
     }
 }
 
@@ -317,12 +408,16 @@ impl HttpClient {
     }
 
     /// Collects a completion-driven batch into original request order.
+    ///
+    /// # Errors
+    /// Returns an internal error if the adapter batch driver violates its slot or termination
+    /// invariants.
     #[inline]
     pub async fn send_all_until(
         &self,
         requests: Vec<OutboundRequest>,
         cutoff: Deadline,
-    ) -> OutboundBatchResults {
+    ) -> Result<OutboundBatchResults, EdgeError> {
         self.start_batch_until(requests, cutoff).collect().await
     }
 
@@ -945,6 +1040,11 @@ impl OutboundRequest {
     }
 }
 
+#[inline]
+fn batch_driver_error(message: &'static str) -> EdgeError {
+    EdgeError::internal(anyhow::anyhow!(message))
+}
+
 fn invalid_host_authority_override() -> EdgeError {
     EdgeError::bad_request("invalid outbound host authority override")
 }
@@ -1528,9 +1628,10 @@ mod tests {
     };
 
     use super::{
-        HttpClient, OutboundBatch, OutboundBatchItem, OutboundCachePolicy, OutboundHttpClient,
-        OutboundRequest, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
-        ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
+        HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundBatchNext,
+        OutboundBatchTermination, OutboundCachePolicy, OutboundHttpClient, OutboundRequest,
+        OutboundResponse, OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition,
+        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
         enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
         limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
         validate_for_dispatch,
@@ -1594,8 +1695,21 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             items.reverse();
-            OutboundBatch::from_stream(slot_count, stream::iter(items))
+            OutboundBatch::from_driver(
+                slot_count,
+                stream::iter(items.into_iter().map(OutboundBatchDriverEvent::Item)),
+            )
         }
+    }
+
+    fn batch_item(index: usize) -> OutboundBatchItem {
+        OutboundBatchItem::new(
+            index,
+            OutboundSlotResult::new(
+                Duration::from_millis(u64::try_from(index).expect("index")),
+                Ok(response_with_body(Body::empty())),
+            ),
+        )
     }
 
     #[expect(
@@ -1852,8 +1966,10 @@ mod tests {
         assert_eq!(response.body().as_bytes(), Some(b"single".as_slice()));
 
         let empty =
-            block_on(client.send_all_until(Vec::new(), Deadline::after(Duration::from_secs(1))));
+            block_on(client.send_all_until(Vec::new(), Deadline::after(Duration::from_secs(1))))
+                .expect("valid empty batch");
         assert!(empty.slots.is_empty());
+        assert_eq!(empty.termination, OutboundBatchTermination::Completed);
     }
 
     #[test]
@@ -1871,18 +1987,30 @@ mod tests {
 
         let cutoff = Deadline::after(Duration::from_secs(1));
         let mut batch = client.start_batch_until(requests, cutoff);
-        let first = block_on(batch.next()).expect("first completion");
+        let OutboundBatchNext::Item(first) = block_on(batch.next()).expect("valid batch driver")
+        else {
+            panic!("expected first completion");
+        };
         assert_eq!(first.index, 2);
         assert_eq!(first.result.elapsed, Duration::from_millis(3));
-        let second = block_on(batch.next()).expect("second completion");
+        let OutboundBatchNext::Item(second) = block_on(batch.next()).expect("valid batch driver")
+        else {
+            panic!("expected second completion");
+        };
         assert_eq!(second.index, 1);
         assert!(matches!(
             second.result.outcome,
             Err(EdgeError::BadGateway { .. })
         ));
-        let third = block_on(batch.next()).expect("third completion");
+        let OutboundBatchNext::Item(third) = block_on(batch.next()).expect("valid batch driver")
+        else {
+            panic!("expected third completion");
+        };
         assert_eq!(third.index, 0);
-        assert!(block_on(batch.next()).is_none());
+        assert!(matches!(
+            block_on(batch.next()).expect("valid batch driver"),
+            OutboundBatchNext::Finished(OutboundBatchTermination::Completed)
+        ));
 
         let requests = vec![
             OutboundRequest::get("https://example.com/one").expect("one"),
@@ -1890,7 +2018,9 @@ mod tests {
                 .expect("two"),
             OutboundRequest::post("https://example.com/three").expect("three"),
         ];
-        let results = block_on(client.send_all_until(requests, cutoff));
+        let results =
+            block_on(client.send_all_until(requests, cutoff)).expect("valid batch driver");
+        assert_eq!(results.termination, OutboundBatchTermination::Completed);
         assert_eq!(results.slots.len(), 3);
         assert_eq!(
             results.slots[0].as_ref().expect("first slot").elapsed,
@@ -1924,7 +2054,7 @@ mod tests {
 
     #[test]
     fn batch_next_is_cancellation_safe_and_cancel_reports_unresolved_indices() {
-        fn poll_next_once(batch: &mut OutboundBatch) -> Poll<Option<OutboundBatchItem>> {
+        fn poll_next_once(batch: &mut OutboundBatch) -> Poll<Result<OutboundBatchNext, EdgeError>> {
             let next = batch.next();
             pin_mut!(next);
             let waker = noop_waker_ref();
@@ -1938,43 +2068,81 @@ mod tests {
             let current = observed_poll_count.get();
             observed_poll_count.set(current.saturating_add(1));
             if current == 1 {
-                Poll::Ready(Some(OutboundBatchItem {
+                Poll::Ready(Some(OutboundBatchDriverEvent::Item(OutboundBatchItem {
                     index: 1,
                     result: OutboundSlotResult::new(
                         Duration::from_millis(2),
                         Err(EdgeError::bad_gateway("second")),
                     ),
-                }))
+                })))
             } else {
                 Poll::Pending
             }
         });
-        let mut batch = OutboundBatch::from_stream(3, source);
+        let mut batch = OutboundBatch::from_driver(3, source);
 
         assert!(poll_next_once(&mut batch).is_pending());
 
-        let item = block_on(batch.next()).expect("item survives cancelled next future");
+        let OutboundBatchNext::Item(item) =
+            block_on(batch.next()).expect("item survives cancelled next future")
+        else {
+            panic!("expected terminal item");
+        };
         assert_eq!(item.index, 1);
         assert_eq!(batch.cancel(), vec![0, 2]);
     }
 
     #[test]
-    fn batch_collection_marks_slots_missing_when_driver_ends_before_completion() {
-        let batch = OutboundBatch::from_stream(
+    fn batch_collection_reports_cutoff_and_preserves_unresolved_slots() {
+        let batch = OutboundBatch::from_driver(
             3,
-            stream::iter([OutboundBatchItem {
-                index: 2,
-                result: OutboundSlotResult::new(
-                    Duration::from_millis(3),
-                    Err(EdgeError::bad_gateway("third")),
-                ),
-            }]),
+            stream::iter([
+                OutboundBatchDriverEvent::Item(batch_item(2)),
+                OutboundBatchDriverEvent::Cutoff,
+            ]),
         );
 
-        let results = block_on(batch.collect());
+        let results = block_on(batch.collect()).expect("valid cutoff");
+        assert_eq!(results.termination, OutboundBatchTermination::Cutoff);
         assert!(results.slots[0].is_none());
         assert!(results.slots[1].is_none());
         assert!(results.slots[2].is_some());
+    }
+
+    #[test]
+    fn batch_collection_rejects_premature_driver_end() {
+        let batch = OutboundBatch::from_driver(
+            3,
+            stream::iter([OutboundBatchDriverEvent::Item(batch_item(2))]),
+        );
+
+        let error = block_on(batch.collect()).expect_err("premature EOF must fail");
+        assert!(matches!(error, EdgeError::Internal { .. }));
+    }
+
+    #[test]
+    fn batch_collection_rejects_duplicate_driver_indices() {
+        let batch = OutboundBatch::from_driver(
+            2,
+            stream::iter([
+                OutboundBatchDriverEvent::Item(batch_item(0)),
+                OutboundBatchDriverEvent::Item(batch_item(0)),
+            ]),
+        );
+
+        let error = block_on(batch.collect()).expect_err("duplicate index must fail");
+        assert!(matches!(error, EdgeError::Internal { .. }));
+    }
+
+    #[test]
+    fn batch_collection_rejects_out_of_range_driver_indices() {
+        let batch = OutboundBatch::from_driver(
+            2,
+            stream::iter([OutboundBatchDriverEvent::Item(batch_item(2))]),
+        );
+
+        let error = block_on(batch.collect()).expect_err("out-of-range index must fail");
+        assert!(matches!(error, EdgeError::Internal { .. }));
     }
 
     #[test]
