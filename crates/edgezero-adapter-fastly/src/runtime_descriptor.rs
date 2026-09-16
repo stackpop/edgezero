@@ -167,15 +167,7 @@ impl RuntimeDescriptor {
         stores: StoresMetadata,
     ) -> Result<EnvConfig, RuntimeDescriptorError> {
         let allowed_keys = runtime_value_kinds(stores);
-        for (key, value) in &self.entries {
-            let Some(kind) = allowed_keys.get(key) else {
-                return Err(RuntimeDescriptorError::UnsupportedEntry { key: key.clone() });
-            };
-            if !kind.accepts(value) {
-                return Err(RuntimeDescriptorError::InvalidValue { key: key.clone() });
-            }
-        }
-        Ok(EnvConfig::from_vars(self.entries.iter()))
+        validated_env_from_entries(&self.entries, &allowed_keys)
     }
 }
 
@@ -364,6 +356,44 @@ impl RuntimeValueKind {
     }
 }
 
+#[cfg(feature = "cli")]
+pub(crate) fn validated_deploy_env<I, K, V>(
+    variables: I,
+    config_ids: &[String],
+    kv_ids: &[String],
+    secret_ids: &[String],
+) -> Result<EnvConfig, RuntimeDescriptorError>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    let allowed_keys = runtime_value_kinds_for_ids(config_ids, kv_ids, secret_ids);
+    let mut entries = BTreeMap::new();
+    for (raw_key, value) in variables {
+        let key_name = raw_key.as_ref();
+        if allowed_keys.contains_key(key_name) {
+            entries.insert(key_name.to_owned(), value.into());
+        }
+    }
+    validated_env_from_entries(&entries, &allowed_keys)
+}
+
+fn validated_env_from_entries(
+    entries: &BTreeMap<String, String>,
+    allowed_keys: &BTreeMap<String, RuntimeValueKind>,
+) -> Result<EnvConfig, RuntimeDescriptorError> {
+    for (key, value) in entries {
+        let Some(kind) = allowed_keys.get(key) else {
+            return Err(RuntimeDescriptorError::UnsupportedEntry { key: key.clone() });
+        };
+        if !kind.accepts(value) {
+            return Err(RuntimeDescriptorError::InvalidValue { key: key.clone() });
+        }
+    }
+    Ok(EnvConfig::from_vars(entries.iter()))
+}
+
 fn is_managed_store_name_key(key: &str) -> bool {
     let mut segments = key.split("__");
     matches!(segments.next(), Some("EDGEZERO"))
@@ -464,33 +494,75 @@ fn missing_runtime_env_config(
 }
 
 fn runtime_value_kinds(stores: StoresMetadata) -> BTreeMap<String, RuntimeValueKind> {
+    runtime_value_kinds_from_ids(
+        stores
+            .config
+            .into_iter()
+            .flat_map(|metadata| metadata.ids.iter().copied()),
+        stores
+            .kv
+            .into_iter()
+            .flat_map(|metadata| metadata.ids.iter().copied()),
+        stores
+            .secrets
+            .into_iter()
+            .flat_map(|metadata| metadata.ids.iter().copied()),
+    )
+}
+
+#[cfg(feature = "cli")]
+fn runtime_value_kinds_for_ids(
+    config_ids: &[String],
+    kv_ids: &[String],
+    secret_ids: &[String],
+) -> BTreeMap<String, RuntimeValueKind> {
+    runtime_value_kinds_from_ids(
+        config_ids.iter().map(String::as_str),
+        kv_ids.iter().map(String::as_str),
+        secret_ids.iter().map(String::as_str),
+    )
+}
+
+fn runtime_value_kinds_from_ids<'ids, C, K, S>(
+    config_ids: C,
+    kv_ids: K,
+    secret_ids: S,
+) -> BTreeMap<String, RuntimeValueKind>
+where
+    C: IntoIterator<Item = &'ids str>,
+    K: IntoIterator<Item = &'ids str>,
+    S: IntoIterator<Item = &'ids str>,
+{
     let mut allowed_keys = FIXED_RUNTIME_KEYS
         .into_iter()
         .map(|(key, kind)| (key.to_owned(), kind))
         .collect::<BTreeMap<_, _>>();
-    for (kind, metadata_option) in [
-        ("CONFIG", stores.config),
-        ("KV", stores.kv),
-        ("SECRETS", stores.secrets),
-    ] {
-        let Some(store_metadata) = metadata_option else {
-            continue;
-        };
-        for store_id in store_metadata.ids {
-            let canonical_id = store_id.to_ascii_uppercase();
+    add_runtime_store_value_kinds(&mut allowed_keys, "CONFIG", config_ids);
+    add_runtime_store_value_kinds(&mut allowed_keys, "KV", kv_ids);
+    add_runtime_store_value_kinds(&mut allowed_keys, "SECRETS", secret_ids);
+    allowed_keys
+}
+
+fn add_runtime_store_value_kinds<'ids, I>(
+    allowed_keys: &mut BTreeMap<String, RuntimeValueKind>,
+    kind: &str,
+    ids: I,
+) where
+    I: IntoIterator<Item = &'ids str>,
+{
+    for store_id in ids {
+        let canonical_id = store_id.to_ascii_uppercase();
+        allowed_keys.insert(
+            format!("EDGEZERO__STORES__{kind}__{canonical_id}__NAME"),
+            RuntimeValueKind::NonblankPrintable,
+        );
+        if kind == "CONFIG" {
             allowed_keys.insert(
-                format!("EDGEZERO__STORES__{kind}__{canonical_id}__NAME"),
+                format!("EDGEZERO__STORES__{kind}__{canonical_id}__KEY"),
                 RuntimeValueKind::NonblankPrintable,
             );
-            if kind == "CONFIG" {
-                allowed_keys.insert(
-                    format!("EDGEZERO__STORES__{kind}__{canonical_id}__KEY"),
-                    RuntimeValueKind::NonblankPrintable,
-                );
-            }
         }
     }
-    allowed_keys
 }
 
 #[cfg(test)]

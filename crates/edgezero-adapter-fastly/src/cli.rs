@@ -20,13 +20,14 @@ use crate::chunked_config::{
     prior_chunk_keys, resolve_fastly_config_value_typed, sha256_hex, value_announces_our_kind,
     value_is_future_format, value_is_inert_foreign, verify_writer_split_layout,
 };
+use crate::runtime_descriptor::validated_deploy_env;
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterDeployContext, AdapterPushContext, DeployStoreIds,
-    ProvisionStores, ReadConfigEntry, ResolvedStoreId, register_adapter,
+    Adapter, AdapterAction, AdapterDeployContext, AdapterPushContext, DeployOwnership,
+    DeployStoreIds, ProvisionStores, ReadConfigEntry, ResolvedStoreId, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -161,29 +162,9 @@ const FASTLY_API_MAX_TIME_SECS: u64 = 30;
 /// curl's exit code for an operation that exceeded `--connect-timeout`/`--max-time`.
 const CURL_EXIT_TIMEOUT: i32 = 28;
 
-/// Flags `fastly compute update` accepts that take a VALUE (either
-/// `--flag value` or `--flag=value`). Verified against
-/// `fastly compute update --help` (Fastly CLI v15): the command's
-/// `--service-id`/`-s`, `--service-name`, `--package`/`-p`, `--version`,
-/// plus the global `--token`/`-t`.
-const COMPUTE_UPDATE_VALUE_FLAGS: &[&str] = &[
-    "--service-id",
-    "-s",
-    "--service-name",
-    "--package",
-    "-p",
-    "--version",
-    "--token",
-    "-t",
-];
-
-/// Boolean flags `fastly compute update` accepts: the command's
-/// `--autoclone` plus the Fastly CLI globals. NOTE the absence of
-/// `--comment` -- `compute update` does NOT support it (unlike
-/// `compute deploy`), which is why an operator `--comment` is routed to
-/// `service-version update` instead (see `deploy_staged`).
-const COMPUTE_UPDATE_BOOL_FLAGS: &[&str] = &[
-    "--autoclone",
+/// Non-targeting Fastly CLI global booleans accepted by the managed deploy
+/// path. Lifecycle-owned `--autoclone` is deliberately absent.
+const MANAGED_DEPLOY_GLOBAL_BOOL_FLAGS: &[&str] = &[
     "--accept-defaults",
     "-d",
     "--auto-yes",
@@ -205,19 +186,11 @@ const FUTURE_FORMAT_READ_ERROR: &str = "the remote value uses a config format th
 
 struct FastlyCliAdapter;
 
-/// An operator passthrough arg list split for a staged deploy (see
-/// `split_staged_passthrough`).
-struct StagedPassthrough {
-    /// The `--comment` value, applied to the version separately via
-    /// `fastly service-version update --comment` (`compute update` has
-    /// no `--comment` flag).
+#[derive(Debug, Eq, PartialEq)]
+struct ManagedDeployArgs {
     comment: Option<String>,
-    /// Args `compute update` does not support; dropped with a warning
-    /// rather than forwarded (forwarding them makes the CLI exit
-    /// non-zero and fails the whole staged deploy).
-    dropped: Vec<String>,
-    /// Args that `fastly compute update` actually supports.
-    forwarded: Vec<String>,
+    globals: Vec<String>,
+    package: Option<String>,
 }
 
 /// Outcome of scanning `fastly config-store list --json` for a
@@ -416,6 +389,8 @@ impl From<&DeployStoreIds> for RuntimeStoreIds {
 )]
 impl Adapter for FastlyCliAdapter {
     fn deploy(&self, context: &AdapterDeployContext, args: &[String]) -> Result<(), String> {
+        validate_effective_deploy_service_id(context)?;
+        scan_reserved_deploy_args(args)?;
         if context.staging {
             deploy_staged_with_context(context, args)
         } else {
@@ -521,6 +496,16 @@ impl Adapter for FastlyCliAdapter {
         // here, before the remote read, instead of after it.
         prepare_fastly_config_entries(key, body)?;
         Ok(())
+    }
+
+    fn preflight_deploy(
+        &self,
+        context: &AdapterDeployContext,
+        args: &[String],
+    ) -> Result<DeployOwnership, String> {
+        validate_effective_deploy_service_id(context)?;
+        scan_reserved_deploy_args(args)?;
+        Ok(DeployOwnership::ManifestCommand)
     }
 
     fn provision(
@@ -1610,8 +1595,8 @@ fn looks_like_already_exists(stderr: &str, kind: &str) -> bool {
 
 /// Read the top-level `service_id` from `fastly.toml`. Returns
 /// `Ok(None)` when the file is absent (scaffold state before first
-/// `fastly compute deploy`) or when `service_id` is missing /
-/// empty. Used by `provision` to detect when an already-deployed
+/// `fastly compute deploy`) or when `service_id` is missing. Used by
+/// `provision` to detect when an already-deployed
 /// service needs a separate resource-link step beyond `[setup]`
 /// (which `compute deploy` only consumes on the FIRST deploy).
 fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
@@ -1629,8 +1614,7 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
     let svc = doc
         .get("service_id")
         .and_then(|item| item.as_str())
-        .map(str::to_owned)
-        .filter(|svc_id| !svc_id.is_empty());
+        .map(str::to_owned);
     Ok(svc)
 }
 
@@ -1638,6 +1622,12 @@ fn select_fastly_service_id(
     manifest_id: Option<String>,
     environment_id: Option<String>,
 ) -> Result<Option<SelectedFastlyService>, String> {
+    if let Some(manifest) = manifest_id.as_deref() {
+        validate_service_id(manifest)?;
+    }
+    if let Some(environment) = environment_id.as_deref() {
+        validate_service_id(environment)?;
+    }
     if let (Some(manifest), Some(environment)) = (&manifest_id, &environment_id)
         && manifest != environment
     {
@@ -1657,17 +1647,20 @@ fn select_fastly_service_id(
         }),
         (None, None) => None,
     };
-    if let Some(service) = &selected {
-        validate_service_id(&service.id)?;
-    }
     Ok(selected)
 }
 
 fn effective_fastly_service_id(path: &Path) -> Result<Option<SelectedFastlyService>, String> {
     let manifest_id = read_fastly_service_id(path)?;
-    let environment_id = env::var(FASTLY_SERVICE_ID_ENV)
-        .ok()
-        .filter(|id| !id.is_empty());
+    let environment_id = match env::var(FASTLY_SERVICE_ID_ENV) {
+        Ok(id) => Some(id),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "invalid service id from {FASTLY_SERVICE_ID_ENV}: expected ASCII letters and digits only"
+            ));
+        }
+    };
     select_fastly_service_id(manifest_id, environment_id)
 }
 
@@ -4197,16 +4190,24 @@ fn deploy_with_context(
     context: &AdapterDeployContext,
     extra_args: &[String],
 ) -> Result<(), String> {
-    let manifest_dir = resolve_deploy_manifest_dir(context)?;
+    let manifest_path = resolve_deploy_manifest_path(context)?;
+    validate_deploy_service_id_for_manifest(context, &manifest_path)?;
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "fastly manifest path {} has no parent directory",
+            manifest_path.display()
+        )
+    })?;
     let without_manifest = args_without_flag_value(extra_args, "--manifest-path");
     let mut forwarded = args_without_flag_value(&without_manifest, "--service-id");
+    scan_reserved_deploy_args(&forwarded)?;
     if let Some(service_id) = context.service_id.as_deref() {
         forwarded.extend(["--service-id".to_owned(), service_id.to_owned()]);
     }
 
     let status = Command::new("fastly")
         .args(build_compute_deploy_args(&forwarded))
-        .current_dir(&manifest_dir)
+        .current_dir(manifest_dir)
         .status()
         .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
@@ -4388,54 +4389,111 @@ fn args_without_flag_value(args: &[String], flag: &str) -> Vec<String> {
     out
 }
 
-/// Split an arg on a leading `--flag=value`, returning `(flag, value)`.
-fn split_inline_value(arg: &str) -> (&str, Option<&str>) {
-    match arg.split_once('=') {
-        Some((flag, value)) if flag.starts_with('-') => (flag, Some(value)),
-        Some(_) | None => (arg, None),
-    }
-}
-
-/// Partition operator passthrough args for a staged deploy: forward only
-/// what `fastly compute update` supports, lift `--comment` out (it is a
-/// `compute deploy` / `service-version update` flag, NOT a
-/// `compute update` one), and drop the rest.
-///
-/// Both `--comment value` and `--comment=value` are recognised.
-fn split_staged_passthrough(args: &[String]) -> StagedPassthrough {
-    let mut split = StagedPassthrough {
-        forwarded: Vec::with_capacity(args.len()),
-        comment: None,
-        dropped: Vec::new(),
-    };
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        let (flag, inline) = split_inline_value(arg);
-        if flag == "--comment" {
-            split.comment = match inline {
-                Some(value) => Some(value.to_owned()),
-                None => iter.next().cloned(),
-            };
-        } else if COMPUTE_UPDATE_VALUE_FLAGS.contains(&flag) {
-            split.forwarded.push(arg.clone());
-            if inline.is_none()
-                && let Some(value) = iter.next()
-            {
-                split.forwarded.push(value.clone());
-            }
-        } else if COMPUTE_UPDATE_BOOL_FLAGS.contains(&flag) {
-            split.forwarded.push(arg.clone());
-        } else {
-            // Unsupported by `compute update`. Consume a detached value
-            // too, so a stray `stage` from `--env stage` is not left
-            // behind as a bogus positional.
-            split.dropped.push(flag.to_owned());
-            if inline.is_none() && iter.peek().is_some_and(|next| !next.starts_with('-')) {
-                iter.next();
-            }
+fn scan_reserved_deploy_args(args: &[String]) -> Result<(), String> {
+    for arg in args {
+        let reserved_flag = match arg.as_str() {
+            "--service-id" | "-s" | "--service-name" | "--version" | "--autoclone" | "--token"
+            | "-t" => Some(arg.as_str()),
+            value if value.starts_with("--service-id=") => Some("--service-id"),
+            value if value.starts_with("--service-name=") => Some("--service-name"),
+            value if value.starts_with("--version=") => Some("--version"),
+            value if value.starts_with("--autoclone=") => Some("--autoclone"),
+            value if value.starts_with("--token=") => Some("--token"),
+            value if value.starts_with("-s") && value.len() > 2 => Some("-s"),
+            value if value.starts_with("-t") && value.len() > 2 => Some("-t"),
+            _ => None,
+        };
+        if let Some(flag) = reserved_flag {
+            return Err(format!(
+                "Fastly deploy argument `{flag}` is reserved for the EdgeZero deployment lifecycle"
+            ));
         }
     }
-    split
+    Ok(())
+}
+
+fn set_managed_deploy_value(
+    slot: &mut Option<String>,
+    flag: &str,
+    value: &str,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!(
+            "Fastly deploy argument `{flag}` requires a non-empty value"
+        ));
+    }
+    if slot.is_some() {
+        return Err(format!(
+            "Fastly deploy argument `{flag}` may be provided only once"
+        ));
+    }
+    *slot = Some(value.to_owned());
+    Ok(())
+}
+
+fn detached_managed_deploy_value<'args>(
+    args: &'args [String],
+    index: usize,
+    flag: &str,
+) -> Result<&'args str, String> {
+    let value = args
+        .get(index.saturating_add(1))
+        .ok_or_else(|| format!("Fastly deploy argument `{flag}` requires a value"))?;
+    if value.is_empty() || value.starts_with('-') {
+        return Err(format!(
+            "Fastly deploy argument `{flag}` requires a non-empty value"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_managed_deploy_args(args: &[String]) -> Result<ManagedDeployArgs, String> {
+    scan_reserved_deploy_args(args)?;
+    let mut parsed = ManagedDeployArgs {
+        comment: None,
+        globals: Vec::new(),
+        package: None,
+    };
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--comment" {
+            let value = detached_managed_deploy_value(args, index, "--comment")?;
+            set_managed_deploy_value(&mut parsed.comment, "--comment", value)?;
+            index = index.saturating_add(2);
+        } else if let Some(value) = arg.strip_prefix("--comment=") {
+            set_managed_deploy_value(&mut parsed.comment, "--comment", value)?;
+            index = index.saturating_add(1);
+        } else if arg == "--package" || arg == "-p" {
+            let value = detached_managed_deploy_value(args, index, arg)?;
+            set_managed_deploy_value(&mut parsed.package, "--package/-p", value)?;
+            index = index.saturating_add(2);
+        } else if let Some(value) = arg.strip_prefix("--package=") {
+            set_managed_deploy_value(&mut parsed.package, "--package/-p", value)?;
+            index = index.saturating_add(1);
+        } else if let Some(value) = arg.strip_prefix("-p=") {
+            set_managed_deploy_value(&mut parsed.package, "--package/-p", value)?;
+            index = index.saturating_add(1);
+        } else if let Some(value) = arg.strip_prefix("-p") {
+            set_managed_deploy_value(&mut parsed.package, "--package/-p", value)?;
+            index = index.saturating_add(1);
+        } else if MANAGED_DEPLOY_GLOBAL_BOOL_FLAGS.contains(&arg.as_str()) {
+            parsed.globals.push(arg.clone());
+            index = index.saturating_add(1);
+        } else if let Some((flag, _)) = arg.split_once('=')
+            && MANAGED_DEPLOY_GLOBAL_BOOL_FLAGS.contains(&flag)
+        {
+            return Err(format!(
+                "Fastly boolean deploy argument `{flag}` does not accept a value"
+            ));
+        } else if arg.starts_with('-') {
+            return Err(format!("unsupported Fastly deploy argument {arg:?}"));
+        } else {
+            return Err(format!(
+                "unexpected positional Fastly deploy argument {arg:?}"
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 /// Resolve the target service id from `--service-id` or, failing that,
@@ -4447,6 +4505,45 @@ fn resolve_service_id(args: &[String]) -> Result<String, String> {
     env::var(FASTLY_SERVICE_ID_ENV).map_err(|_err| {
         format!("no service id: pass `--service-id <id>` or set {FASTLY_SERVICE_ID_ENV}")
     })
+}
+
+fn validate_effective_deploy_service_id(context: &AdapterDeployContext) -> Result<(), String> {
+    if let Some(service_id) = context.service_id.as_deref() {
+        return validate_service_id(service_id);
+    }
+    if let Some(manifest_path) = context.adapter_manifest_path.as_deref() {
+        return validate_deploy_service_id_for_manifest(context, manifest_path);
+    }
+    match env::var(FASTLY_SERVICE_ID_ENV) {
+        Ok(service_id) => validate_service_id(&service_id),
+        Err(env::VarError::NotPresent) => Ok(()),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "invalid service id from {FASTLY_SERVICE_ID_ENV}: expected ASCII letters and digits only"
+        )),
+    }
+}
+
+fn validate_deploy_service_id_for_manifest(
+    context: &AdapterDeployContext,
+    manifest_path: &Path,
+) -> Result<(), String> {
+    if let Some(service_id) = context.service_id.as_deref() {
+        return validate_service_id(service_id);
+    }
+    effective_fastly_service_id(manifest_path)?;
+    Ok(())
+}
+
+fn effective_deploy_environment(context: &AdapterDeployContext) -> Result<EnvConfig, String> {
+    let mut variables = context.variable_defaults.clone();
+    variables.extend(env::vars());
+    validated_deploy_env(
+        variables,
+        &context.stores.config,
+        &context.stores.kv,
+        &context.stores.secrets,
+    )
+    .map_err(|error| format!("invalid Fastly deploy environment: {error}"))
 }
 
 /// Read the required Fastly API token from the environment.
@@ -4919,20 +5016,16 @@ fn curl_quote(value: &str) -> String {
 }
 
 /// Validate an operator-supplied Fastly service id before it is
-/// interpolated into an API URL. Fastly service ids are opaque handles, so
-/// constrain them to `^[A-Za-z0-9_-]+$`.
+/// interpolated into an API URL. Fastly service ids contain only ASCII
+/// letters and digits.
 /// Values carrying a quote, newline, or space could inject curl options via
 /// the `--config` file.
 fn validate_service_id(id: &str) -> Result<(), String> {
-    if !id.is_empty()
-        && id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
+    if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_alphanumeric()) {
         Ok(())
     } else {
         Err(format!(
-            "invalid service id {id:?}: expected only ASCII letters, digits, `_`, or `-`"
+            "invalid service id {id:?}: expected ASCII letters and digits only"
         ))
     }
 }
@@ -5038,21 +5131,15 @@ fn legacy_deploy_context(args: &[String], staging: bool) -> AdapterDeployContext
 
 /// Resolve the directory containing the Fastly manifest selected by the
 /// application manifest. Fall back to discovery for direct adapter callers.
-fn resolve_deploy_manifest_dir(context: &AdapterDeployContext) -> Result<PathBuf, String> {
+fn resolve_deploy_manifest_path(context: &AdapterDeployContext) -> Result<PathBuf, String> {
     if let Some(path) = context.adapter_manifest_path.as_deref() {
-        return path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .ok_or_else(|| {
-                format!(
-                    "fastly manifest path {} has no parent directory",
-                    path.display()
-                )
-            });
+        return Ok(path.to_path_buf());
     }
-    let manifest =
-        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())
+}
+
+fn resolve_deploy_manifest_dir(context: &AdapterDeployContext) -> Result<PathBuf, String> {
+    let manifest = resolve_deploy_manifest_path(context)?;
     manifest
         .parent()
         .map(Path::to_path_buf)
@@ -5076,6 +5163,7 @@ fn deploy_staged_with_context(
         .clone()
         .map_or_else(|| resolve_service_id(&[]), Ok)?;
     validate_service_id(&service_id)?;
+    let environment = effective_deploy_environment(context)?;
     // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
     // with a clear message when it's missing rather than deep in a
     // `fastly compute update` error.
@@ -5084,21 +5172,14 @@ fn deploy_staged_with_context(
     let manifest_dir_buf = resolve_deploy_manifest_dir(context)?;
     let manifest_dir = manifest_dir_buf.as_path();
     let runtime_stores = RuntimeStoreIds::from(&context.stores);
-    // Strip legacy direct-call context flags, then keep only the passthrough flags
-    // `compute update` actually supports. `--comment` in particular is
-    // NOT a `compute update` flag — it is lifted out here and applied to
-    // the version below.
+    // Strip legacy direct-call context flags, then parse every remaining token
+    // through the managed allowlist. `--comment` is applied to the version
+    // separately because `compute update` does not support it.
     let extra = args_without_flag_value(
         &args_without_flag_value(args, "--service-id"),
         "--manifest-path",
     );
-    let passthrough = split_staged_passthrough(&extra);
-    if !passthrough.dropped.is_empty() {
-        log::warn!(
-            "[edgezero] ignoring deploy args not supported by `fastly compute update`: {}",
-            passthrough.dropped.join(" ")
-        );
-    }
+    let managed_args = parse_managed_deploy_args(&extra)?;
 
     // 1. Build the wasm package (no deploy / activation).
     run_fastly_status(
@@ -5120,8 +5201,11 @@ fn deploy_staged_with_context(
         format!("--service-id={service_id}"),
         "--version=active".to_owned(),
     ];
-    update.extend(passthrough.forwarded.iter().cloned());
-    if !has_non_interactive(&passthrough.forwarded) {
+    if let Some(package) = managed_args.package.as_deref() {
+        update.push(format!("--package={package}"));
+    }
+    update.extend(managed_args.globals.iter().cloned());
+    if !has_non_interactive(&managed_args.globals) {
         update.push("--non-interactive".to_owned());
     }
     let update_out = run_fastly_capture(&update, manifest_dir)?;
@@ -5144,7 +5228,7 @@ fn deploy_staged_with_context(
     //    with `service-version update`. Done BEFORE staging, while the
     //    version is still an editable draft (and without `--autoclone`,
     //    so it can never clone into yet another version).
-    if let Some(comment) = passthrough.comment.as_deref() {
+    if let Some(comment) = managed_args.comment.as_deref() {
         run_fastly_status(
             &[
                 "service-version".to_owned(),
@@ -5162,7 +5246,6 @@ fn deploy_staged_with_context(
     //    so this version reads the staging environment's store names and config
     //    key while production keeps its own. Done while the version is still an
     //    editable draft.
-    let environment = EnvConfig::from_env();
     relink_runtime_env_for_staging(
         &service_id,
         version,
@@ -5675,6 +5758,7 @@ mod tests {
     #[cfg(unix)]
     use edgezero_core::test_env::{EnvOverride, PathPrepend};
     use std::collections::{BTreeMap, HashSet};
+    use std::iter::once;
 
     #[cfg(unix)]
     use std::sync::Mutex;
@@ -5753,68 +5837,329 @@ mod tests {
         assert_eq!(resolve_service_id(&args).unwrap(), "SVCFROMARG");
     }
 
-    // ── `compute update` passthrough filtering (`--comment`) ─────────
+    // ── managed deploy argument validation ────────────────────────
 
     fn owned(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_owned()).collect()
     }
 
-    #[test]
-    fn split_staged_passthrough_lifts_comment_out_of_compute_update() {
-        // `fastly compute update` has NO `--comment` flag (verified against
-        // `fastly compute update --help`, CLI v15) — forwarding it makes the
-        // command exit non-zero and fails the whole staged deploy. It must be
-        // lifted out and applied via `service-version update` instead.
-        for args in [owned(&["--comment", "ci run 12"]), owned(&["--comment=x"])] {
-            let split = split_staged_passthrough(&args);
-            assert!(
-                !split
-                    .forwarded
-                    .iter()
-                    .any(|arg| arg.starts_with("--comment")),
-                "--comment must never reach `compute update`: {:?}",
-                split.forwarded
-            );
-            assert!(
-                split.comment.is_some(),
-                "comment must be captured: {args:?}"
-            );
+    #[cfg(unix)]
+    fn fake_provider_invocation_marker(marker: &Path) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().expect("provider fake dir");
+        for binary in ["fastly", "curl"] {
+            let script_path = dir.path().join(binary);
+            fs::write(
+                &script_path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> '{}'\nexit 0\n",
+                    marker.display()
+                ),
+            )
+            .expect("write provider fake");
+            let mut permissions = fs::metadata(&script_path)
+                .expect("provider fake metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).expect("chmod provider fake");
         }
-        assert_eq!(
-            split_staged_passthrough(&owned(&["--comment", "ci run 12"])).comment,
-            Some("ci run 12".to_owned())
+        dir
+    }
+
+    #[cfg(unix)]
+    fn assert_provider_not_invoked(marker: &Path) {
+        assert!(
+            !marker.exists()
+                || fs::read_to_string(marker)
+                    .expect("provider marker")
+                    .is_empty(),
+            "invalid input must be rejected before the provider fake is invoked: {}",
+            fs::read_to_string(marker).unwrap_or_default()
         );
-        assert_eq!(
-            split_staged_passthrough(&owned(&["--comment=x"])).comment,
-            Some("x".to_owned())
+    }
+
+    fn assert_service_id_error(error: &str) {
+        assert!(
+            error.contains("ASCII letters and digits only"),
+            "service-id error must state the exact accepted alphabet: {error}"
         );
     }
 
     #[test]
-    fn split_staged_passthrough_forwards_supported_flags_only() {
-        let args = owned(&[
-            "--package",
-            "pkg.tar.gz",
-            "--autoclone",
-            "--verbose",
-            "--comment",
-            "note",
-            "--env",
-            "stage",
-            "--status-check-off",
-        ]);
-        let split = split_staged_passthrough(&args);
-        // Supported by `compute update`: kept (value flags keep their value).
+    fn deploy_arg_scan_rejects_every_reserved_spelling() {
+        for args in [
+            owned(&["--service-id", "service1"]),
+            owned(&["--service-id=service1"]),
+            owned(&["-s", "service1"]),
+            owned(&["-s=service1"]),
+            owned(&["-sservice1"]),
+            owned(&["--service-name", "demo"]),
+            owned(&["--service-name=demo"]),
+            owned(&["--version", "active"]),
+            owned(&["--version=active"]),
+            owned(&["--autoclone"]),
+            owned(&["--token", "secret"]),
+            owned(&["--token=secret"]),
+            owned(&["-t", "secret"]),
+            owned(&["-t=secret"]),
+            owned(&["-tsecret"]),
+        ] {
+            let error = scan_reserved_deploy_args(&args)
+                .expect_err("lifecycle-owned deploy argument must be rejected");
+            assert!(
+                error.contains("reserved") || error.contains("lifecycle"),
+                "reserved argument error must explain ownership for {args:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_arg_scan_redacts_inline_token_values() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_SENTINEL";
+        for (arg, expected_flag) in [
+            (format!("--token={SENTINEL}"), "--token"),
+            (format!("-t={SENTINEL}"), "-t"),
+            (format!("-t{SENTINEL}"), "-t"),
+        ] {
+            let error = scan_reserved_deploy_args(&[arg])
+                .expect_err("inline credential arguments must be reserved");
+            assert!(
+                !error.contains(SENTINEL),
+                "reserved-argument error leaked a credential: {error}"
+            );
+            assert!(
+                error.contains(expected_flag),
+                "reserved-argument error must identify {expected_flag}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_arg_preflight_scans_store_free_manifest_deploys() {
+        let context = AdapterDeployContext {
+            service_id: Some("SVC1".to_owned()),
+            ..AdapterDeployContext::default()
+        };
         assert_eq!(
-            split.forwarded,
-            owned(&["--package", "pkg.tar.gz", "--autoclone", "--verbose"])
+            FastlyCliAdapter
+                .preflight_deploy(&context, &owned(&["--comment", "release"]))
+                .expect("safe manifest-command argument"),
+            DeployOwnership::ManifestCommand
         );
-        // `--env`/`--status-check-off` are `compute deploy` flags, not
-        // `compute update` ones: dropped, and `--env`'s detached value
-        // `stage` is dropped with it (never left as a bogus positional).
-        assert_eq!(split.dropped, owned(&["--env", "--status-check-off"]));
-        assert!(!split.forwarded.iter().any(|arg| arg == "stage"));
-        assert_eq!(split.comment, Some("note".to_owned()));
+        FastlyCliAdapter
+            .preflight_deploy(&context, &owned(&["-tsecret"]))
+            .expect_err("reserved scan must run before store-free manifest dispatch");
+    }
+
+    #[test]
+    fn deploy_arg_parser_accepts_only_managed_value_and_global_forms() {
+        for (args, comment, package) in [
+            (owned(&["--comment", "ci run 12"]), Some("ci run 12"), None),
+            (owned(&["--comment=ci run 12"]), Some("ci run 12"), None),
+            (
+                owned(&["--package", "pkg.tar.gz"]),
+                None,
+                Some("pkg.tar.gz"),
+            ),
+            (owned(&["--package=pkg.tar.gz"]), None, Some("pkg.tar.gz")),
+            (owned(&["-p", "pkg.tar.gz"]), None, Some("pkg.tar.gz")),
+            (owned(&["-p=pkg.tar.gz"]), None, Some("pkg.tar.gz")),
+            (owned(&["-ppkg.tar.gz"]), None, Some("pkg.tar.gz")),
+        ] {
+            let parsed = parse_managed_deploy_args(&args).expect("documented value form");
+            assert_eq!(parsed.comment.as_deref(), comment, "args: {args:?}");
+            assert_eq!(parsed.package.as_deref(), package, "args: {args:?}");
+            assert!(parsed.globals.is_empty(), "args: {args:?}");
+        }
+
+        let globals = owned(&[
+            "--accept-defaults",
+            "-d",
+            "--auto-yes",
+            "-y",
+            "--debug-mode",
+            "--non-interactive",
+            "-i",
+            "--quiet",
+            "-q",
+            "--verbose",
+            "-v",
+        ]);
+        let parsed = parse_managed_deploy_args(&globals).expect("documented global booleans");
+        assert_eq!(parsed.globals, globals);
+        assert_eq!(parsed.comment, None);
+        assert_eq!(parsed.package, None);
+    }
+
+    #[test]
+    fn deploy_arg_parser_rejects_every_unconsumed_or_ambiguous_token() {
+        for args in [
+            owned(&["--unknown"]),
+            owned(&["--env", "stage"]),
+            owned(&["positional"]),
+            owned(&["--comment"]),
+            owned(&["--comment="]),
+            owned(&["--comment", ""]),
+            owned(&["--comment", "--verbose"]),
+            owned(&["--package"]),
+            owned(&["--package="]),
+            owned(&["--package", ""]),
+            owned(&["-p"]),
+            owned(&["-p="]),
+            owned(&["--verbose=true"]),
+            owned(&["-v=true"]),
+            owned(&["-vtrue"]),
+            owned(&["--comment", "one", "--comment=one"]),
+            owned(&["--comment", "one", "--comment=two"]),
+            owned(&["--package", "one", "-pone"]),
+            owned(&["--package", "one", "-ptwo"]),
+        ] {
+            parse_managed_deploy_args(&args)
+                .expect_err("strict parser must reject unknown, missing, or duplicate input");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_environment_parent_overrides_defaults_then_uses_logical_store_ids() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let config_name = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME";
+        let kv_name = "EDGEZERO__STORES__KV__SESSIONS__NAME";
+        let config_key = "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY";
+        let legacy_name = "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__NAME";
+        let legacy_feature_name = "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__FEATURE_FLAGS__NAME";
+        let _parent = EnvOverride::set(config_name, "parent_config");
+        let _no_parent_kv = EnvOverride::remove(kv_name);
+        let _no_parent_key = EnvOverride::remove(config_key);
+        let _legacy = EnvOverride::set(legacy_name, "legacy_config");
+        let _legacy_feature = EnvOverride::set(legacy_feature_name, "legacy_feature_flags");
+        let context = AdapterDeployContext {
+            stores: DeployStoreIds {
+                config: vec!["app_config".to_owned(), "feature_flags".to_owned()],
+                kv: vec!["sessions".to_owned()],
+                secrets: vec!["default".to_owned()],
+            },
+            variable_defaults: BTreeMap::from([
+                (config_name.to_owned(), "manifest_config".to_owned()),
+                (kv_name.to_owned(), "manifest_sessions".to_owned()),
+                (legacy_name.to_owned(), "legacy_manifest_config".to_owned()),
+                (
+                    legacy_feature_name.to_owned(),
+                    "legacy_manifest_feature_flags".to_owned(),
+                ),
+            ]),
+            ..AdapterDeployContext::default()
+        };
+
+        let environment =
+            effective_deploy_environment(&context).expect("valid effective environment");
+        assert_eq!(
+            environment.store_name("config", "app_config"),
+            "parent_config",
+            "the parent process must override the manifest default"
+        );
+        assert_eq!(
+            environment.store_name("kv", "sessions"),
+            "manifest_sessions",
+            "the manifest default must fill an absent parent value"
+        );
+        assert_eq!(
+            environment.store_key("config", "app_config"),
+            "app_config",
+            "the logical id must fill an absent config selector"
+        );
+        assert_eq!(
+            environment.store_name("config", "feature_flags"),
+            "feature_flags",
+            "legacy service-scoped selectors must not participate in precedence"
+        );
+        assert_eq!(
+            environment.store_name("secrets", "default"),
+            "default",
+            "the logical id must fill an absent optional Secret Store selector"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_environment_rejects_invalid_present_selector_and_fixed_values() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let selector = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME";
+        let port = "EDGEZERO__ADAPTER__PORT";
+        let _no_parent_selector = EnvOverride::remove(selector);
+        let _no_parent_port = EnvOverride::remove(port);
+        let base = AdapterDeployContext {
+            stores: DeployStoreIds {
+                config: vec!["app_config".to_owned()],
+                ..DeployStoreIds::default()
+            },
+            ..AdapterDeployContext::default()
+        };
+
+        let mut invalid_selector = base.clone();
+        invalid_selector
+            .variable_defaults
+            .insert(selector.to_owned(), String::new());
+        let selector_error = effective_deploy_environment(&invalid_selector)
+            .expect_err("a present empty selector must not fall back to the logical id");
+        assert!(
+            selector_error.contains(selector),
+            "error names invalid selector: {selector_error}"
+        );
+
+        let _invalid_parent_selector = EnvOverride::set(selector, "bad\nselector");
+        let mut invalid_parent = base.clone();
+        invalid_parent
+            .variable_defaults
+            .insert(selector.to_owned(), "valid_manifest_selector".to_owned());
+        let parent_error = effective_deploy_environment(&invalid_parent)
+            .expect_err("an invalid parent selector must not fall back to a valid default");
+        assert!(
+            parent_error.contains(selector),
+            "error names parent selector: {parent_error}"
+        );
+
+        let mut invalid_fixed = base;
+        invalid_fixed
+            .variable_defaults
+            .insert(port.to_owned(), "0".to_owned());
+        let fixed_error = effective_deploy_environment(&invalid_fixed)
+            .expect_err("a present invalid fixed runtime value must not disappear");
+        assert!(
+            fixed_error.contains(port),
+            "error names invalid fixed value: {fixed_error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_environment_rejects_invalid_value_before_provider_cli() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let manifest = dir.path().join("fastly.toml");
+        fs::write(&manifest, "name = \"app\"\n").expect("manifest");
+        let marker = dir.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "token");
+        let selector = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME";
+        let _no_parent_selector = EnvOverride::remove(selector);
+        let context = AdapterDeployContext {
+            adapter_manifest_path: Some(manifest),
+            service_id: Some("SVC1".to_owned()),
+            staging: true,
+            stores: DeployStoreIds {
+                config: vec!["app_config".to_owned()],
+                ..DeployStoreIds::default()
+            },
+            variable_defaults: BTreeMap::from([(selector.to_owned(), String::new())]),
+        };
+
+        let error = deploy_staged_with_context(&context, &[])
+            .expect_err("invalid runtime environment must fail staged deploy");
+        assert!(error.contains(selector), "error names selector: {error}");
+        assert_provider_not_invoked(&marker);
     }
 
     // ── non-interactive CI safety (`--non-interactive`) ───────────────
@@ -5991,10 +6336,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_service_id_accepts_opaque_handle_punctuation() {
-        validate_service_id("SVC1_").expect("underscore");
-        validate_service_id("SVC-1").expect("hyphen");
-        validate_service_id("SVC__OTHER").expect("double underscore has no key semantics");
+    fn validate_service_id_rejects_punctuation() {
+        for invalid in ["SVC1_", "SVC-1", "SVC__OTHER"] {
+            let error = validate_service_id(invalid).expect_err("punctuation is not valid");
+            assert_service_id_error(&error);
+        }
     }
 
     #[test]
@@ -6006,6 +6352,195 @@ mod tests {
         validate_service_id("has space").expect_err("space");
         validate_service_id("has/slash").expect_err("slash");
         validate_service_id("").expect_err("empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_rejects_invalid_service_id_before_provider_cli() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let app = tempdir().expect("app dir");
+        let manifest = app.path().join("fastly.toml");
+        fs::write(&manifest, "name = \"app\"\n").expect("manifest");
+        let marker = app.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let _path = PathPrepend::new(fake.path());
+        let args = owned(&[
+            "--manifest-path",
+            manifest.to_str().expect("utf8 manifest"),
+            "--service-id",
+            "SVC-1",
+        ]);
+
+        let error = deploy(&args).expect_err("invalid service id must fail deploy");
+        assert_service_id_error(&error);
+        assert_provider_not_invoked(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_version_rejects_invalid_service_id_before_provider_api() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let marker = dir.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "token");
+
+        let error = emit_active_version(&owned(&["--service-id", "SVC_1"]))
+            .expect_err("invalid service id must fail active-version capture");
+        assert_service_id_error(&error);
+        assert_provider_not_invoked(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthcheck_rejects_invalid_service_id_before_provider_api() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let marker = dir.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "token");
+        let args = owned(&[
+            "--domain",
+            "example.com",
+            "--service-id",
+            "SVC-1",
+            "--version",
+            "7",
+        ]);
+
+        let error = healthcheck(&args).expect_err("invalid service id must fail healthcheck");
+        assert_service_id_error(&error);
+        assert_provider_not_invoked(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_rejects_invalid_service_id_before_provider_api() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let marker = dir.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "token");
+        let args = owned(&[
+            "--service-id",
+            "SVC_1",
+            "--version",
+            "7",
+            "--rollback-to",
+            "6",
+        ]);
+
+        let error = rollback(&args).expect_err("invalid service id must fail rollback");
+        assert_service_id_error(&error);
+        assert_provider_not_invoked(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_rejects_invalid_service_id_before_provider_cli() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("fastly.toml"),
+            "name = \"app\"\nservice_id = \"SVC-1\"\n",
+        )
+        .expect("manifest");
+        let marker = dir.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let _path = PathPrepend::new(fake.path());
+        let _service_env = EnvOverride::remove(FASTLY_SERVICE_ID_ENV);
+        let kv = vec![ResolvedStoreId::from_logical("sessions")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv,
+            secrets: &[],
+        };
+
+        let error = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect_err("invalid manifest service id must fail provision");
+        assert_service_id_error(&error);
+        assert_provider_not_invoked(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adapter_deploy_rejects_invalid_service_id_before_provider_cli() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let manifest = dir.path().join("fastly.toml");
+        fs::write(&manifest, "name = \"app\"\nservice_id = \"SVC_1\"\n").expect("manifest");
+        let marker = dir.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let _path = PathPrepend::new(fake.path());
+        let _service_env = EnvOverride::remove(FASTLY_SERVICE_ID_ENV);
+        let context = AdapterDeployContext {
+            adapter_manifest_path: Some(manifest),
+            ..AdapterDeployContext::default()
+        };
+
+        let error = FastlyCliAdapter
+            .deploy(&context, &[])
+            .expect_err("direct adapter deploy must reject invalid service id");
+        assert_service_id_error(&error);
+        assert_provider_not_invoked(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adapter_deploy_discovers_and_rejects_invalid_service_id_before_provider_cli() {
+        const CHILD_ENV: &str = "EDGEZERO_FASTLY_DISCOVERY_TEST_CHILD";
+        const MARKER_ENV: &str = "EDGEZERO_FASTLY_DISCOVERY_TEST_MARKER";
+
+        if env::var_os(CHILD_ENV).is_some() {
+            let marker = PathBuf::from(env::var_os(MARKER_ENV).expect("child marker path"));
+            let error = FastlyCliAdapter
+                .deploy(&AdapterDeployContext::default(), &[])
+                .expect_err("discovered invalid service id must fail direct adapter deploy");
+            assert_service_id_error(&error);
+            assert_provider_not_invoked(&marker);
+            return;
+        }
+
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"app\"\n")
+            .expect("Cargo manifest");
+        fs::write(
+            dir.path().join("fastly.toml"),
+            "name = \"app\"\nservice_id = \"SVC-1\"\n",
+        )
+        .expect("manifest");
+        let marker = dir.path().join("provider.log");
+        let fake = fake_provider_invocation_marker(&marker);
+        let path = env::join_paths(
+            once(fake.path().to_path_buf())
+                .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+        )
+        .expect("test PATH");
+        let output = Command::new(env::current_exe().expect("current test binary"))
+            .args([
+                "--exact",
+                "cli::tests::adapter_deploy_discovers_and_rejects_invalid_service_id_before_provider_cli",
+                "--nocapture",
+            ])
+            .current_dir(dir.path())
+            .env(CHILD_ENV, "1")
+            .env(MARKER_ENV, &marker)
+            .env("PATH", path)
+            .env_remove(FASTLY_SERVICE_ID_ENV)
+            .output()
+            .expect("run isolated discovery regression");
+
+        assert!(
+            output.status.success(),
+            "isolated discovery regression failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_provider_not_invoked(&marker);
     }
 
     #[test]
@@ -7279,13 +7814,13 @@ build = \"cargo build --release\"
 
     #[test]
     fn provision_uses_fastly_service_id_environment_fallback_for_link_note() {
-        let selected = select_fastly_service_id(None, Some("env-service".to_owned()))
+        let selected = select_fastly_service_id(None, Some("envservice".to_owned()))
             .expect("select environment service id");
         let note = resource_link_note(selected.as_ref(), "secret", "trusted_server_secrets")
             .expect("environment service produces a link note");
         assert!(
-            note.contains("`FASTLY_SERVICE_ID` selects service `env-service`")
-                && note.contains("--service-id=env-service")
+            note.contains("`FASTLY_SERVICE_ID` selects service `envservice`")
+                && note.contains("--service-id=envservice")
                 && note.contains("secret-store list --json"),
             "environment-selected service is used consistently: {note}"
         );
@@ -7294,8 +7829,8 @@ build = \"cargo build --release\"
     #[test]
     fn provision_rejects_conflicting_manifest_and_environment_service_ids() {
         let err = select_fastly_service_id(
-            Some("manifest-service".to_owned()),
-            Some("environment-service".to_owned()),
+            Some("manifestservice".to_owned()),
+            Some("environmentservice".to_owned()),
         )
         .expect_err("conflicting service ids must fail before provisioning");
         assert!(
