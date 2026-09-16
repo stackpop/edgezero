@@ -195,7 +195,7 @@ Expected: PASS, including Fastly Viceroy, provider WASM builds, generated worksp
 
 Run: `git diff --check`, search for removed API shapes, and confirm only intended files changed.
 
-- [ ] **Step 4: Commit and push PR 275**
+- [x] **Step 4: Commit and push PR 275**
 
 Commit message: `fix(outbound): type batch termination`
 
