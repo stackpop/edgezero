@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
@@ -61,6 +61,13 @@ impl DeployStoreIds {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeployOwnership {
+    AdapterManaged,
+    #[default]
+    ManifestCommand,
+}
+
 /// Structured application context for an adapter deploy.
 ///
 /// Native-CLI passthrough remains in the separate `args` slice. EdgeZero-owned
@@ -71,6 +78,7 @@ pub struct AdapterDeployContext {
     pub service_id: Option<String>,
     pub staging: bool,
     pub stores: DeployStoreIds,
+    pub variable_defaults: BTreeMap<String, String>,
 }
 
 /// A single declared store id, paired with the platform name the
@@ -305,7 +313,24 @@ pub enum ReadConfigEntry {
 /// `SecretField` from `edgezero-core`) so this crate stays dep-free
 /// of `edgezero-core`. Defaults are no-ops; adapters override what
 /// they actually need.
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "deploy lifecycle hooks read in invocation order: preflight before deploy"
+)]
 pub trait Adapter: Sync + Send {
+    /// Decide whether the manifest command or adapter owns this deployment.
+    ///
+    /// # Errors
+    /// Returns an error string when the adapter cannot safely select a deploy path.
+    #[inline]
+    fn preflight_deploy(
+        &self,
+        _context: &AdapterDeployContext,
+        _args: &[String],
+    ) -> Result<DeployOwnership, String> {
+        Ok(DeployOwnership::ManifestCommand)
+    }
+
     /// Deploy with EdgeZero-owned inputs carried as typed context and only
     /// provider-native passthrough in `args`.
     ///
@@ -752,6 +777,16 @@ mod tests {
         let mut registry = super::REGISTRY.write().expect("registry lock");
         registry.clear();
         HIT.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn default_deploy_preflight_keeps_manifest_command() {
+        let context = AdapterDeployContext::default();
+        assert_eq!(
+            FIRST.preflight_deploy(&context, &[]).unwrap(),
+            DeployOwnership::ManifestCommand
+        );
+        assert!(context.variable_defaults.is_empty());
     }
 
     #[test]

@@ -196,24 +196,30 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         kv: declared_ids(manifest_stores.and_then(|declared| declared.kv.as_ref())),
         secrets: declared_ids(manifest_stores.and_then(|declared| declared.secrets.as_ref())),
     };
-    let has_declared_stores = !deploy_stores.is_empty();
-    let uses_manifest_command =
-        adapter::has_manifest_deploy_command(&args.adapter, manifest.as_ref());
-    let adapter_manifest_path = if uses_manifest_command && !has_declared_stores && !args.staging {
-        None
-    } else {
-        resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)?.map(PathBuf::from)
-    };
+    let variable_defaults = manifest
+        .as_ref()
+        .map(|loader| loader.manifest().environment_for(&args.adapter))
+        .into_iter()
+        .flat_map(|environment| environment.variables)
+        .filter_map(|binding| binding.value.map(|value| (binding.env, value)))
+        .collect();
+    let (adapter_manifest_path, adapter_manifest_path_error) =
+        match resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter) {
+            Ok(path) => (path.map(PathBuf::from), None),
+            Err(err) => (None, Some(err)),
+        };
     let context = AdapterDeployContext {
         adapter_manifest_path,
         service_id: args.service_id.clone(),
         stores: deploy_stores,
         staging: args.staging,
+        variable_defaults,
     };
 
     adapter::deploy(
         &args.adapter,
         &context,
+        adapter_manifest_path_error.as_deref(),
         manifest.as_ref(),
         &args.adapter_args,
     )
@@ -526,10 +532,93 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 mod tests {
     use super::*;
     use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard, path_mutation_guard};
+    use edgezero_adapter::registry::{
+        self as adapter_registry, Adapter, AdapterAction, DeployOwnership,
+    };
     use edgezero_core::manifest::ManifestLoader;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
+
+    const PREFLIGHT_MANIFEST_COMMAND: usize = 0;
+    const PREFLIGHT_ADAPTER_MANAGED: usize = 1;
+    const PREFLIGHT_ERROR: usize = 2;
+
+    static DEPLOY_PREFLIGHT_MODE: AtomicUsize = AtomicUsize::new(PREFLIGHT_MANIFEST_COMMAND);
+    static DEPLOY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DEPLOY_CONTEXT: LazyLock<Mutex<Option<AdapterDeployContext>>> =
+        LazyLock::new(|| Mutex::new(None));
+    static DEPLOY_FINALIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DEPLOY_PREFLIGHT_CONTEXT: LazyLock<Mutex<Option<AdapterDeployContext>>> =
+        LazyLock::new(|| Mutex::new(None));
+    static RECORDING_DEPLOY_ADAPTER: RecordingDeployAdapter = RecordingDeployAdapter;
+
+    struct RecordingDeployAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the recording adapter exercises only deploy preflight, deploy dispatch, and finalization"
+    )]
+    impl Adapter for RecordingDeployAdapter {
+        fn deploy(&self, context: &AdapterDeployContext, _args: &[String]) -> Result<(), String> {
+            *DEPLOY_CONTEXT
+                .lock()
+                .map_err(|err| format!("deploy context lock poisoned: {err}"))? =
+                Some(context.clone());
+            DEPLOY_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn execute(&self, action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            if action == AdapterAction::Deploy {
+                return Err("managed deployment must call Adapter::deploy".to_owned());
+            }
+            Err(format!("unexpected recording adapter action: {action:?}"))
+        }
+
+        fn finalize_deploy(
+            &self,
+            _context: &AdapterDeployContext,
+            _command_output: Option<&str>,
+        ) -> Result<(), String> {
+            DEPLOY_FINALIZE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "recording_deploy_test"
+        }
+
+        fn preflight_deploy(
+            &self,
+            context: &AdapterDeployContext,
+            _args: &[String],
+        ) -> Result<DeployOwnership, String> {
+            *DEPLOY_PREFLIGHT_CONTEXT
+                .lock()
+                .map_err(|err| format!("deploy preflight context lock poisoned: {err}"))? =
+                Some(context.clone());
+            match DEPLOY_PREFLIGHT_MODE.load(Ordering::SeqCst) {
+                PREFLIGHT_ADAPTER_MANAGED => Ok(DeployOwnership::AdapterManaged),
+                PREFLIGHT_ERROR => Err("recording preflight failed".to_owned()),
+                _ => Ok(DeployOwnership::ManifestCommand),
+            }
+        }
+    }
+
+    fn reset_recording_deploy_adapter(mode: usize) {
+        adapter_registry::register_adapter(&RECORDING_DEPLOY_ADAPTER);
+        DEPLOY_PREFLIGHT_MODE.store(mode, Ordering::SeqCst);
+        DEPLOY_CALLS.store(0, Ordering::SeqCst);
+        *DEPLOY_CONTEXT.lock().expect("deploy context lock") = None;
+        DEPLOY_FINALIZE_CALLS.store(0, Ordering::SeqCst);
+        *DEPLOY_PREFLIGHT_CONTEXT
+            .lock()
+            .expect("deploy preflight context lock") = None;
+    }
 
     #[test]
     fn load_manifest_optional_hard_errors_when_explicit_env_path_missing() {
@@ -662,7 +751,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn run_custom_deploy_with_stores_requires_registered_adapter_before_command() {
+    fn run_custom_deploy_with_stores_runs_without_registered_adapter() {
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let marker = temp.path().join("deploy-ran");
@@ -684,19 +773,264 @@ mod tests {
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
-        let err = run_deploy(&DeployArgs {
+        run_deploy(&DeployArgs {
             adapter: "unregistered_test".to_owned(),
             adapter_args: Vec::new(),
             service_id: None,
             staging: false,
         })
-        .expect_err("store-aware custom deploy requires its adapter finalizer");
+        .expect("an unregistered custom adapter can run its manifest deploy command");
 
-        assert!(err.contains("not registered"), "registration error: {err}");
+        assert!(
+            marker.exists(),
+            "the custom deploy command should run without a registered adapter"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_adapter_managed_bypasses_manifest_command_and_receives_context() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let adapter_dir = temp.path().join("nested/adapter");
+        fs::create_dir_all(&adapter_dir).expect("adapter dir");
+        let adapter_manifest = adapter_dir.join("adapter.toml");
+        fs::write(&adapter_manifest, "name = \"recording\"\n").expect("adapter manifest");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "APPLICABLE_DEFAULT"
+env = "EDGEZERO_TEST_APPLICABLE"
+value = "from-manifest"
+adapters = ["recording_deploy_test"]
+
+[[environment.variables]]
+name = "OTHER_DEFAULT"
+env = "EDGEZERO_TEST_OTHER"
+value = "other-adapter"
+adapters = ["other"]
+
+[[environment.variables]]
+name = "UNSET_DEFAULT"
+env = "EDGEZERO_TEST_UNSET"
+
+[[environment.secrets]]
+name = "PRIVATE_TOKEN"
+env = "EDGEZERO_TEST_SECRET"
+value = "must-not-leak"
+adapters = ["recording_deploy_test"]
+
+[adapters.recording_deploy_test.adapter]
+crate = "crates/demo"
+manifest = "nested/adapter/adapter.toml"
+
+[adapters.recording_deploy_test.commands]
+deploy = "touch '{}'"
+"#,
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect("adapter-managed deploy succeeds");
+
+        assert!(!marker.exists(), "adapter ownership bypasses the command");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+        let preflight_context = DEPLOY_PREFLIGHT_CONTEXT
+            .lock()
+            .expect("deploy preflight context lock")
+            .clone()
+            .expect("Adapter::preflight_deploy captured its context");
+        let deployed_context = DEPLOY_CONTEXT
+            .lock()
+            .expect("deploy context lock")
+            .clone()
+            .expect("Adapter::deploy captured its context");
+        let expected_adapter_manifest = adapter_manifest.canonicalize().expect("canonical path");
+        assert_eq!(
+            preflight_context.adapter_manifest_path,
+            Some(expected_adapter_manifest.clone())
+        );
+        assert_eq!(
+            deployed_context.adapter_manifest_path,
+            Some(expected_adapter_manifest)
+        );
+        assert_eq!(
+            deployed_context.variable_defaults,
+            BTreeMap::from([(
+                "EDGEZERO_TEST_APPLICABLE".to_owned(),
+                "from-manifest".to_owned()
+            )])
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_adapter_managed_rejects_invalid_manifest_before_deploy() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"nested/missing.toml\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect_err("managed deploy requires its configured adapter manifest");
+
+        assert!(
+            err.contains("nested/missing.toml") && err.contains("could not resolve"),
+            "resolution error is preserved: {err}"
+        );
+        assert!(!marker.exists(), "managed ownership bypasses the command");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+        assert!(
+            DEPLOY_CONTEXT
+                .lock()
+                .expect("deploy context lock")
+                .is_none(),
+            "invalid manifest fails before Adapter::deploy"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_manifest_command_ignores_invalid_adapter_manifest() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_MANIFEST_COMMAND);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"nested/missing.toml\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect("manifest ownership does not require an adapter manifest");
+
+        assert!(marker.exists(), "the manifest deploy command runs");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 1);
+        assert!(
+            DEPLOY_CONTEXT
+                .lock()
+                .expect("deploy context lock")
+                .is_none()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_manifest_command_with_stores_rejects_invalid_adapter_manifest() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_MANIFEST_COMMAND);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[stores.config]\nids = [\"app_config\"]\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"nested/missing.toml\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect_err("registered finalization with stores requires its adapter manifest");
+
+        assert!(
+            err.contains("nested/missing.toml") && err.contains("could not resolve"),
+            "resolution error is preserved: {err}"
+        );
         assert!(
             !marker.exists(),
-            "the custom deploy command must not run before required finalization is available"
+            "manifest resolution fails before the command"
         );
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_error_prevents_manifest_command() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ERROR);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect_err("preflight failure stops deployment");
+
+        assert!(err.contains("recording preflight failed"), "{err}");
+        assert!(!marker.exists(), "preflight fails before the command runs");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(not(windows))]

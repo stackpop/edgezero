@@ -5032,6 +5032,7 @@ fn legacy_deploy_context(args: &[String], staging: bool) -> AdapterDeployContext
         service_id: arg_value(args, "--service-id").map(str::to_owned),
         stores: DeployStoreIds::default(),
         staging,
+        variable_defaults: BTreeMap::default(),
     }
 }
 
@@ -9563,6 +9564,7 @@ echo 'unexpected' >&2; exit 1
             service_id: Some("SVC1".to_owned()),
             stores,
             staging: true,
+            variable_defaults: BTreeMap::default(),
         };
         let result = deploy_staged_with_context(&context, &args);
 
@@ -11222,6 +11224,7 @@ echo 'unexpected' >&2; exit 1
                 ..DeployStoreIds::default()
             },
             staging: true,
+            variable_defaults: BTreeMap::default(),
         };
         deploy_staged_with_context(&context, &[])
             .expect("staged deploy must auto-create the twin and succeed");
@@ -11293,6 +11296,7 @@ echo 'unexpected' >&2; exit 1
                 ..DeployStoreIds::default()
             },
             staging: true,
+            variable_defaults: BTreeMap::default(),
         };
         deploy_staged_with_context(&context, &[])
             .expect("must isolate staging even with no production override store");
@@ -11345,6 +11349,7 @@ echo 'unexpected' >&2; exit 1
                 ..DeployStoreIds::default()
             },
             staging: true,
+            variable_defaults: BTreeMap::default(),
         };
         let err = deploy_staged_with_context(&context, &[])
             .expect_err("an unreadable config-store listing must fail closed");

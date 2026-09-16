@@ -1,4 +1,6 @@
-use edgezero_adapter::registry::{self as adapter_registry, AdapterAction, AdapterDeployContext};
+use edgezero_adapter::registry::{
+    self as adapter_registry, AdapterAction, AdapterDeployContext, DeployOwnership,
+};
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::env;
@@ -159,27 +161,44 @@ fn require_adapter(
     })
 }
 
-/// Deploy through either the manifest-defined command or the registered
-/// adapter, then let the adapter finalize provider state through the same typed
-/// lifecycle hook.
+/// Select deployment ownership through the registered adapter's preflight.
+/// Manifest-owned and fallback deployments retain the legacy finalizer, while
+/// adapter-managed deployments own the complete lifecycle in `deploy`.
 pub fn deploy(
     adapter_name: &str,
     context: &AdapterDeployContext,
+    adapter_manifest_path_error: Option<&str>,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
 ) -> Result<(), String> {
+    let registered_adapter = adapter_registry::get_adapter(adapter_name);
+    let ownership = registered_adapter
+        .map_or(Ok(DeployOwnership::ManifestCommand), |registered| {
+            registered.preflight_deploy(context, adapter_args)
+        })?;
+
+    if ownership == DeployOwnership::AdapterManaged {
+        if let Some(err) = adapter_manifest_path_error {
+            return Err(err.to_owned());
+        }
+        let Some(managed_adapter) = registered_adapter else {
+            return Err(format!(
+                "adapter `{adapter_name}` selected managed deployment without being registered"
+            ));
+        };
+        return managed_adapter.deploy(context, adapter_args);
+    }
+
     if !context.staging
         && let Some(loader) = manifest_loader
         && let Some(command) = manifest_command(loader.manifest(), adapter_name, Action::Deploy)
     {
-        // Store-aware adapters must finalize the provider state after a custom
-        // deploy command. Resolve that capability before the command activates
-        // anything so a CLI build without the adapter cannot silently skip it.
-        let finalizer = if context.stores.is_empty() {
-            adapter_registry::get_adapter(adapter_name)
-        } else {
-            Some(require_adapter(adapter_name, true)?)
-        };
+        if registered_adapter.is_some()
+            && !context.stores.is_empty()
+            && let Some(err) = adapter_manifest_path_error
+        {
+            return Err(err.to_owned());
+        }
         let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
         let env = loader.manifest().environment_for(adapter_name);
         let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
@@ -197,24 +216,18 @@ pub fn deploy(
             adapter_bind,
             &command_args,
         )?;
-        if let Some(adapter) = finalizer {
-            adapter.finalize_deploy(context, Some(&output))?;
+        if let Some(finalizer) = registered_adapter {
+            finalizer.finalize_deploy(context, Some(&output))?;
         }
         return Ok(());
     }
 
-    let adapter = require_adapter(adapter_name, manifest_loader.is_some())?;
-    adapter.deploy(context, adapter_args)?;
-    adapter.finalize_deploy(context, None)
-}
-
-pub fn has_manifest_deploy_command(
-    adapter_name: &str,
-    manifest_loader: Option<&ManifestLoader>,
-) -> bool {
-    manifest_loader.is_some_and(|loader| {
-        manifest_command(loader.manifest(), adapter_name, Action::Deploy).is_some()
-    })
+    if let Some(err) = adapter_manifest_path_error {
+        return Err(err.to_owned());
+    }
+    let fallback_adapter = require_adapter(adapter_name, manifest_loader.is_some())?;
+    fallback_adapter.deploy(context, adapter_args)?;
+    fallback_adapter.finalize_deploy(context, None)
 }
 
 fn manifest_command<'manifest>(
