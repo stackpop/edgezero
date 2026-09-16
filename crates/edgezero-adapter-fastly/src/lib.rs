@@ -34,12 +34,6 @@ use edgezero_core::env_config::EnvConfig;
 use edgezero_core::http::Extensions;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::manifest::ResolvedLoggingConfig;
-#[cfg(feature = "fastly")]
-use fastly::compute_runtime::service_id;
-
-#[cfg(any(feature = "cli", feature = "fastly", test))]
-const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
-
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
 /// overrides.
 ///
@@ -102,19 +96,6 @@ impl From<&EnvConfig> for FastlyLogging {
             use_fastly_logger,
         }
     }
-}
-
-/// Prefix a canonical `EDGEZERO__*` key with its owning Fastly service.
-///
-/// The shared `edgezero_runtime_env` Config Store is account-wide. Service
-/// scoping prevents two linked services that declare the same logical store id
-/// from overwriting one another's runtime mappings.
-#[cfg(any(feature = "cli", feature = "fastly", test))]
-fn service_scoped_runtime_env_key(service_id: &str, canonical_key: &str) -> String {
-    let suffix = canonical_key
-        .strip_prefix(RUNTIME_ENV_PREFIX)
-        .unwrap_or(canonical_key);
-    format!("{RUNTIME_ENV_PREFIX}SERVICES__{service_id}__{suffix}")
 }
 
 /// # Errors
@@ -195,10 +176,9 @@ where
 /// host and port, logging settings, `__NAME` entries for declared stores, and
 /// `__KEY` entries for declared config stores.
 ///
-/// Each lookup uses the current Fastly service's
-/// `EDGEZERO__SERVICES__<SERVICE_ID>__*` key. Legacy unscoped entries are not
-/// read because they have no safe owner when this Config Store is linked to more
-/// than one service. The returned [`EnvConfig`] contains canonical unscoped keys.
+/// Each lookup uses the same canonical `EDGEZERO__*` name accepted by the other
+/// adapters. The deploy flow copies the selected deployment environment's
+/// declared store selectors into this Config Store.
 ///
 /// [`run_app`] and [`run_app_with_request_extensions`] call this themselves.
 /// [`run_app_with_config`] does NOT, and neither does a hand-built
@@ -223,37 +203,28 @@ pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
         // EDGEZERO__* runtime overrides (spec 5.4 __KEY, spec 5.2
         // __NAME) will silently fall back to baked defaults. Log
         // once at request time so operators can spot the gap in
-        // their Fastly logs and run `edgezero provision --adapter fastly`
-        // to create the store.
+        // their Fastly logs and provision the store when overrides are needed.
         log::warn!(
             "Fastly Config Store `edgezero_runtime_env` not found; \
              EDGEZERO__* runtime overrides will use baked-in defaults. \
              Run `edgezero provision --adapter fastly` to create the store, \
-             then populate per-environment override keys with \
-             `fastly config-store-entry update --upsert`."
+             then deploy from the selected environment to populate its \
+             canonical store selectors."
         );
         return EnvConfig::from_vars(empty::<(String, String)>());
     };
-    let current_service_id = service_id();
-    let vars = runtime_env_vars_for_service(stores, current_service_id, |key| dict.get(key));
+    let vars = runtime_env_vars(stores, |key| dict.get(key));
     EnvConfig::from_vars(vars)
 }
 
 #[cfg(any(feature = "fastly", test))]
-fn runtime_env_vars_for_service<F>(
-    stores: StoresMetadata,
-    service_id: &str,
-    mut get: F,
-) -> Vec<(String, String)>
+fn runtime_env_vars<F>(stores: StoresMetadata, mut get: F) -> Vec<(String, String)>
 where
     F: FnMut(&str) -> Option<String>,
 {
     runtime_env_keys(stores)
         .into_iter()
-        .filter_map(|canonical_key| {
-            let scoped_key = service_scoped_runtime_env_key(service_id, &canonical_key);
-            get(&scoped_key).map(|value| (canonical_key, value))
-        })
+        .filter_map(|key| get(&key).map(|value| (key, value)))
         .collect()
 }
 

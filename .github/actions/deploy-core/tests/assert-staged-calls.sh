@@ -52,9 +52,9 @@ assert_comment_precedes_stage() {
 # production logging override.
 assert_twin_mirrors_production() {
   local log="$1"
-  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__SERVICES__dummyservice__LOGGING__LEVEL' "$log" ||
+  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__LOGGING__LEVEL' "$log" ||
     fail "production's non-config override was not mirrored into the staging twin"
-  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__SERVICES__dummyservice__STORES__CONFIG__APP_CONFIG__KEY' "$log" ||
+  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY' "$log" ||
     fail "the config selector was not written into the staging twin"
 
   # The mirror must land before the relink points the draft at the twin.

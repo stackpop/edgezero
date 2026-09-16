@@ -196,6 +196,27 @@ scrub_action_private_env() {
   done < <(compgen -e)
 }
 
+PUBLIC_RUNTIME_ENV_NAMES=()
+PUBLIC_RUNTIME_ENV_VALUES=()
+capture_public_runtime_env() {
+  local name
+  while IFS= read -r name; do
+    if [[ "$name" =~ ^EDGEZERO__STORES__CONFIG__[A-Z0-9_]+__(NAME|KEY)$ ]] ||
+      [[ "$name" =~ ^EDGEZERO__STORES__(KV|SECRETS)__[A-Z0-9_]+__NAME$ ]]; then
+      PUBLIC_RUNTIME_ENV_NAMES+=("$name")
+      PUBLIC_RUNTIME_ENV_VALUES+=("${!name}")
+    fi
+  done < <(compgen -e)
+}
+
+restore_public_runtime_env() {
+  local index name
+  for ((index = 0; index < ${#PUBLIC_RUNTIME_ENV_NAMES[@]}; index++)); do
+    name="${PUBLIC_RUNTIME_ENV_NAMES[$index]}"
+    export "$name=${PUBLIC_RUNTIME_ENV_VALUES[$index]}"
+  done
+}
+
 ARGV=()
 main() {
   local mode="${1:-}"
@@ -217,11 +238,16 @@ main() {
       # Clear inherited provider aliases and export only the typed credentials.
       import_provider_env "${EDGEZERO__PROVIDER__ENV_CLEAR_FILE:-/dev/null}"
       build_deploy_argv "$cli_bin" "$adapter"
+      # GitHub Environment selection happens outside this action. Preserve the
+      # public canonical store selectors it supplied while the broad scrub below
+      # removes action-private EDGEZERO__ carriers.
+      capture_public_runtime_env
       ;;
   esac
 
   # Everything the action needed from its own env is now in locals or in ARGV.
   scrub_action_private_env
+  restore_public_runtime_env
 
   if [[ -n "$manifest" ]]; then
     export EDGEZERO_MANIFEST="$manifest"

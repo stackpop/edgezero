@@ -190,28 +190,41 @@ Fastly uses a native Config Store resource link for runtime configuration. Decla
 ids in `edgezero.toml`; each id opens its own platform store via
 `EDGEZERO__STORES__CONFIG__<ID>__NAME` (default = the logical id):
 
-Because `edgezero_runtime_env` is an account-wide Fastly resource, its stored
-keys are scoped by the current service ID:
+Fastly Compute has no process environment, so the EdgeZero deploy flow copies
+the selected deployment environment's declared store selectors into the
+`edgezero_runtime_env` Config Store under their canonical names:
 
 ```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__NAME
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__KEY
+EDGEZERO__STORES__CONFIG__<ID>__NAME
+EDGEZERO__STORES__CONFIG__<ID>__KEY
+EDGEZERO__STORES__KV__<ID>__NAME
+EDGEZERO__STORES__SECRETS__<ID>__NAME
 ```
 
-The runtime obtains `<SERVICE_ID>` from Fastly and translates these entries back
-to the portable `EDGEZERO__STORES__*` form. Legacy unscoped entries are ignored
-because they have no safe owner when the Config Store is linked to multiple
-services. Re-run `edgezero provision --adapter fastly` to write scoped `__NAME`
-entries, and rewrite any manually managed adapter, logging, or `__KEY` entries
-under the service prefix. Provision writes only the selected service's
-namespace; a non-default store-name mapping therefore requires top-level
-`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must
-match.
+There is no service ID in an environment variable name. A deployer can select a
+GitHub Environment such as `ts.example.com` or `staging.ts.example.com`; each
+environment sets the same canonical variable names and may choose the same or
+different physical Config, KV, and Secret stores. Production deploy reconciles
+those values into `edgezero_runtime_env`. A staged deploy creates a per-service
+staging twin, applies the staging environment's store names, changes each
+declared config selector to `<id>_staging`, attaches every selected physical
+store under the name the runtime opens, and links that twin into only the staged
+Fastly version. The selected resources must already exist in the Fastly account;
+staging fails instead of creating an unusable version when one is missing.
 
-Viceroy reports `0000000000000000000000` as its local service ID. Entries in a
-local `[local_server.config_stores.edgezero_runtime_env.contents]` block must
-therefore use `EDGEZERO__SERVICES__0000000000000000000000__...`, not the
-production service ID or the unscoped canonical key.
+Treat the production `edgezero_runtime_env` store as owned by one Fastly
+service. Its canonical keys are live account resources, so two unrelated
+services linked to the same physical store would overwrite each other's values.
+Serialize deployments for the owning service. The service ID remains a Fastly
+deployment input and part of the staging twin's physical resource name; it is
+not part of the portable configuration contract.
+
+Local Viceroy entries use the same canonical keys:
+
+```toml
+[local_server.config_stores.edgezero_runtime_env.contents]
+EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging"
+```
 
 ```toml
 [stores.config]

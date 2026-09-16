@@ -4,9 +4,9 @@ set -euo pipefail
 # Asserts one config-push-fastly invocation against the fake Fastly CLI.
 #
 # The contract that matters is the staging model: staging and production write
-# DIFFERENT KEYS in the SAME store, so a staged push can never overwrite the key
-# the live service is reading. This runs once per push — re-seeding the fake
-# truncates the call log, so each push is asserted against its own log.
+# different keys in the store selected by each environment, so a staged push can
+# never overwrite the key the live service is reading. This runs once per push —
+# re-seeding the fake truncates the call log, so each push is asserted separately.
 #
 # Reads (env):
 #   FAKE_CALL_LOG                 required  the fake fastly call log

@@ -1,4 +1,4 @@
-use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
+use edgezero_adapter::registry::{self as adapter_registry, AdapterAction, AdapterDeployContext};
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::env;
@@ -130,16 +130,23 @@ pub fn execute(
         );
     }
 
-    let adapter = adapter_registry::get_adapter(adapter_name).ok_or_else(|| {
+    let adapter = require_adapter(adapter_name, manifest_loader.is_some())?;
+
+    adapter.execute(AdapterAction::from(action), adapter_args)
+}
+
+fn require_adapter(
+    adapter_name: &str,
+    has_manifest: bool,
+) -> Result<&'static dyn adapter_registry::Adapter, String> {
+    adapter_registry::get_adapter(adapter_name).ok_or_else(|| {
         let available = adapter_registry::registered_adapters();
         if available.is_empty() {
-            if manifest_loader.is_none() {
-                format!(
-                    "adapter `{adapter_name}` is not registered in this build. Provide an `edgezero.toml` (or set `EDGEZERO_MANIFEST`) so the CLI can load adapters, or rebuild `edgezero-cli` with the `{adapter_name}` adapter feature enabled."
-                )
+            if has_manifest {
+                format!("adapter `{adapter_name}` is not registered (no adapters available)")
             } else {
                 format!(
-                    "adapter `{adapter_name}` is not registered (no adapters available)"
+                    "adapter `{adapter_name}` is not registered in this build. Provide an `edgezero.toml` (or set `EDGEZERO_MANIFEST`) so the CLI can load adapters, or rebuild `edgezero-cli` with the `{adapter_name}` adapter feature enabled."
                 )
             }
         } else {
@@ -149,61 +156,65 @@ pub fn execute(
                 available.join(", ")
             )
         }
-    })?;
-
-    adapter.execute(AdapterAction::from(action), adapter_args)
+    })
 }
 
-/// Same dispatch as [`execute`], but when the action resolves to a
-/// manifest-declared shell command the child's output is echoed AND
-/// captured (see [`run_shell_tee`]) and returned as `Some(text)`.
-///
-/// Returns `Ok(None)` when the action was served by the registered
-/// adapter's built-in `execute` instead — that path writes straight to
-/// the inherited stdio, so there is nothing for us to capture and the
-/// caller must fall back to another source of truth (for Fastly deploy:
-/// the Fastly API).
-pub fn execute_capture(
+/// Deploy through either the manifest-defined command or the registered
+/// adapter, then let the adapter finalize provider state through the same typed
+/// lifecycle hook.
+pub fn deploy(
     adapter_name: &str,
-    action: Action,
+    context: &AdapterDeployContext,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
-) -> Result<Option<String>, String> {
-    if let Some(loader) = manifest_loader
-        && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
+) -> Result<(), String> {
+    if !context.staging
+        && let Some(loader) = manifest_loader
+        && let Some(command) = manifest_command(loader.manifest(), adapter_name, Action::Deploy)
     {
+        // Store-aware adapters must finalize the provider state after a custom
+        // deploy command. Resolve that capability before the command activates
+        // anything so a CLI build without the adapter cannot silently skip it.
+        let finalizer = if context.stores.is_empty() {
+            adapter_registry::get_adapter(adapter_name)
+        } else {
+            Some(require_adapter(adapter_name, true)?)
+        };
         let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
         let env = loader.manifest().environment_for(adapter_name);
         let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
-        return run_shell_tee(
+        let mut command_args = Vec::new();
+        if let Some(service_id) = context.service_id.as_deref() {
+            command_args.extend(["--service-id".to_owned(), service_id.to_owned()]);
+        }
+        command_args.extend_from_slice(adapter_args);
+        let output = run_shell_tee(
             command,
             root,
             adapter_name,
-            action,
+            Action::Deploy,
             Some(env),
             adapter_bind,
-            adapter_args,
-        )
-        .map(Some);
+            &command_args,
+        )?;
+        if let Some(adapter) = finalizer {
+            adapter.finalize_deploy(context, Some(&output))?;
+        }
+        return Ok(());
     }
-    execute(adapter_name, action, manifest_loader, adapter_args)?;
-    Ok(None)
+
+    let adapter = require_adapter(adapter_name, manifest_loader.is_some())?;
+    adapter.deploy(context, adapter_args)?;
+    adapter.finalize_deploy(context, None)
 }
 
-/// Whether `action` for `adapter_name` resolves to a manifest-declared
-/// shell command (rather than the registered adapter's built-in logic).
-///
-/// Callers use this to decide whether an EdgeZero-internal directive
-/// (e.g. `--manifest-path`, understood only by the built-in adapter) is
-/// safe to thread into `adapter_args`: a manifest shell command receives
-/// those args verbatim and would choke on a flag its own CLI lacks.
-pub fn has_manifest_command(
-    manifest_loader: Option<&ManifestLoader>,
+pub fn has_manifest_deploy_command(
     adapter_name: &str,
-    action: Action,
+    manifest_loader: Option<&ManifestLoader>,
 ) -> bool {
-    manifest_loader
-        .is_some_and(|loader| manifest_command(loader.manifest(), adapter_name, action).is_some())
+    manifest_loader.is_some_and(|loader| {
+        manifest_command(loader.manifest(), adapter_name, Action::Deploy).is_some()
+    })
 }
 
 fn manifest_command<'manifest>(

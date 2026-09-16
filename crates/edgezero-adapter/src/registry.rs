@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -39,6 +39,38 @@ pub enum AdapterAction {
     /// adapters return "unsupported".
     Rollback,
     Serve,
+}
+
+/// Logical store ids declared by the application manifest for a deploy.
+///
+/// This stays platform-neutral: each adapter decides whether and how its
+/// runtime needs these declarations materialized.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeployStoreIds {
+    pub config: Vec<String>,
+    pub kv: Vec<String>,
+    pub secrets: Vec<String>,
+}
+
+impl DeployStoreIds {
+    /// Whether the application declares no runtime stores of any kind.
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.config.is_empty() && self.kv.is_empty() && self.secrets.is_empty()
+    }
+}
+
+/// Structured application context for an adapter deploy.
+///
+/// Native-CLI passthrough remains in the separate `args` slice. EdgeZero-owned
+/// deployment data belongs here so it cannot collide with provider CLI flags.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdapterDeployContext {
+    pub adapter_manifest_path: Option<PathBuf>,
+    pub service_id: Option<String>,
+    pub staging: bool,
+    pub stores: DeployStoreIds,
 }
 
 /// A single declared store id, paired with the platform name the
@@ -274,6 +306,24 @@ pub enum ReadConfigEntry {
 /// of `edgezero-core`. Defaults are no-ops; adapters override what
 /// they actually need.
 pub trait Adapter: Sync + Send {
+    /// Deploy with EdgeZero-owned inputs carried as typed context and only
+    /// provider-native passthrough in `args`.
+    ///
+    /// Adapters that do not need structured deploy data can use the default
+    /// dispatch to their existing `execute` implementation.
+    ///
+    /// # Errors
+    /// Returns an error string when the adapter deploy fails.
+    #[inline]
+    fn deploy(&self, context: &AdapterDeployContext, args: &[String]) -> Result<(), String> {
+        let action = if context.staging {
+            AdapterAction::DeployStaged
+        } else {
+            AdapterAction::Deploy
+        };
+        self.execute(action, args)
+    }
+
     /// Execute the requested action with optional adapter-specific args.
     ///
     /// `args` is a stringly-typed pass-through for arguments meant
@@ -289,6 +339,23 @@ pub trait Adapter: Sync + Send {
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+
+    /// Finish a successful deploy.
+    ///
+    /// `command_output` is present when a manifest-defined deploy command ran
+    /// instead of the adapter's built-in deploy. Adapters can reconcile
+    /// provider state or emit deployment metadata from either path.
+    ///
+    /// # Errors
+    /// Returns an error string when provider state cannot be finalized.
+    #[inline]
+    fn finalize_deploy(
+        &self,
+        _context: &AdapterDeployContext,
+        _command_output: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Reclaim chunk entries that no LIVE config pointer references.
     ///

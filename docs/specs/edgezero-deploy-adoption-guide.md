@@ -220,8 +220,9 @@ expansion or JSON→provider config conversion. Config push and provisioning are
 never deploy side effects — they are separate, explicit steps a consumer runs on
 their own schedule. Config push has its own action, `config-push-fastly`
 (including `deploy-to: staging`, which writes the derived
-`<logical-store-id>_staging` variant in the same store — an explicit `key` is
-production-only and rejected with `staging`); provisioning is a CLI subcommand (`<your-app>-cli provision`). The
+`<logical-store-id>_staging` variant in the store selected by the staging
+environment — an explicit `key` is production-only and rejected with
+`staging`); provisioning is a CLI subcommand (`<your-app>-cli provision`). The
 generic engine stays provider-neutral — staging/health/rollback exist only as
 Fastly-specific actions (§4), not engine behavior.
 

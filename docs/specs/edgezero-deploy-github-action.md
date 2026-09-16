@@ -139,8 +139,9 @@ The **generic** engine (`deploy-core`) will not:
 1. check out application source;
 2. choose an application ref;
 3. deploy more than one adapter per `deploy-*` invocation;
-4. provision provider resources or push runtime config as a side effect of
-   deploy — config push is its own action (`config-push-fastly`, §5.5), and
+4. provision provider resources or push the typed app-config payload as a side
+   effect of deploy — Fastly deploy may reconcile declared runtime selector
+   entries, config push is its own action (`config-push-fastly`, §5.5), and
    provision remains an explicit CLI subcommand the caller may run separately;
 5. implement provider staging, health checks, rollback, or deployment-version
    parsing **in the provider-neutral engine** — these are provider-specific and
@@ -494,8 +495,9 @@ adapter adds its own lifecycle actions if its provider supports staging.
 
 ### 5.5 Config push (`config-push-fastly`)
 
-Deploy activates code; it never writes runtime config (§4). Pushing the typed
-app config to the provider's config store is a **separate** action,
+Deploy may reconcile store-name and key selectors, but it never writes the
+typed app-config payload (§4). Pushing that payload to the provider's config
+store is a **separate** action,
 `config-push-fastly`, so a caller decides when config moves and can push it
 independently of a code deploy.
 
@@ -510,17 +512,20 @@ redirect or re-auth the push. (The heavier `provider-env` JSON boundary is for
 `deploy`, which spawns arbitrary manifest build/deploy commands; config-push,
 like the other lifecycle actions, does not.)
 
-#### 5.5.1 Staging model — same store, different key
+#### 5.5.1 Staging model — selected store, different key
 
 Fastly config stores are **not versioned** like the draft service versions the
 deploy-staging path clones, so "push config to staging" cannot mean a draft. It
-means the **same config store, a different key**:
+means the **selected config store, under a different key**. The production and
+staging deployment environments may select the same physical store or different
+stores through `EDGEZERO__STORES__CONFIG__<ID>__NAME`:
 
 - **Production** writes the config blob under the resolved key (the logical store
   id, or an explicit `--key`).
 - **Staging** writes under the staging variant of the logical store id —
-  `<logical-store-id>_staging` — in the **same** store. The staging key is
-  _derived_, so `--key` is mutually exclusive with `--staging`.
+  `<logical-store-id>_staging` — in the store selected by the staging
+  environment. The staging key is _derived_, so `--key` is mutually exclusive
+  with `--staging`.
 
 The CLI gains a `config push --staging` flag (the same `--staging` verb
 `deploy`/`healthcheck`/`rollback` already use); the
@@ -531,11 +536,9 @@ lifecycle actions.
 #### 5.5.2 What makes a staged version _read_ the staged key
 
 Writing `<logical>_staging` is only half of it. The runtime picks its config key
-from the service-scoped
-`EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__KEY` entry of a Config
-Store it opens by the name `edgezero_runtime_env`. Legacy unscoped keys are not
-read because they have no safe owner in a store linked to multiple services. A
-staged deploy clones the active version, and **a
+from the canonical `EDGEZERO__STORES__CONFIG__<ID>__KEY` entry of a Config Store
+it opens by the name `edgezero_runtime_env`. A staged deploy clones the active
+version, and **a
 clone inherits its resource links** — so on its own, a staged version opens the
 same selector store as production and reads production's key. Flipping that
 shared store's selector is not an answer either: it would redirect production
@@ -546,13 +549,10 @@ alias. That is the seam:
 
 - A staged deploy owns a second, **per-service** store,
   `edgezero_runtime_env_staging_<service-id>`, creating it on demand and
-  **mirroring** only the current service's scoped production overrides into it.
-  Unscoped entries and entries belonging to other services are excluded, and
-  only the current service's declared config selectors are
-  redirected to `<id>_staging`. Ambient process mappings are not overlaid, so a
-  staged healthcheck exercises the mappings production actually uses. Because
-  the mirror runs at deploy time, the twin always reflects production's
-  _current_ overrides. The name is
+  carrying unrelated production runtime settings into it. For every declared
+  Config, KV, and Secret store, the staging deployment environment's canonical
+  `__NAME` value replaces production's value; declared config selectors are
+  redirected to `<id>_staging`. The name is
   per service because Fastly config stores are account-wide, versionless
   resources: a single shared twin would let one service's staged deploy clobber
   another's selectors.
@@ -560,6 +560,10 @@ alias. That is the seam:
   `edgezero_runtime_env` link and links the **staging store** under that same
   name. The runtime opens `edgezero_runtime_env` and gets the staging selector;
   the active version is untouched.
+- For every declared Config, KV, and Secret store, the staged deploy resolves
+  the physical name selected by the staging environment and attaches that
+  existing resource to the draft under the same name. A missing selected
+  resource is a hard error before the version is staged.
 
 So the pieces compose:
 
@@ -572,8 +576,25 @@ A staged deploy **fails closed** when it cannot read the store listing (so it
 cannot tell whether production config exists): a version that silently served
 production config would be worse than a refused deploy. When the store listing is
 readable, the twin is created and mirrored automatically — no separate setup
-step. An app that declares no config store has no selector to isolate, so its
-staged version keeps the inherited link (staged code, no config to isolate).
+step. An app that declares no stores has no selector to isolate, so its staged
+version keeps the inherited link (staged code with no runtime store mapping).
+
+The deploy launcher MUST preserve well-formed canonical selectors supplied by
+the selected GitHub Environment while scrubbing action-private `EDGEZERO__*`
+variables. The public allowlist is limited to declared-store shapes:
+
+```text
+EDGEZERO__STORES__CONFIG__<ID>__NAME
+EDGEZERO__STORES__CONFIG__<ID>__KEY
+EDGEZERO__STORES__KV__<ID>__NAME
+EDGEZERO__STORES__SECRETS__<ID>__NAME
+```
+
+The provider-neutral CLI passes the manifest path, service id, staging flag,
+and declared store IDs to the selected adapter as typed deploy context. Native
+CLI passthrough remains a separate string list. The Fastly adapter reconciles
+only the corresponding canonical keys; the deployment environment, rather
+than a service-ID suffix, selects production or staging values.
 
 #### 5.5.3 Inputs / outputs
 
@@ -589,7 +610,7 @@ staged version keeps the inherited link (staged code, no config to isolate).
 | `no-env`            | No       | `false`       | `true` passes `--no-env` (skip the `<APP_NAME>__…__<KEY>` env overlay before pushing).                              |
 | `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).                                                      |
 | `key`               | No       | empty         | Explicit base key for a production push (default: the logical store id). Not allowed with `deploy-to: staging`.     |
-| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the same store.                                        |
+| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the store selected by the staging environment.         |
 
 Outputs: `pushed-key` (the key that was written — the base key, or the derived
 `_staging` variant), `store` (the resolved logical store id),

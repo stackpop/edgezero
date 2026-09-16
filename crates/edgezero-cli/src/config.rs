@@ -1987,15 +1987,13 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 )]
 mod tests {
     use super::*;
-    use crate::test_support::{EnvOverride, manifest_guard};
+    use crate::test_support::{EnvOverride, manifest_guard, path_mutation_guard};
     #[cfg(unix)]
     use edgezero_core::test_env::PathPrepend;
     use serde::{Deserialize, Serialize};
     use std::borrow::Cow;
 
     use std::fs;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
     // ---------- config gc argument gating ----------
@@ -4407,15 +4405,6 @@ ids = ["default"]
     // the Fermyon Cloud detection path inside `read_config_entry`.
 
     // --- PATH-mutation helpers (mirrors Cloudflare adapter test pattern) ---
-
-    /// Process-wide mutex serialising PATH-mutating tests so parallel
-    /// test threads don't race on the `$PATH` environment variable.
-    #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
-    }
 
     /// Build a tempdir containing a `fastly` script that APPENDS every
     /// invocation to `oplog` and fails. Injected via PATH so an ordering

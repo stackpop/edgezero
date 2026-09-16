@@ -805,6 +805,7 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::path_mutation_guard;
     use edgezero_core::app_config::app_name_prefix;
     use edgezero_core::test_env::PathPrepend as PathOverride;
     use std::path::Path;
@@ -1301,6 +1302,7 @@ mod tests {
 
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let temp = TempDir::new().expect("temp dir");
         let bin_dir = temp.path().join("bin");
         write_git_stub(&bin_dir);

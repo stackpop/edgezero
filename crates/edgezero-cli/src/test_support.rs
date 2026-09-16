@@ -107,3 +107,12 @@ pub(crate) fn manifest_guard() -> &'static Mutex<()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD.get_or_init(|| Mutex::new(()))
 }
+
+/// Process-wide mutex serialising tests that mutate `PATH`.
+///
+/// A separate guard in each test module is insufficient because environment
+/// variables are shared by every test thread in this crate.
+pub(crate) fn path_mutation_guard() -> &'static Mutex<()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| Mutex::new(()))
+}

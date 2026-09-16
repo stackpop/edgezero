@@ -468,9 +468,10 @@ pub struct ConfigDiffArgs {
     /// Path to the adapter's runtime configuration file.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
-    /// Diff against the staging key (`<logical-id>_staging`) in the same store,
-    /// so a staged diff compares exactly what `config push --staging` would
-    /// write. Mutually exclusive with `--key`, for the same reason as on push.
+    /// Diff against the staging key (`<logical-id>_staging`) in the
+    /// environment-selected store, so a staged diff compares exactly what
+    /// `config push --staging` would write. Mutually exclusive with `--key`, for
+    /// the same reason as on push.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to diff against. Defaults to the
@@ -561,9 +562,10 @@ pub struct ConfigPushArgs {
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
     /// Push to staging: write the config under the `<logical-id>_staging` key
-    /// in the SAME store, so it never overwrites the production key the live
-    /// service reads. The same `--staging` verb `deploy`/`healthcheck`/`rollback`
-    /// use. Mutually exclusive with `--key`: the
+    /// in the environment-selected store, so it never overwrites the production
+    /// key the live service reads. Production and staging may select the same or
+    /// different physical stores. The same `--staging` verb
+    /// `deploy`/`healthcheck`/`rollback` use. Mutually exclusive with `--key`: the
     /// staging key is derived from the
     /// store's logical id because that is what the staging selector store (created
     /// and linked by a staged deploy) points a staged version at, so an explicit

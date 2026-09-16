@@ -399,6 +399,12 @@ concrete array indices — e.g. `integrations.datadome.server_side_key` or
   skippable. A missing or `null` intermediate object/array in the stored
   blob (e.g. the whole `partners` array) is a `ConfigOutOfDate` error, not
   a silent skip — both `config validate` and the runtime reject it.
+- **Hand-written optional paths:** the derive does not emit optional
+  intermediates, but a hand-written `AppConfigMeta` implementation can mark
+  one with `SecretPathSegment::OptionalField`. An absent or `null` optional
+  intermediate skips the rest of that secret path in `config validate`,
+  `config push`, and the runtime extractor. When present, it must still have
+  the expected object shape.
 - **No cyclic nesting:** a type that directly nests itself by name
   (`#[app_config(nested)] x: Vec<Config>`) is a compile error. A cycle the
   derive can't see one-type-at-a-time — a _mutual_ cycle (`A` nests `B`,

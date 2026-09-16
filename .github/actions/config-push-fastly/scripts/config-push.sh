@@ -11,9 +11,10 @@ set -euo pipefail
 # FASTLY_TOKEN can never redirect or re-auth the push.
 #
 # Staging: `deploy-to: staging` passes `--staging` to the CLI, which writes the
-# `<logical-store-id>_staging` variant in the SAME store — the key the staging
-# selector points a staged version at, never the production key the live service
-# reads. `key` is production-only (the wrapper rejects key + staging up front).
+# `<logical-store-id>_staging` variant in the environment-selected store — the
+# key the staging selector points a staged version at, never the production key
+# the live service reads. Production and staging may select the same or different
+# physical stores. `key` is production-only (the wrapper rejects key + staging).
 #
 # Path confinement: working-directory, manifest, and app-config are
 # caller strings handed to a credential-bearing CLI, so each is canonicalized

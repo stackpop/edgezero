@@ -41,7 +41,7 @@ inputs:
     required: false
     default: ""
   deploy-to:
-    description: "'production' writes the base key; 'staging' writes the <logical-store-id>_staging variant in the same store (the key the staging selector points at)."
+    description: "'production' writes the base key; 'staging' writes the <logical-store-id>_staging variant in the store selected by the staging environment (the key the staging selector points at)."
     required: false
     default: production
 

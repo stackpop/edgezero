@@ -424,8 +424,8 @@ test_wrapper_validate() {
   A=false assert_fails "deploy-fastly: missing artifact is rejected" run_dfl
   T=false assert_fails "deploy-fastly: missing token (by presence) is rejected" run_dfl
   S='bad id!' assert_fails "deploy-fastly: malformed service-id is rejected" run_dfl
-  S='svc_1' assert_fails "deploy-fastly: service-id with underscore is rejected" run_dfl
-  S='svc-1' assert_fails "deploy-fastly: service-id with hyphen is rejected" run_dfl
+  S='svc_1' assert_succeeds "deploy-fastly: service-id with underscore is accepted" run_dfl
+  S='svc-1' assert_succeeds "deploy-fastly: service-id with hyphen is accepted" run_dfl
   S='' assert_fails "deploy-fastly: empty service-id is rejected" run_dfl
 
   # config-push-fastly: artifact + token presence, deploy-to fail-closed.
@@ -658,6 +658,9 @@ printf 'FASTLY_API_TOKEN=%s\n' "${FASTLY_API_TOKEN:-ABSENT}"
 printf 'EDGEZERO__PROVIDER__ENV=%s\n' "${EDGEZERO__PROVIDER__ENV:-ABSENT}"
 printf 'EDGEZERO__FASTLY__API_TOKEN=%s\n' "${EDGEZERO__FASTLY__API_TOKEN:-ABSENT}"
 printf 'EDGEZERO__DEPLOY__ARGS_FILE=%s\n' "${EDGEZERO__DEPLOY__ARGS_FILE:-ABSENT}"
+printf 'EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=%s\n' "${EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME:-ABSENT}"
+printf 'EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=%s\n' "${EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY:-ABSENT}"
+printf 'EDGEZERO__STORES__SECRETS____NAME=%s\n' "${EDGEZERO__STORES__SECRETS____NAME:-ABSENT}"
 printf 'EDGEZERO_MANIFEST=%s\n' "${EDGEZERO_MANIFEST:-ABSENT}"
 CLI
   chmod +x "$dir/bin/scrub-cli"
@@ -671,6 +674,9 @@ CLI
       EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
       EDGEZERO__PROVIDER__ENV='{"FASTLY_API_TOKEN":"s3cret"}' \
       EDGEZERO__FASTLY__API_TOKEN='s3cret' \
+      EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME='ts-secrets-staging' \
+      EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY='trusted_server_config_staging' \
+      EDGEZERO__STORES__SECRETS____NAME='must-not-survive' \
       "$CORE_SCRIPTS/run-app-cli.sh" deploy 2>/dev/null
   )
 
@@ -679,6 +685,12 @@ CLI
     "FASTLY_API_TOKEN=s3cret" "$(grep '^FASTLY_API_TOKEN=' <<<"$out")"
   assert_equals "EDGEZERO_MANIFEST is delivered" \
     "EDGEZERO_MANIFEST=$dir/edgezero.toml" "$(grep '^EDGEZERO_MANIFEST=' <<<"$out")"
+  assert_equals "the selected secret-store name is delivered" \
+    "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts-secrets-staging" \
+    "$(grep '^EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=' <<<"$out")"
+  assert_equals "the selected config-store key is delivered" \
+    "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=trusted_server_config_staging" \
+    "$(grep '^EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=' <<<"$out")"
 
   # What it must NEVER see: the same secret under names we never promised.
   assert_equals "the provider-env JSON blob does not survive" \
@@ -687,6 +699,9 @@ CLI
     "EDGEZERO__FASTLY__API_TOKEN=ABSENT" "$(grep '^EDGEZERO__FASTLY__API_TOKEN=' <<<"$out")"
   assert_equals "action-private file handles do not survive" \
     "EDGEZERO__DEPLOY__ARGS_FILE=ABSENT" "$(grep '^EDGEZERO__DEPLOY__ARGS_FILE=' <<<"$out")"
+  assert_equals "malformed selector names do not survive" \
+    "EDGEZERO__STORES__SECRETS____NAME=ABSENT" \
+    "$(grep '^EDGEZERO__STORES__SECRETS____NAME=' <<<"$out")"
 }
 
 # ---------------------------------------------------------------------------

@@ -523,9 +523,10 @@ than guess a version.
 
 ### `config-push-fastly`
 
-Pushes your app's typed config to a Fastly config store. This is **separate from
-deploy** — deploy activates code, it never writes runtime config — so you run it
-as its own step, whenever config should move.
+Pushes your app's typed config payload to a Fastly config store. This is
+**separate from deploy**: deploy may reconcile the small store-name and key
+selectors in `edgezero_runtime_env`, but it never pushes the typed app-config
+payload. Run config push as its own step whenever that payload should move.
 
 | Input               | Required | Default       | Meaning                                                                                                              |
 | ------------------- | -------- | ------------- | -------------------------------------------------------------------------------------------------------------------- |
@@ -539,7 +540,7 @@ as its own step, whenever config should move.
 | `no-env`            | No       | `false`       | `true` passes `--no-env` so the CLI does not overlay `<APP_NAME>__…__<KEY>` env vars onto the config before pushing. |
 | `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).                                                       |
 | `key`               | No       | empty         | Explicit base key for a **production** push (default: the logical store id). Not allowed with `deploy-to: staging`.  |
-| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the **same** store.                                     |
+| `deploy-to`         | No       | `production`  | `staging` writes `<logical-store-id>_staging` in the store selected by the staging environment.                      |
 
 Outputs: `pushed-key` (the key written — the base key, or the derived `_staging`
 variant), `store` (the logical store id the CLI **resolved** — always emitted,
@@ -566,23 +567,23 @@ A production config push, using the same build artifact:
     # app-config-inline: ${{ vars.APP_CONFIG_TOML }}  # or push inline content
 ```
 
-**Staging config is the same store, a different key.** Fastly config stores are
-not versioned like staged service versions, so `deploy-to: staging` writes your
-config under `<logical-store-id>_staging` alongside the production key — never
-overwriting what the live service reads. The staging key is _derived_ from the
-store's logical id, so `key` is production-only: combining `key` with
-`deploy-to: staging` is rejected up front (an explicit staging key would be
-written where no staged version ever reads).
+**Staging config uses a different key in the selected store.** Fastly config
+stores are not versioned like staged service versions, so `deploy-to: staging`
+writes under `<logical-store-id>_staging`. The production and staging GitHub
+Environments may set `EDGEZERO__STORES__CONFIG__<ID>__NAME` to the same physical
+store or to different stores. The staging key is _derived_ from the store's
+logical id, so `key` is production-only: combining `key` with
+`deploy-to: staging` is rejected up front.
 
 What makes a _staged version_ actually read that key is the other half: a staged
 deploy re-points its own `edgezero_runtime_env` link at a **per-service**
-`edgezero_runtime_env_staging_<service-id>` selector store, mirroring only that
-service's scoped production overrides into it while redirecting the
-service-scoped config selectors to
-`<logical-store-id>_staging`. Ambient `EDGEZERO__STORES__*__NAME` process values
-are not overlaid here; staging verifies the mappings production actually uses.
-The staged deploy creates and populates that
-twin on demand — no separate setup step — so the staged version reads
+`edgezero_runtime_env_staging_<service-id>` selector store. It keeps unrelated
+production runtime settings, applies the selected staging environment's
+canonical `EDGEZERO__STORES__*__NAME` values for every declared Config, KV, and
+Secret store, and redirects config selectors to `<logical-store-id>_staging`.
+It also attaches each selected physical store to the draft under its selected
+name. The physical stores must already exist; the staged deploy creates and
+populates only the selector twin on demand. The staged version therefore reads
 `<logical>_staging` while production keeps reading `<logical>`. (The store is
 named per service because Fastly config stores are account-wide and versionless,
 so a shared twin could let one service's staged deploy clobber another's.) If the deploy
@@ -590,6 +591,27 @@ cannot even read the store listing (so it cannot tell whether production config
 exists), it fails closed rather than risk serving production config. A typo like
 `deploy-to: Staging` is likewise rejected up front, never silently pushed to
 production.
+
+Select the values with the job's GitHub Environment. For example, a Trusted
+Server deployer can map `ts.example.com` to production and
+`staging.ts.example.com` to staging while keeping identical variable names:
+
+```yaml
+jobs:
+  deploy:
+    environment: ${{ inputs.domain }}
+    env:
+      EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME: ${{ vars.EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME }}
+      EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME: ${{ vars.EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME }}
+```
+
+Define those two variables in each GitHub Environment. Give both environments
+the same value to share a physical store, or different values to isolate them.
+The deploy action preserves only well-formed canonical store selectors when it
+scrubs its private `EDGEZERO__*` inputs, and the app CLI materializes selectors
+only for stores declared in `edgezero.toml`. A service ID is still passed to
+Fastly lifecycle commands, but it never appears in an environment variable
+name.
 
 ## Strict lifecycle values (fail closed)
 
@@ -763,10 +785,11 @@ production).
 
 ## Non-goals
 
-The actions do not check out source, expand or convert configuration, or push
-runtime config as a side effect of deploy. Config push and provisioning are
-explicit subcommands you run as separate steps — via the `config-push-fastly`
-action, or your **app-owned** CLI's `<app-cli> config push` / `<app-cli> provision`
+The actions do not check out source, expand configuration, provision resources,
+or push the typed app-config payload as a side effect of deploy. Fastly deploy
+does reconcile declared runtime selector entries in `edgezero_runtime_env`.
+Config push and provisioning remain explicit subcommands — via the
+`config-push-fastly` action, or your **app-owned** CLI's `<app-cli> config push` / `<app-cli> provision`
 (the typed `config push` is only available on your app's CLI; the bundled
 `edgezero` binary has no typed config in scope and returns an unsupported error).
 When you invoke `config push` yourself in CI (rather than through
