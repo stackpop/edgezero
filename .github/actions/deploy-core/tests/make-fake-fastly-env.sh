@@ -57,7 +57,7 @@ case "\${1:-} \${2:-}" in
   "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging_dummyservice"}]' ;;
   # A cloned draft inherits the active version's links; the staged deploy drops
   # this one and re-links the staging store under the same name.
-  "resource-link list") echo '[{"id":"LINK_ENV","name":"edgezero_runtime_env"}]' ;;
+  "resource-link list") echo '[{"id":"LINK_ENV","name":"edgezero_runtime_env","resource_id":"ENVSEL1"}]' ;;
   "resource-link delete") echo "SUCCESS: Deleted resource link" ;;
   "resource-link create") echo "SUCCESS: Created resource link" ;;
   "config-store-entry describe")
