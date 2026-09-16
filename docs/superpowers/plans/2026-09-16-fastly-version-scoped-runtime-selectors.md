@@ -29,8 +29,9 @@ still leaves a focused component testable on its own.
 - Modify `crates/edgezero-adapter-fastly/src/request.rs`: update custom-entry-point
   guidance for the fallible runtime loader.
 - Modify `crates/edgezero-adapter-fastly/src/cli.rs`: Fastly ownership, strict args,
-  environment resolution, provider preflight, migration inventory, link planning,
-  draft preparation, descriptor verification, and publication.
+  environment resolution, provider preflight, link planning, removal of PR #344
+  selector persistence and staging twins, draft preparation, descriptor
+  verification, and publication.
 - Create `.github/actions/fastly-common/scripts/common.sh`: one shared alphanumeric
   Fastly service-ID validator for deploy, capture, healthcheck, and rollback actions.
 - Modify `.github/actions/deploy-core/scripts/run-app-cli.sh`: preserve the fixed
@@ -258,8 +259,8 @@ Recognize only the exact key grammar
 name and return its value even when the logical ID is absent from current metadata.
 Ignore unrelated fixed settings and unknown shapes; never use arbitrary descriptor
 data as a deletion candidate. Keep structural parsing separate from those two consumer
-policies so migration can inspect an older valid descriptor without weakening runtime
-validation.
+policies so deployment can inspect a prior version-scoped descriptor without
+weakening runtime validation. Do not inspect PR #344 or unscoped selector data.
 
 - [ ] **Step 6: Run descriptor tests and crate tests**
 
@@ -460,11 +461,11 @@ git add crates/edgezero-adapter-fastly/src/cli.rs
 git commit -m "fix(fastly): validate managed deploy inputs before dispatch"
 ```
 
-### Task 5: Build a read-only Fastly deployment and migration plan
+### Task 5: Build a read-only Fastly deployment and link plan
 
 **Files:**
 
-- Modify: `crates/edgezero-adapter-fastly/src/cli.rs:223-390,3502-4075,4514-4608,4982-5027,5061-5374`
+- Modify: `crates/edgezero-adapter-fastly/src/cli.rs:223-390,622-679,3502-4075,4514-4608,4982-5027,5061-5374,7077-7090`
 - Modify: `crates/edgezero-adapter-fastly/src/runtime_descriptor.rs`
 - Test: co-located tests in both files
 
@@ -483,24 +484,32 @@ resource ID, stale aliases from a previous version descriptor, a store removal/r
 whose old logical ID is absent from the new manifest, unrelated-link preservation,
 shared-link preservation, and Config/KV/Secret isolation.
 
-- [ ] **Step 3: Write legacy migration-inventory tests**
+- [ ] **Step 3: Write clean-cutover and legacy-removal tests**
 
-Cover PR #344 keys of the form
-`EDGEZERO__SERVICES__<SERVICE_ID>__<CANONICAL_SUFFIX>`, current unscoped canonical
-keys, and unscoped entries read from a legacy twin linked under
-`edgezero_runtime_env`. Prove legacy values identify only already-linked candidate
-aliases, never populate the new descriptor, and ambiguous candidates are preserved.
-Also prove another service's scoped entries are ignored, and an unambiguous legacy
-alias whose resolved resource ID matches the source link is removed when no longer
-selected.
+For a source with no version-scoped descriptor, prove the read-only plan classifies
+linked Config, KV, and Secret Store resources by provider resource ID, removes every
+inherited store link absent from the desired set on the future draft, and preserves
+links whose resource IDs are absent from all three store inventories. Feed malformed
+records, duplicate IDs, and the same resource ID in multiple store kinds; each must
+fail before provider mutation. Assert the command log contains no reads or writes for
+PR #344
+`EDGEZERO__SERVICES__<SERVICE_ID>__<ADAPTER|LOGGING|STORES>__...` keys, unscoped
+canonical selector entries, or `edgezero_runtime_env_staging_<service-id>` stores,
+while still requiring the new `__VERSIONS__<VERSION>__ENV_V1` descriptor operation.
+Delete the scoped selector persistence helpers and their tests while retaining
+optional typed Secret Store support.
+
+Add provisioning tests proving it creates/configures only the one
+`edgezero_runtime_env` store and emits no scoped/unscoped selector writes or staging-
+twin guidance.
 
 - [ ] **Step 4: Run focused tests and verify they fail**
 
 Run: `cargo test -p edgezero-adapter-fastly --features cli deploy_plan -- --nocapture`
 
-Run: `cargo test -p edgezero-adapter-fastly --features cli migration_inventory -- --nocapture`
+Run: `cargo test -p edgezero-adapter-fastly --features cli clean_cutover -- --nocapture`
 
-Expected: FAIL because the plan types and exact migration rules do not exist.
+Expected: FAIL because the plan types and clean-cutover rules do not exist.
 
 - [ ] **Step 5: Add typed planning structures**
 
@@ -534,30 +543,37 @@ Before `compute update`, resolve and validate:
 
 1. service ID, token, target, args, and effective environment;
 2. canonical descriptor bytes and the 8,000-byte limit;
-3. the one physical `edgezero_runtime_env` ID;
-4. every selected Config/KV/Secret resource ID;
+3. complete Config/KV/Secret Store inventories with validated records and unique,
+   unambiguous resource IDs;
+4. the one physical `edgezero_runtime_env` ID and every selected Config/KV/Secret
+   resource ID from those inventories;
 5. all service versions and the active version or existing initial draft;
 6. the source version's links;
-7. its exact prior descriptor, or legacy inventory when absent; and
+7. its exact prior version-scoped descriptor when present, with no legacy selector
+   lookup when absent; and
 8. the complete desired create/delete link plan.
 
 For no-active first deployment, snapshot the exact existing initial draft's version
 metadata, domains, backends, logging endpoints, settings, and links. Never create a
 blank version. Fail before publication if no suitable initialized draft exists.
 
-- [ ] **Step 7: Implement exact migration ownership**
+- [ ] **Step 7: Implement the clean-cutover ownership rule**
 
-Read scoped legacy entries only for the current service. Read unscoped entries from
-the resource actually linked under `edgezero_runtime_env`, which covers a legacy
-staging twin. Compare candidates with the source version's actual alias/resource-ID
-pairs. Delete only unambiguous matches; preserve unknown or ambiguous links. Leave all
-legacy entries and physical twins intact.
+When a prior version-scoped descriptor exists, derive stale managed aliases only from
+that descriptor. When it does not exist, classify the source version's linked Config,
+KV, and Secret Store resources from the complete provider resource-ID inventories and
+plan deletion of every inherited store link absent from the desired set. Preserve
+links absent from all three inventories. Fail closed on incomplete commands, malformed
+records, duplicate IDs, or cross-kind ambiguity. Remove the PR #344 scoped selector
+persistence/read helpers and the unscoped/twin selector inventory code; do not issue
+provider calls for legacy entries or twins. Remove provisioning output that tells
+operators to maintain unscoped selectors or staging twins.
 
 - [ ] **Step 8: Run plan and parser tests**
 
 Run: `cargo test -p edgezero-adapter-fastly --features cli deploy_plan -- --nocapture`
 
-Run: `cargo test -p edgezero-adapter-fastly --features cli migration_inventory -- --nocapture`
+Run: `cargo test -p edgezero-adapter-fastly --features cli clean_cutover -- --nocapture`
 
 Expected: PASS.
 
@@ -786,8 +802,9 @@ deployments.
 
 Model one `ENVSEL1` store, descriptor entry create/readback, resource links per
 version, clone inheritance, selected Config/KV/Secret resources, and stage/activate.
-Retain legacy scoped/unscoped data only as migration input. Remove `STAGESEL1` and all
-creation/linking of `edgezero_runtime_env_staging_dummyservice`.
+Remove all legacy scoped/unscoped selector fixtures, `STAGESEL1`, and all
+creation/linking of `edgezero_runtime_env_staging_dummyservice`. Assert no legacy
+selector entry or twin command is issued.
 
 - [ ] **Step 3: Rewrite staged call assertions**
 
@@ -839,13 +856,14 @@ Document one physical `edgezero_runtime_env`, the internal
 prepare-before-publish ordering, exact store links, and fail-closed runtime behavior for
 apps that declare stores. Remove staging-twin and one-service-owner guidance.
 
-- [ ] **Step 2: Document the public environment contract and migration**
+- [ ] **Step 2: Document the public environment contract and clean cutover**
 
 Keep canonical environment variable names with no service ID. Explain parent value >
-manifest variable default > logical default. State that legacy service-scoped and
-unscoped entries are inventory-only during deployment, old entries/twins remain for
-rollback, and new runtimes never fall back to them. Preserve optional Secret Store
-declarations and `__NAME` examples without including secret values.
+manifest variable default > logical default. State that PR #344 service-scoped,
+unscoped, and staging-twin selector data is unsupported and never read or written;
+operators may remove inert old entries/twins separately. Describe the clean cutover
+for a source without a version descriptor. Preserve optional Secret Store declarations
+and `__NAME` examples without including secret values.
 
 - [ ] **Step 3: Correct the Trusted Server workflow example**
 
@@ -959,6 +977,6 @@ Expected: only intended tracked changes/commits plus the untouched untracked
 - [ ] **Step 7: Update the issue and PR**
 
 Rewrite the existing PR title/body around the final implementation, include the
-problem, resulting production/staging behavior, migration rule, and validation
+problem, resulting production/staging behavior, clean-cutover rule, and validation
 evidence. Push the reviewed commits, then monitor required checks and fix any failure
 before reporting completion.

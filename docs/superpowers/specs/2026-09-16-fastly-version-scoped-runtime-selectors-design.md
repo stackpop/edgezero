@@ -26,7 +26,8 @@ That model has several correctness failures:
 4. production can select a store that is not linked to the activated version;
 5. a failed staging attempt can modify the selector store used by the currently
    staged version;
-6. existing service-scoped and current unscoped installations are not migrated;
+6. legacy service-scoped, unscoped, and staging-twin selector paths make the
+   lifecycle harder to reason about and must be removed rather than extended;
 7. manifest variable defaults reach a manifest deploy subprocess but not the
    parent-side Fastly finalizer;
 8. lifecycle-owned Fastly flags can re-enter through direct CLI passthrough;
@@ -52,8 +53,8 @@ production links, or failures between activation and selector writes.
 - Prepare selectors and exact resource links before staging or activation.
 - Keep service IDs out of GitHub variable names. Service and version scoping is
   an internal Fastly storage detail.
-- Migrate installations written by PR #344 without retaining that user-facing
-  naming scheme as the new configuration contract.
+- Remove the PR #344 selector persistence path and the mutable staging-twin
+  lifecycle. New deploys never read or write their scoped or unscoped entries.
 - Preserve manifest-defined deploy commands for adapters that do not claim a
   managed deployment.
 
@@ -68,6 +69,9 @@ production links, or failures between activation and selector writes.
 - Promote a staged Fastly version to production. The deployer builds production
   and staging through their respective GitHub Environments.
 - Change Cloudflare, Spin, or Axum runtime configuration semantics.
+- Migrate or fall back to PR #344 service-scoped entries, unscoped selector
+  entries, or staging-twin stores. They are unsupported input to the new
+  lifecycle.
 
 ## 4. Options considered
 
@@ -190,11 +194,14 @@ Before creating or editing a Fastly version, the adapter:
 1. validates the alphanumeric service ID and parses passthrough arguments;
 2. resolves the effective environment and builds the canonical descriptor in
    memory, including its size check;
-3. resolves every selected physical Config, KV, and Secret Store by name;
-4. resolves the exact `edgezero_runtime_env` physical store;
+3. lists complete account inventories for Config, KV, and Secret Stores,
+   validates every record, rejects duplicate or cross-kind resource IDs, and
+   resolves every selected physical store from those inventories;
+4. resolves the exact `edgezero_runtime_env` physical store from the Config Store
+   inventory;
 5. resolves the current active version, if any;
-6. reads that version's descriptor and resource links, or inventories both
-   legacy selector formats during migration;
+6. reads that version's descriptor, when present, and its resource links without
+   reading legacy selector entries or staging-twin stores;
 7. when there is no active version, resolves the service's existing initial
    editable version and inventories all versioned configuration on that exact
    draft; and
@@ -281,62 +288,56 @@ Reconciliation must:
   selected resource ID;
 - delete an inherited EdgeZero-managed alias when the new descriptor does not
   select it;
-- preserve unrelated resource links;
+- preserve unrelated non-store resource links;
 - preserve a shared link when production and staging select the same resource;
 - reject alias collisions between different resource IDs; and
 - finish before stage or activation.
 
-The managed alias set comes from a deployment-side descriptor parser. Unlike the
-runtime parser, it is intentionally independent of the new manifest's declared
-store IDs: after validating the descriptor structure and format, it recognizes
-every exact
+When the source version has a version-scoped descriptor, the managed alias set
+comes from a deployment-side descriptor parser. Unlike the runtime parser, it is
+intentionally independent of the new manifest's declared store IDs: after
+validating the descriptor structure and format, it recognizes every exact
 `EDGEZERO__STORES__<CONFIG|KV|SECRETS>__<LOGICAL_ID>__NAME` entry and records its
 validated physical-name value. This lets a later manifest remove or rename a
 store and still remove the alias selected by the prior version. It ignores
 unknown entry shapes and never turns arbitrary descriptor data into a deletion.
 
-During migration, the adapter also inventories aliases found in the current
-service's `EDGEZERO__SERVICES__<SERVICE_ID>__...` entries, the current unscoped
-canonical entries, and logical-ID defaults. Legacy data is used only when
-classifying an alias already linked to the source version; it never supplies a
-new selector value. If ownership of a legacy linked alias is ambiguous, the
-adapter preserves it. After the first version-scoped descriptor is active,
-subsequent removal and rename reconciliation is exact.
+If the source version has no version-scoped descriptor, the adapter performs a
+clean cutover on the unreachable draft. It classifies linked Config, KV, and
+Secret Store resources from the complete, validated provider resource-ID
+inventories, removes inherited store links that are not in the desired link set,
+preserves links whose resource IDs are absent from all three store inventories,
+and creates the exact desired links. Any inventory failure, malformed record,
+duplicate ID, or cross-kind ambiguity fails before draft mutation. This
+guarantees staging isolation without consulting old selector data. After the
+first version-scoped descriptor is active, later removal and rename
+reconciliation is exact.
 
-## 9. Migration from PR #344
+## 9. Cutover from PR #344
 
-Migration is deployment-owned, not a permanent runtime fallback. It covers both
-formats that may exist before this design:
+The new lifecycle has no backward-compatibility reader or migration inventory
+for PR #344. In particular, it never reads or writes:
 
-- PR #344 service-scoped entries in the production `edgezero_runtime_env` store;
-  and
-- this branch's unscoped canonical entries, including entries in a linked
-  `edgezero_runtime_env_staging_<service-id>` twin.
+- legacy service-scoped selector entries of the form
+  `EDGEZERO__SERVICES__<SERVICE_ID>__<ADAPTER|LOGGING|STORES>__...`;
+- unscoped canonical selector entries; or
+- `edgezero_runtime_env_staging_<service-id>` stores.
 
-1. if the active version has no version descriptor, read only the current
-   service's scoped entries and canonical unscoped entries for migration
-   inventory;
-2. if the source version links a staging twin under `edgezero_runtime_env`, read
-   that linked resource as the unscoped source rather than assuming the
-   production store;
-3. resolve the new descriptor only from the normal contract in §6: parent
-   environment, then manifest defaults, then logical defaults; legacy values do
-   not participate in selector precedence because two legacy formats can
-   coexist and there is no reliable way to infer which one the active binary
-   reads;
-4. use scoped, unscoped, and default logical aliases only to classify inherited
-   links already present on the source version, preserving an alias whenever
-   legacy ownership is ambiguous;
-5. write the new version descriptor before stage or activation; and
-6. leave legacy entries intact while old Fastly versions may still be rollback
-   targets.
+The new descriptor key
+`EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1` is explicitly
+outside that legacy grammar and is the only service-scoped Config Store entry
+the new lifecycle reads or writes.
 
-New runtime versions read only their version descriptor. Users do not create or
-set service-scoped environment variables. Legacy staging-twin stores remain
-physically present but new versions never link them. Thus the one-store rule
-applies to newly prepared versions during migration; deleting old twins and
-legacy entries is deferred until no old rollback or staged version depends on
-them.
+Provisioning continues to create the one physical `edgezero_runtime_env` store
+needed by the new runtime, but it no longer persists store mappings into that
+store or prints unscoped-selector and staging-twin instructions. Deployment
+resolves the new descriptor only from the normal contract in §6: parent
+environment, then manifest defaults, then logical defaults.
+
+Old entries and twins may remain as inert provider data until an operator deletes
+them. New versions neither inspect nor link twins, and the CLI contains no code
+to maintain them. Existing versions keep their own provider state; this change
+does not add rollback compatibility logic for their selector format.
 
 ## 10. Validation and passthrough
 
@@ -386,9 +387,11 @@ the Trusted Server deployer, preflight maps `ts.example.com` to production and
 
 ## 12. Error handling
 
-- Resolve and validate the complete desired environment, stores, legacy state,
-  and link plan before creating a remote draft. Local build work is not a
-  provider mutation.
+- Resolve and validate the complete desired environment, stores, source links,
+  prior version descriptor when present, and link plan before creating a remote
+  draft. Local build work is not a provider mutation.
+- Treat store-inventory failure, malformed records, duplicate resource IDs, and
+  cross-kind classification ambiguity as read-only preflight failures.
 - Never activate or stage a version after a selector, resource lookup, link, or
   descriptor verification failure.
 - Emit the exact version immediately after Fastly creates the draft.
@@ -404,17 +407,21 @@ Tests must cover:
 
 - two services sharing one `edgezero_runtime_env` physical store;
 - old and new versions reading different immutable descriptors;
-- migration from service-scoped entries without reading another service;
-- migration from unscoped production entries and a linked legacy staging twin;
+- absence of every PR #344
+  `EDGEZERO__SERVICES__<SERVICE_ID>__<ADAPTER|LOGGING|STORES>__...`, unscoped,
+  and staging-twin read/write path while the new version descriptor is still
+  created and read;
+- clean cutover from a source with no version descriptor, removing undesired
+  inherited Config, KV, and Secret Store links without changing the source;
+- zero provider mutations on store-inventory, record-validation, duplicate-ID,
+  or cross-kind classification failure;
 - environment values overriding manifest defaults and defaults filling absent
   parent values;
 - production and staging selecting equal and different physical stores;
 - removal of inherited production Config, KV, and Secret aliases from staging;
 - store removal and rename after a prior version-scoped descriptor, including a
   prior logical ID absent from the new manifest;
-- ambiguous legacy aliases being preserved while unambiguous legacy aliases are
-  removed;
-- preservation of unrelated and intentionally shared links;
+- preservation of unrelated non-store and intentionally shared desired links;
 - lookup, link, descriptor-write, verification, stage, and activation failures;
 - first deployment through the service's existing initial editable version,
   preserving domains, backends, logging endpoints, and version settings;
