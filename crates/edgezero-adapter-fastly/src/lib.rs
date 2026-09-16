@@ -21,6 +21,15 @@ pub mod proxy;
 pub mod request;
 #[cfg(feature = "fastly")]
 pub mod response;
+#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the shared descriptor contract is wired into deploy and runtime in subsequent changes"
+    )
+)]
+pub(crate) mod runtime_descriptor;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
 
