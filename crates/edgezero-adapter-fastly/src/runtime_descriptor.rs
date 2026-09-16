@@ -1,3 +1,6 @@
+use crate::RuntimeDescriptorError;
+#[cfg(any(feature = "fastly", test))]
+use crate::RuntimeEnvConfigError;
 use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
 use edgezero_core::app::StoresMetadata;
 use edgezero_core::env_config::EnvConfig;
@@ -5,6 +8,8 @@ use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(feature = "fastly", test))]
+use std::error::Error;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr as _;
@@ -26,20 +31,57 @@ const FIXED_RUNTIME_KEYS: [(&str, RuntimeValueKind); 6] = [
     ("EDGEZERO__LOGGING__ECHO_STDOUT", RuntimeValueKind::Boolean),
 ];
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum RuntimeDescriptorError {
-    #[error("runtime descriptor exceeds Fastly's {FASTLY_CONFIG_ENTRY_LIMIT}-byte entry limit")]
-    EntryTooLarge,
-    #[error("runtime descriptor JSON is invalid")]
-    InvalidJson,
-    #[error("runtime descriptor contains an invalid value for {key:?}")]
-    InvalidValue { key: String },
-    #[error("runtime descriptor contains unsupported entry {key:?}")]
-    UnsupportedEntry { key: String },
-    #[error(
-        "runtime descriptor format {format} is unsupported; upgrade EdgeZero to a version that supports it"
-    )]
-    UnsupportedFormat { format: u64 },
+#[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) enum RuntimeEnvLookupError<E> {
+    Lookup(E),
+    SelectorStoreAbsent,
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) struct RuntimeEnvConfigResolution {
+    env: EnvConfig,
+    fallback: Option<RuntimeEnvFallbackDiagnostic>,
+}
+
+#[cfg(any(feature = "fastly", test))]
+impl RuntimeEnvConfigResolution {
+    #[cfg(feature = "fastly")]
+    pub(crate) fn into_parts(self) -> (EnvConfig, Option<RuntimeEnvFallbackDiagnostic>) {
+        (self.env, self.fallback)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg(any(feature = "fastly", test))]
+enum RuntimeEnvFallbackReason {
+    DescriptorAbsent,
+    SelectorStoreAbsent,
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) struct RuntimeEnvFallbackDiagnostic {
+    descriptor_key: String,
+    reason: RuntimeEnvFallbackReason,
+}
+
+#[cfg(any(feature = "fastly", test))]
+impl fmt::Display for RuntimeEnvFallbackDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let missing = match self.reason {
+            RuntimeEnvFallbackReason::DescriptorAbsent => "runtime descriptor is absent",
+            RuntimeEnvFallbackReason::SelectorStoreAbsent => {
+                "selector Config Store `edgezero_runtime_env` is absent"
+            }
+        };
+        write!(
+            f,
+            "{missing} for `{}`; using baked-in defaults because the app declares no stores",
+            self.descriptor_key
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -64,6 +106,13 @@ impl RuntimeDescriptor {
         Ok(json)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the deployment-side descriptor writer lands in a subsequent task"
+        )
+    )]
     pub(crate) fn from_entries(
         entries: BTreeMap<String, String>,
     ) -> Result<Self, RuntimeDescriptorError> {
@@ -72,6 +121,13 @@ impl RuntimeDescriptor {
         Ok(descriptor)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "deployment-side alias cleanup lands in a subsequent task"
+        )
+    )]
     pub(crate) fn managed_store_aliases(&self) -> Result<BTreeSet<String>, RuntimeDescriptorError> {
         let mut aliases = BTreeSet::new();
         for (key, value) in &self.entries {
@@ -329,6 +385,84 @@ pub(crate) fn runtime_descriptor_key(service_id: &str, version: u64) -> String {
     format!("EDGEZERO__SERVICES__{service_id}__VERSIONS__{version}__ENV_V1")
 }
 
+#[cfg(any(feature = "fastly", test))]
+pub(crate) fn runtime_env_config_from_lookup<E, F>(
+    service_id: &str,
+    version: u64,
+    stores: StoresMetadata,
+    mut lookup: F,
+) -> Result<RuntimeEnvConfigResolution, RuntimeEnvConfigError>
+where
+    E: Error + Send + Sync + 'static,
+    F: FnMut(&str) -> Result<Option<String>, RuntimeEnvLookupError<E>>,
+{
+    let descriptor_key = runtime_descriptor_key(service_id, version);
+    let raw = match lookup(&descriptor_key) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return missing_runtime_env_config(
+                descriptor_key,
+                stores,
+                RuntimeEnvFallbackReason::DescriptorAbsent,
+            );
+        }
+        Err(RuntimeEnvLookupError::SelectorStoreAbsent) => {
+            return missing_runtime_env_config(
+                descriptor_key,
+                stores,
+                RuntimeEnvFallbackReason::SelectorStoreAbsent,
+            );
+        }
+        Err(RuntimeEnvLookupError::Lookup(source)) => {
+            return Err(RuntimeEnvConfigError::LookupFailure {
+                descriptor_key,
+                source: Box::new(source),
+            });
+        }
+    };
+    let descriptor = RuntimeDescriptor::parse(&raw).map_err(|source| {
+        RuntimeEnvConfigError::InvalidDescriptor {
+            descriptor_key: descriptor_key.clone(),
+            source,
+        }
+    })?;
+    let env = descriptor.validated_env(stores).map_err(|source| {
+        RuntimeEnvConfigError::InvalidDescriptor {
+            descriptor_key,
+            source,
+        }
+    })?;
+    Ok(RuntimeEnvConfigResolution {
+        env,
+        fallback: None,
+    })
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn missing_runtime_env_config(
+    descriptor_key: String,
+    stores: StoresMetadata,
+    reason: RuntimeEnvFallbackReason,
+) -> Result<RuntimeEnvConfigResolution, RuntimeEnvConfigError> {
+    if stores.config.is_some() || stores.kv.is_some() || stores.secrets.is_some() {
+        return Err(match reason {
+            RuntimeEnvFallbackReason::DescriptorAbsent => {
+                RuntimeEnvConfigError::DescriptorAbsent { descriptor_key }
+            }
+            RuntimeEnvFallbackReason::SelectorStoreAbsent => {
+                RuntimeEnvConfigError::SelectorStoreAbsent { descriptor_key }
+            }
+        });
+    }
+    Ok(RuntimeEnvConfigResolution {
+        env: EnvConfig::default(),
+        fallback: Some(RuntimeEnvFallbackDiagnostic {
+            descriptor_key,
+            reason,
+        }),
+    })
+}
+
 fn runtime_value_kinds(stores: StoresMetadata) -> BTreeMap<String, RuntimeValueKind> {
     let mut allowed_keys = FIXED_RUNTIME_KEYS
         .into_iter()
@@ -365,6 +499,8 @@ mod tests {
     use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
     use edgezero_core::app::{StoreMetadata, StoresMetadata};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io;
+    use std::slice;
 
     fn stores() -> StoresMetadata {
         StoresMetadata {
@@ -393,6 +529,213 @@ mod tests {
                 .collect(),
         )
         .expect("test descriptor must fit")
+    }
+
+    fn descriptor_json(entries: impl IntoIterator<Item = (&'static str, &'static str)>) -> String {
+        descriptor(entries).canonical_json().unwrap()
+    }
+
+    #[test]
+    fn descriptor_lookup_scopes_shared_store_by_service() {
+        let first_key = runtime_descriptor_key("SvcA1", 42);
+        let second_key = runtime_descriptor_key("SvcB2", 42);
+        let values = BTreeMap::from([
+            (
+                first_key.clone(),
+                descriptor_json([("EDGEZERO__ADAPTER__PORT", "4101")]),
+            ),
+            (
+                second_key.clone(),
+                descriptor_json([("EDGEZERO__ADAPTER__PORT", "4102")]),
+            ),
+        ]);
+        let mut lookups = Vec::new();
+
+        let first = runtime_env_config_from_lookup("SvcA1", 42, StoresMetadata::default(), |key| {
+            lookups.push(key.to_owned());
+            Ok::<_, RuntimeEnvLookupError<io::Error>>(values.get(key).cloned())
+        })
+        .unwrap();
+        let second =
+            runtime_env_config_from_lookup("SvcB2", 42, StoresMetadata::default(), |key| {
+                lookups.push(key.to_owned());
+                Ok::<_, RuntimeEnvLookupError<io::Error>>(values.get(key).cloned())
+            })
+            .unwrap();
+
+        assert_eq!(first.env.adapter_port(), Some("4101"));
+        assert_eq!(second.env.adapter_port(), Some("4102"));
+        assert_eq!(lookups, [first_key, second_key]);
+    }
+
+    #[test]
+    fn descriptor_lookup_scopes_shared_store_by_version() {
+        let old_key = runtime_descriptor_key("SvcA1", 42);
+        let new_key = runtime_descriptor_key("SvcA1", 43);
+        let values = BTreeMap::from([
+            (
+                old_key.clone(),
+                descriptor_json([("EDGEZERO__LOGGING__LEVEL", "info")]),
+            ),
+            (
+                new_key.clone(),
+                descriptor_json([("EDGEZERO__LOGGING__LEVEL", "debug")]),
+            ),
+        ]);
+        let mut lookups = Vec::new();
+
+        let old = runtime_env_config_from_lookup("SvcA1", 42, StoresMetadata::default(), |key| {
+            lookups.push(key.to_owned());
+            Ok::<_, RuntimeEnvLookupError<io::Error>>(values.get(key).cloned())
+        })
+        .unwrap();
+        let new = runtime_env_config_from_lookup("SvcA1", 43, StoresMetadata::default(), |key| {
+            lookups.push(key.to_owned());
+            Ok::<_, RuntimeEnvLookupError<io::Error>>(values.get(key).cloned())
+        })
+        .unwrap();
+
+        assert_eq!(old.env.logging_level(), Some("info"));
+        assert_eq!(new.env.logging_level(), Some("debug"));
+        assert_eq!(lookups, [old_key, new_key]);
+    }
+
+    #[test]
+    fn descriptor_lookup_allows_store_free_missing_store_or_descriptor() {
+        const SENSITIVE: &str = "SENSITIVE_RAW_DESCRIPTOR_VALUE";
+        let expected_key = runtime_descriptor_key("SvcA1", 42);
+        let legacy_values =
+            BTreeMap::from([("EDGEZERO__ADAPTER__PORT".to_owned(), SENSITIVE.to_owned())]);
+        let mut missing_store_lookups = Vec::new();
+        let mut missing_descriptor_lookups = Vec::new();
+
+        let missing_store =
+            runtime_env_config_from_lookup("SvcA1", 42, StoresMetadata::default(), |key| {
+                missing_store_lookups.push(key.to_owned());
+                Err::<Option<String>, _>(RuntimeEnvLookupError::<io::Error>::SelectorStoreAbsent)
+            })
+            .expect("store-free app may use defaults without selector store");
+        let missing_descriptor =
+            runtime_env_config_from_lookup("SvcA1", 42, StoresMetadata::default(), |key| {
+                missing_descriptor_lookups.push(key.to_owned());
+                Ok::<_, RuntimeEnvLookupError<io::Error>>(legacy_values.get(key).cloned())
+            })
+            .expect("store-free app may use defaults without descriptor");
+
+        assert_eq!(
+            missing_store_lookups.as_slice(),
+            slice::from_ref(&expected_key)
+        );
+        assert_eq!(
+            missing_descriptor_lookups.as_slice(),
+            slice::from_ref(&expected_key)
+        );
+        for resolution in [missing_store, missing_descriptor] {
+            assert_eq!(resolution.env, EnvConfig::default());
+            let diagnostic = resolution
+                .fallback
+                .expect("fallback must carry an operator diagnostic")
+                .to_string();
+            assert!(diagnostic.contains(&expected_key), "{diagnostic}");
+            assert!(!diagnostic.contains(SENSITIVE), "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn descriptor_lookup_error_is_error_send_sync_and_static() {
+        fn assert_error<E: Error + Send + Sync + 'static>() {}
+
+        assert_error::<RuntimeEnvConfigError>();
+    }
+
+    #[test]
+    fn descriptor_lookup_rejects_missing_store_or_descriptor_for_every_store_kind() {
+        const IDS: &[&str] = &["main"];
+        let metadata = StoreMetadata {
+            default: "main",
+            ids: IDS,
+        };
+        let store_cases = [
+            StoresMetadata {
+                config: Some(metadata),
+                ..StoresMetadata::default()
+            },
+            StoresMetadata {
+                kv: Some(metadata),
+                ..StoresMetadata::default()
+            },
+            StoresMetadata {
+                secrets: Some(metadata),
+                ..StoresMetadata::default()
+            },
+        ];
+
+        for stores in store_cases {
+            let missing_store = runtime_env_config_from_lookup("SvcA1", 42, stores, |_key| {
+                Err::<Option<String>, _>(RuntimeEnvLookupError::<io::Error>::SelectorStoreAbsent)
+            })
+            .expect_err("a store-declaring app requires the selector store");
+            assert!(matches!(
+                missing_store,
+                RuntimeEnvConfigError::SelectorStoreAbsent { .. }
+            ));
+
+            let missing_descriptor = runtime_env_config_from_lookup("SvcA1", 42, stores, |_key| {
+                Ok::<_, RuntimeEnvLookupError<io::Error>>(None)
+            })
+            .expect_err("a store-declaring app requires a descriptor");
+            assert!(matches!(
+                missing_descriptor,
+                RuntimeEnvConfigError::DescriptorAbsent { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn descriptor_lookup_errors_fail_without_exposing_provider_details() {
+        let error =
+            runtime_env_config_from_lookup("SvcA1", 42, StoresMetadata::default(), |_key| {
+                Err(RuntimeEnvLookupError::Lookup(io::Error::other(
+                    "SENSITIVE_PROVIDER_DETAIL",
+                )))
+            })
+            .expect_err("lookup failures never fall back");
+
+        assert!(matches!(error, RuntimeEnvConfigError::LookupFailure { .. }));
+        assert!(!error.to_string().contains("SENSITIVE_PROVIDER_DETAIL"));
+    }
+
+    #[test]
+    fn descriptor_lookup_rejects_malformed_unsupported_and_invalid_descriptors() {
+        let cases = [
+            ("malformed", "SENSITIVE_NOT_JSON".to_owned()),
+            (
+                "unsupported",
+                r#"{"format":2,"entries":{"future":"SENSITIVE_FUTURE"}}"#.to_owned(),
+            ),
+            (
+                "invalid value",
+                descriptor_json([("EDGEZERO__ADAPTER__PORT", "SENSITIVE_INVALID_PORT")]),
+            ),
+        ];
+
+        for (case, raw) in cases {
+            let error =
+                runtime_env_config_from_lookup("SvcA1", 42, StoresMetadata::default(), |_key| {
+                    Ok::<_, RuntimeEnvLookupError<io::Error>>(Some(raw.clone()))
+                })
+                .expect_err(case);
+
+            assert!(matches!(
+                error,
+                RuntimeEnvConfigError::InvalidDescriptor { .. }
+            ));
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains("SENSITIVE"), "{case}: {diagnostic}");
+            if case == "unsupported" {
+                assert!(diagnostic.contains("upgrade"), "{diagnostic}");
+            }
+        }
     }
 
     #[test]

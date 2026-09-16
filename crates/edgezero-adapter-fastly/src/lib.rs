@@ -23,19 +23,24 @@ pub mod request;
 pub mod response;
 #[cfg(any(feature = "cli", feature = "fastly", test))]
 #[cfg_attr(
-    not(test),
+    all(feature = "cli", not(feature = "fastly"), not(test)),
     expect(
         dead_code,
-        reason = "the shared descriptor contract is wired into deploy and runtime in subsequent changes"
+        reason = "CLI descriptor consumers land in the managed Fastly deploy task"
     )
 )]
 pub(crate) mod runtime_descriptor;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
 
+#[cfg(any(feature = "fastly", test))]
+use std::error::Error;
+
+#[cfg(any(feature = "cli", feature = "fastly", test))]
+use chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
 #[cfg(feature = "fastly")]
 use edgezero_core::app::Hooks;
-#[cfg(any(feature = "fastly", test))]
+#[cfg(feature = "fastly")]
 use edgezero_core::app::StoresMetadata;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::env_config::EnvConfig;
@@ -50,6 +55,61 @@ use edgezero_core::manifest::ResolvedLoggingConfig;
 /// staging twin and links it into the staged version under THIS name, which is
 /// how the runtime resolves staged selectors without knowing the twin exists.
 pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
+
+/// Errors produced while serializing, parsing, or validating a Fastly runtime
+/// descriptor.
+#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeDescriptorError {
+    /// The descriptor exceeds Fastly's per-entry byte limit.
+    #[error("runtime descriptor exceeds Fastly's {FASTLY_CONFIG_ENTRY_LIMIT}-byte entry limit")]
+    EntryTooLarge,
+    /// The descriptor is not valid format-1 JSON.
+    #[error("runtime descriptor JSON is invalid")]
+    InvalidJson,
+    /// A descriptor entry contains an invalid value.
+    #[error("runtime descriptor contains an invalid value for {key:?}")]
+    InvalidValue { key: String },
+    /// A descriptor entry is not allowed for this application.
+    #[error("runtime descriptor contains unsupported entry {key:?}")]
+    UnsupportedEntry { key: String },
+    /// The descriptor format requires a newer `EdgeZero` runtime.
+    #[error(
+        "runtime descriptor format {format} is unsupported; upgrade EdgeZero to a version that supports it"
+    )]
+    UnsupportedFormat { format: u64 },
+}
+
+/// Errors produced while loading the current Fastly service-version runtime
+/// descriptor.
+#[cfg(any(feature = "fastly", test))]
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeEnvConfigError {
+    /// The service-version descriptor is absent from the selector store.
+    #[error("Fastly runtime descriptor {descriptor_key:?} is absent")]
+    DescriptorAbsent { descriptor_key: String },
+    /// The descriptor could not be parsed or did not pass runtime validation.
+    #[error("Fastly runtime descriptor {descriptor_key:?} is invalid: {source}")]
+    InvalidDescriptor {
+        descriptor_key: String,
+        #[source]
+        source: RuntimeDescriptorError,
+    },
+    /// The selector store could not be opened or queried.
+    #[error("Fastly runtime descriptor lookup failed for {descriptor_key:?}")]
+    LookupFailure {
+        descriptor_key: String,
+        #[source]
+        source: Box<dyn Error + Send + Sync + 'static>,
+    },
+    /// The linked selector Config Store is absent.
+    #[error(
+        "Fastly selector Config Store `edgezero_runtime_env` is absent for runtime descriptor {descriptor_key:?}"
+    )]
+    SelectorStoreAbsent { descriptor_key: String },
+}
 
 #[cfg(any(feature = "fastly", test))]
 #[derive(Debug, Clone)]
@@ -141,7 +201,9 @@ pub fn init_logger(
 /// `EDGEZERO__*` environment variables. No `edgezero.toml` is required.
 ///
 /// # Errors
-/// Returns an error if logger setup fails or any required store cannot be opened.
+/// Selector-store lookup failures, missing required runtime descriptors, and
+/// invalid runtime descriptors propagate before the app is constructed. Logger
+/// setup failures and unavailable required stores also return errors.
 #[cfg(feature = "fastly")]
 #[inline]
 pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
@@ -155,7 +217,9 @@ pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastl
 /// extensions and are visible to middleware and the `State`/extractor layer.
 ///
 /// # Errors
-/// Returns an error if logger setup fails or any required store cannot be opened.
+/// Selector-store lookup failures, missing required runtime descriptors, and
+/// invalid runtime descriptors propagate before the app is constructed. Logger
+/// setup failures and unavailable required stores also return errors.
 #[cfg(feature = "fastly")]
 #[inline]
 pub fn run_app_with_request_extensions<A, F>(
@@ -167,7 +231,7 @@ where
     F: FnOnce(&fastly::Request, &mut Extensions),
 {
     let stores = A::stores();
-    let env = runtime_env_config(stores);
+    let env = runtime_env_config(stores)?;
     let logging = FastlyLogging::from(&env);
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -177,17 +241,13 @@ where
     request::dispatch_with_registries(&app, req, stores, &env, extend)
 }
 
-/// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
-/// Fastly Config Store.
+/// Build an [`EnvConfig`] from the current service-version descriptor in the
+/// `edgezero_runtime_env` Fastly Config Store.
 ///
 /// Compute@Edge has no process env, so the `EDGEZERO__*` runtime overrides
-/// come from the Config Store. The function reads a fixed allowlist: adapter
-/// host and port, logging settings, `__NAME` entries for declared stores, and
-/// `__KEY` entries for declared config stores.
-///
-/// Each lookup uses the same canonical `EDGEZERO__*` name accepted by the other
-/// adapters. The deploy flow copies the selected deployment environment's
-/// declared store selectors into this Config Store.
+/// come from one immutable descriptor selected using Fastly's current service
+/// ID and version. The descriptor is parsed and validated before any values are
+/// exposed through [`EnvConfig`].
 ///
 /// [`run_app`] and [`run_app_with_request_extensions`] call this themselves.
 /// [`run_app_with_config`] does NOT, and neither does a hand-built
@@ -198,75 +258,55 @@ where
 /// [`Hooks`] impl inherits the empty [`StoresMetadata::default`] and must
 /// override `stores()` or pass explicit metadata here.
 ///
-/// If the store cannot be opened, the function logs a warning and returns an
-/// empty [`EnvConfig`]. Callers then use their baked-in adapter and store defaults.
+/// A store-free app may use its baked-in defaults when the selector store or
+/// descriptor is absent. Apps declaring Config, KV, or Secret stores fail
+/// closed on missing data. Lookup failures and invalid descriptors always fail.
+///
+/// # Errors
+/// Returns [`RuntimeEnvConfigError`] when the selector store cannot be opened or
+/// queried, a required descriptor is absent, or the descriptor is invalid.
 #[cfg(feature = "fastly")]
-#[must_use]
 #[inline]
-pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
+pub fn runtime_env_config(stores: StoresMetadata) -> Result<EnvConfig, RuntimeEnvConfigError> {
     use fastly::ConfigStore;
-    use std::iter::empty;
-    let Ok(dict) = ConfigStore::try_open(RUNTIME_ENV_STORE_NAME) else {
-        // The store is optional -- a clean cutover deploy with all
-        // baked-in defaults works without it. But the absence means
-        // EDGEZERO__* runtime overrides (spec 5.4 __KEY, spec 5.2
-        // __NAME) will silently fall back to baked defaults. Log
-        // once at request time so operators can spot the gap in
-        // their Fastly logs and provision the store when overrides are needed.
-        log::warn!(
-            "Fastly Config Store `edgezero_runtime_env` not found; \
-             EDGEZERO__* runtime overrides will use baked-in defaults. \
-             Run `edgezero provision --adapter fastly` to create the store, \
-             then deploy from the selected environment to populate its \
-             canonical store selectors."
-        );
-        return EnvConfig::from_vars(empty::<(String, String)>());
+    use fastly::compute_runtime::{service_id, service_version};
+    use fastly::config_store::OpenError;
+    use runtime_descriptor::{
+        RuntimeEnvLookupError, runtime_descriptor_key, runtime_env_config_from_lookup,
     };
-    let vars = runtime_env_vars(stores, |key| dict.get(key));
-    EnvConfig::from_vars(vars)
-}
+    use std::io::Error as IoError;
 
-#[cfg(any(feature = "fastly", test))]
-fn runtime_env_vars<F>(stores: StoresMetadata, mut get: F) -> Vec<(String, String)>
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    runtime_env_keys(stores)
-        .into_iter()
-        .filter_map(|key| get(&key).map(|value| (key, value)))
-        .collect()
-}
-
-/// The `EDGEZERO__*` keys resolved from the store into the [`EnvConfig`]: the
-/// fixed adapter and logging settings, plus a `__NAME` selector for every
-/// declared store id and a `__KEY` selector for config-store ids only.
-// The `test` arm keeps the key derivation tests in default workspace tests.
-#[cfg(any(feature = "fastly", test))]
-fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
-    let mut keys: Vec<String> = vec![
-        "EDGEZERO__ADAPTER__HOST".to_owned(),
-        "EDGEZERO__ADAPTER__PORT".to_owned(),
-        "EDGEZERO__LOGGING__LEVEL".to_owned(),
-        "EDGEZERO__LOGGING__ENDPOINT".to_owned(),
-        "EDGEZERO__LOGGING__USE_FASTLY_LOGGER".to_owned(),
-        "EDGEZERO__LOGGING__ECHO_STDOUT".to_owned(),
-    ];
-    for (kind, store_meta) in [
-        ("CONFIG", stores.config),
-        ("KV", stores.kv),
-        ("SECRETS", stores.secrets),
-    ] {
-        if let Some(meta) = store_meta {
-            for id in meta.ids {
-                let id_upper = id.to_ascii_uppercase();
-                keys.push(format!("EDGEZERO__STORES__{kind}__{id_upper}__NAME"));
-                if kind == "CONFIG" {
-                    keys.push(format!("EDGEZERO__STORES__{kind}__{id_upper}__KEY"));
-                }
-            }
+    let current_service_id = service_id();
+    let current_version = service_version();
+    let selector_store = match ConfigStore::try_open(RUNTIME_ENV_STORE_NAME) {
+        Ok(store) => Some(store),
+        Err(OpenError::ConfigStoreDoesNotExist) => None,
+        Err(source) => {
+            return Err(RuntimeEnvConfigError::LookupFailure {
+                descriptor_key: runtime_descriptor_key(current_service_id, current_version),
+                source: Box::new(source),
+            });
         }
+    };
+    let resolution = match selector_store {
+        Some(opened_store) => {
+            runtime_env_config_from_lookup(current_service_id, current_version, stores, |key| {
+                opened_store
+                    .try_get(key)
+                    .map_err(RuntimeEnvLookupError::Lookup)
+            })?
+        }
+        None => {
+            runtime_env_config_from_lookup(current_service_id, current_version, stores, |_key| {
+                Err::<Option<String>, _>(RuntimeEnvLookupError::<IoError>::SelectorStoreAbsent)
+            })?
+        }
+    };
+    let (env, fallback) = resolution.into_parts();
+    if let Some(diagnostic) = fallback {
+        log::warn!("{diagnostic}");
     }
-    keys
+    Ok(env)
 }
 
 /// Dispatch with a config store wired explicitly. This path does NOT apply the
@@ -347,68 +387,5 @@ mod fastly_logging_tests {
         assert_eq!(logging.endpoint.as_deref(), Some("edgezero-logs"));
         assert!(logging.use_fastly_logger);
         assert!(logging.echo_stdout);
-    }
-}
-
-#[cfg(test)]
-mod runtime_env_key_tests {
-    use super::runtime_env_keys;
-    use edgezero_core::app::{StoreMetadata, StoresMetadata};
-
-    #[test]
-    fn runtime_env_keys_name_every_store_and_key_only_config_stores() {
-        let stores = StoresMetadata {
-            config: Some(StoreMetadata {
-                default: "main",
-                ids: &["main", "edge"],
-            }),
-            kv: Some(StoreMetadata {
-                default: "cache",
-                ids: &["cache"],
-            }),
-            secrets: Some(StoreMetadata {
-                default: "vault",
-                ids: &["vault"],
-            }),
-        };
-
-        let mut keys = runtime_env_keys(stores);
-        keys.sort();
-
-        assert_eq!(
-            keys,
-            vec![
-                "EDGEZERO__ADAPTER__HOST",
-                "EDGEZERO__ADAPTER__PORT",
-                "EDGEZERO__LOGGING__ECHO_STDOUT",
-                "EDGEZERO__LOGGING__ENDPOINT",
-                "EDGEZERO__LOGGING__LEVEL",
-                "EDGEZERO__LOGGING__USE_FASTLY_LOGGER",
-                "EDGEZERO__STORES__CONFIG__EDGE__KEY",
-                "EDGEZERO__STORES__CONFIG__EDGE__NAME",
-                "EDGEZERO__STORES__CONFIG__MAIN__KEY",
-                "EDGEZERO__STORES__CONFIG__MAIN__NAME",
-                "EDGEZERO__STORES__KV__CACHE__NAME",
-                "EDGEZERO__STORES__SECRETS__VAULT__NAME",
-            ]
-        );
-    }
-
-    #[test]
-    fn runtime_env_keys_without_declared_stores_are_the_fixed_keys_only() {
-        let mut keys = runtime_env_keys(StoresMetadata::default());
-        keys.sort();
-
-        assert_eq!(
-            keys,
-            vec![
-                "EDGEZERO__ADAPTER__HOST",
-                "EDGEZERO__ADAPTER__PORT",
-                "EDGEZERO__LOGGING__ECHO_STDOUT",
-                "EDGEZERO__LOGGING__ENDPOINT",
-                "EDGEZERO__LOGGING__LEVEL",
-                "EDGEZERO__LOGGING__USE_FASTLY_LOGGER",
-            ]
-        );
     }
 }

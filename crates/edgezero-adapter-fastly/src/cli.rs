@@ -5671,7 +5671,6 @@ fn rollback(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use edgezero_adapter::cli_support::read_package_name;
-    use edgezero_core::app::{StoreMetadata, StoresMetadata};
     use edgezero_core::env_config::EnvConfig;
     #[cfg(unix)]
     use edgezero_core::test_env::{EnvOverride, PathPrepend};
@@ -10852,42 +10851,6 @@ echo 'unexpected' >&2; exit 1
                 "must not delete a chunk of an unreadable root: `{key}`; log:\n{log}"
             );
         }
-    }
-
-    #[test]
-    fn runtime_dictionary_reads_canonical_keys_without_a_service_namespace() {
-        let stores = StoresMetadata {
-            config: Some(StoreMetadata {
-                default: "app_config",
-                ids: &["app_config"],
-            }),
-            kv: Some(StoreMetadata {
-                default: "sessions",
-                ids: &["sessions"],
-            }),
-            secrets: None,
-        };
-        let values = BTreeMap::from([
-            (
-                "EDGEZERO__STORES__KV__OTHER__NAME".to_owned(),
-                "unrelated_sessions".to_owned(),
-            ),
-            (
-                "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME".to_owned(),
-                "selected_config".to_owned(),
-            ),
-            (
-                "EDGEZERO__STORES__KV__SESSIONS__NAME".to_owned(),
-                "selected_sessions".to_owned(),
-            ),
-        ]);
-
-        let vars = crate::runtime_env_vars(stores, |key| values.get(key).cloned());
-        let env = EnvConfig::from_vars(vars);
-
-        assert_eq!(env.store_name("kv", "sessions"), "selected_sessions");
-        assert_eq!(env.store_name("config", "app_config"), "selected_config");
-        assert_ne!(env.store_name("kv", "sessions"), "unrelated_sessions");
     }
 
     #[test]

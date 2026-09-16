@@ -199,9 +199,10 @@ impl<'app> FastlyService<'app> {
     ///
     /// Env-overlay limitation: this bare-handle path does not resolve
     /// `EDGEZERO__STORES__CONFIG__*` selectors and binds the config registry's
-    /// default key to `"default"`. Use [`runtime_env_config`](crate::runtime_env_config)
-    /// with [`dispatch_with_registries`] when a custom entry point needs the
-    /// same `__NAME` / `__KEY` resolution as [`run_app`](crate::run_app).
+    /// default key to `"default"`. A custom entry point needing the same
+    /// `__NAME` / `__KEY` resolution as [`run_app`](crate::run_app) must call
+    /// [`runtime_env_config`](crate::runtime_env_config) with `?`, then pass the
+    /// resulting config to [`dispatch_with_registries`].
     #[must_use]
     #[inline]
     pub fn with_config<S: Into<String>>(mut self, name: S) -> Self {
@@ -213,9 +214,10 @@ impl<'app> FastlyService<'app> {
     /// caller has already opened (or mocked) the backend. Mutually
     /// exclusive with `with_config(name)` -- the last call wins.
     /// Like [`Self::with_config`], this binds the config registry's default key
-    /// to `"default"` and does not apply the [`EnvConfig`] overlay. Use
-    /// [`runtime_env_config`](crate::runtime_env_config) with
-    /// [`dispatch_with_registries`] for manifest-driven selector resolution.
+    /// to `"default"` and does not apply the [`EnvConfig`] overlay. For
+    /// manifest-driven selector resolution, load
+    /// [`runtime_env_config`](crate::runtime_env_config) with `?` and pass it to
+    /// [`dispatch_with_registries`].
     #[must_use]
     #[inline]
     pub fn with_config_handle(mut self, handle: ConfigStoreHandle) -> Self {
@@ -322,10 +324,18 @@ where
 /// its own platform store through the [`EnvConfig`] overlay: the
 /// `EDGEZERO__STORES__CONFIG__<ID>__NAME` selector (and its KV / secrets
 /// counterparts) picks the platform store, and the config-only `__KEY`
-/// selector picks that store's [`ConfigStoreBinding::default_key`]. Pair this
-/// with [`runtime_env_config`](crate::runtime_env_config) in a custom entry
-/// point for full parity with `run_app`. Contrast [`FastlyService`], whose
-/// bare-handle path binds `default_key: "default"` and ignores those selectors.
+/// selector picks that store's [`ConfigStoreBinding::default_key`]. A custom
+/// entry point gets full parity with `run_app` by propagating the fallible
+/// runtime load:
+///
+/// ```rust,ignore
+/// let stores = MyHooks::stores();
+/// let env = edgezero_adapter_fastly::runtime_env_config(stores)?;
+/// dispatch_with_registries(&app, req, stores, &env, |_req, _extensions| {})
+/// ```
+///
+/// [`FastlyService`]'s bare-handle path binds `default_key: "default"` and
+/// ignores those selectors.
 ///
 /// KV failures escalate via `resolve_kv_handle`'s `kv_required=true` path;
 /// missing config / secret stores degrade silently with a one-time warning.
