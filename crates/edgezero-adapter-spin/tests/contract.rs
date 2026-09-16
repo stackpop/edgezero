@@ -615,7 +615,7 @@ mod tests {
                 results.termination,
                 edgezero_core::OutboundBatchTermination::Cutoff
             );
-            assert!(results.slots[0].is_none());
+            assert!(matches!(results.slots.first(), Some(None)));
         }
 
         #[test]
