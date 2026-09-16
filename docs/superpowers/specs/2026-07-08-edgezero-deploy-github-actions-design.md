@@ -535,49 +535,20 @@ lifecycle actions.
 
 #### 5.5.2 What makes a staged version _read_ the staged key
 
-Writing `<logical>_staging` is only half of it. The runtime picks its config key
-from the canonical `EDGEZERO__STORES__CONFIG__<ID>__KEY` entry of a Config Store
-it opens by the name `edgezero_runtime_env`. A staged deploy clones the active
-version, and **a
-clone inherits its resource links** — so on its own, a staged version opens the
-same selector store as production and reads production's key. Flipping that
-shared store's selector is not an answer either: it would redirect production
-too.
+Writing `<logical>_staging` is only half of it. Runtime selection and resource
+links follow the version-scoped design in
+`docs/superpowers/specs/2026-09-16-fastly-version-scoped-runtime-selectors-design.md`,
+which supersedes the earlier mutable staging-twin model.
 
-Fastly resource links are **per-version**, and a link's `name` is an overridable
-alias. That is the seam:
+Production and staging link the same physical `edgezero_runtime_env` store, but
+each Fastly service version reads its own immutable descriptor keyed internally
+by service ID and version. The deploy resolves all selected Config, KV, and
+Secret Stores, removes inherited EdgeZero-managed aliases that are not selected,
+reconciles exact resource IDs, and writes the version descriptor while the
+version is still editable. Only then does it stage or activate the version.
 
-- A staged deploy owns a second, **per-service** store,
-  `edgezero_runtime_env_staging_<service-id>`, creating it on demand and
-  carrying unrelated production runtime settings into it. For every declared
-  Config, KV, and Secret store, the staging deployment environment's canonical
-  `__NAME` value replaces production's value; declared config selectors are
-  redirected to `<id>_staging`. The name is
-  per service because Fastly config stores are account-wide, versionless
-  resources: a single shared twin would let one service's staged deploy clobber
-  another's selectors.
-- A staged deploy, while the draft is still editable, drops the inherited
-  `edgezero_runtime_env` link and links the **staging store** under that same
-  name. The runtime opens `edgezero_runtime_env` and gets the staging selector;
-  the active version is untouched.
-- For every declared Config, KV, and Secret store, the staged deploy resolves
-  the physical name selected by the staging environment and attaches that
-  existing resource to the draft under the same name. A missing selected
-  resource is a hard error before the version is staged.
-
-So the pieces compose:
-
-| Version        | `edgezero_runtime_env` resolves to          | Config key read      |
-| -------------- | ------------------------------------------- | -------------------- |
-| active (prod)  | `edgezero_runtime_env`                      | `app_config`         |
-| staged (draft) | `edgezero_runtime_env_staging_<service-id>` | `app_config_staging` |
-
-A staged deploy **fails closed** when it cannot read the store listing (so it
-cannot tell whether production config exists): a version that silently served
-production config would be worse than a refused deploy. When the store listing is
-readable, the twin is created and mirrored automatically — no separate setup
-step. An app that declares no stores has no selector to isolate, so its staged
-version keeps the inherited link (staged code with no runtime store mapping).
+There is no `edgezero_runtime_env_staging_<service-id>` physical store. The
+service ID is never part of a GitHub variable name.
 
 The deploy launcher MUST preserve well-formed canonical selectors supplied by
 the selected GitHub Environment while scrubbing action-private `EDGEZERO__*`
