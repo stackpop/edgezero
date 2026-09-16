@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make Fastly production and staging deployments resolve canonical store variables into immutable service-version descriptors and exact resource links before the version is published.
+**Goal:** Deploy one immutable Fastly application release to production, staging, and multiple publisher services while resolving canonical runtime variables into service-version descriptors and exact resource links before publication.
 
-**Architecture:** The generic CLI asks each registered adapter, through a provider-neutral preflight hook, whether the manifest command or the adapter owns deployment. Fastly owns staging and every deployment with declared stores, writes one canonical descriptor into the shared `edgezero_runtime_env` store under a service/version key, reconciles links on an unreachable draft, verifies both, and only then stages or activates. Runtime and deploy share a strict descriptor module; other adapters keep their existing process-environment behavior and unregistered custom adapters keep manifest-command deployment.
+**Architecture:** The application builds one release archive before deployment; it contains the prebuilt application CLI, Fastly package, and app-owned manifests and is pinned by SHA-256. The generic CLI asks each registered adapter, through a provider-neutral preflight hook, whether the manifest command or the adapter owns deployment and carries the verified release root without provider-name branches. Fastly owns staging and every deployment with declared stores, validates the release, writes one canonical descriptor into the shared `edgezero_runtime_env` store under a service/version key, reconciles links on an unreachable draft, verifies both, and uploads the release package before it stages or activates. Runtime and deploy share a strict descriptor module; other adapters keep their existing process-environment behavior and unregistered custom adapters keep manifest-command deployment.
 
 **Tech Stack:** Rust 1.95, serde/serde_json, thiserror, Fastly SDK 0.12.1 and CLI 15.1.0, Bash composite actions, VitePress/Prettier/ESLint
 
@@ -20,7 +20,7 @@ still leaves a focused component testable on its own.
   descriptor key, strict duplicate-detecting parser, canonical serializer, value
   validation, runtime allowlist, and prior managed-alias discovery.
 - Modify `crates/edgezero-adapter/src/registry.rs`: provider-neutral deployment
-  ownership and non-secret manifest variable defaults.
+  ownership, release paths, and non-secret manifest variable defaults.
 - Modify `crates/edgezero-cli/src/lib.rs`: construct the typed deployment context.
 - Modify `crates/edgezero-cli/src/adapter.rs`: arbitrate manifest-command versus
   adapter-managed deployment without checking provider names.
@@ -37,8 +37,8 @@ still leaves a focused component testable on its own.
 - Modify `.github/actions/deploy-core/scripts/run-app-cli.sh`: preserve the fixed
   public runtime keys needed in the descriptor while retaining the credential scrub.
 - Modify Fastly action scripts/YAML and `.github/actions/deploy-core/tests/*`: keep a
-  valid emitted version when a later deployment operation fails and model the new
-  single-store lifecycle.
+  valid emitted version when a later deployment operation fails, validate the pinned
+  release archive, and model the new single-store lifecycle.
 - Modify the Fastly, CLI, deployment, adoption, and migration guides listed in Task 9.
 
 Do not add a Tokio dependency, do not create another physical selector store, and do
@@ -386,6 +386,10 @@ values, and conflicting duplicate value flags. Ownership switches only when the 
 managed state machine lands in Task 6, so this task must leave store-aware production
 on its existing path.
 
+This is an intermediate parser checkpoint. Task 5 moves the package into the typed
+immutable-release context and changes the final managed allowlist to reject every raw
+`--package` spelling.
+
 - [ ] **Step 3: Write service-ID and environment-precedence tests**
 
 Change underscore/hyphen cases to rejection and keep mixed ASCII alphanumerics. Test
@@ -465,9 +469,14 @@ git commit -m "fix(fastly): validate managed deploy inputs before dispatch"
 
 **Files:**
 
+- Modify: `crates/edgezero-adapter/src/registry.rs`
+- Modify: `crates/edgezero-cli/src/args.rs`
+- Modify: `crates/edgezero-cli/src/lib.rs`
+- Create: `crates/edgezero-adapter-fastly/src/release.rs`
+- Modify: `crates/edgezero-adapter-fastly/src/lib.rs`
 - Modify: `crates/edgezero-adapter-fastly/src/cli.rs:223-390,622-679,3502-4075,4514-4608,4982-5027,5061-5374,7077-7090`
 - Modify: `crates/edgezero-adapter-fastly/src/runtime_descriptor.rs`
-- Test: co-located tests in both files
+- Test: co-located tests in the modified Rust modules
 
 - [ ] **Step 1: Write version-source parser tests**
 
@@ -477,14 +486,23 @@ the unique highest unlocked/inactive/unstaged draft. Reject missing versions,
 duplicate numbers, malformed fields, a locked/staged/deployed highest version, and
 ambiguous drafts.
 
-- [ ] **Step 2: Write pure link-plan tests**
+- [ ] **Step 2: Write immutable-release parser tests**
+
+Add a strict versioned metadata parser and release verifier. Cover duplicate and
+unknown fields, unsupported format, invalid source revision, absolute/traversing paths,
+symlink and non-file targets, root escapes after canonicalization, missing and extra
+release members, invalid digest syntax, and a SHA-256 mismatch for the application CLI,
+package, `edgezero.toml`, or Fastly manifest. Prove the loaded application manifest and its
+referenced adapter manifest are exactly the two files recorded by the release.
+
+- [ ] **Step 3: Write pure link-plan tests**
 
 Cover exact desired links, already-correct links, an alias collision with a different
 resource ID, stale aliases from a previous version descriptor, a store removal/rename
 whose old logical ID is absent from the new manifest, unrelated-link preservation,
 shared-link preservation, and Config/KV/Secret isolation.
 
-- [ ] **Step 3: Write clean-cutover and legacy-removal tests**
+- [ ] **Step 4: Write clean-cutover and legacy-removal tests**
 
 For a source with no version-scoped descriptor, prove the read-only plan classifies
 linked Config, KV, and Secret Store resources by provider resource ID, removes every
@@ -503,15 +521,17 @@ Add provisioning tests proving it creates/configures only the one
 `edgezero_runtime_env` store and emits no scoped/unscoped selector writes or staging-
 twin guidance.
 
-- [ ] **Step 4: Run focused tests and verify they fail**
+- [ ] **Step 5: Run focused tests and verify they fail**
 
 Run: `cargo test -p edgezero-adapter-fastly --features cli deploy_plan -- --nocapture`
 
 Run: `cargo test -p edgezero-adapter-fastly --features cli clean_cutover -- --nocapture`
 
+Run: `cargo test -p edgezero-adapter-fastly --features cli application_release -- --nocapture`
+
 Expected: FAIL because the plan types and clean-cutover rules do not exist.
 
-- [ ] **Step 5: Add typed planning structures**
+- [ ] **Step 6: Add typed planning structures**
 
 Keep provider I/O in `cli.rs` and add focused private types:
 
@@ -537,27 +557,51 @@ struct ManagedDeployPlan { /* resolved immutable preflight data */ }
 
 Do not move unrelated provisioning/config-GC code out of `cli.rs`.
 
-- [ ] **Step 6: Resolve the complete plan without mutations**
+- [ ] **Step 7: Carry and validate the immutable release**
+
+Add provider-neutral application-manifest and extracted-release-root paths to
+`AdapterDeployContext`. Add a top-level typed
+`deploy --application-release <path>` option; the generic CLI only resolves and
+confines the path and records the exact manifest it loaded. Add a
+strict Fastly release parser/verifier in `release.rs`. The Fastly adapter must require
+the release for adapter-managed ownership, confirm that its recorded `edgezero.toml`
+is the manifest the CLI loaded and that the recorded Fastly manifest is the referenced
+adapter manifest, verify every digest, and derive the package path and digest from the
+release. Change the final managed parser to reject every caller-supplied `--package`/`-p`
+spelling. Fastly preflight must select `AdapterManaged` whenever a release is present,
+including store-free production, so the action has no manifest-command build escape.
+Keep unregistered adapters and direct store-free Fastly CLI calls without a release
+unchanged.
+
+- [ ] **Step 8: Resolve the complete plan without mutations**
 
 Before `compute update`, resolve and validate:
 
 1. service ID, token, target, args, and effective environment;
-2. canonical descriptor bytes and the 8,000-byte limit;
-3. complete Config/KV/Secret Store inventories with validated records and unique,
+2. the immutable application-release metadata, package, `edgezero.toml`, and Fastly
+   manifest, including exact SHA-256 verification before any provider command that
+   can mutate state;
+3. canonical descriptor bytes and the 8,000-byte limit;
+4. complete Config/KV/Secret Store inventories with validated records and unique,
    unambiguous resource IDs;
-4. the one physical `edgezero_runtime_env` ID and every selected Config/KV/Secret
+5. the one physical `edgezero_runtime_env` ID and every selected Config/KV/Secret
    resource ID from those inventories;
-5. all service versions and the active version or existing initial draft;
-6. the source version's links;
-7. its exact prior version-scoped descriptor when present, with no legacy selector
+6. all service versions and the active version or existing initial draft;
+7. the source version's links;
+8. its exact prior version-scoped descriptor when present, with no legacy selector
    lookup when absent; and
-8. the complete desired create/delete link plan.
+9. the complete desired create/delete link plan.
+
+The package and manifests are app-release inputs. Do not read them from a
+GitHub Environment, choose them from a deploy target, or include resolved runtime
+configuration in their selection or digest. Record the verified package digest in
+`ManagedDeployPlan` for output and cross-deployment comparison.
 
 For no-active first deployment, snapshot the exact existing initial draft's version
 metadata, domains, backends, logging endpoints, settings, and links. Never create a
 blank version. Fail before publication if no suitable initialized draft exists.
 
-- [ ] **Step 7: Implement the clean-cutover ownership rule**
+- [ ] **Step 9: Implement the clean-cutover ownership rule**
 
 When a prior version-scoped descriptor exists, derive stale managed aliases only from
 that descriptor. When it does not exist, classify the source version's linked Config,
@@ -569,18 +613,20 @@ persistence/read helpers and the unscoped/twin selector inventory code; do not i
 provider calls for legacy entries or twins. Remove provisioning output that tells
 operators to maintain unscoped selectors or staging twins.
 
-- [ ] **Step 8: Run plan and parser tests**
+- [ ] **Step 10: Run plan and parser tests**
 
 Run: `cargo test -p edgezero-adapter-fastly --features cli deploy_plan -- --nocapture`
 
 Run: `cargo test -p edgezero-adapter-fastly --features cli clean_cutover -- --nocapture`
 
+Run: `cargo test -p edgezero-adapter-fastly --features cli application_release -- --nocapture`
+
 Expected: PASS.
 
-- [ ] **Step 9: Commit provider preflight planning**
+- [ ] **Step 11: Commit provider preflight planning**
 
 ```bash
-git add crates/edgezero-adapter-fastly/src/cli.rs crates/edgezero-adapter-fastly/src/runtime_descriptor.rs
+git add crates/edgezero-adapter/src/registry.rs crates/edgezero-cli/src/args.rs crates/edgezero-cli/src/lib.rs crates/edgezero-adapter-fastly/src/cli.rs crates/edgezero-adapter-fastly/src/lib.rs crates/edgezero-adapter-fastly/src/release.rs crates/edgezero-adapter-fastly/src/runtime_descriptor.rs
 git commit -m "feat(fastly): plan descriptors and resource links before deploy"
 ```
 
@@ -611,10 +657,15 @@ Prove:
 - descriptor/link verification occurs before publish;
 - old and new versions retain different descriptor bytes; and
 - two services sharing the physical store never collide.
+- production, staging, and two publisher services upload byte-identical packages
+  with the same digest while using different runtime descriptors; and
+- app-owned `edgezero.toml` and Fastly manifests come from the immutable release,
+  never from environment-specific or deployer-selected paths.
 
 Also prove the completed Fastly `preflight_deploy` returns `AdapterManaged` for
-staging or any declared store, returns `ManifestCommand` for store-free production,
-and prevents a store-aware production manifest command from running.
+an application release, staging, or any declared store; returns `ManifestCommand` only
+for a direct store-free production call without a release; and prevents store-aware or
+release-backed production manifest commands from running.
 
 Replace `run_deploy_reconciles_fastly_selectors_after_a_manifest_command` in
 `edgezero-cli/src/lib.rs` with that store-aware bypass assertion. Keep the existing
@@ -628,10 +679,12 @@ changed initial drafts. Inject lookup, update, comment, link delete/create, desc
 create/readback, stage, and activation failures; assert no earlier active/staged
 version is modified.
 
-For every read-only preflight failure (version/store/descriptor/link lookup, parse, or
-plan collision) and for local `compute build` failure, assert the fake operation log
-contains zero provider mutations: no clone, package upload, comment, link delete/create,
-descriptor create, stage, or activation.
+For every read-only preflight failure (release metadata/digest, version/store/descriptor/
+link lookup, parse, or plan collision), assert the fake operation log contains zero
+provider mutations: no clone, package upload, comment, link delete/create, descriptor
+create, stage, or activation. Assert managed deploy never invokes `cargo build`,
+`fastly compute build`, or a manifest build command, including when canonical runtime
+variables are present.
 
 - [ ] **Step 4: Write descriptor immutability and version-output tests**
 
@@ -648,16 +701,19 @@ Expected: FAIL under the current post-activation/twin lifecycle.
 - [ ] **Step 6: Enable managed ownership with the common state machine**
 
 Change Fastly's `preflight_deploy` ownership result to `AdapterManaged` exactly when
-`context.staging || !context.stores.is_empty()`. In the same implementation change,
-route those calls into the complete state machine below; do not leave a checkpoint
-where managed ownership reaches the legacy production or twin lifecycle.
+`context.application_release.is_some() || context.staging || !context.stores.is_empty()`.
+In the same implementation change, route those calls into the complete state machine
+below; do not leave a checkpoint where managed ownership reaches the legacy production,
+manifest-command build, or twin lifecycle.
 
-Perform local build before remote draft mutation. For an active service, run
-`fastly compute update --autoclone --version=active` with the exact validated package
-and global args. For first deploy, revalidate the initial snapshot, emit its version,
-and run `compute update --version=<N>` without autoclone. Capture command status and
-combined output separately so a returned version can be logged before preserving a
-nonzero status.
+Require the verified package from the immutable application release; managed deploy
+must not have a build fallback. For an active service, run `fastly compute update
+--autoclone --version=active --package=<verified-path>` with the validated global args.
+For first deploy, revalidate the initial snapshot, emit its version, and run `compute
+update --version=<N> --package=<verified-path>` without autoclone. Capture command
+status and combined output separately so a returned version can be logged before
+preserving a nonzero status. Emit the verified package digest as canonical deployment
+metadata.
 
 Apply the comment to that exact version. Re-list clone links and require them to match
 the source inventory before reconciliation.
@@ -706,7 +762,9 @@ git commit -m "fix(fastly): prepare selectors before publishing versions"
 **Files:**
 
 - Create: `.github/actions/fastly-common/scripts/common.sh`
+- Create: `.github/actions/fastly-common/scripts/prepare-release.sh`
 - Modify: `.github/actions/deploy-core/scripts/run-app-cli.sh:199-218`
+- Modify: `.github/actions/deploy-core/scripts/download-app-cli.sh`
 - Modify: `.github/actions/deploy-fastly/scripts/validate.sh:21-37`
 - Modify: `.github/actions/deploy-fastly/scripts/deploy.sh:22-80`
 - Modify: `.github/actions/deploy-fastly/scripts/capture-previous.sh:39-65`
@@ -714,9 +772,12 @@ git commit -m "fix(fastly): prepare selectors before publishing versions"
 - Modify: `.github/actions/healthcheck-fastly/scripts/healthcheck.sh:27-40`
 - Modify: `.github/actions/rollback-fastly/scripts/validate.sh:1-16`
 - Modify: `.github/actions/rollback-fastly/scripts/rollback.sh:22-35`
+- Modify: `.github/actions/config-push-fastly/scripts/validate.sh`
+- Modify: `.github/actions/config-push-fastly/scripts/config-push.sh`
 - Modify: `.github/actions/deploy-fastly/action.yml`
 - Modify: `.github/actions/healthcheck-fastly/action.yml`
 - Modify: `.github/actions/rollback-fastly/action.yml`
+- Modify: `.github/actions/config-push-fastly/action.yml`
 - Test: `.github/actions/deploy-core/tests/run.sh:403-456,647-705,2008-2233,2330-2408`
 
 - [ ] **Step 1: Write failing shell contract tests**
@@ -731,6 +792,23 @@ Add a fake deploy CLI that prints `version=42` then exits with a distinctive non
 status. Require `fastly-version=42` and the unchanged exit status. Malformed,
 conflicting, or absent version lines on a failed command must emit no version and
 preserve the original status.
+
+Add release-artifact tests proving `deploy-fastly` accepts required
+`app-release-archive` and `app-release-sha256` inputs, verifies and safely extracts the
+archive, extracts the application CLI recorded by that release, passes its action-owned
+release root through the typed deploy flag, and
+publishes the package digest output. Prove a runtime selector can change between two
+deploy invocations while the uploaded package bytes and digest remain identical. Reject
+a missing archive/digest, outer digest mismatch, unsafe or extra archive members,
+invalid metadata, inner digest mismatch, extra manifest selection, and every build
+control before any provider mutation.
+
+Add equivalent config-push, healthcheck, and rollback wrapper tests proving each extracts
+the same application CLI from the pinned release and rejects a missing or mismatched
+release before invoking the CLI or provider. Config push must use the bundled
+`edgezero.toml` for schema/store declarations while still accepting publisher-specific
+typed config content as runtime data. Reject both the neither-config and both-config
+cases before invoking the CLI or provider.
 
 - [ ] **Step 2: Run action tests and verify they fail**
 
@@ -753,19 +831,46 @@ Extend `capture_public_runtime_env` with an exact allowlist for host, port, logg
 endpoint, and logging level. Keep its canonical store-selector syntax check and private
 input scrub unchanged.
 
-- [ ] **Step 5: Parse a valid version before returning CLI failure**
+- [ ] **Step 5: Consume an immutable Fastly application release**
+
+Replace Fastly `app-cli-artifact`, `app-cli-bin`, `working-directory`, `manifest`,
+`rust-toolchain`, `build-mode`, `build-args`, and `cache` inputs with required
+`app-release-archive` and `app-release-sha256` inputs. The caller acquires the pinned archive from the
+application's release pipeline, so separate deploy workflows and repositories can use
+the same bytes. Verify the outer digest, extract only the strict member set into the
+action-owned workspace, extract and validate the release's application CLI using the
+existing CLI metadata contract, set `EDGEZERO_MANIFEST` from release metadata, and pass
+the release root through `--application-release` before the passthrough boundary. The app CLI and Fastly
+adapter verify the strict metadata and inner digests and derive the package path; no raw
+`--package` reaches the public deploy interface. The shared engine receives typed paths
+and never branches on `fastly`. Do not compile, run a build subcommand, or expose runtime
+configuration to a build process. Output the verified package digest; callers already
+hold the required release-archive digest input.
+
+Remove Fastly's project-resolution, Rust-toolchain, validation-build, and Cargo-cache
+steps from `deploy-fastly`; they are release-production concerns. Read
+`source-revision` from the verified release metadata instead of the deployer's checkout.
+Change Fastly config-push, healthcheck, and rollback actions to extract the same pinned
+application CLI from the release rather than accept a separately rebuilt CLI artifact.
+Remove config push's manifest selector. Require exactly one of `app-config` or
+`app-config-inline`, pass the bundled release manifest explicitly through `--manifest`,
+and pass the publisher-supplied config explicitly through `--app-config`; never allow
+the CLI to resolve a default config file beside the bundled manifest.
+
+- [ ] **Step 6: Parse a valid version before returning CLI failure**
 
 Refactor the parsing in `deploy.sh` into a helper that classifies missing, malformed,
 conflicting, or one distinct numeric value. After `run-app-cli.sh`, parse the log even
 when `rc != 0`; append a valid version first, then call `fail_with "$rc"`. When `rc ==
 0`, retain the existing fail-closed contract for every invalid output shape.
 
-- [ ] **Step 6: Update action metadata**
+- [ ] **Step 7: Update action metadata**
 
 Describe service IDs as alphanumeric and document that `fastly-version` may be
-available after a later deployment failure. Do not weaken token or artifact boundaries.
+available after a later deployment failure. Document the immutable release input and
+package-digest output. Do not weaken token or artifact boundaries.
 
-- [ ] **Step 7: Run local action gates**
+- [ ] **Step 8: Run local action gates**
 
 Run: `bash .github/actions/deploy-core/tests/run.sh`
 
@@ -773,10 +878,10 @@ Run: `shellcheck -e SC1091 .github/actions/*/scripts/*.sh .github/actions/deploy
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit action contracts**
+- [ ] **Step 9: Commit action contracts**
 
 ```bash
-git add .github/actions/fastly-common .github/actions/deploy-core/scripts/run-app-cli.sh .github/actions/deploy-fastly .github/actions/healthcheck-fastly .github/actions/rollback-fastly .github/actions/deploy-core/tests/run.sh
+git add .github/actions/fastly-common .github/actions/deploy-core/scripts/download-app-cli.sh .github/actions/deploy-core/scripts/run-app-cli.sh .github/actions/config-push-fastly .github/actions/deploy-fastly .github/actions/healthcheck-fastly .github/actions/rollback-fastly .github/actions/deploy-core/tests/run.sh
 git commit -m "fix(actions): retain failed Fastly deploy versions"
 ```
 
@@ -789,14 +894,20 @@ git commit -m "fix(actions): retain failed Fastly deploy versions"
 - Modify: `.github/actions/deploy-core/tests/assert-staged-calls.sh:1-110`
 - Modify: `.github/actions/deploy-core/tests/assert-production-deploy.sh`
 - Modify: `.github/actions/deploy-core/tests/assert-lost-version.sh`
-- Modify: `.github/workflows/deploy-action.yml:403-501`
+- Modify: `.github/workflows/deploy-action.yml`
 
-- [ ] **Step 1: Split store-free and store-aware smoke fixtures**
+- [ ] **Step 1: Move every Fastly action smoke fixture to one release artifact**
 
-Add an explicit fixture mode for `[stores.config]`. Keep production credential-boundary,
-cross-job, cache, and lost-version manifest-command smokes store-free. Opt config-push
-and staged lifecycle fixtures into stores so the registered Fastly adapter owns those
-deployments.
+Add an explicit fixture mode for `[stores.config]`, but run both store-free and
+store-aware `deploy-fastly` fixtures through adapter-managed release deployment. Remove
+Fastly action smoke assumptions about validation builds, Cargo caching, and manifest
+deploy commands. Retain direct CLI tests for store-free manifest-command compatibility;
+the release action must never use that path.
+
+Build one fixture release artifact before the production/staging matrix. Feed that same
+artifact and expected digest to every Fastly deploy, config-push, healthcheck, and
+rollback case. The fixture release contains the application CLI and app-owned
+EdgeZero/Fastly manifests; lifecycle jobs have no CLI, manifest, or build selector.
 
 - [ ] **Step 2: Replace the fake staging twin with descriptor state**
 
@@ -816,6 +927,8 @@ Assert:
 - descriptor key equals
   `EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1`;
 - canonical bytes include staging Config `__KEY` and selected store names;
+- production and staging upload the same fixture package bytes and report the same
+  package digest even though their descriptor bytes differ;
 - descriptor write/readback and final link verification precede stage; and
 - `--comment`, update flags, and version threading remain correct.
 
@@ -878,6 +991,20 @@ environment: ${{ needs.preflight.outputs.environment }}
 Map `ts.example.com` to production and `staging.ts.example.com` to staging while
 keeping `inputs.domain` as the actual Fastly/healthcheck hostname.
 
+Show Trusted Server selecting one immutable application release by source revision and
+digest before choosing the GitHub Environment. Its release artifact supplies the exact
+package, `edgezero.toml`, and Fastly manifest for every publisher and for both staging
+and production. It also supplies the same application CLI to deploy, config push,
+healthcheck, and rollback. The deployer supplies no build flags or alternate manifest.
+Canonical runtime variables still come from the selected GitHub Environment and may
+differ.
+
+Document the producer/consumer split explicitly: the Trusted Server application release
+pipeline builds and publishes the archive once without a GitHub Environment or provider
+credential; `trusted-server-deployer` downloads that archive and verifies its pinned
+digest, and never checks out or rebuilds Trusted Server application source. The release
+reference/digest is app-release data and cannot come from a publisher GitHub Environment.
+
 Add a persistent action/docs contract test in `deploy-core/tests/run.sh` that requires
 the example to contain both
 `environment: ${{ needs.preflight.outputs.environment }}` and a Fastly/healthcheck
@@ -889,7 +1016,8 @@ distinct from the real hostname.
 
 Describe provider-neutral ownership, unregistered manifest-command compatibility,
 Fastly's reserved lifecycle flags, its managed allowlist, the common alphanumeric
-service-ID rule, and recovery from a failed deploy using an emitted `fastly-version`.
+service-ID rule, immutable application-release validation, package-digest output, and
+recovery from a failed deploy using an emitted `fastly-version`.
 
 - [ ] **Step 5: Remove obsolete manual and Viceroy examples**
 

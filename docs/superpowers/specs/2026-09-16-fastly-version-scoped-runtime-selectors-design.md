@@ -57,6 +57,13 @@ production links, or failures between activation and selector writes.
   lifecycle. New deploys never read or write their scoped or unscoped entries.
 - Preserve manifest-defined deploy commands for adapters that do not claim a
   managed deployment.
+- Treat the prebuilt application CLI, compiled Fastly package, and app-owned
+  manifests as one immutable application release. Build it once, identify it by
+  digest, and use the exact same bytes for every service, publisher, staging
+  environment, and production environment selected for that release.
+- Keep deployment-time runtime configuration out of every package build input.
+  GitHub Environment values may change descriptors and resource links, but never
+  the package bytes or the manifest used to describe the application.
 
 ## 3. Non-goals
 
@@ -66,9 +73,14 @@ production links, or failures between activation and selector writes.
 - Add automatic garbage collection of old version descriptors in this change.
   A later bounded GC can remove descriptors after the corresponding Fastly
   versions are no longer rollback or staging targets.
-- Promote a staged Fastly version to production. The deployer builds production
-  and staging through their respective GitHub Environments.
+- Promote a staged Fastly version to production. The deployer publishes the same
+  immutable release separately through the production and staging GitHub
+  Environments.
 - Change Cloudflare, Spin, or Axum runtime configuration semantics.
+- Define where an application publishes or retains its immutable release
+  artifacts. EdgeZero validates and consumes the release; the application may
+  distribute it through GitHub artifacts, a release, or another immutable
+  artifact store.
 - Migrate or fall back to PR #344 service-scoped entries, unscoped selector
   entries, or staging-twin stores. They are unsupported input to the new
   lifecycle.
@@ -171,6 +183,103 @@ The GitHub Environment supplies identical canonical variable names for
 production and staging. It may give them equal values to share a physical store
 or different values to isolate the environments.
 
+These values are deployment inputs only. They are captured after the immutable
+application release has been selected and must never be inherited by a compiler,
+build script, package command, or manifest-selection step.
+
+### 6.1 Immutable application release
+
+An application release is a gzip-compressed tar archive supplied through the
+typed `app-release-archive` action input. A required
+`app-release-sha256` input pins the complete archive. The archive contains the
+prebuilt application CLI, prebuilt Fastly package, and the exact `edgezero.toml`
+and referenced Fastly manifest that defined that package. Its strict, versioned
+metadata records the source revision and confined relative paths and SHA-256
+digests for all four files. Duplicate or unknown metadata fields, absolute paths, traversal,
+symlinks, non-regular files, extra archive members, and digest mismatches are
+rejected before a provider mutation. The release is created before a deployer
+selects a GitHub Environment and before it receives provider credentials.
+
+The metadata is strict JSON with this shape:
+
+```json
+{
+  "format": 1,
+  "source_revision": "<full commit ID>",
+  "adapter": "fastly",
+  "app_cli": {
+    "path": "cli/app-cli.tar.gz",
+    "sha256": "<64 lowercase hex characters>"
+  },
+  "package": {
+    "path": "pkg/app.tar.gz",
+    "sha256": "<64 lowercase hex characters>"
+  },
+  "manifests": {
+    "edgezero": {
+      "path": "edgezero.toml",
+      "sha256": "<64 lowercase hex characters>"
+    },
+    "adapter": {
+      "path": "path/to/fastly.toml",
+      "sha256": "<64 lowercase hex characters>"
+    }
+  }
+}
+```
+
+`source_revision` is a full 40- or 64-character lowercase hexadecimal Git
+object ID. Metadata paths use `/`, are relative to the release root, and resolve
+to distinct regular files within it. Apart from required parent directory
+members, the archive contains exactly `release.json` and those four files. The
+application CLI archive retains the existing strict `app-cli-meta.json` plus
+executable contract.
+
+Typed app-config content is deliberately absent from the release because it is
+runtime configuration and may differ by publisher or environment. Consequently,
+`config-push-fastly` removes its manifest selector, always passes the bundled
+`edgezero.toml` explicitly, and requires exactly one of a publisher-supplied
+`app-config` file or `app-config-inline` value. It never falls back to a config
+file beside the bundled manifest.
+
+The application owns these manifests. Different applications may publish
+different manifests, and a later application release may change them. A deployer
+cannot replace, patch, or select a different manifest for staging, production,
+or a particular publisher. It selects one immutable release and supplies only
+the destination service, publish target, credentials, and canonical runtime
+configuration.
+
+Adapter-managed Fastly deployment requires this release input. It verifies the
+metadata and digests before provider mutation, passes the verified package to
+`fastly compute update --package`, and never invokes `cargo build`,
+`fastly compute build`, or any manifest build command. The package digest is
+emitted as deployment metadata so separate publisher and environment runs can
+prove they deployed identical bytes.
+
+The Fastly action extracts the verified archive into its action-owned temporary
+workspace, sets `EDGEZERO_MANIFEST` to the one manifest recorded by the release,
+and supplies the confined release root through the top-level typed
+`--application-release <path>` deploy option. The generic CLI copies that path
+and the exact loaded application-manifest path into its provider-neutral deploy
+context. The Fastly adapter independently validates the release metadata, the
+loaded application-manifest path, the referenced Fastly-manifest path, and all
+file digests. The generic CLI carries paths and dispatch ownership only; it does
+not branch on Fastly or interpret provider package metadata.
+
+The application CLI is control-plane tooling rather than deployed workload code,
+but it is pinned inside the same release so deployment behavior cannot vary by
+publisher. Deploy, config push, healthcheck, and rollback extract and run that
+exact CLI. It cannot rebuild or rewrite the selected application release during
+deployment.
+
+The application release pipeline is the sole producer. It checks out one full
+source revision, builds the application CLI and Fastly package without a GitHub
+Environment or provider credentials, copies that revision's app-owned manifests,
+writes the strict metadata, creates the archive once, and publishes the archive
+with its SHA-256. Publisher deployers consume that published archive; they never
+recreate it from source. This change defines and validates the release format
+while leaving the choice of artifact registry to the application.
+
 ## 7. Managed Fastly deployment
 
 The adapter registry exposes provider-neutral deploy preflight and ownership
@@ -179,11 +288,14 @@ is `ManifestCommand`, preserving existing behavior for custom or unregistered
 adapters. A registered adapter may validate its provider arguments and return
 `AdapterManaged` for a specific typed deployment context.
 
-Fastly claims adapter-managed deployment when staging is requested or when the
-manifest declares Config, KV, or Secret Stores. Store-free production deploys
-may continue to use a manifest command. This avoids provider-name conditionals
-in the generic CLI and does not require an unregistered custom adapter merely
-because its manifest declares stores.
+Fastly claims adapter-managed deployment when an application release is present,
+staging is requested, or the manifest declares Config, KV, or Secret Stores.
+Every `deploy-fastly` action invocation supplies a release, so its store-free and
+store-aware deployments both use the same no-build state machine. A direct,
+store-free production CLI invocation without a release may continue to use a
+manifest command. This avoids provider-name conditionals in the generic CLI and
+does not require an unregistered custom adapter merely because its manifest
+declares stores.
 
 Production and staging share three phases.
 
@@ -192,30 +304,32 @@ Production and staging share three phases.
 Before creating or editing a Fastly version, the adapter:
 
 1. validates the alphanumeric service ID and parses passthrough arguments;
-2. resolves the effective environment and builds the canonical descriptor in
+2. validates the application release and derives its package path and digest;
+3. resolves the effective environment and builds the canonical descriptor in
    memory, including its size check;
-3. lists complete account inventories for Config, KV, and Secret Stores,
+4. lists complete account inventories for Config, KV, and Secret Stores,
    validates every record, rejects duplicate or cross-kind resource IDs, and
    resolves every selected physical store from those inventories;
-4. resolves the exact `edgezero_runtime_env` physical store from the Config Store
+5. resolves the exact `edgezero_runtime_env` physical store from the Config Store
    inventory;
-5. resolves the current active version, if any;
-6. reads that version's descriptor, when present, and its resource links without
+6. resolves the current active version, if any;
+7. reads that version's descriptor, when present, and its resource links without
    reading legacy selector entries or staging-twin stores;
-7. when there is no active version, resolves the service's existing initial
+8. when there is no active version, resolves the service's existing initial
    editable version and inventories all versioned configuration on that exact
    draft; and
-8. constructs and validates the complete desired link plan.
+9. constructs and validates the complete desired link plan.
 
-These calls do not change provider state. The Compute build is also completed
-before creating a remote draft.
+These calls do not change provider state. Release metadata and digests are
+validated before creating a remote draft; there is no Compute build in the
+deployment lifecycle.
 
 ### 7.2 Editable version
 
 When an active version exists, the adapter:
 
-1. runs `fastly compute update --autoclone --version=active` with the validated
-   package arguments;
+1. runs `fastly compute update --autoclone --version=active` with the one
+   verified release package;
 2. parses and immediately emits the exact draft `version=<N>`; and
 3. applies the optional comment to that exact editable version.
 
@@ -229,7 +343,7 @@ logging endpoints, resource links, and service-version settings, and uses the
 same version as the link-plan source and deployment target. It then:
 
 1. emits that exact numeric version before any draft mutation;
-2. uploads the built package with `fastly compute update
+2. uploads the verified release package with `fastly compute update
    --service-id=<service-id> --version=<N>` and no `--autoclone`; and
 3. applies the optional comment to that exact editable version.
 
@@ -358,13 +472,14 @@ including detached, inline, equals-short, and attached-short forms:
 - `--token`, `--token=...`, `-t`, `-t=...`, and `-tVALUE`.
 
 For adapter-managed deployment, a second parser uses an allowlist rather than
-forwarding unknown tokens. It accepts `--comment` (detached or inline), package
-selection (`--package`, `--package=...`, `-p`, `-p=...`, or `-pVALUE`), and the
+forwarding unknown tokens. It accepts `--comment` (detached or inline) and the
 documented non-targeting global booleans (`--accept-defaults`/`-d`,
 `--auto-yes`/`-y`, `--debug-mode`, `--non-interactive`/`-i`, `--quiet`/`-q`, and
-`--verbose`/`-v`). It rejects unknown flags and positional arguments. A manifest
-command may keep its other custom arguments after the universal reserved-flag
-scan because EdgeZero does not reinterpret that command's private interface.
+`--verbose`/`-v`). The verified package path comes only from the typed release
+context; a caller cannot replace it with `--package`. Unknown flags and
+positional arguments are rejected. A manifest command may keep its other custom
+arguments after the universal reserved-flag scan because EdgeZero does not
+reinterpret that command's private interface.
 
 ## 11. Trusted Server deployer documentation
 
@@ -385,11 +500,19 @@ jobs:
 the Trusted Server deployer, preflight maps `ts.example.com` to production and
 `staging.ts.example.com` to staging.
 
+The Trusted Server release pipeline publishes one archive and SHA-256 for each
+approved Trusted Server source revision. The deployer resolves the requested
+Trusted Server release to that immutable archive before selecting the GitHub
+Environment. The archive path and digest are not GitHub Environment variables
+and cannot be overridden per publisher. Production and staging jobs then supply
+their own canonical runtime variables while deploying the same package digest.
+
 ## 12. Error handling
 
 - Resolve and validate the complete desired environment, stores, source links,
   prior version descriptor when present, and link plan before creating a remote
-  draft. Local build work is not a provider mutation.
+  draft. Validate the immutable release metadata and file digests in the same
+  read-only phase. Deployment performs no local build work.
 - Treat store-inventory failure, malformed records, duplicate resource IDs, and
   cross-kind classification ambiguity as read-only preflight failures.
 - Never activate or stage a version after a selector, resource lookup, link, or
@@ -434,8 +557,14 @@ Tests must cover:
 - rejection of lifecycle-owned passthrough spellings;
 - alphanumeric service-ID validation across every action and Rust path;
 - unregistered custom adapters with declared stores retaining manifest-command
-  dispatch; and
-- the validated GitHub Environment output remaining distinct from the hostname.
+  dispatch;
+- the validated GitHub Environment output remaining distinct from the hostname;
+- one release package digest remaining identical across staging, production, and
+  multiple publisher services while descriptors and resource links vary;
+- rejection before provider mutation when the application CLI, release package,
+  or either bundled manifest does not match its recorded digest; and
+- absence of every compiler and package-build invocation from managed deploys,
+  including when runtime selector variables are present.
 
 Required gates remain the repository's Rust workspace checks, Fastly/Cloudflare/
 Spin target checks, action smoke and lifecycle tests, shell/static analysis, and
