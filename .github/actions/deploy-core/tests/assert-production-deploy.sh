@@ -65,13 +65,16 @@ main() {
       fail "store-aware production unexpectedly changed inherited matching resource links"
   else
     expected_mutations=$(cat <<'EOF'
-fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
 fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD
+fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
 fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD
 EOF
 )
-    [[ "$resource_mutations" == "$expected_mutations" ]] ||
+    if [[ "$resource_mutations" != "$expected_mutations" ]]; then
+      printf 'expected resource mutations:\n%s\nactual resource mutations:\n%s\n' \
+        "$expected_mutations" "${resource_mutations:-<none>}" >&2
       fail "store-free production did not delete exactly the inherited managed links"
+    fi
   fi
 
   grep -q '^PUT https://api.fastly.com/service/dummyservice/version/42/activate$' "$log" ||

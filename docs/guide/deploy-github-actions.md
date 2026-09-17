@@ -99,13 +99,14 @@ The deployment output includes:
 - `provider-cli-version`; and
 - `mutation-attempted`.
 
-The action emits `fastly-version` as soon as Fastly creates or selects the
-recoverable draft. Its public `package-digest` is available only after the deploy
-step emits adapter `package-sha256`; it may be absent when preflight fails before
-the application CLI runs. In particular, the action emits `fastly-version` before
-later preparation failures. Read outputs from a failed step in a follow-up step
-guarded with GitHub Actions' `always()` condition, and treat an emitted version as
-provider state that needs inspection and reuse, or deactivation when staged.
+The action emits `fastly-version` as soon as the target version is known. In
+particular, it emits `fastly-version` before later preparation failures. Its
+public `package-digest` becomes available only after the deploy step emits
+adapter `package-sha256`; it may be absent when
+preflight fails before the application CLI runs. The version output identifies
+the exact provider version but does not prove its current Fastly state. Read
+outputs from a failed step in a follow-up step guarded with GitHub Actions'
+`always()` condition.
 
 ## Runtime configuration and stores
 
@@ -215,12 +216,13 @@ For production rollback, capture `previous-version` from deploy and pass it as
     deploy-to: production
 ```
 
-If a deploy fails after emitting `fastly-version`, inspect and reuse that exact
-inactive draft, or deactivate it when it is staged. A production run can activate
-only after descriptor and link verification; a failed staging run can leave a
-prepared or staged version. If no version was emitted but `mutation-attempted` is
-true, reconcile Fastly state manually. Never guess a rollback source or target. A
-first deployment has no previous production version.
+If a deploy fails after emitting `fastly-version`, the version's current state may
+have changed. Inspect the exact version state first: reuse it only if it is
+inactive; deactivate it only if it is staged; if it is active and
+`previous-version` is present, run production rollback. If its state is unknown,
+reconcile provider state manually without guessing. If no version was emitted but
+`mutation-attempted` is true, reconcile provider state manually as well. A first
+deployment has no previous production version.
 
 ## Config push
 
@@ -249,14 +251,14 @@ or manifests.
 
 ### `deploy-fastly`
 
-| Input                 | Required | Default      | Meaning                                             |
-| --------------------- | -------- | ------------ | --------------------------------------------------- |
-| `app-release-archive` | Yes      | —            | Local path to the immutable release archive.        |
-| `app-release-sha256`  | Yes      | —            | Expected lowercase SHA-256 of the archive.          |
-| `fastly-api-token`    | Yes      | —            | Token exposed only to provider operations.          |
-| `fastly-service-id`   | Yes      | —            | Alphanumeric destination service ID.                |
-| `deploy-args`         | No       | `[]`         | JSON array limited to the managed Fastly allowlist. |
-| `deploy-to`           | No       | `production` | `production` activates; `staging` stages.           |
+| Input                 | Required | Default      | Meaning                                      |
+| --------------------- | -------- | ------------ | -------------------------------------------- |
+| `app-release-archive` | Yes      | —            | Local path to the immutable release archive. |
+| `app-release-sha256`  | Yes      | —            | Expected lowercase SHA-256 of the archive.   |
+| `fastly-api-token`    | Yes      | —            | Token exposed only to provider operations.   |
+| `fastly-service-id`   | Yes      | —            | Alphanumeric destination service ID.         |
+| `deploy-args`         | No       | `[]`         | At most one `--comment` in the JSON array.   |
+| `deploy-to`           | No       | `production` | `production` activates; `staging` stages.    |
 
 ### `config-push-fastly`
 

@@ -5425,26 +5425,23 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 }
 
 // ===================================================================
-// Fastly staging lifecycle
+// Fastly lifecycle
 // ===================================================================
 //
-// These entry points back the `deploy --staging`, `healthcheck`, and
-// `rollback` app-CLI subcommands. They mirror the Fastly semantics of
-// EdgeZero's Fastly lifecycle actions:
+// The adapter-managed deployment path verifies the immutable application release,
+// uploads its recorded package with `compute update` to an exact unreachable draft,
+// reconciles and reads back the version descriptor and exact resource links, and
+// stages or activates only after verification. It emits `version=<N>` and
+// `package-sha256=<SHA256>`. The bare store-free production manifest command is a
+// compatibility path outside this managed lifecycle.
 //
-//   * staged deploy  → build + `compute update --autoclone` (no
-//     activation) + `service-version stage`; emits the staged version.
-//   * production      → `fastly compute deploy` runs via the manifest
-//     command; `emit_active_version` resolves the activated version.
+// These entry points also back the `healthcheck` and `rollback` app-CLI subcommands:
+//
 //   * healthcheck     → curl the domain (production) or the version's
 //     resolved staging IP (`--staging`); non-zero exit when unhealthy.
 //   * rollback        → activate the explicit `--rollback-to` version
 //     (production) or deactivate `<v>` (staging) via the Fastly API.
-//
-// **Version-output contract:** deploy/stage print a
-// single `version=<N>` line to stdout (via `log::info!`, which the CLI
-// logger emits verbatim). The `deploy-fastly` action greps that line
-// to surface `fastly-version`. Rollback prints `rolled-back-to=<N>`.
+// Rollback prints `rolled-back-to=<N>`.
 //
 // Provider HTTP calls shell out to `curl` (matching the lifecycle action
 // conventions and avoiding a WASM-incompatible HTTP client

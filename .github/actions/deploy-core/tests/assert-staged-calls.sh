@@ -48,16 +48,19 @@ main() {
   local resource_mutations expected_mutations
   resource_mutations=$(grep -E '^fastly resource-link (create|delete) ' "$log" || true)
   expected_mutations=$(cat <<'EOF'
-fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
 fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD
+fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
 fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD
 fastly resource-link create --service-id=dummyservice --version=42 --resource-id=KVSTAGE --name=cache-stage
 fastly resource-link create --service-id=dummyservice --version=42 --resource-id=CONFIGSTAGE --name=config-stage
 fastly resource-link create --service-id=dummyservice --version=42 --resource-id=SECRETSTAGE --name=credentials-stage
 EOF
-)
-  [[ "$resource_mutations" == "$expected_mutations" ]] ||
+  )
+  if [[ "$resource_mutations" != "$expected_mutations" ]]; then
+    printf 'expected resource mutations:\n%s\nactual resource mutations:\n%s\n' \
+      "$expected_mutations" "${resource_mutations:-<none>}" >&2
     fail "staging did not replace exactly the inherited production links with staging links"
+  fi
 
   grep -q "config-store-entry create --store-id=ENVSEL1 --key=$key --stdin" "$log" ||
     fail "the descriptor was not written under the exact version key"

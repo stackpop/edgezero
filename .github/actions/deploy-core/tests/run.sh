@@ -2345,6 +2345,13 @@ test_fastly_smoke_release_contract() {
     grep -q 'EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1' "$staged"
   assert_succeeds "production asserts the verified release package digest" \
     grep -q 'EDGEZERO__TEST__PACKAGE_DIGEST' "$production"
+  local assertion_script
+  for assertion_script in "$staged" "$production"; do
+    assert_succeeds "link-order failures show expected mutations ($(basename "$assertion_script"))" \
+      grep -Fq 'expected resource mutations:' "$assertion_script"
+    assert_succeeds "link-order failures show actual mutations ($(basename "$assertion_script"))" \
+      grep -Fq 'actual resource mutations:' "$assertion_script"
+  done
   assert_succeeds "failed deployment asserts its recoverable version and package digest" \
     grep -q 'EDGEZERO__TEST__FASTLY_VERSION' "$lost"
   assert_succeeds "failed deployment checks its verified package digest" \
@@ -2468,7 +2475,7 @@ test_fastly_fake_rejects_inexact_commands() {
     run_generated_fastly "$root" service-version update --service-id=dummyservice \
       --version=42 --comment 'staged smoke'
   local id
-  for id in LINK_CONFIG_PROD LINK_KV_PROD LINK_SECRET_PROD; do
+  for id in LINK_KV_PROD LINK_CONFIG_PROD LINK_SECRET_PROD; do
     assert_succeeds "the exact inherited-link deletion is accepted ($id)" \
       run_generated_fastly "$root" resource-link delete --service-id=dummyservice \
         --version=42 --id="$id"
@@ -2534,8 +2541,8 @@ write_deploy_assertion_state() {
   if [[ "$target" == staging && "$commands" != missing-isolation ]] ||
     [[ "$target" == production-free ]]; then
     printf '%s\n' \
-      'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD' \
       'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD' \
+      'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD' \
       'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD' \
       >>"$root/calls.log"
   fi
@@ -2608,6 +2615,11 @@ test_fastly_smoke_assertion_strictness() {
     run_production_deploy_assertion "$production"
 
   write_deploy_assertion_state "$staging" staging "$staging_descriptor" valid
+  local staging_delete_ids
+  staging_delete_ids=$(sed -n \
+    's/^fastly resource-link delete .*--id=//p' "$staging/calls.log")
+  assert_equals "the local staging log models alias-sorted inherited-link deletes" \
+    $'LINK_KV_PROD\nLINK_CONFIG_PROD\nLINK_SECRET_PROD' "$staging_delete_ids"
   assert_succeeds "staging accepts the exact canonical descriptor and publish order" \
     run_staged_deploy_assertion "$staging"
   local staging_missing_isolation="$WORK_DIR/staging-missing-isolation"
@@ -2651,6 +2663,11 @@ test_fastly_smoke_assertion_strictness() {
     run_staged_deploy_assertion "$staging"
 
   write_deploy_assertion_state "$store_free" production-free "$store_free_descriptor" valid
+  local store_free_delete_ids
+  store_free_delete_ids=$(sed -n \
+    's/^fastly resource-link delete .*--id=//p' "$store_free/calls.log")
+  assert_equals "the local store-free log models alias-sorted inherited-link deletes" \
+    $'LINK_KV_PROD\nLINK_CONFIG_PROD\nLINK_SECRET_PROD' "$store_free_delete_ids"
   assert_succeeds "release-backed store-free deployment is asserted as adapter-managed" \
     run_production_deploy_assertion "$store_free" store-free
 }
@@ -2663,6 +2680,7 @@ test_fastly_version_scoped_documentation() {
   local manifest="$REPO_ROOT/docs/guide/manifest-store-migration.md"
   local blob="$REPO_ROOT/docs/guide/blob-app-config-migration.md"
   local adoption="$REPO_ROOT/docs/guide/deploy-action-adoption.md"
+  local fastly_cli="$REPO_ROOT/crates/edgezero-adapter-fastly/src/cli.rs"
   local corpus="$WORK_DIR/fastly-version-scoped-docs.md"
   local example_workflow="$WORK_DIR/application-deploy-workflow.yml"
   local example_deploy="$WORK_DIR/application-deploy-job.yml"
@@ -2672,6 +2690,7 @@ test_fastly_version_scoped_documentation() {
   local deploy_flat="$WORK_DIR/deploy-github-actions-flat.md"
   local adoption_flat="$WORK_DIR/deploy-action-adoption-flat.md"
   local descriptor_block="$WORK_DIR/canonical-descriptor-exact.md"
+  local managed_lifecycle_comment="$WORK_DIR/managed-lifecycle-comment.txt"
   cat "$deploy" "$fastly" "$cli" "$manifest" "$blob" "$adoption" >"$corpus"
 
   awk '
@@ -2702,6 +2721,11 @@ test_fastly_version_scoped_documentation() {
     /canonical-descriptor-exact:end/ { exit }
     capture && NF { print }
   ' "$fastly" >"$descriptor_block"
+  awk '
+    /^\/\/ Fastly lifecycle$/ { capture = 1 }
+    capture && /^\/\/\/ Value that follows/ { exit }
+    capture { print }
+  ' "$fastly_cli" | sed 's|^//[ ]*||' | tr '\n' ' ' >"$managed_lifecycle_comment"
 
   # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
   assert_succeeds "docs name the one physical runtime Config Store" \
@@ -2774,6 +2798,8 @@ test_fastly_version_scoped_documentation() {
     grep -Eq '^[[:space:]]+(repository|ref):' "$example_deploy"
   assert_fails "example deploy never runs an application build" \
     grep -Eiq 'cargo build|fastly compute build|build-app-cli|app-cli-artifact' "$example_deploy"
+  assert_fails "example deploy never clones or checks out application source with git" \
+    grep -Eiq 'git[[:space:]]+(clone|checkout)' "$example_deploy"
   assert_fails "example deploy has no alternate manifest CLI or build selectors" \
     grep -Eq '^[[:space:]]+(manifest|app-cli-bin|build-mode|build-args):' "$example_deploy"
 
@@ -2802,6 +2828,51 @@ test_fastly_version_scoped_documentation() {
   assert_fails "example never maps a Secret Store value or key" \
     grep -Eq 'EDGEZERO__STORES__SECRETS__[^[:space:]]+__(KEY|VALUE)' "$example_workflow"
 
+  if command -v yq >/dev/null 2>&1; then
+    assert_succeeds "extracted application example parses as YAML" \
+      yq eval '.' "$example_workflow"
+    local uses action_input
+    for action in deploy-fastly config-push-fastly healthcheck-fastly rollback-fastly; do
+      uses="stackpop/edgezero/.github/actions/$action@<ref>"
+      assert_equals "example has exactly one structural $action step" \
+        1 "$(yq eval "[.jobs.deploy.steps[] | select(.uses == \"$uses\")] | length" "$example_workflow")"
+      action_input=$(yq eval -r \
+        ".jobs.deploy.steps[] | select(.uses == \"$uses\") | .with.\"app-release-archive\"" \
+        "$example_workflow")
+      # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+      assert_equals "$action structurally uses the one local release archive" \
+        '${{ github.workspace }}/app-release.tar.gz' "$action_input"
+      action_input=$(yq eval -r \
+        ".jobs.deploy.steps[] | select(.uses == \"$uses\") | .with.\"app-release-sha256\"" \
+        "$example_workflow")
+      # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+      assert_equals "$action structurally uses the selected release digest" \
+        '${{ needs.preflight.outputs.sha256 }}' "$action_input"
+    done
+    for runtime_name in \
+      EDGEZERO__LOGGING__LEVEL \
+      EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME \
+      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY \
+      EDGEZERO__STORES__KV__CACHE__NAME \
+      EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME; do
+      action_input=$(yq eval -r ".jobs.deploy.env.\"$runtime_name\"" "$example_workflow")
+      assert_equals "example structurally maps $runtime_name from its selected Environment" \
+        "\${{ vars.$runtime_name }}" "$action_input"
+    done
+  else
+    skip "application documentation workflow structure (yq not installed)"
+  fi
+
+  if command -v actionlint >/dev/null 2>&1; then
+    local actionlint_workflow="$WORK_DIR/application-deploy-actionlint.yml"
+    sed 's/@<ref>/@0123456789abcdef0123456789abcdef01234567/g' \
+      "$example_workflow" >"$actionlint_workflow"
+    assert_succeeds "sanitized application example passes actionlint" \
+      actionlint "$actionlint_workflow"
+  else
+    skip "application documentation workflow actionlint (actionlint not installed)"
+  fi
+
   assert_succeeds "CLI docs explain provider-neutral managed deployment ownership" \
     grep -Fq 'provider-neutral deployment ownership' "$cli"
   assert_succeeds "CLI docs preserve unregistered manifest-command adapters" \
@@ -2828,6 +2899,12 @@ test_fastly_version_scoped_documentation() {
   # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
   assert_succeeds "action wrapper deploy args are restricted to comment" \
     grep -Fq 'action wrapper accepts only `--comment`' "$deploy"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "deploy action input table limits deploy args to at most one comment" \
+    grep -Eq '^\| `deploy-args`.*At most one `--comment`' "$deploy"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_fails "deploy action input table does not claim the direct CLI allowlist" \
+    grep -Eq '^\| `deploy-args`.*managed Fastly allowlist' "$deploy"
   assert_succeeds "docs state the shared alphanumeric Fastly service-ID rule" \
     grep -Fq 'ASCII letters and digits only' "$corpus"
   # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
@@ -2840,7 +2917,7 @@ test_fastly_version_scoped_documentation() {
   assert_succeeds "deploy docs scope package digest to adapter output timing" \
     grep -Fq 'only after the deploy step emits adapter `package-sha256`' "$deploy_flat"
   assert_succeeds "deploy docs allow package digest to be absent on preflight failure" \
-    grep -Fq 'may be absent when preflight fails' "$deploy"
+    grep -Fq 'may be absent when preflight fails' "$deploy_flat"
 
   # shellcheck disable=SC2016 # Shell variables are literal documentation contracts.
   assert_succeeds "Fastly primary deployment uses a verified application release" \
@@ -2864,10 +2941,49 @@ test_fastly_version_scoped_documentation() {
     awk 'previous && /^\|[ :|-]+\|$/ { found = 1 } { previous = ($0 ~ /^\|[ :|-]+\|$/) } END { exit !found }' "$deploy"
   assert_fails "recovery never recommends removing an exact inactive version" \
     grep -Eiq '(remove|delete).{0,32}(exact|inactive).{0,32}version|(exact|inactive).{0,32}version.{0,32}(remove|delete)' "$deploy" "$adoption"
-  assert_succeeds "recovery tells operators to inspect and reuse inactive drafts" \
-    grep -Fq 'inspect and reuse that exact inactive draft' "$adoption"
-  assert_succeeds "recovery limits deactivation to staged versions" \
-    grep -Fq 'deactivate it only when it is staged' "$adoption"
+  local recovery_guide recovery_flat
+  for recovery_guide in "$deploy" "$adoption"; do
+    recovery_flat="$WORK_DIR/recovery-$(basename "$recovery_guide")"
+    tr '\n' ' ' <"$recovery_guide" >"$recovery_flat"
+    assert_succeeds "$(basename "$recovery_guide") says version output does not prove current state" \
+      grep -Fq 'does not prove its current Fastly state' "$recovery_flat"
+    assert_succeeds "$(basename "$recovery_guide") requires exact-state inspection first" \
+      grep -Fq 'Inspect the exact version state first' "$recovery_flat"
+    assert_succeeds "$(basename "$recovery_guide") permits reuse only while inactive" \
+      grep -Fq 'reuse it only if it is inactive' "$recovery_flat"
+    assert_succeeds "$(basename "$recovery_guide") permits deactivation only while staged" \
+      grep -Fq 'deactivate it only if it is staged' "$recovery_flat"
+    # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+    assert_succeeds "$(basename "$recovery_guide") scopes production rollback to active state" \
+      grep -Fq 'if it is active and `previous-version` is present, run production rollback' "$recovery_flat"
+    assert_succeeds "$(basename "$recovery_guide") sends unknown state to manual reconciliation" \
+      grep -Fq 'If its state is unknown, reconcile provider state manually' "$recovery_flat"
+  done
+  assert_fails "recovery never assumes an emitted version is an inactive draft" \
+    grep -Fq 'inspect and reuse that exact inactive draft' "$deploy" "$adoption"
+  assert_fails "recovery never labels an emitted version a recoverable draft" \
+    grep -Fq 'recoverable draft' "$deploy" "$adoption"
+
+  assert_succeeds "managed lifecycle comment verifies the immutable release" \
+    grep -Fq 'verifies the immutable application release' "$managed_lifecycle_comment"
+  # shellcheck disable=SC2016 # Source contract contains literal Rust-doc backticks.
+  assert_succeeds "managed lifecycle comment uploads only the recorded package" \
+    grep -Fq 'uploads its recorded package with `compute update` to an exact unreachable draft' "$managed_lifecycle_comment"
+  assert_succeeds "managed lifecycle comment describes descriptor and link reconciliation" \
+    grep -Fq 'reconciles and reads back the version descriptor and exact resource links' "$managed_lifecycle_comment"
+  assert_succeeds "managed lifecycle comment orders publication after verification" \
+    grep -Fq 'stages or activates only after verification' "$managed_lifecycle_comment"
+  # shellcheck disable=SC2016 # Source contract contains literal Rust-doc backticks.
+  assert_succeeds "managed lifecycle comment names both adapter outputs" \
+    grep -Fq 'version=<N>` and `package-sha256=<SHA256>' "$managed_lifecycle_comment"
+  assert_succeeds "managed lifecycle comment scopes bare manifest compatibility" \
+    grep -Fq 'bare store-free production manifest command is a compatibility path outside this managed lifecycle' "$managed_lifecycle_comment"
+  # shellcheck disable=SC2016 # Source contract contains literal Rust-doc backticks.
+  assert_fails "managed lifecycle comment has no obsolete build-first staging path" \
+    grep -Fq 'build + `compute update --autoclone`' "$managed_lifecycle_comment"
+  # shellcheck disable=SC2016 # Source contract contains literal Rust-doc backticks.
+  assert_fails "managed lifecycle comment has no obsolete production manifest semantics" \
+    grep -Fq '`fastly compute deploy` runs via the manifest' "$managed_lifecycle_comment"
 
   assert_fails "docs contain no staging runtime-store physical name" \
     grep -Fq 'edgezero_runtime_env_staging_' "$corpus"

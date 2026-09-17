@@ -243,18 +243,17 @@ deployment.
 
 The action's public `package-digest` becomes available only after the deploy step
 emits adapter `package-sha256`; it may be absent when preflight fails before the
-application CLI runs. The action emits a recoverable `fastly-version` immediately
-after Fastly creates or selects an inactive draft. Those outputs can remain
-available if descriptor, link, or publication work fails later. In a follow-up
-step guarded with GitHub Actions' `always()` condition, inspect the failed step's
-outputs:
+application CLI runs. The action emits `fastly-version` as soon as the target
+version is known, so it can remain available if descriptor, link, or publication
+work fails later. The output identifies the exact provider version but does not
+prove its current Fastly state.
 
-- if `fastly-version` is present, inspect and reuse that exact inactive draft;
-- deactivate it only when it is staged;
-- if production activated it and `previous-version` is present, roll back to the
-  recorded previous version;
-- if `mutation-attempted` is true but no version is available, reconcile provider
-  state manually rather than guessing.
+In a follow-up step guarded with GitHub Actions' `always()` condition, inspect the
+failed step's outputs. Inspect the exact version state first: reuse it only if it
+is inactive; deactivate it only if it is staged; if it is active and
+`previous-version` is present, run production rollback. If its state is unknown,
+reconcile provider state manually without guessing. If `mutation-attempted` is
+true but no version is available, reconcile provider state manually as well.
 
 Serialize deployments by service. Without serialization, a provider lookup after
 failure may observe another run's version.
