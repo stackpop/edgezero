@@ -571,7 +571,7 @@ pub struct ConfigPushArgs {
     /// key falls back to `<logical-id>_staging`. Production and staging may
     /// select the same or different physical stores. The same `--staging` verb
     /// `deploy`/`healthcheck`/`rollback` use. Mutually exclusive with `--key` so
-    /// the deployed descriptor and pushed entry cannot diverge.
+    /// the deployed runtime and pushed entry cannot diverge.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to push to. Defaults to the

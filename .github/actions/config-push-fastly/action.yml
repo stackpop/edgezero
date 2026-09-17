@@ -31,6 +31,10 @@ inputs:
     description: Optional logical Config Store ID declared by the bundled application manifest.
     required: false
     default: ""
+  key:
+    description: "Deprecated and rejected when nonempty; use EDGEZERO__STORES__CONFIG__<ID>__KEY."
+    required: false
+    default: ""
   deploy-to:
     description: "Select the canonical environment key, with production/staging fallback when absent."
     required: false
@@ -88,6 +92,7 @@ runs:
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
         EDGEZERO__CONFIG_PUSH__APP_CONFIG_PRESENT: ${{ inputs['app-config'] != '' && 'true' || 'false' }}
         EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE_PRESENT: ${{ inputs['app-config-inline'] != '' && 'true' || 'false' }}
+        EDGEZERO__CONFIG_PUSH__KEY: ${{ inputs.key }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""

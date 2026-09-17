@@ -85,8 +85,8 @@ the spec, §6.6):
 precedence: parent value > manifest variable default > logical default. A parent
 environment or GitHub Environment value wins; otherwise a default declared for
 the manifest variable is used; otherwise a store selector resolves to its logical
-ID. Fastly records the resolved result in a version descriptor. It does not add a
-service ID to any canonical variable name.
+ID. Fastly resolves physical names during deployment and attaches them under
+logical aliases; it does not add a service ID to any canonical variable name.
 
 | Variable                                   | Role                                                                                                                   | Default         |
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | --------------- |
@@ -118,19 +118,17 @@ ids = ["credentials"]
 
 ```text
 EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
-EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config
 EDGEZERO__STORES__KV__CACHE__NAME=cache-prod
 EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=credentials-prod
 ```
 
 The Secret selector names a physical store. Secret values never belong in these
-variables or in the Fastly descriptor.
-
-Fastly writes all resolved entries as canonical JSON under
-`EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1` in the one
-physical `edgezero_runtime_env` Config Store. The public variables remain
-portable and contain no service ID. See the
-[Fastly adapter guide](./adapters/fastly.md#runtime-descriptor).
+variables. Fastly resolves the selected physical resources at deployment and
+links them to the target version under the manifest's logical IDs. The package
+contains no service ID or deployment-specific store name. Fastly fixes Config
+Store keys to `app_config` in production and `app_config_staging` in staging;
+omit `__KEY` for Fastly. See the
+[Fastly adapter guide](./adapters/fastly.md#store-selection-and-deployment).
 
 ## What this means for handler code
 

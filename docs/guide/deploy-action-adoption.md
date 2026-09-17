@@ -64,23 +64,21 @@ manifest. There are no deployer build flags or alternate manifest inputs.
 Publisher GitHub Environments can set canonical runtime variables such as:
 
 ```text
-EDGEZERO__LOGGING__LEVEL
-EDGEZERO__LOGGING__USE_FASTLY_LOGGER
-EDGEZERO__LOGGING__ECHO_STDOUT
 EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME
-EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
 EDGEZERO__STORES__KV__CACHE__NAME
 EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME
 ```
 
 They may choose different values and physical resources for each publisher and
 for production/staging. The variable names contain no service ID. Secret Store
-selectors contain only a store name, never a secret value.
+selectors contain only a store name, never a secret value. Fastly logging comes
+from the immutable application manifest. Config keys are fixed by target:
+`<logical-id>` in production and `<logical-id>_staging` in staging.
 
-Fastly prepares the version-scoped descriptor and exact resource links before
-staging or activation. Failed resolution or verification withholds publication.
-See the [Fastly adapter guide](./adapters/fastly.md#runtime-descriptor) for the
-descriptor format and clean-cutover behavior.
+Fastly resolves each selected physical store and attaches it to the target
+version under the manifest's logical ID before staging or activation. Failed
+resolution or verification withholds publication. See the
+[Fastly adapter guide](./adapters/fastly.md#store-selection-and-deployment).
 
 ## Example application deployer
 
@@ -164,9 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ needs.preflight.outputs.environment }}
     env:
-      EDGEZERO__LOGGING__LEVEL: ${{ vars.EDGEZERO__LOGGING__LEVEL }}
       EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: ${{ vars.EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME }}
-      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY: ${{ vars.EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY }}
       EDGEZERO__STORES__KV__CACHE__NAME: ${{ vars.EDGEZERO__STORES__KV__CACHE__NAME }}
       EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: ${{ vars.EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME }}
     concurrency:
@@ -246,21 +242,23 @@ repository; it never checks out or rebuilds application source.
 
 For a staging rollback, omit `rollback-to`; for production, skip rollback when
 `previous-version` is empty because a first deployment has no earlier version.
-Use an additional guard in a production-only workflow if it can perform a first
-deployment.
+The staging rollback action inspects the exact version and deactivates it only
+when staged; it succeeds without mutation when deployment failed while the
+version was still an unpublished draft. Use an additional guard in a
+production-only workflow if it can perform a first deployment.
 
 ## Failed deploy recovery
 
 The action's public `package-digest` becomes available only after the deploy step
 emits adapter `package-sha256`; it may be absent when preflight fails before the
 application CLI runs. The action emits `fastly-version` as soon as the target
-version is known, so it can remain available if descriptor, link, or publication
+version is known, so it can remain available if link reconciliation or publication
 work fails later. The output identifies the exact provider version but does not
 prove its current Fastly state.
 
 In a follow-up step guarded with GitHub Actions' `always()` condition, inspect the
-failed step's outputs. Inspect the exact version state first: reuse it only if it
-is inactive; deactivate it only if it is staged; if it is active and
+failed step's outputs. The rollback action handles the exact staging version
+state and refuses incompatible state. If a production version is active and
 `previous-version` is present, run production rollback. If its state is unknown,
 reconcile provider state manually without guessing. If `mutation-attempted` is
 true but no version is available, reconcile provider state manually as well.

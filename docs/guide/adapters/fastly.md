@@ -188,88 +188,47 @@ fn main() {
 Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
 :::
 
-## Runtime descriptor
+## Store selection and deployment
 
-Fastly Compute has no process environment. EdgeZero therefore uses one physical
-`edgezero_runtime_env` Config Store for all participating services and versions.
-Every Fastly version links that store under the reserved alias
-`edgezero_runtime_env` and reads exactly one internal key:
-
-```text
-EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1
-```
-
-The service ID and version come from Fastly's runtime. They are part of the
-internal descriptor key, not the public environment variable names. A canonical
-descriptor is compact JSON with sorted entry keys. For example, these are the
-exact bytes for a staging version:
-
-<!-- canonical-descriptor-exact:start -->
-
-```text
-{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"debug","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config_staging","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-stage","EDGEZERO__STORES__KV__CACHE__NAME":"cache-stage","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-stage"}}
-```
-
-<!-- canonical-descriptor-exact:end -->
-
-Only the fixed runtime allowlist and selectors for logical stores declared by
-the bundled `edgezero.toml` are accepted. The canonical public names are:
+Fastly Compute applications open Config, KV, and Secret Stores by resource-link
+name. EdgeZero bakes the logical IDs declared in `edgezero.toml` into the package.
+A managed deployment resolves these optional deployment selectors:
 
 ```text
 EDGEZERO__STORES__CONFIG__<ID>__NAME
-EDGEZERO__STORES__CONFIG__<ID>__KEY
 EDGEZERO__STORES__KV__<ID>__NAME
 EDGEZERO__STORES__SECRETS__<ID>__NAME
 ```
 
-A Secret Store is optional. Its `__NAME` selector chooses a physical Secret
-Store and never carries a secret value. All selected Config, KV, and Secret
-resources must already exist.
+Each selected physical store is linked to the unpublished target version under
+the stable logical `<ID>` alias. An absent `__NAME` defaults to `<ID>`; a present
+blank or invalid value fails before provider mutation. The same logical ID can be
+used independently by Config, KV, and Secret Stores because link identity is the
+pair `(resource kind, logical ID)`.
 
-Apps that declare any store fail closed when the runtime store, descriptor,
-descriptor format, required selector, or exact resource link is missing or
-invalid. An app with no declared stores may fall back to its baked-in fixed
-runtime defaults when the runtime store or descriptor is absent.
+Config keys are deterministic on Fastly: production reads `<ID>`, staging reads
+`<ID>_staging`, and local Viceroy reads `<ID>`. A conflicting
+`EDGEZERO__STORES__CONFIG__<ID>__KEY` or `--key` fails before a write. Logging is
+resolved from `[adapters.fastly.logging]` when the package is built.
 
-### Deployment ordering
+Before publication, EdgeZero:
 
-Release-backed deployments and deployments with declared stores are owned by
-Fastly's managed lifecycle. Before any new code can receive traffic, EdgeZero:
-
-1. verifies the immutable release and its package and manifests;
-2. resolves complete Config, KV, and Secret resource inventories;
-3. selects an exact active, staged, or initialized-draft source;
+1. verifies the immutable release package and manifests;
+2. resolves complete Config, KV, and Secret Store inventories;
+3. selects the exact active, staged, or initialized-draft source;
 4. uploads the verified package to an unreachable draft;
-5. removes inherited managed links that are no longer desired;
-6. creates each desired link under the exact physical store name;
-7. creates or verifies the immutable version descriptor;
-8. reads back the descriptor and exact links and revalidates both versions;
-9. compares the target version's provider-visible package `files_hash` with the
-   verified local package; and
-10. stages or activates the prepared version.
+5. replaces declared links whose selected physical resource changed and creates
+   missing declared links under their logical aliases;
+6. preserves links not declared by the application;
+7. re-reads the exact links, source state, draft state, and provider-visible
+   package identity; and
+8. stages or activates the prepared version without another EdgeZero mutation.
 
-This prepares the descriptor and exact resource links before staging or
-activation. Any ambiguous resource, alias collision, malformed provider record,
-source race, descriptor mismatch, or readback failure withholds publication.
-EdgeZero never publishes the package and then repairs runtime selectors.
-
-Production and staging may use different runtime values or physical stores. They
-still link the same physical `edgezero_runtime_env`, with separate immutable keys
-for their service versions. Multiple services can safely share that physical
-store because their descriptor keys cannot collide.
-
-When a source version predates descriptors, EdgeZero refuses to infer link
-ownership from complete provider inventories. An inherited Config/KV/Secret
-link absent from the desired set stops publication until it is declared or an
-operator removes it after review. Links whose IDs are outside all store
-inventories remain untouched. A prior descriptor is trusted only when the
-source version links `edgezero_runtime_env` to the exact resolved runtime store.
-EdgeZero does not inspect any legacy selector entry.
-
-PR #344 service-scoped selectors, unscoped canonical entries, and old staging
-twin stores are unsupported and are never read or written. They are inert under
-the current runtime. Operators can remove those old entries and physical stores
-separately after confirming older releases no longer use them.
+Production and staging can select different physical resources while deploying
+identical package bytes. Secret Stores remain optional. The only automatic
+legacy cleanup removes an undeclared Config link whose alias and physical store
+are both exactly `edgezero_runtime_env`; the account-wide store is retained for
+older versions.
 
 ### Declaring and using stores
 
@@ -287,26 +246,16 @@ ids = ["cache"]
 ids = ["credentials"]
 ```
 
-For local Viceroy tests, seed the complete descriptor under an explicit local
-service/version key that matches the runtime values used by the test. Do not seed
-individual unscoped selector entries:
+For local Viceroy tests, expose the Config Store under its logical ID and
+write the production key under that store. Local Viceroy uses the production
+key because it has no Fastly staging publication state:
 
 ```toml
-[local_server.config_stores.edgezero_runtime_env]
+[local_server.config_stores.app_config]
 format = "inline-toml"
 
-[local_server.config_stores.edgezero_runtime_env.contents]
-EDGEZERO__SERVICES__localservice__VERSIONS__1__ENV_V1 = '''{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"debug","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config_staging","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-stage","EDGEZERO__STORES__KV__CACHE__NAME":"cache-stage","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-stage"}}'''
-```
-
-The selected application Config Store still holds the typed data itself:
-
-```toml
-[local_server.config_stores.config-stage]
-format = "inline-toml"
-
-[local_server.config_stores.config-stage.contents]
-greeting = "hello from config store"
+[local_server.config_stores.app_config.contents]
+app_config = "hello from config store"
 ```
 
 Handlers read values through the `Config` extractor or
@@ -322,8 +271,7 @@ async fn handler(config: Config) -> Result<Response, EdgeError> {
 }
 ```
 
-See [the store migration guide](../manifest-store-migration.md) for selector
-precedence and [the GitHub Actions guide](../deploy-github-actions.md) for the
+See [the store migration guide](../manifest-store-migration.md) for store selection and [the GitHub Actions guide](../deploy-github-actions.md) for the
 immutable-release workflow.
 
 ## Context Access

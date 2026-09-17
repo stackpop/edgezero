@@ -233,53 +233,39 @@ mechanism.**
 | **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging <app-cli> serve --adapter axum`                                                                   |
 | **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                           |
 | **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging spin up` for a per-invocation override |
-| **Fastly**     | A dedicated `edgezero_runtime_env` Config Store (Compute@Edge has no process env). See below.                                                                                |
+| **Fastly**     | Do not set a custom key. Production uses `app_config`, staging uses `app_config_staging`, and local Viceroy uses `app_config`.                                               |
 
 #### Fastly specifically
 
-Compute@Edge has no `std::env`, so EdgeZero reads runtime overrides
-from one physical `edgezero_runtime_env` Config Store. Provision creates its
-setup block, but operators do not write individual selector entries. Managed
-deploy writes one complete canonical descriptor for each Fastly service version:
+Fastly deployment variables select physical stores, while the application always
+opens the logical Config Store ID. Managed deploy links the selected physical
+store under that logical alias. Production reads key `app_config`; staging reads
+`app_config_staging`:
 
-```text
-EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1
+```bash
+# Production environment
+EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
+<app-cli> config push --adapter fastly --store app_config --yes
+
+# Staging environment
+EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-stage
+<app-cli> config push --adapter fastly --store app_config --staging --yes
 ```
 
-The descriptor contains the resolved config key together with the Config Store
-name, any declared KV Store names, optional Secret Store names, and fixed runtime
-values. Deploy also makes the version's resource links match those selected
-physical stores. It verifies the descriptor and exact resource links before
-staging or activation.
+Do not set a custom Fastly `__KEY`: a conflicting value fails before provider
+mutation. Production and staging may select the same physical Config Store or
+different stores. Store selection changes resource links on the target Fastly
+version and does not change the application release or package.
 
-A staged config push uses the staging GitHub Environment's canonical
-`EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` value when present. If it is absent,
-an applicable `[environment.variables]` manifest default is used next. When
-both are absent, the push and managed deployment descriptor fall back to
-`app_config_staging`. Production and staging can select the same physical store
-or different stores. Those runtime choices do not change the application release
-or Fastly package.
-
-For local Viceroy testing, seed one complete descriptor under an explicit test
-service/version key rather than setting an unscoped selector:
+For local Viceroy testing, use the logical store name and production key:
 
 ```toml
-[local_server.config_stores.edgezero_runtime_env]
+[local_server.config_stores.app_config]
 format = "inline-toml"
 
-[local_server.config_stores.edgezero_runtime_env.contents]
-EDGEZERO__SERVICES__localservice__VERSIONS__1__ENV_V1 = '''{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"debug","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config_staging","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"app_config"}}'''
+[local_server.config_stores.app_config.contents]
+app_config = '''{"version":1,"generated_at":"2026-09-17T00:00:00Z","sha256":"<digest>","data":{}}'''
 ```
-
-Use the service ID and version reported by the local runtime. An app that
-declares stores fails closed if the physical runtime store, version descriptor,
-selector, or selected link is unavailable. Store-free apps alone can fall back
-to baked-in fixed runtime defaults when the descriptor is absent.
-
-PR #344 service-scoped entries, unscoped canonical entries, and old physical
-staging twin stores are unsupported and never read or written by current
-deployments. They are inert after cutover. Delete them separately only after
-confirming no older application release still uses them.
 
 ### Drift detection in CI
 

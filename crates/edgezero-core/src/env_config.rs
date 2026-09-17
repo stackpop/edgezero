@@ -126,7 +126,7 @@ impl EnvConfig {
     /// A valid canonical `EDGEZERO__STORES__<KIND>__<ID>__KEY` value always
     /// wins. Otherwise production falls back to `id`, while staging falls back
     /// to `<id>_staging`. Keeping this rule here lets config push, config diff,
-    /// and deployment descriptors resolve the same key.
+    /// and deployment planning resolve the same key.
     #[must_use]
     #[inline]
     pub fn store_key_for_target(&self, kind: &str, id: &str, staging: bool) -> String {
@@ -214,12 +214,12 @@ impl EnvConfig {
             .map_or_else(|| Ok(id.to_owned()), |value| Ok(value.to_owned()))
     }
 
-    fn store_selector_checked<'a>(
-        &'a self,
+    fn store_selector_checked<'value>(
+        &'value self,
         kind: &str,
         id: &str,
         setting: &str,
-    ) -> Result<Option<&'a str>, String> {
+    ) -> Result<Option<&'value str>, String> {
         let value = self.get(&["stores", kind, id, setting]);
         if value.is_some_and(is_blank_or_control) {
             return Err(format!(

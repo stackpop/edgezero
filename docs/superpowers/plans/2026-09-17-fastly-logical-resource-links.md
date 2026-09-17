@@ -1,6 +1,6 @@
 # Fastly Logical Resource Links Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Remove Fastly runtime descriptors and select deployment-specific stores through version-scoped logical resource links while preserving identical application package bytes.
 
@@ -35,12 +35,12 @@
 - Modify: `crates/edgezero-adapter-fastly/src/cli.rs`
 - Test: colocated Fastly adapter unit tests
 
-- [ ] Replace descriptor tests with failing tests for logical store aliases and production/staging config keys.
-- [ ] Add a pure target-key helper and make the Fastly adapter hook reject a configured key that differs from `<id>` or `<id>_staging`.
-- [ ] Remove descriptor modules, constants, errors, Config Store lookup, service ID lookup, and version lookup from request dispatch.
-- [ ] Use `fastly::compute_runtime::is_staging()` only to select config keys; keep store aliases logical.
-- [ ] Bake `[adapters.fastly.logging]` into `Hooks` metadata, use it from `run_app`, and preserve explicit logging ownership and optional Secret Store behavior without deployment-time logging variables.
-- [ ] Run `cargo test -p edgezero-adapter-fastly --features cli -- --test-threads=1` and the no-default-features library check.
+- [x] Replace descriptor tests with failing tests for logical store aliases and production/staging config keys.
+- [x] Add a pure target-key helper and make the Fastly adapter hook reject a configured key that differs from `<id>` or `<id>_staging`.
+- [x] Remove descriptor modules, constants, errors, Config Store lookup, service ID lookup, and version lookup from request dispatch.
+- [x] Use `fastly::compute_runtime::is_staging()` only to select config keys; keep store aliases logical.
+- [x] Bake `[adapters.fastly.logging]` into `Hooks` metadata, use it from `run_app`, and preserve explicit logging ownership and optional Secret Store behavior without deployment-time logging variables.
+- [x] Run `cargo test -p edgezero-adapter-fastly --features cli -- --test-threads=1` and the no-default-features library check.
 
 ### Task 3: Logical-link managed deployment
 
@@ -48,13 +48,13 @@
 - Modify: `crates/edgezero-adapter-fastly/src/cli.rs`
 - Test: colocated managed-deployment tests in `cli.rs`
 
-- [ ] Add failing reconciliation tests for declared alias replacement, undeclared-link preservation, legacy runtime-link removal, shared physical resources, same logical IDs across store kinds, and final exact readback.
-- [ ] Build desired links as `(kind, logical alias, selected physical resource ID)`, parse Fastly `resource_type`, and validate selectors with checked `EnvConfig` methods.
-- [ ] Remove descriptor plan fields, reads, writes, ownership inference, orphan checks, and final descriptor revalidation.
-- [ ] Reconcile declared `(kind, alias)` identities and remove only an undeclared Config link whose alias and resolved physical store are both exactly `edgezero_runtime_env`; preserve every other inherited link, including same-named links of another kind or resource.
-- [ ] Retain release verification, source snapshots, package upload/hash verification, recovery output, and stage/activate ordering; make the immediate final barrier re-read exact links, provider-visible package identity, source state, and draft state after every EdgeZero mutation, and document the caller's per-service serialization requirement and remaining provider TOCTOU risk.
-- [ ] Remove automatic provisioning and setup of `edgezero_runtime_env`; keep declared physical-store provisioning.
-- [ ] Run the Fastly CLI test suite after each implementation slice.
+- [x] Add failing reconciliation tests for declared alias replacement, undeclared-link preservation, legacy runtime-link removal, shared physical resources, same logical IDs across store kinds, and final exact readback.
+- [x] Build desired links as `(kind, logical alias, selected physical resource ID)`, parse Fastly `resource_type`, and validate selectors with checked `EnvConfig` methods.
+- [x] Remove descriptor plan fields, reads, writes, ownership inference, orphan checks, and final descriptor revalidation.
+- [x] Reconcile declared `(kind, alias)` identities and remove only an undeclared Config link whose alias and resolved physical store are both exactly `edgezero_runtime_env`; preserve every other inherited link, including same-named links of another kind or resource.
+- [x] Retain release verification, source snapshots, package upload/hash verification, recovery output, and stage/activate ordering; make the immediate final barrier re-read exact links, provider-visible package identity, source state, and draft state after every EdgeZero mutation, and document the caller's per-service serialization requirement and remaining provider TOCTOU risk.
+- [x] Remove automatic provisioning and setup of `edgezero_runtime_env`; keep declared physical-store provisioning.
+- [x] Run the Fastly CLI test suite after each implementation slice.
 
 ### Task 4: State-aware staging rollback
 
@@ -65,11 +65,11 @@
 - Modify: `.github/actions/deploy-core/tests/run.sh`
 - Test: Fastly adapter and action smoke tests
 
-- [ ] Add failing tests for an unpublished draft, an exactly staged version, and incompatible/missing version state.
-- [ ] Read and validate the requested version before staging deactivation.
-- [ ] Return success without a provider mutation for an unpublished editable draft.
-- [ ] Deactivate only the exact staged version and fail closed for all other states.
-- [ ] Run focused Rust rollback tests and Bash action tests.
+- [x] Add failing tests for an unpublished draft, an exactly staged version, and incompatible/missing version state.
+- [x] Read and validate the requested version before staging deactivation.
+- [x] Return success without a provider mutation for an unpublished editable draft.
+- [x] Deactivate only the exact staged version and fail closed for all other states.
+- [x] Run focused Rust rollback tests and Bash action tests.
 
 ### Task 5: Action compatibility and selector validation
 
@@ -79,12 +79,12 @@
 - Modify: `.github/actions/deploy-core/tests/run.sh`
 - Modify: `.github/actions/build-app-cli/action.yml`
 
-- [ ] Add a failing action-surface test requiring the deprecated optional `key` input.
-- [ ] Add a failing validation test proving a non-empty deprecated key stops before mutation.
-- [ ] Restore `key` as a deprecated input and pass only its presence to validation.
-- [ ] Fail with migration guidance before release extraction or provider access.
-- [ ] Correct the build-app-cli output description to say release assembly consumes the artifact.
-- [ ] Run `.github/actions/deploy-core/tests/run.sh` and ShellCheck.
+- [x] Add a failing action-surface test requiring the deprecated optional `key` input.
+- [x] Add a failing validation test proving a non-empty deprecated key stops before mutation.
+- [x] Restore `key` as a deprecated input and pass only its presence to validation.
+- [x] Fail with migration guidance before release extraction or provider access.
+- [x] Correct the build-app-cli output description to say release assembly consumes the artifact.
+- [x] Run `.github/actions/deploy-core/tests/run.sh` and ShellCheck.
 
 ### Task 6: Rewrite managed-deploy fixtures
 
@@ -97,13 +97,13 @@
 - Modify: `.github/actions/deploy-core/tests/run.sh`
 - Modify: `scripts/smoke_test_config_key_override.sh`
 
-- [ ] Remove descriptor store IDs, descriptor files, and descriptor API routes from the fake provider.
-- [ ] Seed production links under logical aliases and model staging replacement with staging physical resource IDs.
-- [ ] Assert identical package digests and distinct target versions.
-- [ ] Assert exact link/package verification occurs before publication.
-- [ ] Assert unrelated inherited store links remain present.
-- [ ] Rewrite the live Fastly smoke test around logical aliases and fixed production/staging keys, without descriptor seeding or arbitrary Fastly `__KEY` values.
-- [ ] Run the complete deploy-core action test suite.
+- [x] Remove descriptor store IDs, descriptor files, and descriptor API routes from the fake provider.
+- [x] Seed production links under logical aliases and model staging replacement with staging physical resource IDs.
+- [x] Assert identical package digests and distinct target versions.
+- [x] Assert exact link/package verification occurs before publication.
+- [x] Assert unrelated inherited store links remain present.
+- [x] Rewrite the live Fastly smoke test around logical aliases and fixed production/staging keys, without descriptor seeding or arbitrary Fastly `__KEY` values.
+- [x] Run the complete deploy-core action test suite.
 
 ### Task 7: Align local Fastly configuration
 
@@ -112,9 +112,9 @@
 - Modify: `crates/edgezero-cli/src/config.rs`
 - Test: colocated local push/diff tests
 
-- [ ] Add failing tests proving local Fastly push, diff, and runtime lookup use the logical alias and production logical key even when remote `__NAME` selects another physical store.
-- [ ] Keep remote operations on the environment-selected physical store while routing local Fastly operations to Viceroy's logical alias.
-- [ ] Run focused Fastly adapter and CLI config tests.
+- [x] Add failing tests proving local Fastly push, diff, and runtime lookup use the logical alias and production logical key even when remote `__NAME` selects another physical store.
+- [x] Keep remote operations on the environment-selected physical store while routing local Fastly operations to Viceroy's logical alias.
+- [x] Run focused Fastly adapter and CLI config tests.
 
 ### Task 8: Documentation and templates
 
@@ -135,24 +135,24 @@
 - Modify: `docs/superpowers/plans/2026-09-17-fastly-logical-resource-links.md`
 - Delete: `docs/superpowers/plans/2026-09-17-fastly-runtime-review-followup.md`
 
-- [ ] Remove every live reference to runtime descriptors, service/version selector keys, staging selector twins, and `edgezero_runtime_env`.
-- [ ] Document deploy-time `__NAME` selection, logical aliases, deterministic target keys, and identical release bytes.
-- [ ] Document state-aware rollback and separate real domain, deployment target, and GitHub Environment identifier.
-- [ ] Document manifest-baked Fastly logging and the caller's per-service deployment serialization requirement.
-- [ ] Update documentation assertions in the action suite.
-- [ ] Run docs formatting, lint, and build.
+- [x] Remove every live reference to runtime descriptors, service/version selector keys, and staging selector twins; retain only the documented exact legacy-link cleanup for `edgezero_runtime_env`.
+- [x] Document deploy-time `__NAME` selection, logical aliases, deterministic target keys, and identical release bytes.
+- [x] Document state-aware rollback and separate real domain, deployment target, and GitHub Environment identifier.
+- [x] Document manifest-baked Fastly logging and the caller's per-service deployment serialization requirement.
+- [x] Update documentation assertions in the action suite.
+- [x] Run docs formatting, lint, and build.
 
 ### Task 9: Full verification and publication
 
 **Files:**
 - Modify: PR #381 and issue #380 descriptions after the implementation is final
 
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
-- [ ] Run `cargo test --workspace --all-targets`.
-- [ ] Run `cargo check --workspace --all-targets --features "fastly cloudflare spin"`.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- [x] Run `cargo test --workspace --all-targets`.
+- [x] Run `cargo check --workspace --all-targets --features "fastly cloudflare spin"`.
 - [ ] Run Fastly and Spin WASM checks used by CI.
-- [ ] Run action tests and exact ShellCheck command.
-- [ ] Run docs format, lint, and build.
-- [ ] Search the tracked tree for forbidden descriptor/runtime-store names and inspect every remaining historical reference.
+- [x] Run action tests and exact ShellCheck command.
+- [x] Run docs format, lint, and build.
+- [x] Search the tracked tree for forbidden descriptor/runtime-store names and inspect every remaining historical reference.
 - [ ] Review the final diff against the accepted design, commit, push, update PR/issue text, and watch CI to completion.

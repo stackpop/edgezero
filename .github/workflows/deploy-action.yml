@@ -199,9 +199,7 @@ jobs:
     needs: fixture-release
     runs-on: ubuntu-latest
     env:
-      EDGEZERO__LOGGING__LEVEL: info
       EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: config-prod
-      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY: app_config
       EDGEZERO__STORES__KV__CACHE__NAME: cache-prod
       EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: credentials-prod
       FASTLY_ENDPOINT: https://inherited.invalid
@@ -227,7 +225,7 @@ jobs:
           fastly-service-id: dummyservice
           deploy-args: '["--comment","production smoke"]'
 
-      - name: Assert the production descriptor and package
+      - name: Assert the production resource links and package
         env:
           EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs.fastly-version }}
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs.previous-version }}
@@ -266,8 +264,6 @@ jobs:
   store-free-deploy-smoke:
     needs: store-free-release
     runs-on: ubuntu-latest
-    env:
-      EDGEZERO__LOGGING__LEVEL: warn
     steps:
       - uses: actions/checkout@v7
         with:
@@ -301,9 +297,7 @@ jobs:
     needs: fixture-release
     runs-on: ubuntu-latest
     env:
-      EDGEZERO__LOGGING__LEVEL: debug
       EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: config-stage
-      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY: app_config_staging
       EDGEZERO__STORES__KV__CACHE__NAME: cache-stage
       EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: credentials-stage
       FASTLY_API_TOKEN: inherited-must-not-reach-production-probes
@@ -329,7 +323,7 @@ jobs:
           deploy-args: '["--comment","staged smoke"]'
           deploy-to: staging
 
-      - name: Assert version-scoped staging calls
+      - name: Assert staging resource links and package
         env:
           EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs.fastly-version }}
           EDGEZERO__TEST__PACKAGE_DIGEST: ${{ steps.stage.outputs.package-digest }}
@@ -561,9 +555,7 @@ jobs:
     needs: fixture-release
     runs-on: ubuntu-latest
     env:
-      EDGEZERO__LOGGING__LEVEL: info
       EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: config-prod
-      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY: app_config
       EDGEZERO__STORES__KV__CACHE__NAME: cache-prod
       EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: credentials-prod
       FAKE_FAIL_AFTER_VERSION: "1"

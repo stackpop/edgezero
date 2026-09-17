@@ -520,14 +520,13 @@ means the **selected config store, under a different key**. The production and
 staging deployment environments may select the same physical store or different
 stores through `EDGEZERO__STORES__CONFIG__<ID>__NAME`:
 
-- **Production** writes under the valid canonical
-  `EDGEZERO__STORES__CONFIG__<ID>__KEY` value when present, then falls back to the
-  logical store id. An explicit `--key` remains a production-only CLI override.
-- **Staging** also honors the valid canonical KEY first, then falls back to
-  `<logical-store-id>_staging` in the store selected by the staging environment.
-  `--key` remains mutually exclusive with `--staging`; an explicit staging key
-  belongs in the canonical environment variable so config push and deployment
-  descriptors cannot diverge.
+- **Production** writes under the logical store ID.
+- **Staging** writes under `<logical-store-id>_staging` in the store selected by
+  the staging environment.
+
+Fastly rejects a `__KEY` value or `--key` argument that differs from the fixed
+target key. This keeps config push and runtime lookup on one target-derived
+contract.
 
 The CLI gains a `config push --staging` flag (the same `--staging` verb
 `deploy`/`healthcheck`/`rollback` already use); the
@@ -538,19 +537,13 @@ lifecycle actions.
 #### 5.5.2 What makes a staged version _read_ the staged key
 
 Writing `<logical>_staging` is only half of it. Runtime selection and resource
-links follow the version-scoped design in
-`docs/superpowers/specs/2026-09-16-fastly-version-scoped-runtime-selectors-design.md`,
-which supersedes the earlier mutable staging-twin model.
-
-Production and staging link the same physical `edgezero_runtime_env` store, but
-each Fastly service version reads its own immutable descriptor keyed internally
-by service ID and version. The deploy resolves all selected Config, KV, and
-Secret Stores, removes inherited EdgeZero-managed aliases that are not selected,
-reconciles exact resource IDs, and writes the version descriptor while the
-version is still editable. Only then does it stage or activate the version.
-
-There is no `edgezero_runtime_env_staging_<service-id>` physical store. The
-service ID is never part of a GitHub variable name.
+links follow the
+[Fastly logical resource-link design](./2026-09-17-fastly-logical-resource-links-design.md).
+The deploy resolves each selected Config, KV, and Secret Store and links it to
+the unpublished service version under the manifest's logical ID. The runtime
+opens that stable alias and uses Fastly's staging state only to choose between
+the logical production key and its `_staging` key. The service ID is never part
+of a GitHub variable name.
 
 The deploy launcher MUST preserve well-formed canonical selectors supplied by
 the selected GitHub Environment while scrubbing action-private `EDGEZERO__*`
@@ -558,7 +551,6 @@ variables. The public allowlist is limited to declared-store shapes:
 
 ```text
 EDGEZERO__STORES__CONFIG__<ID>__NAME
-EDGEZERO__STORES__CONFIG__<ID>__KEY
 EDGEZERO__STORES__KV__<ID>__NAME
 EDGEZERO__STORES__SECRETS__<ID>__NAME
 ```

@@ -110,52 +110,44 @@ outputs from a failed step in a follow-up step guarded with GitHub Actions'
 
 ## Runtime configuration and stores
 
-Fastly Compute has no process environment. EdgeZero keeps one physical
-`edgezero_runtime_env` Config Store and links it under that reserved alias. Each
-service version reads one immutable descriptor at:
+The application package contains only portable logical store IDs from
+`edgezero.toml`. At deployment, these variables select the physical Fastly
+resources for that target:
 
 ```text
-EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1
-```
-
-The descriptor contains the fixed runtime allowlist and only selectors for stores
-declared by the bundled `edgezero.toml`. Canonical environment variables never
-contain the service ID:
-
-```text
-EDGEZERO__LOGGING__LEVEL
-EDGEZERO__LOGGING__USE_FASTLY_LOGGER
-EDGEZERO__LOGGING__ECHO_STDOUT
 EDGEZERO__STORES__CONFIG__<ID>__NAME
-EDGEZERO__STORES__CONFIG__<ID>__KEY
 EDGEZERO__STORES__KV__<ID>__NAME
 EDGEZERO__STORES__SECRETS__<ID>__NAME
 ```
 
-Secret Store selectors name a physical store; they never contain secret values.
-Secrets remain optional, and deployments without a `[stores.secrets]` declaration
-do not select or link a Secret Store.
+If a `__NAME` variable is absent, the physical name defaults to the logical ID.
+A present blank or invalid selector fails before provider mutation. Secret Store
+selectors contain store names, never secret values. Omitting `[stores.secrets]`
+creates no Secret Store link.
 
-For a managed deployment, EdgeZero verifies the release and resolves the complete
-Config, KV, and Secret inventories before mutation. It uploads the verified
-package to an unreachable draft, reconciles the descriptor and exact resource
-links, reads them back, revalidates the source and target, and prepares the
-descriptor and exact resource links before staging or activation. It also
-compares Fastly's final package `files_hash` with the verified local package. A
-lookup, collision, malformed inventory, changed source, descriptor mismatch,
-package mismatch, or readback failure stops publication.
+For each declared store, managed deploy links the selected physical resource to
+the unpublished Fastly version under the stable logical ID. The runtime opens
+that logical alias, so production and staging may select the same or different
+physical stores without changing package bytes. Config data uses the logical ID
+as the production key and `<ID>_staging` as the staging key. Conflicting
+`EDGEZERO__STORES__CONFIG__<ID>__KEY` values fail; omit them for Fastly.
+Fastly logging settings come from `[adapters.fastly.logging]` in the application
+manifest and are baked into the package.
 
-When the source has no version descriptor, EdgeZero does not infer ownership
-from the account-wide resource inventories. Any inherited Config/KV/Secret link
-outside the desired manifest stops the first managed deployment. Declare every
-store the application needs or remove an audited stale link before retrying.
-Provider resources outside those inventories remain untouched. EdgeZero does
-not inspect any legacy selector entry.
+Managed deploy verifies the immutable release, resolves complete Config, KV, and
+Secret inventories, prepares an unreachable draft, and reconciles declared
+`(resource kind, logical ID)` links. A declared link pointing at a different
+physical resource is replaced. Undeclared inherited links are preserved. After
+all mutations, EdgeZero re-reads the exact links, source and draft state, and
+provider-visible package identity immediately before staging or activation.
+Any lookup, malformed inventory, changed source, package mismatch, or readback
+failure stops publication.
 
-PR #344 service-scoped and unscoped selector entries and old physical staging
-twin stores are unsupported. Current deploys never read or write them. They are
-inert after cutover and operators may remove them separately after confirming no
-older application still depends on them.
+The PR #344 runtime descriptor and service-scoped selector keys are unsupported.
+Deploy removes only the exact inherited legacy Config link whose alias and
+physical store are both `edgezero_runtime_env`; it leaves the account-wide store
+for older versions and rollback. Operators may remove that store after no older
+version depends on it.
 
 ## Staging, healthcheck, and rollback
 
@@ -198,10 +190,9 @@ archive:
     deploy-to: staging
 ```
 
-Staging and production can select different physical stores and runtime values,
-but both use the exact release package and manifests. Staging publication uses a
-version-scoped descriptor in the same physical runtime store; it does not create
-another runtime Config Store. The `domain` remains the application's real Fastly
+Staging and production can select different physical stores, while both use the
+exact release package and manifests. Fastly version resource links bind each
+target to its selected stores. The `domain` remains the application's real Fastly
 hostname for both targets; a workflow may use a separate value such as
 `staging.app.example.com` only as its GitHub Environment identifier.
 
@@ -222,13 +213,13 @@ For production rollback, capture `previous-version` from deploy and pass it as
     deploy-to: production
 ```
 
-If a deploy fails after emitting `fastly-version`, the version's current state may
-have changed. Inspect the exact version state first: reuse it only if it is
-inactive; deactivate it only if it is staged; if it is active and
-`previous-version` is present, run production rollback. If its state is unknown,
-reconcile provider state manually without guessing. If no version was emitted but
-`mutation-attempted` is true, reconcile provider state manually as well. A first
-deployment has no previous production version.
+If a staging deploy fails after emitting `fastly-version`, the rollback action
+reads that exact version first. It deactivates a staged version, succeeds without
+mutation for an unpublished editable draft, and refuses active, missing,
+ambiguous, or incompatible state. Production rollback still requires
+`previous-version`. If no version was emitted but `mutation-attempted` is true,
+reconcile provider state manually. A first deployment has no previous production
+version.
 
 ## Config push
 
@@ -249,13 +240,11 @@ config source:
 ```
 
 `app-config` and `app-config-inline` are mutually exclusive. With
-`deploy-to: staging`, the selected GitHub Environment's canonical
-`EDGEZERO__STORES__CONFIG__<ID>__KEY` value wins, followed by an applicable
-`[environment.variables]` manifest default. When both are absent, the key falls
-back to `<logical-id>_staging`. Production falls back to `<logical-id>`. The
-managed action has no separate key input, so config push and deploy cannot select
-different runtime keys. Config push changes typed runtime data; it does not change
-the application release, package, or manifests.
+`deploy-to: staging`, Fastly writes `<logical-id>_staging`; production writes
+`<logical-id>`. A conflicting canonical `__KEY` fails before mutation. The
+deprecated action `key` input is retained only to fail with migration guidance
+when nonempty. Config push changes typed runtime data; it does not change the
+application release, package, or manifests.
 
 ## Action reference
 
@@ -272,17 +261,18 @@ the application release, package, or manifests.
 
 ### `config-push-fastly`
 
-| Input                 | Required | Default      | Meaning                                                                     |
-| --------------------- | -------- | ------------ | --------------------------------------------------------------------------- |
-| `app-release-archive` | Yes      | —            | The same pinned release archive.                                            |
-| `app-release-sha256`  | Yes      | —            | Expected archive SHA-256.                                                   |
-| `fastly-api-token`    | Yes      | —            | Token for the Config Store write.                                           |
-| `working-directory`   | No       | `.`          | Publisher-owned typed-config directory.                                     |
-| `app-config`          | No\*     | empty        | Typed config file under `working-directory`.                                |
-| `app-config-inline`   | No\*     | empty        | Inline typed config.                                                        |
-| `no-env`              | No       | `false`      | Skip the typed runtime environment overlay.                                 |
-| `store`               | No       | manifest     | Logical Config Store ID.                                                    |
-| `deploy-to`           | No       | `production` | Select the canonical environment key, then the production/staging fallback. |
+| Input                 | Required | Default      | Meaning                                               |
+| --------------------- | -------- | ------------ | ----------------------------------------------------- |
+| `app-release-archive` | Yes      | —            | The same pinned release archive.                      |
+| `app-release-sha256`  | Yes      | —            | Expected archive SHA-256.                             |
+| `fastly-api-token`    | Yes      | —            | Token for the Config Store write.                     |
+| `working-directory`   | No       | `.`          | Publisher-owned typed-config directory.               |
+| `app-config`          | No\*     | empty        | Typed config file under `working-directory`.          |
+| `app-config-inline`   | No\*     | empty        | Inline typed config.                                  |
+| `no-env`              | No       | `false`      | Skip the typed runtime environment overlay.           |
+| `store`               | No       | manifest     | Logical Config Store ID.                              |
+| `key`                 | No       | empty        | Deprecated; any nonempty value fails before mutation. |
+| `deploy-to`           | No       | `production` | Select `<logical-id>` or `<logical-id>_staging`.      |
 
 \* Exactly one typed config input is required.
 
@@ -297,7 +287,8 @@ version's staging IP; a production probe does not receive the token.
 
 `rollback-fastly` requires the release archive and digest, Fastly token, service
 ID, failed version, and target. Production additionally requires `rollback-to`;
-staging deactivates the supplied staged version.
+staging inspects the supplied version, deactivates it only when staged, and
+no-ops when it is still an unpublished draft.
 
 ## Managed deploy arguments
 

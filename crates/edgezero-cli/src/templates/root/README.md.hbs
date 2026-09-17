@@ -51,14 +51,14 @@ cargo run -p {{proj_cli}} -- config diff --adapter <name> --format json --exit-c
 Uncomment `[stores.config]` in `edgezero.toml` (and the matching
 adapter binding in the per-adapter manifest) before running `config push`.
 
-Use `--key <name>` for per-environment overrides (staging / canary):
+Use `--key <name>` for per-environment overrides (staging / canary) on adapters
+that support custom runtime keys:
 the same `{{name}}.toml` can land under multiple keys, and the runtime
 picks one via the canonical `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=<name>`
 setting. Axum reads that setting from process env, Cloudflare from worker
-vars, and Spin from application variables. Fastly stores the equivalent
-setting under the canonical key
-`EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` in the `edgezero_runtime_env`
-Config Store. The Fastly deploy flow materializes declared selectors from
-the selected deployment environment; no service ID appears in the variable name.
+vars, and Spin from application variables. Fastly uses deterministic keys:
+`app_config` for production and local Viceroy, and `app_config_staging` for
+staging. Its deploy flow links the selected physical store under the logical
+`app_config` alias; no service ID appears in an environment variable name.
 See the [blob app-config migration guide](https://stackpop.github.io/edgezero/guide/blob-app-config-migration)
 for the per-adapter steps and the full operator runbook.

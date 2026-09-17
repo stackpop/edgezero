@@ -3,8 +3,9 @@
 ## Status
 
 Accepted on 2026-09-17. This design supersedes the version-scoped runtime
-descriptor design. EdgeZero does not create or use `edgezero_runtime_env`, and
-it does not put a Fastly service ID or version in an `EDGEZERO__*` name.
+descriptor design. EdgeZero does not create or use `edgezero_runtime_env` as a
+runtime configuration store, and it does not put a Fastly service ID or version
+in an `EDGEZERO__*` name.
 
 ## Problem
 

@@ -33,6 +33,13 @@ struct ReleaseMember {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "release verification records every member; host-only tests audit their exact bytes"
+    )
+)]
 pub(crate) struct VerifiedApplicationRelease {
     adapter_manifest: PathBuf,
     application_cli: PathBuf,
@@ -43,24 +50,9 @@ pub(crate) struct VerifiedApplicationRelease {
     source_revision: String,
 }
 
-#[cfg_attr(
-    any(not(test), target_arch = "wasm32"),
-    expect(
-        dead_code,
-        reason = "release verification records every member; host-only tests audit their exact bytes"
-    )
-)]
 impl VerifiedApplicationRelease {
     pub(crate) fn adapter_manifest(&self) -> &Path {
         &self.adapter_manifest
-    }
-
-    pub(crate) fn application_cli(&self) -> &Path {
-        &self.application_cli
-    }
-
-    pub(crate) fn application_manifest(&self) -> &Path {
-        &self.application_manifest
     }
 
     pub(crate) fn package(&self) -> &Path {
@@ -69,14 +61,6 @@ impl VerifiedApplicationRelease {
 
     pub(crate) fn package_sha256(&self) -> &str {
         &self.package_sha256
-    }
-
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub(crate) fn source_revision(&self) -> &str {
-        &self.source_revision
     }
 }
 

@@ -1414,8 +1414,8 @@ fn resolve_adapter_push_ctx(
 /// applied the canonical environment override and production/staging fallback.
 ///
 /// `--key` keeps its production override behavior. It remains incompatible with
-/// `--staging`, because the staged runtime reads the canonical
-/// `EDGEZERO__STORES__CONFIG__<ID>__KEY` selection recorded at deploy time.
+/// `--staging`, because a staged push must use the canonical target key resolved
+/// from `EDGEZERO__STORES__CONFIG__<ID>__KEY` and the adapter policy.
 fn resolve_config_key(
     explicit: Option<&str>,
     runtime_key: &str,
@@ -1423,7 +1423,7 @@ fn resolve_config_key(
 ) -> Result<String, String> {
     match (explicit, staging) {
         (Some(key), true) => Err(format!(
-            "`--key {key}` cannot be combined with `--staging`. A staged push must use the canonical `EDGEZERO__STORES__CONFIG__<ID>__KEY` selected by its runtime environment (currently `{runtime_key}`), so the pushed entry and deployed runtime cannot diverge.\n  Set that canonical KEY in the staging environment and push without `--key`, or push to `--key {key}` without `--staging`."
+            "`--key {key}` cannot be combined with `--staging`. A staged push must use the canonical `EDGEZERO__STORES__CONFIG__<ID>__KEY` selected for that target (currently `{runtime_key}`), so the pushed entry and deployed runtime cannot diverge.\n  Set that canonical KEY in the staging environment and push without `--key`, or push to `--key {key}` without `--staging`."
         )),
         (Some(key), false) => Ok(key.to_owned()),
         (None, _) => Ok(runtime_key.to_owned()),
@@ -2534,8 +2534,8 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             resolve_config_key(Some("custom"), &production_default, false).unwrap(),
             "custom"
         );
-        // Staging uses the same provider-neutral canonical runtime key resolver
-        // as the deployment descriptor. With no override, both fall back to the
+        // Staging uses the same provider-neutral canonical target-key resolver
+        // as deployment planning. With no override, both fall back to the
         // documented staging suffix.
         assert_eq!(
             resolve_config_key(None, &staging_default, true).unwrap(),
@@ -2556,7 +2556,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         assert_eq!(
             resolve_config_key(None, &selected_runtime_key, true).unwrap(),
             selected_runtime_key,
-            "staging push and runtime descriptor must select the same explicit canonical KEY"
+            "staging push and runtime must select the same explicit canonical KEY"
         );
 
         // --key + --staging is refused because only the canonical runtime KEY
@@ -3799,12 +3799,10 @@ ids = ["default"]
             .expect_err("a real push over malformed TOML must fail at the writer");
     }
 
-    /// The body-aware preflight runs BEFORE any remote I/O: an infeasible cloud
-    /// push (here, a reserved `--key`) fails with the preflight error, not a
-    /// `fastly`-not-found / auth error from the remote read. If preflight ran
-    /// after `read_remote`, the error would be about the missing/failed shell-out.
+    /// Fastly's deterministic-key policy runs before any remote I/O. A custom
+    /// `--key` fails locally rather than reaching a provider read or write.
     #[test]
-    fn cloud_push_preflight_rejects_reserved_key_before_remote_io() {
+    fn fastly_push_rejects_custom_key_before_remote_io() {
         const FASTLY_ONLY_MANIFEST: &str = r#"
 [app]
 name = "demo-app"
@@ -3834,22 +3832,73 @@ ids = ["default"]
         let _prepend = PathPrepend::new(fake.path());
 
         let mut args = push_args(&manifest, "fastly");
-        // A reserved-namespace --key: infeasible, and preflight-detectable.
+        // Fastly derives the production key from the logical store ID.
         args.key = Some("app_config.__edgezero_chunks.deadbeef.0".to_owned());
         args.yes = true;
         args.app_config = Some(dir.path().join("demo-app.toml"));
 
         let err = run_config_push_typed::<FixtureConfig>(&args)
-            .expect_err("a reserved --key must be rejected");
+            .expect_err("a custom Fastly --key must be rejected");
         assert!(
-            err.contains("reserved infix"),
-            "must fail at preflight (before any remote read), not on a shell-out: {err}"
+            err.contains("deterministic config key `app_config`"),
+            "must fail at Fastly key validation before any remote read: {err}"
         );
         assert!(
             !oplog.exists(),
             "preflight must reject BEFORE any `fastly` invocation; log: {:?}",
             fs::read_to_string(&oplog).unwrap_or_default()
         );
+    }
+
+    /// An explicitly exported but empty canonical selector must fail while the
+    /// push context is being resolved. It must never fall back to the logical
+    /// store or key and reach the provider.
+    #[test]
+    fn fastly_push_rejects_empty_selectors_before_remote_io() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_logging(&oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let mut args = push_args(&manifest, "fastly");
+        args.yes = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        for variable in [
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+        ] {
+            let selector = EnvOverride::set(variable, "");
+            let error = run_config_push_typed::<FixtureConfig>(&args)
+                .expect_err("an exported empty selector must fail before provider I/O");
+            assert!(
+                error.contains(variable),
+                "error must identify the invalid canonical selector: {error}"
+            );
+            assert!(
+                !oplog.exists(),
+                "selector validation must reject before any `fastly` invocation"
+            );
+            drop(selector);
+        }
     }
 
     /// Stronger ordering proof: the generic push runs the FULL body-aware
@@ -3863,7 +3912,7 @@ ids = ["default"]
     /// the generic path performs no list/describe/update/delete before the offline
     /// feasibility check has passed.
     #[test]
-    fn cloud_push_preflight_rejects_derived_key_overflow_before_remote_io() {
+    fn fastly_push_preflight_rejects_derived_key_overflow_before_remote_io() {
         const FASTLY_ONLY_MANIFEST: &str = r#"
 [app]
 name = "demo-app"
@@ -3885,7 +3934,9 @@ ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
         let _path_lock = path_mutation_guard().lock().expect("path guard");
-        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        let logical = "r".repeat(200);
+        let long_id_manifest = FASTLY_ONLY_MANIFEST.replace("app_config", &logical);
+        let (dir, manifest, _) = setup_project(&long_id_manifest, FIXTURE_APP_CONFIG);
         // A fake `fastly` on PATH records any invocation, so an ordering
         // regression shows up as a logged call rather than a real shell-out
         // against the developer's authenticated CLI.
@@ -3901,9 +3952,9 @@ ids = ["default"]
         fs::write(dir.path().join("demo-app.toml"), big_app_config).expect("write big app config");
 
         let mut args = push_args(&manifest, "fastly");
-        // A VALID root key (<= 255 chars, no reserved infix) whose DERIVED chunk
-        // key (+~85 chars) overflows the store's 255-char limit once chunked.
-        args.key = Some("r".repeat(200));
+        // A valid logical root key (<= 255 chars, no reserved infix) whose
+        // derived chunk key (+~85 chars) exceeds Fastly's 255-char limit.
+        args.store = Some(logical);
         args.yes = true;
         args.app_config = Some(dir.path().join("demo-app.toml"));
 

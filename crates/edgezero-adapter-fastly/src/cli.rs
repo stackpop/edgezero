@@ -18,7 +18,6 @@ use std::process::id as process_id;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::RUNTIME_ENV_STORE_NAME;
 use crate::chunked_config::{
     CHUNK_KEY_INFIX, GcPointer, GcRootValue, ResolveFailure, chunk_key_generation, chunk_key_index,
     chunk_lengths, gc_classify_root, gc_verify_generation, prepare_fastly_config_entries,
@@ -26,7 +25,6 @@ use crate::chunked_config::{
     value_is_future_format, value_is_inert_foreign, verify_writer_split_layout,
 };
 use crate::release::{VerifiedApplicationRelease, verify_application_release};
-use crate::runtime_descriptor::{RuntimeDescriptor, runtime_descriptor_key, validated_deploy_env};
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
@@ -287,6 +285,12 @@ enum PublishTarget {
     Staging,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StagingRollbackDecision {
+    Deactivate,
+    NoopDraft,
+}
+
 #[derive(Debug)]
 struct InitialDraftSnapshot {
     backends: serde_json::Value,
@@ -319,31 +323,17 @@ enum EditableVersionSource {
 }
 
 #[derive(Debug)]
-#[cfg_attr(
-    any(not(test), target_arch = "wasm32"),
-    expect(
-        dead_code,
-        reason = "the plan retains validated preflight evidence used by host-only tests and later reconciliation audits"
-    )
-)]
 struct ManagedDeployPlan {
     arguments: ReleaseManagedDeployArgs,
-    descriptor_json: String,
-    desired_links: Vec<DesiredResourceLink>,
-    environment: EnvConfig,
-    inventories: ResourceInventories,
     links: LinkReconciliation,
     package_files_hash: String,
     package_sha256: String,
-    prior_descriptor: Option<RuntimeDescriptor>,
     release: VerifiedApplicationRelease,
-    runtime_store_id: String,
     service_id: String,
     source_links: Vec<ExistingResourceLink>,
     target: PublishTarget,
     token: FastlyApiToken,
     version_source: EditableVersionSource,
-    versions: Vec<ServiceVersionRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -375,7 +365,6 @@ impl ResourceKind {
 struct DesiredResourceLink {
     alias: String,
     kind: ResourceKind,
-    logical_id: Option<String>,
     resource_id: String,
     selected_name: String,
 }
@@ -383,6 +372,7 @@ struct DesiredResourceLink {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExistingResourceLink {
     alias: String,
+    kind: ResourceKind,
     link_id: String,
     resource_id: String,
 }
@@ -419,11 +409,6 @@ struct PaginatedStoreInventoryMeta {
     next_cursor: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct ExactConfigStoreItemResponse {
-    item_value: String,
-}
-
 #[derive(Clone, Debug)]
 struct ResourceInventories {
     config: StoreInventory,
@@ -433,10 +418,6 @@ struct ResourceInventories {
 }
 
 impl ResourceInventories {
-    fn contains_resource_id(&self, resource_id: &str) -> bool {
-        self.kind_by_resource_id.contains_key(resource_id)
-    }
-
     fn for_kind(&self, kind: ResourceKind) -> &StoreInventory {
         match kind {
             ResourceKind::Config => &self.config,
@@ -643,18 +624,7 @@ fn desired_resource_links(
     environment: &EnvConfig,
     inventories: &ResourceInventories,
 ) -> Result<Vec<DesiredResourceLink>, String> {
-    let mut desired_by_alias = BTreeMap::<String, DesiredResourceLink>::new();
-    let runtime_id = inventories.resolve(ResourceKind::Config, RUNTIME_ENV_STORE_NAME)?;
-    desired_by_alias.insert(
-        RUNTIME_ENV_STORE_NAME.to_owned(),
-        DesiredResourceLink {
-            logical_id: None,
-            kind: ResourceKind::Config,
-            alias: RUNTIME_ENV_STORE_NAME.to_owned(),
-            selected_name: RUNTIME_ENV_STORE_NAME.to_owned(),
-            resource_id: runtime_id,
-        },
-    );
+    let mut desired_by_identity = BTreeMap::<(ResourceKind, String), DesiredResourceLink>::new();
 
     for (kind, logical_ids) in [
         (ResourceKind::Config, &stores.config),
@@ -662,51 +632,47 @@ fn desired_resource_links(
         (ResourceKind::Secret, &stores.secrets),
     ] {
         for logical_id in logical_ids {
-            let selected_name = environment.store_name(kind.runtime_name(), logical_id);
-            if selected_name == RUNTIME_ENV_STORE_NAME {
-                return Err(format!(
-                    "selected {} store for `{logical_id}` cannot use the reserved Fastly resource-link alias `{RUNTIME_ENV_STORE_NAME}`",
-                    kind.runtime_name()
-                ));
-            }
+            let selected_name = environment
+                .store_name_checked(kind.runtime_name(), logical_id)
+                .map_err(|error| format!("invalid Fastly deploy environment: {error}"))?;
             let resource_id = inventories.resolve(kind, &selected_name)?;
             let desired = DesiredResourceLink {
-                logical_id: Some(logical_id.clone()),
                 kind,
-                alias: selected_name.clone(),
+                alias: logical_id.clone(),
                 selected_name: selected_name.clone(),
                 resource_id,
             };
-            if let Some(prior) = desired_by_alias.get(&selected_name) {
-                if prior.resource_id != desired.resource_id || prior.kind != desired.kind {
-                    return Err(format!(
-                        "Fastly resource-link alias `{selected_name}` is selected by different resources or store kinds"
-                    ));
-                }
-                continue;
+            let identity = (kind, logical_id.clone());
+            if desired_by_identity.insert(identity, desired).is_some() {
+                return Err(format!(
+                    "Fastly {} logical store id `{logical_id}` is declared more than once",
+                    kind.display_name()
+                ));
             }
-            desired_by_alias.insert(selected_name, desired);
         }
     }
-    Ok(desired_by_alias.into_values().collect())
+    Ok(desired_by_identity.into_values().collect())
 }
 
 fn plan_link_reconciliation(
     desired: &[DesiredResourceLink],
     existing: &[ExistingResourceLink],
-    prior_managed_aliases: Option<&BTreeSet<String>>,
     inventories: &ResourceInventories,
 ) -> Result<LinkReconciliation, String> {
-    let mut desired_by_alias = BTreeMap::new();
+    const LEGACY_RUNTIME_STORE: &str = "edgezero_runtime_env";
+
+    let mut desired_by_identity = BTreeMap::new();
     for link in desired {
-        if desired_by_alias.insert(link.alias.as_str(), link).is_some() {
+        let identity = (link.kind, link.alias.as_str());
+        if desired_by_identity.insert(identity, link).is_some() {
             return Err(format!(
-                "desired Fastly resource-link alias `{}` is duplicated",
+                "desired Fastly {} resource-link alias `{}` is duplicated",
+                link.kind.display_name(),
                 link.alias
             ));
         }
     }
-    let mut existing_by_alias = BTreeMap::new();
+    let mut existing_by_identity = BTreeMap::new();
     let mut existing_ids = BTreeSet::new();
     for link in existing {
         if !existing_ids.insert(link.link_id.as_str()) {
@@ -715,100 +681,66 @@ fn plan_link_reconciliation(
                 link.link_id
             ));
         }
-        if existing_by_alias
-            .insert(link.alias.as_str(), link)
-            .is_some()
-        {
+        match inventories.kind_by_resource_id.get(&link.resource_id) {
+            Some(kind) if *kind == link.kind => {}
+            Some(kind) => {
+                return Err(format!(
+                    "Fastly resource link `{}` reports {} but resource `{}` belongs to {}",
+                    link.alias,
+                    link.kind.display_name(),
+                    link.resource_id,
+                    kind.display_name()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "Fastly {} resource link `{}` refers to resource `{}` absent from the complete provider inventory",
+                    link.kind.display_name(),
+                    link.alias,
+                    link.resource_id
+                ));
+            }
+        }
+        let identity = (link.kind, link.alias.as_str());
+        if existing_by_identity.insert(identity, link).is_some() {
             return Err(format!(
-                "Fastly resource-link inventory contains duplicate alias `{}`",
+                "Fastly resource-link inventory contains duplicate {} alias `{}`",
+                link.kind.display_name(),
                 link.alias
             ));
         }
     }
 
     let mut create = Vec::new();
+    let mut delete_link_ids = Vec::new();
     for desired_link in desired {
-        match existing_by_alias.get(desired_link.alias.as_str()) {
+        let identity = (desired_link.kind, desired_link.alias.as_str());
+        match existing_by_identity.get(&identity) {
             Some(existing_link) if existing_link.resource_id == desired_link.resource_id => {}
             Some(existing_link) => {
-                return Err(format!(
-                    "Fastly resource-link alias collision for `{}`: existing resource `{}` differs from desired resource `{}`",
-                    desired_link.alias, existing_link.resource_id, desired_link.resource_id
-                ));
+                delete_link_ids.push(existing_link.link_id.clone());
+                create.push(desired_link.clone());
             }
             None => create.push(desired_link.clone()),
         }
     }
 
-    if prior_managed_aliases.is_none() {
-        let mut undeclared = existing
-            .iter()
-            .filter(|link| !desired_by_alias.contains_key(link.alias.as_str()))
-            .filter(|link| inventories.contains_resource_id(&link.resource_id))
-            .map(|link| link.alias.as_str())
-            .collect::<Vec<_>>();
-        undeclared.sort_unstable();
-        if let Some(alias) = undeclared.first() {
-            return Err(format!(
-                "first managed Fastly deployment found inherited store link `{alias}` without prior descriptor ownership; declare the required store in edgezero.toml or remove the stale link before retrying"
-            ));
-        }
-    }
-
-    let mut delete_link_ids = existing
-        .iter()
-        .filter(|link| !desired_by_alias.contains_key(link.alias.as_str()))
-        .filter(|link| prior_managed_aliases.is_some_and(|aliases| aliases.contains(&link.alias)))
-        .map(|link| link.link_id.clone())
-        .collect::<Vec<_>>();
+    let legacy_resource_id = inventories.config.by_name.get(LEGACY_RUNTIME_STORE);
+    delete_link_ids.extend(existing.iter().filter_map(|link| {
+        let identity = (link.kind, link.alias.as_str());
+        (link.kind == ResourceKind::Config
+            && link.alias == LEGACY_RUNTIME_STORE
+            && legacy_resource_id == Some(&link.resource_id)
+            && !desired_by_identity.contains_key(&identity))
+        .then(|| link.link_id.clone())
+    }));
     delete_link_ids.sort();
-    create.sort_by(|left, right| left.alias.cmp(&right.alias));
+    delete_link_ids.dedup();
+    create.sort_by(|left, right| (left.kind, &left.alias).cmp(&(right.kind, &right.alias)));
     Ok(LinkReconciliation {
         create,
         delete_link_ids,
     })
-}
-
-fn require_descriptor_source_link(
-    source_links: &[ExistingResourceLink],
-    runtime_store_id: &str,
-) -> Result<(), String> {
-    let Some(link) = source_links
-        .iter()
-        .find(|link| link.alias == RUNTIME_ENV_STORE_NAME)
-    else {
-        return Err(format!(
-            "Fastly source version has a runtime descriptor but no `{RUNTIME_ENV_STORE_NAME}` resource link; refusing an orphan descriptor"
-        ));
-    };
-    if link.resource_id != runtime_store_id {
-        return Err(format!(
-            "Fastly source version `{RUNTIME_ENV_STORE_NAME}` link does not match the resolved runtime descriptor store"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_reusable_initial_draft_links(
-    desired: &[DesiredResourceLink],
-    existing: &[ExistingResourceLink],
-    inventories: &ResourceInventories,
-) -> Result<(), String> {
-    let desired_by_alias = desired
-        .iter()
-        .map(|link| (link.alias.as_str(), link.resource_id.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    for link in existing {
-        if inventories.contains_resource_id(&link.resource_id)
-            && desired_by_alias.get(link.alias.as_str()).copied() != Some(link.resource_id.as_str())
-        {
-            return Err(format!(
-                "reusable Fastly initial draft contains managed resource-link alias `{}` outside the immutable runtime descriptor",
-                link.alias
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[expect(
@@ -850,17 +782,16 @@ fn build_managed_deploy_plan(
     }
 
     let stores = RuntimeStoreIds::from(&context.stores);
-    let descriptor = RuntimeDescriptor::from_environment(
-        &environment,
-        &stores.config,
-        &stores.kv,
-        &stores.secrets,
-        target == PublishTarget::Staging,
-    )
-    .map_err(|error| format!("invalid Fastly runtime descriptor: {error}"))?;
-    let descriptor_json = descriptor
-        .canonical_json()
-        .map_err(|error| format!("invalid Fastly runtime descriptor: {error}"))?;
+    for logical_id in &stores.config {
+        let key = environment
+            .store_key_for_target_checked(
+                ResourceKind::Config.runtime_name(),
+                logical_id,
+                target == PublishTarget::Staging,
+            )
+            .map_err(|error| format!("invalid Fastly deploy environment: {error}"))?;
+        validate_fastly_config_key(logical_id, &key, target == PublishTarget::Staging, false)?;
+    }
     let cwd = release
         .adapter_manifest()
         .parent()
@@ -881,7 +812,6 @@ fn build_managed_deploy_plan(
     )?;
     let inventories =
         ResourceInventories::from_inventories(config_inventory, kv_inventory, secret_inventory)?;
-    let runtime_store_id = inventories.resolve(ResourceKind::Config, RUNTIME_ENV_STORE_NAME)?;
     let desired_links = desired_resource_links(&stores, &environment, &inventories)?;
 
     let versions_raw = fastly_api_get(&format!("/service/{service_id}/version"), token.as_str())?;
@@ -904,44 +834,7 @@ fn build_managed_deploy_plan(
     )?;
     let (source_links, links_snapshot) = parse_resource_links(&links_raw)?;
 
-    let descriptor_key = runtime_descriptor_key(&service_id, source_version);
-    let prior_descriptor_raw =
-        read_exact_config_store_item_value(&runtime_store_id, &descriptor_key, token.as_str())?;
-    if prior_descriptor_raw.is_some() {
-        require_descriptor_source_link(&source_links, &runtime_store_id)?;
-    }
-    if matches!(selected_source, VersionSource::InitialDraft(_))
-        && prior_descriptor_raw
-            .as_deref()
-            .is_some_and(|raw| raw != descriptor_json)
-    {
-        return Err(format!(
-            "Fastly version descriptor `{descriptor_key}` already exists with different immutable bytes"
-        ));
-    }
-    let prior_descriptor = prior_descriptor_raw
-        .as_deref()
-        .map(|raw| {
-            RuntimeDescriptor::parse(raw).map_err(|_error| {
-                "Fastly exact Config Store item contains an invalid runtime descriptor (payload redacted)"
-                    .to_owned()
-            })
-        })
-        .transpose()?;
-    if matches!(selected_source, VersionSource::InitialDraft(_)) && prior_descriptor.is_some() {
-        validate_reusable_initial_draft_links(&desired_links, &source_links, &inventories)?;
-    }
-    let prior_aliases = prior_descriptor
-        .as_ref()
-        .map(RuntimeDescriptor::managed_store_aliases)
-        .transpose()
-        .map_err(|error| format!("invalid prior Fastly runtime descriptor: {error}"))?;
-    let links = plan_link_reconciliation(
-        &desired_links,
-        &source_links,
-        prior_aliases.as_ref(),
-        &inventories,
-    )?;
+    let links = plan_link_reconciliation(&desired_links, &source_links, &inventories)?;
 
     let version_source = match selected_source {
         VersionSource::Active(active_version) => {
@@ -991,22 +884,15 @@ fn build_managed_deploy_plan(
 
     Ok(ManagedDeployPlan {
         arguments,
-        descriptor_json,
-        desired_links,
-        environment,
-        inventories,
         links,
         package_files_hash,
         package_sha256,
-        prior_descriptor,
         release,
-        runtime_store_id,
         service_id,
         source_links,
         target,
         token,
         version_source,
-        versions,
     })
 }
 
@@ -1050,12 +936,16 @@ fn execute_managed_deploy_plan_with_emit(
 
     let inherited = read_version_links(&plan.service_id, version, cwd)?;
     require_same_link_resources(&plan.source_links, &inherited, "inherited draft")?;
-    let delete_aliases = planned_delete_aliases(plan)?;
-    let expected_links = expected_final_link_resources(plan, &delete_aliases)?;
-    let inherited_by_alias = links_by_alias(&inherited)?;
-    for alias in &delete_aliases {
-        let link = inherited_by_alias.get(alias).ok_or_else(|| {
-            format!("planned stale Fastly resource link `{alias}` is absent from the draft")
+    let delete_identities = planned_delete_identities(plan)?;
+    let expected_links = expected_final_link_resources(plan, &delete_identities)?;
+    let inherited_by_identity = links_by_identity(&inherited)?;
+    for identity in &delete_identities {
+        let link = inherited_by_identity.get(identity).ok_or_else(|| {
+            format!(
+                "planned stale Fastly {} resource link `{}` is absent from the draft",
+                identity.0.display_name(),
+                identity.1
+            )
         })?;
         run_fastly_status(
             &[
@@ -1084,7 +974,6 @@ fn execute_managed_deploy_plan_with_emit(
     let reconciled = read_version_links(&plan.service_id, version, cwd)?;
     require_exact_link_resources(&expected_links, &reconciled, "reconciled draft")?;
 
-    ensure_exact_version_descriptor(plan, version, cwd)?;
     revalidate_managed_draft(plan, version, &expected_links, cwd)?;
 
     match plan.target {
@@ -1321,10 +1210,12 @@ fn read_version_links_with_snapshot(
     parse_resource_links(&raw)
 }
 
-fn links_by_alias(
+type ResourceLinkIdentity = (ResourceKind, String);
+
+fn links_by_identity(
     links: &[ExistingResourceLink],
-) -> Result<BTreeMap<String, ExistingResourceLink>, String> {
-    let mut by_alias = BTreeMap::new();
+) -> Result<BTreeMap<ResourceLinkIdentity, ExistingResourceLink>, String> {
+    let mut by_identity = BTreeMap::new();
     let mut ids = BTreeSet::new();
     for link in links {
         if !ids.insert(link.link_id.as_str()) {
@@ -1333,20 +1224,24 @@ fn links_by_alias(
                 link.link_id
             ));
         }
-        if by_alias.insert(link.alias.clone(), link.clone()).is_some() {
+        let identity = (link.kind, link.alias.clone());
+        if by_identity.insert(identity, link.clone()).is_some() {
             return Err(format!(
-                "Fastly resource-link inventory contains duplicate alias `{}`",
+                "Fastly resource-link inventory contains duplicate {} alias `{}`",
+                link.kind.display_name(),
                 link.alias
             ));
         }
     }
-    Ok(by_alias)
+    Ok(by_identity)
 }
 
-fn link_resource_map(links: &[ExistingResourceLink]) -> Result<BTreeMap<String, String>, String> {
-    Ok(links_by_alias(links)?
+fn link_resource_map(
+    links: &[ExistingResourceLink],
+) -> Result<BTreeMap<ResourceLinkIdentity, String>, String> {
+    Ok(links_by_identity(links)?
         .into_iter()
-        .map(|(alias, link)| (alias, link.resource_id))
+        .map(|(identity, link)| (identity, link.resource_id))
         .collect())
 }
 
@@ -1360,7 +1255,7 @@ fn require_same_link_resources(
 }
 
 fn require_exact_link_resources(
-    expected: &BTreeMap<String, String>,
+    expected: &BTreeMap<ResourceLinkIdentity, String>,
     actual: &[ExistingResourceLink],
     label: &str,
 ) -> Result<(), String> {
@@ -1374,11 +1269,13 @@ fn require_exact_link_resources(
     }
 }
 
-fn planned_delete_aliases(plan: &ManagedDeployPlan) -> Result<BTreeSet<String>, String> {
+fn planned_delete_identities(
+    plan: &ManagedDeployPlan,
+) -> Result<BTreeSet<ResourceLinkIdentity>, String> {
     let by_id = plan
         .source_links
         .iter()
-        .map(|link| (link.link_id.as_str(), link.alias.as_str()))
+        .map(|link| (link.link_id.as_str(), (link.kind, link.alias.as_str())))
         .collect::<BTreeMap<_, _>>();
     plan.links
         .delete_link_ids
@@ -1386,7 +1283,7 @@ fn planned_delete_aliases(plan: &ManagedDeployPlan) -> Result<BTreeSet<String>, 
         .map(|id| {
             by_id
                 .get(id.as_str())
-                .map(|alias| (*alias).to_owned())
+                .map(|(kind, alias)| (*kind, (*alias).to_owned()))
                 .ok_or_else(|| {
                     format!("planned Fastly resource-link deletion `{id}` has no source link")
                 })
@@ -1396,59 +1293,32 @@ fn planned_delete_aliases(plan: &ManagedDeployPlan) -> Result<BTreeSet<String>, 
 
 fn expected_final_link_resources(
     plan: &ManagedDeployPlan,
-    delete_aliases: &BTreeSet<String>,
-) -> Result<BTreeMap<String, String>, String> {
+    delete_identities: &BTreeSet<ResourceLinkIdentity>,
+) -> Result<BTreeMap<ResourceLinkIdentity, String>, String> {
     let mut expected = link_resource_map(&plan.source_links)?;
-    for alias in delete_aliases {
-        if expected.remove(alias).is_none() {
+    for identity in delete_identities {
+        if expected.remove(identity).is_none() {
             return Err(format!(
-                "planned stale Fastly resource-link alias `{alias}` has no source link"
+                "planned stale Fastly {} resource-link alias `{}` has no source link",
+                identity.0.display_name(),
+                identity.1
             ));
         }
     }
     for link in &plan.links.create {
+        let identity = (link.kind, link.alias.clone());
         if expected
-            .insert(link.alias.clone(), link.resource_id.clone())
+            .insert(identity, link.resource_id.clone())
             .is_some()
         {
             return Err(format!(
-                "planned Fastly resource-link creation `{}` collides with an inherited alias",
+                "planned Fastly {} resource-link creation `{}` collides with an inherited identity",
+                link.kind.display_name(),
                 link.alias
             ));
         }
     }
     Ok(expected)
-}
-
-fn ensure_exact_version_descriptor(
-    plan: &ManagedDeployPlan,
-    version: u64,
-    cwd: &Path,
-) -> Result<(), String> {
-    let key = runtime_descriptor_key(&plan.service_id, version);
-    match read_exact_config_store_item_value(&plan.runtime_store_id, &key, plan.token.as_str())? {
-        Some(existing) if existing == plan.descriptor_json => {}
-        Some(_different) => {
-            return Err(format!(
-                "Fastly version descriptor `{key}` already exists with different immutable bytes"
-            ));
-        }
-        None => create_config_store_entry_once_in(
-            &plan.runtime_store_id,
-            &key,
-            &plan.descriptor_json,
-            cwd,
-        )?,
-    }
-    let readback =
-        read_exact_config_store_item_value(&plan.runtime_store_id, &key, plan.token.as_str())?
-            .ok_or_else(|| format!("Fastly version descriptor `{key}` is absent after create"))?;
-    if readback != plan.descriptor_json {
-        return Err(format!(
-            "Fastly version descriptor `{key}` readback differs from the immutable deployment bytes"
-        ));
-    }
-    Ok(())
 }
 
 fn revalidate_initial_draft_before_update(
@@ -1554,7 +1424,7 @@ fn require_protected_initial_snapshot(
 fn revalidate_managed_draft(
     plan: &ManagedDeployPlan,
     version: u64,
-    expected_links: &BTreeMap<String, String>,
+    expected_links: &BTreeMap<ResourceLinkIdentity, String>,
     cwd: &Path,
 ) -> Result<(), String> {
     let versions_raw = fastly_api_get(
@@ -1609,17 +1479,6 @@ fn revalidate_managed_draft(
     }
     let links = read_version_links(&plan.service_id, version, cwd)?;
     require_exact_link_resources(expected_links, &links, "final draft")?;
-    let key = runtime_descriptor_key(&plan.service_id, version);
-    let descriptor =
-        read_exact_config_store_item_value(&plan.runtime_store_id, &key, plan.token.as_str())?
-            .ok_or_else(|| {
-                format!("Fastly version descriptor `{key}` disappeared before publication")
-            })?;
-    if descriptor != plan.descriptor_json {
-        return Err(format!(
-            "Fastly version descriptor `{key}` changed before publication"
-        ));
-    }
     let package_raw = fastly_api_get(
         &format!("/service/{}/version/{version}/package", plan.service_id),
         plan.token.as_str(),
@@ -1699,55 +1558,25 @@ fn parse_resource_links(
                     )
                 })
         };
+        let resource_type = required("resource_type")?;
+        let kind = match resource_type.as_str() {
+            "config_store" => ResourceKind::Config,
+            "kv_store" => ResourceKind::Kv,
+            "secret_store" => ResourceKind::Secret,
+            _ => {
+                return Err(format!(
+                    "Fastly resource-link inventory record #{index} has unknown `resource_type` `{resource_type}`"
+                ));
+            }
+        };
         links.push(ExistingResourceLink {
             link_id: required("id")?,
             alias: required("name")?,
+            kind,
             resource_id: required("resource_id")?,
         });
     }
     Ok((links, snapshot))
-}
-
-#[cfg(all(test, unix))]
-fn read_exact_prior_descriptor(
-    store_id: &str,
-    key: &str,
-    token: &str,
-) -> Result<Option<RuntimeDescriptor>, String> {
-    read_exact_config_store_item_value(store_id, key, token)?
-        .map(|raw| RuntimeDescriptor::parse(&raw).map_err(|_error| {
-            "Fastly exact Config Store item contains an invalid runtime descriptor (payload redacted)"
-                .to_owned()
-        }))
-        .transpose()
-}
-
-#[cfg(test)]
-fn parse_exact_config_store_item_descriptor(raw: &str) -> Result<RuntimeDescriptor, String> {
-    let value = parse_exact_config_store_item_value(raw)?;
-    RuntimeDescriptor::parse(&value).map_err(|_error| {
-        "Fastly exact Config Store item contains an invalid runtime descriptor (payload redacted)"
-            .to_owned()
-    })
-}
-
-fn read_exact_config_store_item_value(
-    store_id: &str,
-    key: &str,
-    token: &str,
-) -> Result<Option<String>, String> {
-    let path = format!("/resources/stores/config/{store_id}/item/{key}");
-    fastly_api_get_optional(&path, token)?
-        .map(|raw| parse_exact_config_store_item_value(&raw))
-        .transpose()
-}
-
-fn parse_exact_config_store_item_value(raw: &str) -> Result<String, String> {
-    let response: ExactConfigStoreItemResponse = serde_json::from_str(raw).map_err(|_error| {
-        "Fastly exact Config Store item response is unreadable or malformed (payload redacted)"
-            .to_owned()
-    })?;
-    Ok(response.item_value)
 }
 
 fn snapshot_initial_draft(
@@ -2140,6 +1969,16 @@ impl Adapter for FastlyCliAdapter {
         Ok(())
     }
 
+    fn validate_config_key_for_target(
+        &self,
+        logical_store_id: &str,
+        key: &str,
+        staging: bool,
+        local: bool,
+    ) -> Result<(), String> {
+        validate_fastly_config_key(logical_store_id, key, staging, local)
+    }
+
     fn preflight_deploy(
         &self,
         context: &AdapterDeployContext,
@@ -2249,56 +2088,6 @@ impl Adapter for FastlyCliAdapter {
                 out.push(line);
             }
         }
-        // EdgeZero runtime overrides live in a dedicated Fastly Config
-        // Store named `edgezero_runtime_env`. Compute@Edge has no
-        // process env, so `EDGEZERO__STORES__CONFIG__<ID>__KEY` and
-        // similar overrides have to come from a platform Config Store
-        // the runtime opens by name (see `runtime_env_config` in
-        // lib.rs). Provision owns the store creation alongside the
-        // operator's declared stores so the runtime override path is
-        // wired correctly out of the box; if the store already appears
-        // in `[setup.config_stores.edgezero_runtime_env]`, skip.
-        let runtime_env_kind = "config";
-        let runtime_env_name = RUNTIME_ENV_STORE_NAME;
-        if dry_run {
-            out.push(format!(
-                "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
-                fastly_path.display()
-            ));
-        } else if !setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
-            create_fastly_store_in(runtime_env_kind, runtime_env_name, manifest_dir)?;
-            append_fastly_setup(&fastly_path, runtime_env_kind, runtime_env_name).map_err(
-                |err| {
-                    format!(
-                        "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
-                        path = fastly_path.display()
-                    )
-                },
-            )?;
-            // Same already-deployed-service caveat as the declared-store
-            // path: if `service_id` is set in fastly.toml, the
-            // `[setup.config_stores.edgezero_runtime_env]` table won't
-            // be re-applied by the next `fastly compute deploy`, so the
-            // runtime can't open the store. Emit only the resource-link
-            // remediation; deployment owns every descriptor entry.
-            let post_create_note = resource_link_note(
-                selected_service.as_ref(),
-                runtime_env_kind,
-                runtime_env_name,
-            );
-            let mut line = format!(
-                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero version-scoped runtime descriptor store); appended setup tables to {}\n  Deployment writes the complete runtime descriptor for each service version.",
-                fastly_path.display()
-            );
-            if let Some(note) = post_create_note {
-                line.push('\n');
-                line.push_str(&note);
-            }
-            out.push(line);
-        } else {
-            // Already declared; nothing to do.
-        }
-
         if out.is_empty() {
             out.push("fastly has no declared stores to provision".to_owned());
         }
@@ -2413,7 +2202,7 @@ impl Adapter for FastlyCliAdapter {
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         // Local-emulator path: edit
-        // `[local_server.config_stores.<platform>.contents]` in
+        // `[local_server.config_stores.<logical>.contents]` in
         // `fastly.toml`. Viceroy reads it on startup, so a
         // subsequent `fastly compute serve` exposes the new values
         // to the wasm component. No shell-out to the production
@@ -2427,7 +2216,7 @@ impl Adapter for FastlyCliAdapter {
         };
         let fastly_path = manifest_root.join(rel);
         let logical = store.logical.as_str();
-        let name = store.platform.as_str();
+        let name = store.logical.as_str();
         if entries.is_empty() {
             return Ok(vec![format!(
                 "no config entries to push to `[local_server.config_stores.{name}]` in {} (logical id `{logical}`)",
@@ -2615,7 +2404,7 @@ impl Adapter for FastlyCliAdapter {
         key: &str,
         _push_ctx: &AdapterPushContext<'_>,
     ) -> Result<ReadConfigEntry, String> {
-        // Read from `[local_server.config_stores.<platform_name>.contents]`
+        // Read from `[local_server.config_stores.<logical_name>.contents]`
         // in fastly.toml — the same section `push_config_entries_local` writes.
         let Some(rel) = adapter_manifest_path else {
             return Err(
@@ -2624,7 +2413,7 @@ impl Adapter for FastlyCliAdapter {
             );
         };
         let fastly_path = manifest_root.join(rel);
-        let name = store.platform.as_str();
+        let name = store.logical.as_str();
         // A prior-state read failure must never BLOCK the command: the diff just
         // cannot be computed, so it degrades to `Unsupported` ("cannot diff").
         // Downstream, a dry-run then reaches the writer's orphan-count
@@ -5010,53 +4799,6 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
     create_config_store_entry_with_cwd(store_id, key, value, None)
 }
 
-fn create_config_store_entry_once_in(
-    store_id: &str,
-    key: &str,
-    value: &str,
-    cwd: &Path,
-) -> Result<(), String> {
-    let store_arg = format!("--store-id={store_id}");
-    let key_arg = format!("--key={key}");
-    let mut child = Command::new("fastly")
-        .args([
-            "config-store-entry",
-            "create",
-            store_arg.as_str(),
-            key_arg.as_str(),
-            "--stdin",
-        ])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
-            } else {
-                format!("failed to spawn `fastly`: {error}")
-            }
-        })?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
-    write_value_to_fastly_stdin(stdin, value)?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to wait on `fastly`: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "`fastly config-store-entry create --store-id={store_id} --key={key} --stdin` exited with status {}\nstderr: {}",
-            output.status,
-            redact_stderr(&String::from_utf8_lossy(&output.stderr))
-        ))
-    }
-}
-
 fn create_config_store_entry_with_cwd(
     store_id: &str,
     key: &str,
@@ -5568,7 +5310,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 //
 // The adapter-managed deployment path verifies the immutable application release,
 // uploads its recorded package with `compute update` to an exact unreachable draft,
-// reconciles and reads back the version descriptor and exact resource links, and
+// reconciles and reads back exact logical resource links and the package identity, and
 // stages or activates only after verification. It emits `version=<N>` and
 // `package-sha256=<SHA256>`. The bare store-free production manifest command is a
 // compatibility path outside this managed lifecycle.
@@ -5769,13 +5511,52 @@ fn validate_deploy_service_id_for_manifest(
 
 fn effective_deploy_environment(context: &AdapterDeployContext) -> Result<EnvConfig, String> {
     let variables = merge_env_defaults(context.variable_defaults.iter(), env::vars());
-    validated_deploy_env(
-        variables,
-        &context.stores.config,
-        &context.stores.kv,
-        &context.stores.secrets,
-    )
-    .map_err(|error| format!("invalid Fastly deploy environment: {error}"))
+    let environment = EnvConfig::from_vars(variables);
+    for (kind, logical_ids) in [
+        (ResourceKind::Config, &context.stores.config),
+        (ResourceKind::Kv, &context.stores.kv),
+        (ResourceKind::Secret, &context.stores.secrets),
+    ] {
+        for logical_id in logical_ids {
+            environment
+                .store_name_checked(kind.runtime_name(), logical_id)
+                .map_err(|error| format!("invalid Fastly deploy environment: {error}"))?;
+            if kind == ResourceKind::Config {
+                environment
+                    .store_key_for_target_checked(kind.runtime_name(), logical_id, context.staging)
+                    .map_err(|error| format!("invalid Fastly deploy environment: {error}"))?;
+            }
+        }
+    }
+    Ok(environment)
+}
+
+fn validate_fastly_config_key(
+    logical_store_id: &str,
+    key: &str,
+    staging: bool,
+    local: bool,
+) -> Result<(), String> {
+    let expected = if local {
+        logical_store_id.to_owned()
+    } else {
+        crate::config_entry_key(logical_store_id, staging)
+    };
+    if key == expected {
+        Ok(())
+    } else {
+        let target = if local {
+            "local Viceroy"
+        } else if staging {
+            "Fastly staging"
+        } else {
+            "Fastly production"
+        };
+        Err(format!(
+            "Fastly {target} uses deterministic config key `{expected}` for logical store `{logical_store_id}`; remove the conflicting --key or EDGEZERO__STORES__CONFIG__{}__KEY override",
+            logical_store_id.to_ascii_uppercase()
+        ))
+    }
 }
 
 /// Read the required Fastly API token from the environment.
@@ -6013,6 +5794,45 @@ fn ensure_rollback_from_is_active(
             "refusing to roll back service {service_id}: it has no active version"
         )),
     }
+}
+
+fn staging_rollback_decision(
+    versions: &[ServiceVersionRecord],
+    requested_version: u64,
+    service_id: &str,
+) -> Result<StagingRollbackDecision, String> {
+    let version = versions
+        .iter()
+        .find(|candidate| candidate.number == requested_version)
+        .ok_or_else(|| {
+            format!(
+                "Fastly version {requested_version} is absent from service {service_id}; refusing staging rollback"
+            )
+        })?;
+    let staged = !version.active
+        && version.locked
+        && version.deployed
+        && ((version.staging && version.environments.is_empty())
+            || (version.environments.len() == 1
+                && version.environments.iter().all(|environment| {
+                    environment.name == "staging"
+                        && environment.service_id == service_id
+                        && environment.active_version == requested_version
+                })));
+    if staged {
+        return Ok(StagingRollbackDecision::Deactivate);
+    }
+    let unpublished_draft = !version.active
+        && !version.locked
+        && !version.staging
+        && !version.deployed
+        && version.environments.is_empty();
+    if unpublished_draft {
+        return Ok(StagingRollbackDecision::NoopDraft);
+    }
+    Err(format!(
+        "Fastly version {requested_version} is neither the exact staged version nor an unpublished editable draft; refusing staging rollback"
+    ))
 }
 
 /// First staging IP found in a Fastly
@@ -6358,33 +6178,6 @@ fn fastly_api_get(path: &str, token: &str) -> Result<String, String> {
     Ok(body.to_owned())
 }
 
-/// Read one exact Fastly API resource, treating only an authoritative HTTP 404
-/// as absence. The response body is returned for 2xx and never included in an
-/// error because a Config Store item can contain runtime configuration.
-fn fastly_api_get_optional(path: &str, token: &str) -> Result<Option<String>, String> {
-    let header = curl_quote(&format!("Fastly-Key: {token}"));
-    let url = curl_quote(&format!("https://api.fastly.com{path}"));
-    let config = format!("header = {header}\nurl = {url}\nwrite-out = \"\\n%{{http_code}}\"\n");
-    let out = curl_config_capture(&config)
-        .map_err(|error| format!("Fastly API exact GET {path} failed: {error}"))?;
-    let (body, status_line) = out
-        .rsplit_once('\n')
-        .ok_or_else(|| format!("Fastly API exact GET {path}: no HTTP status in curl output"))?;
-    let status: u16 = status_line.trim().parse().map_err(|error| {
-        format!(
-            "Fastly API exact GET {path}: could not parse the HTTP status {:?}: {error}",
-            status_line.trim()
-        )
-    })?;
-    match status {
-        200..=299 => Ok(Some(body.to_owned())),
-        404 => Ok(None),
-        _ => Err(format!(
-            "Fastly API exact GET {path} returned HTTP {status}"
-        )),
-    }
-}
-
 /// `PUT https://api.fastly.com<path>` with the `Fastly-Key` header;
 /// returns the HTTP status, erroring on non-2xx. Fastly's version
 /// activate/deactivate endpoints require `PUT` (not `POST`). Header and
@@ -6680,17 +6473,25 @@ fn rollback(args: &[String]) -> Result<(), String> {
     let token = require_token()?;
 
     if arg_flag(args, "--staging") {
-        // Staging rollback deactivates the STAGED version on the
-        // `staging` environment. Fastly's environment-scoped
-        // deactivate is `PUT .../deactivate/staging` (a plain
-        // `.../deactivate` would target the production activation).
-        fastly_api_put(
-            &format!("/service/{service_id}/version/{version}/deactivate/staging"),
-            &token,
-        )?;
-        log::info!(
-            "[edgezero] deactivated staged version {version} on Fastly service {service_id}"
-        );
+        let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
+        let versions = parse_service_versions(&json)?;
+        match staging_rollback_decision(&versions, version, &service_id)? {
+            StagingRollbackDecision::Deactivate => {
+                // Fastly's environment-scoped deactivate is
+                // `PUT .../deactivate/staging`; a plain `.../deactivate`
+                // targets production activation.
+                fastly_api_put(
+                    &format!("/service/{service_id}/version/{version}/deactivate/staging"),
+                    &token,
+                )?;
+                log::info!(
+                    "[edgezero] deactivated staged version {version} on Fastly service {service_id}"
+                );
+            }
+            StagingRollbackDecision::NoopDraft => log::info!(
+                "[edgezero] Fastly version {version} is an unpublished draft; staging rollback has nothing to deactivate"
+            ),
+        }
     } else {
         // Production rollback re-activates an EXPLICIT target. Fastly's version
         // list has no field distinguishing a previously-live version from a
@@ -6731,7 +6532,9 @@ mod tests {
     use edgezero_core::env_config::EnvConfig;
     #[cfg(unix)]
     use edgezero_core::test_env::{EnvOverride, PathPrepend};
-    use std::collections::{BTreeMap, HashSet};
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
+    use std::collections::HashSet;
     #[cfg(unix)]
     use std::iter::once;
     #[cfg(unix)]
@@ -6739,9 +6542,6 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::tempdir;
-
-    #[cfg(unix)]
-    const TEST_PACKAGE_FILES_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     // Shared fixture names. Pinning these as consts (instead of
     // inline `"sessions"` / `"app_config"` per call site) keeps the
@@ -7124,18 +6924,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn deploy_environment_parent_overrides_defaults_then_uses_logical_store_ids() {
+    fn deploy_environment_parent_overrides_defaults_then_falls_back_to_logical_ids() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let config_name = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME";
         let kv_name = "EDGEZERO__STORES__KV__SESSIONS__NAME";
         let config_key = "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY";
-        let legacy_name = "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__APP_CONFIG__NAME";
-        let legacy_feature_name = "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__FEATURE_FLAGS__NAME";
         let _parent = EnvOverride::set(config_name, "parent_config");
         let _no_parent_kv = EnvOverride::remove(kv_name);
         let _parent_key = EnvOverride::set(config_key, "parent_key");
-        let _legacy = EnvOverride::set(legacy_name, "legacy_config");
-        let _legacy_feature = EnvOverride::set(legacy_feature_name, "legacy_feature_flags");
         let context = AdapterDeployContext {
             stores: DeployStoreIds {
                 config: vec!["app_config".to_owned(), "feature_flags".to_owned()],
@@ -7146,11 +6942,6 @@ mod tests {
                 (config_name.to_owned(), "manifest_config".to_owned()),
                 (config_key.to_owned(), "manifest_key".to_owned()),
                 (kv_name.to_owned(), "manifest_sessions".to_owned()),
-                (legacy_name.to_owned(), "legacy_manifest_config".to_owned()),
-                (
-                    legacy_feature_name.to_owned(),
-                    "legacy_manifest_feature_flags".to_owned(),
-                ),
             ]),
             ..AdapterDeployContext::default()
         };
@@ -7175,7 +6966,7 @@ mod tests {
         assert_eq!(
             environment.store_name("config", "feature_flags"),
             "feature_flags",
-            "legacy service-scoped selectors must not participate in precedence"
+            "an absent selector must fall back to the logical ID"
         );
         assert_eq!(
             environment.store_name("secrets", "default"),
@@ -7186,12 +6977,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn deploy_environment_rejects_invalid_present_selector_and_fixed_values() {
+    fn deploy_environment_rejects_invalid_present_store_selectors() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let selector = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME";
-        let port = "EDGEZERO__ADAPTER__PORT";
         let _no_parent_selector = EnvOverride::remove(selector);
-        let _no_parent_port = EnvOverride::remove(port);
         let base = AdapterDeployContext {
             stores: DeployStoreIds {
                 config: vec!["app_config".to_owned()],
@@ -7221,17 +7010,6 @@ mod tests {
         assert!(
             parent_error.contains(selector),
             "error names parent selector: {parent_error}"
-        );
-
-        let mut invalid_fixed = base;
-        invalid_fixed
-            .variable_defaults
-            .insert(port.to_owned(), "0".to_owned());
-        let fixed_error = effective_deploy_environment(&invalid_fixed)
-            .expect_err("a present invalid fixed runtime value must not disappear");
-        assert!(
-            fixed_error.contains(port),
-            "error names invalid fixed value: {fixed_error}"
         );
     }
 
@@ -7963,3083 +7741,235 @@ mod tests {
     fn deploy_plan_inventories() -> ResourceInventories {
         ResourceInventories::from_json(
             r#"[
-                {"id":"RUNTIME","name":"edgezero_runtime_env"},
+                {"id":"LEGACY","name":"edgezero_runtime_env"},
                 {"id":"CONFIG_A","name":"config-a"},
                 {"id":"CONFIG_B","name":"config-b"}
             ]"#,
-            r#"[{"id":"KV_A","name":"kv-a"}]"#,
-            r#"[{"id":"SECRET_A","name":"secret-a"},{"id":"SECRET_B","name":"secret-b"}]"#,
+            r#"[{"id":"KV_A","name":"kv-a"},{"id":"KV_B","name":"kv-b"}]"#,
+            r#"[{"id":"SECRET_A","name":"secret-a"}]"#,
         )
         .expect("valid inventories")
     }
 
-    fn deploy_plan_desired_links() -> Vec<DesiredResourceLink> {
+    fn desired_link(
+        kind: ResourceKind,
+        alias: &str,
+        selected_name: &str,
+        resource_id: &str,
+    ) -> DesiredResourceLink {
+        DesiredResourceLink {
+            alias: alias.to_owned(),
+            kind,
+            resource_id: resource_id.to_owned(),
+            selected_name: selected_name.to_owned(),
+        }
+    }
+
+    fn existing_link(
+        kind: ResourceKind,
+        alias: &str,
+        resource_id: &str,
+        link_id: &str,
+    ) -> ExistingResourceLink {
+        ExistingResourceLink {
+            alias: alias.to_owned(),
+            kind,
+            link_id: link_id.to_owned(),
+            resource_id: resource_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn deploy_plan_uses_logical_aliases_and_selected_physical_resources() {
         let environment = EnvConfig::from_vars([
-            ("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "config-a"),
-            ("EDGEZERO__STORES__CONFIG__FEATURE_FLAGS__NAME", "config-a"),
-            ("EDGEZERO__STORES__KV__SESSIONS__NAME", "kv-a"),
+            ("EDGEZERO__STORES__CONFIG__SHARED__NAME", "config-a"),
+            ("EDGEZERO__STORES__KV__SHARED__NAME", "kv-a"),
             ("EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME", "secret-a"),
         ]);
-        desired_resource_links(
+        let desired = desired_resource_links(
             &RuntimeStoreIds {
-                config: vec!["app_config".to_owned(), "feature_flags".to_owned()],
-                kv: vec!["sessions".to_owned()],
+                config: vec!["shared".to_owned()],
+                kv: vec!["shared".to_owned()],
                 secrets: vec!["credentials".to_owned()],
             },
             &environment,
             &deploy_plan_inventories(),
         )
-        .expect("desired links")
-    }
+        .expect("desired links");
 
-    #[test]
-    fn deploy_plan_builds_exact_kind_isolated_desired_links() {
-        let desired = deploy_plan_desired_links();
         assert_eq!(
             desired,
             vec![
-                DesiredResourceLink {
-                    logical_id: Some("app_config".to_owned()),
-                    kind: ResourceKind::Config,
-                    alias: "config-a".to_owned(),
-                    selected_name: "config-a".to_owned(),
-                    resource_id: "CONFIG_A".to_owned(),
-                },
-                DesiredResourceLink {
-                    logical_id: None,
-                    kind: ResourceKind::Config,
-                    alias: "edgezero_runtime_env".to_owned(),
-                    selected_name: "edgezero_runtime_env".to_owned(),
-                    resource_id: "RUNTIME".to_owned(),
-                },
-                DesiredResourceLink {
-                    logical_id: Some("sessions".to_owned()),
-                    kind: ResourceKind::Kv,
-                    alias: "kv-a".to_owned(),
-                    selected_name: "kv-a".to_owned(),
-                    resource_id: "KV_A".to_owned(),
-                },
-                DesiredResourceLink {
-                    logical_id: Some("credentials".to_owned()),
-                    kind: ResourceKind::Secret,
-                    alias: "secret-a".to_owned(),
-                    selected_name: "secret-a".to_owned(),
-                    resource_id: "SECRET_A".to_owned(),
-                },
+                desired_link(ResourceKind::Config, "shared", "config-a", "CONFIG_A"),
+                desired_link(ResourceKind::Kv, "shared", "kv-a", "KV_A"),
+                desired_link(ResourceKind::Secret, "credentials", "secret-a", "SECRET_A",),
             ]
         );
     }
 
     #[test]
-    fn deploy_plan_preserves_already_correct_and_shared_links() {
-        let desired = deploy_plan_desired_links();
-        assert_eq!(
-            desired
-                .iter()
-                .filter(|link| link.alias == "config-a")
-                .count(),
-            1,
-            "two logical ids selecting one physical store must collapse to one link"
-        );
-        let existing = desired
-            .iter()
-            .enumerate()
-            .map(|(index, link)| ExistingResourceLink {
-                link_id: format!("LINK_{index}"),
-                alias: link.alias.clone(),
-                resource_id: link.resource_id.clone(),
-            })
-            .collect::<Vec<_>>();
-        let reconciliation = plan_link_reconciliation(
-            &desired,
-            &existing,
-            Some(&BTreeSet::new()),
-            &deploy_plan_inventories(),
-        )
-        .expect("already correct links");
-        assert!(reconciliation.delete_link_ids.is_empty());
-        assert!(reconciliation.create.is_empty());
-    }
-
-    #[test]
-    fn deploy_plan_rejects_declared_store_using_reserved_runtime_alias() {
-        let inventories = deploy_plan_inventories();
-        for (kind, stores, variable) in [
-            (
-                ResourceKind::Config,
-                RuntimeStoreIds {
-                    config: vec!["app".to_owned()],
-                    kv: Vec::new(),
-                    secrets: Vec::new(),
+    fn deploy_plan_rejects_present_invalid_store_name_before_inventory_lookup() {
+        for value in ["", "  ", "bad\nname"] {
+            let environment =
+                EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", value)]);
+            let error = desired_resource_links(
+                &RuntimeStoreIds {
+                    config: vec!["app_config".to_owned()],
+                    ..RuntimeStoreIds::default()
                 },
-                "EDGEZERO__STORES__CONFIG__APP__NAME",
-            ),
-            (
-                ResourceKind::Kv,
-                RuntimeStoreIds {
-                    config: Vec::new(),
-                    kv: vec!["app".to_owned()],
-                    secrets: Vec::new(),
-                },
-                "EDGEZERO__STORES__KV__APP__NAME",
-            ),
-            (
-                ResourceKind::Secret,
-                RuntimeStoreIds {
-                    config: Vec::new(),
-                    kv: Vec::new(),
-                    secrets: vec!["app".to_owned()],
-                },
-                "EDGEZERO__STORES__SECRETS__APP__NAME",
-            ),
-        ] {
-            let environment = EnvConfig::from_vars([(variable, RUNTIME_ENV_STORE_NAME)]);
-            let error = desired_resource_links(&stores, &environment, &inventories)
-                .expect_err("the runtime descriptor alias is reserved");
-            assert!(error.contains(RUNTIME_ENV_STORE_NAME) && error.contains(kind.runtime_name()));
-        }
-    }
-
-    #[test]
-    fn deploy_plan_rejects_alias_collision_with_different_resource() {
-        let desired = deploy_plan_desired_links();
-        let existing = vec![ExistingResourceLink {
-            link_id: "COLLISION".to_owned(),
-            alias: "config-a".to_owned(),
-            resource_id: "CONFIG_B".to_owned(),
-        }];
-        let error = plan_link_reconciliation(
-            &desired,
-            &existing,
-            Some(&BTreeSet::new()),
-            &deploy_plan_inventories(),
-        )
-        .expect_err("alias collisions fail closed");
-        assert!(
-            error.contains("config-a") && error.contains("collision"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn deploy_plan_reusable_initial_draft_rejects_inventory_backed_alias_residue() {
-        let desired = deploy_plan_desired_links();
-        let mut existing = desired
-            .iter()
-            .enumerate()
-            .map(|(index, link)| ExistingResourceLink {
-                link_id: format!("DESIRED_{index}"),
-                alias: link.alias.clone(),
-                resource_id: link.resource_id.clone(),
-            })
-            .collect::<Vec<_>>();
-        existing.extend([
-            ExistingResourceLink {
-                link_id: "SECRET_B_LINK".to_owned(),
-                alias: "secret-b".to_owned(),
-                resource_id: "SECRET_B".to_owned(),
-            },
-            ExistingResourceLink {
-                link_id: "UNRELATED".to_owned(),
-                alias: "backend-resource".to_owned(),
-                resource_id: "NOT_A_STORE".to_owned(),
-            },
-        ]);
-
-        let error =
-            validate_reusable_initial_draft_links(&desired, &existing, &deploy_plan_inventories())
-                .expect_err("managed aliases outside the immutable descriptor must fail closed");
-        assert!(error.contains("secret-b"), "{error}");
-
-        existing.retain(|link| link.alias != "secret-b");
-        validate_reusable_initial_draft_links(&desired, &existing, &deploy_plan_inventories())
-            .expect("unrelated provider links remain valid and preserved");
-    }
-
-    #[test]
-    fn deploy_plan_deletes_stale_descriptor_alias_after_store_removal_or_rename() {
-        let desired = deploy_plan_desired_links();
-        let prior = RuntimeDescriptor::from_entries(BTreeMap::from([(
-            "EDGEZERO__STORES__CONFIG__REMOVED_LOGICAL_ID__NAME".to_owned(),
-            "config-b".to_owned(),
-        )]))
-        .expect("prior descriptor");
-        let prior_aliases = prior.managed_store_aliases().expect("managed aliases");
-        let existing = vec![ExistingResourceLink {
-            link_id: "STALE".to_owned(),
-            alias: "config-b".to_owned(),
-            resource_id: "CONFIG_B".to_owned(),
-        }];
-        let reconciliation = plan_link_reconciliation(
-            &desired,
-            &existing,
-            Some(&prior_aliases),
-            &deploy_plan_inventories(),
-        )
-        .expect("stale alias plan");
-        assert_eq!(reconciliation.delete_link_ids, ["STALE"]);
-        assert!(
-            !reconciliation
-                .create
-                .iter()
-                .any(|link| link.alias == "config-b")
-        );
-    }
-
-    #[test]
-    fn clean_cutover_rejects_undeclared_inherited_stores_without_prior_descriptor() {
-        let inventories = deploy_plan_inventories();
-        let desired = deploy_plan_desired_links();
-        let existing = vec![
-            ExistingResourceLink {
-                link_id: "OLD_CONFIG".to_owned(),
-                alias: "old-config".to_owned(),
-                resource_id: "CONFIG_B".to_owned(),
-            },
-            ExistingResourceLink {
-                link_id: "OLD_KV".to_owned(),
-                alias: "old-kv".to_owned(),
-                resource_id: "KV_A".to_owned(),
-            },
-            ExistingResourceLink {
-                link_id: "OLD_SECRET".to_owned(),
-                alias: "old-secret".to_owned(),
-                resource_id: "SECRET_A".to_owned(),
-            },
-            ExistingResourceLink {
-                link_id: "BACKEND_RESOURCE".to_owned(),
-                alias: "unrelated".to_owned(),
-                resource_id: "NOT_A_STORE".to_owned(),
-            },
-        ];
-        let error = plan_link_reconciliation(&desired, &existing, None, &inventories)
-            .expect_err("first managed cutover must not infer ownership from account inventory");
-        assert!(error.contains("old-config"), "{error}");
-        assert!(
-            error.contains("declare") || error.contains("remove"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn prior_descriptor_requires_exact_runtime_store_link_on_source_version() {
-        let matching = vec![ExistingResourceLink {
-            link_id: "RUNTIME_LINK".to_owned(),
-            alias: RUNTIME_ENV_STORE_NAME.to_owned(),
-            resource_id: "RUNTIME".to_owned(),
-        }];
-        require_descriptor_source_link(&matching, "RUNTIME")
-            .expect("the exact source link proves descriptor reachability");
-
-        let missing = Vec::new();
-        let error = require_descriptor_source_link(&missing, "RUNTIME")
-            .expect_err("an orphan descriptor must not establish ownership");
-        assert!(error.contains(RUNTIME_ENV_STORE_NAME), "{error}");
-
-        let wrong = vec![ExistingResourceLink {
-            link_id: "OTHER_RUNTIME_LINK".to_owned(),
-            alias: RUNTIME_ENV_STORE_NAME.to_owned(),
-            resource_id: "OTHER_RUNTIME".to_owned(),
-        }];
-        let wrong_store_error = require_descriptor_source_link(&wrong, "RUNTIME")
-            .expect_err("a descriptor in a different physical store is not authoritative");
-        assert!(
-            wrong_store_error.contains("does not match"),
-            "{wrong_store_error}"
-        );
-    }
-
-    #[test]
-    fn deploy_plan_rejects_cross_kind_aliases_and_resource_ids() {
-        let aliases = ResourceInventories::from_json(
-            r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"CONFIG","name":"shared"}]"#,
-            r#"[{"id":"KV","name":"shared"}]"#,
-            "[]",
-        )
-        .expect("kind-specific inventories");
-        let environment = EnvConfig::from_vars([
-            ("EDGEZERO__STORES__CONFIG__APP__NAME", "shared"),
-            ("EDGEZERO__STORES__KV__CACHE__NAME", "shared"),
-        ]);
-        let error = desired_resource_links(
-            &RuntimeStoreIds {
-                config: vec!["app".to_owned()],
-                kv: vec!["cache".to_owned()],
-                secrets: Vec::new(),
-            },
-            &environment,
-            &aliases,
-        )
-        .expect_err("same alias for different kinds is ambiguous");
-        assert!(error.contains("shared"));
-
-        let resource_id_error = ResourceInventories::from_json(
-            r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"SAME","name":"config"}]"#,
-            r#"[{"id":"SAME","name":"kv"}]"#,
-            "[]",
-        )
-        .expect_err("cross-kind resource id collision");
-        assert!(
-            resource_id_error.contains("SAME") && resource_id_error.contains("kind"),
-            "{resource_id_error}"
-        );
-    }
-
-    #[test]
-    fn clean_cutover_rejects_incomplete_malformed_and_duplicate_inventories() {
-        for (config, kv, secrets) in [
-            (r#"{"items":[],"next_cursor":"more"}"#, "[]", "[]"),
-            (r#"[{"name":"missing-id"}]"#, "[]", "[]"),
-            (
-                r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"DUP","name":"one"},{"id":"DUP","name":"two"}]"#,
-                "[]",
-                "[]",
-            ),
-            (
-                r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"ONE","name":"duplicate"},{"id":"TWO","name":"duplicate"}]"#,
-                "[]",
-                "[]",
-            ),
-            (
-                r#"[{"id":"../ESCAPE","name":"edgezero_runtime_env"}]"#,
-                "[]",
-                "[]",
-            ),
-        ] {
-            assert!(
-                ResourceInventories::from_json(config, kv, secrets).is_err(),
-                "invalid inventory must fail before planning: {config}"
-            );
-        }
-    }
-
-    #[test]
-    fn deploy_plan_kv_inventory_accepts_fastly_cli_15_1_shape_and_collects_every_page() {
-        let mut requested = Vec::new();
-        let inventory = collect_paginated_store_inventory(
-            ResourceKind::Kv,
-            "/resources/stores/kv?limit=100",
-            |path| {
-                requested.push(path.to_owned());
-                match requested.len() {
-                    1 => Ok(r#"{
-                        "Data":[{
-                            "CreatedAt":"2026-09-16T00:00:00Z",
-                            "Name":"kv-a",
-                            "StoreID":"KV_A",
-                            "UpdatedAt":"2026-09-16T00:00:00Z"
-                        }],
-                        "Meta":{"limit":"1","next_cursor":"page+/="}
-                    }"#
-                    .to_owned()),
-                    2 => Ok(r#"{
-                        "data":[{"id":"KV_B","name":"kv-b"}],
-                        "meta":{"limit":100}
-                    }"#
-                    .to_owned()),
-                    _ => panic!("unexpected third inventory page"),
-                }
-            },
-        )
-        .expect("complete KV inventory");
-
-        assert_eq!(
-            requested,
-            [
-                "/resources/stores/kv?limit=100",
-                "/resources/stores/kv?limit=100&cursor=page%2B%2F%3D"
-            ]
-        );
-        assert_eq!(inventory.by_name["kv-a"], "KV_A");
-        assert_eq!(inventory.by_name["kv-b"], "KV_B");
-    }
-
-    #[test]
-    fn deploy_plan_paginated_inventory_rejects_incomplete_or_ambiguous_pages() {
-        for malformed in [
-            r#"[{"id":"KV_A","name":"kv-a"}]"#,
-            r#"{"data":[],"meta":"missing"}"#,
-            r#"{"data":[{"id":"KV_A"}],"meta":{}}"#,
-        ] {
-            let error = collect_paginated_store_inventory(
-                ResourceKind::Kv,
-                "/resources/stores/kv?limit=100",
-                |_| Ok(malformed.to_owned()),
+                &environment,
+                &deploy_plan_inventories(),
             )
-            .expect_err("incomplete page must fail closed");
-            assert!(error.contains("payload redacted"), "{error}");
-        }
-
-        let repeated = collect_paginated_store_inventory(
-            ResourceKind::Kv,
-            "/resources/stores/kv?limit=100",
-            |_| {
-                Ok(
-                    r#"{"data":[{"id":"KV_A","name":"kv-a"}],"meta":{"next_cursor":"same"}}"#
-                        .to_owned(),
-                )
-            },
-        )
-        .expect_err("repeated cursor must not loop or claim completeness");
-        assert!(repeated.contains("repeated"), "{repeated}");
-
-        let mut page = 0_u8;
-        let duplicate = collect_paginated_store_inventory(
-            ResourceKind::Kv,
-            "/resources/stores/kv?limit=100",
-            |_| {
-                page = page.saturating_add(1);
-                if page == 1 {
-                    Ok(
-                        r#"{"data":[{"id":"KV_A","name":"kv-a"}],"meta":{"next_cursor":"two"}}"#
-                            .to_owned(),
-                    )
-                } else {
-                    Ok(r#"{"data":[{"id":"KV_A","name":"kv-b"}],"meta":{}}"#.to_owned())
-                }
-            },
-        )
-        .expect_err("duplicate resource id across pages must fail closed");
-        assert!(duplicate.contains("duplicate resource id"), "{duplicate}");
-    }
-
-    #[test]
-    fn deploy_plan_inventories_reject_missing_and_empty_resource_ids() {
-        let missing = collect_paginated_store_inventory(
-            ResourceKind::Kv,
-            "/resources/stores/kv?limit=100",
-            |_| Ok(r#"{"Data":[{"Name":"kv-a"}],"Meta":{}}"#.to_owned()),
-        )
-        .expect_err("provider-shaped records with no resource id must fail closed");
-        assert!(missing.contains("payload redacted"), "{missing}");
-
-        let empty = collect_paginated_store_inventory(
-            ResourceKind::Secret,
-            "/resources/stores/secret?limit=100",
-            |_| Ok(r#"{"Data":[{"StoreID":"","Name":"secret-a"}],"Meta":{}}"#.to_owned()),
-        )
-        .expect_err("provider-shaped records with an empty resource id must fail closed");
-        assert!(empty.contains("invalid resource id"), "{empty}");
-
-        let empty_config =
-            parse_store_inventory(ResourceKind::Config, r#"[{"id":"","name":"config-a"}]"#)
-                .expect_err("bare-array records with an empty resource id must fail closed");
-        assert!(
-            empty_config.contains("non-empty string `name` and `id`"),
-            "{empty_config}"
-        );
-    }
-
-    #[test]
-    fn deploy_plan_exact_descriptor_requires_item_wrapper_and_redacts_unreadable_payloads() {
-        const SENTINEL: &str = "DO_NOT_LEAK_DESCRIPTOR_PAYLOAD";
-
-        let descriptor = RuntimeDescriptor::from_entries(BTreeMap::from([(
-            "EDGEZERO__LOGGING__LEVEL".to_owned(),
-            "debug".to_owned(),
-        )]))
-        .expect("descriptor");
-        let descriptor_json = descriptor.canonical_json().expect("descriptor JSON");
-        let wrapped = serde_json::json!({
-            "item_key": "EDGEZERO__SERVICES__SVC1__VERSIONS__7__ENV_V1",
-            "item_value": descriptor_json,
-            "store_id": "RUNTIME"
-        })
-        .to_string();
-        let parsed =
-            parse_exact_config_store_item_descriptor(&wrapped).expect("wrapped descriptor");
-        assert_eq!(
-            parsed.canonical_json().expect("parsed descriptor JSON"),
-            descriptor_json
-        );
-
-        for unreadable in [
-            SENTINEL.to_owned(),
-            serde_json::json!({"item_value": 42_i32, "secret": SENTINEL}).to_string(),
-            serde_json::json!({"secret": SENTINEL}).to_string(),
-        ] {
-            let error = parse_exact_config_store_item_descriptor(&unreadable)
-                .expect_err("malformed Config Store item wrapper");
-            assert!(!error.contains(SENTINEL), "payload leaked: {error}");
-            assert!(error.contains("payload redacted"), "{error}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn deploy_plan_exact_descriptor_accepts_wrapped_2xx_and_only_404_is_absence() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        const SENTINEL: &str = "DO_NOT_LEAK_CONFIG_STORE_RESPONSE";
-
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fake = tempdir().expect("fake curl directory");
-        let response = fake.path().join("response");
-        let curl = fake.path().join("curl");
-        fs::write(
-            &curl,
-            format!("#!/bin/sh\ncat >/dev/null\ncat '{}'\n", response.display()),
-        )
-        .expect("curl fake");
-        let mut permissions = fs::metadata(&curl).expect("curl metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&curl, permissions).expect("curl executable");
-        let _path = PathPrepend::new(fake.path());
-
-        let descriptor = RuntimeDescriptor::from_entries(BTreeMap::from([(
-            "EDGEZERO__LOGGING__LEVEL".to_owned(),
-            "debug".to_owned(),
-        )]))
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        fs::write(
-            &response,
-            format!("{}\n200", serde_json::json!({"item_value": descriptor})),
-        )
-        .expect("valid response");
-        assert!(
-            read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
-                .expect("valid wrapped 2xx")
-                .is_some()
-        );
-
-        fs::write(&response, format!("{SENTINEL}\n204")).expect("unreadable 2xx response");
-        let unreadable = read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
-            .expect_err("unreadable 2xx must fail closed");
-        assert!(!unreadable.contains(SENTINEL), "{unreadable}");
-
-        fs::write(&response, format!("{SENTINEL}\n404")).expect("404 response");
-        assert!(
-            read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
-                .expect("404 is authoritative absence")
-                .is_none()
-        );
-
-        fs::write(&response, format!("{SENTINEL}\n403")).expect("403 response");
-        let forbidden = read_exact_prior_descriptor("RUNTIME", "VERSION_KEY", "test-token")
-            .expect_err("non-404 must not be absence");
-        assert!(!forbidden.contains(SENTINEL), "{forbidden}");
-        assert!(forbidden.contains("HTTP 403"), "{forbidden}");
-    }
-
-    #[cfg(unix)]
-    struct DeployPlanReleaseFixture {
-        root: tempfile::TempDir,
-        application_manifest: PathBuf,
-        adapter_manifest: PathBuf,
-        package_digest: String,
-    }
-
-    #[cfg(unix)]
-    fn deploy_plan_release_fixture() -> DeployPlanReleaseFixture {
-        let root = tempdir().expect("release root");
-        for directory in ["bin", "package", "adapter"] {
-            fs::create_dir_all(root.path().join(directory)).expect("release directory");
-        }
-        let application_manifest = root.path().join("edgezero.toml");
-        let adapter_manifest = root.path().join("adapter/fastly.toml");
-        let members = [
-            ("bin/edgezero", b"application cli".as_slice()),
-            ("package/app.tar.gz", b"immutable package".as_slice()),
-            (
-                "edgezero.toml",
-                b"[app]\nname = \"demo\"\n[adapters.fastly.adapter]\nmanifest = \"adapter/fastly.toml\"\n"
-                    .as_slice(),
-            ),
-            (
-                "adapter/fastly.toml",
-                b"manifest_version = 3\nname = \"demo\"\n".as_slice(),
-            ),
-        ];
-        for (path, bytes) in members {
-            fs::write(root.path().join(path), bytes).expect("release member");
-        }
-        let digest = |path: &str| {
-            sha256_hex(&fs::read(root.path().join(path)).expect("release member bytes"))
-        };
-        let package_digest = digest("package/app.tar.gz");
-        fs::write(
-            root.path().join("release.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "format": 1_u64,
-                "source_revision": "a".repeat(40),
-                "adapter": "fastly",
-                "app_cli": {"path": "bin/edgezero", "sha256": digest("bin/edgezero")},
-                "package": {"path": "package/app.tar.gz", "sha256": package_digest},
-                "manifests": {
-                    "edgezero": {"path": "edgezero.toml", "sha256": digest("edgezero.toml")},
-                    "adapter": {"path": "adapter/fastly.toml", "sha256": digest("adapter/fastly.toml")}
-                }
-            }))
-            .expect("release metadata"),
-        )
-        .expect("release metadata file");
-        DeployPlanReleaseFixture {
-            root,
-            application_manifest,
-            adapter_manifest,
-            package_digest,
-        }
-    }
-
-    #[cfg(unix)]
-    fn fake_managed_plan_provider(
-        versions: &str,
-        links: &str,
-        prior_descriptor: Option<&str>,
-        config_inventory: &str,
-        operation_log: &Path,
-    ) -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let fake = tempdir().expect("provider fake");
-        for (name, body) in [
-            ("versions.json", versions),
-            ("links.json", links),
-            ("config.json", config_inventory),
-            (
-                "kv-page-1.json",
-                r#"{"data":[{"id":"KV_A","name":"kv-a"},{"id":"KV_B","name":"kv-b"}],"meta":{"limit":2,"next_cursor":"page-two"}}"#,
-            ),
-            (
-                "kv-page-2.json",
-                r#"{"data":[{"id":"KV_OLD","name":"kv-old"}],"meta":{"limit":100}}"#,
-            ),
-            (
-                "secret-page.json",
-                r#"{"data":[{"id":"SECRET_A","name":"secret-a"},{"id":"SECRET_B","name":"secret-b"},{"id":"SECRET_OLD","name":"secret-old"}],"meta":{"limit":100}}"#,
-            ),
-        ] {
-            fs::write(fake.path().join(name), body).expect("provider payload");
-        }
-        let descriptor_response = prior_descriptor.map_or_else(
-            || "printf '\\n404'".to_owned(),
-            |descriptor| {
-                fs::write(
-                    fake.path().join("descriptor.json"),
-                    serde_json::json!({
-                        "item_key": "EDGEZERO__SERVICES__SVC1__VERSIONS__7__ENV_V1",
-                        "item_value": descriptor,
-                        "store_id": "RUNTIME"
-                    })
-                    .to_string(),
-                )
-                .expect("descriptor response file");
-                format!(
-                    "cat '{}'; printf '\\n200'",
-                    fake.path().join("descriptor.json").display()
-                )
-            },
-        );
-        let script = format!(
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> '{log}'
-if [ "$1 $2" = "config-store list" ]; then cat '{config}'; exit 0; fi
-if [ "$1 $2" = "resource-link list" ]; then cat '{links}'; exit 0; fi
-if [ "$1 $2" = "compute hash-files" ]; then printf '%s\n' '{package_files_hash}'; exit 0; fi
-echo 'unexpected provider command' >&2
-exit 1
-"#,
-            log = operation_log.display(),
-            config = fake.path().join("config.json").display(),
-            links = fake.path().join("links.json").display(),
-            package_files_hash = TEST_PACKAGE_FILES_HASH,
-        );
-        let fastly = fake.path().join("fastly");
-        fs::write(&fastly, script).expect("fastly fake");
-        let mut fastly_permissions = fs::metadata(&fastly)
-            .expect("fastly metadata")
-            .permissions();
-        fastly_permissions.set_mode(0o755);
-        fs::set_permissions(&fastly, fastly_permissions).expect("fastly executable");
-
-        let curl = fake.path().join("curl");
-        fs::write(
-            &curl,
-            format!(
-                r#"#!/bin/sh
-config=$(cat)
-printf '%s\n' "$config" | while IFS= read -r line; do case "$line" in url*) printf 'curl %s\n' "$line";; esac; done >> '{log}'
-case "$config" in
-  *'/resources/stores/kv?limit=100&cursor=page-two'*) cat '{kv_page_2}'; printf '\n200';;
-  *'/resources/stores/kv?limit=100'*) cat '{kv_page_1}'; printf '\n200';;
-  *'/resources/stores/secret?limit=100'*) cat '{secret_page}'; printf '\n200';;
-  *'/service/'*'/version"'*) cat '{versions}'; printf '\n200';;
-  *'/resources/stores/config/RUNTIME/item/EDGEZERO__SERVICES__'*'__VERSIONS__'*) {descriptor_response};;
-  *'/domain'*) printf '[{{"name":"example.com"}}]\n200';;
-  *'/backend'*) printf '[{{"name":"origin","address":"origin.example.com"}}]\n200';;
-  *'/logging/https'*) printf '[{{"name":"logs","placement":"none","url":"https://logs.example.com"}}]\n200';;
-  *'/logging/'*) printf '[]\n200';;
-  *'/logging'*) printf '{{"error":"aggregate logging endpoint does not exist"}}\n404';;
-  *'/settings'*) printf '{{"general.default_host":"origin.example.com"}}\n200';;
-  *) printf '{{"error":"unexpected"}}\n500';;
-esac
-"#,
-                log = operation_log.display(),
-                kv_page_1 = fake.path().join("kv-page-1.json").display(),
-                kv_page_2 = fake.path().join("kv-page-2.json").display(),
-                secret_page = fake.path().join("secret-page.json").display(),
-                versions = fake.path().join("versions.json").display(),
-            ),
-        )
-        .expect("curl fake");
-        let mut curl_permissions = fs::metadata(&curl).expect("curl metadata").permissions();
-        curl_permissions.set_mode(0o755);
-        fs::set_permissions(&curl, curl_permissions).expect("curl executable");
-        fake
-    }
-
-    #[cfg(unix)]
-    #[derive(Clone, Copy)]
-    enum ManagedFakeSource {
-        Active,
-        InitialDraft,
-        Staged,
-    }
-
-    #[cfg(unix)]
-    #[derive(Clone, Copy)]
-    struct ManagedFakeSpec<'provider> {
-        selection: &'provider str,
-        service_id: &'provider str,
-        source: ManagedFakeSource,
-        source_version: u64,
-        target_version: u64,
-    }
-
-    #[cfg(unix)]
-    impl<'provider> ManagedFakeSpec<'provider> {
-        fn active(service_id: &'provider str, source_version: u64, target_version: u64) -> Self {
-            Self {
-                selection: "a",
-                service_id,
-                source: ManagedFakeSource::Active,
-                source_version,
-                target_version,
-            }
-        }
-
-        fn initial(service_id: &'provider str, version: u64) -> Self {
-            Self {
-                selection: "a",
-                service_id,
-                source: ManagedFakeSource::InitialDraft,
-                source_version: version,
-                target_version: version,
-            }
-        }
-
-        fn staged(service_id: &'provider str, source_version: u64, target_version: u64) -> Self {
-            Self {
-                selection: "a",
-                service_id,
-                source: ManagedFakeSource::Staged,
-                source_version,
-                target_version,
-            }
-        }
-
-        fn with_selection(mut self, selection: &'provider str) -> Self {
-            self.selection = selection;
-            self
-        }
-    }
-
-    #[cfg(unix)]
-    fn fake_stateful_managed_provider(
-        spec: ManagedFakeSpec<'_>,
-        expected_descriptor: &str,
-        expected_package: &Path,
-        operation_log: &Path,
-    ) -> tempfile::TempDir {
-        fake_stateful_managed_provider_in_runtime_store(
-            spec,
-            expected_descriptor,
-            expected_package,
-            operation_log,
-            None,
-        )
-    }
-
-    #[cfg(unix)]
-    fn fake_stateful_managed_provider_with_runtime_store(
-        spec: ManagedFakeSpec<'_>,
-        expected_descriptor: &str,
-        expected_package: &Path,
-        operation_log: &Path,
-        runtime_store: &Path,
-    ) -> tempfile::TempDir {
-        fake_stateful_managed_provider_in_runtime_store(
-            spec,
-            expected_descriptor,
-            expected_package,
-            operation_log,
-            Some(runtime_store),
-        )
-    }
-
-    #[cfg(unix)]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the stateful provider fake models every ordered managed-deployment operation in one script"
-    )]
-    fn fake_stateful_managed_provider_in_runtime_store(
-        spec: ManagedFakeSpec<'_>,
-        expected_descriptor: &str,
-        expected_package: &Path,
-        operation_log: &Path,
-        shared_runtime_store: Option<&Path>,
-    ) -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let fake = tempdir().expect("stateful provider fake");
-        let target_descriptor_key = runtime_descriptor_key(spec.service_id, spec.target_version);
-        let source_descriptor_key = runtime_descriptor_key(spec.service_id, spec.source_version);
-        let descriptor_state = if let Some(runtime_store) = shared_runtime_store {
-            fs::create_dir_all(runtime_store).expect("physical RUNTIME store directory");
-            runtime_store.join(&target_descriptor_key)
-        } else {
-            fake.path()
-                .join(format!("descriptor-{target_descriptor_key}"))
-        };
-        let source_descriptor_state = shared_runtime_store.map_or_else(
-            || {
-                if source_descriptor_key == target_descriptor_key {
-                    descriptor_state.clone()
-                } else {
-                    fake.path()
-                        .join(format!("descriptor-{source_descriptor_key}"))
-                }
-            },
-            |runtime_store| runtime_store.join(&source_descriptor_key),
-        );
-        let (versions_before, versions_after) = match spec.source {
-            ManagedFakeSource::Active => (
-                format!(
-                    r#"[{{"number":{},"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{{"active_version":{},"name":"production","service_id":"{}"}}]}}]"#,
-                    spec.source_version, spec.source_version, spec.service_id
-                ),
-                format!(
-                    r#"[{{"number":{},"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{{"active_version":{},"name":"production","service_id":"{}"}}]}},{{"number":{},"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}}]"#,
-                    spec.source_version, spec.source_version, spec.service_id, spec.target_version
-                ),
-            ),
-            ManagedFakeSource::InitialDraft => (
-                format!(
-                    r#"[{{"number":{},"active":false,"locked":false,"staging":false,"deployed":false,"environments":[],"comment":"initialized through Fastly UI"}}]"#,
-                    spec.source_version
-                ),
-                format!(
-                    r#"[{{"number":{},"active":false,"locked":false,"staging":false,"deployed":false,"environments":[],"comment":"initialized through Fastly UI"}}]"#,
-                    spec.target_version
-                ),
-            ),
-            ManagedFakeSource::Staged => (
-                format!(
-                    r#"[{{"number":{},"active":false,"locked":true,"staging":true,"deployed":true,"environments":[{{"active_version":{},"name":"staging","service_id":"{}"}}]}}]"#,
-                    spec.source_version, spec.source_version, spec.service_id
-                ),
-                format!(
-                    r#"[{{"number":{},"active":false,"locked":true,"staging":true,"deployed":true,"environments":[{{"active_version":{},"name":"staging","service_id":"{}"}}]}},{{"number":{},"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}}]"#,
-                    spec.source_version, spec.source_version, spec.service_id, spec.target_version
-                ),
-            ),
-        };
-        let versions_raced = format!(
-            r#"[{{"number":{},"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{{"active_version":{},"name":"production","service_id":"{}"}}]}}]"#,
-            spec.source_version, spec.source_version, spec.service_id
-        );
-        let intervening_active = spec.target_version.saturating_add(100);
-        let versions_with_new_active = format!(
-            r#"{},{{"number":{intervening_active},"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{{"active_version":{intervening_active},"name":"production","service_id":"{}"}}]}}]"#,
-            versions_after
-                .strip_suffix(']')
-                .expect("versions fixture is an array"),
-            spec.service_id
-        );
-        let second_staged = spec.target_version.saturating_add(101);
-        let versions_with_second_staged = format!(
-            r#"{},{{"number":{second_staged},"active":false,"locked":true,"staging":true,"deployed":true,"environments":[{{"active_version":{second_staged},"name":"staging","service_id":"{}"}}]}}]"#,
-            versions_after
-                .strip_suffix(']')
-                .expect("versions fixture is an array"),
-            spec.service_id
-        );
-        let selection_upper = spec.selection.to_ascii_uppercase();
-        let final_links = format!(
-            r#"[{{"id":"DRAFT_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"}},{{"id":"DRAFT_CONFIG","name":"config-{}","resource_id":"CONFIG_{}"}},{{"id":"DRAFT_KV","name":"kv-{}","resource_id":"KV_{}"}},{{"id":"DRAFT_SECRET","name":"secret-{}","resource_id":"SECRET_{}"}},{{"id":"DRAFT_OTHER","name":"backend-resource","resource_id":"NOT_A_STORE"}}]"#,
-            spec.selection,
-            selection_upper,
-            spec.selection,
-            selection_upper,
-            spec.selection,
-            selection_upper
-        );
-        let source_links = match spec.source {
-            ManagedFakeSource::Staged => final_links.replace("DRAFT_", "SRC_"),
-            ManagedFakeSource::InitialDraft => format!(
-                r#"[{{"id":"SRC_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME","created_at":"2026-09-16T00:00:00Z"}},{{"id":"SRC_CONFIG","name":"config-{}","resource_id":"CONFIG_{}"}},{{"id":"SRC_OTHER","name":"backend-resource","resource_id":"NOT_A_STORE"}}]"#,
-                spec.selection, selection_upper
-            ),
-            ManagedFakeSource::Active => format!(
-                r#"[{{"id":"SRC_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME","created_at":"2026-09-16T00:00:00Z"}},{{"id":"SRC_CONFIG","name":"config-{}","resource_id":"CONFIG_{}"}},{{"id":"SRC_OLD","name":"kv-old","resource_id":"KV_OLD"}},{{"id":"SRC_OTHER","name":"backend-resource","resource_id":"NOT_A_STORE"}}]"#,
-                spec.selection, selection_upper
-            ),
-        };
-        let draft_links = if matches!(spec.source, ManagedFakeSource::Staged) {
-            final_links.clone()
-        } else {
-            format!(
-                r#"[{{"id":"DRAFT_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"}},{{"id":"DRAFT_CONFIG","name":"config-{}","resource_id":"CONFIG_{}"}},{{"id":"DRAFT_OLD","name":"kv-old","resource_id":"KV_OLD"}},{{"id":"DRAFT_OTHER","name":"backend-resource","resource_id":"NOT_A_STORE"}}]"#,
-                spec.selection, selection_upper
-            )
-        };
-        let source_links_drifted = format!(
-            r#"{},{{"id":"SRC_DRIFT","name":"kv-old","resource_id":"KV_OLD"}}]"#,
-            source_links
-                .strip_suffix(']')
-                .expect("source links fixture is an array")
-        );
-        for (name, body) in [
-            ("versions-before.json", versions_before),
-            ("versions-after.json", versions_after),
-            ("versions-raced.json", versions_raced),
-            ("versions-with-new-active.json", versions_with_new_active),
-            (
-                "versions-with-second-staged.json",
-                versions_with_second_staged,
-            ),
-            ("source-links.json", source_links),
-            ("source-links-drifted.json", source_links_drifted),
-            ("draft-links.json", draft_links),
-            ("final-links.json", final_links),
-            (
-                "config.json",
-                r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"CONFIG_A","name":"config-a"},{"id":"CONFIG_B","name":"config-b"}]"#.to_owned(),
-            ),
-            (
-                "kv.json",
-                r#"{"data":[{"id":"KV_A","name":"kv-a"},{"id":"KV_B","name":"kv-b"},{"id":"KV_OLD","name":"kv-old"}],"meta":{}}"#.to_owned(),
-            ),
-            (
-                "secret.json",
-                r#"{"data":[{"id":"SECRET_A","name":"secret-a"},{"id":"SECRET_B","name":"secret-b"}],"meta":{}}"#.to_owned(),
-            ),
-        ] {
-            fs::write(fake.path().join(name), body).expect("stateful provider payload");
-        }
-        fs::write(fake.path().join("descriptor.expected"), expected_descriptor)
-            .expect("expected descriptor");
-        let existing_target_descriptor = fs::read_to_string(&descriptor_state).ok();
-        fs::write(
-            fake.path().join("descriptor-wrapper.json"),
-            serde_json::json!({
-                "item_value": existing_target_descriptor.as_deref().unwrap_or(expected_descriptor)
-            })
-            .to_string(),
-        )
-        .expect("descriptor wrapper");
-        let source_descriptor = RuntimeDescriptor::from_entries(BTreeMap::from([(
-            "EDGEZERO__STORES__KV__REMOVED__NAME".to_owned(),
-            "kv-old".to_owned(),
-        )]))
-        .expect("source descriptor")
-        .canonical_json()
-        .expect("source descriptor JSON");
-        let existing_source_descriptor = fs::read_to_string(&source_descriptor_state).ok();
-        fs::write(
-            fake.path().join("source-descriptor-wrapper.json"),
-            serde_json::json!({
-                "item_value": existing_source_descriptor.as_deref().unwrap_or(&source_descriptor)
-            })
-            .to_string(),
-        )
-        .expect("source descriptor wrapper");
-        fs::write(
-            fake.path().join("expected-package-path"),
-            expected_package.as_os_str().as_encoded_bytes(),
-        )
-        .expect("expected package path");
-        let fastly = fake.path().join("fastly");
-        fs::write(
-            &fastly,
-            format!(
-r#"#!/bin/sh
-printf '%s\n' "$*" >> '{log}'
-fail_at=''
-[ -f '{fail_at}' ] && fail_at=$(cat '{fail_at}')
-case "$1 $2" in
-  'config-store list') cat '{config}'; exit 0;;
-  'compute hash-files') printf '%s\n' '{package_files_hash}'; exit 0;;
-  'resource-link list')
-    target_links() {{
-      if [ -f '{final_version_read}' ]; then
-        if [ "$fail_at" = 'final-link-revalidation' ]; then cat '{draft_links}'; else cat '{final_links}'; fi
-      elif {{ [ '{delete_required}' = no ] || [ -f '{deleted}' ]; }} && [ -f '{created_kv}' ] && [ -f '{created_secret}' ]; then
-        if [ "$fail_at" = 'reconciled-link-verification' ]; then cat '{draft_links}'; else cat '{final_links}'; fi
-      else
-        [ "$fail_at" = 'inherited-link-lookup' ] && return 60
-        cat '{inherited_links}'
-      fi
-    }}
-    case "$*" in
-      *'--service-id={service_id}'*'--version={source_version}'*)
-        if [ {source_version} = {target_version} ] && [ -f '{draft}' ]; then
-          target_links || exit $?
-        elif [ -f '{final_version_read}' ] && [ "$fail_at" = 'staged-source-link-drift' ]; then
-          cat '{source_links_drifted}'
-        else cat '{source_links}'; fi;;
-      *'--service-id={service_id}'*'--version={target_version}'*)
-        target_links || exit $?;;
-      *) exit 41;;
-    esac
-    exit 0;;
-  'compute update')
-    package=''
-    for arg in "$@"; do case "$arg" in --package=*) package=${{arg#--package=}};; esac; done
-    expected=$(cat '{expected_package_path}')
-    [ "$package" = "$expected" ] || exit 42
-    case "$*" in *'--service-id={service_id}'*) :;; *) exit 55;; esac
-    case '{source_kind}' in
-      active) case "$*" in *'--autoclone'*'--version=active'*) :;; *) exit 46;; esac;;
-      staged)
-        case "$*" in
-          *'--autoclone'*'--version={source_version}'*) :;;
-          *'--autoclone'*'--version=staged'*) [ "$fail_at" = 'staged-pointer-moved' ] && exit 63;;
-          *) exit 62;;
-        esac;;
-      initial) case "$*" in *'--autoclone'*) exit 47;; *'--version={target_version}'*) :;; *) exit 48;; esac;;
-    esac
-    touch '{draft}'
-    if [ "$fail_at" = 'compute-update-no-version' ]; then
-      echo 'provider rejected package upload' >&2
-      echo "credential=$FASTLY_API_TOKEN" >&2
-      exit 59
-    fi
-    if [ "$fail_at" = 'compute-update-active-version' ]; then
-      echo 'Updated package (service {service_id}, version {source_version})'
-      echo 'provider rejected clone after reporting the active source' >&2
-      echo "credential=$FASTLY_API_TOKEN" >&2
-      exit 61
-    fi
-    echo 'Updated package (service {service_id}, version {target_version})'
-    [ "$fail_at" = 'compute-update' ] && exit 49
-    exit 0;;
-  'service-version update')
-    case "$*" in *'--service-id={service_id}'*'--version={target_version}'*'--comment'*) :;; *) exit 56;; esac
-    [ "$fail_at" = 'comment' ] && exit 50
-    touch '{commented}'
-    exit 0;;
-  'resource-link delete')
-    [ "$fail_at" = 'link-delete' ] && exit 51
-    case "$*" in *'--service-id={service_id}'*'--version={target_version}'*'--id={delete_id}'*) touch '{deleted}'; exit 0;; *) exit 43;; esac;;
-  'resource-link create')
-    [ "$fail_at" = 'link-create' ] && exit 52
-    case "$*" in
-      *'--service-id={service_id}'*'--version={target_version}'*'--resource-id=KV_{selection_upper}'*'--name=kv-{selection}'*) touch '{created_kv}'; exit 0;;
-      *'--service-id={service_id}'*'--version={target_version}'*'--resource-id=SECRET_{selection_upper}'*'--name=secret-{selection}'*) touch '{created_secret}'; exit 0;;
-      *) exit 44;;
-    esac;;
-  'config-store-entry create')
-    case "$*" in 'config-store-entry create --store-id=RUNTIME --key={target_descriptor_key} --stdin') :;; *) exit 57;; esac
-    [ "$fail_at" = 'descriptor-create' ] && exit 53
-    cat > '{descriptor_actual}'
-    cmp -s '{descriptor_actual}' '{descriptor_expected}' || exit 45
-    cp '{descriptor_actual}' '{descriptor_state}'
-    exit 0;;
-  'service-version stage')
-    case "$*" in 'service-version stage --service-id={service_id} --version={target_version}') :;; *) exit 58;; esac
-    [ "$fail_at" = 'stage' ] && exit 54
-    touch '{staged}'
-    exit 0;;
-esac
-echo 'unexpected provider command' >&2
-exit 40
-"#,
-                log = operation_log.display(),
-                config = fake.path().join("config.json").display(),
-                source_links = fake.path().join("source-links.json").display(),
-                source_links_drifted = fake.path().join("source-links-drifted.json").display(),
-                draft_links = fake.path().join("draft-links.json").display(),
-                inherited_links = fake
-                    .path()
-                    .join(match spec.source {
-                        ManagedFakeSource::Active => "draft-links.json",
-                        ManagedFakeSource::InitialDraft | ManagedFakeSource::Staged => "source-links.json",
-                    })
-                    .display(),
-                final_links = fake.path().join("final-links.json").display(),
-                deleted = fake.path().join("deleted").display(),
-                created_kv = fake.path().join("created-kv").display(),
-                created_secret = fake.path().join("created-secret").display(),
-                expected_package_path = fake.path().join("expected-package-path").display(),
-                draft = fake.path().join("draft").display(),
-                commented = fake.path().join("commented").display(),
-                descriptor_actual = fake.path().join("descriptor.actual").display(),
-                descriptor_expected = fake.path().join("descriptor.expected").display(),
-                descriptor_state = descriptor_state.display(),
-                staged = fake.path().join("staged").display(),
-                fail_at = fake.path().join("fail-at").display(),
-                final_version_read = fake.path().join("final-version-read").display(),
-                source_version = spec.source_version,
-                target_version = spec.target_version,
-                service_id = spec.service_id,
-                target_descriptor_key = target_descriptor_key,
-                selection = spec.selection,
-                selection_upper = selection_upper,
-                source_kind = match spec.source {
-                    ManagedFakeSource::Active => "active",
-                    ManagedFakeSource::InitialDraft => "initial",
-                    ManagedFakeSource::Staged => "staged",
-                },
-                delete_id = match spec.source {
-                    ManagedFakeSource::Active => "DRAFT_OLD",
-                    ManagedFakeSource::InitialDraft | ManagedFakeSource::Staged => "SRC_OLD",
-                },
-                delete_required = if matches!(spec.source, ManagedFakeSource::Active) {
-                    "yes"
-                } else {
-                    "no"
-                },
-                package_files_hash = TEST_PACKAGE_FILES_HASH,
-            ),
-        )
-        .expect("stateful fastly fake");
-        let mut permissions = fs::metadata(&fastly)
-            .expect("fastly metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fastly, permissions).expect("fastly executable");
-
-        let curl = fake.path().join("curl");
-        fs::write(
-            &curl,
-            format!(
-r#"#!/bin/sh
-config=$(cat)
-fail_at=''
-[ -f '{fail_at}' ] && fail_at=$(cat '{fail_at}')
-printf '%s\n' "$config" | while IFS= read -r line; do case "$line" in url*) printf 'curl %s\n' "$line";; esac; done >> '{log}'
-case "$config" in
-  *'/resources/stores/kv?limit=100'*) cat '{kv}'; printf '\n200';;
-  *'/resources/stores/secret?limit=100'*) cat '{secret}'; printf '\n200';;
-  *'/service/{service_id}/version"'*)
-    if [ -f '{descriptor_state}' ] && [ -f '{draft}' ]; then
-      touch '{final_version_read}'
-      if [ "$fail_at" = 'final-version-revalidation' ]; then printf '[]'
-      elif [ "$fail_at" = 'new-active-before-publication' ]; then cat '{versions_with_new_active}'
-      elif [ "$fail_at" = 'second-staged-before-publication' ]; then cat '{versions_with_second_staged}'
-      else cat '{versions_after}'; fi
-    elif [ -f '{draft}' ]; then cat '{versions_after}'
-    elif [ "$fail_at" = 'staged-source-race' ]; then cat '{versions_raced}'
-    else cat '{versions_before}'; fi
-    printf '\n200';;
-  *'/resources/stores/config/RUNTIME/item/{target_descriptor_key}'*)
-    if [ -f '{descriptor_state}' ]; then
-      if [ ! -f '{descriptor_readback_done}' ]; then
-        touch '{descriptor_readback_done}'
-        if [ "$fail_at" = 'descriptor-readback' ]; then printf '{{"item_value":"different"}}\n200'
-        else cat '{descriptor_wrapper}'; printf '\n200'; fi
-      elif [ "$fail_at" = 'final-descriptor-revalidation' ]; then
-        printf '{{"item_value":"different"}}\n200'
-      else cat '{descriptor_wrapper}'; printf '\n200'; fi
-    else printf '\n404'; fi;;
-  *'/resources/stores/config/RUNTIME/item/{source_descriptor_key}'*)
-    if [ '{source_kind}' = active ] || [ '{source_descriptor_exists}' = yes ]; then cat '{source_descriptor_wrapper}'; printf '\n200'
-    else printf '\n404'; fi;;
-  *'/service/{service_id}/version/{source_version}/domain"'*)
-    if [ "$fail_at" = 'final-protected-state-drift' ] && [ -f '{final_version_read}' ]; then printf '[{{"name":"changed.example.com"}}]\n200'
-    else printf '[{{"name":"example.com"}}]\n200'; fi;;
-  *'/service/{service_id}/version/{source_version}/backend"'*)
-    if [ "$fail_at" = 'final-protected-state-drift' ] && [ -f '{final_version_read}' ]; then printf '[{{"name":"changed-origin","address":"changed.example.com"}}]\n200'
-    else printf '[{{"name":"origin","address":"origin.example.com"}}]\n200'; fi;;
-  *'/service/{service_id}/version/{source_version}/logging/https"'*)
-    if [ "$fail_at" = 'initial-logging-revalidation' ]; then printf '{{"error":"unavailable"}}\n500'
-    elif [ "$fail_at" = 'final-protected-state-drift' ] && [ -f '{final_version_read}' ]; then printf '[{{"name":"changed-logs","placement":"none","url":"https://changed.example.com"}}]\n200'
-    else printf '[{{"name":"logs","placement":"none","url":"https://logs.example.com"}}]\n200'; fi;;
-  *'/service/{service_id}/version/{source_version}/logging/'*)
-    if [ "$fail_at" = 'final-protected-state-drift' ] && [ -f '{final_version_read}' ]; then printf '[{{"name":"changed-logs"}}]\n200'
-    else printf '[]\n200'; fi;;
-  *'/service/{service_id}/version/{source_version}/logging"'*) printf '{{"error":"aggregate logging endpoint does not exist"}}\n404';;
-  *'/service/{service_id}/version/{source_version}/settings"'*)
-    if [ "$fail_at" = 'final-protected-state-drift' ] && [ -f '{final_version_read}' ]; then printf '{{"general.default_host":"changed.example.com"}}\n200'
-    else printf '{{"general.default_host":"origin.example.com"}}\n200'; fi;;
-  *'/service/{service_id}/version/{target_version}/package"'*)
-    if [ "$fail_at" = 'final-package-revalidation' ]; then package_hash='{changed_package_files_hash}'
-    else package_hash='{package_files_hash}'; fi
-    printf '{{"service_id":"{service_id}","version":{target_version},"metadata":{{"files_hash":"%s"}}}}\n200' "$package_hash";;
-  *'/service/{service_id}/version/{target_version}/activate'*) if [ "$fail_at" = 'activate' ]; then printf '500'; else printf 'activate\n' >> '{log}'; touch '{activated}'; printf '200'; fi;;
-  *) printf '{{"error":"unexpected"}}\n500';;
-esac
-"#,
-                kv = fake.path().join("kv.json").display(),
-                secret = fake.path().join("secret.json").display(),
-                draft = fake.path().join("draft").display(),
-                versions_after = fake.path().join("versions-after.json").display(),
-                versions_before = fake.path().join("versions-before.json").display(),
-                versions_raced = fake.path().join("versions-raced.json").display(),
-                versions_with_new_active = fake
-                    .path()
-                    .join("versions-with-new-active.json")
-                    .display(),
-                versions_with_second_staged = fake
-                    .path()
-                    .join("versions-with-second-staged.json")
-                    .display(),
-                descriptor_state = descriptor_state.display(),
-                descriptor_readback_done = fake.path().join("descriptor-readback-done").display(),
-                final_version_read = fake.path().join("final-version-read").display(),
-                descriptor_wrapper = fake.path().join("descriptor-wrapper.json").display(),
-                source_descriptor_wrapper = fake
-                    .path()
-                    .join("source-descriptor-wrapper.json")
-                    .display(),
-                log = operation_log.display(),
-                activated = fake.path().join("activated").display(),
-                fail_at = fake.path().join("fail-at").display(),
-                service_id = spec.service_id,
-                source_version = spec.source_version,
-                target_version = spec.target_version,
-                source_descriptor_key = runtime_descriptor_key(spec.service_id, spec.source_version),
-                target_descriptor_key = target_descriptor_key,
-                source_kind = match spec.source {
-                    ManagedFakeSource::Active => "active",
-                    ManagedFakeSource::InitialDraft => "initial",
-                    ManagedFakeSource::Staged => "staged",
-                },
-                source_descriptor_exists = if existing_source_descriptor.is_some() {
-                    "yes"
-                } else {
-                    "no"
-                },
-                package_files_hash = TEST_PACKAGE_FILES_HASH,
-                changed_package_files_hash = "b".repeat(128),
-            ),
-        )
-        .expect("stateful curl fake");
-        let mut curl_permissions = fs::metadata(&curl).expect("curl metadata").permissions();
-        curl_permissions.set_mode(0o755);
-        fs::set_permissions(&curl, curl_permissions).expect("curl executable");
-        fake
-    }
-
-    #[cfg(unix)]
-    fn managed_plan_context(fixture: &DeployPlanReleaseFixture) -> AdapterDeployContext {
-        AdapterDeployContext {
-            adapter_manifest_path: Some(fixture.adapter_manifest.clone()),
-            application_manifest_path: Some(fixture.application_manifest.clone()),
-            application_release_root: Some(fixture.root.path().to_path_buf()),
-            service_id: Some("SVC1".to_owned()),
-            staging: true,
-            stores: DeployStoreIds {
-                config: vec!["app".to_owned()],
-                kv: vec!["cache".to_owned()],
-                secrets: vec!["credentials".to_owned()],
-            },
-            variable_defaults: BTreeMap::from([
-                (
-                    "EDGEZERO__STORES__CONFIG__APP__NAME".to_owned(),
-                    "config-a".to_owned(),
-                ),
-                (
-                    "EDGEZERO__STORES__CONFIG__APP__KEY".to_owned(),
-                    "publisher-a".to_owned(),
-                ),
-                (
-                    "EDGEZERO__STORES__KV__CACHE__NAME".to_owned(),
-                    "kv-a".to_owned(),
-                ),
-                (
-                    "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME".to_owned(),
-                    "secret-a".to_owned(),
-                ),
-            ]),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_prepares_descriptor_and_links_before_production_activation() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        context.staging = false;
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log_directory = tempdir().expect("operation log directory");
-        let log = log_directory.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::active("SVC1", 7, 8),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        FastlyCliAdapter
-            .deploy(
-                &context,
-                &owned(&["--comment=publisher release", "--quiet"]),
-            )
-            .expect("managed production deploy");
-
-        let operations = fs::read_to_string(&log).expect("operation log");
-        let update = operations.find("compute update").expect("package update");
-        let delete = operations
-            .find("resource-link delete")
-            .expect("stale link deletion");
-        let create = operations
-            .find("resource-link create")
-            .expect("desired link creation");
-        let descriptor_create = operations
-            .find("config-store-entry create")
-            .expect("create-only descriptor");
-        let activate = operations.find("activate").expect("activation");
-        assert!(update < delete && delete < create && create < descriptor_create);
-        assert!(descriptor_create < activate, "{operations}");
-        assert!(operations.contains("--autoclone"), "{operations}");
-        assert!(operations.contains("--version=active"), "{operations}");
-        assert!(operations.contains("--id=DRAFT_OLD"), "{operations}");
-        assert!(!operations.contains("compute build"), "{operations}");
-        assert!(!operations.contains("compute deploy"), "{operations}");
-        assert!(!operations.contains("--upsert"), "{operations}");
-        assert!(fake.path().join("activated").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_stages_the_prepared_draft_without_activation() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let context = managed_plan_context(&fixture);
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log_directory = tempdir().expect("operation log directory");
-        let log = log_directory.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::active("SVC1", 7, 8),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        FastlyCliAdapter
-            .deploy(&context, &[])
-            .expect("managed staging deploy");
-
-        let operations = fs::read_to_string(&log).expect("operation log");
-        let descriptor_create = operations
-            .find("config-store-entry create")
-            .expect("descriptor create");
-        let stage = operations
-            .find("service-version stage")
-            .expect("staging publish");
-        assert!(descriptor_create < stage, "{operations}");
-        assert!(fake.path().join("staged").exists());
-        assert!(!fake.path().join("activated").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_first_release_reuses_initialized_draft_without_autoclone() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        context.staging = false;
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log_directory = tempdir().expect("operation log directory");
-        let log = log_directory.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::initial("SVC1", 3),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        FastlyCliAdapter
-            .deploy(&context, &[])
-            .expect("managed first release");
-
-        let operations = fs::read_to_string(&log).expect("operation log");
-        let update = operations
-            .lines()
-            .find(|line| line.starts_with("compute update"))
-            .expect("package update");
-        assert!(update.contains("--version=3"), "{update}");
-        assert!(!update.contains("--autoclone"), "{update}");
-        assert_eq!(
-            operations
-                .lines()
-                .filter(|line| line.starts_with("compute update"))
-                .count(),
-            1,
-            "the initialized draft is reused exactly once: {operations}"
-        );
-        assert_eq!(
-            operations.matches("/version/3/logging/https").count(),
-            3,
-            "the nonempty logging collection must survive preflight, pre-update, and final revalidation: {operations}"
-        );
-        assert!(
-            !operations.lines().any(|line| line.ends_with("/logging\"")),
-            "the nonexistent aggregate logging endpoint must never be used: {operations}"
-        );
-        assert!(fake.path().join("activated").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_staging_first_service_reuses_staged_source_for_later_targets() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let operation_log_directory = tempdir().expect("operation log directory");
-        let operation_log = operation_log_directory.path().join("staging-sequence.log");
-        let runtime_store = tempdir().expect("shared physical RUNTIME store");
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let package = fixture
-            .root
-            .path()
-            .join("package/app.tar.gz")
-            .canonicalize()
-            .expect("canonical package");
-
-        for (spec, staging) in [
-            (ManagedFakeSpec::initial("SVC1", 3), true),
-            (ManagedFakeSpec::staged("SVC1", 3, 4), true),
-            (ManagedFakeSpec::staged("SVC1", 4, 5), false),
-        ] {
-            context.staging = staging;
-            let fake = fake_stateful_managed_provider_with_runtime_store(
-                spec,
-                &descriptor,
-                &package,
-                &operation_log,
-                runtime_store.path(),
-            );
-            let _path = PathPrepend::new(fake.path());
-            deploy_managed_with_context(&context, &[]).expect("managed sequence step");
-        }
-
-        let log = fs::read_to_string(&operation_log).expect("sequence command log");
-        assert!(
-            log.contains("compute update --service-id=SVC1 --version=3 --package="),
-            "{log}"
-        );
-        assert!(
-            log.contains("compute update --service-id=SVC1 --autoclone --version=3 --package=")
-                && log.contains(
-                    "compute update --service-id=SVC1 --autoclone --version=4 --package="
-                ),
-            "{log}"
-        );
-        assert!(!log.contains("--version=staged"), "{log}");
-        assert!(
-            log.contains("service-version stage --service-id=SVC1 --version=3")
-                && log.contains("service-version stage --service-id=SVC1 --version=4")
-                && log.contains("/service/SVC1/version/5/activate"),
-            "{log}"
-        );
-        for version in [3_u64, 4, 5] {
-            assert_eq!(
-                fs::read_to_string(
-                    runtime_store
-                        .path()
-                        .join(runtime_descriptor_key("SVC1", version))
-                )
-                .expect("version descriptor"),
-                descriptor
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_staged_clone_pins_numeric_source_across_pointer_race() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let context = managed_plan_context(&fixture);
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log_directory = tempdir().expect("log directory");
-        let log = log_directory.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::staged("SVC1", 3, 4),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let plan = build_managed_deploy_plan(&context, &[]).expect("read-only staged plan");
-        fs::write(fake.path().join("fail-at"), "staged-pointer-moved")
-            .expect("staging pointer race marker");
-        fs::write(&log, "").expect("clear preflight log");
-
-        execute_managed_deploy_plan(&plan)
-            .expect("numeric source remains pinned when the symbolic staging pointer moves");
-
-        let operations = fs::read_to_string(&log).expect("operation log");
-        assert!(
-            operations
-                .contains("compute update --service-id=SVC1 --autoclone --version=3 --package="),
-            "{operations}"
-        );
-        assert!(!operations.contains("--version=staged"), "{operations}");
-        assert!(fake.path().join("staged").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_revalidates_exact_staged_source_before_clone() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let context = managed_plan_context(&fixture);
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log_directory = tempdir().expect("log directory");
-        let log = log_directory.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::staged("SVC1", 3, 4),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let plan = build_managed_deploy_plan(&context, &[]).expect("read-only staged plan");
-        fs::write(fake.path().join("fail-at"), "staged-source-race")
-            .expect("stage source race marker");
-        fs::write(&log, "").expect("clear preflight log");
-
-        let error = execute_managed_deploy_plan(&plan)
-            .expect_err("staged source state change must fail before clone");
-        assert!(
-            error.contains("staged source") || error.contains("active version"),
-            "{error}"
-        );
-        let operations = fs::read_to_string(&log).expect("operation log");
-        assert!(!operations.contains("compute update"), "{operations}");
-        assert!(
-            !operations.contains("service-version stage"),
-            "{operations}"
-        );
-        assert!(!operations.contains("activate"), "{operations}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_no_active_sources_reject_intervening_active_before_publication() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log_directory = tempdir().expect("log directory");
-        let package = fixture
-            .root
-            .path()
-            .join("package/app.tar.gz")
-            .canonicalize()
-            .expect("canonical package");
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        for (index, (spec, staging)) in [
-            (ManagedFakeSpec::initial("SVC1", 3), false),
-            (ManagedFakeSpec::staged("SVC1", 3, 4), true),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            context.staging = staging;
-            let log = log_directory.path().join(format!("operations-{index}.log"));
-            let fake = fake_stateful_managed_provider(spec, &descriptor, &package, &log);
-            let _path = PathPrepend::new(fake.path());
-            let plan = build_managed_deploy_plan(&context, &[]).expect("read-only plan");
-            fs::write(fake.path().join("fail-at"), "new-active-before-publication")
-                .expect("intervening active marker");
-            fs::write(&log, "").expect("clear preflight log");
-
-            let error = execute_managed_deploy_plan(&plan)
-                .expect_err("no-active source must reject an intervening active version");
-            assert!(error.contains("active version"), "{error}");
-            let operations = fs::read_to_string(&log).expect("operation log");
+            .expect_err("present invalid selector must fail");
             assert!(
-                operations.contains("config-store-entry create"),
-                "race must occur after descriptor/link preparation: {operations}"
-            );
-            assert!(
-                !operations.contains("service-version stage"),
-                "{operations}"
-            );
-            assert!(!operations.contains("/activate"), "{operations}");
-            assert!(!fake.path().join("staged").exists());
-            assert!(!fake.path().join("activated").exists());
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_final_staged_source_barrier_rejects_second_staged_or_link_drift() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log_directory = tempdir().expect("log directory");
-        let package = fixture
-            .root
-            .path()
-            .join("package/app.tar.gz")
-            .canonicalize()
-            .expect("canonical package");
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        for (index, (fail_at, staging)) in [
-            ("second-staged-before-publication", false),
-            ("staged-source-link-drift", true),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            context.staging = staging;
-            let log = log_directory.path().join(format!("operations-{index}.log"));
-            let fake = fake_stateful_managed_provider(
-                ManagedFakeSpec::staged("SVC1", 3, 4),
-                &descriptor,
-                &package,
-                &log,
-            );
-            let _path = PathPrepend::new(fake.path());
-            let plan = build_managed_deploy_plan(&context, &[]).expect("read-only staged plan");
-            fs::write(fake.path().join("fail-at"), fail_at).expect("final race marker");
-            fs::write(&log, "").expect("clear preflight log");
-
-            let error = execute_managed_deploy_plan(&plan)
-                .expect_err("final staged source race must block publication");
-            assert!(
-                error.contains("staged source") || error.contains("links"),
+                error.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"),
                 "{error}"
             );
-            let operations = fs::read_to_string(&log).expect("operation log");
-            assert!(
-                operations.contains("config-store-entry create"),
-                "race must occur after descriptor/link preparation: {operations}"
-            );
-            assert!(
-                !operations.contains("service-version stage"),
-                "{operations}"
-            );
-            assert!(!operations.contains("/activate"), "{operations}");
-            assert!(!fake.path().join("staged").exists());
-            assert!(!fake.path().join("activated").exists());
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the stateful regression proves one failed deployment and two distinct zero-mutation retries"
-    )]
-    fn managed_deploy_initial_draft_retry_rejects_descriptor_or_managed_alias_residue_without_mutation()
-     {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let context_a = managed_plan_context(&fixture);
-        let descriptor_for = |context: &AdapterDeployContext| {
-            RuntimeDescriptor::from_environment(
-                &EnvConfig::from_vars(context.variable_defaults.iter()),
-                &context.stores.config,
-                &context.stores.kv,
-                &context.stores.secrets,
-                context.staging,
-            )
-            .expect("descriptor")
-            .canonical_json()
-            .expect("descriptor JSON")
-        };
-        let descriptor_a = descriptor_for(&context_a);
-        let mut context_b = context_a.clone();
-        for (key, value) in [
-            ("EDGEZERO__STORES__CONFIG__APP__NAME", "config-b"),
-            ("EDGEZERO__STORES__KV__CACHE__NAME", "kv-b"),
-            ("EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME", "secret-b"),
-        ] {
-            context_b
-                .variable_defaults
-                .insert(key.to_owned(), value.to_owned());
-        }
-        let descriptor_b = descriptor_for(&context_b);
-        let runtime_store = tempdir().expect("shared RUNTIME store");
-        let log_directory = tempdir().expect("log directory");
-        let package = fixture
-            .root
-            .path()
-            .join("package/app.tar.gz")
-            .canonicalize()
-            .expect("canonical package");
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        let first_log = log_directory.path().join("first.log");
-        let first = fake_stateful_managed_provider_with_runtime_store(
-            ManagedFakeSpec::initial("SVC1", 3),
-            &descriptor_a,
-            &package,
-            &first_log,
-            runtime_store.path(),
-        );
-        fs::write(first.path().join("fail-at"), "stage").expect("stage failure marker");
-        let _first_error = {
-            let _path = PathPrepend::new(first.path());
-            let plan = build_managed_deploy_plan(&context_a, &[]).expect("initial A plan");
-            execute_managed_deploy_plan(&plan).expect_err("publication A fails after preparation")
-        };
-        let descriptor_key = runtime_descriptor_key("SVC1", 3);
-        let descriptor_state = runtime_store.path().join(&descriptor_key);
-        assert_eq!(
-            fs::read_to_string(&descriptor_state).expect("persisted A descriptor"),
-            descriptor_a
-        );
-
-        let complete_links = |selection: &str| {
-            let upper = selection.to_ascii_uppercase();
-            format!(
-                r#"[{{"id":"SRC_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"}},{{"id":"SRC_CONFIG","name":"config-{selection}","resource_id":"CONFIG_{upper}"}},{{"id":"SRC_KV","name":"kv-{selection}","resource_id":"KV_{upper}"}},{{"id":"SRC_SECRET","name":"secret-{selection}","resource_id":"SECRET_{upper}"}},{{"id":"SRC_OTHER","name":"backend-resource","resource_id":"NOT_A_STORE"}}]"#
-            )
-        };
-        let mutation_markers = [
-            "compute update",
-            "service-version update",
-            "resource-link delete",
-            "resource-link create",
-            "config-store-entry create",
-            "service-version stage",
-            "/activate",
+    fn deploy_plan_replaces_declared_identity_and_preserves_undeclared_links() {
+        let desired = vec![desired_link(
+            ResourceKind::Config,
+            "app_config",
+            "config-b",
+            "CONFIG_B",
+        )];
+        let existing = vec![
+            existing_link(ResourceKind::Config, "app_config", "CONFIG_A", "OLD_CONFIG"),
+            existing_link(ResourceKind::Kv, "sessions", "KV_A", "KEEP_KV"),
         ];
 
-        let b_log = log_directory.path().join("b.log");
-        let attempt_b = fake_stateful_managed_provider_with_runtime_store(
-            ManagedFakeSpec::initial("SVC1", 3).with_selection("b"),
-            &descriptor_b,
-            &package,
-            &b_log,
-            runtime_store.path(),
-        );
-        fs::write(
-            attempt_b.path().join("source-links.json"),
-            complete_links("a"),
-        )
-        .expect("persisted A links");
-        let b_error = {
-            let _path = PathPrepend::new(attempt_b.path());
-            build_managed_deploy_plan(&context_b, &[])
-                .expect_err("descriptor B must not replace immutable descriptor A")
-        };
-        assert!(b_error.contains("different immutable bytes"), "{b_error}");
-        let b_operations = fs::read_to_string(&b_log).expect("B operation log");
-        assert!(
-            mutation_markers
-                .iter()
-                .all(|marker| !b_operations.contains(marker)),
-            "{b_operations}"
-        );
-        assert_eq!(
-            fs::read_to_string(&descriptor_state).expect("preserved A descriptor"),
-            descriptor_a
-        );
-        assert!(
-            fs::read_to_string(attempt_b.path().join("source-links.json"))
-                .expect("preserved A links")
-                .contains("secret-a")
-        );
+        let plan = plan_link_reconciliation(&desired, &existing, &deploy_plan_inventories())
+            .expect("reconciliation");
+        assert_eq!(plan.delete_link_ids, vec!["OLD_CONFIG"]);
+        assert_eq!(plan.create, desired);
+    }
 
-        let retry_log = log_directory.path().join("retry.log");
-        let retry_a = fake_stateful_managed_provider_with_runtime_store(
-            ManagedFakeSpec::initial("SVC1", 3),
-            &descriptor_a,
-            &package,
-            &retry_log,
-            runtime_store.path(),
-        );
-        fs::write(
-            retry_a.path().join("source-links.json"),
-            complete_links("b"),
-        )
-        .expect("conflicting B link residue");
-        let retry_error = {
-            let _path = PathPrepend::new(retry_a.path());
-            build_managed_deploy_plan(&context_a, &[])
-                .expect_err("retry A cannot publish with managed B aliases")
-        };
-        assert!(
-            retry_error.contains("managed resource-link alias"),
-            "{retry_error}"
-        );
-        let retry_operations = fs::read_to_string(&retry_log).expect("retry operation log");
-        assert!(
-            mutation_markers
-                .iter()
-                .all(|marker| !retry_operations.contains(marker)),
-            "{retry_operations}"
-        );
-        assert!(
-            fs::read_to_string(retry_a.path().join("source-links.json"))
-                .expect("B residue remains for operator recovery")
-                .contains("backend-resource"),
-            "unrelated links must remain untouched"
-        );
+    #[test]
+    fn deploy_plan_keeps_same_alias_isolated_by_resource_kind() {
+        let desired = vec![
+            desired_link(ResourceKind::Config, "shared", "config-a", "CONFIG_A"),
+            desired_link(ResourceKind::Kv, "shared", "kv-b", "KV_B"),
+        ];
+        let existing = vec![
+            existing_link(ResourceKind::Config, "shared", "CONFIG_A", "CONFIG_LINK"),
+            existing_link(ResourceKind::Kv, "shared", "KV_A", "KV_LINK"),
+        ];
+
+        let plan = plan_link_reconciliation(&desired, &existing, &deploy_plan_inventories())
+            .expect("kind-isolated reconciliation");
+        assert_eq!(plan.delete_link_ids, vec!["KV_LINK"]);
         assert_eq!(
-            fs::read_to_string(&descriptor_state).expect("preserved A descriptor"),
-            descriptor_a
+            plan.create,
+            vec![desired_link(ResourceKind::Kv, "shared", "kv-b", "KV_B")]
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    #[expect(
-        clippy::cognitive_complexity,
-        clippy::too_many_lines,
-        reason = "the two-service integration proof checks immutable release identity and service-scoped provider mutations together"
-    )]
-    fn managed_deploy_same_release_keeps_artifacts_fixed_across_runtime_configurations() {
-        #[derive(Debug, PartialEq, Eq)]
-        struct ArtifactEvidence {
-            bytes: Vec<u8>,
-            recorded_sha256: String,
-        }
-
-        struct ExecutionEvidence {
-            adapter_manifest: PathBuf,
-            application_manifest: PathBuf,
-            artifacts: BTreeMap<&'static str, ArtifactEvidence>,
-            descriptor: String,
-            descriptor_key: String,
-            digest_line: String,
-            operations: String,
-            package: PathBuf,
-            package_bytes: Vec<u8>,
-        }
-
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let expected_package = fixture
-            .root
-            .path()
-            .join("package/app.tar.gz")
-            .canonicalize()
-            .expect("canonical package");
-        let log_directory = tempdir().expect("operation log directory");
-        let shared_runtime_store = tempdir().expect("shared physical runtime store");
-        let runtime_store = shared_runtime_store.path().join("RUNTIME");
-        fs::create_dir_all(&runtime_store).expect("shared RUNTIME store");
-        let mut executions = BTreeMap::new();
-
-        for (service_id, source_version, target_version, selection, publisher, staging) in [
-            ("SVC1", 7_u64, 8_u64, "a", "publisher-a", false),
-            ("SVC2", 11_u64, 12_u64, "b", "publisher-b", true),
-        ] {
-            let mut context = managed_plan_context(&fixture);
-            context.service_id = Some(service_id.to_owned());
-            context.staging = staging;
-            context.variable_defaults.extend([
-                (
-                    "EDGEZERO__STORES__CONFIG__APP__NAME".to_owned(),
-                    format!("config-{selection}"),
-                ),
-                (
-                    "EDGEZERO__STORES__CONFIG__APP__KEY".to_owned(),
-                    publisher.to_owned(),
-                ),
-                (
-                    "EDGEZERO__STORES__KV__CACHE__NAME".to_owned(),
-                    format!("kv-{selection}"),
-                ),
-                (
-                    "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME".to_owned(),
-                    format!("secret-{selection}"),
-                ),
-            ]);
-            let descriptor = RuntimeDescriptor::from_environment(
-                &EnvConfig::from_vars(context.variable_defaults.iter()),
-                &context.stores.config,
-                &context.stores.kv,
-                &context.stores.secrets,
-                context.staging,
-            )
-            .expect("descriptor")
-            .canonical_json()
-            .expect("descriptor JSON");
-            let log = log_directory
-                .path()
-                .join(format!("operations-{service_id}.log"));
-            let fake = fake_stateful_managed_provider_with_runtime_store(
-                ManagedFakeSpec::active(service_id, source_version, target_version)
-                    .with_selection(selection),
-                &descriptor,
-                &expected_package,
-                &log,
-                &runtime_store,
-            );
-            let _path = PathPrepend::new(fake.path());
-            let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-            let plan = build_managed_deploy_plan(
-                &context,
-                &owned(&["--comment=shared release", "--quiet"]),
-            )
-            .expect("service-specific read-only plan");
-            assert_eq!(plan.runtime_store_id, "RUNTIME");
-            assert_eq!(plan.release.package(), expected_package);
-            assert_eq!(plan.package_sha256, fixture.package_digest);
-            fs::write(&log, "").expect("clear preflight log");
-            let mut emitted = Vec::new();
-
-            execute_managed_deploy_plan_with_emit(&plan, &mut |line| {
-                emitted.push(line.to_owned());
-            })
-            .expect("managed deployment");
-
-            let descriptor_key = runtime_descriptor_key(service_id, target_version);
-            assert!(
-                if staging {
-                    fake.path().join("staged").exists() && !fake.path().join("activated").exists()
-                } else {
-                    fake.path().join("activated").exists() && !fake.path().join("staged").exists()
-                },
-                "deployment must use the selected production/staging publication path"
-            );
-            let operations = fs::read_to_string(&log).expect("operation log");
-            assert!(
-                operations.contains(&format!("--service-id={service_id}")),
-                "{operations}"
-            );
-            assert!(
-                operations.contains(&format!("--version={target_version}")),
-                "{operations}"
-            );
-            assert!(
-                operations.contains(&format!("--package={}", expected_package.display())),
-                "{operations}"
-            );
-            assert!(
-                operations.contains(&format!(
-                    "config-store-entry create --store-id=RUNTIME --key={descriptor_key} --stdin"
-                )),
-                "{operations}"
-            );
-            if staging {
-                assert!(
-                    operations.contains(&format!(
-                        "service-version stage --service-id={service_id} --version={target_version}"
-                    )),
-                    "{operations}"
-                );
-                assert!(!operations.contains("/activate"), "{operations}");
-            } else {
-                assert!(
-                    operations.contains(&format!(
-                        "/service/{service_id}/version/{target_version}/activate"
-                    )),
-                    "{operations}"
-                );
-                assert!(
-                    !operations.contains("service-version stage"),
-                    "{operations}"
-                );
-            }
-            assert!(
-                operations.contains(&format!("--resource-id=KV_{}", selection.to_uppercase())),
-                "{operations}"
-            );
-            assert!(
-                operations.contains(&format!(
-                    "--resource-id=SECRET_{}",
-                    selection.to_uppercase()
-                )),
-                "{operations}"
-            );
-            assert!(!operations.contains("compute build"), "{operations}");
-            let digest_line = format!("package-sha256={}", fixture.package_digest);
-            assert!(emitted.contains(&digest_line), "{emitted:?}");
-            assert!(
-                emitted.contains(&format!("version={target_version}")),
-                "{emitted:?}"
-            );
-            let metadata: serde_json::Value = serde_json::from_slice(
-                &fs::read(fixture.root.path().join("release.json"))
-                    .expect("release metadata bytes"),
-            )
-            .expect("release metadata JSON");
-            let artifacts = [
-                ("app_cli", plan.release.application_cli(), "/app_cli/sha256"),
-                ("package", plan.release.package(), "/package/sha256"),
-                (
-                    "edgezero.toml",
-                    plan.release.application_manifest(),
-                    "/manifests/edgezero/sha256",
-                ),
-                (
-                    "fastly.toml",
-                    plan.release.adapter_manifest(),
-                    "/manifests/adapter/sha256",
-                ),
-            ]
-            .into_iter()
-            .map(|(label, path, digest_pointer)| {
-                let bytes = fs::read(path).expect("verified release member bytes");
-                let recorded_sha256 = metadata
-                    .pointer(digest_pointer)
-                    .and_then(serde_json::Value::as_str)
-                    .expect("recorded release member digest")
-                    .to_owned();
-                assert_eq!(sha256_hex(&bytes), recorded_sha256, "{label}");
-                (
-                    label,
-                    ArtifactEvidence {
-                        bytes,
-                        recorded_sha256,
-                    },
-                )
-            })
-            .collect();
-            executions.insert(
-                service_id.to_owned(),
-                ExecutionEvidence {
-                    adapter_manifest: plan.release.adapter_manifest().to_path_buf(),
-                    application_manifest: plan.release.application_manifest().to_path_buf(),
-                    artifacts,
-                    descriptor: fs::read_to_string(fake.path().join("descriptor.actual"))
-                        .expect("written descriptor"),
-                    descriptor_key,
-                    digest_line,
-                    operations,
-                    package: plan.release.package().to_path_buf(),
-                    package_bytes: fs::read(plan.release.package()).expect("package bytes"),
-                },
-            );
-        }
-
-        let svc1 = &executions["SVC1"];
-        let svc2 = &executions["SVC2"];
-        assert_eq!(svc1.package, svc2.package);
-        assert_eq!(svc1.package_bytes, svc2.package_bytes);
-        assert_eq!(svc1.package_bytes, b"immutable package");
-        assert_eq!(svc1.digest_line, svc2.digest_line);
-        assert_eq!(svc1.application_manifest, svc2.application_manifest);
-        assert_eq!(svc1.adapter_manifest, svc2.adapter_manifest);
-        assert_eq!(svc1.artifacts, svc2.artifacts);
-        for label in ["app_cli", "package", "edgezero.toml", "fastly.toml"] {
-            assert_eq!(
-                sha256_hex(&svc1.artifacts[label].bytes),
-                svc1.artifacts[label].recorded_sha256,
-                "{label} bytes must match the immutable release digest"
-            );
-        }
-        assert_ne!(svc1.descriptor_key, svc2.descriptor_key);
-        assert_ne!(svc1.descriptor, svc2.descriptor);
-        assert!(svc1.descriptor.contains("publisher-a"));
-        assert!(svc2.descriptor.contains("publisher-b"));
-        assert!(!svc1.operations.contains(&svc2.descriptor_key));
-        assert!(!svc2.operations.contains(&svc1.descriptor_key));
-        assert_eq!(
-            fs::read(runtime_store.join(&svc1.descriptor_key))
-                .expect("SVC1 descriptor in shared RUNTIME store"),
-            svc1.descriptor.as_bytes()
-        );
-        assert_eq!(
-            fs::read(runtime_store.join(&svc2.descriptor_key))
-                .expect("SVC2 descriptor in shared RUNTIME store"),
-            svc2.descriptor.as_bytes()
-        );
-        assert_eq!(
-            fs::read_dir(&runtime_store)
-                .expect("shared RUNTIME store listing")
-                .count(),
-            2,
-            "one physical RUNTIME store must retain both version-scoped descriptors"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_accepts_identical_descriptor_retry_without_rewriting_it() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        context.staging = false;
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log = fixture.root.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::active("SVC1", 7, 8),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        fs::write(
-            fake.path()
-                .join(format!("descriptor-{}", runtime_descriptor_key("SVC1", 8))),
-            &descriptor,
-        )
-        .expect("existing descriptor");
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        FastlyCliAdapter
-            .deploy(&context, &[])
-            .expect("identical descriptor retry");
-
-        let operations = fs::read_to_string(&log).expect("operation log");
-        assert!(
-            !operations.contains("config-store-entry create"),
-            "{operations}"
-        );
-        assert!(fake.path().join("activated").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_rejects_different_existing_or_readback_descriptor_before_publish() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        for case in ["existing", "descriptor-readback"] {
-            let fixture = deploy_plan_release_fixture();
-            let mut context = managed_plan_context(&fixture);
-            context.staging = false;
-            let descriptor = RuntimeDescriptor::from_environment(
-                &EnvConfig::from_vars(context.variable_defaults.iter()),
-                &context.stores.config,
-                &context.stores.kv,
-                &context.stores.secrets,
-                context.staging,
-            )
-            .expect("descriptor")
-            .canonical_json()
-            .expect("descriptor JSON");
-            let log = fixture.root.path().join("operations.log");
-            let fake = fake_stateful_managed_provider(
-                ManagedFakeSpec::active("SVC1", 7, 8),
-                &descriptor,
-                &fixture
-                    .root
-                    .path()
-                    .join("package/app.tar.gz")
-                    .canonicalize()
-                    .expect("canonical package"),
-                &log,
-            );
-            if case == "existing" {
-                fs::write(
-                    fake.path().join("descriptor-wrapper.json"),
-                    r#"{"item_value":"different"}"#,
-                )
-                .expect("different descriptor");
-                fs::write(
-                    fake.path()
-                        .join(format!("descriptor-{}", runtime_descriptor_key("SVC1", 8))),
-                    "different",
-                )
-                .expect("existing descriptor marker");
-            } else {
-                fs::write(fake.path().join("fail-at"), case).expect("failure marker");
-            }
-            let _path = PathPrepend::new(fake.path());
-            let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-            let error = FastlyCliAdapter
-                .deploy(&context, &[])
-                .expect_err("different descriptor bytes must fail closed");
-
-            assert!(error.contains("descriptor"), "{case}: {error}");
-            assert!(!fake.path().join("activated").exists(), "{case}");
-            let operations = fs::read_to_string(&log).expect("operation log");
-            assert!(!operations.contains("activate"), "{case}: {operations}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_revalidates_initial_draft_before_upload() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        context.staging = false;
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log = fixture.root.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::initial("SVC1", 3),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let plan = build_managed_deploy_plan(&context, &[]).expect("read-only plan");
-        fs::write(&log, "").expect("clear preflight log");
-        fs::write(
-            fake.path().join("versions-before.json"),
-            r#"[{"number":3,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[],"comment":"initialized through Fastly UI"}]"#,
-        )
-        .expect("changed initial draft");
-
-        let error = execute_managed_deploy_plan(&plan)
-            .expect_err("changed initial draft must fail before upload");
-
-        assert!(
-            error.contains("first deployment") || error.contains("initial draft"),
-            "{error}"
-        );
-        let operations = fs::read_to_string(&log).expect("operation log");
-        assert!(!operations.contains("compute update"), "{operations}");
-        assert!(!fake.path().join("activated").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_fails_closed_when_any_initial_logging_collection_is_unavailable() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let mut context = managed_plan_context(&fixture);
-        context.staging = false;
-        let descriptor = RuntimeDescriptor::from_environment(
-            &EnvConfig::from_vars(context.variable_defaults.iter()),
-            &context.stores.config,
-            &context.stores.kv,
-            &context.stores.secrets,
-            context.staging,
-        )
-        .expect("descriptor")
-        .canonical_json()
-        .expect("descriptor JSON");
-        let log = fixture.root.path().join("operations.log");
-        let fake = fake_stateful_managed_provider(
-            ManagedFakeSpec::initial("SVC1", 3),
-            &descriptor,
-            &fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package"),
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let plan = build_managed_deploy_plan(&context, &[]).expect("read-only plan");
-        fs::write(&log, "").expect("clear preflight log");
-        fs::write(fake.path().join("fail-at"), "initial-logging-revalidation")
-            .expect("failure marker");
-
-        let error = execute_managed_deploy_plan(&plan)
-            .expect_err("an unavailable logging collection must fail closed");
-
-        assert!(error.contains("logging/https"), "{error}");
-        let operations = fs::read_to_string(&log).expect("operation log");
-        assert!(!operations.contains("compute update"), "{operations}");
-        assert!(!fake.path().join("activated").exists());
-        assert!(!fake.path().join("staged").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_deploy_initial_draft_final_protected_state_drift_withholds_publication() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        for staging in [false, true] {
-            let fixture = deploy_plan_release_fixture();
-            let mut context = managed_plan_context(&fixture);
-            context.staging = staging;
-            let descriptor = RuntimeDescriptor::from_environment(
-                &EnvConfig::from_vars(context.variable_defaults.iter()),
-                &context.stores.config,
-                &context.stores.kv,
-                &context.stores.secrets,
-                context.staging,
-            )
-            .expect("descriptor")
-            .canonical_json()
-            .expect("descriptor JSON");
-            let log = fixture.root.path().join("operations.log");
-            let fake = fake_stateful_managed_provider(
-                ManagedFakeSpec::initial("SVC1", 3),
-                &descriptor,
-                &fixture
-                    .root
-                    .path()
-                    .join("package/app.tar.gz")
-                    .canonicalize()
-                    .expect("canonical package"),
-                &log,
-            );
-            let _path = PathPrepend::new(fake.path());
-            let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-            let plan = build_managed_deploy_plan(&context, &[]).expect("read-only plan");
-            fs::write(&log, "").expect("clear preflight log");
-            fs::write(fake.path().join("fail-at"), "final-protected-state-drift")
-                .expect("failure marker");
-
-            let error = execute_managed_deploy_plan(&plan)
-                .expect_err("protected initial-draft drift must block publication");
-
-            assert!(error.contains("protected configuration"), "{error}");
-            for mutation in [
-                "draft",
-                "created-kv",
-                "created-secret",
-                "descriptor-readback-done",
-                "final-version-read",
-            ] {
-                assert!(
-                    fake.path().join(mutation).exists(),
-                    "{mutation} must precede the final protected-state barrier"
-                );
-            }
-            assert!(
-                !fake.path().join("deleted").exists(),
-                "a first managed deployment must not infer a stale link to delete"
-            );
-            assert_eq!(
-                fs::read(
-                    fake.path()
-                        .join(format!("descriptor-{}", runtime_descriptor_key("SVC1", 3)))
-                )
-                .expect("created immutable descriptor"),
-                descriptor.as_bytes()
-            );
-            assert!(!fake.path().join("activated").exists());
-            assert!(!fake.path().join("staged").exists());
-            let operations = fs::read_to_string(&log).expect("operation log");
-            for endpoint in ["domain", "backend", "logging/https", "settings"] {
-                assert_eq!(
-                    operations
-                        .matches(&format!("/version/3/{endpoint}"))
-                        .count(),
-                    2,
-                    "{endpoint} must be checked before upload and at the final barrier: {operations}"
-                );
-            }
-            assert!(
-                !operations.contains("service-version stage"),
-                "{operations}"
-            );
-            assert!(!operations.contains("/activate"), "{operations}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the failure-order matrix keeps each injected provider failure and its forbidden subsequent mutations reviewable together"
-    )]
-    fn managed_deploy_failure_order_never_publishes_and_retains_early_version_output() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        for (failure, staging, expected_version, expected_status) in [
-            ("compute-update-no-version", false, None, Some("59")),
-            ("compute-update-active-version", false, None, Some("61")),
-            ("compute-update", false, Some(8_u64), None),
-            ("comment", false, Some(8_u64), None),
-            ("inherited-link-lookup", false, Some(8_u64), None),
-            ("link-delete", false, Some(8_u64), None),
-            ("link-create", false, Some(8_u64), None),
-            ("reconciled-link-verification", false, Some(8_u64), None),
-            ("descriptor-create", false, Some(8_u64), None),
-            ("descriptor-readback", false, Some(8_u64), None),
-            ("final-version-revalidation", false, Some(8_u64), None),
-            ("final-link-revalidation", false, Some(8_u64), None),
-            ("final-descriptor-revalidation", false, Some(8_u64), None),
-            ("final-package-revalidation", false, Some(8_u64), None),
-            ("activate", false, Some(8_u64), None),
-            ("stage", true, Some(8_u64), None),
-        ] {
-            let fixture = deploy_plan_release_fixture();
-            let mut context = managed_plan_context(&fixture);
-            context.staging = staging;
-            let descriptor = RuntimeDescriptor::from_environment(
-                &EnvConfig::from_vars(context.variable_defaults.iter()),
-                &context.stores.config,
-                &context.stores.kv,
-                &context.stores.secrets,
-                context.staging,
-            )
-            .expect("descriptor")
-            .canonical_json()
-            .expect("descriptor JSON");
-            let log = fixture.root.path().join("operations.log");
-            let fake = fake_stateful_managed_provider(
-                ManagedFakeSpec::active("SVC1", 7, 8),
-                &descriptor,
-                &fixture
-                    .root
-                    .path()
-                    .join("package/app.tar.gz")
-                    .canonicalize()
-                    .expect("canonical package"),
-                &log,
-            );
-            let _path = PathPrepend::new(fake.path());
-            let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-            let plan = build_managed_deploy_plan(&context, &owned(&["--comment=release"]))
-                .expect("read-only plan");
-            fs::write(&log, "").expect("clear preflight log");
-            fs::write(fake.path().join("fail-at"), failure).expect("failure marker");
-            let mut emitted = Vec::new();
-
-            let error = execute_managed_deploy_plan_with_emit(&plan, &mut |line| {
-                emitted.push(line.to_owned());
-            })
-            .expect_err("injected mutation failure");
-
-            let emitted_versions = emitted
-                .iter()
-                .filter(|line| line.starts_with("version="))
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(
-                emitted_versions,
-                expected_version
-                    .map(|version| vec![format!("version={version}")])
-                    .unwrap_or_default(),
-                "{failure}: {emitted:?}"
-            );
-            if let Some(status) = expected_status {
-                assert!(
-                    error.contains(&format!("exit status: {status}")),
-                    "{failure}: {error}"
-                );
-                assert!(error.contains("provider rejected"), "{failure}: {error}");
-                assert!(!error.contains("test-token"), "{failure}: {error}");
-                assert!(error.contains("[REDACTED]"), "{failure}: {error}");
-            }
-            assert!(
-                emitted
-                    .iter()
-                    .any(|line| line == &format!("package-sha256={}", fixture.package_digest)),
-                "{failure}: {emitted:?}"
-            );
-            assert!(!fake.path().join("activated").exists(), "{failure}");
-            assert!(!fake.path().join("staged").exists(), "{failure}");
-            let operations = fs::read_to_string(&log).expect("operation log");
-            let forbidden_after_failure: &[&str] = match failure {
-                "compute-update"
-                | "compute-update-no-version"
-                | "compute-update-active-version" => &[
-                    "service-version update",
-                    "resource-link delete",
-                    "resource-link create",
-                    "config-store-entry create",
-                    "activate",
-                ],
-                "comment" | "inherited-link-lookup" => &[
-                    "resource-link delete",
-                    "resource-link create",
-                    "config-store-entry create",
-                    "activate",
-                ],
-                "link-delete" => &[
-                    "resource-link create",
-                    "config-store-entry create",
-                    "activate",
-                ],
-                "link-create" | "reconciled-link-verification" => {
-                    &["config-store-entry create", "activate"]
-                }
-                "descriptor-create"
-                | "descriptor-readback"
-                | "final-version-revalidation"
-                | "final-link-revalidation"
-                | "final-descriptor-revalidation"
-                | "final-package-revalidation" => &["activate"],
-                _ => &[],
-            };
-            for forbidden in forbidden_after_failure {
-                assert!(
-                    !operations.contains(forbidden),
-                    "{failure} must stop before {forbidden}: {operations}"
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[expect(
-        clippy::cognitive_complexity,
-        clippy::too_many_lines,
-        reason = "the integration assertion reviews every immutable plan component and forbidden mutation in one scenario"
-    )]
-    #[test]
-    fn deploy_plan_builds_complete_read_only_active_version_plan() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let log_directory = tempdir().expect("provider log directory");
-        let log = log_directory.path().join("provider.log");
-        let prior = RuntimeDescriptor::from_entries(BTreeMap::from([(
-            "EDGEZERO__STORES__KV__REMOVED__NAME".to_owned(),
-            "kv-old".to_owned(),
-        )]))
-        .expect("prior descriptor")
-        .canonical_json()
-        .expect("prior descriptor json");
-        let fake = fake_managed_plan_provider(
-            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":7,"name":"production","service_id":"SVC1"}]}]"#,
-            r#"[
-                {"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"},
-                {"id":"LINK_CONFIG","name":"config-a","resource_id":"CONFIG_A"},
-                {"id":"LINK_OLD_KV","name":"kv-old","resource_id":"KV_OLD"},
-                {"id":"LINK_BACKEND","name":"backend-resource","resource_id":"NOT_A_STORE"}
-            ]"#,
-            Some(&prior),
-            r#"[
-                {"id":"RUNTIME","name":"edgezero_runtime_env"},
-                {"id":"CONFIG_A","name":"config-a"}
-            ]"#,
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let plan = build_managed_deploy_plan(
-            &managed_plan_context(&fixture),
-            &owned(&["--comment=publisher release", "--quiet"]),
-        )
-        .expect("complete plan");
-
-        assert_eq!(plan.service_id, "SVC1");
-        assert_eq!(plan.target, PublishTarget::Staging);
-        assert_eq!(plan.arguments.comment.as_deref(), Some("publisher release"));
-        assert_eq!(plan.arguments.globals, ["--quiet"]);
-        assert_eq!(plan.environment.store_key("config", "app"), "publisher-a");
-        assert_eq!(plan.package_sha256, fixture.package_digest);
-        assert_eq!(
-            plan.release.root(),
-            fixture.root.path().canonicalize().expect("canonical root")
-        );
-        assert_eq!(
-            plan.release.application_cli(),
-            fixture
-                .root
-                .path()
-                .join("bin/edgezero")
-                .canonicalize()
-                .expect("canonical application CLI")
-        );
-        assert_eq!(
-            plan.release.package(),
-            fixture
-                .root
-                .path()
-                .join("package/app.tar.gz")
-                .canonicalize()
-                .expect("canonical package")
-        );
-        assert_eq!(
-            plan.release.application_manifest(),
-            fixture
-                .application_manifest
-                .canonicalize()
-                .expect("canonical application manifest")
-        );
-        assert_eq!(
-            plan.release.adapter_manifest(),
-            fixture
-                .adapter_manifest
-                .canonicalize()
-                .expect("canonical adapter manifest")
-        );
-        assert_eq!(plan.release.source_revision(), "a".repeat(40));
-        assert!(matches!(
-            plan.version_source,
-            EditableVersionSource::CloneActive { active_version: 7 }
-        ));
-        assert_eq!(plan.runtime_store_id, "RUNTIME");
-        assert_eq!(
-            plan.inventories
-                .resolve(ResourceKind::Secret, "secret-a")
-                .expect("selected secret"),
-            "SECRET_A"
-        );
-        assert!(plan.descriptor_json.contains("publisher-a"));
-        assert_eq!(plan.desired_links.len(), 4);
-        assert_eq!(plan.source_links.len(), 4);
-        assert_eq!(plan.versions.len(), 1);
-        assert!(plan.prior_descriptor.is_some());
-        assert_eq!(plan.links.delete_link_ids, ["LINK_OLD_KV"]);
-        assert_eq!(
-            plan.links
-                .create
-                .iter()
-                .map(|link| link.alias.as_str())
-                .collect::<Vec<_>>(),
-            ["kv-a", "secret-a"]
-        );
-
-        let operations = fs::read_to_string(&log).expect("provider command log");
-        assert!(
-            operations.contains("EDGEZERO__SERVICES__SVC1__VERSIONS__7__ENV_V1"),
-            "{operations}"
-        );
-        for forbidden in [
-            " create",
-            " update",
-            " delete",
-            " activate",
-            " stage",
-            "EDGEZERO__SERVICES__SVC1__ADAPTER",
-            "EDGEZERO__SERVICES__SVC1__LOGGING",
-            "EDGEZERO__SERVICES__SVC1__STORES",
-            "EDGEZERO__STORES__",
-            "edgezero_runtime_env_staging_SVC1",
-            "kv-store list",
-            "secret-store list",
-            "service-version list",
-        ] {
-            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn deploy_plan_rejects_orphan_source_descriptor_without_runtime_store_link() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let log = fixture.root.path().join("orphan-descriptor.log");
-        let prior = RuntimeDescriptor::from_entries(BTreeMap::new())
-            .expect("prior descriptor")
-            .canonical_json()
-            .expect("prior descriptor JSON");
-        let fake = fake_managed_plan_provider(
-            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#,
-            r#"[{"id":"LINK_CONFIG","name":"config-a","resource_id":"CONFIG_A"}]"#,
-            Some(&prior),
-            r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"CONFIG_A","name":"config-a"}]"#,
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        let error = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
-            .expect_err("an account-wide descriptor is not authoritative without its source link");
-        assert!(error.contains("orphan descriptor"), "{error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn deploy_plan_runtime_configuration_cannot_select_different_release_members() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let log_directory = tempdir().expect("provider log directory");
-        let log = log_directory.path().join("provider.log");
-        let fake = fake_managed_plan_provider(
-            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":7,"name":"production","service_id":"SVC1"}]}]"#,
-            r#"[{"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"}]"#,
-            None,
-            r#"[
-                {"id":"RUNTIME","name":"edgezero_runtime_env"},
-                {"id":"CONFIG_A","name":"config-a"},
-                {"id":"CONFIG_B","name":"config-b"}
-            ]"#,
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-
-        let publisher_a = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
-            .expect("publisher A plan");
-        let mut publisher_b_context = managed_plan_context(&fixture);
-        publisher_b_context.service_id = Some("SVC2".to_owned());
-        publisher_b_context.variable_defaults.extend([
-            (
-                "EDGEZERO__STORES__CONFIG__APP__NAME".to_owned(),
-                "config-b".to_owned(),
+    fn deploy_plan_only_removes_the_exact_legacy_runtime_link() {
+        let inventories = deploy_plan_inventories();
+        let existing = vec![
+            existing_link(
+                ResourceKind::Config,
+                "edgezero_runtime_env",
+                "LEGACY",
+                "REMOVE",
             ),
-            (
-                "EDGEZERO__STORES__CONFIG__APP__KEY".to_owned(),
-                "publisher-b".to_owned(),
+            existing_link(
+                ResourceKind::Config,
+                "edgezero_runtime_env_other",
+                "LEGACY",
+                "KEEP_ALIAS",
             ),
-            (
-                "EDGEZERO__STORES__KV__CACHE__NAME".to_owned(),
-                "kv-b".to_owned(),
+            existing_link(
+                ResourceKind::Kv,
+                "edgezero_runtime_env",
+                "KV_A",
+                "KEEP_KIND",
             ),
-            (
-                "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME".to_owned(),
-                "secret-b".to_owned(),
-            ),
-        ]);
-        let publisher_b =
-            build_managed_deploy_plan(&publisher_b_context, &[]).expect("publisher B plan");
+        ];
+        let plan =
+            plan_link_reconciliation(&[], &existing, &inventories).expect("narrow legacy cleanup");
+        assert_eq!(plan.delete_link_ids, vec!["REMOVE"]);
 
-        assert_eq!(publisher_a.package_sha256, publisher_b.package_sha256);
-        assert_ne!(publisher_a.service_id, publisher_b.service_id);
-        assert_eq!(publisher_a.release.package(), publisher_b.release.package());
-        assert_eq!(
-            publisher_a.release.application_cli(),
-            publisher_b.release.application_cli()
-        );
-        assert_eq!(
-            publisher_a.release.application_manifest(),
-            publisher_b.release.application_manifest()
-        );
-        assert_eq!(
-            publisher_a.release.adapter_manifest(),
-            publisher_b.release.adapter_manifest()
-        );
-        assert_ne!(publisher_a.descriptor_json, publisher_b.descriptor_json);
-        assert!(publisher_a.descriptor_json.contains("publisher-a"));
-        assert!(publisher_b.descriptor_json.contains("publisher-b"));
-        assert_eq!(
-            publisher_a
-                .desired_links
-                .iter()
-                .map(|link| link.selected_name.as_str())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["config-a", "edgezero_runtime_env", "kv-a", "secret-a"])
-        );
-        assert_eq!(
-            publisher_b
-                .desired_links
-                .iter()
-                .map(|link| link.selected_name.as_str())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["config-b", "edgezero_runtime_env", "kv-b", "secret-b"])
-        );
+        let different_resource = vec![existing_link(
+            ResourceKind::Config,
+            "edgezero_runtime_env",
+            "CONFIG_A",
+            "KEEP_RESOURCE",
+        )];
+        let different_resource_plan =
+            plan_link_reconciliation(&[], &different_resource, &inventories)
+                .expect("same alias with a different physical resource");
+        assert!(different_resource_plan.delete_link_ids.is_empty());
 
-        let operations = fs::read_to_string(&log).expect("provider command log");
-        for forbidden in [
-            " create",
-            " update",
-            " delete",
-            "EDGEZERO__STORES__",
-            "EDGEZERO__SERVICES__SVC1__ADAPTER",
-            "EDGEZERO__SERVICES__SVC1__LOGGING",
-            "EDGEZERO__SERVICES__SVC1__STORES",
-            "edgezero_runtime_env_staging_SVC1",
-        ] {
-            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn deploy_plan_store_free_cutover_rejects_inherited_kv_found_on_later_page() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let log_directory = tempdir().expect("provider log directory");
-        let log = log_directory.path().join("provider.log");
-        let fake = fake_managed_plan_provider(
-            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#,
-            r#"[
-                {"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"},
-                {"id":"LINK_OLD_KV","name":"kv-old","resource_id":"KV_OLD"}
-            ]"#,
-            None,
-            r#"[
-                {"id":"RUNTIME","name":"edgezero_runtime_env"},
-                {"id":"CONFIG_A","name":"config-a"}
-            ]"#,
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let mut context = managed_plan_context(&fixture);
-        context.stores.kv.clear();
-        context
-            .variable_defaults
-            .remove("EDGEZERO__STORES__KV__CACHE__NAME");
-
-        let error = build_managed_deploy_plan(&context, &[])
-            .expect_err("descriptor-less cutover must not delete an inherited KV store");
-        assert!(error.contains("kv-old"), "{error}");
-        let operations = fs::read_to_string(&log).expect("provider command log");
-        assert!(
-            operations.contains("/resources/stores/kv?limit=100&cursor=page-two"),
-            "the inherited KV exists only on page two: {operations}"
-        );
-        assert!(!operations.contains("kv-store list"), "{operations}");
-        for forbidden in [
-            "EDGEZERO__STORES__",
-            "EDGEZERO__SERVICES__SVC1__ADAPTER",
-            "EDGEZERO__SERVICES__SVC1__LOGGING",
-            "EDGEZERO__SERVICES__SVC1__STORES",
-            "edgezero_runtime_env_staging_SVC1",
-        ] {
-            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the first-draft snapshot assertion covers the complete authoritative logging-provider set and all protected metadata"
-    )]
-    fn deploy_plan_snapshots_initialized_first_draft_without_blank_version() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let log = fixture.root.path().join("provider.log");
-        let fake = fake_managed_plan_provider(
-            r#"[{"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[],"comment":"initialized through Fastly UI"}]"#,
-            r#"[{"id":"LINK_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME"}]"#,
-            None,
-            r#"[
-                {"id":"RUNTIME","name":"edgezero_runtime_env"},
-                {"id":"CONFIG_A","name":"config-a"}
-            ]"#,
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let plan = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
-            .expect("initialized draft plan");
-        let EditableVersionSource::InitialDraft(snapshot) = plan.version_source else {
-            panic!("expected initialized draft snapshot");
-        };
-        assert_eq!(snapshot.version.number, 3);
-        assert_eq!(
-            snapshot.metadata["comment"],
-            "initialized through Fastly UI"
-        );
-        assert_eq!(snapshot.domains[0]["name"], "example.com");
-        assert_eq!(snapshot.backends[0]["name"], "origin");
-        assert_eq!(
-            snapshot
-                .logging
-                .iter()
-                .map(|provider| provider.kind)
-                .collect::<Vec<_>>(),
-            [
-                "azureblob",
-                "bigquery",
-                "cloudfiles",
-                "datadog",
-                "digitalocean",
-                "elasticsearch",
-                "ftp",
-                "gcs",
-                "googlepubsub",
-                "grafanacloudlogs",
-                "heroku",
-                "honeycomb",
-                "https",
-                "kafka",
-                "kinesis",
-                "loggly",
-                "logshuttle",
-                "newrelic",
-                "newrelicotlp",
-                "openstack",
-                "papertrail",
-                "s3",
-                "scalyr",
-                "sftp",
-                "splunk",
-                "sumologic",
-                "syslog",
-            ]
-        );
-        let https = snapshot
-            .logging
-            .iter()
-            .find(|provider| provider.kind == "https")
-            .expect("HTTPS logging snapshot");
-        assert_eq!(https.endpoints[0]["name"], "logs");
-        assert!(snapshot.logging.iter().all(|provider| {
-            provider.kind == "https" || provider.endpoints.as_array().is_some_and(Vec::is_empty)
-        }));
-        assert_eq!(
-            snapshot.settings["general.default_host"],
-            "origin.example.com"
-        );
-        assert_eq!(snapshot.links[0]["id"], "LINK_RUNTIME");
-        let operations = fs::read_to_string(&log).expect("provider command log");
-        assert!(operations.contains("/version/3/settings"), "{operations}");
-        for kind in FASTLY_LOGGING_PROVIDER_KINDS {
-            assert!(
-                operations.contains(&format!("/version/3/logging/{kind}")),
-                "missing {kind} logging collection: {operations}"
-            );
-        }
-        assert!(
-            !operations.lines().any(|line| line.ends_with("/logging\"")),
-            "aggregate logging collection must never be requested: {operations}"
-        );
-        assert!(
-            !operations.contains("config-store-entry"),
-            "descriptor absence must use only its exact API lookup: {operations}"
-        );
-        assert!(!operations.contains(" create"), "{operations}");
-        assert!(!operations.contains(" update"), "{operations}");
-        assert!(!operations.contains(" delete"), "{operations}");
-        for forbidden in [
-            "EDGEZERO__STORES__",
-            "EDGEZERO__SERVICES__SVC1__ADAPTER",
-            "EDGEZERO__SERVICES__SVC1__LOGGING",
-            "EDGEZERO__SERVICES__SVC1__STORES",
-            "edgezero_runtime_env_staging_SVC1",
-        ] {
-            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
-        }
+        let declared = vec![desired_link(
+            ResourceKind::Config,
+            "edgezero_runtime_env",
+            "edgezero_runtime_env",
+            "LEGACY",
+        )];
+        let declared_existing = vec![existing_link(
+            ResourceKind::Config,
+            "edgezero_runtime_env",
+            "LEGACY",
+            "REMOVE",
+        )];
+        let declared_plan = plan_link_reconciliation(&declared, &declared_existing, &inventories)
+            .expect("declared legacy identity");
+        assert!(declared_plan.delete_link_ids.is_empty());
     }
 
     #[test]
-    fn deploy_plan_logging_snapshot_rejects_malformed_collection() {
-        let error = parse_snapshot_array("logging/https", r#"{"data":[]}"#)
-            .expect_err("logging collection must be a complete array");
-        assert!(error.contains("logging/https"), "{error}");
-        assert!(error.contains("complete JSON array"), "{error}");
+    fn deploy_plan_rejects_reported_kind_that_conflicts_with_inventory() {
+        let existing = vec![existing_link(
+            ResourceKind::Secret,
+            "credentials",
+            "CONFIG_A",
+            "BAD_KIND",
+        )];
+        let error = plan_link_reconciliation(&[], &existing, &deploy_plan_inventories())
+            .expect_err("kind conflict must fail");
+        assert!(error.contains("reports Secret Store"), "{error}");
+        assert!(error.contains("belongs to Config Store"), "{error}");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn deploy_plan_inventory_failure_performs_no_mutation_or_legacy_lookup() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let fixture = deploy_plan_release_fixture();
-        let log = fixture.root.path().join("provider.log");
-        let fake = fake_managed_plan_provider(
-            r#"[{"number":7,"active":true}]"#,
-            "[]",
-            None,
-            r#"{"items":[],"next_cursor":"not-complete"}"#,
-            &log,
-        );
-        let _path = PathPrepend::new(fake.path());
-        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
-        let error = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
-            .expect_err("incomplete inventory must fail closed");
-        assert!(error.contains("bare JSON array"), "{error}");
-        let operations = fs::read_to_string(&log).expect("provider command log");
-        for forbidden in [
-            " create",
-            " update",
-            " delete",
-            "EDGEZERO__SERVICES__SVC1__ADAPTER",
-            "EDGEZERO__SERVICES__SVC1__LOGGING",
-            "EDGEZERO__SERVICES__SVC1__STORES",
-            "EDGEZERO__STORES__",
-            "edgezero_runtime_env_staging_SVC1",
+    fn resource_link_parser_requires_known_resource_type() {
+        let raw = r#"[
+            {"id":"CONFIG_LINK","name":"shared","resource_id":"CONFIG_A","resource_type":"config_store"},
+            {"id":"KV_LINK","name":"shared","resource_id":"KV_A","resource_type":"kv_store"},
+            {"id":"SECRET_LINK","name":"credentials","resource_id":"SECRET_A","resource_type":"secret_store"}
+        ]"#;
+        let (links, _) = parse_resource_links(raw).expect("typed links");
+        assert_eq!(links[0].kind, ResourceKind::Config);
+        assert_eq!(links[1].kind, ResourceKind::Kv);
+        assert_eq!(links[2].kind, ResourceKind::Secret);
+
+        let unknown =
+            r#"[{"id":"LINK","name":"x","resource_id":"X","resource_type":"dictionary"}]"#;
+        let error = parse_resource_links(unknown).expect_err("unknown type must fail");
+        assert!(error.contains("unknown `resource_type`"), "{error}");
+    }
+
+    #[test]
+    fn fastly_config_keys_are_deterministic_for_each_target() {
+        validate_fastly_config_key("app_config", "app_config", false, false)
+            .expect("production key");
+        validate_fastly_config_key("app_config", "app_config_staging", true, false)
+            .expect("staging key");
+        validate_fastly_config_key("app_config", "app_config", false, true).expect("local key");
+
+        for (key, staging, local) in [
+            ("custom", false, false),
+            ("app_config", true, false),
+            ("app_config_staging", false, true),
         ] {
-            assert!(!operations.contains(forbidden), "{forbidden}: {operations}");
+            let error = validate_fastly_config_key("app_config", key, staging, local)
+                .expect_err("conflicting key must fail");
+            assert!(error.contains("deterministic config key"), "{error}");
         }
     }
 
@@ -11113,6 +8043,34 @@ esac
         // No active version at all → refuse.
         ensure_rollback_from_is_active(None, 7, "svc")
             .expect_err("no active version must block the rollback");
+    }
+
+    #[test]
+    fn staging_rollback_after_failure_before_stage_is_a_noop() {
+        let versions = parse_service_versions(
+            r#"[{"active":false,"number":7,"locked":false,"staging":false,"deployed":false,"environments":[]}]"#,
+        )
+        .expect("version list");
+        assert_eq!(
+            staging_rollback_decision(&versions, 7, "svc"),
+            Ok(StagingRollbackDecision::NoopDraft)
+        );
+    }
+
+    #[test]
+    fn staging_rollback_after_failure_after_stage_deactivates_exact_version() {
+        let versions = parse_service_versions(
+            r#"[{"active":false,"number":7,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
+        )
+        .expect("version list");
+        assert_eq!(
+            staging_rollback_decision(&versions, 7, "svc"),
+            Ok(StagingRollbackDecision::Deactivate)
+        );
+        staging_rollback_decision(&versions, 8, "svc")
+            .expect_err("an absent version must fail closed");
+        staging_rollback_decision(&versions, 7, "other-service")
+            .expect_err("a staged version for another service must fail closed");
     }
 
     #[test]
@@ -11941,22 +8899,10 @@ build = \"cargo build --release\"
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret + the single runtime descriptor store.
-        assert_eq!(out.len(), 4, "dry-run rows: {out:?}");
+        assert_eq!(out.len(), 3, "dry-run rows: {out:?}");
         assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
         assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
-        assert!(
-            out[3].contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
-            "runtime-env store row: {out:?}",
-        );
-        assert_eq!(
-            out.iter()
-                .filter(|row| row.contains("edgezero_runtime_env"))
-                .count(),
-            1,
-            "provision creates exactly one runtime descriptor store: {out:?}",
-        );
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(
@@ -11973,7 +8919,7 @@ build = \"cargo build --release\"
         let adapter_dir = dir.path().join("adapters/fastly");
         fs::create_dir_all(&adapter_dir).expect("adapter dir");
         let path = adapter_dir.join("fastly.toml");
-        fs::write(&path, "[setup.config_stores.edgezero_runtime_env]\n").expect("write");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
         let kv = vec![ResolvedStoreId::from_logical("sessions")];
         let stores = ProvisionStores {
             config: &[],
@@ -12033,14 +8979,7 @@ build = \"cargo build --release\"
     fn provision_with_no_declared_stores_says_so() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        // Pre-populate the runtime-env block so the provision flow's
-        // unconditional runtime-env step skips (otherwise it would
-        // shell out to real `fastly` to create the store).
-        fs::write(
-            &path,
-            "name = \"demo\"\n[setup.config_stores.edgezero_runtime_env]\n",
-        )
-        .expect("write");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
         let stores = ProvisionStores {
             config: &[],
             kv: &[],
@@ -12054,56 +8993,15 @@ build = \"cargo build --release\"
 
     #[cfg(unix)]
     #[test]
-    fn provision_runtime_store_emits_no_selector_write_or_twin_guidance() {
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("fastly.toml"), "name = \"demo\"\n").expect("manifest");
-        let operation_log = dir.path().join("operations.log");
-        let fake = fake_fastly_runtime_mapping(&[], &operation_log);
-        let _path = PathPrepend::new(fake.path());
-        let out = FastlyCliAdapter
-            .provision(
-                dir.path(),
-                Some("fastly.toml"),
-                None,
-                &ProvisionStores {
-                    config: &[],
-                    kv: &[],
-                    secrets: &[],
-                },
-                false,
-            )
-            .expect("runtime descriptor store provision");
-        assert_eq!(out.len(), 1);
-        assert!(out[0].contains("version-scoped runtime descriptor store"));
-        for forbidden in ["config-store-entry", "selector", "staging twin", "_staging"] {
-            assert!(!out[0].contains(forbidden), "{forbidden}: {}", out[0]);
-        }
-        let operations = fs::read_to_string(&operation_log).expect("operation log");
-        assert_eq!(
-            operations
-                .lines()
-                .filter(|line| line.contains("store-create"))
-                .count(),
-            1,
-            "{operations}"
-        );
-        assert!(!operations.contains("config-store-entry"), "{operations}");
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn provision_skips_store_creation_when_setup_block_already_present() {
-        // Re-running provision skips resource creation. Runtime selectors are
-        // applied by deploy, so provision performs no remote lookup here.
+        // Re-running provision skips resource creation.
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(
             &path,
             "service_id = \"SVC1\"\n\
-             [setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n\
-             [setup.config_stores.edgezero_runtime_env]\n",
+             [setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
         )
         .expect("write");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
@@ -12123,32 +9021,22 @@ build = \"cargo build --release\"
         assert!(out[0].contains("already declared"), "got: {out:?}");
         assert!(
             !oplog.exists(),
-            "provision must not inspect or mutate runtime selectors"
+            "provision must not inspect or mutate provider state"
         );
     }
 
     /// When `fastly.toml` declares `service_id`, the next
     /// `fastly compute deploy` skips `[setup]` entirely. provision
     /// must emit the `fastly resource-link create` remediation for
-    /// every store it creates -- including the implicit
-    /// `edgezero_runtime_env` store the runtime override path
-    /// depends on. Without this, a freshly-provisioned override
-    /// store would not be linked to the already-deployed service
-    /// and the runtime would silently fall back to baked defaults.
+    /// every declared store it creates.
     #[test]
-    fn provision_emits_resource_link_note_for_runtime_env_on_existing_service() {
-        // Dry-run only -- we just want to drive the resource_link_note
-        // helper for the runtime-env store branch. The real-create
-        // path can't run in tests (would shell out to `fastly`).
-        // The dry-run output line for runtime-env doesn't include the
-        // note (the helper only fires on real create), so we test the
-        // helper directly here.
+    fn provision_emits_resource_link_note_for_declared_store_on_existing_service() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\nservice_id = \"abc123svc\"\n").expect("write");
         let selected = select_fastly_service_id(Some("abc123svc".to_owned()), None)
             .expect("select service id");
-        let note = resource_link_note(selected.as_ref(), "config", "edgezero_runtime_env")
+        let note = resource_link_note(selected.as_ref(), "config", "app_config")
             .expect("note present when service_id set");
         assert!(
             note.contains("service_id = \"abc123svc\""),
@@ -12159,12 +9047,12 @@ build = \"cargo build --release\"
             "note tells operator how to find the store id: {note}"
         );
         assert!(
-            note.contains("name=`edgezero_runtime_env`"),
-            "note names the runtime override store: {note}"
+            note.contains("name=`app_config`"),
+            "note names the declared store: {note}"
         );
         assert!(
             note.contains(
-                "fastly resource-link create --service-id=abc123svc --resource-id=<STORE-ID> --version=latest --autoclone --name=edgezero_runtime_env"
+                "fastly resource-link create --service-id=abc123svc --resource-id=<STORE-ID> --version=latest --autoclone --name=app_config"
             ),
             "note carries the full resource-link command: {note}"
         );
@@ -12177,7 +9065,7 @@ build = \"cargo build --release\"
     /// guidance.
     #[test]
     fn provision_skips_resource_link_note_when_service_undeployed() {
-        let note = resource_link_note(None, "config", "edgezero_runtime_env");
+        let note = resource_link_note(None, "config", "app_config");
         assert!(
             note.is_none(),
             "no service_id => no resource-link prompt: {note:?}"
@@ -12359,7 +9247,7 @@ build = \"cargo build --release\"
             {"id": "abc123", "name": "some_other_store"},
             {"id": "def456"}
         ]"#;
-        let drift = find_config_store_id(stdout, "edgezero_runtime_env");
+        let drift = find_config_store_id(stdout, "app_config");
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
             "a malformed entry alongside a well-formed one must be schema drift, got {drift:?}"
@@ -12371,10 +9259,10 @@ build = \"cargo build --release\"
         // The full list is scanned: a malformed entry AFTER the match must still
         // be caught (no short-circuit on the first Found).
         let stdout = r#"[
-            {"id": "abc123", "name": "edgezero_runtime_env"},
+            {"id": "abc123", "name": "app_config"},
             {"name": "broken"}
         ]"#;
-        let drift = find_config_store_id(stdout, "edgezero_runtime_env");
+        let drift = find_config_store_id(stdout, "app_config");
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
             "a malformed entry after the match must be schema drift, got {drift:?}"
@@ -12384,10 +9272,10 @@ build = \"cargo build --release\"
     #[test]
     fn find_config_store_id_flags_duplicate_names_as_ambiguous() {
         let stdout = r#"[
-            {"id": "abc123", "name": "edgezero_runtime_env"},
-            {"id": "def456", "name": "edgezero_runtime_env"}
+            {"id": "abc123", "name": "app_config"},
+            {"id": "def456", "name": "app_config"}
         ]"#;
-        let drift = find_config_store_id(stdout, "edgezero_runtime_env");
+        let drift = find_config_store_id(stdout, "app_config");
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
             "two stores with the same name must be ambiguous drift, got {drift:?}"
@@ -12694,7 +9582,7 @@ build = \"cargo build --release\"
         let entry_list = dir.path().join("entries.json");
         fs::write(
             &store_list,
-            format!(r#"[{{"name":"{RUNTIME_ENV_STORE_NAME}","id":"runtime-env-123"}}]"#),
+            format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#),
         )
         .expect("store list");
         let entries = current

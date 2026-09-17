@@ -3314,122 +3314,14 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   git commit -m "Fastly: primitive synthesiser for fastly.toml + bootstrap override"
   ```
 
-### Task 22: Fastly local-mode `provision` — `[local_server.*]` + `edgezero_runtime_env`
+### Task 22: Fastly local-mode `provision` — logical stores
 
-**Files:**
-
-- Modify: `crates/edgezero-adapter-fastly/src/cli.rs`
-- Test: same file
-
-**Interfaces:**
-
-- Consumes: synthesised baseline, `ProvisionStores`, deployed `service_id`
-- Produces: Fastly local arm — synthesise/merge `fastly.toml` with kv_stores + config_stores + edgezero_runtime_env
-
-- [ ] **Step 1: Write the failing tests**
-
-  ```rust
-  #[test]
-  fn fastly_local_provision_writes_kv_and_config_store_blocks() {
-      // Fixture: stores.kv.ids = ["sessions"], stores.config.ids = ["app_config"].
-      // Run local provision. Read fastly.toml, assert:
-      //   [[local_server.kv_stores.sessions]]
-      //   key = "__init__"
-      //   data = ""
-      //   [local_server.config_stores.app_config]
-      //   format = "inline-toml"
-      //   [local_server.config_stores.app_config.contents]
-      //   # empty table -- NOT `contents = ""`
-      //
-      // `contents` MUST be a TOML table, not a string. The
-      // existing Fastly push writer at
-      // crates/edgezero-adapter-fastly/src/cli.rs:986 calls
-      // `contents_entry.as_table_mut()` and refuses to edit in
-      // place when the value isn't a table; provision writing
-      // a string here would brick subsequent `config push --local`.
-  }
-
-  #[test]
-  fn fastly_local_provision_writes_edgezero_runtime_env() {
-      // Same fixture. Assert fastly.toml contains:
-      //   [local_server.config_stores.edgezero_runtime_env]
-      //   format = "inline-toml"
-      //   [local_server.config_stores.edgezero_runtime_env.contents]
-      //   EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME = "app_config"
-      //   EDGEZERO__STORES__KV__SESSIONS__NAME = "sessions"
-      //   # EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging"
-  }
-
-  #[test]
-  fn fastly_local_provision_errors_if_manifest_absent() {
-      // DO NOT pre-seed fastly.toml. Run local provision.
-      // Assert error mentions the missing path (synthesis is
-      // Task 8b's CLI bootstrap concern; the adapter trait does
-      // not receive app_name so it cannot synthesise here).
-  }
-
-  #[test]
-  fn fastly_local_provision_upserts_deployed_service_id_into_existing_manifest() {
-      // Pre-seed fastly.toml WITHOUT a service_id key (operator
-      // deleted it, or it was synthesised before a deploy
-      // happened). Pass deployed.fields["service_id"] = "SVC1"
-      // via the new `deployed` parameter. Run local provision.
-      // Re-parse fastly.toml; assert top-level
-      // `service_id = "SVC1"` is now present. Locks the spec's
-      // "synthesising OR merging" rule -- the prior plan rev
-      // only handled service_id during synthesis (Task 8b), so
-      // operators who pre-seeded fastly.toml from a stale
-      // template would never get the deployed value pinned.
-  }
-
-  #[test]
-  fn fastly_local_provision_leaves_operator_service_id_alone_when_deployed_absent() {
-      // Pre-seed fastly.toml with `service_id = "operator-set"`.
-      // Pass `deployed = None` (no [adapters.fastly.deployed]).
-      // Run local provision. Assert service_id is still
-      // "operator-set" -- when there's no cloud authority, the
-      // operator's local value wins.
-  }
-
-  #[test]
-  fn fastly_local_provision_resolves_nested_adapter_manifest_path() {
-      // Fixture: adapter_manifest_path = "crates/fastly/fastly.toml".
-      // PRE-SEED crates/fastly/fastly.toml via synthesise_fastly_toml
-      // (mirrors what Task 8b's bootstrap would write). Run local
-      // provision. Assert merges land inside crates/fastly/fastly.toml
-      // (NOT a sibling at the manifest_root level).
-  }
-  ```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-  Run: `cargo test -p edgezero-adapter-fastly fastly_local_provision`
-  Expected: FAIL
-
-- [ ] **Step 3: Implement Fastly's local arm**
-
-  In `crates/edgezero-adapter-fastly/src/cli.rs`'s `provision`:
-
-  1. Resolve `fastly_path = manifest_root.join(adapter_manifest_path.unwrap_or("fastly.toml"))` (mirrors today's resolution at `crates/edgezero-adapter-fastly/src/cli.rs:214`). **Assume `fastly_path` already exists** -- Task 8b's CLI bootstrap writes the baseline (including the pinned `service_id` from `deployed.fields["service_id"]`) BEFORE `provision` runs, and the trait does not receive `app_name`, so the adapter cannot synthesise here. If the file is unexpectedly absent, return an error pointing at the missing path -- do NOT silently re-synthesise.
-  2. Parse `fastly_path` via `toml_edit::DocumentMut`.
-  3. **Upsert top-level `service_id` from `deployed.fields["service_id"]`** when present. Spec §"Fastly" → "Where durable identifiers live" says local provision reads `[adapters.fastly.deployed].service_id` when "synthesising OR MERGING `fastly.toml`" -- not just on first synthesis. If `deployed.fields.get("service_id")` is `Some(svc)`, set `doc["service_id"] = value(svc.as_str())` (overwrite stale local value with the cloud-authoritative one); if `None`, leave any existing operator-set value alone. Operator workflow: first cloud `deploy` creates the service id; operator commits it under `[adapters.fastly.deployed].service_id` in `edgezero.toml`; teammates' next `provision --local` pins it inside their gitignored `fastly.toml`.
-  4. For each `stores.kv.ids` entry: append `[[local_server.kv_stores.<platform>]]` array entry with `key = "__init__"`, `data = ""` IFF absent.
-  5. For each `stores.config.ids` entry: append `[local_server.config_stores.<platform>]` normal table with `format = "inline-toml"` AND an empty `[local_server.config_stores.<platform>.contents]` SUB-TABLE (NOT `contents = ""` — must be a TOML table per the existing Fastly push writer at `crates/edgezero-adapter-fastly/src/cli.rs:986`, which calls `contents_entry.as_table_mut()` and refuses to edit in place when the value isn't a table). IFF absent.
-  6. Append `[local_server.config_stores.edgezero_runtime_env]` block IFF absent, with `contents` containing one `EDGEZERO__STORES__<KIND>__<LOGICAL_ID>__NAME = "<platform>"` per id (KV/CONFIG/SECRETS) and commented-out `# EDGEZERO__STORES__CONFIG__<LOGICAL_ID>__KEY = "<logical_id>_staging"` examples for CONFIG ids only.
-  7. Write back (skip on `dry_run`).
-  8. Status lines describe what was added.
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-  Run: `cargo test -p edgezero-adapter-fastly fastly_local_provision`
-  Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add crates/edgezero-adapter-fastly/src/cli.rs
-  git commit -m "Fastly: local-mode provision writes [local_server.*] + edgezero_runtime_env"
-  ```
+> Superseded behavior: Fastly local provisioning now exposes declared stores
+> directly under their logical IDs. It does not create a runtime selector store.
+> Remote production and staging deployments select physical stores with
+> version-scoped resource links, while local Config reads use the logical ID as
+> both store alias and entry key. See the accepted
+> [Fastly logical resource-link design](../specs/2026-09-17-fastly-logical-resource-links-design.md).
 
 ### Task 23: Fastly `provision_typed` — secret-store array entries
 

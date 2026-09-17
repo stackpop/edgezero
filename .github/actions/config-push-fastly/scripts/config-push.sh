@@ -10,12 +10,10 @@ set -euo pipefail
 # wrapper blanks every other FASTLY_* alias, so an inherited FASTLY_ENDPOINT or
 # FASTLY_TOKEN can never redirect or re-auth the push.
 #
-# Staging: `deploy-to: staging` passes `--staging` to the CLI. The canonical
-# `EDGEZERO__STORES__CONFIG__<ID>__KEY` selected by the caller's environment wins;
-# when absent, both config push and the managed runtime descriptor fall back to
-# `<logical-store-id>_staging`. Production and staging may select the same or
-# different physical stores. The managed action does not accept a separate key;
-# config push and deploy therefore use the same canonical resolution.
+# Staging: `deploy-to: staging` passes `--staging` to the CLI, which writes
+# `<logical-store-id>_staging`; production writes `<logical-store-id>`. Fastly
+# rejects a conflicting canonical `__KEY`. Production and staging may select
+# the same or different physical stores through their `__NAME` selectors.
 #
 # The manifest is an absolute verified member of the immutable application
 # release. Publisher-owned app-config files remain confined beneath the selected
@@ -29,6 +27,7 @@ set -euo pipefail
 #   GITHUB_WORKSPACE                      required  confinement root
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__CONFIG_PUSH__STORE          optional  logical config-store id
+#   EDGEZERO__CONFIG_PUSH__KEY            deprecated; nonempty is rejected
 #   EDGEZERO__CONFIG_PUSH__MANIFEST       required  verified absolute release manifest
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG     optional  typed config file path (relative to the app dir)
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE optional  raw inline typed-config content (exclusive with APP_CONFIG)
@@ -65,12 +64,16 @@ main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local deploy_to="${EDGEZERO__DEPLOY__TO:-production}"
   local store="${EDGEZERO__CONFIG_PUSH__STORE:-}"
+  local deprecated_key="${EDGEZERO__CONFIG_PUSH__KEY:-}"
   local manifest="${EDGEZERO__CONFIG_PUSH__MANIFEST:-}"
   local app_config="${EDGEZERO__CONFIG_PUSH__APP_CONFIG:-}"
   local app_config_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE:-}"
   local no_env="${EDGEZERO__CONFIG_PUSH__NO_ENV:-false}"
   local inline_file=""
 
+  if [[ -n "$deprecated_key" ]]; then
+    fail "input 'key' is deprecated and unsupported; use EDGEZERO__STORES__CONFIG__<ID>__KEY"
+  fi
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_input application-manifest "$manifest"
   [[ "$manifest" == /* && -f "$manifest" && ! -L "$manifest" ]] ||

@@ -1,7 +1,8 @@
-use crate::manifest_definitions::{Manifest, StoreDeclaration};
+use crate::manifest_definitions::{LogLevel, Manifest, ResolvedLoggingConfig, StoreDeclaration};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -123,6 +124,59 @@ fn build_stores_tokens(manifest: &Manifest) -> TokenStream2 {
     }
 }
 
+fn logging_config_tokens(config: &ResolvedLoggingConfig) -> TokenStream2 {
+    let level = match config.level {
+        LogLevel::Trace => quote! { edgezero_core::manifest::LogLevel::Trace },
+        LogLevel::Debug => quote! { edgezero_core::manifest::LogLevel::Debug },
+        LogLevel::Info => quote! { edgezero_core::manifest::LogLevel::Info },
+        LogLevel::Warn => quote! { edgezero_core::manifest::LogLevel::Warn },
+        LogLevel::Error => quote! { edgezero_core::manifest::LogLevel::Error },
+        LogLevel::Off => quote! { edgezero_core::manifest::LogLevel::Off },
+    };
+    let endpoint = config.endpoint.as_ref().map_or_else(
+        || quote! { None },
+        |endpoint| {
+            let endpoint_literal = LitStr::new(endpoint, Span::call_site());
+            quote! { Some(#endpoint_literal.to_owned()) }
+        },
+    );
+    let echo_stdout = config.echo_stdout.map_or_else(
+        || quote! { None },
+        |echo_stdout| quote! { Some(#echo_stdout) },
+    );
+    quote! {
+        edgezero_core::manifest::ResolvedLoggingConfig {
+            echo_stdout: #echo_stdout,
+            endpoint: #endpoint,
+            level: #level,
+        }
+    }
+}
+
+fn build_logging_tokens(manifest: &Manifest) -> TokenStream2 {
+    let adapter_names = manifest
+        .adapters
+        .keys()
+        .chain(manifest.logging.adapters.keys())
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let arms = adapter_names.into_iter().map(|adapter| {
+        let adapter_lit = LitStr::new(adapter, Span::call_site());
+        let config = logging_config_tokens(&manifest.logging_or_default(adapter));
+        quote! {
+            if adapter.eq_ignore_ascii_case(#adapter_lit) {
+                return #config;
+            }
+        }
+    });
+    quote! {
+        fn logging_for(adapter: &str) -> edgezero_core::manifest::ResolvedLoggingConfig {
+            #(#arms)*
+            edgezero_core::manifest::ResolvedLoggingConfig::default()
+        }
+    }
+}
+
 fn build_middleware_tokens(manifest: &Manifest) -> Result<Vec<TokenStream2>, String> {
     manifest
         .app
@@ -206,6 +260,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
         Err(msg) => return quote!(compile_error!(#msg);).into(),
     };
     let stores_tokens = build_stores_tokens(&manifest);
+    let logging_tokens = build_logging_tokens(&manifest);
 
     let manifest_path_lit = LitStr::new(&manifest_path.to_string_lossy(), Span::call_site());
     let owns_logging_lit = args.owns_logging.unwrap_or(false);
@@ -236,6 +291,8 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
             fn owns_logging() -> bool {
                 #owns_logging_lit
             }
+
+            #logging_tokens
 
             fn name() -> &'static str {
                 #app_name_lit

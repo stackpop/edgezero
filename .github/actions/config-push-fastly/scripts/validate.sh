@@ -9,6 +9,7 @@ set -euo pipefail
 #   EDGEZERO__APP__RELEASE__SHA256_PRESENT  required  release digest presence flag
 #   EDGEZERO__FASTLY__API_TOKEN_PRESENT   required  "true" when fastly-api-token is non-empty
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
+#   EDGEZERO__CONFIG_PUSH__KEY            deprecated key input; nonempty is rejected
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../deploy-core/scripts/common.sh
@@ -18,6 +19,9 @@ main() {
   require_present app-release-archive "${EDGEZERO__APP__RELEASE__ARCHIVE_PRESENT:-}"
   require_present app-release-sha256 "${EDGEZERO__APP__RELEASE__SHA256_PRESENT:-}"
   require_present fastly-api-token "${EDGEZERO__FASTLY__API_TOKEN_PRESENT:-}"
+  if [[ -n "${EDGEZERO__CONFIG_PUSH__KEY:-}" ]]; then
+    fail "input 'key' is deprecated and unsupported; use EDGEZERO__STORES__CONFIG__<ID>__KEY"
+  fi
   local has_file="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_PRESENT:-false}"
   local has_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE_PRESENT:-false}"
   if [[ "$has_file" == "$has_inline" ]]; then
