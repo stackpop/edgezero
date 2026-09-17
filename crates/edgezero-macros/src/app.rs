@@ -158,11 +158,11 @@ fn build_logging_tokens(manifest: &Manifest) -> TokenStream2 {
         .adapters
         .keys()
         .chain(manifest.logging.adapters.keys())
-        .map(String::as_str)
+        .map(|adapter| adapter.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     let arms = adapter_names.into_iter().map(|adapter| {
-        let adapter_lit = LitStr::new(adapter, Span::call_site());
-        let config = logging_config_tokens(&manifest.logging_or_default(adapter));
+        let adapter_lit = LitStr::new(&adapter, Span::call_site());
+        let config = logging_config_tokens(&manifest.logging_or_default(&adapter));
         quote! {
             if adapter.eq_ignore_ascii_case(#adapter_lit) {
                 return #config;

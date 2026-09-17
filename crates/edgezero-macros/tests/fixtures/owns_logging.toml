@@ -1,6 +1,11 @@
 [app]
 name = "owns-logging-fixture"
 
+[logging.Fastly]
+endpoint = "global_logs"
+level = "error"
+echo_stdout = true
+
 [adapters.fastly.logging]
 endpoint = "fixture_logs"
 level = "debug"
