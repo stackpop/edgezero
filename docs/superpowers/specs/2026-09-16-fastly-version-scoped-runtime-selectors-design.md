@@ -15,7 +15,7 @@ therefore reads runtime settings from a Config Store linked under the stable
 alias `edgezero_runtime_env`.
 
 The current deployment work writes canonical selectors such as
-`EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME` into unscoped,
+`EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME` into unscoped,
 mutable entries. It also creates a mutable per-service staging selector store.
 That model has several correctness failures:
 
@@ -34,7 +34,7 @@ That model has several correctness failures:
 9. generic custom adapters with declared stores are forced to register solely
    because Fastly needs finalization;
 10. service-ID validation differs across actions; and
-11. the Trusted Server workflow example selects the requested domain directly
+11. the application workflow example selects the requested domain directly
     instead of the validated GitHub Environment name.
 
 Green CI does not prove these properties because the existing fakes do not model
@@ -129,9 +129,9 @@ The value is a versioned JSON object:
 {
   "format": 1,
   "entries": {
-    "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME": "ts_config_staging",
-    "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY": "trusted_server_config_staging",
-    "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME": "ts_secrets_staging"
+    "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME": "config-stage",
+    "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY": "app_config_staging",
+    "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME": "credentials-stage"
   }
 }
 ```
@@ -481,7 +481,7 @@ positional arguments are rejected. A manifest command may keep its other custom
 arguments after the universal reserved-flag scan because EdgeZero does not
 reinterpret that command's private interface.
 
-## 11. Trusted Server deployer documentation
+## 11. Application deployer documentation
 
 The workflow preflight job validates the requested domain and emits the exact
 GitHub Environment name. The deploy job uses that output:
@@ -492,20 +492,20 @@ jobs:
     needs: preflight
     environment: ${{ needs.preflight.outputs.environment }}
     env:
-      EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME: ${{ vars.EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME }}
-      EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME: ${{ vars.EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME }}
+      EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: ${{ vars.EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME }}
+      EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: ${{ vars.EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME }}
 ```
 
-`inputs.domain` remains the actual Fastly domain and healthcheck hostname. For
-the Trusted Server deployer, preflight maps `ts.example.com` to production and
-`staging.ts.example.com` to staging.
+`inputs.domain` remains the actual Fastly domain and healthcheck hostname. The
+deployer preflight maps `app.example.com` to production and
+`staging.app.example.com` to staging.
 
-The Trusted Server release pipeline publishes one archive and SHA-256 for each
-approved Trusted Server source revision. The deployer resolves the requested
-Trusted Server release to that immutable archive before selecting the GitHub
-Environment. The archive path and digest are not GitHub Environment variables
-and cannot be overridden per publisher. Production and staging jobs then supply
-their own canonical runtime variables while deploying the same package digest.
+The application release pipeline publishes one archive and SHA-256 for each
+approved source revision. The deployer resolves the requested application release
+to that immutable archive before selecting the GitHub Environment. The archive
+path and digest are not GitHub Environment variables and cannot be overridden per
+publisher. Production and staging jobs then supply their own canonical runtime
+variables while deploying the same package digest.
 
 ## 12. Error handling
 

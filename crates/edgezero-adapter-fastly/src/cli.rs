@@ -5430,7 +5430,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 //
 // These entry points back the `deploy --staging`, `healthcheck`, and
 // `rollback` app-CLI subcommands. They mirror the Fastly semantics of
-// `stackpop/trusted-server-actions`:
+// EdgeZero's Fastly lifecycle actions:
 //
 //   * staged deploy  → build + `compute update --autoclone` (no
 //     activation) + `service-version stage`; emits the staged version.
@@ -5446,8 +5446,8 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 // logger emits verbatim). The `deploy-fastly` action greps that line
 // to surface `fastly-version`. Rollback prints `rolled-back-to=<N>`.
 //
-// Provider HTTP calls shell out to `curl` (matching
-// trusted-server-actions and avoiding a WASM-incompatible HTTP client
+// Provider HTTP calls shell out to `curl` (matching the lifecycle action
+// conventions and avoiding a WASM-incompatible HTTP client
 // in the adapter). The `FASTLY_API_TOKEN` is passed to `curl` via a
 // `--config -` stdin file rather than on argv, so it never appears in
 // `ps` / `/proc/<pid>/cmdline` (same discipline as
@@ -11907,7 +11907,7 @@ build = \"cargo build --release\"
     fn provision_uses_fastly_service_id_environment_fallback_for_link_note() {
         let selected = select_fastly_service_id(None, Some("envservice".to_owned()))
             .expect("select environment service id");
-        let note = resource_link_note(selected.as_ref(), "secret", "trusted_server_secrets")
+        let note = resource_link_note(selected.as_ref(), "secret", "credentials")
             .expect("environment service produces a link note");
         assert!(
             note.contains("`FASTLY_SERVICE_ID` selects service `envservice`")

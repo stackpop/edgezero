@@ -988,7 +988,7 @@ operators may remove inert old entries/twins separately. Describe the clean cuto
 for a source without a version descriptor. Preserve optional Secret Store declarations
 and `__NAME` examples without including secret values.
 
-- [ ] **Step 3: Correct the Trusted Server workflow example**
+- [ ] **Step 3: Correct the application workflow example**
 
 Show a preflight job that validates the requested domain and emits the exact GitHub
 Environment name. The deploy job must use:
@@ -998,10 +998,10 @@ needs: preflight
 environment: ${{ needs.preflight.outputs.environment }}
 ```
 
-Map `ts.example.com` to production and `staging.ts.example.com` to staging while
+Map `app.example.com` to production and `staging.app.example.com` to staging while
 keeping `inputs.domain` as the actual Fastly/healthcheck hostname.
 
-Show Trusted Server selecting one immutable application release by source revision and
+Show the deployer selecting one immutable application release by source revision and
 digest before choosing the GitHub Environment. Its release artifact supplies the exact
 package, `edgezero.toml`, and Fastly manifest for every publisher and for both staging
 and production. It also supplies the same application CLI to deploy, config push,
@@ -1009,11 +1009,11 @@ healthcheck, and rollback. The deployer supplies no build flags or alternate man
 Canonical runtime variables still come from the selected GitHub Environment and may
 differ.
 
-Document the producer/consumer split explicitly: the Trusted Server application release
-pipeline builds and publishes the archive once without a GitHub Environment or provider
-credential; `trusted-server-deployer` downloads that archive and verifies its pinned
-digest, and never checks out or rebuilds Trusted Server application source. The release
-reference/digest is app-release data and cannot come from a publisher GitHub Environment.
+Document the producer/consumer split explicitly: the application release pipeline builds
+and publishes the archive once without a GitHub Environment or provider credential; the
+deployer downloads that archive and verifies its pinned digest, and never checks out or
+rebuilds application source. The application release reference and digest are app-release
+data and cannot come from a publisher GitHub Environment.
 
 Add a persistent action/docs contract test in `deploy-core/tests/run.sh` that requires
 the example to contain both

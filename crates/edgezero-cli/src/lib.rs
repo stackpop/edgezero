@@ -1207,7 +1207,7 @@ deploy = "touch '{}'"
         fs::write(
             &manifest_path,
             format!(
-                "[app]\nname = \"demo-app\"\n\n[stores.secrets]\nids = [\"trusted_server_secrets\"]\n\n[adapters.fastly.adapter]\ncrate = \"crates/demo-fastly\"\nmanifest = \"crates/demo-fastly/fastly.toml\"\n\n[adapters.fastly.commands]\ndeploy = \"{}\"\n",
+                "[app]\nname = \"demo-app\"\n\n[stores.secrets]\nids = [\"credentials\"]\n\n[adapters.fastly.adapter]\ncrate = \"crates/demo-fastly\"\nmanifest = \"crates/demo-fastly/fastly.toml\"\n\n[adapters.fastly.commands]\ndeploy = \"{}\"\n",
                 deploy_script.display()
             ),
         )
@@ -1215,8 +1215,8 @@ deploy = "touch '{}'"
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _manifest = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
         let _selector = EnvOverride::set(
-            "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
-            "ts_secrets_staging",
+            "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME",
+            "credentials-staging",
         );
 
         let error = run_deploy(&DeployArgs {
