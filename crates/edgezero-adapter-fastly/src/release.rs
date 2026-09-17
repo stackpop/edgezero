@@ -44,10 +44,10 @@ pub(crate) struct VerifiedApplicationRelease {
 }
 
 #[cfg_attr(
-    not(test),
+    any(not(test), target_arch = "wasm32"),
     expect(
         dead_code,
-        reason = "Task 5 records every verified release member for Task 6 consumption"
+        reason = "release verification records every member; host-only tests audit their exact bytes"
     )
 )]
 impl VerifiedApplicationRelease {

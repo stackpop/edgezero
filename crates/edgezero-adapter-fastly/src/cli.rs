@@ -308,10 +308,10 @@ enum EditableVersionSource {
 
 #[derive(Debug)]
 #[cfg_attr(
-    not(test),
+    any(not(test), target_arch = "wasm32"),
     expect(
         dead_code,
-        reason = "the plan retains validated preflight evidence used by tests and later reconciliation audits"
+        reason = "the plan retains validated preflight evidence used by host-only tests and later reconciliation audits"
     )
 )]
 struct ManagedDeployPlan {
@@ -1577,7 +1577,7 @@ fn parse_resource_links(
     Ok((links, snapshot))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn read_exact_prior_descriptor(
     store_id: &str,
     key: &str,
@@ -6594,6 +6594,7 @@ mod tests {
     #[cfg(unix)]
     use edgezero_core::test_env::{EnvOverride, PathPrepend};
     use std::collections::{BTreeMap, HashSet};
+    #[cfg(unix)]
     use std::iter::once;
 
     #[cfg(unix)]
@@ -6826,6 +6827,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_deploy_requires_application_release_before_provider_mutation() {
         let _lock = path_mutation_guard().lock().expect("guard");
