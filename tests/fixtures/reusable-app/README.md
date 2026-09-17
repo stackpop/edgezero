@@ -107,7 +107,9 @@ preservation and isolation rather than merely setting a constant header.
 - A: original single-request helper.
 - B: `Serve`, once-only logging, app construction on each callback.
 - C: production retained-app helper.
-- Custom A/B/C: raw request mutation/conversion, response-extension finalization,
+- Custom A/B/C: EdgeZero `lifecycle::run_custom` / `serve_custom` and `Sandbox<App>`
+  own the serving boundary and successful-only initialization. Arm B uses a fresh
+  state slot per callback; C uses the retained slot. Raw request mutation/conversion, response-extension finalization,
   appended headers, progressive stream pumping with explicit flush/finish, and
   completed post-send work.
 

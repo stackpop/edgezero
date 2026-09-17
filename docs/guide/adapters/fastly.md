@@ -348,9 +348,10 @@ remain sandbox failures.
 
 The standard helper collects core response streams into a native response body.
 For progressive client streaming, mutable native requests, response-extension
-finalization, or post-send work, use `Serve::run` or `run_with_context` directly.
-Capture an ordinary `Option<App>` or an application-owned initialized-state value
-inside the callback. Initialize lazily so health checks can bypass expensive
+finalization, or post-send work, use `lifecycle::serve_custom` with a configured
+`Serve` builder and a callback receiving `&mut lifecycle::Sandbox<T>`. EdgeZero
+owns the retained slot and successful-only initialization; your callback chooses
+the application-owned `T`. Initialize lazily so health checks can bypass expensive
 construction. Use `runtime_env_config` and `request::dispatch_with_registries`
 when standard translation suffices; otherwise retain the existing raw
 `into_core_request` and router dispatch path.
@@ -369,11 +370,38 @@ not retain correlation fields in app state or global logger configuration.
 ### Custom lifecycle compatibility contract
 
 The custom path is a supported interface, not a requirement to use `serve_app`.
-It combines SDK `Serve::run` or `run_with_context`, public
-`request::into_core_request`, and `App::router().oneshot`. The SDK owns the
-receive loop and host limits; EdgeZero owns request conversion and router
-dispatch. The application owns which state survives, initialization retries,
-logging, configuration refresh, response finalization, and explicit sending.
+It combines `lifecycle::serve_custom`, public `request::into_core_request`, and
+`App::router().oneshot`. EdgeZero delegates the receive loop and limits to the SDK,
+owns the state slot, attempted-callback count, initialization-attempt count, and
+successful setup guard. The application owns the limit configuration, which state
+survives, initialization and setup closures, error responses, logging policy,
+configuration refresh, response finalization, and explicit sending. Direct SDK
+serving remains available when these helpers do not fit.
+
+`Sandbox::initialize` invokes its builder only while empty. It returns `Result<(), E>`
+without constraining `E`: an error may carry a fallback router for this request.
+Read the retained value afterward using `state()`. `setup_once` has an independent
+success guard, so application retries do not repeat successful logger installation.
+Failed setup must be safe to retry; partial side effects are not rolled back.
+Neither method catches panics. `requests()` includes the current callback and
+early-return probes; `initialization_attempts()` counts only actual builder calls.
+
+For example, inside a callback after its health checks:
+
+```rust,ignore
+sandbox.setup_once(|| install_application_logger())?;
+let fallback = sandbox.initialize(|| build_application()).err();
+// build_application returns Ok(retained_state) or Err(request_local_error_router).
+// Select fallback.as_ref() or sandbox.state(), then dispatch and explicitly send.
+```
+
+Use `lifecycle::run_custom(Request::from_client(), callback)` for the single-request
+branch. It creates fresh state and does not enter `Serve` or call `next_request`.
+Both wrappers complete the SDK `HandlerResult` exactly once. Use an ordinary
+`fn main`, not `#[fastly::main]`, which could attempt another error response when
+an already-completed error propagates. Manually sending callbacks can return `()`
+or `Result<(), E>`; after response commitment, handle failures locally and return
+`() / Ok(())`. The wrappers never convert or collect the callback's response body.
 
 Retain only successfully initialized state. A handled initialization failure
 may send an error response and return `()` (or `Ok(())`) to allow another
@@ -399,7 +427,7 @@ EdgeZero revision, run the existing compatibility suite against that checkout:
 ```
 
 The standalone fixture workspace depends on this checkout by path. Its custom
-entry points exercise lazy health bypass, failed initialization followed by
+entry points use these lifecycle helpers and exercise lazy health bypass, failed initialization followed by
 successful retry and reuse, request-specific response extensions, progressive
 streaming, duplicate cookies, and post-commit error handling. The runner records
 runtime versions and artifact identities. Recovery only passes when all required

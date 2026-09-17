@@ -108,15 +108,9 @@ pub fn rebuilt() -> Result<(), Error> {
     }))
 }
 
-#[derive(Default)]
-struct CustomState {
-    app: Option<App>,
-    attempts: usize,
-}
-
 fn custom_dispatch(
     mut req: Request,
-    state: &mut CustomState,
+    sandbox: &mut edgezero_adapter_fastly::lifecycle::Sandbox<App>,
     reuse_app: bool,
 ) -> Result<(), Error> {
     let token = req
@@ -124,14 +118,18 @@ fn custom_dispatch(
         .unwrap_or("missing")
         .to_owned();
     let observation = observation(&req);
+    assert_eq!(sandbox.requests(), observation.ordinal as u64);
     if req.get_path() == "/panic" {
         panic!("injected callback panic");
     }
     if req.get_path() == "/health" {
         Response::from_status(200)
-            .with_header("x-fixture-attempts", state.attempts.to_string())
+            .with_header(
+                "x-fixture-attempts",
+                sandbox.initialization_attempts().to_string(),
+            )
             .with_body_json(&serde_json::json!({"instance":observation.instance,
-                "ordinal":observation.ordinal,"retained":state.app.is_some()}))?
+                "ordinal":observation.ordinal,"retained":sandbox.state().is_some()}))?
             .send_to_client();
         return Ok(());
     }
@@ -141,28 +139,32 @@ fn custom_dispatch(
     req.set_header("x-fixture-mutated", "true");
     if req.get_path() == "/constructor-panic" {
         PANIC_IN_CONSTRUCTOR.store(true, Ordering::SeqCst);
-        state.app = None;
     }
-    if !reuse_app || state.app.is_none() {
-        state.attempts += 1;
-        // A deterministic fallible constructor seam. Publish only success;
-        // the failed attempt serves this request without terminating the loop.
-        let built = if req.get_path() == "/initialization-error" {
+    // Arm B deliberately scopes application state to the current callback.
+    // The panic fixture also needs a fresh constructor even after initialization.
+    let mut per_request = edgezero_adapter_fastly::lifecycle::Sandbox::default();
+    let state = if reuse_app && req.get_path() != "/constructor-panic" {
+        sandbox
+    } else {
+        &mut per_request
+    };
+    let result = state.initialize(|| {
+        if req.get_path() == "/initialization-error" {
             Err(Error::msg("injected initialization failure"))
         } else {
             Ok(MeasuredApp::build_app())
-        };
-        match built {
-            Ok(app) => state.app = Some(app),
-            Err(_) => {
-                Response::from_status(503)
-                    .with_header("x-fixture-attempts", state.attempts.to_string())
-                    .with_body_json(&serde_json::json!({"instance":observation.instance,
-                        "ordinal":observation.ordinal,"retained":state.app.is_some()}))?
-                    .send_to_client();
-                return Ok(());
-            }
         }
+    });
+    if result.is_err() {
+        Response::from_status(503)
+            .with_header(
+                "x-fixture-attempts",
+                state.initialization_attempts().to_string(),
+            )
+            .with_body_json(&serde_json::json!({"instance":observation.instance,
+                        "ordinal":observation.ordinal,"retained":state.state().is_some()}))?
+            .send_to_client();
+        return Ok(());
     }
     initialized(&observation, &token);
     let mut core = edgezero_adapter_fastly::request::into_core_request(req)?;
@@ -171,7 +173,7 @@ fn custom_dispatch(
         .extensions()
         .get::<edgezero_core::proxy::ProxyHandle>()
         .cloned();
-    let mut response = block_on(state.app.as_ref().unwrap().router().oneshot(core))?;
+    let mut response = block_on(state.state().unwrap().router().oneshot(core))?;
     if let Some(fixture_core::Finalize(value)) =
         response.extensions_mut().remove::<fixture_core::Finalize>()
     {
@@ -181,7 +183,10 @@ fn custom_dispatch(
     }
     let (parts, body) = response.into_parts();
     let mut native = Response::from_status(parts.status.as_u16());
-    native.set_header("x-fixture-attempts", state.attempts.to_string());
+    native.set_header(
+        "x-fixture-attempts",
+        state.initialization_attempts().to_string(),
+    );
     for (name, value) in &parts.headers {
         native.append_header(name.as_str(), value.as_bytes());
     }
@@ -260,11 +265,15 @@ fn custom_dispatch(
     Ok(())
 }
 pub fn custom(reuse_sandbox: bool, reuse_app: bool) -> Result<(), Error> {
-    let mut state = CustomState::default();
     if reuse_sandbox {
-        finish(serving().run(move |req| custom_dispatch(req, &mut state, reuse_app)))
+        finish(edgezero_adapter_fastly::lifecycle::serve_custom(
+            serving(),
+            move |req, state| custom_dispatch(req, state, reuse_app),
+        ))
     } else {
-        custom_dispatch(Request::from_client(), &mut state, false)
+        edgezero_adapter_fastly::lifecycle::run_custom(Request::from_client(), |req, state| {
+            custom_dispatch(req, state, false)
+        })
     }
 }
 

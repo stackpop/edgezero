@@ -21,6 +21,7 @@ pub mod config_store;
 pub mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
+pub mod lifecycle;
 #[cfg(feature = "fastly")]
 pub mod logger;
 #[cfg(feature = "fastly")]

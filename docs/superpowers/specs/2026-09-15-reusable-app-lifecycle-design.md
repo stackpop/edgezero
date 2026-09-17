@@ -143,7 +143,7 @@ The example deliberately uses ordinary `main`, not `#[fastly::main]`. Existing g
 
 ### 4.3 Fastly custom lifecycle
 
-Use re-exported `Serve::run` or `run_with_context` directly. Preserve access to the SDK's `HandlerResult` trait through its existing SDK path; a new framework callback trait is unnecessary.
+Use `lifecycle::serve_custom(Serve, callback)` for EdgeZero-owned custom lifecycle mechanics, or direct SDK serving as an escape hatch. Preserve access to the SDK's `HandlerResult` trait through its existing SDK path; a new framework callback trait is unnecessary.
 
 A callback receives an owned native request and may mutate it, capture metadata, convert it with `request::into_core_request`, dispatch through a retained router, inspect core response extensions, finalize the response, send or stream it explicitly, and finish request-owned post-send work before returning.
 
@@ -151,7 +151,7 @@ Applications may capture retained state in a closure or pass it through `run_wit
 
 Existing public `runtime_env_config` and `request::dispatch_with_registries` remain the complete prebuilt-app path when standard response translation is appropriate. The immutable extensions callback is not a substitute for mutable raw-request custom dispatch.
 
-No framework-owned application-state object, teardown hook, or response-finalization pipeline is introduced.
+The custom lifecycle extension adds `lifecycle::Sandbox<T>`: an application-owned payload in a framework-owned successful-only slot, attempted-callback and initialization counters, and an independent successful setup guard. `initialize` returns errors unchanged and leaves the slot empty so a later call can retry; applications decide whether to respond and continue. `run_custom` creates fresh state for a single received request without entering `Serve`. Both wrappers complete `HandlerResult` exactly once. State decision logic is feature-independent for host tests; SDK wrappers require `fastly`. No teardown hook or response-finalization pipeline is introduced. Default generated entry points remain unchanged.
 
 ### 4.4 Cloudflare and Spin prebuilt dispatch
 
