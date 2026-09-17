@@ -2792,9 +2792,9 @@ test_fastly_version_scoped_documentation() {
   assert_fails "example never treats a hostname as a GitHub Environment name" \
     grep -Fq 'environment: ${{ inputs.domain }}' "$example_workflow"
   assert_succeeds "example preflight derives the production Environment from the real hostname" \
-    grep -Fq 'production) environment="$DOMAIN"' "$adoption"
+    grep -Fq "production) environment=\"\$DOMAIN\"" "$adoption"
   assert_succeeds "example preflight prefixes only the staging Environment identifier" \
-    grep -Fq 'staging) environment="staging.$DOMAIN"' "$adoption"
+    grep -Fq "staging) environment=\"staging.\$DOMAIN\"" "$adoption"
   assert_succeeds "example keeps one real application domain across both targets" \
     grep -Fq 'hostname passed to healthcheck for both targets' "$adoption"
   assert_succeeds "release identity is selected before the publisher environment" \
