@@ -112,7 +112,10 @@ impl Records {
         Ok(())
     }
     fn push(&mut self, v: Value) -> Result<()> {
-        if matches!(v["status"].as_str(), Some("fail" | "unverified" | "unsupported")) {
+        if matches!(
+            v["status"].as_str(),
+            Some("fail" | "unverified" | "unsupported")
+        ) {
             eprintln!("fixture-harness: {v}");
         }
         writeln!(

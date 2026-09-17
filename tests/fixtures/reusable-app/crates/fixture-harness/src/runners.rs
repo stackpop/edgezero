@@ -21,6 +21,69 @@ fn fastly_command(exe: &Path, config: &Path, variant: &str, port: u16) -> Comman
         .arg(wasm(variant));
     cmd
 }
+
+fn custom_initialization_contract(
+    exe: &Path,
+    config: &Path,
+    run: &Path,
+    records: &mut Records,
+) -> Result<()> {
+    let port = net::port()?;
+    let process = Process::start(
+        &mut fastly_command(exe, config, "custom-c", port),
+        &run.join("custom-initialization.log"),
+        port,
+    )?;
+    let outcome = (|| -> Result<()> {
+        let mut instances = Vec::new();
+        for (path, status, attempts, initialized) in [
+            ("/health", 200, 0, false),
+            ("/initialization-error", 503, 1, false),
+            ("/health", 200, 1, false),
+            ("/probe/recovered", 200, 2, true),
+            ("/probe/retained", 200, 2, true),
+        ] {
+            let reply = req(port, path)?;
+            require(
+                reply["status"] == status,
+                "custom initialization status mismatch",
+            )?;
+            let value: Value = serde_json::from_str(reply["body"].as_str().ok_or("missing body")?)?;
+            instances.push(value["instance"].clone());
+            let same_instance = instances.iter().all(|id| id == &instances[0]);
+            if same_instance {
+                require(
+                    value["ordinal"] == instances.len(),
+                    "recovery ordinal mismatch",
+                )?;
+                if initialized {
+                    require(value["builds"] == 1, "recovered application was rebuilt")?;
+                } else {
+                    require(
+                        value["retained"] == false,
+                        "health or failure retained an app",
+                    )?;
+                }
+                require(
+                    reply["headers"].as_array().unwrap().iter().any(|h| {
+                        h[0].as_str()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("x-fixture-attempts"))
+                            && h[1].as_str().and_then(|v| v.parse::<u64>().ok()) == Some(attempts)
+                    }),
+                    "lazy build attempt count mismatch",
+                )?;
+            }
+            records.push(annotate(
+                reply,
+                json!({"variant":"custom-initialization", "guest":value}),
+            ))?;
+        }
+        records.push(json!({"assertion":"custom_lazy_initialization_recovery", "status":if instances.iter().all(|id| id == &instances[0]) {"pass"} else {"unverified"}, "reason":"recovery requires all five callbacks in the same guest"}))
+    })();
+    drop(process);
+    outcome
+}
+
 pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
     let Some(exe) = executable("VICEROY_BIN", "viceroy") else {
         return records.push(json!({"status":"unsupported","reason":"Viceroy unavailable"}));
@@ -47,6 +110,9 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
         root().join("crates/fixture-fastly/fastly.toml"),
         &config_snapshot,
     )?;
+    if args.suite == "smoke" {
+        custom_initialization_contract(&exe, &config_snapshot, run, records)?;
+    }
     let mut variants = vec!["a", "b", "c", "custom-a", "custom-b", "custom-c"];
     if args.suite == "smoke" {
         variants.extend(["limit-requests", "limit-lifetime", "limit-memory"]);
@@ -105,6 +171,16 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
                         value["mutated"] == variant.starts_with("custom-"),
                         "raw request mutation mismatch",
                     )?;
+                    if variant.starts_with("custom-") {
+                        require(
+                            reply["headers"].as_array().unwrap().iter().any(|h| {
+                                h[0].as_str().is_some_and(|name| {
+                                    name.eq_ignore_ascii_case("x-fixture-finalized")
+                                }) && h[1] == token
+                            }),
+                            "request-specific response extension was lost or leaked",
+                        )?;
+                    }
                     match *variant {
                         "c" | "custom-c" => require(
                             value["ordinal"]
@@ -186,7 +262,7 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
                         stream["headers"].as_array().unwrap().iter().any(|h| {
                             h[0].as_str()
                                 .is_some_and(|s| s.eq_ignore_ascii_case("x-fixture-finalized"))
-                                && h[1] == "true"
+                                && h[1] == token
                         }),
                         "response not finalized",
                     )?;

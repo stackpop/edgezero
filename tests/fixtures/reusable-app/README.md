@@ -94,6 +94,16 @@ crash are not zero attempted requests.
 
 ## Fastly comparisons
 
+The provider/application boundary is documented in
+[`Custom lifecycle compatibility contract`](../../../docs/guide/adapters/fastly.md#custom-lifecycle-compatibility-contract).
+This workspace uses path dependencies on the checkout under test. The Fastly
+smoke suite additionally runs a fresh custom guest through health, a handled
+initialization failure, another health request, successful initialization, and
+retained reuse. The sequence must share one guest to establish recovery; early
+guest retirement is reported as unverified. Router-produced finalization metadata
+carries each request's token, so finalization also checks response-extension
+preservation and isolation rather than merely setting a constant header.
+
 - A: original single-request helper.
 - B: `Serve`, once-only logging, app construction on each callback.
 - C: production retained-app helper.
@@ -162,10 +172,10 @@ are separate comparisons. Values are client completion p50 in milliseconds for
 reused guests; each cell contains 249 samples. Each variant also has 51 cold
 samples (A has 300 cold samples and no reused samples).
 
-| Construction | Standard B | Standard C | Custom B | Custom C |
-| --- | ---: | ---: | ---: | ---: |
-| Cheap (`--construction-rounds 0`) | 0.232 | 0.197 | 0.225 | 0.194 |
-| Synthetic expensive (`--construction-rounds 10000`) | 7.698 | 0.208 | 7.667 | 0.204 |
+| Construction                                        | Standard B | Standard C | Custom B | Custom C |
+| --------------------------------------------------- | ---------: | ---------: | -------: | -------: |
+| Cheap (`--construction-rounds 0`)                   |      0.232 |      0.197 |    0.225 |    0.194 |
+| Synthetic expensive (`--construction-rounds 10000`) |      7.698 |      0.208 |    7.667 |    0.204 |
 
 Evidence directories: `18d5774746f44488-d6d5-0` and
 `18d57754ea36d748-e01c-0`. B rebuilt on each callback; C initialized once per
@@ -230,13 +240,13 @@ absence of small leaks or bounded growth for an arbitrary application.
 
 These are explicitly unverified, not assertions counted as passed:
 
-| Case | Available evidence / limitation |
-| --- | --- |
-| Optional runtime-store open fails, then recovers in the same guest | Production host tests inject degraded then successful configuration snapshots; actual required-registry recovery is exercised above. The fixed optional store has no transient-open-failure control in the inspected local runtime. |
-| `EdgeError` itself fails to render | The current renderer builds fixed valid statuses/headers from JSON values. Its fallible signature remains preserved, but there is no public input or injection hook that triggers this failure. OOM/traps would not demonstrate a returned rendering error. |
-| Unavailable heap hostcall | The installed runtime supplies it. Preflight and fallback are implemented; no documented fault-injection control was found to demonstrate unavailable-hostcall behavior. |
-| Full standard callback/send/cleanup timing | The public retained helper has no post-send callback. Conversion observations and SDK summary timing are labeled separately; unavailable phases stay unknown. |
-| Deployed eviction, endpoint handles, resource accounting, capacity, and workload gains | Require separately authorized deployment and application telemetry. Local CPU samples are not cross-run CPU benchmarks; finite origin tests do not establish service-wide capacity. |
+| Case                                                                                   | Available evidence / limitation                                                                                                                                                                                                                             |
+| -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Optional runtime-store open fails, then recovers in the same guest                     | Production host tests inject degraded then successful configuration snapshots; actual required-registry recovery is exercised above. The fixed optional store has no transient-open-failure control in the inspected local runtime.                         |
+| `EdgeError` itself fails to render                                                     | The current renderer builds fixed valid statuses/headers from JSON values. Its fallible signature remains preserved, but there is no public input or injection hook that triggers this failure. OOM/traps would not demonstrate a returned rendering error. |
+| Unavailable heap hostcall                                                              | The installed runtime supplies it. Preflight and fallback are implemented; no documented fault-injection control was found to demonstrate unavailable-hostcall behavior.                                                                                    |
+| Full standard callback/send/cleanup timing                                             | The public retained helper has no post-send callback. Conversion observations and SDK summary timing are labeled separately; unavailable phases stay unknown.                                                                                               |
+| Deployed eviction, endpoint handles, resource accounting, capacity, and workload gains | Require separately authorized deployment and application telemetry. Local CPU samples are not cross-run CPU benchmarks; finite origin tests do not establish service-wide capacity.                                                                         |
 
 No deployment is performed by these fixtures.
 

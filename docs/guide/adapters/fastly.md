@@ -366,6 +366,51 @@ describes the sandbox and must not be treated as a unique request ID. If a nativ
 ID is unavailable, generate a request-local fallback and label its source. Do
 not retain correlation fields in app state or global logger configuration.
 
+### Custom lifecycle compatibility contract
+
+The custom path is a supported interface, not a requirement to use `serve_app`.
+It combines SDK `Serve::run` or `run_with_context`, public
+`request::into_core_request`, and `App::router().oneshot`. The SDK owns the
+receive loop and host limits; EdgeZero owns request conversion and router
+dispatch. The application owns which state survives, initialization retries,
+logging, configuration refresh, response finalization, and explicit sending.
+
+Retain only successfully initialized state. A handled initialization failure
+may send an error response and return `()` (or `Ok(())`) to allow another
+callback to retry. Do not put an error router into the retained slot. Check
+health routes before initialization. Guard successful global logger installation
+separately: retrying application initialization must not reinstall the logger.
+Constructor panics are sandbox failures, not recoverable initialization results.
+The standard helper's terminal error policy is unchanged.
+
+Every callback gets fresh request extensions, metadata, native handles, and
+bodies. Mutable parsing buffers belong to a request or document, even when their
+rewriter is referenced by a retained router. Response extensions produced by
+handlers remain available after direct router dispatch; inspect them before
+sending. Registry-aware `dispatch_with_registries` performs standard response
+conversion and is not a streaming/finalization substitute.
+
+Pin the adapter, core, and SDK to compatible versions. Do not repin merely to
+replace the SDK's `Serve` import with its EdgeZero re-export. When adopting a new
+EdgeZero revision, run the existing compatibility suite against that checkout:
+
+```sh
+./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime
+```
+
+The standalone fixture workspace depends on this checkout by path. Its custom
+entry points exercise lazy health bypass, failed initialization followed by
+successful retry and reuse, request-specific response extensions, progressive
+streaming, duplicate cookies, and post-commit error handling. The runner records
+runtime versions and artifact identities. Recovery only passes when all required
+callbacks are observed in the same guest. An unavailable runtime or missing
+reuse is unverified, not a compatibility pass. Run the corresponding adapter
+suites when using Cloudflare, Spin, or Axum; their host lifetimes differ.
+
+Application-specific refresh, key rotation, and workload validation remain the
+application's responsibility. Passing local fixtures does not guarantee reuse
+or establish deployed resource lifetimes.
+
 Warning caches persist too. Their bounded recent-name sets can evict entries,
 so warnings can recur; suppressed warning counts are not failure counts.
 Dynamic-backend capacity is service-wide, and registrations may wait for capacity.

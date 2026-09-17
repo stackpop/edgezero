@@ -74,6 +74,10 @@ pub struct ResponseLifetime(
     pub Arc<std::sync::atomic::AtomicBool>,
 );
 
+/// Request-specific finalization data produced inside the router.
+#[derive(Clone)]
+pub struct Finalize(pub String);
+
 #[derive(Clone)]
 pub struct Observation {
     pub instance: String,
@@ -324,7 +328,16 @@ impl edgezero_core::middleware::Middleware for ObserveRequest {
             .extensions()
             .get::<ResponseLifetime>()
             .cloned();
+        let finalization = Finalize(
+            ctx.request()
+                .headers()
+                .get("x-request-token")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing")
+                .to_owned(),
+        );
         let mut response = next.run(ctx).await?;
+        response.extensions_mut().insert(finalization);
         if let Some(lifetime) = lifetime {
             lifetime.1.store(true, Ordering::SeqCst);
             response.extensions_mut().insert(lifetime);
