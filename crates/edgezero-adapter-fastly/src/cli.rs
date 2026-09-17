@@ -7823,7 +7823,7 @@ mod tests {
             .expect_err("present invalid selector must fail");
             assert!(
                 error.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"),
-                "{error}"
+                "invalid selector error must name its canonical variable"
             );
         }
     }
