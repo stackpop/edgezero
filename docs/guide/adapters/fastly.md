@@ -226,10 +226,8 @@ Before publication, EdgeZero:
 8. stages or activates the prepared version without another EdgeZero mutation.
 
 Production and staging can select different physical resources while deploying
-identical package bytes. Secret Stores remain optional. The only automatic
-legacy cleanup removes an undeclared Config link whose alias and physical store
-are both exactly `edgezero_runtime_env`; the account-wide store is retained for
-older versions.
+identical package bytes. Secret Stores remain optional. Links the application
+does not declare are preserved.
 
 ### Declaring and using stores
 

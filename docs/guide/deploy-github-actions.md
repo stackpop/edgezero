@@ -45,8 +45,9 @@ adapter/fastly.toml
 
 The four member paths are release metadata, so another release may arrange them
 differently. `release.json` records `format: 1`, the 40- or 64-character lowercase
-hexadecimal source revision, adapter `fastly`, and the relative path and SHA-256
-for each file. Verification rejects unknown or duplicate fields, unsafe paths,
+hexadecimal source revision, adapter `fastly`, required
+`lifecycle_protocol: 1`, and the relative path and SHA-256 for each file.
+Verification rejects unknown or duplicate fields, unsafe paths,
 symlinks, extra files or directories, digest mismatches, and manifests that do
 not match the application's recorded manifest relationship. The deployer cannot
 substitute a package or manifest after verification.
@@ -74,6 +75,9 @@ jobs:
         with:
           name: ${{ needs.release.outputs.artifact }}
           path: app-release
+          run-id: ${{ needs.release.outputs.run-id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
 
       - id: deploy
         uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
@@ -144,11 +148,9 @@ provider-visible package identity immediately before staging or activation.
 Any lookup, malformed inventory, changed source, package mismatch, or readback
 failure stops publication.
 
-The PR #344 runtime descriptor and service-scoped selector keys are unsupported.
-Deploy removes only the exact inherited legacy Config link whose alias and
-physical store are both `edgezero_runtime_env`; it leaves the account-wide store
-for older versions and rollback. Operators may remove that store after no older
-version depends on it.
+Runtime descriptors and service-scoped selector keys are unsupported. Managed
+deploy reconciles only the stores declared by the application and preserves all
+other inherited resource links.
 
 ## Staging, healthcheck, and rollback
 
@@ -300,6 +302,13 @@ action wrapper accepts only `--comment` for a version comment. A direct managed
 CLI invocation also accepts the non-targeting global booleans listed in the CLI
 reference. Unsupported, duplicated, positional, or malformed arguments fail
 before provider mutation.
+
+## Runner requirements
+
+The actions are tested on `ubuntu-latest`. A self-hosted runner must be Linux
+x86-64 and provide Bash, `jq`, Python 3, `tar`, `curl`, `git`, `base64`,
+`realpath`, and either `sha256sum` or `shasum`. The application CLI archive must
+contain a Linux x86-64 executable.
 
 ## Security and concurrency
 

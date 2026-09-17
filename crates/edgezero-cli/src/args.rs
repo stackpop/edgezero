@@ -473,10 +473,9 @@ pub struct ConfigDiffArgs {
     /// Path to the adapter's runtime configuration file.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
-    /// Diff against the canonical runtime key selected by
-    /// `EDGEZERO__STORES__CONFIG__<ID>__KEY`, falling back to
-    /// `<logical-id>_staging` when that variable is absent. Mutually exclusive
-    /// with `--key`, for the same reason as on push.
+    /// Diff against the environment-selected staging Config Store. The entry
+    /// key remains the logical store ID. Mutually exclusive with `--key`, for
+    /// the same reason as on push.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to diff against. Defaults to the
@@ -566,9 +565,8 @@ pub struct ConfigPushArgs {
     /// `runtime-config.toml` next to the adapter manifest.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
-    /// Push to the staging runtime key in the environment-selected store.
-    /// `EDGEZERO__STORES__CONFIG__<ID>__KEY` wins when present; otherwise the
-    /// key falls back to `<logical-id>_staging`. Production and staging may
+    /// Push to the physical Config Store selected by the staging environment.
+    /// The entry key remains the logical store ID. Production and staging may
     /// select the same or different physical stores. The same `--staging` verb
     /// `deploy`/`healthcheck`/`rollback` use. Mutually exclusive with `--key` so
     /// the deployed runtime and pushed entry cannot diverge.

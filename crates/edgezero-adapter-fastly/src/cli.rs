@@ -230,24 +230,16 @@ impl FastlyApiToken {
     }
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "these independent booleans are the Fastly version API's exact typed state fields"
-)]
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
 struct ServiceVersionRecord {
     #[serde(alias = "Active")]
     active: bool,
-    #[serde(alias = "Deployed")]
-    deployed: bool,
     #[serde(alias = "Environments")]
     environments: Vec<ServiceEnvironmentRecord>,
     #[serde(alias = "Locked")]
     locked: bool,
     #[serde(alias = "Number")]
     number: u64,
-    #[serde(alias = "Staging")]
-    staging: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
@@ -276,6 +268,7 @@ struct ComputePackageMetadata {
 enum VersionSource {
     Active(u64),
     InitialDraft(u64),
+    Retired(u64),
     Staged(u64),
 }
 
@@ -303,7 +296,7 @@ struct InitialDraftSnapshot {
 }
 
 #[derive(Debug)]
-struct StagedSourceSnapshot {
+struct InactiveSourceSnapshot {
     links: serde_json::Value,
     metadata: serde_json::Value,
     version: ServiceVersionRecord,
@@ -318,7 +311,8 @@ struct LoggingProviderSnapshot {
 #[derive(Debug)]
 enum EditableVersionSource {
     CloneActive { active_version: u64 },
-    CloneStaged(Box<StagedSourceSnapshot>),
+    CloneRetired(Box<InactiveSourceSnapshot>),
+    CloneStaged(Box<InactiveSourceSnapshot>),
     InitialDraft(Box<InitialDraftSnapshot>),
 }
 
@@ -659,12 +653,10 @@ fn plan_link_reconciliation(
     existing: &[ExistingResourceLink],
     inventories: &ResourceInventories,
 ) -> Result<LinkReconciliation, String> {
-    const LEGACY_RUNTIME_STORE: &str = "edgezero_runtime_env";
-
-    let mut desired_by_identity = BTreeMap::new();
+    let mut desired_identities = BTreeSet::new();
     for link in desired {
         let identity = (link.kind, link.alias.as_str());
-        if desired_by_identity.insert(identity, link).is_some() {
+        if !desired_identities.insert(identity) {
             return Err(format!(
                 "desired Fastly {} resource-link alias `{}` is duplicated",
                 link.kind.display_name(),
@@ -692,14 +684,12 @@ fn plan_link_reconciliation(
                     kind.display_name()
                 ));
             }
-            None => {
-                return Err(format!(
-                    "Fastly {} resource link `{}` refers to resource `{}` absent from the complete provider inventory",
-                    link.kind.display_name(),
-                    link.alias,
-                    link.resource_id
-                ));
-            }
+            // Account inventory visibility can be narrower than the resource
+            // links inherited by this service version. The link response is
+            // authoritative for an undeclared inherited link, which must
+            // survive reconciliation even when the token cannot list its
+            // physical resource.
+            None => {}
         }
         let identity = (link.kind, link.alias.as_str());
         if existing_by_identity.insert(identity, link).is_some() {
@@ -725,15 +715,6 @@ fn plan_link_reconciliation(
         }
     }
 
-    let legacy_resource_id = inventories.config.by_name.get(LEGACY_RUNTIME_STORE);
-    delete_link_ids.extend(existing.iter().filter_map(|link| {
-        let identity = (link.kind, link.alias.as_str());
-        (link.kind == ResourceKind::Config
-            && link.alias == LEGACY_RUNTIME_STORE
-            && legacy_resource_id == Some(&link.resource_id)
-            && !desired_by_identity.contains_key(&identity))
-        .then(|| link.link_id.clone())
-    }));
     delete_link_ids.sort();
     delete_link_ids.dedup();
     create.sort_by(|left, right| (left.kind, &left.alias).cmp(&(right.kind, &right.alias)));
@@ -816,6 +797,7 @@ fn build_managed_deploy_plan(
     let source_version = match selected_source {
         VersionSource::Active(version)
         | VersionSource::InitialDraft(version)
+        | VersionSource::Retired(version)
         | VersionSource::Staged(version) => version,
     };
     let links_raw = run_fastly_json_capture(
@@ -853,27 +835,34 @@ fn build_managed_deploy_plan(
                 token.as_str(),
             )?))
         }
-        VersionSource::Staged(staged_version) => {
+        VersionSource::Retired(inactive_version) | VersionSource::Staged(inactive_version) => {
             let version = versions
                 .iter()
-                .find(|version| version.number == staged_version)
+                .find(|version| version.number == inactive_version)
                 .cloned()
-                .ok_or_else(|| format!("selected staged version {staged_version} disappeared"))?;
+                .ok_or_else(|| {
+                    format!("selected inactive version {inactive_version} disappeared")
+                })?;
             if version
                 .environments
                 .iter()
                 .any(|record| record.service_id != service_id)
             {
                 return Err(format!(
-                    "staged Fastly version {staged_version} belongs to a different service environment"
+                    "inactive Fastly version {inactive_version} belongs to a different service environment"
                 ));
             }
-            let metadata = exact_version_metadata(&versions_raw, staged_version)?;
-            EditableVersionSource::CloneStaged(Box::new(StagedSourceSnapshot {
+            let metadata = exact_version_metadata(&versions_raw, inactive_version)?;
+            let snapshot = Box::new(InactiveSourceSnapshot {
                 links: links_snapshot,
                 metadata,
                 version,
-            }))
+            });
+            if matches!(selected_source, VersionSource::Retired(_)) {
+                EditableVersionSource::CloneRetired(snapshot)
+            } else {
+                EditableVersionSource::CloneStaged(snapshot)
+            }
         }
     };
     let package_sha256 = release.package_sha256().to_owned();
@@ -970,7 +959,14 @@ fn execute_managed_deploy_plan_with_emit(
     let reconciled = read_version_links(&plan.service_id, version, cwd)?;
     require_exact_link_resources(&expected_links, &reconciled, "reconciled draft")?;
 
-    revalidate_managed_draft(plan, version, &expected_links, cwd)?;
+    // Fastly's self-diff returns the complete version configuration. Capture it
+    // only after EdgeZero has finished every intended mutation, then compare it
+    // again in the immediate publication barrier below. This covers versioned
+    // configuration outside the package and resource-link APIs (domains,
+    // backends, logging endpoints, headers, snippets, conditions, and so on).
+    let expected_configuration = read_version_configuration_snapshot(plan, version)?;
+
+    revalidate_managed_draft(plan, version, &expected_links, &expected_configuration, cwd)?;
 
     match plan.target {
         PublishTarget::Staging => run_fastly_status(
@@ -1016,8 +1012,9 @@ fn prepare_managed_version(
             update.push("--version=active".to_owned());
             None
         }
-        EditableVersionSource::CloneStaged(snapshot) => {
-            revalidate_staged_source(plan, snapshot, cwd, None)?;
+        EditableVersionSource::CloneRetired(snapshot)
+        | EditableVersionSource::CloneStaged(snapshot) => {
+            revalidate_inactive_source(plan, snapshot, cwd, None)?;
             update.push("--autoclone".to_owned());
             update.push(format!("--version={}", snapshot.version.number));
             None
@@ -1040,7 +1037,8 @@ fn prepare_managed_version(
     let reported_version = parse_fastly_version(&outcome.combined);
     let cloned_source_version = match &plan.version_source {
         EditableVersionSource::CloneActive { active_version } => Some(*active_version),
-        EditableVersionSource::CloneStaged(snapshot) => Some(snapshot.version.number),
+        EditableVersionSource::CloneRetired(snapshot)
+        | EditableVersionSource::CloneStaged(snapshot) => Some(snapshot.version.number),
         EditableVersionSource::InitialDraft(_) => None,
     };
     let recoverable_version = match (cloned_source_version, reported_version) {
@@ -1349,9 +1347,9 @@ fn revalidate_initial_draft_before_update(
     Ok(())
 }
 
-fn revalidate_staged_source(
+fn revalidate_inactive_source(
     plan: &ManagedDeployPlan,
-    snapshot: &StagedSourceSnapshot,
+    snapshot: &InactiveSourceSnapshot,
     cwd: &Path,
     excluded_target: Option<u64>,
 ) -> Result<(), String> {
@@ -1365,22 +1363,29 @@ fn revalidate_staged_source(
         .filter(|version| Some(version.number) != excluded_target)
         .cloned()
         .collect::<Vec<_>>();
-    if select_version_source(&source_versions)? != VersionSource::Staged(snapshot.version.number) {
-        return Err("Fastly staged source selection changed after preflight".to_owned());
+    let expected = match &plan.version_source {
+        EditableVersionSource::CloneRetired(_) => VersionSource::Retired(snapshot.version.number),
+        EditableVersionSource::CloneStaged(_) => VersionSource::Staged(snapshot.version.number),
+        EditableVersionSource::CloneActive { .. } | EditableVersionSource::InitialDraft(_) => {
+            return Err("internal managed deploy inactive source mismatch".to_owned());
+        }
+    };
+    if select_version_source(&source_versions)? != expected {
+        return Err("Fastly inactive source selection changed after preflight".to_owned());
     }
     let current = versions
         .iter()
         .find(|version| version.number == snapshot.version.number)
-        .ok_or_else(|| "Fastly staged source disappeared after preflight".to_owned())?;
+        .ok_or_else(|| "Fastly inactive source disappeared after preflight".to_owned())?;
     if current != &snapshot.version
         || exact_version_metadata(&versions_raw, snapshot.version.number)? != snapshot.metadata
     {
-        return Err("Fastly staged source metadata changed after preflight".to_owned());
+        return Err("Fastly inactive source metadata changed after preflight".to_owned());
     }
     let (_current_links, links_value) =
         read_version_links_with_snapshot(&plan.service_id, snapshot.version.number, cwd)?;
     if links_value != snapshot.links {
-        return Err("Fastly staged source links changed after preflight".to_owned());
+        return Err("Fastly inactive source links changed after preflight".to_owned());
     }
     Ok(())
 }
@@ -1421,6 +1426,7 @@ fn revalidate_managed_draft(
     plan: &ManagedDeployPlan,
     version: u64,
     expected_links: &BTreeMap<ResourceLinkIdentity, String>,
+    expected_configuration: &str,
     cwd: &Path,
 ) -> Result<(), String> {
     let versions_raw = fastly_api_get(
@@ -1432,12 +1438,7 @@ fn revalidate_managed_draft(
         .iter()
         .find(|candidate| candidate.number == version)
         .ok_or_else(|| format!("Fastly draft version {version} disappeared before publication"))?;
-    if draft.active
-        || draft.locked
-        || draft.staging
-        || draft.deployed
-        || !draft.environments.is_empty()
-    {
+    if draft.active || draft.locked || !draft.environments.is_empty() {
         return Err(format!(
             "Fastly version {version} is no longer an unpublished editable draft"
         ));
@@ -1460,11 +1461,17 @@ fn revalidate_managed_draft(
                 return Err("Fastly active version changed before publication".to_owned());
             }
         }
+        EditableVersionSource::CloneRetired(snapshot) => {
+            if version == snapshot.version.number {
+                return Err("managed Fastly retired clone version did not advance".to_owned());
+            }
+            revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
+        }
         EditableVersionSource::CloneStaged(snapshot) => {
             if version == snapshot.version.number {
                 return Err("managed Fastly staged clone version did not advance".to_owned());
             }
-            revalidate_staged_source(plan, snapshot, cwd, Some(version))?;
+            revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
         }
         EditableVersionSource::InitialDraft(snapshot) => {
             if version != snapshot.version.number {
@@ -1486,7 +1493,49 @@ fn revalidate_managed_draft(
             "Fastly version {version} package identity changed before publication"
         ));
     }
+    let current_configuration = read_version_configuration_snapshot(plan, version)?;
+    if current_configuration != expected_configuration {
+        return Err(format!(
+            "Fastly version {version} complete configuration changed before publication"
+        ));
+    }
     Ok(())
+}
+
+fn read_version_configuration_snapshot(
+    plan: &ManagedDeployPlan,
+    version: u64,
+) -> Result<String, String> {
+    let raw = fastly_api_get(
+        &format!(
+            "/service/{}/diff/from/{version}/to/{version}",
+            plan.service_id
+        ),
+        plan.token.as_str(),
+    )?;
+    parse_version_configuration_snapshot(&raw, version)
+}
+
+fn parse_version_configuration_snapshot(raw: &str, version: u64) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_error| {
+        "Fastly complete version configuration response is malformed".to_owned()
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        "Fastly complete version configuration response must be an object".to_owned()
+    })?;
+    let from = object.get("from").and_then(serde_json::Value::as_u64);
+    let to = object.get("to").and_then(serde_json::Value::as_u64);
+    let format = object.get("format").and_then(serde_json::Value::as_str);
+    let diff = object.get("diff").and_then(serde_json::Value::as_str);
+    if from != Some(version) || to != Some(version) || format != Some("text") {
+        return Err(
+            "Fastly complete version configuration response does not identify the requested self-diff"
+                .to_owned(),
+        );
+    }
+    diff.filter(|snapshot| !snapshot.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Fastly complete version configuration snapshot is empty".to_owned())
 }
 
 fn resolve_managed_plan_service_id(
@@ -1556,9 +1605,9 @@ fn parse_resource_links(
         };
         let resource_type = required("resource_type")?;
         let kind = match resource_type.as_str() {
-            "config_store" => ResourceKind::Config,
-            "kv_store" => ResourceKind::Kv,
-            "secret_store" => ResourceKind::Secret,
+            "config-store" => ResourceKind::Config,
+            "object-store" => ResourceKind::Kv,
+            "secret-store" => ResourceKind::Secret,
             _ => {
                 return Err(format!(
                     "Fastly resource-link inventory record #{index} has unknown `resource_type` `{resource_type}`"
@@ -3390,16 +3439,11 @@ fn write_fastly_local_config_store(
         )
     })?;
 
-    // Upsert into the existing per-store contents table so a
-    // `config push --key app_config_staging` does NOT wipe the
-    // previously-pushed `app_config` blob. The
-    // default + staging keys must coexist so the runtime
-    // EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY env var can
-    // switch between them. (Earlier wholesale-replace was a
-    // misread of the "stale entries don't linger" property:
-    // that applies WITHIN a key (old chunks for the same root
-    // become unreferenced when a new chunk-set installs a new
-    // pointer), NOT across sibling keys.)
+    // Upsert into the existing per-store contents table so writing one root
+    // key does not wipe an unrelated sibling. Earlier wholesale replacement
+    // misread the "stale entries don't linger" property: that applies within
+    // one key, where old chunks become unreferenced after a new pointer is
+    // installed, not across sibling keys.
     let store_entry = config_stores_tbl.entry(platform_name).or_insert_with(|| {
         let mut tbl = Table::new();
         tbl.insert("format", toml_edit::value("inline-toml"));
@@ -5708,51 +5752,53 @@ fn select_version_source(versions: &[ServiceVersionRecord]) -> Result<VersionSou
         .ok_or_else(|| "the Fastly version list is empty".to_owned())?;
     let drafts = versions
         .iter()
-        .filter(|version| {
-            !version.active
-                && !version.locked
-                && !version.staging
-                && !version.deployed
-                && version.environments.is_empty()
-        })
+        .filter(|version| !version.active && !version.locked && version.environments.is_empty())
         .collect::<Vec<_>>();
     let staged = versions
         .iter()
         .filter(|version| {
             !version.active
-                && version.locked
-                && version.deployed
-                && ((version.staging && version.environments.is_empty())
-                    || (version.environments.len() == 1
-                        && version.environments.iter().all(|environment| {
-                            environment.name == "staging"
-                                && environment.active_version == version.number
-                        })))
+                && version.environments.len() == 1
+                && version.environments.iter().all(|environment| {
+                    environment.name == "staging" && environment.active_version == version.number
+                })
         })
         .collect::<Vec<_>>();
+    let retired = versions
+        .iter()
+        .filter(|version| !version.active && version.locked && version.environments.is_empty())
+        .collect::<Vec<_>>();
     match (drafts.as_slice(), staged.as_slice()) {
-        ([draft], []) if draft.number == highest => {
+        ([draft], [] | [_]) if draft.number == highest => {
             return Ok(VersionSource::InitialDraft(draft.number));
         }
         ([], [staged_version]) => return Ok(VersionSource::Staged(staged_version.number)),
         _ => {}
     }
-    if drafts.len() == 1 && staged.is_empty() {
+    if drafts.is_empty()
+        && staged.is_empty()
+        && let Some(retired_version) = retired.iter().find(|version| version.number == highest)
+    {
+        return Ok(VersionSource::Retired(retired_version.number));
+    }
+    if drafts.len() == 1 && staged.len() <= 1 {
         return Err(format!(
             "first deployment requires the highest service version ({highest}) to be the initialized editable draft"
         ));
     }
-    if staged.len() > 1 || (!staged.is_empty() && !drafts.is_empty()) {
+    if staged.len() > 1 || drafts.len() > 1 {
         return Err(format!(
-            "deployment without an active version requires exactly one initialized initial draft or staged source; found {} drafts and {} staged versions",
+            "deployment without an active version requires one highest editable draft, staged source, or retired source; found {} drafts, {} staged versions, and {} retired versions",
             drafts.len(),
-            staged.len()
+            staged.len(),
+            retired.len()
         ));
     }
     Err(format!(
-        "deployment without an active version requires exactly one initialized initial draft or staged source; found {} drafts and {} staged versions",
+        "deployment without an active version requires one highest editable draft, staged source, or retired source; found {} drafts, {} staged versions, and {} retired versions",
         drafts.len(),
-        staged.len()
+        staged.len(),
+        retired.len()
     ))
 }
 
@@ -5794,24 +5840,22 @@ fn staging_rollback_decision(
                 "Fastly version {requested_version} is absent from service {service_id}; refusing staging rollback"
             )
         })?;
-    let staged = !version.active
-        && version.locked
-        && version.deployed
-        && ((version.staging && version.environments.is_empty())
-            || (version.environments.len() == 1
-                && version.environments.iter().all(|environment| {
-                    environment.name == "staging"
-                        && environment.service_id == service_id
-                        && environment.active_version == requested_version
-                })));
+    let staged = {
+        let mut staging_records = version
+            .environments
+            .iter()
+            .filter(|environment| environment.name == "staging");
+        matches!(
+            (staging_records.next(), staging_records.next()),
+            (Some(environment), None)
+                if environment.service_id == service_id
+                    && environment.active_version == requested_version
+        )
+    };
     if staged {
         return Ok(StagingRollbackDecision::Deactivate);
     }
-    let unpublished_draft = !version.active
-        && !version.locked
-        && !version.staging
-        && !version.deployed
-        && version.environments.is_empty();
+    let unpublished_draft = !version.active && !version.locked && version.environments.is_empty();
     if unpublished_draft {
         return Ok(StagingRollbackDecision::NoopDraft);
     }
@@ -5820,7 +5864,7 @@ fn staging_rollback_decision(
     ))
 }
 
-/// First staging IP found in a Fastly
+/// Staging IP for one exact domain in a Fastly
 /// `GET /service/<id>/version/<n>/domain?include=staging_ips` response.
 ///
 /// The response is an ARRAY of domain objects, and the staging address
@@ -5829,39 +5873,34 @@ fn staging_rollback_decision(
 /// a field name). Verified against the go-fastly `Domain` model, whose
 /// field is `StagingIP` with the mapstructure tag `staging_ip`, and its
 /// recorded API fixture `fixtures/domains/list_with_staging_ips.yaml`,
-/// plus Fastly's "working with staging" guide. The field is absent from
-/// the published Domain data model, so it is treated as optional.
-///
-/// We also tolerate a plural `staging_ips` array, in case a Fastly
-/// response (or a future API version) carries that shape.
-fn parse_staging_ip(json: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    find_staging_ip(&value)
-}
-
-fn find_staging_ip(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            // The documented shape: a singular `staging_ip` string.
-            if let Some(ip) = map.get("staging_ip").and_then(serde_json::Value::as_str) {
-                return Some(ip.to_owned());
-            }
-            // Tolerated: a plural `staging_ips` array of strings.
-            if let Some(ip) = map
-                .get("staging_ips")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|arr| arr.iter().find_map(serde_json::Value::as_str))
-            {
-                return Some(ip.to_owned());
-            }
-            map.values().find_map(find_staging_ip)
-        }
-        serde_json::Value::Array(arr) => arr.iter().find_map(find_staging_ip),
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => None,
+/// plus Fastly's "working with staging" guide.
+fn parse_staging_ip(json: &str, domain: &str) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct DomainRecord {
+        name: String,
+        staging_ip: Option<String>,
     }
+
+    let records: Vec<DomainRecord> = serde_json::from_str(json).map_err(|error| {
+        format!(
+            "Fastly staging domain inventory has an invalid response shape (payload redacted): {error}"
+        )
+    })?;
+    let mut matches = records.iter().filter(|record| record.name == domain);
+    let record = matches.next().ok_or_else(|| {
+        format!("Fastly staging domain inventory does not contain domain `{domain}`")
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "Fastly staging domain inventory contains duplicate domain `{domain}`"
+        ));
+    }
+    record
+        .staging_ip
+        .as_deref()
+        .filter(|ip| !ip.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("Fastly staging domain `{domain}` has no staging IP"))
 }
 
 /// Build the `curl` argv for a health probe. Production probes the
@@ -6353,12 +6392,9 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
             &format!("/service/{service_id}/version/{version}/domain?include=staging_ips"),
             &token,
         )?;
-        let ip = parse_staging_ip(&json).ok_or_else(|| {
-            format!("no staging IP found for service {service_id} version {version}")
-        })?;
-        // `find_staging_ip` searches the response structurally and could surface a
-        // non-address string; require a real `IpAddr` before it reaches curl's
-        // `--connect-to`, which also settles IPv4-vs-IPv6 formatting.
+        let ip = parse_staging_ip(&json, domain)?;
+        // Require a real `IpAddr` before it reaches curl's `--connect-to`, which
+        // also settles IPv4-vs-IPv6 formatting.
         ip.parse::<IpAddr>().map_err(|err| {
             format!("resolved staging IP {ip:?} is not a valid IP address: {err}")
         })?;
@@ -7544,7 +7580,6 @@ mod tests {
         assert_eq!(versions[1].number, 2);
         assert!(versions[1].active);
         assert!(versions[1].locked);
-        assert!(versions[1].deployed);
         assert_eq!(versions[1].environments[0].name, "production");
         assert_eq!(
             select_version_source(&versions),
@@ -7611,7 +7646,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_plan_version_source_rejects_every_missing_safety_field() {
+    fn deploy_plan_version_source_rejects_every_missing_authoritative_field() {
         const VERSION_NUMBER: u64 = 1;
 
         let complete = serde_json::json!({
@@ -7622,14 +7657,7 @@ mod tests {
             "number": VERSION_NUMBER,
             "staging": false
         });
-        for field in [
-            "active",
-            "deployed",
-            "environments",
-            "locked",
-            "number",
-            "staging",
-        ] {
+        for field in ["active", "environments", "locked", "number"] {
             let mut record = complete.clone();
             record
                 .as_object_mut()
@@ -7645,7 +7673,7 @@ mod tests {
         let versions = parse_service_versions(
             r#"[
                 {"number":1,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[]},
-                {"number":2,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}
+                {"number":2,"active":false,"locked":false,"staging":true,"deployed":true,"environments":[]}
             ]"#,
         )
         .expect("typed version list");
@@ -7657,25 +7685,47 @@ mod tests {
 
     #[test]
     fn deploy_plan_version_source_selects_unique_staged_source_without_active() {
-        for staged_record in [
-            r#"{"number":3,"active":false,"locked":true,"staging":true,"deployed":true,"environments":[]}"#,
-            r#"{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":3,"name":"staging","service_id":"SVC1"}]}"#,
-        ] {
-            let versions =
-                parse_service_versions(&format!("[{staged_record}]")).expect("staged version list");
-            assert_eq!(
-                select_version_source(&versions),
-                Ok(VersionSource::Staged(3))
-            );
-        }
+        let versions = parse_service_versions(
+            r#"[{"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":3,"name":"staging","service_id":"SVC1"}]}]"#,
+        )
+        .expect("staged version list");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::Staged(3))
+        );
+    }
+
+    #[test]
+    fn deploy_plan_version_source_recovers_first_staging_deactivation() {
+        let versions = parse_service_versions(
+            r#"[{"number":1,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[]}]"#,
+        )
+        .expect("retired first staging version");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::Retired(1))
+        );
+    }
+
+    #[test]
+    fn deploy_plan_version_source_reuses_highest_retry_draft_beside_staging() {
+        let versions = parse_service_versions(
+            r#"[
+                {"number":1,"active":false,"locked":true,"environments":[{"active_version":1,"name":"staging","service_id":"SVC1"}]},
+                {"number":2,"active":false,"locked":false,"environments":[]}
+            ]"#,
+        )
+        .expect("staged source and one retry draft");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::InitialDraft(2))
+        );
     }
 
     #[test]
     fn deploy_plan_version_source_rejects_missing_duplicate_or_ambiguous_staged_source() {
         for invalid in [
-            r#"[{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#,
-            r#"[{"number":2,"active":false,"locked":true,"staging":true,"deployed":true,"environments":[]},{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":3,"name":"staging","service_id":"SVC1"}]}]"#,
-            r#"[{"number":2,"active":false,"locked":true,"staging":true,"deployed":true,"environments":[]},{"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}]"#,
+            r#"[{"number":2,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":2,"name":"staging","service_id":"SVC1"}]},{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":3,"name":"staging","service_id":"SVC1"}]}]"#,
             r#"[{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":2,"name":"staging","service_id":"SVC1"}]}]"#,
             r#"[{"number":3,"active":false,"locked":true,"staging":true,"deployed":true,"environments":[{"active_version":3,"name":"production","service_id":"SVC1"}]}]"#,
         ] {
@@ -7695,8 +7745,6 @@ mod tests {
             r#"[{"number":"1"}]"#,
             r#"[{"number":1,"active":"false"}]"#,
             r#"[{"number":1,"locked":"false"}]"#,
-            r#"[{"number":1,"staging":"false"}]"#,
-            r#"[{"number":1,"deployed":"false"}]"#,
             r#"[{"number":1,"environments":"staging"}]"#,
         ] {
             assert!(
@@ -7704,6 +7752,18 @@ mod tests {
                 "invalid version list must fail: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn deploy_plan_version_source_ignores_unused_deployed_and_staging_fields() {
+        let versions = parse_service_versions(
+            r#"[{"number":1,"active":false,"locked":false,"staging":"unused","deployed":{"unused":true},"environments":[]}]"#,
+        )
+        .expect("unused provider fields must not control version state");
+        assert_eq!(
+            select_version_source(&versions),
+            Ok(VersionSource::InitialDraft(1))
+        );
     }
 
     #[test]
@@ -7726,7 +7786,6 @@ mod tests {
     fn deploy_plan_inventories() -> ResourceInventories {
         ResourceInventories::from_json(
             r#"[
-                {"id":"LEGACY","name":"edgezero_runtime_env"},
                 {"id":"CONFIG_A","name":"config-a"},
                 {"id":"CONFIG_B","name":"config-b"}
             ]"#,
@@ -7833,6 +7892,21 @@ mod tests {
     }
 
     #[test]
+    fn deploy_plan_preserves_undeclared_link_absent_from_visible_inventories() {
+        let existing = vec![existing_link(
+            ResourceKind::Secret,
+            "shared_by_another_app",
+            "INACCESSIBLE_SECRET",
+            "KEEP_SECRET",
+        )];
+
+        let plan = plan_link_reconciliation(&[], &existing, &deploy_plan_inventories())
+            .expect("an undeclared inherited link does not require inventory visibility");
+        assert!(plan.delete_link_ids.is_empty());
+        assert!(plan.create.is_empty());
+    }
+
+    #[test]
     fn deploy_plan_keeps_same_alias_isolated_by_resource_kind() {
         let desired = vec![
             desired_link(ResourceKind::Config, "shared", "config-a", "CONFIG_A"),
@@ -7853,61 +7927,6 @@ mod tests {
     }
 
     #[test]
-    fn deploy_plan_only_removes_the_exact_legacy_runtime_link() {
-        let inventories = deploy_plan_inventories();
-        let existing = vec![
-            existing_link(
-                ResourceKind::Config,
-                "edgezero_runtime_env",
-                "LEGACY",
-                "REMOVE",
-            ),
-            existing_link(
-                ResourceKind::Config,
-                "edgezero_runtime_env_other",
-                "LEGACY",
-                "KEEP_ALIAS",
-            ),
-            existing_link(
-                ResourceKind::Kv,
-                "edgezero_runtime_env",
-                "KV_A",
-                "KEEP_KIND",
-            ),
-        ];
-        let plan =
-            plan_link_reconciliation(&[], &existing, &inventories).expect("narrow legacy cleanup");
-        assert_eq!(plan.delete_link_ids, vec!["REMOVE"]);
-
-        let different_resource = vec![existing_link(
-            ResourceKind::Config,
-            "edgezero_runtime_env",
-            "CONFIG_A",
-            "KEEP_RESOURCE",
-        )];
-        let different_resource_plan =
-            plan_link_reconciliation(&[], &different_resource, &inventories)
-                .expect("same alias with a different physical resource");
-        assert!(different_resource_plan.delete_link_ids.is_empty());
-
-        let declared = vec![desired_link(
-            ResourceKind::Config,
-            "edgezero_runtime_env",
-            "edgezero_runtime_env",
-            "LEGACY",
-        )];
-        let declared_existing = vec![existing_link(
-            ResourceKind::Config,
-            "edgezero_runtime_env",
-            "LEGACY",
-            "REMOVE",
-        )];
-        let declared_plan = plan_link_reconciliation(&declared, &declared_existing, &inventories)
-            .expect("declared legacy identity");
-        assert!(declared_plan.delete_link_ids.is_empty());
-    }
-
-    #[test]
     fn deploy_plan_rejects_reported_kind_that_conflicts_with_inventory() {
         let existing = vec![existing_link(
             ResourceKind::Secret,
@@ -7924,9 +7943,9 @@ mod tests {
     #[test]
     fn resource_link_parser_requires_known_resource_type() {
         let raw = r#"[
-            {"id":"CONFIG_LINK","name":"shared","resource_id":"CONFIG_A","resource_type":"config_store"},
-            {"id":"KV_LINK","name":"shared","resource_id":"KV_A","resource_type":"kv_store"},
-            {"id":"SECRET_LINK","name":"credentials","resource_id":"SECRET_A","resource_type":"secret_store"}
+            {"id":"CONFIG_LINK","name":"shared","resource_id":"CONFIG_A","resource_type":"config-store"},
+            {"id":"KV_LINK","name":"shared","resource_id":"KV_A","resource_type":"object-store"},
+            {"id":"SECRET_LINK","name":"credentials","resource_id":"SECRET_A","resource_type":"secret-store"}
         ]"#;
         let (links, _) = parse_resource_links(raw).expect("typed links");
         assert_eq!(links[0].kind, ResourceKind::Config);
@@ -7940,16 +7959,40 @@ mod tests {
     }
 
     #[test]
+    fn version_configuration_snapshot_requires_an_exact_nonempty_self_diff() {
+        assert_eq!(
+            parse_version_configuration_snapshot(
+                r#"{"from":42,"to":42,"format":"text","diff":"complete configuration"}"#,
+                42,
+            ),
+            Ok("complete configuration".to_owned())
+        );
+
+        for invalid in [
+            r#"{"from":41,"to":42,"format":"text","diff":"configuration"}"#,
+            r#"{"from":42,"to":42,"format":"html","diff":"configuration"}"#,
+            r#"{"from":42,"to":42,"format":"text","diff":""}"#,
+            r#"{"from":42,"to":42,"format":"text"}"#,
+            "[]",
+            "not json",
+        ] {
+            parse_version_configuration_snapshot(invalid, 42)
+                .expect_err("malformed or mismatched self-diff must fail closed");
+        }
+    }
+
+    #[test]
     fn fastly_config_keys_use_the_logical_id_for_every_target() {
         validate_fastly_config_key("app_config", "app_config", false, false)
             .expect("production key");
-        validate_fastly_config_key("app_config", "app_config", true, false).expect("staging key");
+        validate_fastly_config_key("app_config", "app_config", true, false)
+            .expect("staging target key");
         validate_fastly_config_key("app_config", "app_config", false, true).expect("local key");
 
         for (key, staging, local) in [
             ("custom", false, false),
-            ("app_config_staging", true, false),
-            ("app_config_staging", false, true),
+            ("alternate", true, false),
+            ("alternate", false, true),
         ] {
             let error = validate_fastly_config_key("app_config", key, staging, local)
                 .expect_err("conflicting key must fail");
@@ -8032,7 +8075,7 @@ mod tests {
     #[test]
     fn staging_rollback_after_failure_before_stage_is_a_noop() {
         let versions = parse_service_versions(
-            r#"[{"active":false,"number":7,"locked":false,"staging":false,"deployed":false,"environments":[]}]"#,
+            r#"[{"active":false,"number":7,"locked":false,"staging":true,"deployed":true,"environments":[]}]"#,
         )
         .expect("version list");
         assert_eq!(
@@ -8044,7 +8087,7 @@ mod tests {
     #[test]
     fn staging_rollback_after_failure_after_stage_deactivates_exact_version() {
         let versions = parse_service_versions(
-            r#"[{"active":false,"number":7,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
+            r#"[{"active":false,"number":7,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
         )
         .expect("version list");
         assert_eq!(
@@ -8055,6 +8098,25 @@ mod tests {
             .expect_err("an absent version must fail closed");
         staging_rollback_decision(&versions, 7, "other-service")
             .expect_err("a staged version for another service must fail closed");
+    }
+
+    #[test]
+    fn staging_rollback_uses_the_exact_staging_environment_record() {
+        let versions = parse_service_versions(
+            r#"[{"active":true,"number":7,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":7,"name":"production","service_id":"svc"},{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
+        )
+        .expect("version list");
+        assert_eq!(
+            staging_rollback_decision(&versions, 7, "svc"),
+            Ok(StagingRollbackDecision::Deactivate)
+        );
+
+        let duplicate = parse_service_versions(
+            r#"[{"active":false,"number":7,"locked":true,"environments":[{"active_version":7,"name":"staging","service_id":"svc"},{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
+        )
+        .expect("version list");
+        staging_rollback_decision(&duplicate, 7, "svc")
+            .expect_err("duplicate staging environment records must fail closed");
     }
 
     #[test]
@@ -8099,23 +8161,36 @@ mod tests {
                 "staging_ip": "167.82.81.194"
             }
         ]"#;
-        assert_eq!(parse_staging_ip(json).as_deref(), Some("167.82.81.194"));
-    }
-
-    #[test]
-    fn parse_staging_ip_tolerates_a_plural_array_shape() {
-        let json = r#"[{"name": "example.com", "staging_ips": ["151.101.2.10"]}]"#;
-        assert_eq!(parse_staging_ip(json).as_deref(), Some("151.101.2.10"));
-    }
-
-    #[test]
-    fn parse_staging_ip_none_when_absent_or_null() {
-        assert_eq!(parse_staging_ip(r#"[{"name": "example.com"}]"#), None);
-        // `staging_ip` is nullable for services without staging enabled.
         assert_eq!(
-            parse_staging_ip(r#"[{"name": "example.com", "staging_ip": null}]"#),
-            None
+            parse_staging_ip(json, "integ-test-20221104.go-fastly-1.com"),
+            Ok("167.82.81.194".to_owned())
         );
+    }
+
+    #[test]
+    fn parse_staging_ip_selects_the_requested_domain() {
+        let json = r#"[
+            {"name":"other.example.com","staging_ip":"151.101.1.10"},
+            {"name":"example.com","staging_ip":"151.101.2.10"}
+        ]"#;
+        assert_eq!(
+            parse_staging_ip(json, "example.com"),
+            Ok("151.101.2.10".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_staging_ip_rejects_missing_duplicate_or_malformed_domain_records() {
+        for json in [
+            r#"[{"name":"other.example.com","staging_ip":"151.101.1.10"}]"#,
+            r#"[{"name":"example.com","staging_ip":null}]"#,
+            r#"[{"name":"example.com","staging_ips":["151.101.2.10"]}]"#,
+            r#"[{"name":"example.com","staging_ip":"151.101.2.10"},{"name":"example.com","staging_ip":"151.101.2.11"}]"#,
+            r#"{"name":"example.com","staging_ip":"151.101.2.10"}"#,
+        ] {
+            parse_staging_ip(json, "example.com")
+                .expect_err("ambiguous or malformed domain inventory must fail closed");
+        }
     }
 
     #[test]
@@ -10467,11 +10542,8 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// Pushing two blobs under different root keys
-    /// (e.g. `app_config` + `app_config_staging`) must leave both
-    /// keys readable from the local fastly.toml so the runtime
-    /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` override can
-    /// switch between them. Prior to the upsert fix the second
+    /// Writing two blobs under different root keys must leave both keys
+    /// readable from the local fastly.toml. Prior to the upsert fix the second
     /// push wholesale-replaced the per-store contents table.
     #[cfg(unix)]
     #[test]
@@ -10499,10 +10571,7 @@ echo 'unexpected' >&2; exit 1
                 Some("fastly.toml"),
                 None,
                 &store,
-                &[(
-                    "app_config_staging".to_owned(),
-                    "{\"envelope\":\"B\"}".to_owned(),
-                )],
+                &[("other_config".to_owned(), "{\"envelope\":\"B\"}".to_owned())],
                 &ctx,
                 false,
             )
@@ -10525,11 +10594,11 @@ echo 'unexpected' >&2; exit 1
             app_config, "{\"envelope\":\"A\"}",
             "default key value: {raw}"
         );
-        let staging = contents
-            .get("app_config_staging")
+        let sibling = contents
+            .get("other_config")
             .and_then(toml_edit::Item::as_str)
-            .expect("staging key must be present");
-        assert_eq!(staging, "{\"envelope\":\"B\"}", "staging key value: {raw}");
+            .expect("sibling key must be present");
+        assert_eq!(sibling, "{\"envelope\":\"B\"}", "sibling key value: {raw}");
     }
 
     #[cfg(unix)]
@@ -11115,8 +11184,8 @@ echo 'unexpected' >&2; exit 1
     /// by the full-envelope SHA, so push B writes a new chunk-set and
     /// installs a new root pointer.
     ///
-    /// `--key app_config_staging` push leaves `app_config` intact per
-    /// spec 12.7). Within the SAME root key, GC on re-push prunes the
+    /// Writing a sibling root leaves `app_config` intact. Within the same root
+    /// key, GC on re-push prunes the
     /// prior generation: after envelope B's push, envelope A's chunks —
     /// now unreferenced by the `app_config` pointer — are removed from
     /// the contents table. A read after push B follows the active
@@ -12557,7 +12626,7 @@ echo 'unexpected' >&2; exit 1
         let mut out = Vec::new();
         append_kept_roots_report(
             &mut out,
-            &["app_config".to_owned(), "app_config_staging".to_owned()],
+            &["app_config".to_owned(), "other_config".to_owned()],
             5,
         );
         assert!(
@@ -12566,10 +12635,7 @@ echo 'unexpected' >&2; exit 1
             "heading names the retained-root and referenced-chunk counts: {out:?}"
         );
         assert!(out.iter().any(|line| line == "  keeping `app_config`"));
-        assert!(
-            out.iter()
-                .any(|line| line == "  keeping `app_config_staging`")
-        );
+        assert!(out.iter().any(|line| line == "  keeping `other_config`"));
         // Never the misleading "live" label -- a retained root may not be
         // runtime-live, and its chunks are protected/referenced, not live.
         assert!(
@@ -14391,7 +14457,7 @@ echo 'unexpected' >&2; exit 1
 
     /// GC of a chunked root must not touch a chunked SIBLING's chunks —
     /// the prefix `app_config.__edgezero_chunks.` must not match
-    /// `app_config_staging.__edgezero_chunks.` (shared string prefix).
+    /// `app_config_archive.__edgezero_chunks.` (shared string prefix).
     #[cfg(unix)]
     #[test]
     fn push_config_entries_local_gc_preserves_sibling_chunks() {
@@ -14423,8 +14489,8 @@ echo 'unexpected' >&2; exit 1
 
         // app_config gen X, then a chunked sibling, then app_config gen Z.
         push("app_config", make("x1"));
-        push("app_config_staging", make("staging"));
-        let staging_chunks = chunk_keys_of("app_config_staging", &make("staging"));
+        push("app_config_archive", make("archive"));
+        let sibling_chunks = chunk_keys_of("app_config_archive", &make("archive"));
         push("app_config", make("z2")); // GCs app_config's gen-X chunks
 
         let after = fs::read_to_string(&fastly_toml).expect("read");
@@ -14436,7 +14502,7 @@ echo 'unexpected' >&2; exit 1
             .and_then(|st| st.get("contents"))
             .and_then(toml_edit::Item::as_table)
             .expect("contents");
-        for key in &staging_chunks {
+        for key in &sibling_chunks {
             assert!(
                 contents.get(key).is_some(),
                 "sibling chunk `{key}` must survive app_config GC: {after}"
@@ -14450,7 +14516,7 @@ echo 'unexpected' >&2; exit 1
     fn reject_reserved_root_keys_accepts_clean_keys() {
         let entries = vec![
             ("app_config".to_owned(), "{}".to_owned()),
-            ("app_config_staging".to_owned(), "{}".to_owned()),
+            ("other_config".to_owned(), "{}".to_owned()),
         ];
         reject_reserved_root_keys(&entries).expect("clean keys accepted");
     }

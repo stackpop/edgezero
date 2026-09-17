@@ -37,7 +37,7 @@ case "\${1:-} \${2:-}" in
   'version ' | '--version ') echo 'Fastly CLI version v$version (fake)' ;;
   'config-store list')
     cat <<'JSON'
-[{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"CONFIGPROD","name":"config-prod"},{"id":"CONFIGSTAGE","name":"config-stage"}]
+[{"id":"CONFIGPROD","name":"config-prod"},{"id":"CONFIGSTAGE","name":"config-stage"}]
 JSON
     ;;
   'resource-link list')
@@ -104,9 +104,9 @@ JSON
     resource=\$(arg_value --resource-id= "\$@") || exit 91
     alias=\$(arg_value --name= "\$@") || exit 91
     case "\$resource/\$alias" in
-      CONFIGSTAGE/app_config) type=config_store ;;
-      KVSTAGE/cache) type=kv_store ;;
-      SECRETSTAGE/credentials) type=secret_store ;;
+      CONFIGSTAGE/app_config) type=config-store ;;
+      KVSTAGE/cache) type=object-store ;;
+      SECRETSTAGE/credentials) type=secret-store ;;
       *) exit 91;;
     esac
     file=\$(links_file "\$target")
@@ -204,8 +204,10 @@ if [[ "$*" == *--config* ]]; then
     */service/dummyservice/version) printf '%s\n200' "$(version_list)" ;;
     */service/dummyservice/version/42/package)
       printf '{"service_id":"dummyservice","version":42,"metadata":{"files_hash":"%0128d"}}\n200' 0 ;;
+    */service/dummyservice/diff/from/42/to/42)
+      printf '{"from":42,"to":42,"format":"text","diff":"complete fixture configuration"}\n200' ;;
     */service/dummyservice/version/*/domain\?include=staging_ips)
-      printf '[{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n200' ;;
+      printf '[{"name":"other.example.com","staging_ip":"151.101.1.10"},{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n200' ;;
     */resources/stores/config/*/item/*) printf 'unexpected Config Store item read\n400' ;;
     *) printf 'unexpected fake API read\n404';;
   esac
@@ -233,7 +235,7 @@ main() {
   : >"$log"
   printf '40\n' >"$state/active-version"
   printf '39\n40\n' >"$state/versions"
-  printf 'LINK_RUNTIME\tedgezero_runtime_env\tENVSEL1\tconfig_store\nLINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig_store\nLINK_KV_PROD\tcache\tKVPROD\tkv_store\nLINK_SECRET_PROD\tcredentials\tSECRETPROD\tsecret_store\n' >"$state/links/version-40.tsv"
+  printf 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig-store\nLINK_KV_PROD\tcache\tKVPROD\tobject-store\nLINK_SECRET_PROD\tcredentials\tSECRETPROD\tsecret-store\n' >"$state/links/version-40.tsv"
   : >"$state/staged-version"
   : >"$state/package-digest"
 

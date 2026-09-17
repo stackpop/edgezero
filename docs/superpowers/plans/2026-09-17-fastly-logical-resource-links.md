@@ -48,12 +48,12 @@
 - Modify: `crates/edgezero-adapter-fastly/src/cli.rs`
 - Test: colocated managed-deployment tests in `cli.rs`
 
-- [x] Add failing reconciliation tests for declared alias replacement, undeclared-link preservation, legacy runtime-link removal, shared physical resources, same logical IDs across store kinds, and final exact readback.
+- [x] Add failing reconciliation tests for declared alias replacement, undeclared-link preservation, shared physical resources, same logical IDs across store kinds, and final exact readback.
 - [x] Build desired links as `(kind, logical alias, selected physical resource ID)`, parse Fastly `resource_type`, and validate selectors with checked `EnvConfig` methods.
 - [x] Remove descriptor plan fields, reads, writes, ownership inference, orphan checks, and final descriptor revalidation.
-- [x] Reconcile declared `(kind, alias)` identities and remove only an undeclared Config link whose alias and resolved physical store are both exactly `edgezero_runtime_env`; preserve every other inherited link, including same-named links of another kind or resource.
+- [x] Reconcile declared `(kind, alias)` identities and preserve every undeclared inherited link.
 - [x] Retain release verification, source snapshots, package upload/hash verification, recovery output, and stage/activate ordering; make the immediate final barrier re-read exact links, provider-visible package identity, source state, and draft state after every EdgeZero mutation, and document the caller's per-service serialization requirement and remaining provider TOCTOU risk.
-- [x] Remove automatic provisioning and setup of `edgezero_runtime_env`; keep declared physical-store provisioning.
+- [x] Remove automatic provisioning and setup of selector stores; keep declared physical-store provisioning.
 - [x] Run the Fastly CLI test suite after each implementation slice.
 
 ### Task 4: State-aware staging rollback
@@ -135,7 +135,7 @@
 - Modify: `docs/superpowers/plans/2026-09-17-fastly-logical-resource-links.md`
 - Delete: `docs/superpowers/plans/2026-09-17-fastly-runtime-review-followup.md`
 
-- [x] Remove every live reference to runtime descriptors, service/version selector keys, and staging selector twins; retain only the documented exact legacy-link cleanup for `edgezero_runtime_env`.
+- [x] Remove every live reference to runtime descriptors, service/version selector keys, and staging selector twins.
 - [x] Document deploy-time `__NAME` selection, logical aliases and keys, and identical release bytes.
 - [x] Document state-aware rollback and separate real domain, deployment target, and GitHub Environment identifier.
 - [x] Document manifest-baked Fastly logging and the caller's per-service deployment serialization requirement.

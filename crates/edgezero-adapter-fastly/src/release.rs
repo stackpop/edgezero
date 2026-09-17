@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 const RELEASE_METADATA_NAME: &str = "release.json";
+const LIFECYCLE_PROTOCOL: u64 = 1;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +14,7 @@ struct ApplicationReleaseMetadata {
     adapter: String,
     app_cli: ReleaseMember,
     format: u64,
+    lifecycle_protocol: u64,
     manifests: ReleaseManifests,
     package: ReleaseMember,
     source_revision: String,
@@ -168,6 +170,12 @@ fn validate_metadata(metadata: &ApplicationReleaseMetadata) -> Result<(), String
         return Err(format!(
             "unsupported application release format {}; expected format 1",
             metadata.format
+        ));
+    }
+    if metadata.lifecycle_protocol != LIFECYCLE_PROTOCOL {
+        return Err(format!(
+            "unsupported application release lifecycle protocol {}; expected {}",
+            metadata.lifecycle_protocol, LIFECYCLE_PROTOCOL
         ));
     }
     if metadata.adapter != "fastly" {
@@ -428,6 +436,7 @@ mod tests {
         fn metadata(&self) -> serde_json::Value {
             serde_json::json!({
                 "format": 1,
+                "lifecycle_protocol": 1,
                 "source_revision": "a".repeat(40),
                 "adapter": "fastly",
                 "app_cli": {
@@ -549,6 +558,40 @@ mod tests {
                 .remove("package");
         });
         assert!(fixture.verify().unwrap_err().contains("missing field"));
+    }
+
+    #[test]
+    fn application_release_requires_supported_lifecycle_protocol() {
+        let missing = ReleaseFixture::new();
+        missing.write_metadata_with(|metadata| {
+            metadata
+                .as_object_mut()
+                .expect("release metadata object")
+                .remove("lifecycle_protocol");
+        });
+        assert!(missing.verify().unwrap_err().contains("lifecycle_protocol"));
+
+        let wrong_type = ReleaseFixture::new();
+        wrong_type.write_metadata_with(|metadata| {
+            metadata["lifecycle_protocol"] = serde_json::json!("1");
+        });
+        assert!(
+            wrong_type
+                .verify()
+                .unwrap_err()
+                .contains("invalid application release release.json")
+        );
+
+        let unsupported = ReleaseFixture::new();
+        unsupported.write_metadata_with(|metadata| {
+            metadata["lifecycle_protocol"] = serde_json::json!(2_u64);
+        });
+        assert!(
+            unsupported
+                .verify()
+                .unwrap_err()
+                .contains("lifecycle protocol")
+        );
     }
 
     #[test]

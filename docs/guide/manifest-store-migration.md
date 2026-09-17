@@ -126,8 +126,8 @@ The Secret selector names a physical store. Secret values never belong in these
 variables. Fastly resolves the selected physical resources at deployment and
 links them to the target version under the manifest's logical IDs. The package
 contains no service ID or deployment-specific store name. Fastly fixes Config
-Store keys to `app_config` in production and `app_config_staging` in staging;
-omit `__KEY` for Fastly. See the
+Store keys to the logical ID (`app_config`) for every target; omit `__KEY` for
+Fastly. See the
 [Fastly adapter guide](./adapters/fastly.md#store-selection-and-deployment).
 
 ## What this means for handler code

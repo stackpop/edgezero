@@ -233,14 +233,14 @@ mechanism.**
 | **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging <app-cli> serve --adapter axum`                                                                   |
 | **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                           |
 | **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging spin up` for a per-invocation override |
-| **Fastly**     | Do not set a custom key. Production uses `app_config`, staging uses `app_config_staging`, and local Viceroy uses `app_config`.                                               |
+| **Fastly**     | Do not set a custom key. Production, staging, and local Viceroy all use the logical key `app_config`; select a different physical store with `__NAME`.                       |
 
 #### Fastly specifically
 
 Fastly deployment variables select physical stores, while the application always
 opens the logical Config Store ID. Managed deploy links the selected physical
-store under that logical alias. Production reads key `app_config`; staging reads
-`app_config_staging`:
+store under that logical alias. Production and staging both read key
+`app_config` from the physical store selected by their deployment environment:
 
 ```bash
 # Production environment

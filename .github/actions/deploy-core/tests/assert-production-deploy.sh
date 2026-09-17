@@ -30,23 +30,24 @@ main() {
   jq -Rn '
     [inputs | split("\t") | {alias: .[1], resource: .[2], type: .[3]}] |
     sort_by(.type, .alias) == ([
-      {alias:"app_config", resource:"CONFIGPROD", type:"config_store"},
-      {alias:"cache", resource:"KVPROD", type:"kv_store"},
-      {alias:"credentials", resource:"SECRETPROD", type:"secret_store"}
+      {alias:"app_config", resource:"CONFIGPROD", type:"config-store"},
+      {alias:"cache", resource:"KVPROD", type:"object-store"},
+      {alias:"credentials", resource:"SECRETPROD", type:"secret-store"}
     ] | sort_by(.type, .alias))
   ' <"$FAKE_LINK_DIR/version-42.tsv" | grep -qx true || fail "production links do not expose the selected resources under logical aliases"
 
   local mutations
   mutations=$(grep -E '^fastly resource-link (create|delete) ' "$log" || true)
-  [[ "$mutations" == 'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_RUNTIME' ]] || fail "production must remove only the exact legacy runtime link; got: ${mutations:-<none>}"
+  [[ -z "$mutations" ]] || fail "production must retain already-correct resource links; got: $mutations"
   grep -q '^PUT https://api.fastly.com/service/dummyservice/version/42/activate$' "$log" || fail "production did not activate version 42"
 
-  local delete_line final_links_line package_line publish_line
-  delete_line=$(grep -n '^fastly resource-link delete ' "$log" | tail -n1 | cut -d: -f1)
+  local final_links_line package_line configuration_line publish_line
   final_links_line=$(grep -n '^fastly resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n1 | cut -d: -f1)
   package_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n1 | cut -d: -f1)
+  configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log" | tail -n1 | cut -d: -f1)
   publish_line=$(grep -n '^PUT https://api.fastly.com/service/dummyservice/version/42/activate$' "$log" | tail -n1 | cut -d: -f1)
-  [[ "$delete_line" -lt "$final_links_line" && "$final_links_line" -lt "$publish_line" && "$package_line" -lt "$publish_line" ]] || fail "final link and package verification did not follow reconciliation and precede activation"
+  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log")" -eq 2 ]] || fail "production did not capture and revalidate the complete draft configuration"
+  [[ "$final_links_line" -lt "$publish_line" && "$package_line" -lt "$publish_line" && "$configuration_line" -lt "$publish_line" ]] || fail "final link, package, and complete-configuration verification did not precede activation"
   ! grep -qE 'config-store-entry (create|describe)|/resources/stores/config/.*/item/' "$log" || fail "production used the removed runtime descriptor path"
   notice "production activated version 42 with logical resource links and pinned package bytes"
 }

@@ -66,6 +66,11 @@ except (InvalidConstant, json.JSONDecodeError, OSError, UnicodeError):
 if isinstance(document, dict) and "format" in document:
     if type(document["format"]) is not int or document["format"] != 1:
         sys.exit(22)
+if isinstance(document, dict):
+    if "lifecycle_protocol" not in document or type(document["lifecycle_protocol"]) is not int:
+        sys.exit(23)
+    if document["lifecycle_protocol"] != 1:
+        sys.exit(24)
 PY
 
   case "$status" in
@@ -73,6 +78,8 @@ PY
     20) fail "release.json contains a duplicate field" ;;
     21) fail "release.json is not valid JSON" ;;
     22) fail "release.json has an unsupported format" ;;
+    23) fail "release.json has an invalid lifecycle_protocol" ;;
+    24) fail "release.json has an unsupported lifecycle protocol" ;;
     *) fail "release.json validation failed" ;;
   esac
 }
@@ -132,13 +139,13 @@ main() {
   tar -xOzf "$archive" release.json >"$release_json" 2>/dev/null || fail "application release archive is missing release.json"
   validate_release_json_syntax "$release_json"
 
-  assert_exact_keys "$release_json" 'type == "object" and (keys == ["adapter","app_cli","format","manifests","package","source_revision"])' root
+  assert_exact_keys "$release_json" 'type == "object" and (keys == ["adapter","app_cli","format","lifecycle_protocol","manifests","package","source_revision"])' root
   assert_exact_keys "$release_json" '.app_cli | type == "object" and (keys == ["path","sha256"])' app_cli
   assert_exact_keys "$release_json" '.package | type == "object" and (keys == ["path","sha256"])' package
   assert_exact_keys "$release_json" '.manifests | type == "object" and (keys == ["adapter","edgezero"])' manifests
   assert_exact_keys "$release_json" '.manifests.edgezero | type == "object" and (keys == ["path","sha256"])' manifests.edgezero
   assert_exact_keys "$release_json" '.manifests.adapter | type == "object" and (keys == ["path","sha256"])' manifests.adapter
-  jq -e '.format == 1 and .adapter == "fastly"' "$release_json" >/dev/null 2>&1 || fail "release.json has an unsupported format or adapter"
+  jq -e '.format == 1 and .lifecycle_protocol == 1 and .adapter == "fastly"' "$release_json" >/dev/null 2>&1 || fail "release.json has an unsupported format, lifecycle protocol, or adapter"
 
   local revision
   revision=$(jq -er '.source_revision | select(type == "string")' "$release_json") || fail "release.json has an invalid source_revision"

@@ -2612,7 +2612,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         .expect_err("adapter validation must see the explicit final key");
         assert_eq!(error, "fixed key required");
 
-        let (_, key) = resolve_config_store_and_key(
+        let (_, staging_key) = resolve_config_store_and_key(
             &FIXED_CONFIG_KEY_ADAPTER,
             &env,
             "app_config",
@@ -2621,13 +2621,13 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             false,
         )
         .expect("staging uses the same logical key without target derivation");
-        assert_eq!(key, "app_config");
+        assert_eq!(staging_key, "app_config");
 
         let staging_env = EnvConfig::from_vars([(
             "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
             "app_config_staging",
         )]);
-        let error = resolve_config_store_and_key(
+        let staging_error = resolve_config_store_and_key(
             &FIXED_CONFIG_KEY_ADAPTER,
             &staging_env,
             "app_config",
@@ -2636,7 +2636,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             false,
         )
         .expect_err("target-specific keys must not change runtime behavior");
-        assert_eq!(error, "fixed key required");
+        assert_eq!(staging_error, "fixed key required");
     }
 
     #[test]
@@ -3849,7 +3849,7 @@ ids = ["default"]
         let err = run_config_push_typed::<FixtureConfig>(&args)
             .expect_err("a custom Fastly --key must be rejected");
         assert!(
-            err.contains("deterministic config key `app_config`"),
+            err.contains("logical config key `app_config`"),
             "must fail at Fastly key validation before any remote read: {err}"
         );
         assert!(

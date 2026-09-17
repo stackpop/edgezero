@@ -21,6 +21,27 @@ release supplies a byte-identical application CLI, Fastly package,
 staging. Different applications or later releases can have different manifests.
 A deployer or runtime environment cannot replace them.
 
+Use the release packager after the application CLI and Fastly package have been
+built in the credential-free producer job:
+
+```yaml
+- id: release
+  uses: stackpop/edgezero/.github/actions/package-fastly-application-release@<ref>
+  with:
+    app-cli-archive: release-inputs/edgezero-cli.tar
+    fastly-package: pkg/app.tar.gz
+    application-manifest: edgezero.toml
+    adapter-manifest: adapters/fastly/fastly.toml
+    source-revision: ${{ github.sha }}
+    artifact-name: application-release-${{ github.sha }}
+```
+
+The action verifies the application CLI's lifecycle command surface, writes
+strict metadata with `format: 1` and `lifecycle_protocol: 1`, verifies the
+assembled archive through the same consumer validator, uploads
+`app-release.tar.gz`, and returns its SHA-256. It accepts only prebuilt inputs
+beneath `github.workspace` and receives no provider credentials.
+
 ## Deployment consumer
 
 The deployment repository resolves a trusted application release, downloads its
@@ -44,6 +65,9 @@ Download the selected release once and reuse it:
   with:
     name: application-release-${{ needs.release.outputs.source-revision }}
     path: app-release
+    run-id: ${{ needs.release.outputs.run-id }}
+    repository: ${{ github.repository }}
+    github-token: ${{ github.token }}
 
 - id: deploy
   uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
@@ -88,8 +112,11 @@ The example application has one real hostname, `app.example.com`, and two
 publication targets. Production selects the `app.example.com` GitHub
 Environment; staging selects `staging.app.example.com`. Both targets still pass
 `app.example.com` to Fastly health checks. Validate the domain and target in a
-credential-free preflight job, derive the Environment identifier there, and use
-that output on the deploy job.
+provider-credential-free preflight job, derive the Environment identifier, and
+query GitHub before the deploy job references it. This prevents GitHub from
+silently creating a missing Environment without its expected protection rules
+or secrets. Private repositories use the built-in token with `actions: read`;
+the preflight receives no provider secret.
 
 ```yaml
 name: Deploy Application
@@ -113,42 +140,56 @@ on:
         description: Approved application revision
         required: true
         type: string
+      release-run-id:
+        description: Trusted producer workflow run containing the immutable release
+        required: true
+        type: string
+      release-sha256:
+        description: Lowercase SHA-256 recorded by the trusted producer
+        required: true
+        type: string
 
 jobs:
-  release:
+  preflight:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     outputs:
-      release-ref: ${{ steps.select.outputs['release-ref'] }}
-      sha256: ${{ steps.select.outputs.sha256 }}
+      environment: ${{ steps.environment.outputs.environment-name }}
+      concurrency-key: ${{ steps.target.outputs.concurrency-key }}
+      deploy-to: ${{ steps.target.outputs.deploy-to }}
+      release-artifact: ${{ steps.release.outputs.artifact }}
+      release-run-id: ${{ steps.release.outputs.run-id }}
+      sha256: ${{ steps.release.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - id: select
+      - id: release
         env:
           SOURCE_REVISION: ${{ inputs.source-revision }}
+          RELEASE_RUN_ID: ${{ inputs.release-run-id }}
+          RELEASE_SHA256: ${{ inputs.release-sha256 }}
         run: |
-          # Resolve SOURCE_REVISION through trusted application-release metadata.
-          # Never read the archive reference or digest from a publisher Environment.
-          ./scripts/select-application-release "$SOURCE_REVISION"
+          {
+            [[ "$SOURCE_REVISION" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || {
+              echo "::error::source-revision must be a full lowercase Git SHA"; exit 1;
+            }
+            [[ "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+              echo "::error::release-run-id must be a positive integer"; exit 1;
+            }
+            [[ "$RELEASE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+              echo "::error::release-sha256 must be 64 lowercase hexadecimal characters"; exit 1;
+            }
+            echo "artifact=application-release-$SOURCE_REVISION"
+            echo "run-id=$RELEASE_RUN_ID"
+            echo "sha256=$RELEASE_SHA256"
+          } >>"$GITHUB_OUTPUT"
 
-  preflight:
-    needs: release
-    runs-on: ubuntu-latest
-    outputs:
-      environment: ${{ steps.target.outputs.environment }}
-      deploy-to: ${{ steps.target.outputs.deploy-to }}
-      release-ref: ${{ needs.release.outputs['release-ref'] }}
-      sha256: ${{ needs.release.outputs.sha256 }}
-    steps:
       - id: target
         env:
           DOMAIN: ${{ inputs.domain }}
           DEPLOY_TO: ${{ inputs.deploy-to }}
         run: |
           case "$DOMAIN" in
-            app.example.com) ;;
+            app.example.com) concurrency_key=app-example-com ;;
             *) echo "::error::unsupported application domain"; exit 1 ;;
           esac
           case "$DEPLOY_TO" in
@@ -156,8 +197,18 @@ jobs:
             staging) environment="staging.$DOMAIN" ;;
             *) echo "::error::unsupported publication target"; exit 1 ;;
           esac
-          echo "environment=$environment" >>"$GITHUB_OUTPUT"
-          echo "deploy-to=$DEPLOY_TO" >>"$GITHUB_OUTPUT"
+          {
+            echo "environment=$environment"
+            echo "concurrency-key=$concurrency_key"
+            echo "deploy-to=$DEPLOY_TO"
+          } >>"$GITHUB_OUTPUT"
+
+      - id: environment
+        uses: stackpop/edgezero/.github/actions/require-github-environment@<ref>
+        with:
+          environment-name: ${{ steps.target.outputs.environment }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
 
   deploy:
     needs: preflight
@@ -168,7 +219,7 @@ jobs:
       EDGEZERO__STORES__KV__CACHE__NAME: ${{ vars.EDGEZERO__STORES__KV__CACHE__NAME }}
       EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: ${{ vars.EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME }}
     concurrency:
-      group: application-${{ vars.FASTLY_SERVICE_ID }}
+      group: application-${{ needs.preflight.outputs.concurrency-key }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -179,17 +230,18 @@ jobs:
           persist-credentials: false
 
       - name: Download the selected application release
-        env:
-          RELEASE_REF: ${{ needs.preflight.outputs['release-ref'] }}
-        run: |
-          ./scripts/download-application-release \
-            "$RELEASE_REF" \
-            "$GITHUB_WORKSPACE/app-release.tar.gz"
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.preflight.outputs.release-artifact }}
+          path: app-release
+          run-id: ${{ needs.preflight.outputs.release-run-id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
 
       - id: config
         uses: stackpop/edgezero/.github/actions/config-push-fastly@<ref>
         with:
-          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           working-directory: publisher-config
@@ -197,10 +249,19 @@ jobs:
           store: app_config
           deploy-to: ${{ needs.preflight.outputs.deploy-to }}
 
+      - name: Record required config reconciliation
+        if: ${{ always() && steps.config.outcome == 'failure' && steps.config.outputs.mutation-attempted == 'true' }}
+        env:
+          RELEASE_SHA256: ${{ needs.preflight.outputs.sha256 }}
+          DEPLOY_TO: ${{ needs.preflight.outputs.deploy-to }}
+        run: |
+          echo "::error::Config mutation was attempted. Re-run config push with release $RELEASE_SHA256 and target $DEPLOY_TO, or verify the selected store and logical key before deploying."
+          exit 1
+
       - id: deploy
         uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
-          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
@@ -210,7 +271,7 @@ jobs:
       - id: health
         uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<ref>
         with:
-          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
           fastly-api-token: ${{ needs.preflight.outputs.deploy-to == 'staging' && secrets.FASTLY_API_TOKEN || '' }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
@@ -223,7 +284,7 @@ jobs:
         if: ${{ (failure() || cancelled()) && steps.deploy.outputs.fastly-version != '' && (needs.preflight.outputs.deploy-to == 'staging' || steps.deploy.outputs.previous-version != '') }}
         uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
         with:
-          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
@@ -232,15 +293,15 @@ jobs:
           deploy-to: ${{ needs.preflight.outputs.deploy-to }}
 ```
 
-The example keeps application release selection outside both publisher
-Environments. `preflight` waits for that selection and forwards the immutable
-reference and digest with its validated environment name. The deploy job then
-downloads the release once; each lifecycle action independently verifies the
-same archive and digest. It receives environment-scoped runtime values only
-after release selection. The optional `CREDENTIALS` selector is a Secret Store
+The example pins the producer run, source revision, and archive digest outside
+both publisher Environments. `preflight` validates that identity and proves the
+derived GitHub Environment already exists. The deploy job downloads the exact
+artifact from that producer run once; each lifecycle action independently
+verifies the same archive and digest. It receives environment-scoped runtime
+values only afterward. The optional `CREDENTIALS` selector is a Secret Store
 name from `vars`, never a secret value. `inputs.domain` remains the actual
-hostname passed to healthcheck for both targets. The deployer checkout is only the deployment
-repository; it never checks out or rebuilds application source.
+hostname passed to healthcheck for both targets. The deployer checkout contains
+only publisher config; it never checks out or rebuilds application source.
 
 For a staging rollback, omit `rollback-to`; for production, skip rollback when
 `previous-version` is empty because a first deployment has no earlier version.
@@ -263,10 +324,18 @@ failed step's outputs. The rollback action handles the exact staging version
 state and refuses incompatible state. If a production version is active and
 `previous-version` is present, run production rollback. If its state is unknown,
 reconcile provider state manually without guessing. If `mutation-attempted` is
-true but no version is available, reconcile provider state manually as well.
+true for config push, re-run the same pinned release, logical store, payload, and
+target or verify that exact physical store and logical key before deployment.
 
 Serialize deployments by service. Without serialization, a provider lookup after
 failure may observe another run's version.
+
+## Runner requirements
+
+The actions are tested on `ubuntu-latest`. A self-hosted runner must be Linux
+x86-64 and provide Bash, `jq`, Python 3, `tar`, `curl`, `git`, `base64`,
+`realpath`, and either `sha256sum` or `shasum`. The application CLI archive must
+contain a Linux x86-64 executable.
 
 ## Adoption checklist
 

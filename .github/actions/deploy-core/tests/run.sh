@@ -429,7 +429,7 @@ CLI
     --arg package "$(hash_file "$dir/release/package/app.tar.gz")" \
     --arg edgezero "$(hash_file "$dir/release/edgezero.toml")" \
     --arg adapter "$(hash_file "$dir/release/adapter/fastly.toml")" \
-    '{format:1,source_revision:$revision,adapter:"fastly",app_cli:{path:"cli/app-cli.tar.gz",sha256:$cli},package:{path:"package/app.tar.gz",sha256:$package},manifests:{edgezero:{path:"edgezero.toml",sha256:$edgezero},adapter:{path:"adapter/fastly.toml",sha256:$adapter}}}' \
+    '{format:1,lifecycle_protocol:1,source_revision:$revision,adapter:"fastly",app_cli:{path:"cli/app-cli.tar.gz",sha256:$cli},package:{path:"package/app.tar.gz",sha256:$package},manifests:{edgezero:{path:"edgezero.toml",sha256:$edgezero},adapter:{path:"adapter/fastly.toml",sha256:$adapter}}}' \
     >"$dir/release/release.json"
   tar -C "$dir/release" -czf "$dir/app-release.tar.gz" \
     release.json cli/app-cli.tar.gz package/app.tar.gz edgezero.toml adapter/fastly.toml
@@ -603,6 +603,50 @@ test_fastly_application_release() {
     env EDGEZERO__APP__RELEASE__ARCHIVE="$dir/float-format/float.tar.gz" \
     EDGEZERO__APP__RELEASE__SHA256="$(hash_file "$dir/float-format/float.tar.gz")" \
     EDGEZERO__APP__RELEASE__ROOT="$dir/float-format/root" bash "$prepare"
+
+  make_fastly_release_fixture "$dir/missing-lifecycle-protocol"
+  jq 'del(.lifecycle_protocol)' "$dir/missing-lifecycle-protocol/release/release.json" \
+    >"$dir/missing-lifecycle-protocol/release/release.invalid.json"
+  mv "$dir/missing-lifecycle-protocol/release/release.invalid.json" \
+    "$dir/missing-lifecycle-protocol/release/release.json"
+  tar -C "$dir/missing-lifecycle-protocol/release" \
+    -czf "$dir/missing-lifecycle-protocol/invalid.tar.gz" \
+    release.json cli/app-cli.tar.gz package/app.tar.gz edgezero.toml adapter/fastly.toml
+  assert_fails_with "release metadata requires a lifecycle protocol" \
+    "lifecycle_protocol" \
+    env EDGEZERO__APP__RELEASE__ARCHIVE="$dir/missing-lifecycle-protocol/invalid.tar.gz" \
+    EDGEZERO__APP__RELEASE__SHA256="$(hash_file "$dir/missing-lifecycle-protocol/invalid.tar.gz")" \
+    EDGEZERO__APP__RELEASE__ROOT="$dir/missing-lifecycle-protocol/root" bash "$prepare"
+
+  make_fastly_release_fixture "$dir/string-lifecycle-protocol"
+  jq '.lifecycle_protocol = "1"' "$dir/string-lifecycle-protocol/release/release.json" \
+    >"$dir/string-lifecycle-protocol/release/release.invalid.json"
+  mv "$dir/string-lifecycle-protocol/release/release.invalid.json" \
+    "$dir/string-lifecycle-protocol/release/release.json"
+  tar -C "$dir/string-lifecycle-protocol/release" \
+    -czf "$dir/string-lifecycle-protocol/invalid.tar.gz" \
+    release.json cli/app-cli.tar.gz package/app.tar.gz edgezero.toml adapter/fastly.toml
+  assert_fails_with "release lifecycle protocol must be an integer" \
+    "lifecycle_protocol" \
+    env EDGEZERO__APP__RELEASE__ARCHIVE="$dir/string-lifecycle-protocol/invalid.tar.gz" \
+    EDGEZERO__APP__RELEASE__SHA256="$(hash_file "$dir/string-lifecycle-protocol/invalid.tar.gz")" \
+    EDGEZERO__APP__RELEASE__ROOT="$dir/string-lifecycle-protocol/root" bash "$prepare"
+
+  make_fastly_release_fixture "$dir/unsupported-lifecycle-protocol"
+  jq '.lifecycle_protocol = 2' "$dir/unsupported-lifecycle-protocol/release/release.json" \
+    >"$dir/unsupported-lifecycle-protocol/release/release.invalid.json"
+  mv "$dir/unsupported-lifecycle-protocol/release/release.invalid.json" \
+    "$dir/unsupported-lifecycle-protocol/release/release.json"
+  tar -C "$dir/unsupported-lifecycle-protocol/release" \
+    -czf "$dir/unsupported-lifecycle-protocol/invalid.tar.gz" \
+    release.json cli/app-cli.tar.gz package/app.tar.gz edgezero.toml adapter/fastly.toml
+  assert_fails_with "unsupported release lifecycle protocols are rejected" \
+    "lifecycle protocol" \
+    env EDGEZERO__APP__RELEASE__ARCHIVE="$dir/unsupported-lifecycle-protocol/invalid.tar.gz" \
+    EDGEZERO__APP__RELEASE__SHA256="$(hash_file "$dir/unsupported-lifecycle-protocol/invalid.tar.gz")" \
+    EDGEZERO__APP__RELEASE__ROOT="$dir/unsupported-lifecycle-protocol/root" bash "$prepare"
+  assert_fails "invalid lifecycle protocols are rejected before creating the release root" \
+    test -e "$dir/unsupported-lifecycle-protocol/root"
 
   make_fastly_release_fixture "$dir/inner"
   printf 'tampered\n' >>"$dir/inner/release/package/app.tar.gz"
@@ -794,7 +838,8 @@ test_workspace_step_scrub() {
   # those channels at startup, before a step's script can scrub, so a caller's job env
   # could otherwise run code with a provider token in scope.
   local a p missing
-  for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly; do
+  for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly \
+    package-fastly-application-release require-github-environment; do
     p="$ACTIONS_DIR/$a/action.yml"
     missing=$(run_steps_missing_env_scrub "$p")
     assert_equals "$a: every run: step blanks BASH_ENV and ENV" "" "$missing"
@@ -804,7 +849,8 @@ test_workspace_step_scrub() {
   # Fastly lifecycle actions must replace the whole Fastly environment surface
   # in every shell step. Typed credentials are installed only in the step that
   # needs them; ambient service IDs, endpoints, profiles, and tokens stay inert.
-  for a in deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly; do
+  for a in deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly \
+    package-fastly-application-release require-github-environment; do
     p="$ACTIONS_DIR/$a/action.yml"
     missing=$(run_steps_missing_fastly_env_boundary "$p")
     assert_equals "$a: every run: step replaces all Fastly environment aliases" "" "$missing"
@@ -2235,6 +2281,30 @@ out healthy
 out status-code
 EOF
   )" "$(parse_action_surface "$ACTIONS_DIR/healthcheck-fastly/action.yml")"
+
+  assert_equals "package-fastly-application-release public surface" "$(
+    cat <<'EOF'
+in adapter-manifest true none
+in app-cli-archive true none
+in application-manifest true none
+in artifact-name false application-release
+in fastly-package true none
+in source-revision true none
+out archive-sha256
+out artifact-name
+out package-sha256
+out source-revision
+EOF
+  )" "$(parse_action_surface "$ACTIONS_DIR/package-fastly-application-release/action.yml")"
+
+  assert_equals "require-github-environment public surface" "$(
+    cat <<'EOF'
+in environment-name true none
+in github-token true none
+in repository true none
+out environment-name
+EOF
+  )" "$(parse_action_surface "$ACTIONS_DIR/require-github-environment/action.yml")"
 }
 
 test_fastly_release_action_wiring() {
@@ -2276,6 +2346,14 @@ test_fastly_release_action_wiring() {
   assert_fails "deploy exposes no build controls" \
     grep -Eq '^  (working-directory|manifest|rust-toolchain|build-mode|build-args|cache):' \
     "$ACTIONS_DIR/deploy-fastly/action.yml"
+}
+
+test_release_producer_and_environment_preflight() {
+  section "release producer and GitHub Environment preflight"
+  assert_succeeds "GitHub Environment preflight rejects missing and invalid environments" \
+    bash "$ACTIONS_DIR/require-github-environment/tests/run.sh"
+  assert_succeeds "Fastly application release packager verifies its lifecycle protocol" \
+    bash "$ACTIONS_DIR/package-fastly-application-release/tests/run.sh"
 }
 
 test_fastly_smoke_release_contract() {
@@ -2351,9 +2429,7 @@ test_fastly_smoke_release_contract() {
   assert_succeeds "the fixture supports an explicit store-aware application mode" \
     grep -q 'store-aware' "$fixture"
   assert_succeeds "the fake seeds active v40 with logical Config, KV, and Secret aliases" \
-    grep -Fq 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig_store' "$fake"
-  assert_succeeds "the fake models the exact legacy link eligible for removal" \
-    grep -Fq 'LINK_RUNTIME\tedgezero_runtime_env\tENVSEL1\tconfig_store' "$fake"
+    grep -Fq 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig-store' "$fake"
   assert_succeeds "the staged assertion checks staging resources under logical aliases" \
     grep -Fq 'alias:"app_config", resource:"CONFIGSTAGE"' "$staged"
   assert_succeeds "production checks selected resources under logical aliases" \
@@ -2366,15 +2442,15 @@ test_fastly_smoke_release_contract() {
     grep -Fq 'expected resource mutations:' "$staged"
   assert_succeeds "staging link-order failures show actual mutations" \
     grep -Fq 'actual resource mutations:' "$staged"
-  assert_succeeds "production requires only the exact legacy-link deletion" \
-    grep -Fq 'must remove only the exact legacy runtime link' "$production"
+  assert_succeeds "production preserves already-correct resource links" \
+    grep -Fq 'must retain already-correct resource links' "$production"
   assert_succeeds "failed deployment asserts its recoverable version and package digest" \
     grep -q 'EDGEZERO__TEST__FASTLY_VERSION' "$lost"
   assert_succeeds "failed deployment checks its verified package digest" \
     grep -q 'EDGEZERO__TEST__PACKAGE_DIGEST' "$lost"
 
   local legacy
-  for legacy in STAGESEL1 edgezero_runtime_env_staging_dummyservice \
+  for legacy in STAGESEL1 \
     EDGEZERO__SERVICES__dummyservice__STORES EDGEZERO__SERVICES__dummyservice__VERSIONS; do
     assert_fails "smoke fixtures issue no legacy selector or staging-twin command ($legacy)" \
       grep -Fq -- "$legacy" "$fake" "$staged" "$production" "$lost" "$workflow"
@@ -2404,11 +2480,14 @@ test_smoke_release_uses_application_revision() {
   GITHUB_WORKSPACE="$workspace" GITHUB_OUTPUT="$output" \
     bash "$ACTIONS_DIR/deploy-core/tests/make-smoke-fixture.sh" release "$workspace/app-cli.tar"
 
-  local recorded app_revision harness_revision
+  local recorded protocol app_revision harness_revision
   recorded=$(tar -xOzf "$workspace/fixture-release/app-release.tar.gz" release.json |
     jq -er '.source_revision')
+  protocol=$(tar -xOzf "$workspace/fixture-release/app-release.tar.gz" release.json |
+    jq -er '.lifecycle_protocol')
   app_revision=$(git -C "$workspace/fixture-app" rev-parse HEAD)
   harness_revision=$(git -C "$workspace" rev-parse HEAD)
+  assert_equals "release metadata records lifecycle protocol 1" "1" "$protocol"
   assert_equals "release metadata records the fixture application revision" \
     "$app_revision" "$recorded"
   assert_fails "release metadata never records the harness checkout revision" \
@@ -2470,10 +2549,11 @@ test_fastly_logical_link_documentation() {
   # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
   assert_succeeds "docs state the production Config Store key" \
     grep -Fq 'production, staging, and local Viceroy' "$corpus"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
   assert_succeeds "docs state the staging Config Store key" \
     grep -Fq 'all read `<ID>`' "$corpus"
-  assert_succeeds "docs mark PR 344 runtime selectors unsupported" \
-    grep -Fq 'PR #344 runtime descriptor and service-scoped selector keys are unsupported' "$corpus"
+  assert_succeeds "docs mark runtime selectors unsupported" \
+    grep -Fq 'Runtime descriptors and service-scoped selector keys are unsupported' "$corpus"
   assert_fails "docs contain no service-scoped runtime selector key" \
     grep -Fq 'EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1' "$corpus"
   assert_succeeds "docs state canonical environment precedence" \
@@ -2512,25 +2592,29 @@ test_fastly_logical_link_documentation() {
 
   assert_succeeds "application example is extracted as a workflow" \
     grep -Fxq 'name: Deploy Application' "$example_workflow"
-  assert_succeeds "example preflight waits for immutable release selection" \
-    grep -Fxq '    needs: release' "$example_workflow"
-  assert_succeeds "example preflight threads the selected release reference" \
-    grep -Fq "release-ref: \${{ needs.release.outputs['release-ref'] }}" "$example_workflow"
-  # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
-  assert_succeeds "example preflight threads the selected release digest" \
-    grep -Fq 'sha256: ${{ needs.release.outputs.sha256 }}' "$example_workflow"
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_succeeds "example preflight validates the pinned producer run" \
+    grep -Fq 'RELEASE_RUN_ID: ${{ inputs.release-run-id }}' "$example_workflow"
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_succeeds "example preflight validates the pinned release digest" \
+    grep -Fq 'RELEASE_SHA256: ${{ inputs.release-sha256 }}' "$example_workflow"
+  assert_succeeds "example preflight verifies the derived GitHub Environment" \
+    grep -Fq '/require-github-environment@<ref>' "$example_workflow"
   assert_succeeds "example deploy depends literally on preflight" \
     grep -Fxq '    needs: preflight' "$example_deploy"
   assert_succeeds "deployer checkout remains allowed" \
     grep -Fq 'uses: actions/checkout@v4' "$example_deploy"
   assert_succeeds "example downloads the selected immutable release" \
     grep -Fq 'Download the selected application release' "$example_deploy"
-  assert_succeeds "example invokes the release downloader" \
-    grep -Fq './scripts/download-application-release' "$example_deploy"
+  assert_succeeds "example uses GitHub's release artifact downloader" \
+    grep -Fq 'uses: actions/download-artifact@v4' "$example_deploy"
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_succeeds "example pins the producer run used for artifact download" \
+    grep -Fq 'run-id: ${{ needs.preflight.outputs.release-run-id }}' "$example_deploy"
   assert_succeeds "each lifecycle action verifies the same downloaded release" \
     grep -Fq 'each lifecycle action independently verifies the same archive and digest' "$adoption_flat"
-  assert_fails "example deploy never selects application source checkout repository or ref" \
-    grep -Eq '^[[:space:]]+(repository|ref):' "$example_deploy"
+  assert_fails "example checkout never selects application source repository or ref" \
+    awk '/uses: actions\/checkout@/{checkout=1; next} checkout && /^[[:space:]]+-/{exit} checkout && /^[[:space:]]+(repository|ref):/{found=1} END{exit !found}' "$example_deploy"
   assert_fails "example deploy never runs an application build" \
     grep -Eiq 'cargo build|fastly compute build|build-app-cli|app-cli-artifact' "$example_deploy"
   assert_fails "example deploy never clones or checks out application source with git" \
@@ -2545,7 +2629,7 @@ test_fastly_logical_link_documentation() {
   done
   # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
   assert_equals "all four example lifecycle actions use one local release archive" \
-    4 "$(grep -Fc 'app-release-archive: ${{ github.workspace }}/app-release.tar.gz' "$example_deploy")"
+    4 "$(grep -Fc 'app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz' "$example_deploy")"
   # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
   assert_equals "all four example lifecycle actions use one release digest" \
     4 "$(grep -Fc 'app-release-sha256: ${{ needs.preflight.outputs.sha256 }}' "$example_deploy")"
@@ -2574,7 +2658,7 @@ test_fastly_logical_link_documentation() {
         "$example_workflow")
       # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
       assert_equals "$action structurally uses the one local release archive" \
-        '${{ github.workspace }}/app-release.tar.gz' "$action_input"
+        '${{ github.workspace }}/app-release/app-release.tar.gz' "$action_input"
       action_input=$(yq eval -r \
         ".jobs.deploy.steps[] | select(.uses == \"$uses\") | .with.\"app-release-sha256\"" \
         "$example_workflow")
@@ -3551,6 +3635,7 @@ main() {
   test_action_output_contracts
   test_action_public_surface
   test_fastly_release_action_wiring
+  test_release_producer_and_environment_preflight
   test_fastly_smoke_release_contract
   test_smoke_release_uses_application_revision
   test_fastly_logical_link_documentation

@@ -1,5 +1,7 @@
 # Build-Cache Container Implementation Plan (sub-plan 1 of 4)
 
+**Status:** Historical plan; the deploy-time build model was withdrawn on 2026-09-17
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Publish a pinned, single-manifest `linux/amd64` build container that bakes the exact Rust toolchain + build tools, so `platform-id` for the cached-build feature is an immutable digest.

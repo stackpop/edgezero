@@ -90,12 +90,15 @@ jobs:
             .github/actions/deploy-fastly/action.yml \
             .github/actions/healthcheck-fastly/action.yml \
             .github/actions/rollback-fastly/action.yml \
-            .github/actions/config-push-fastly/action.yml
+            .github/actions/config-push-fastly/action.yml \
+            .github/actions/package-fastly-application-release/action.yml \
+            .github/actions/require-github-environment/action.yml
 
       - name: ShellCheck action scripts
         run: |
           shellcheck -e SC1091 \
             .github/actions/*/scripts/*.sh \
+            .github/actions/*/tests/*.sh \
             .github/actions/deploy-core/tests/*.sh \
             scripts/install-actionlint.sh \
             scripts/install-yq.sh

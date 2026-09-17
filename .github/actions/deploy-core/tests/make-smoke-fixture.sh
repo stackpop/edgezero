@@ -178,6 +178,7 @@ package_release() {
     --arg adapter "$adapter_digest" \
     '{
       format: 1,
+      lifecycle_protocol: 1,
       source_revision: $revision,
       adapter: "fastly",
       app_cli: {path: "cli/app-cli.tar", sha256: $cli},

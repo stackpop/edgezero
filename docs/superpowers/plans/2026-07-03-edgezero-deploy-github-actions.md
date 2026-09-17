@@ -1,6 +1,6 @@
 # EdgeZero Deploy GitHub Actions Implementation Plan
 
-**Status:** Revised plan (layered, adapter-independent)
+**Status:** Historical plan; superseded on 2026-09-17 by the immutable application-release lifecycle
 
 **Spec:** `docs/superpowers/specs/2026-07-08-edgezero-deploy-github-actions-design.md`
 

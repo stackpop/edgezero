@@ -3,9 +3,8 @@
 ## Status
 
 Accepted on 2026-09-17. This design supersedes the version-scoped runtime
-descriptor design. EdgeZero does not create or use `edgezero_runtime_env` as a
-runtime configuration store, and it does not put a Fastly service ID or version
-in an `EDGEZERO__*` name.
+descriptor design. EdgeZero does not put a Fastly service ID or version in an
+`EDGEZERO__*` name.
 
 ## Problem
 
@@ -22,7 +21,7 @@ correctness depend on mutable shared state.
 Fastly already provides the two primitives EdgeZero needs:
 
 - resource links bind a physical store to a service version under a link name;
-- the runtime reports whether a request is executing in Fastly staging.
+- service-version environment records identify where a version is published.
 
 ## Public contract
 
@@ -68,8 +67,9 @@ For every declared store, EdgeZero resolves the selected physical name against
 the complete Fastly inventory. It creates a resource link on the unpublished
 target draft whose alias is the stable logical ID and whose resource ID is the
 selected physical store. Resource-link identity is `(resource kind, logical
-alias)`, not alias alone. EdgeZero parses and validates Fastly's
-`resource_type`; duplicate links for the same identity, an unknown resource
+alias)`, not alias alone. EdgeZero parses and validates Fastly's hyphenated
+provider `resource_type` values (`config-store`, `object-store`, and
+`secret-store`); duplicate links for the same identity, an unknown resource
 type, or a resource ID that conflicts with its reported type fails preflight.
 The same logical ID may be used independently by Config, KV, and Secret Store
 declarations.
@@ -82,31 +82,30 @@ When the source version already contains that resource kind and logical alias:
 
 Links whose identities are not declared by the current manifest are preserved.
 EdgeZero does not infer ownership from account inventories and does not delete
-undeclared Config, KV, or Secret Store links. The sole cleanup exception is a
-Config Store link whose alias is `edgezero_runtime_env`, whose resource ID
-resolves to the physical Config Store also named `edgezero_runtime_env`, and
-whose identity is not declared by the application. EdgeZero removes that exact
-legacy link from newly prepared versions. A same-named link of another kind, a
-Config link to another physical store, or an application declaration using
-that logical ID is preserved. The account-wide legacy store is left intact for
-older versions and rollback.
+undeclared Config, KV, or Secret Store links.
 
 After every EdgeZero draft mutation is complete, EdgeZero performs one final
 publication barrier immediately before staging or activation. The barrier
 reads the exact draft links, provider-visible package identity, source version
-state, and draft version state and requires all four to match the preflight
-plan. EdgeZero performs no mutation between this barrier and the publication
-call. Deployments for one service must be serialized by the caller. Fastly does
-not expose a compare-and-swap token for publication, so an external actor can
-still create a time-of-check/time-of-use race; the final barrier minimizes and
-detects earlier interference but cannot make the provider API atomic. Any
-observed mismatch fails without publication.
+state, draft version state, and Fastly's complete self-diff snapshot. EdgeZero
+captures the self-diff after its last intended mutation and requires the
+immediate final read to match byte for byte, covering domains, backends,
+logging, headers, VCL and snippets, conditions, health checks, and other
+version-scoped configuration. EdgeZero performs no mutation between this
+barrier and the publication call. Deployments for one service must be serialized
+by the caller. Fastly does not expose a compare-and-swap token for publication,
+so an external actor can still create a time-of-check/time-of-use race after the
+final read; the barrier detects earlier interference but cannot make the
+provider API atomic. Any observed mismatch fails without publication.
 
 Staging and production use different service versions of the same Fastly
 service. A staging deploy clones the active version, replaces declared logical
 links with staging selections, verifies the draft, and stages it. A production
 deploy creates a new draft and reconciles production selections before
 activation. It never activates a staging-configured version directly.
+Version-state decisions use exact `environments` records. Fastly's `deployed`
+and `staging` version fields are unused and do not control source selection or
+rollback; `locked` only determines whether a draft can be edited.
 
 ## Runtime model
 
@@ -141,8 +140,9 @@ name the variable but do not print its value.
 
 The Fastly config-key policy is an adapter hook. Generic configuration code
 passes the checked canonical selection to the adapter. Fastly accepts only the
-deterministic production or staging key; other adapters accept their configured
-key unchanged.
+logical ID for every target; other adapters accept their configured key
+unchanged. The application and runtime never receive a staging flag to choose a
+store or key.
 
 ## Rollback
 
@@ -158,6 +158,11 @@ Staging rollback first reads the exact requested version state:
   mutation.
 
 This makes a recovery step safe both before and after staging publication.
+After deactivating a first deployment, the highest locked version with no
+environment record is a retired staging source. A subsequent deployment clones
+that source. If a failed retry already left one highest editable draft beside a
+staged source, the next deployment revalidates and reuses that draft rather than
+creating an ambiguous chain of clones.
 
 ## Action compatibility
 
@@ -188,10 +193,8 @@ staged versions retain their frozen packages and resource links.
 
 Tests must prove:
 
-- no runtime lookup, provisioning, descriptor read/write, or newly created link
-  references `edgezero_runtime_env`; the sole permitted deployment behavior
-  narrowly removes the exact undeclared legacy Config Store link described
-  above and preserves same-named non-legacy identities;
+- no runtime lookup, provisioning, descriptor read/write, or deployment logic
+  uses a selector store;
 - no runtime or deployment path constructs a service/version `EDGEZERO__*`
   key;
 - production and staging deploy identical package bytes;
@@ -209,4 +212,5 @@ Tests must prove:
   deactivates the exact version;
 - deprecated `key` input fails before mutation;
 - the immediate final barrier re-reads exact links, provider-visible package
-  identity, source state, and draft state before stage or activation.
+  identity, source state, draft state, and a complete self-diff snapshot before
+  stage or activation.
