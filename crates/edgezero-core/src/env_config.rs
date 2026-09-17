@@ -144,6 +144,35 @@ impl EnvConfig {
             )
     }
 
+    /// Checked key for a logical store and publication target.
+    ///
+    /// An absent selector uses the target default. A present blank value or a
+    /// value containing control characters is rejected so callers cannot
+    /// mutate the fallback key and later fail stricter deployment validation.
+    /// The error names the canonical variable without including its value.
+    ///
+    /// # Errors
+    /// Returns an error when the canonical `__KEY` selector is present but
+    /// invalid.
+    #[inline]
+    pub fn store_key_for_target_checked(
+        &self,
+        kind: &str,
+        id: &str,
+        staging: bool,
+    ) -> Result<String, String> {
+        self.store_selector_checked(kind, id, "key")?.map_or_else(
+            || {
+                Ok(if staging {
+                    format!("{id}_staging")
+                } else {
+                    id.to_owned()
+                })
+            },
+            |value| Ok(value.to_owned()),
+        )
+    }
+
     /// Platform name for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__NAME`
     /// — falling back to `id` itself when the variable is unset OR when
     /// the value is empty / whitespace-only. `kind` is `"kv"` /
@@ -168,6 +197,39 @@ impl EnvConfig {
         self.get(&["stores", kind, id, "name"])
             .filter(|value| !is_blank_or_control(value))
             .map_or_else(|| id.to_owned(), str::to_owned)
+    }
+
+    /// Checked platform name for a logical store.
+    ///
+    /// An absent selector defaults to `id`. A present blank value or a value
+    /// containing control characters is rejected. The error names the
+    /// canonical variable without including its value.
+    ///
+    /// # Errors
+    /// Returns an error when the canonical `__NAME` selector is present but
+    /// invalid.
+    #[inline]
+    pub fn store_name_checked(&self, kind: &str, id: &str) -> Result<String, String> {
+        self.store_selector_checked(kind, id, "name")?
+            .map_or_else(|| Ok(id.to_owned()), |value| Ok(value.to_owned()))
+    }
+
+    fn store_selector_checked<'a>(
+        &'a self,
+        kind: &str,
+        id: &str,
+        setting: &str,
+    ) -> Result<Option<&'a str>, String> {
+        let value = self.get(&["stores", kind, id, setting]);
+        if value.is_some_and(is_blank_or_control) {
+            return Err(format!(
+                "EDGEZERO__STORES__{}__{}__{} is present but must be non-blank and contain no control characters (value redacted)",
+                kind.to_ascii_uppercase(),
+                id.to_ascii_uppercase(),
+                setting.to_ascii_uppercase()
+            ));
+        }
+        Ok(value)
     }
 
     /// Free-form per-store tuning — `EDGEZERO__STORES__<KIND>__<ID>__<KEY>`.
@@ -320,6 +382,33 @@ mod tests {
     }
 
     #[test]
+    fn checked_store_name_rejects_present_invalid_values_without_disclosing_them() {
+        for invalid in ["", "   \t  ", "sensitive\nname", "sensitive\0name"] {
+            let cfg = EnvConfig::from_vars([("EDGEZERO__STORES__KV__SESSIONS__NAME", invalid)]);
+            let error = cfg
+                .store_name_checked("kv", "sessions")
+                .expect_err("a present invalid selector must not fall back");
+            assert!(
+                error.contains("EDGEZERO__STORES__KV__SESSIONS__NAME"),
+                "the diagnostic must identify the canonical variable: {error}"
+            );
+            assert!(
+                invalid.is_empty() || !error.contains(invalid),
+                "the diagnostic must redact the selector value: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_store_name_defaults_only_when_selector_is_absent() {
+        let cfg = EnvConfig::default();
+        assert_eq!(
+            cfg.store_name_checked("config", "app_config"),
+            Ok("app_config".to_owned())
+        );
+    }
+
+    #[test]
     fn store_name_accepts_real_world_punctuation() {
         // Underscores, dashes, and dots are valid in every platform
         // store-name we target. Don't false-reject them.
@@ -357,6 +446,38 @@ mod tests {
         let cfg =
             EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "bad\x01key")]);
         assert_eq!(cfg.store_key("config", "app_config"), "app_config");
+    }
+
+    #[test]
+    fn checked_store_key_rejects_present_invalid_values_without_disclosing_them() {
+        for invalid in ["", "   \t  ", "sensitive\nkey", "sensitive\0key"] {
+            let cfg =
+                EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", invalid)]);
+            let error = cfg
+                .store_key_for_target_checked("config", "app_config", true)
+                .expect_err("a present invalid selector must not fall back");
+            assert!(
+                error.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"),
+                "the diagnostic must identify the canonical variable: {error}"
+            );
+            assert!(
+                invalid.is_empty() || !error.contains(invalid),
+                "the diagnostic must redact the selector value: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_store_key_uses_target_default_only_when_selector_is_absent() {
+        let cfg = EnvConfig::default();
+        assert_eq!(
+            cfg.store_key_for_target_checked("config", "app_config", false),
+            Ok("app_config".to_owned())
+        );
+        assert_eq!(
+            cfg.store_key_for_target_checked("config", "app_config", true),
+            Ok("app_config_staging".to_owned())
+        );
     }
 
     #[test]

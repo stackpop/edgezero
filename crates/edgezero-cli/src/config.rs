@@ -73,9 +73,9 @@ struct PushContext {
     /// helper borrows from this to build the `AdapterPushContext<'_>`
     /// it hands the adapter trait method.
     adapter_push_ctx: ResolvedAdapterPushContext,
-    /// Canonical config entry key selected from the runtime environment, with
-    /// the publication target fallback applied by `EnvConfig`.
-    runtime_key: String,
+    /// Final config entry key after CLI, environment, target fallback, and
+    /// adapter policy validation.
+    key: String,
     /// Resolved config store id (`--store` or the manifest
     /// default), paired with its env-resolved platform name. The
     /// platform name is what the adapter writes / pushes into
@@ -473,9 +473,8 @@ where
         push_ctx: &push_ctx,
     };
 
-    // Build envelope. Without `--key`, use the same canonical environment key
-    // and target fallback as the deployed runtime descriptor.
-    let key = resolve_config_key(args.key.as_deref(), &ctx.runtime_key, args.staging)?;
+    // Build the envelope only after selector and adapter key-policy validation.
+    let key = ctx.key.clone();
     let body = build_config_envelope::<C>(&typed)?;
     let local_envelope: BlobEnvelope =
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
@@ -645,12 +644,14 @@ where
     })?;
     let logical = resolve_config_store_id(args.store.as_deref(), ctx.manifest())?;
     let env_config = effective_manifest_environment(ctx.manifest(), &args.adapter, env::vars());
-    let platform = env_config.store_name("config", &logical);
-    let store = ResolvedStoreId::new(logical.clone(), platform);
-    // Diff exactly what `config push` would write, including the canonical
-    // environment override and target fallback.
-    let runtime_key = env_config.store_key_for_target("config", &logical, args.staging);
-    let key = resolve_config_key(args.key.as_deref(), &runtime_key, args.staging)?;
+    let (store, key) = resolve_config_store_and_key(
+        adapter,
+        &env_config,
+        &logical,
+        args.key.as_deref(),
+        args.staging,
+        args.local,
+    )?;
 
     // Resolve adapter paths for the read call.
     let manifest_root = ctx
@@ -1358,15 +1359,21 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     let logical = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
     let env_config =
         effective_manifest_environment(validation.manifest(), &args.adapter, env::vars());
-    let platform = env_config.store_name("config", &logical);
-    let runtime_key = env_config.store_key_for_target("config", &logical, args.staging);
+    let (store, key) = resolve_config_store_and_key(
+        adapter,
+        &env_config,
+        &logical,
+        args.key.as_deref(),
+        args.staging,
+        args.local,
+    )?;
     let adapter_push_ctx =
         resolve_adapter_push_ctx(args, &env_config, validation.manifest(), &args.adapter);
     Ok(PushContext {
         adapter,
         adapter_push_ctx,
-        runtime_key,
-        store: ResolvedStoreId::new(logical, platform),
+        key,
+        store,
         validation,
     })
 }
@@ -1421,6 +1428,21 @@ fn resolve_config_key(
         (Some(key), false) => Ok(key.to_owned()),
         (None, _) => Ok(runtime_key.to_owned()),
     }
+}
+
+fn resolve_config_store_and_key(
+    adapter: &dyn adapter_registry::Adapter,
+    env_config: &EnvConfig,
+    logical: &str,
+    explicit_key: Option<&str>,
+    staging: bool,
+    local: bool,
+) -> Result<(ResolvedStoreId, String), String> {
+    let platform = env_config.store_name_checked("config", logical)?;
+    let runtime_key = env_config.store_key_for_target_checked("config", logical, staging)?;
+    let key = resolve_config_key(explicit_key, &runtime_key, staging)?;
+    adapter.validate_config_key_for_target(logical, &key, staging, local)?;
+    Ok((ResolvedStoreId::new(logical, platform), key))
 }
 
 fn resolve_config_store_id(requested: Option<&str>, manifest: &Manifest) -> Result<String, String> {
@@ -2018,6 +2040,42 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    struct FixedConfigKeyAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test adapter only customizes final config-key validation"
+    )]
+    impl adapter_registry::Adapter for FixedConfigKeyAdapter {
+        fn execute(
+            &self,
+            _action: adapter_registry::AdapterAction,
+            _args: &[String],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "fixed-key-test"
+        }
+
+        fn validate_config_key_for_target(
+            &self,
+            logical_store_id: &str,
+            key: &str,
+            _staging: bool,
+            _local: bool,
+        ) -> Result<(), String> {
+            if key == logical_store_id {
+                Ok(())
+            } else {
+                Err("fixed key required".to_owned())
+            }
+        }
+    }
+
+    static FIXED_CONFIG_KEY_ADAPTER: FixedConfigKeyAdapter = FixedConfigKeyAdapter;
+
     // ---------- config gc argument gating ----------
 
     /// A destructive `config gc --yes` MUST NOT invent the safety assertion: it
@@ -2512,6 +2570,58 @@ source = "target/wasm32-wasip2/release/demo.wasm"
                 && !err.contains("selector store"),
             "the error must explain canonical runtime-key selection without legacy selectors: {err}"
         );
+    }
+
+    #[test]
+    fn config_target_rejects_present_invalid_selectors_before_fallback() {
+        for (setting, value) in [("NAME", ""), ("NAME", "bad\nname"), ("KEY", "   ")] {
+            let variable = format!("EDGEZERO__STORES__CONFIG__APP_CONFIG__{setting}");
+            let env = EnvConfig::from_vars([(variable.as_str(), value)]);
+            let error = resolve_config_store_and_key(
+                &FIXED_CONFIG_KEY_ADAPTER,
+                &env,
+                "app_config",
+                None,
+                false,
+                false,
+            )
+            .expect_err("present invalid selectors must fail instead of falling back");
+            assert!(
+                error.contains(&variable),
+                "error must name {variable}: {error}"
+            );
+            assert!(
+                value.is_empty() || !error.contains(value),
+                "error must redact the invalid value: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_target_validates_the_final_key_after_cli_precedence() {
+        let env = EnvConfig::default();
+        let (store, key) = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &env,
+            "app_config",
+            None,
+            false,
+            false,
+        )
+        .expect("the deterministic default is accepted");
+        assert_eq!(store, ResolvedStoreId::from_logical("app_config"));
+        assert_eq!(key, "app_config");
+
+        let error = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &env,
+            "app_config",
+            Some("custom"),
+            false,
+            false,
+        )
+        .expect_err("adapter validation must see the explicit final key");
+        assert_eq!(error, "fixed key required");
     }
 
     #[test]

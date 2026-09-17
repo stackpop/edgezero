@@ -18,11 +18,11 @@
 - Modify: `crates/edgezero-cli/src/config.rs`
 - Test: colocated unit tests in those files
 
-- [ ] Add failing tests showing that present empty, whitespace, or control-character `__NAME` and `__KEY` selectors return a redacted error rather than a fallback.
-- [ ] Add checked `EnvConfig` methods that preserve the existing fallback only when the canonical variable is absent.
-- [ ] Add a default adapter hook that validates/resolves the final checked config key for a target without exposing adapter types to generic CLI code.
-- [ ] Call the hook from both config push and config diff after CLI/env/fallback precedence, and before provider reads or writes.
-- [ ] Run `cargo test -p edgezero-core -p edgezero-adapter -p edgezero-cli`.
+- [x] Add failing tests showing that present empty, whitespace, or control-character `__NAME` and `__KEY` selectors return a redacted error rather than a fallback.
+- [x] Add checked `EnvConfig` methods that preserve the existing fallback only when the canonical variable is absent.
+- [x] Add a default adapter hook that validates/resolves the final checked config key for a target without exposing adapter types to generic CLI code.
+- [x] Call the hook from both config push and config diff after CLI/env/fallback precedence, and before provider reads or writes.
+- [x] Run `cargo test -p edgezero-core -p edgezero-adapter -p edgezero-cli`.
 
 ### Task 2: Descriptor-free Fastly runtime
 

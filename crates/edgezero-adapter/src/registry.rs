@@ -471,6 +471,29 @@ pub trait Adapter: Sync + Send {
         Ok(())
     }
 
+    /// Validate the final config key selected by CLI, environment, and target
+    /// fallback precedence before config push or diff performs provider I/O.
+    ///
+    /// `logical_store_id` is the portable manifest ID. `key` is the final key
+    /// the operation would read or write. `staging` identifies the requested
+    /// deployment target, and `local` identifies an emulator operation.
+    /// Adapters whose runtimes use fixed keys can reject a divergent selection;
+    /// the default preserves configurable keys.
+    ///
+    /// # Errors
+    /// Returns a human-readable error when the selected key cannot be read by
+    /// this adapter's runtime for the requested target.
+    #[inline]
+    fn validate_config_key_for_target(
+        &self,
+        _logical_store_id: &str,
+        _key: &str,
+        _staging: bool,
+        _local: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Provision the platform resources backing each store id the
     /// user declared. Returns a list of human-readable
     /// status lines the CLI logs verbatim — one line per resource
@@ -887,6 +910,10 @@ mod tests {
         );
         let entry = TypedSecretEntry::new("vault", "api_token", "demo_api_token");
         assert_eq!(FIRST.validate_typed_secrets(&[entry]), Ok(()));
+        assert_eq!(
+            FIRST.validate_config_key_for_target("app_config", "publisher-selected", true, false),
+            Ok(())
+        );
     }
 
     #[test]
