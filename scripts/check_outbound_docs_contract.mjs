@@ -16,6 +16,8 @@ const responseEgressSpecPath =
   'docs/superpowers/specs/2026-09-08-response-egress-design.md'
 const outboundImplementationIndexPath =
   'docs/superpowers/plans/2026-07-10-outbound-http-implementation.md'
+const outboundBatchTerminationPlanPath =
+  'docs/superpowers/plans/2026-09-16-outbound-batch-termination.md'
 const spinPhasePath =
   'docs/superpowers/plans/2026-09-06-outbound-http-phase5-spin.md'
 const cloudflarePhasePath =
@@ -401,7 +403,8 @@ for (const requiredFragment of [
   'OutboundBatchNext::Finished',
   'OutboundBatchTermination::Completed',
   'OutboundBatchTermination::Cutoff',
-  'send_all_until(requests, cutoff).await?',
+  'OutboundBatchFailure',
+  'send_all_until(requests, cutoff).await',
 ]) {
   if (!hardCutSurfaces[1][1].includes(requiredFragment)) {
     fail(`${proxyGuidePath} is missing typed batch contract: ${requiredFragment}`)
@@ -458,6 +461,8 @@ for (const staleFragment of [
   'pub async fn next(&mut self) -> Option<OutboundBatchItem>',
   'pub async fn collect(self) -> OutboundBatchResults',
   'OutboundBatch::from_stream',
+  'Result<OutboundBatchResults, EdgeError>',
+  'let Ok((selection, metadata)) = select_pending_slot(&mut pending) else',
 ]) {
   if (outboundSpecSource.includes(staleFragment)) {
     fail(
@@ -468,7 +473,8 @@ for (const staleFragment of [
 for (const requiredFragment of [
   'pub enum OutboundBatchTermination',
   'pub enum OutboundBatchNext',
-  'Result<OutboundBatchResults, EdgeError>',
+  'pub struct OutboundBatchFailure',
+  'Result<OutboundBatchResults, OutboundBatchFailure>',
   'premature driver EOF',
   'duplicate or out-of-range',
 ]) {
@@ -498,6 +504,10 @@ for (const staleFragment of [
 
 const currentDocumentation = [
   [outboundImplementationIndexPath, readFileSync(outboundImplementationIndexPath, 'utf8')],
+  [
+    outboundBatchTerminationPlanPath,
+    readFileSync(outboundBatchTerminationPlanPath, 'utf8'),
+  ],
   [cloudflarePhasePath, readFileSync(cloudflarePhasePath, 'utf8')],
   [spinPhasePath, readFileSync(spinPhasePath, 'utf8')],
   [fastlyPhasePath, readFileSync(fastlyPhasePath, 'utf8')],
@@ -538,7 +548,14 @@ if (
   fail('outbound implementation index still presents implemented phases as pending')
 }
 
-const cloudflarePhaseSource = currentDocumentation[1][1]
+const outboundBatchTerminationPlanSource = currentDocumentation[1][1]
+if (outboundBatchTerminationPlanSource.includes('send_all_until(...).await?')) {
+  fail(
+    `${outboundBatchTerminationPlanPath} contains the stale batch collector error conversion`,
+  )
+}
+
+const cloudflarePhaseSource = currentDocumentation[2][1]
 for (const staleFragment of [
   "Cloudflare's Native timing claim",
   'Cloudflare: Native for HTTP, deadlines',
@@ -552,7 +569,7 @@ for (const staleFragment of [
   }
 }
 
-const migrationPhaseSource = currentDocumentation[4][1]
+const migrationPhaseSource = currentDocumentation[5][1]
 for (const currentRow of [
   '| `outbound-deadlines` | Native | BestEffort | BestEffort | BestEffort |',
   '| `streamed-upload-deadlines` | Native | BestEffort | BestEffort | BestEffort |',

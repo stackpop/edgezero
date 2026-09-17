@@ -120,6 +120,18 @@ pub struct OutboundBatchResults {
     pub termination: OutboundBatchTermination,
 }
 
+/// An adapter-driver failure paired with terminal slots collected before it occurred.
+#[derive(Debug, thiserror::Error)]
+#[error("outbound batch driver failed: {error}")]
+#[non_exhaustive]
+pub struct OutboundBatchFailure {
+    /// The precise adapter or core invariant failure.
+    #[source]
+    pub error: EdgeError,
+    /// Index-aligned terminal results observed before the failure.
+    pub slots: Vec<Option<OutboundSlotResult>>,
+}
+
 /// Why an outbound batch stopped producing terminal slot results.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -145,6 +157,8 @@ pub enum OutboundBatchNext {
 pub enum OutboundBatchDriverEvent {
     /// The method-level observation cutoff won before every slot became terminal.
     Cutoff,
+    /// The adapter could not continue driving the batch without violating an invariant.
+    Failed(EdgeError),
     /// One newly terminal slot from an adapter driver.
     Item(OutboundBatchItem),
 }
@@ -176,22 +190,28 @@ impl OutboundBatch {
     /// Drives the batch to normal completion or cutoff and restores input index order.
     ///
     /// # Errors
-    /// Returns an internal error if the adapter driver ends prematurely or emits an invalid or
-    /// duplicate slot index.
+    /// Returns the precise adapter or core invariant failure together with every terminal slot
+    /// collected before the failure.
     #[inline]
-    pub async fn collect(mut self) -> Result<OutboundBatchResults, EdgeError> {
+    pub async fn collect(mut self) -> Result<OutboundBatchResults, OutboundBatchFailure> {
         let mut slots = iter::repeat_with(|| None)
             .take(self.unresolved.len())
             .collect::<Vec<_>>();
         loop {
-            match self.next().await? {
-                OutboundBatchNext::Item(item) => {
-                    let slot = slots.get_mut(item.index).ok_or_else(|| {
-                        batch_driver_error("validated outbound batch index became invalid")
-                    })?;
+            match self.next().await {
+                Err(error) => return Err(OutboundBatchFailure { error, slots }),
+                Ok(OutboundBatchNext::Item(item)) => {
+                    let Some(slot) = slots.get_mut(item.index) else {
+                        return Err(OutboundBatchFailure {
+                            error: batch_driver_error(
+                                "validated outbound batch index became invalid",
+                            ),
+                            slots,
+                        });
+                    };
                     *slot = Some(item.result);
                 }
-                OutboundBatchNext::Finished(termination) => {
+                Ok(OutboundBatchNext::Finished(termination)) => {
                     return Ok(OutboundBatchResults { slots, termination });
                 }
             }
@@ -227,8 +247,8 @@ impl OutboundBatch {
     /// Cancelling the returned future does not consume a ready slot.
     ///
     /// # Errors
-    /// Returns an internal error if the adapter driver ends prematurely or emits an invalid or
-    /// duplicate slot index.
+    /// Returns an internal error if the adapter driver fails, ends prematurely, or emits an
+    /// invalid or duplicate slot index.
     #[inline]
     pub async fn next(&mut self) -> Result<OutboundBatchNext, EdgeError> {
         if self.poisoned {
@@ -266,6 +286,10 @@ impl OutboundBatch {
                     OutboundBatchTermination::Cutoff,
                 ))
             }
+            Some(OutboundBatchDriverEvent::Failed(error)) => {
+                self.poisoned = true;
+                Err(error)
+            }
             None => {
                 self.poisoned = true;
                 Err(batch_driver_error(
@@ -273,6 +297,13 @@ impl OutboundBatch {
                 ))
             }
         }
+    }
+}
+
+impl From<OutboundBatchFailure> for EdgeError {
+    #[inline]
+    fn from(failure: OutboundBatchFailure) -> Self {
+        failure.error
     }
 }
 
@@ -410,14 +441,14 @@ impl HttpClient {
     /// Collects a completion-driven batch into original request order.
     ///
     /// # Errors
-    /// Returns an internal error if the adapter batch driver violates its slot or termination
-    /// invariants.
+    /// Returns the precise adapter or core invariant failure together with every terminal slot
+    /// collected before the failure.
     #[inline]
     pub async fn send_all_until(
         &self,
         requests: Vec<OutboundRequest>,
         cutoff: Deadline,
-    ) -> Result<OutboundBatchResults, EdgeError> {
+    ) -> Result<OutboundBatchResults, OutboundBatchFailure> {
         self.start_batch_until(requests, cutoff).collect().await
     }
 
@@ -2116,8 +2147,33 @@ mod tests {
             stream::iter([OutboundBatchDriverEvent::Item(batch_item(2))]),
         );
 
-        let error = block_on(batch.collect()).expect_err("premature EOF must fail");
-        assert!(matches!(error, EdgeError::Internal { .. }));
+        let failure = block_on(batch.collect()).expect_err("premature EOF must fail");
+        assert!(matches!(failure.error, EdgeError::Internal { .. }));
+        assert!(matches!(failure.slots.first(), Some(None)));
+        assert!(matches!(failure.slots.get(1), Some(None)));
+        assert!(matches!(failure.slots.get(2), Some(Some(_))));
+    }
+
+    #[test]
+    fn batch_collection_preserves_driver_failure_and_completed_slots() {
+        let batch = OutboundBatch::from_driver(
+            3,
+            stream::iter([
+                OutboundBatchDriverEvent::Item(batch_item(1)),
+                OutboundBatchDriverEvent::Failed(EdgeError::internal(anyhow::anyhow!(
+                    "Fastly omitted a pending handle from selection"
+                ))),
+            ]),
+        );
+
+        let failure = block_on(batch.collect()).expect_err("driver failure must surface");
+        assert_eq!(
+            failure.error.to_string(),
+            "internal error: Fastly omitted a pending handle from selection"
+        );
+        assert!(matches!(failure.slots.first(), Some(None)));
+        assert!(matches!(failure.slots.get(1), Some(Some(_))));
+        assert!(matches!(failure.slots.get(2), Some(None)));
     }
 
     #[test]
@@ -2130,8 +2186,10 @@ mod tests {
             ]),
         );
 
-        let error = block_on(batch.collect()).expect_err("duplicate index must fail");
-        assert!(matches!(error, EdgeError::Internal { .. }));
+        let failure = block_on(batch.collect()).expect_err("duplicate index must fail");
+        assert!(matches!(failure.error, EdgeError::Internal { .. }));
+        assert!(matches!(failure.slots.first(), Some(Some(_))));
+        assert!(matches!(failure.slots.get(1), Some(None)));
     }
 
     #[test]
@@ -2141,8 +2199,9 @@ mod tests {
             stream::iter([OutboundBatchDriverEvent::Item(batch_item(2))]),
         );
 
-        let error = block_on(batch.collect()).expect_err("out-of-range index must fail");
-        assert!(matches!(error, EdgeError::Internal { .. }));
+        let failure = block_on(batch.collect()).expect_err("out-of-range index must fail");
+        assert!(matches!(failure.error, EdgeError::Internal { .. }));
+        assert!(failure.slots.iter().all(Option::is_none));
     }
 
     #[test]

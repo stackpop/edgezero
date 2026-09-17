@@ -187,7 +187,10 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
             Ok(outbound_policy(OutboundRequest::new(Method::GET, target)?).deadline(deadline))
         })
         .collect::<Result<Vec<_>, EdgeError>>()?;
-    let slots = client.send_all_until(requests, deadline).await?;
+    let slots = client
+        .send_all_until(requests, deadline)
+        .await
+        .map_err(|failure| failure.error)?;
     let termination = slots.termination;
     let output = slots
         .slots

@@ -167,6 +167,15 @@ pub struct OutboundBatchResults {
     pub termination: OutboundBatchTermination,
 }
 
+/// A batch-level driver failure and the terminal slots collected before it occurred.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub struct OutboundBatchFailure {
+    pub error: EdgeError,
+    /// Index-aligned with the input; unresolved slots remain `None`.
+    pub slots: Vec<Option<OutboundSlotResult>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum OutboundBatchTermination {
@@ -195,7 +204,7 @@ impl OutboundBatch {
     pub fn cancel(self) -> Vec<usize>;
 
     /// Collects terminal items into the original input order until completion/cutoff.
-    pub async fn collect(self) -> Result<OutboundBatchResults, EdgeError>;
+    pub async fn collect(self) -> Result<OutboundBatchResults, OutboundBatchFailure>;
 }
 
 #[async_trait(?Send)]
@@ -399,7 +408,7 @@ impl HttpClient {
         &self,
         reqs: Vec<OutboundRequest>,
         cutoff: Deadline,
-    ) -> Result<OutboundBatchResults, EdgeError>;
+    ) -> Result<OutboundBatchResults, OutboundBatchFailure>;
     pub fn with_client<C: OutboundHttpClient + 'static>(client: C) -> Self;
 }
 ```
@@ -409,9 +418,11 @@ impl HttpClient {
 On success, its `slots` vector always has the input length. A slot rejected during preflight is
 `Some(OutboundSlotResult { outcome: Err(..), .. })`. `None` is legal only when `termination` is
 `OutboundBatchTermination::Cutoff` and means that the slot had not become terminal before the
-method-level cutoff. `Completed` guarantees every slot is `Some`. A malformed adapter driver is a
-batch-level `EdgeError::Internal`, not a successful collection. The hard cut retains no
-deadline-free `send_all` alias.
+method-level cutoff. `Completed` guarantees every slot is `Some`. An explicit adapter failure,
+premature driver EOF, or invalid index is not a successful collection and is never `Cutoff`.
+`OutboundBatchFailure.error` retains the precise `EdgeError`, while `slots` retains every terminal
+result collected before the failure. Converting `OutboundBatchFailure` into `EdgeError` explicitly
+discards those partial slots. The hard cut retains no deadline-free `send_all` alias.
 
 Obtained from the context:
 
@@ -1652,13 +1663,18 @@ emits an explicit cutoff event. A response that was provider-ready but not obser
 blocking provider primitive returned remains unresolved; capability rows make that limitation
 explicit. Core infers normal completion only after every input index emits exactly once. A
 premature driver EOF and duplicate or out-of-range indices are invariant failures returned as
-`EdgeError::Internal`; they never become `Cutoff` or `None` slots.
+`EdgeError::Internal`; they never become `Cutoff`. An adapter that detects its own invariant
+failure emits a private failure event carrying that exact `EdgeError` rather than ending its driver
+or fabricating a cutoff. Incremental `next()` callers receive the error directly.
 
-`HttpClient::send_all_until` is the simple ordered view. It constructs the batch, calls
-`collect()`, and propagates any batch-level error. A successful `OutboundBatchResults.slots` always
-has the input length. Preflight and other terminal failures are `Some`; only work unresolved when
-the method cutoff won is `None`, and only when `termination == Cutoff`. `Completed` guarantees no
-missing slots. There is no second adapter collector and no compatibility `send_all` method.
+`HttpClient::send_all_until` is the simple ordered view. It constructs the batch and calls
+`collect()`. A successful `OutboundBatchResults.slots` always has the input length. Preflight and
+other terminal failures are `Some`; only work unresolved when the method cutoff won is `None`, and
+only when `termination == Cutoff`. `Completed` guarantees no missing slots. If the driver fails,
+`OutboundBatchFailure.slots` has the same input length and preserves every result collected before
+the failure; unresolved positions remain `None`, but that absence is distinguished from cutoff by
+the `Err` result and precise `error` field. There is no second adapter collector and no
+compatibility `send_all` method.
 
 | Adapter | `start_batch_until` mechanism | Completion/cancellation quality |
 | --- | --- | --- |
@@ -2860,7 +2876,7 @@ the third plus `ResponseLimitReason` in the same mechanical style.
 | Outbound response body not valid JSON, gzip, or Brotli / `json::<T>` called on a streamed body | `bad_gateway`, reason `Decode(Json/Gzip/Brotli)` for malformed content and `Protocol` for invalid API state | 502 |
 | Outbound per-request timeout or request deadline exceeded | `gateway_timeout` (carries `budget.cause`: per-call vs request deadline — §3.3.2) | 504 |
 | Batch method cutoff reached | collection terminates as `Cutoff`; unresolved slots are `None`; no synthetic terminal slot error is emitted | n/a |
-| Malformed batch driver | batch-level `Internal` for premature EOF or duplicate/out-of-range index; never represented as `None` | 500 |
+| Malformed or explicitly failed batch driver | `OutboundBatchFailure` with the precise batch-level `Internal` and all previously collected slots; never represented as `Cutoff` | 500 |
 | Outbound completed with a non-2xx status | **not an error** — `Ok(OutboundResponse)` | app decides |
 
 The non-2xx rule is load-bearing: a target returning 204/400/500 is a normal fan-out batch
@@ -4814,8 +4830,12 @@ fn start_batch_until(
         while !pending.is_empty() && !cutoff.is_expired_at(clock.now()) {
             // `select_pending_slot` calls `select_handles`, restores metadata by raw handle
             // identity, and supports bounded groups up to Fastly's MAX_PENDING_REQS.
-            let Ok((selection, metadata)) = select_pending_slot(&mut pending) else {
-                return;
+            let (selection, metadata) = match select_pending_slot(&mut pending) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    yield OutboundBatchDriverEvent::Failed(error);
+                    return;
+                }
             };
             let index = metadata.index;
             let outcome = finish_selected(selection, metadata, &clock).await;
@@ -6295,10 +6315,12 @@ Required coverage:
 - `HttpClient::start_batch_until` delegates the complete input and cutoff to its injected client.
   `HttpClient::send_all_until` collects that same driver into index-aligned `Option` slots,
   including empty input, mixed success/error results, and unresolved-at-cutoff slots. Tests assert
-  `Completed` for complete and empty batches, `Cutoff` for explicit cutoff, and batch-level
-  `Internal` for premature EOF and duplicate or out-of-range indices. `None` occurs only with
-  `Cutoff`. These core/mock tests establish handle delegation and collection only; adapter batch
-  behavior is required separately by the Tier 2 batch row.
+  `Completed` for complete and empty batches, `Cutoff` for explicit cutoff, and
+  `OutboundBatchFailure` carrying batch-level `Internal` plus previously collected slots for an
+  explicit driver failure, premature EOF, or duplicate/out-of-range index. Successful-result
+  `None` occurs only with `Cutoff`; failure-result `None` marks a slot not collected before the
+  separate typed failure. These core/mock tests establish handle delegation and collection only;
+  adapter batch behavior is required separately by the Tier 2 batch row.
 - Shared preflight tests pin the GET/HEAD streamed-body diagnostic. Tier 2 verifies each
   adapter invokes that validator before its batch-only streamed-body rejection.
 - Buffered and streamed response drains enforce caps and deadlines, recheck after EOF, and
@@ -6322,7 +6344,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 | Capability metadata | All four adapters return the exact twelve **outbound** cells in §3.5.2, including completion order, cancellation, slot isolation, cache bypass, authority override, complete resource accounting = Unsupported everywhere, Fastly outbound HTTP = BestEffort, Cloudflare header fidelity = BestEffort, and Spin deadline/upload/flexible-phase-budget = BestEffort. Tests do not assert that the shared enum has only twelve global variants; non-outbound cells belong to their own specs. A fixture adapter that relies on the trait default returns Unsupported. Because each adapter crate matches core's non-exhaustive `Capability` enum across a crate boundary, normal adapter compilation requires a wildcard; review asserts that its result is `_ => Unsupported`. A hypothetical future variant is a structural fail-closed invariant, not a value current Rust code can safely construct at runtime. |
 | Request conversion | Method/body/headers/full canonical URI survive conversion; normalized hop-by-hop fields cannot reappear; buffered and streamed request caps map to 400. Dot-segment/percent/numeric-host/IDNA cases use the exact core serialization rather than adapter reconstruction. Typed `EdgeError` request chunks survive adapter conversion; in-tree paths never route them through `from_external_stream`. |
 | Deadline anchoring and clock propagation | Every standard adapter installs its outbound client with the exact `App::monotonic_clock()` clone used by ingress; explicit low-level constructors use a documented default clock. Every adapter captures one stored-clock snapshot as the first operation in `send`/`start_batch_until`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors or bypasses the client clock. Preflight slot elapsed, provider-error precedence, post-ready expiry, deferred upload/response streams, returned `OutboundResponse` bounded-until collection, and response-egress coordinator checks use that same handle. A backwards clock cannot enlarge `budget.duration`; a backwards terminal sample produces zero elapsed plus an internal invariant outcome. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
-| `start_batch_until` / `send_all_until` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Assert every emitted slot carries its own elapsed time from the one method-entry snapshot through that slot's terminal point; advance the injected clock during preflight to prove that time is included. A same-tick terminal result may legitimately report zero. A slow sibling's later completion must not overwrite an earlier slot's elapsed value. Valid one-slot buffered batches match single-send outcome semantics while elapsed is asserted independently. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Assert cancellation retains already emitted items, reports unresolved indices, and does not consume a ready item when a `next()` future is dropped. Fastly tests dispatch-before-selection, selected-handle identity reassociation, bounded groups, and immediate elapsed sampling after each preflight/dispatch/selected-body terminal result while retaining its documented BestEffort timing caveats. Backwards injected time produces zero plus an internal outcome, distinguishable from legitimate zero by outcome. |
+| `start_batch_until` / `send_all_until` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Assert every emitted slot carries its own elapsed time from the one method-entry snapshot through that slot's terminal point; advance the injected clock during preflight to prove that time is included. A same-tick terminal result may legitimately report zero. A slow sibling's later completion must not overwrite an earlier slot's elapsed value. Valid one-slot buffered batches match single-send outcome semantics while elapsed is asserted independently. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Assert cancellation retains already emitted items, reports unresolved indices, and does not consume a ready item when a `next()` future is dropped. Fastly tests dispatch-before-selection, selected-handle identity reassociation, all three reassociation failure diagnostics, exact error-to-driver-event propagation with previously collected slots, bounded groups, and immediate elapsed sampling after each preflight/dispatch/selected-body terminal result while retaining its documented BestEffort timing caveats. Backwards injected time produces zero plus an internal outcome, distinguishable from legitimate zero by outcome. |
 | Streamed fan-out usage | On Axum/Cloudflare/Spin, join per-request tasks containing both `send` and body consumption. Script a fast response whose body can finish before its deadline while a sibling's headers remain pending beyond it. Assert the fast body is consumed and succeeds before those sibling headers arrive. Joining only sends and delaying all body consumption must fail this regression. Fastly is excluded from this non-portable usage pattern. |
 | Response conversion | Every adapter enforces guest-visible header limits before normalization, then normalizes before body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method and retained clock into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. HEAD/304 malformed, conflicting, comma-list, and `u64`-overflow `Content-Length` fail as protocol 502 before body polling while valid representation lengths are retained; 1xx/204 remove the field. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
 | 205 settlement | Test declared-body immediate abort, one in-budget clean EOF, observed non-empty bytes, read failure, and deadline precedence. Where the SDK exposes empty items, one empty item aborts without another read; on Fastly a non-empty read buffer returning zero is EOF. Cloudflare additionally tests null-body host suppression with absent/zero and positive visible lengths without claiming hidden-byte visibility. Assert native-handle cleanup and Spin completion signalling using observable results, never synthetic wire-frame visibility. |
