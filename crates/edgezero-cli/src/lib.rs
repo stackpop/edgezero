@@ -594,7 +594,7 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 #[cfg(feature = "cli")]
 mod tests {
     use super::*;
-    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard, path_mutation_guard};
+    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use edgezero_adapter::registry::{
         self as adapter_registry, Adapter, AdapterAction, DeployOwnership,
     };
@@ -1183,41 +1183,25 @@ deploy = "touch '{}'"
 
     #[cfg(not(windows))]
     #[test]
-    fn run_deploy_reconciles_fastly_selectors_after_a_manifest_command() {
+    fn run_deploy_store_backed_fastly_bypasses_manifest_command_and_requires_release() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let temp = TempDir::new().expect("temp dir");
         let adapter_dir = temp.path().join("crates/demo-fastly");
-        let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&adapter_dir).expect("adapter dir");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
         fs::write(adapter_dir.join("fastly.toml"), "name = \"demo\"\n").expect("fastly manifest");
 
+        let marker = temp.path().join("manifest-command-ran");
         let deploy_script = temp.path().join("deploy.sh");
-        fs::write(&deploy_script, "#!/bin/sh\necho version=42\n").expect("deploy script");
+        fs::write(
+            &deploy_script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("deploy script");
         let mut deploy_perms = fs::metadata(&deploy_script).expect("meta").permissions();
         deploy_perms.set_mode(0o755);
         fs::set_permissions(&deploy_script, deploy_perms).expect("chmod deploy");
-
-        let operations = temp.path().join("operations.log");
-        let fake_fastly = bin_dir.join("fastly");
-        fs::write(
-            &fake_fastly,
-            format!(
-                "#!/bin/sh\n\
-                 if [ \"$1 $2\" = \"config-store list\" ]; then echo '[{{\"id\":\"ENV1\",\"name\":\"edgezero_runtime_env\"}}]'; exit 0; fi\n\
-                 if [ \"$1 $2\" = \"config-store-entry list\" ]; then echo '[]'; exit 0; fi\n\
-                 if [ \"$1 $2\" = \"config-store-entry update\" ]; then value=$(cat); printf '%s %s\\n' \"$*\" \"$value\" >> '{}'; exit 0; fi\n\
-                 exit 1\n",
-                operations.display()
-            ),
-        )
-        .expect("fake fastly");
-        let mut fastly_perms = fs::metadata(&fake_fastly).expect("meta").permissions();
-        fastly_perms.set_mode(0o755);
-        fs::set_permissions(&fake_fastly, fastly_perms).expect("chmod fastly");
 
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(
@@ -1229,33 +1213,26 @@ deploy = "touch '{}'"
         )
         .expect("edgezero manifest");
         let manifest_str = manifest_path.to_string_lossy().into_owned();
-        let path = format!(
-            "{}:{}",
-            bin_dir.display(),
-            env::var("PATH").unwrap_or_default()
-        );
         let _manifest = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
-        let _path = EnvOverride::set("PATH", &path);
         let _selector = EnvOverride::set(
             "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
             "ts_secrets_staging",
         );
 
-        run_deploy(&DeployArgs {
+        let error = run_deploy(&DeployArgs {
             adapter: "fastly".to_owned(),
             application_release: None,
             adapter_args: vec!["--non-interactive".to_owned()],
             service_id: Some("SVC1".to_owned()),
             staging: false,
         })
-        .expect("custom deploy and selector reconciliation succeed");
+        .expect_err("store-backed Fastly deploy requires an immutable release");
 
-        let log = fs::read_to_string(&operations).expect("selector update recorded");
         assert!(
-            log.contains("--key=EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME")
-                && log.contains("ts_secrets_staging"),
-            "the selected canonical secret store is materialized after the custom deploy: {log}"
+            error.contains("--application-release"),
+            "managed ownership reaches the release verifier: {error}"
         );
+        assert!(!marker.exists(), "the manifest deploy command is bypassed");
     }
 
     #[test]
