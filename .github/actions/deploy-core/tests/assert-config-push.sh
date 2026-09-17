@@ -4,9 +4,9 @@ set -euo pipefail
 # Asserts one config-push-fastly invocation against the fake Fastly CLI.
 #
 # The contract that matters is the staging model: staging and production write
-# different keys in the store selected by each environment, so a staged push can
-# never overwrite the key the live service is reading. This runs once per push —
-# re-seeding the fake truncates the call log, so each push is asserted separately.
+# the same logical key in the physical store selected by each environment. This
+# runs once per push; re-seeding the fake truncates the call log, so each
+# environment-selected store is asserted separately.
 #
 # Reads (env):
 #   FAKE_CALL_LOG                 required  the fake fastly call log
@@ -44,7 +44,7 @@ grep -q 'fastly config-store list' "$log" ||
 grep -qE "fastly config-store-entry update .*--key=${expect_key}( |$)" "$log" ||
   fail "config push never wrote --key=$expect_key via 'fastly config-store-entry update'"
 
-# Staging must not touch the production key (and vice versa).
+# The push must not use a rejected target-derived key.
 if [[ -n "$reject_key" ]]; then
   if grep -qE "config-store-entry update .*--key=${reject_key}( |$)" "$log"; then
     fail "this push wrote --key=$reject_key, which it must never touch"

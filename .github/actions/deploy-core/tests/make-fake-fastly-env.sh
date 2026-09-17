@@ -44,6 +44,10 @@ JSON
     [[ "\$#" -eq 5 && "\$3" == --service-id=dummyservice &&
       ("\$4" == --version=40 || "\$4" == --version=42) && "\$5" == --json ]] || exit 91
     target=\$(arg_value --version= "\$@") || exit 91
+    if [[ "\$target" == 42 && -n "\${FAKE_FAIL_AFTER_VERSION:-}" ]]; then
+      echo 'simulated post-upload resource-link readback failure' >&2
+      exit 77
+    fi
     [[ -f "\$(links_file "\$target")" ]] || exit 91
     links_json "\$target"
     ;;
@@ -87,10 +91,6 @@ JSON
     ;;
   'resource-link delete')
     [[ "\$#" -eq 5 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 ]] || exit 91
-    if [[ -n "\${FAKE_FAIL_AFTER_VERSION:-}" ]]; then
-      echo 'simulated post-upload resource-link failure' >&2
-      exit 77
-    fi
     target=\$(arg_value --version= "\$@") || exit 91
     id=\$(arg_value --id= "\$@") || exit 91
     file=\$(links_file "\$target")

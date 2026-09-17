@@ -526,8 +526,8 @@ jobs:
 
       - name: Assert publisher B staging config
         env:
-          EDGEZERO__TEST__EXPECT_KEY: app_config_staging
-          EDGEZERO__TEST__REJECT_KEY: app_config
+          EDGEZERO__TEST__EXPECT_KEY: app_config
+          EDGEZERO__TEST__REJECT_KEY: app_config_staging
           EDGEZERO__TEST__PUSHED_KEY: ${{ steps.staged.outputs.pushed-key }}
           EDGEZERO__TEST__PUSHED_STORE: ${{ steps.staged.outputs.store }}
         run: .github/actions/deploy-core/tests/assert-config-push.sh
