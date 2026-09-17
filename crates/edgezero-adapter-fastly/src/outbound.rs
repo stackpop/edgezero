@@ -19,6 +19,8 @@ use std::time::Duration;
 use edgezero_core::error::EdgeError;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::error::{BadGatewayReason, BudgetSource};
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::outbound::OutboundBatchDriverEvent;
 #[cfg(any(feature = "fastly", feature = "test-utils"))]
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 #[cfg(test)]
@@ -176,7 +178,9 @@ mod fastly_impl {
     use futures_util::StreamExt as _;
     use sha2::{Digest as _, Sha256};
 
-    use super::{reassociate_selection, timeout_error, validate_batch_request};
+    use super::{
+        driver_selection_failure, reassociate_selection, timeout_error, validate_batch_request,
+    };
 
     pub const DYNAMIC_BACKENDS_DISABLED_MESSAGE: &str = "Fastly dynamic backends are not enabled on this service; enable them in the service configuration";
     const RESPONSE_READ_BYTES: usize = 16 * 1024;
@@ -568,8 +572,12 @@ mod fastly_impl {
                 }
 
                 while !pending.is_empty() && !cutoff.is_expired_at(clock.now()) {
-                    let Ok((selection, metadata)) = select_pending_slot(&mut pending) else {
-                        return;
+                    let (selection, metadata) = match select_pending_slot(&mut pending) {
+                        Ok(selected) => selected,
+                        Err(error) => {
+                            yield driver_selection_failure(error);
+                            return;
+                        }
                     };
                     let index = metadata.index;
                     let outcome = finish_selected(selection, metadata, &clock).await;
@@ -2424,6 +2432,11 @@ fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
     Ok(())
 }
 
+#[cfg(any(feature = "fastly", test))]
+fn driver_selection_failure(error: EdgeError) -> OutboundBatchDriverEvent {
+    OutboundBatchDriverEvent::Failed(error)
+}
+
 /// Runs the target-neutral Fastly batch preflight contract in native tests.
 ///
 /// # Errors
@@ -2441,6 +2454,10 @@ fn timeout_error(cause: BudgetSource) -> EdgeError {
 
 #[cfg(test)]
 mod send_failure_policy_tests {
+    use edgezero_core::outbound::{OutboundBatch, OutboundBatchItem, OutboundSlotResult};
+    use futures::executor::block_on;
+    use futures_util::stream;
+
     use super::*;
 
     #[test]
@@ -2458,6 +2475,89 @@ mod send_failure_policy_tests {
 
         assert_eq!(selected, "second");
         assert_eq!(remaining, ["third", "first"]);
+    }
+
+    #[test]
+    fn selection_rejects_an_invalid_selected_handle_index() {
+        let error = reassociate_selection(vec![(11_u32, Some("first"))], 1, &[])
+            .expect_err("selected index must identify an input handle");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: Fastly returned an invalid selected handle index"
+        );
+    }
+
+    #[test]
+    fn selection_rejects_an_unknown_or_duplicate_pending_handle() {
+        let unknown = reassociate_selection(
+            vec![(11_u32, Some("first")), (22, Some("second"))],
+            0,
+            &[99],
+        )
+        .expect_err("remaining handle must come from the input group");
+        let duplicate = reassociate_selection(
+            vec![(11_u32, Some("first")), (22, Some("second"))],
+            0,
+            &[22, 22],
+        )
+        .expect_err("remaining handle must not be duplicated");
+
+        for error in [unknown, duplicate] {
+            assert_eq!(
+                error.to_string(),
+                "internal error: Fastly returned an unknown or duplicate pending handle"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_rejects_an_omitted_pending_handle() {
+        let error = reassociate_selection(
+            vec![
+                (11_u32, Some("first")),
+                (22, Some("second")),
+                (33, Some("third")),
+            ],
+            0,
+            &[22],
+        )
+        .expect_err("every unselected handle must be returned");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: Fastly omitted a pending handle from selection"
+        );
+    }
+
+    #[test]
+    fn selection_failure_preserves_its_diagnostic_and_previously_collected_slots() {
+        let event = driver_selection_failure(EdgeError::internal(anyhow::anyhow!(
+            "Fastly omitted a pending handle from selection"
+        )));
+        let OutboundBatchDriverEvent::Failed(_) = &event else {
+            panic!("selection failure must become a driver failure event");
+        };
+        let completed = OutboundBatchItem::new(
+            0,
+            OutboundSlotResult::new(
+                Duration::from_millis(1),
+                Err(EdgeError::bad_gateway("completed slot failure")),
+            ),
+        );
+        let batch = OutboundBatch::from_driver(
+            2,
+            stream::iter([OutboundBatchDriverEvent::Item(completed), event]),
+        );
+        let failure =
+            block_on(batch.collect()).expect_err("selection failure must fail collection");
+
+        assert_eq!(
+            failure.error.to_string(),
+            "internal error: Fastly omitted a pending handle from selection"
+        );
+        assert!(matches!(failure.slots.first(), Some(Some(_))));
+        assert!(matches!(failure.slots.get(1), Some(None)));
     }
 
     fn failures() -> [SendFailure; 8] {

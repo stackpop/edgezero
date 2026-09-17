@@ -1587,6 +1587,7 @@ mod tests {
             ".max_brotli_decoder_bytes(",
             ".timeout(",
             "send_all_until(",
+            "map_err(|failure| failure.error)",
             "OutboundBatchTermination::Completed",
             "OutboundBatchTermination::Cutoff",
             "OutboundBatch::from_driver",

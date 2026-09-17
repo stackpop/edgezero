@@ -4,7 +4,7 @@
 
 **Goal:** Make normal completion, method-cutoff termination, and malformed adapter-driver termination unambiguous in the public outbound batch API.
 
-**Architecture:** Replace the stream-like `Option` terminal signal with an explicit `OutboundBatchNext::{Item, Finished}` result and add `OutboundBatchTermination::{Completed, Cutoff}` to ordered results. Adapter streams emit private-contract driver events for slots or cutoff; core validates index range, uniqueness, and premature EOF and returns typed `EdgeError::Internal` failures instead of silently converting invariant violations into unresolved slots.
+**Architecture:** Replace the stream-like `Option` terminal signal with an explicit `OutboundBatchNext::{Item, Finished}` result and add `OutboundBatchTermination::{Completed, Cutoff}` to ordered results. Adapter streams emit private-contract driver events for slots, cutoff, or failure; core validates index range, uniqueness, and premature EOF and returns `OutboundBatchFailure` with the precise `EdgeError::Internal` and previously collected slots instead of silently converting invariant violations into unresolved slots.
 
 **Tech Stack:** Rust 2024, `futures`, `async-stream`, EdgeZero `EdgeError`, provider adapter contract tests, VitePress documentation checks.
 
@@ -48,9 +48,9 @@ pub enum OutboundBatchNext {
 }
 ```
 
-Change `OutboundBatch::next` to return `Result<OutboundBatchNext, EdgeError>`, `collect` to return `Result<OutboundBatchResults, EdgeError>`, and `HttpClient::send_all_until` to return `Result<OutboundBatchResults, EdgeError>`. Add `termination` to `OutboundBatchResults`.
+Change `OutboundBatch::next` to return `Result<OutboundBatchNext, EdgeError>`, `collect` to return `Result<OutboundBatchResults, OutboundBatchFailure>`, and `HttpClient::send_all_until` to return `Result<OutboundBatchResults, OutboundBatchFailure>`. Add `termination` to `OutboundBatchResults`.
 
-Use a doc-hidden adapter driver event with `Item` and `Cutoff` variants. Mark completion only after every index resolves. Return a fixed category-safe internal error for premature EOF, duplicate indices, out-of-range indices, or impossible terminal transitions.
+Use a doc-hidden adapter driver event with `Item`, `Cutoff`, and `Failed` variants. Mark completion only after every index resolves. Return a fixed category-safe internal error for core-detected premature EOF, duplicate indices, out-of-range indices, or impossible terminal transitions; preserve adapter-supplied failures exactly. Ordered collection retains every slot observed before either class of failure.
 
 - [x] **Step 4: Run core tests and verify GREEN**
 
@@ -83,7 +83,7 @@ Expected: FAIL until adapters emit explicit driver events.
 
 - [x] **Step 3: Emit explicit item and cutoff events**
 
-For Axum, Cloudflare, and Spin, map every completed exchange to an item event and every `finish_batch_item` cutoff decision to a cutoff event. For Fastly, also map initial expiry, dispatch-loop expiry, selected-body cutoff, and provider-selection cutoff to a cutoff event. Driver EOF is reserved for full completion only.
+For Axum, Cloudflare, and Spin, map every completed exchange to an item event and every `finish_batch_item` cutoff decision to a cutoff event. For Fastly, also map initial expiry, dispatch-loop expiry, and selected-body cutoff to a cutoff event; map provider-selection invariant failure to a failure event carrying its precise error. Driver EOF is reserved for full completion only.
 
 - [x] **Step 4: Run adapter tests and WASM checks**
 
@@ -113,7 +113,7 @@ Expected: PASS.
 
 - [x] **Step 1: Add failing demo and generator assertions**
 
-Require checked-in and generated handlers to propagate batch-level internal errors with `?`, inspect the typed termination reason, and avoid the removed direct-result API shape.
+Require checked-in and generated handlers to choose explicitly whether to inspect `OutboundBatchFailure.slots` or discard them while propagating `failure.error`, inspect the typed termination reason, and avoid the removed direct-result API shape.
 
 - [x] **Step 2: Run focused consumer tests and verify RED**
 
@@ -146,11 +146,11 @@ Expected: PASS.
 
 - [x] **Step 1: Update specification API and invariants**
 
-Document explicit `Completed`/`Cutoff` termination, batch-level `EdgeError::Internal`, the rule that `None` is legal only for `Cutoff`, and explicit adapter cutoff signaling.
+Document explicit `Completed`/`Cutoff` termination, `OutboundBatchFailure`, the successful-result rule that `None` is legal only for `Cutoff`, retained partial slots on failure, and explicit adapter cutoff/failure signaling.
 
 - [x] **Step 2: Update guides and examples**
 
-Show `OutboundBatchNext::Item`/`Finished` iteration and `send_all_until(...).await?`. State that malformed drivers never degrade into timeout-like unresolved slots.
+Show `OutboundBatchNext::Item`/`Finished` iteration and explicit handling of `send_all_until(...).await` as `Result<OutboundBatchResults, OutboundBatchFailure>`. State that malformed drivers never degrade into timeout-like unresolved slots and that ordered collection preserves slots observed before failure.
 
 - [x] **Step 3: Extend documentation regression checks**
 

@@ -50,7 +50,7 @@ scan \
 # Batch termination is explicit. Adapter drivers cannot use stream EOF as a
 # cutoff signal, and callers cannot interpret every missing item as timeout.
 scan \
-  'OutboundBatch::from_stream|while[[:space:]]+let[[:space:]]+Some\([^)]*\)[[:space:]]*=[[:space:]]*batch\.next\(\)\.await|send_all_until\(.*\)\.await\.slots' \
+  'OutboundBatch::from_stream|while[[:space:]]+let[[:space:]]+Some\([^)]*\)[[:space:]]*=[[:space:]]*batch\.next\(\)\.await|send_all_until\(.*\)\.await\.slots|Result<OutboundBatchResults,[[:space:]]*EdgeError>' \
   crates examples/app-demo docs/guide README.md CLAUDE.md TODO.md || failed=1
 
 # Generated/demo Fastly entrypoints must delegate transmission to EdgeZero.

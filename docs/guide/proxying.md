@@ -128,12 +128,29 @@ assert!(matches!(
 ));
 ```
 
-`let results = client.send_all_until(requests, cutoff).await?;` collects the same driver into an
-index-aligned `Vec<Option<OutboundSlotResult>>` plus `results.termination`. `Completed` guarantees
-every slot is present. Only `Cutoff` permits `None`, meaning that slot was unresolved when the
-method cutoff won. A premature or malformed adapter driver returns a batch-level internal error;
-it never degrades into timeout-like missing slots. Every terminal slot is timed from the batch
-method-entry snapshot through its own terminal observation, including preflight and body
+`client.send_all_until(requests, cutoff).await` collects the same driver into an index-aligned
+`Vec<Option<OutboundSlotResult>>` plus `results.termination`. `Completed` guarantees every slot is
+present. Only `Cutoff` permits `None` in a successful result, meaning that slot was unresolved when
+the method cutoff won. A premature, malformed, or explicitly failed adapter driver returns
+`OutboundBatchFailure` instead. Its `error` is the precise batch-level failure, and its `slots`
+retains every terminal result collected before that failure:
+
+```rust
+let results = match client.send_all_until(requests, cutoff).await {
+    Ok(results) => results,
+    Err(failure) => {
+        for (index, slot) in failure.slots.into_iter().enumerate() {
+            if let Some(slot) = slot {
+                retain_terminal_slot(index, slot);
+            }
+        }
+        return Err(failure.error);
+    }
+};
+```
+
+Driver failure never degrades into cutoff-like missing slots. Every terminal slot is timed from the
+batch method-entry snapshot through its own terminal observation, including preflight and body
 buffering. It is not pure network RTT. Bound the request count and every per-request body limit;
 EdgeZero intentionally has no global batch-concurrency or memory cap.
 
