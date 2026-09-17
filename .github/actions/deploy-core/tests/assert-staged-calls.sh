@@ -25,8 +25,8 @@ main() {
   local expected mutations
   expected=$(cat <<'MUTATIONS'
 fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
-fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD
 fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_RUNTIME
+fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD
 fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD
 fastly resource-link create --service-id=dummyservice --version=42 --resource-id=CONFIGSTAGE --name=app_config
 fastly resource-link create --service-id=dummyservice --version=42 --resource-id=KVSTAGE --name=cache
