@@ -320,18 +320,18 @@ where
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use edgezero_core::BudgetSource;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{HeaderMap, Method, StatusCode, Uri, request_builder};
     use edgezero_core::outbound::{
-        HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundHttpClient,
-        OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseMode,
+        HttpClient, OutboundBatch, OutboundBatchItem, OutboundHttpClient, OutboundRequestParts,
+        OutboundResponse, OutboundSlotResult, ResponseMode,
     };
     use edgezero_core::params::PathParams;
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::test_env::env_lock;
+    use edgezero_core::{BudgetSource, OutboundBatchDriverEvent};
     use futures::executor::block_on;
     use std::collections::HashMap;
     use std::time::Duration;

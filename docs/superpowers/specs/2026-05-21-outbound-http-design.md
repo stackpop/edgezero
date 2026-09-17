@@ -192,19 +192,36 @@ pub enum OutboundBatchNext {
     Item(OutboundBatchItem),
 }
 
+/// Public adapter-to-core batch driver protocol.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum OutboundBatchDriverEvent {
+    Cutoff,
+    Failed(EdgeError),
+    Item(OutboundBatchItem),
+}
+
 /// Adapter-owned completion driver. The transport and pending handles remain opaque.
 pub struct OutboundBatch { /* private */ }
 
 impl OutboundBatch {
-    /// Returns the next observed terminal item or the explicit termination reason.
-    /// Cancelling this future does not consume or lose a ready item.
-    pub async fn next(&mut self) -> Result<OutboundBatchNext, EdgeError>;
-
     /// Stops observation, applies strongest-available teardown, and returns unresolved indices.
     pub fn cancel(self) -> Vec<usize>;
 
     /// Collects terminal items into the original input order until completion/cutoff.
     pub async fn collect(self) -> Result<OutboundBatchResults, OutboundBatchFailure>;
+
+    /// Builds an already-cut-off batch without polling adapter transport work.
+    pub fn cutoff(slot_count: usize) -> Self;
+
+    /// Builds a batch from an adapter-owned event stream.
+    pub fn from_driver<StreamValue>(slot_count: usize, stream: StreamValue) -> Self
+    where
+        StreamValue: Stream<Item = OutboundBatchDriverEvent> + 'static;
+
+    /// Returns the next observed terminal item or the explicit termination reason.
+    /// Cancelling this future does not consume or lose a ready item.
+    pub async fn next(&mut self) -> Result<OutboundBatchNext, EdgeError>;
 }
 
 #[async_trait(?Send)]
@@ -453,8 +470,8 @@ pub struct OutboundRequest {
     max_decoded_response_bytes: Option<u64>, // identity/EdgeZero-decoded output only
     max_encoded_response_bytes: Option<u64>, // pre-decode guest-visible body cap
     max_request_body_bytes: u64,         // cap for buffered or streamed body bytes (default 8 MiB)
-    max_response_header_bytes: Option<u64>, // guest-visible names + values
-    max_response_header_count: Option<u64>, // guest-visible name/value entries
+    max_response_header_bytes: Option<u64>, // adapter-visible upstream names + values before normalization
+    max_response_header_count: Option<u64>, // adapter-visible upstream entries before normalization
     method: Method,
     response_mode: ResponseMode,         // Buffered { max_bytes } (default) | Streamed
     timeout: Option<Duration>,           // per-request budget
@@ -916,13 +933,21 @@ pub fn decode_brotli_stream(
 pub fn decode_gzip_stream(stream: BodyStream) -> BodyStream;
 
 // `edgezero_core::outbound` items, in module order:
+pub fn finish_batch_item(
+    index: usize,
+    started_at: MonotonicInstant,
+    completed_at: MonotonicInstant,
+    cutoff: Deadline,
+    outcome: Result<OutboundResponse, EdgeError>,
+) -> Option<OutboundBatchItem>;
 pub async fn collect_response_stream(stream: BodyStream, max: u64) -> Result<Bytes, EdgeError>;
 pub fn limit_decoded_stream(stream: BodyStream, max: Option<u64>) -> BodyStream;
 pub fn limit_encoded_stream(stream: BodyStream, max: Option<u64>) -> BodyStream;
 pub fn rechunk_stream(stream: BodyStream, max: Option<NonZeroU64>) -> BodyStream;
 
-/// Cumulative guest-visible field-section accounting retained by the adapter from the
-/// first exposed informational block through final headers and exposed trailers.
+/// Cumulative adapter-visible upstream field-section accounting retained from the first
+/// exposed informational block through final headers and exposed trailers, before EdgeZero
+/// normalization, plus synthetic fields inserted by EdgeZero after normalization.
 pub struct ResponseHeaderLimiter { /* private checked-u64 counters and limits */ }
 impl ResponseHeaderLimiter {
     pub fn new(max_bytes: Option<u64>, max_count: Option<u64>) -> Self;
@@ -1664,8 +1689,16 @@ blocking provider primitive returned remains unresolved; capability rows make th
 explicit. Core infers normal completion only after every input index emits exactly once. A
 premature driver EOF and duplicate or out-of-range indices are invariant failures returned as
 `EdgeError::Internal`; they never become `Cutoff`. An adapter that detects its own invariant
-failure emits a private failure event carrying that exact `EdgeError` rather than ending its driver
-or fabricating a cutoff. Incremental `next()` callers receive the error directly.
+failure emits `OutboundBatchDriverEvent::Failed` carrying that exact `EdgeError` rather than ending
+its driver or fabricating a cutoff. Incremental `next()` callers receive the error directly.
+
+On the concurrent Axum, Cloudflare, and Spin drivers, each child samples its terminal instant
+synchronously when that child is observed ready. The terminal samples follow poll-observation order in the shared monotonic clock domain. Once one observation is at or past
+the cutoff, a later-observed child cannot have an earlier on-time terminal sample unless the
+injected clock violates its monotonic contract; backwards samples already fail closed as internal
+slot outcomes. The drivers therefore emit `Cutoff` immediately rather than polling or grouping
+siblings after expiry. Fastly stores provider-selected completions across blocking host operations
+and retains its separately documented BestEffort completion-order limitation.
 
 `HttpClient::send_all_until` is the simple ordered view. It constructs the batch and calls
 `collect()`. A successful `OutboundBatchResults.slots` always has the input length. Preflight and
@@ -2380,9 +2413,9 @@ timing needs are fully met by the outbound path. Noted as possible future work.
 
 #### 3.4.1 Outbound responses
 
-**Guest-visible header limits happen first; normalization and no-content handling follow,
+**Adapter-visible upstream header limits happen first; normalization and no-content handling follow,
 before body decode or body-cap logic.** §3.4.5 measures response headers at the earliest
-guest-visible adapter boundary, before normalization can remove fields. After those limits
+adapter-visible boundary, before normalization can remove fields. After those limits
 pass, `normalize_response_headers` strips hop-by-hop fields and `connection`
 nominations (§3.1.4), a response that is bodyless by HTTP framing — the response to a
 **`HEAD`** request, or any **`1xx`**, **`204`**, or **`304`** status — carries no payload even
@@ -2431,7 +2464,7 @@ without asserting that every adapter can inspect wire frames. On Cloudflare ever
 abort disposition calls the subrequest's `AbortController::abort()` (§4.2).
 
 Cloudflare has one narrower observable boundary: workerd can expose `Response.body == null`
-for 205 after suppressing content itself. After guest-visible header checks, a positive
+for 205 after suppressing content itself. After adapter-visible upstream header checks, a positive
 `Content-Length` still selects `declared_body` and aborts the subrequest. With absent/zero
 length and a null body, the adapter treats the host-suppressed body as clean empty 205 and
 does not call `stream()` or invent a read. It cannot prove whether illegal bytes existed
@@ -2645,7 +2678,7 @@ keeps transport failure distinguishable from every limit outcome.
   a client-side misuse — unchanged.
 
 **Pipeline order — resource and decoder work stay inside the absolute-deadline output
-wrapper.** After guest-visible header limits and bodyless disposition, payload layers compose
+wrapper.** After adapter-visible upstream header limits and bodyless disposition, payload layers compose
 in exactly one order:
 `platform raw/completion stream → encoded-byte counter → optional Brotli prefix gate →
 EdgeError/io::Error carrier bridge → gzip/br decoder + native-EOF validation → exact carrier
@@ -2973,8 +3006,8 @@ passthrough representation:
 | `max_brotli_decoder_bytes(u64)` | `DEFAULT_MAX_BROTLI_DECODER_BYTES = 32 MiB` | conservative decoder-state charge `BROTLI_DECODER_FIXED_CHARGE_BYTES + 2^WBITS`, checked before decoder construction | `ResponseLimitReason::DecoderMemory` |
 | `max_encoded_response_bytes(u64)` | unset | cumulative guest-visible body bytes before content decoding | `ResponseLimitReason::EncodedBody` |
 | `max_decoded_response_bytes(u64)` | unset | cumulative identity or EdgeZero-decoded gzip/Brotli output; never raw passthrough | `ResponseLimitReason::DecodedBody` |
-| `max_response_header_bytes(u64)` | unset | sum of each guest-visible field name length plus value length, including EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderBytes` |
-| `max_response_header_count(u64)` | unset | guest-visible name/value entries, including repeated values and EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderCount` |
+| `max_response_header_bytes(u64)` | unset | sum of each adapter-visible upstream field name length plus value length before normalization, plus EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderBytes` |
+| `max_response_header_count(u64)` | unset | adapter-visible upstream name/value entries before normalization, including repeated values, plus EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderCount` |
 | `max_brotli_window_bits(u8)` | `DEFAULT_MAX_BROTLI_WINDOW_BITS = 24` | advertised Brotli window bits, valid configured range `10..=30` | `ResponseLimitReason::BrotliWindow` |
 | `max_chunk_bytes(NonZeroU64)` | unset | each app-visible `Body::Stream` item after decode or passthrough | no overflow; items are split lazily |
 | `max_response_bytes(u64)` | `DEFAULT_MAX_RESPONSE_BYTES = 1 MiB` | final bytes collected into `Body::Once`, regardless of coding disposition | `ResponseLimitReason::BufferedBody` |
@@ -2986,11 +3019,12 @@ These are per-response controls, not aggregate batch limits.
 
 **Enforcement order and precedence:**
 
-1. At the earliest adapter boundary where a response field section is guest-visible, count
+1. At the earliest adapter boundary where an upstream response field section is exposed, count
    entries and `name.as_bytes().len() + value.as_bytes().len()` for every visible pair
    before normalization, duplicate coalescing by EdgeZero, or additional collected header
-   state. Maintain one cumulative count/byte total across every guest-visible informational
-   block, the final response headers, and guest-visible trailers; a later field section can
+   state. Fields that normalization later strips still count. Maintain one cumulative count/byte
+   total across every adapter-visible informational block, the final response headers, and
+   adapter-visible trailers; a later field section can
    therefore fail the returned body/completion stream with the same typed reason.
    Increment and check the entry count before adding/checking bytes for that entry, so if
    the same field crosses both configured limits, `HeaderCount` wins. Reject on the first
@@ -3516,8 +3550,9 @@ Capability matrix (all four adapters):
     native receive chunks, guest buffers and spare capacity, decoder state, allocator
     metadata, and runtime copies. Current platform APIs do not expose or bound every term,
     so all four adapters report `Unsupported`. EdgeZero still enforces and documents its
-    narrower guest-visible limits: encoded bytes, decoded bytes, final Buffered bytes,
-    visible header fields, Brotli decoder-state charge, and emitted item shape. A caller
+    narrower guest-visible body limits and adapter-visible field limits: encoded bytes,
+    decoded bytes, final Buffered bytes, upstream header fields before normalization plus
+    EdgeZero's synthetic proxy marker, Brotli decoder-state charge, and emitted item shape. A caller
     requiring a complete RSS/isolate bound must declare this capability required and fail
     closed on every current target rather than treating the narrower arithmetic in §3.4.4
     as a complete memory guarantee.
@@ -6346,7 +6381,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 | Deadline anchoring and clock propagation | Every standard adapter installs its outbound client with the exact `App::monotonic_clock()` clone used by ingress; explicit low-level constructors use a documented default clock. Every adapter captures one stored-clock snapshot as the first operation in `send`/`start_batch_until`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors or bypasses the client clock. Preflight slot elapsed, provider-error precedence, post-ready expiry, deferred upload/response streams, returned `OutboundResponse` bounded-until collection, and response-egress coordinator checks use that same handle. A backwards clock cannot enlarge `budget.duration`; a backwards terminal sample produces zero elapsed plus an internal invariant outcome. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
 | `start_batch_until` / `send_all_until` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Assert every emitted slot carries its own elapsed time from the one method-entry snapshot through that slot's terminal point; advance the injected clock during preflight to prove that time is included. A same-tick terminal result may legitimately report zero. A slow sibling's later completion must not overwrite an earlier slot's elapsed value. Valid one-slot buffered batches match single-send outcome semantics while elapsed is asserted independently. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Assert cancellation retains already emitted items, reports unresolved indices, and does not consume a ready item when a `next()` future is dropped. Fastly tests dispatch-before-selection, selected-handle identity reassociation, all three reassociation failure diagnostics, exact error-to-driver-event propagation with previously collected slots, bounded groups, and immediate elapsed sampling after each preflight/dispatch/selected-body terminal result while retaining its documented BestEffort timing caveats. Backwards injected time produces zero plus an internal outcome, distinguishable from legitimate zero by outcome. |
 | Streamed fan-out usage | On Axum/Cloudflare/Spin, join per-request tasks containing both `send` and body consumption. Script a fast response whose body can finish before its deadline while a sibling's headers remain pending beyond it. Assert the fast body is consumed and succeeds before those sibling headers arrive. Joining only sends and delaying all body consumption must fail this regression. Fastly is excluded from this non-portable usage pattern. |
-| Response conversion | Every adapter enforces guest-visible header limits before normalization, then normalizes before body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method and retained clock into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. HEAD/304 malformed, conflicting, comma-list, and `u64`-overflow `Content-Length` fail as protocol 502 before body polling while valid representation lengths are retained; 1xx/204 remove the field. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
+| Response conversion | Every adapter enforces adapter-visible upstream header limits before normalization, including fields normalization later strips, accounts the synthetic proxy marker after normalization, then applies body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method and retained clock into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. HEAD/304 malformed, conflicting, comma-list, and `u64`-overflow `Content-Length` fail as protocol 502 before body polling while valid representation lengths are retained; 1xx/204 remove the field. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
 | 205 settlement | Test declared-body immediate abort, one in-budget clean EOF, observed non-empty bytes, read failure, and deadline precedence. Where the SDK exposes empty items, one empty item aborts without another read; on Fastly a non-empty read buffer returning zero is EOF. Cloudflare additionally tests null-body host suppression with absent/zero and positive visible lengths without claiming hidden-byte visibility. Assert native-handle cleanup and Spin completion signalling using observable results, never synthetic wire-frame visibility. |
 | Header fidelity | Axum/Fastly/Spin preserve repeated outbound request field lines and exercise raw malformed response nomination/encoding lines. Cloudflare tests request list semantics and the visible response-string baseline without asserting unavailable octets/line boundaries. Cloudflare encoded passthrough uses `EncodeBody::Manual`; its streamed downstream `Content-Length` is asserted only to the documented BestEffort scope. |
 | Decoder integration | Each adapter uses the shared decoder/carrier/deadline pipeline; gzip/br stalls before output, midstream, and after codec completion but before native EOF produce attributed 504 rather than hanging or degrading to 502/500. Exercise both Buffered and Streamed modes, multi-member gzip/cumulative caps, trailing data, and late typed source/completion errors. No guard disarm or Spin caller-result success occurs solely because a decoder reached its end marker. |

@@ -50,7 +50,7 @@ pub enum OutboundBatchNext {
 
 Change `OutboundBatch::next` to return `Result<OutboundBatchNext, EdgeError>`, `collect` to return `Result<OutboundBatchResults, OutboundBatchFailure>`, and `HttpClient::send_all_until` to return `Result<OutboundBatchResults, OutboundBatchFailure>`. Add `termination` to `OutboundBatchResults`.
 
-Use a doc-hidden adapter driver event with `Item`, `Cutoff`, and `Failed` variants. Mark completion only after every index resolves. Return a fixed category-safe internal error for core-detected premature EOF, duplicate indices, out-of-range indices, or impossible terminal transitions; preserve adapter-supplied failures exactly. Ordered collection retains every slot observed before either class of failure.
+Use the public adapter driver event with `Item`, `Cutoff`, and `Failed` variants. Mark completion only after every index resolves. Return a fixed category-safe internal error for core-detected premature EOF, duplicate indices, out-of-range indices, or impossible terminal transitions; preserve adapter-supplied failures exactly. Ordered collection retains every slot observed before either class of failure. The event and constructors were promoted from doc-hidden adapter support by the round-6 hardening pass.
 
 - [x] **Step 4: Run core tests and verify GREEN**
 

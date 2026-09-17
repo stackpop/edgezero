@@ -206,17 +206,17 @@ not require provider host registration.
 
 Each `OutboundRequest` owns independent limits:
 
-| Control                      | Scope                                                                          | Default |
-| ---------------------------- | ------------------------------------------------------------------------------ | ------- |
-| `max_request_body_bytes`     | Buffered or streamed request bytes                                             | 8 MiB   |
-| `max_encoded_response_bytes` | Upstream transport bytes before decoding                                       | Unset   |
-| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/Brotli output                                | Unset   |
-| `max_response_bytes`         | Final buffered response, including raw passthrough                             | 1 MiB   |
-| `max_response_header_bytes`  | Cumulative guest-visible header name/value bytes, including `x-edgezero-proxy` | Unset   |
-| `max_response_header_count`  | Cumulative guest-visible header fields, including `x-edgezero-proxy`           | Unset   |
-| `max_brotli_window_bits`     | Brotli stream header checked before decoder allocation                         | 24      |
-| `max_brotli_decoder_bytes`   | Pinned policy charge for Brotli decoder state                                  | 32 MiB  |
-| `max_chunk_bytes`            | Maximum emitted item size after decoding or passthrough                        | Unset   |
+| Control                      | Scope                                                                                          | Default |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- | ------- |
+| `max_request_body_bytes`     | Buffered or streamed request bytes                                                             | 8 MiB   |
+| `max_encoded_response_bytes` | Upstream transport bytes before decoding                                                       | Unset   |
+| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/Brotli output                                                | Unset   |
+| `max_response_bytes`         | Final buffered response, including raw passthrough                                             | 1 MiB   |
+| `max_response_header_bytes`  | Adapter-visible upstream header name/value bytes before normalization, plus `x-edgezero-proxy` | Unset   |
+| `max_response_header_count`  | Adapter-visible upstream header fields before normalization, plus `x-edgezero-proxy`           | Unset   |
+| `max_brotli_window_bits`     | Brotli stream header checked before decoder allocation                                         | 24      |
+| `max_brotli_decoder_bytes`   | Pinned policy charge for Brotli decoder state                                                  | 32 MiB  |
+| `max_chunk_bytes`            | Maximum emitted item size after decoding or passthrough                                        | Unset   |
 
 The encoded counter applies to every response path. The decoded counter applies to identity
 and gzip/Brotli data decoded by EdgeZero, but not to unknown, stacked, parameterized, or other
@@ -225,8 +225,10 @@ an application permit a larger raw body while keeping decoded expansion small.
 
 `max_chunk_bytes` is an item-shape guarantee, not a source-allocation limit: splitting a
 `Bytes` value may retain its original allocation, and a provider may have already materialized
-the source chunk. Header controls cover guest-visible fields, not opaque parser allocations,
-informational blocks that the SDK hides, or provider-owned trailers. These exclusions are why
+the source chunk. Header controls cover every adapter-visible upstream field before EdgeZero
+normalization, including fields later stripped, and then charge EdgeZero's synthetic proxy marker.
+They do not cover opaque parser allocations, informational blocks that the SDK hides, or
+provider-owned trailers. These exclusions are why
 `outbound-complete-resource-accounting` is `Unsupported` on every current adapter.
 
 For a buffered batch, bound both the number of requests and every per-slot cap. Core-retained payload
@@ -266,6 +268,11 @@ Preflight failures are timed from the same batch start, and a same-tick result m
 A successful outcome is contractually terminal and on time. `elapsed` is metadata, not a second
 lateness check; callers must not sample their clock after the whole batch returns to reinterpret an
 earlier `Ok`, and the API intentionally exposes no absolute terminal or batch-start instant.
+On Axum, Cloudflare, and Spin, terminal instants are sampled synchronously as child futures are
+observed ready, so their samples follow poll-observation order in the shared monotonic clock
+domain. Once an observation reaches the cutoff, a later observation cannot carry an earlier
+on-time sample unless an injected clock violates its monotonic contract. Fastly retains its
+documented BestEffort completion-order limitation.
 
 Standard adapter wiring clones the application's monotonic clock into its outbound client, so
 ingress timing, dispatch budgets, slot elapsed values, error precedence, and deferred body

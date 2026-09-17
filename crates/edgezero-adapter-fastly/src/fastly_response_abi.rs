@@ -99,3 +99,14 @@ pub(super) fn write_body(body: BodyHandle, bytes: &[u8]) -> Result<usize, Fastly
     })?;
     Ok(written)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FastlyAbiError, FastlyStatus, result};
+
+    #[test]
+    fn status_result_preserves_success_and_collapses_host_failure() {
+        assert_eq!(result(FastlyStatus::OK), Ok(()));
+        assert_eq!(result(FastlyStatus::ERROR), Err(FastlyAbiError));
+    }
+}

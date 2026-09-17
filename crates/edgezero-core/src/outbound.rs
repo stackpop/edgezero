@@ -16,7 +16,9 @@ use url::Url;
 
 use crate::body::{Body, BodyStream};
 use crate::compression::ContentEncoding;
-use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError, ResponseLimitReason};
+use crate::error::{
+    BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
+};
 use crate::http::header::{
     CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, PROXY_AUTHENTICATE,
     PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
@@ -25,7 +27,7 @@ use crate::http::{
     Authority, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
     response_builder,
 };
-use crate::time::{Deadline, MonotonicClock};
+use crate::time::{Deadline, MonotonicClock, MonotonicInstant};
 
 pub const DEFAULT_MAX_BROTLI_DECODER_BYTES: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -152,8 +154,14 @@ pub enum OutboundBatchNext {
     Item(OutboundBatchItem),
 }
 
-/// Adapter-to-core batch driver protocol.
-#[doc(hidden)]
+/// Adapter-to-core protocol for constructing an [`OutboundBatch`].
+///
+/// Driver streams emit each terminal index at most once. They emit [`Self::Cutoff`] when the
+/// method-level observation cutoff wins, or [`Self::Failed`] when the adapter cannot continue
+/// without violating an invariant. Stream EOF is valid only after every input index has emitted;
+/// premature EOF is a core invariant failure.
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum OutboundBatchDriverEvent {
     /// The method-level observation cutoff won before every slot became terminal.
     Cutoff,
@@ -219,7 +227,9 @@ impl OutboundBatch {
     }
 
     /// Builds an already-cut-off batch without polling adapter transport work.
-    #[doc(hidden)]
+    ///
+    /// Adapters use this when the method-level cutoff is expired at batch entry. Every input index
+    /// remains unresolved.
     #[must_use]
     #[inline]
     pub fn cutoff(slot_count: usize) -> Self {
@@ -227,7 +237,11 @@ impl OutboundBatch {
     }
 
     /// Builds a batch from an adapter-owned driver stream.
-    #[doc(hidden)]
+    ///
+    /// `slot_count` fixes the valid index range and the length of collected results. The driver
+    /// must emit each terminal index exactly once unless it first emits [`OutboundBatchDriverEvent::Cutoff`]
+    /// or [`OutboundBatchDriverEvent::Failed`]. Ending the stream with unresolved indices is an
+    /// invariant failure.
     #[must_use]
     #[inline]
     pub fn from_driver<StreamValue>(slot_count: usize, stream: StreamValue) -> Self
@@ -386,7 +400,8 @@ impl ResponseHeaderLimiter {
         }
     }
 
-    /// Adds one guest-visible field section to the cumulative response-header budget.
+    /// Adds one adapter-visible upstream field section to the cumulative response-header
+    /// budget before normalization.
     ///
     /// # Errors
     /// Returns a typed response limit error on count, byte, or accounting overflow.
@@ -1071,6 +1086,44 @@ impl OutboundRequest {
     }
 }
 
+/// Converts one adapter-observed terminal batch outcome into its indexed public result.
+///
+/// Adapters must pass samples from the batch's shared monotonic clock. `None` means the
+/// method-level cutoff won, either by observation time or by an attributed cutoff timeout.
+/// A backward terminal sample remains a terminal item with zero elapsed time and an internal
+/// invariant error so it cannot enlarge or bypass the batch budget.
+#[must_use]
+#[inline]
+pub fn finish_batch_item(
+    index: usize,
+    started_at: MonotonicInstant,
+    completed_at: MonotonicInstant,
+    cutoff: Deadline,
+    outcome: Result<OutboundResponse, EdgeError>,
+) -> Option<OutboundBatchItem> {
+    if cutoff.is_expired_at(completed_at)
+        || matches!(
+            outcome,
+            Err(EdgeError::GatewayTimeout {
+                cause: BudgetSource::BatchCutoff,
+                ..
+            })
+        )
+    {
+        return None;
+    }
+    let result = match completed_at.checked_duration_since(started_at) {
+        Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
+        None => OutboundSlotResult::new(
+            Duration::ZERO,
+            Err(EdgeError::internal(anyhow::anyhow!(
+                "monotonic clock moved backwards during outbound dispatch"
+            ))),
+        ),
+    };
+    Some(OutboundBatchItem::new(index, result))
+}
+
 #[inline]
 fn batch_driver_error(message: &'static str) -> EdgeError {
     EdgeError::internal(anyhow::anyhow!(message))
@@ -1663,9 +1716,9 @@ mod tests {
         OutboundBatchTermination, OutboundCachePolicy, OutboundHttpClient, OutboundRequest,
         OutboundResponse, OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition,
         ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-        enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
-        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
-        validate_for_dispatch,
+        enforce_payload_content_length, finish_batch_item, insert_proxy_header,
+        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
+        normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
 
     struct MockClient {
@@ -1741,6 +1794,106 @@ mod tests {
                 Ok(response_with_body(Body::empty())),
             ),
         )
+    }
+
+    #[test]
+    fn finish_batch_item_preserves_an_on_time_terminal_outcome() {
+        let started_at = MonotonicInstant::now();
+        let completed_at = started_at
+            .checked_add(Duration::from_millis(7))
+            .expect("completion instant");
+        let cutoff = Deadline::at_instant(
+            started_at
+                .checked_add(Duration::from_millis(10))
+                .expect("cutoff instant"),
+        );
+
+        let item = finish_batch_item(
+            3,
+            started_at,
+            completed_at,
+            cutoff,
+            Ok(response_with_body(Body::empty())),
+        )
+        .expect("on-time outcome");
+
+        assert_eq!(item.index, 3);
+        assert_eq!(item.result.elapsed, Duration::from_millis(7));
+        let _response = item.result.outcome.expect("successful on-time outcome");
+    }
+
+    #[test]
+    fn finish_batch_item_rejects_an_outcome_observed_at_cutoff() {
+        let started_at = MonotonicInstant::now();
+        let cutoff_at = started_at
+            .checked_add(Duration::from_millis(10))
+            .expect("cutoff instant");
+
+        let item = finish_batch_item(
+            0,
+            started_at,
+            cutoff_at,
+            Deadline::at_instant(cutoff_at),
+            Err(EdgeError::bad_gateway("late")),
+        );
+
+        assert!(item.is_none());
+    }
+
+    #[test]
+    fn finish_batch_item_rejects_an_attributed_batch_cutoff() {
+        let started_at = MonotonicInstant::now();
+        let completed_at = started_at
+            .checked_add(Duration::from_millis(1))
+            .expect("completion instant");
+        let cutoff = Deadline::at_instant(
+            started_at
+                .checked_add(Duration::from_millis(10))
+                .expect("cutoff instant"),
+        );
+
+        let item = finish_batch_item(
+            0,
+            started_at,
+            completed_at,
+            cutoff,
+            Err(EdgeError::gateway_timeout_caused(
+                "batch cutoff",
+                BudgetSource::BatchCutoff,
+            )),
+        );
+
+        assert!(item.is_none());
+    }
+
+    #[test]
+    fn finish_batch_item_maps_a_backward_terminal_sample_to_internal() {
+        let started_at = MonotonicInstant::now();
+        let completed_at = started_at
+            .checked_sub(Duration::from_millis(1))
+            .expect("earlier instant");
+        let cutoff = Deadline::at_instant(
+            started_at
+                .checked_add(Duration::from_millis(10))
+                .expect("cutoff instant"),
+        );
+
+        let item = finish_batch_item(
+            4,
+            started_at,
+            completed_at,
+            cutoff,
+            Ok(response_with_body(Body::empty())),
+        )
+        .expect("clock fault remains terminal");
+
+        assert_eq!(item.index, 4);
+        assert_eq!(item.result.elapsed, Duration::ZERO);
+        let error = item.result.outcome.expect_err("clock fault outcome");
+        assert_eq!(
+            error.to_string(),
+            "internal error: monotonic clock moved backwards during outbound dispatch"
+        );
     }
 
     #[expect(
@@ -2141,6 +2294,15 @@ mod tests {
     }
 
     #[test]
+    fn batch_cutoff_constructor_reports_every_slot_unresolved() {
+        let results = block_on(OutboundBatch::cutoff(3).collect()).expect("valid cutoff");
+
+        assert_eq!(results.termination, OutboundBatchTermination::Cutoff);
+        assert_eq!(results.slots.len(), 3);
+        assert!(results.slots.iter().all(Option::is_none));
+    }
+
+    #[test]
     fn batch_collection_rejects_premature_driver_end() {
         let batch = OutboundBatch::from_driver(
             3,
@@ -2148,7 +2310,10 @@ mod tests {
         );
 
         let failure = block_on(batch.collect()).expect_err("premature EOF must fail");
-        assert!(matches!(failure.error, EdgeError::Internal { .. }));
+        assert_eq!(
+            failure.error.to_string(),
+            "internal error: outbound batch driver ended before every slot resolved"
+        );
         assert!(matches!(failure.slots.first(), Some(None)));
         assert!(matches!(failure.slots.get(1), Some(None)));
         assert!(matches!(failure.slots.get(2), Some(Some(_))));
@@ -2187,7 +2352,10 @@ mod tests {
         );
 
         let failure = block_on(batch.collect()).expect_err("duplicate index must fail");
-        assert!(matches!(failure.error, EdgeError::Internal { .. }));
+        assert_eq!(
+            failure.error.to_string(),
+            "internal error: outbound batch driver emitted a duplicate slot index"
+        );
         assert!(matches!(failure.slots.first(), Some(Some(_))));
         assert!(matches!(failure.slots.get(1), Some(None)));
     }
@@ -2200,8 +2368,30 @@ mod tests {
         );
 
         let failure = block_on(batch.collect()).expect_err("out-of-range index must fail");
-        assert!(matches!(failure.error, EdgeError::Internal { .. }));
+        assert_eq!(
+            failure.error.to_string(),
+            "internal error: outbound batch driver emitted an out-of-range slot index"
+        );
         assert!(failure.slots.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn batch_poisoned_repoll_reports_the_guard_diagnostic() {
+        let mut batch = OutboundBatch::from_driver(
+            1,
+            stream::iter([OutboundBatchDriverEvent::Item(batch_item(1))]),
+        );
+
+        let first = block_on(batch.next()).expect_err("out-of-range index must poison driver");
+        assert_eq!(
+            first.to_string(),
+            "internal error: outbound batch driver emitted an out-of-range slot index"
+        );
+        let second = block_on(batch.next()).expect_err("poisoned driver must reject re-poll");
+        assert_eq!(
+            second.to_string(),
+            "internal error: outbound batch driver was polled after an invariant failure"
+        );
     }
 
     #[test]
