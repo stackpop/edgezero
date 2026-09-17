@@ -1,345 +1,273 @@
-# EdgeZero Deploy Actions — Adoption Guide
+# EdgeZero deployment action adoption
 
-**Status:** Adoption guide for any EdgeZero application repository
+The Fastly lifecycle actions deploy an immutable application release. They do not
+build the application or choose its source. This split keeps application bytes
+independent from a publisher's credentials and runtime configuration.
 
-**Spec:** `docs/superpowers/specs/2026-07-08-edgezero-deploy-github-actions-design.md`
+## Application release producer
 
-The layered deploy actions are for **any** EdgeZero application repository, not a
-single deployer. This guide describes the general adoption shape and then walks
-through the Trusted Server deployer as one concrete migration example.
+Each application owns a release pipeline that:
 
-## 1. What a consumer gets
+1. checks out one approved source revision;
+2. builds the application CLI and Fastly package without provider credentials;
+3. bundles that CLI, package, `edgezero.toml`, its referenced `fastly.toml`, and
+   strict `release.json` metadata;
+4. publishes the archive under an immutable reference; and
+5. publishes the archive's lowercase SHA-256 digest.
 
-Composable actions:
+The producer does not select a publisher GitHub Environment. One application
+release supplies a byte-identical application CLI, Fastly package,
+`edgezero.toml`, and `fastly.toml` to every publisher and to both production and
+staging. Different applications or later releases can have different manifests.
+A deployer or runtime environment cannot replace them.
 
-- `build-app-cli` — compile the CLI package the application provides (a crate in the
-  app's own workspace) once, publish it as an artifact;
-- `deploy-fastly` — deploy a checked-out Fastly application using the prebuilt
-  CLI artifact, to production or (with `deploy-to: staging`) a staged draft version;
-- `healthcheck-fastly` / `rollback-fastly` — the Fastly staging lifecycle (§4);
-- `config-push-fastly` — push the application's typed config to a Fastly config
-  store (the production key, or the `_staging` twin), from a checked-out file or
-  inline content;
-- future `deploy-cloudflare` / `deploy-spin` wrappers over the same engine.
+## Deployment consumer
 
-The actions own repeatable deploy setup and the Fastly staging mechanisms. The
-consumer owns checkout, ref selection, permissions, environments, concurrency,
-timeouts, and **orchestrating** the health-check / rollback flow.
+The deployment repository resolves a trusted application release, downloads its
+archive, verifies the pinned digest, and passes it to the lifecycle actions. The
+deployer never checks out or rebuilds application source. It supplies only:
 
-## 2. Checkout layouts
+- the destination Fastly service and production/staging target;
+- runtime variables and selected physical Config/KV/Secret stores;
+- a typed config payload when running config push; and
+- provider credentials.
 
-The adapters your CLI supports come from your app's own `Cargo.toml`, so
-`build-app-cli` takes no `adapters` input — it builds your CLI package as declared.
+Select the source revision and release digest before choosing the publisher
+GitHub Environment. A release reference or digest is application-release data and
+cannot come from a publisher GitHub Environment. This prevents a publisher or
+environment administrator from selecting different executable code or manifests.
 
-### 2.1 Same-repository application
-
-The app and its deploy workflow live in one repo.
+Download the selected release once and reuse it:
 
 ```yaml
+- uses: actions/download-artifact@v4
+  with:
+    name: application-release-${{ needs.release.outputs.source-revision }}
+    path: app-release
+
+- id: deploy
+  uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
+  with:
+    app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
+    app-release-sha256: ${{ needs.release.outputs.sha256 }}
+    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+```
+
+Deploy, config push, healthcheck, and rollback extract the application CLI from
+that release. Deploy uploads its recorded Fastly package. Config push uses its
+recorded `edgezero.toml`; Fastly deployment verifies the recorded referenced
+manifest. There are no deployer build flags or alternate manifest inputs.
+
+## Environment contract
+
+Publisher GitHub Environments can set canonical runtime variables such as:
+
+```text
+EDGEZERO__LOGGING__LEVEL
+EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME
+EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
+EDGEZERO__STORES__KV__CACHE__NAME
+EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME
+```
+
+They may choose different values and physical resources for each publisher and
+for production/staging. The variable names contain no service ID. Secret Store
+selectors contain only a store name, never a secret value.
+
+Fastly prepares the version-scoped descriptor and exact resource links before
+staging or activation. Failed resolution or verification withholds publication.
+See the [Fastly adapter guide](./adapters/fastly.md#runtime-descriptor) for the
+descriptor format and clean-cutover behavior.
+
+## Example application deployer
+
+The example application has two hostnames:
+
+- `app.example.com` selects the `production` GitHub Environment;
+- `staging.app.example.com` selects the `staging` GitHub Environment.
+
+The hostname remains the real Fastly and healthcheck domain. It is not itself a
+GitHub Environment name. Validate and map it in a credential-free preflight job,
+then use the preflight output on the deploy job.
+
+```yaml
+name: Deploy Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: Application hostname
+        required: true
+        type: choice
+        options:
+          - app.example.com
+          - staging.app.example.com
+      source-revision:
+        description: Approved application revision
+        required: true
+        type: string
+
 jobs:
-  deploy:
+  release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    outputs:
+      release-ref: ${{ steps.select.outputs['release-ref'] }}
+      sha256: ${{ steps.select.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - id: cli
-        uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-        with:
-          app-cli-package: my-app-cli # the CLI crate in your app's workspace
+      - id: select
+        env:
+          SOURCE_REVISION: ${{ inputs.source-revision }}
+        run: |
+          # Resolve SOURCE_REVISION through trusted application-release metadata.
+          # Never read the archive reference or digest from a publisher Environment.
+          ./scripts/select-application-release "$SOURCE_REVISION"
 
-      - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
+  preflight:
+    needs: release
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.target.outputs.environment }}
+      deploy-to: ${{ steps.target.outputs.deploy-to }}
+      release-ref: ${{ needs.release.outputs['release-ref'] }}
+      sha256: ${{ needs.release.outputs.sha256 }}
+    steps:
+      - id: target
+        env:
+          DOMAIN: ${{ inputs.domain }}
+        run: |
+          case "$DOMAIN" in
+            app.example.com) environment=production ; deploy_to=production ;;
+            staging.app.example.com) environment=staging ; deploy_to=staging ;;
+            *) echo "::error::unsupported application domain"; exit 1 ;;
+          esac
+          echo "environment=$environment" >>"$GITHUB_OUTPUT"
+          echo "deploy-to=$deploy_to" >>"$GITHUB_OUTPUT"
+
+  deploy:
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: ${{ needs.preflight.outputs.environment }}
+    env:
+      EDGEZERO__LOGGING__LEVEL: ${{ vars.EDGEZERO__LOGGING__LEVEL }}
+      EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: ${{ vars.EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME }}
+      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY: ${{ vars.EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY }}
+      EDGEZERO__STORES__KV__CACHE__NAME: ${{ vars.EDGEZERO__STORES__KV__CACHE__NAME }}
+      EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: ${{ vars.EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME }}
+    concurrency:
+      group: application-${{ vars.FASTLY_SERVICE_ID }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the selected application release
+        env:
+          RELEASE_REF: ${{ needs.preflight.outputs['release-ref'] }}
+        run: |
+          ./scripts/download-application-release \
+            "$RELEASE_REF" \
+            "$GITHUB_WORKSPACE/app-release.tar.gz"
+
+      - id: config
+        uses: stackpop/edgezero/.github/actions/config-push-fastly@<ref>
+        with:
+          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          working-directory: publisher-config
+          app-config: app.toml
+          store: app_config
+          deploy-to: ${{ needs.preflight.outputs.deploy-to }}
+
+      - id: deploy
         uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
-          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+          deploy-args: '["--comment","Application release"]'
+          deploy-to: ${{ needs.preflight.outputs.deploy-to }}
+
+      - id: health
+        uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<ref>
+        with:
+          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
+          fastly-api-token: ${{ needs.preflight.outputs.deploy-to == 'staging' && secrets.FASTLY_API_TOKEN || '' }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+          fastly-version: ${{ steps.deploy.outputs.fastly-version }}
+          domain: ${{ inputs.domain }}
+          path: /health
+          deploy-to: ${{ needs.preflight.outputs.deploy-to }}
+
+      - name: Roll back failed deployment
+        if: ${{ (failure() || cancelled()) && steps.deploy.outputs.fastly-version != '' && (needs.preflight.outputs.deploy-to == 'staging' || steps.deploy.outputs.previous-version != '') }}
+        uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
+        with:
+          app-release-archive: ${{ github.workspace }}/app-release.tar.gz
+          app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
+          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
+          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
+          fastly-version: ${{ steps.deploy.outputs.fastly-version }}
+          rollback-to: ${{ steps.deploy.outputs.previous-version }}
+          deploy-to: ${{ needs.preflight.outputs.deploy-to }}
 ```
 
-### 2.2 Separate deployer and application repositories
+The example keeps application release selection outside both publisher
+Environments. `preflight` waits for that selection and forwards the immutable
+reference and digest with its validated environment name. The deploy job then
+downloads the release once; each lifecycle action independently verifies the
+same archive and digest. It receives environment-scoped runtime values only
+after release selection. The optional `CREDENTIALS` selector is a Secret Store
+name from `vars`, never a secret value. `inputs.domain` remains the actual
+hostname passed to healthcheck. The deployer checkout is only the deployment
+repository; it never checks out or rebuilds application source.
 
-A deployment repo drives a separate application repo. Check the app into a path
-and point both actions at it.
+For a staging rollback, omit `rollback-to`; for production, skip rollback when
+`previous-version` is empty because a first deployment has no earlier version.
+Use an additional guard in a production-only workflow if it can perform a first
+deployment.
 
-> **Private app repos need their own token.** The deployer job's default
-> `GITHUB_TOKEN` cannot read a _different_ private repository. Mint an app-scoped
-> token first — e.g. with `actions/create-github-app-token` for a GitHub App
-> installed on the app repo, or a fine-grained PAT with `contents: read` — and
-> pass it to the application checkout's `token:`. The step below assumes an
-> earlier `id: app-token` step produced `steps.app-token.outputs.token`.
+## Failed deploy recovery
 
-```yaml
-steps:
-  - name: Checkout deployer
-    uses: actions/checkout@v4
-    with:
-      path: deployer
-      persist-credentials: false
+The action's public `package-digest` becomes available only after the deploy step
+emits adapter `package-sha256`; it may be absent when preflight fails before the
+application CLI runs. The action emits a recoverable `fastly-version` immediately
+after Fastly creates or selects an inactive draft. Those outputs can remain
+available if descriptor, link, or publication work fails later. In a follow-up
+step guarded with GitHub Actions' `always()` condition, inspect the failed step's
+outputs:
 
-  - name: Checkout application
-    uses: actions/checkout@v4
-    with:
-      repository: stackpop/my-edgezero-app
-      # MUST be a trusted, immutable ref (a full commit SHA, or a protected tag)
-      # — never an arbitrary branch. Fastly's default `build-mode: never` means
-      # `fastly compute deploy` COMPILES the application while the API token is
-      # in scope, so untrusted code would run with your credentials (spec §10.1).
-      ref: ${{ inputs.ref }}
-      path: app
-      persist-credentials: false
-      # A private app repo is NOT readable with the deployer's default
-      # GITHUB_TOKEN. Supply a token scoped to the app repo — a GitHub App
-      # installation token (preferred) or a fine-grained PAT with
-      # `contents: read` on the app repo:
-      token: ${{ steps.app-token.outputs.token }}
+- if `fastly-version` is present, inspect and reuse that exact inactive draft;
+- deactivate it only when it is staged;
+- if production activated it and `previous-version` is present, roll back to the
+  recorded previous version;
+- if `mutation-attempted` is true but no version is available, reconcile provider
+  state manually rather than guessing.
 
-  - id: cli
-    uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-    with:
-      app-cli-package: my-app-cli
-      working-directory: app
+Serialize deployments by service. Without serialization, a provider lookup after
+failure may observe another run's version.
 
-  - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
-    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-    with:
-      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-      working-directory: app
-      fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-      fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-```
+## Adoption checklist
 
-### 2.3 Monorepo application
-
-Select the app subdirectory and, when needed, an explicit manifest. Caching
-resolves `target/` and `Cargo.lock` at the **Cargo workspace root** for that
-subdirectory (which in a nested workspace may be the subdirectory itself, not the
-repo root), so a monorepo caches the right artifacts.
-
-```yaml
-steps:
-  - uses: actions/checkout@v4
-    with:
-      persist-credentials: false
-
-  - id: cli
-    uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-    with:
-      app-cli-package: api-cli
-      working-directory: apps/api
-
-  - id: deploy # so recovery/rollback can read steps.deploy.outputs.*
-    uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
-    with:
-      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
-      working-directory: apps/api
-      manifest: edgezero.toml
-      # `cache` only takes effect with `build-mode: always` (the credential-free
-      # build that seeds the cache); with the Fastly default `never` it is a no-op.
-      build-mode: always
-      cache: true
-      fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-      fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-```
-
-## 3. Consumer requirements
-
-- Check out application source yourself; the actions never call
-  `actions/checkout`.
-- Provide a CLI package in your own workspace and name it via `app-cli-package`;
-  `build-app-cli` compiles that package from your checkout, so the CLI and your app
-  never disagree on schema. `build-app-cli` does not use the EdgeZero monorepo CLI.
-- **Expose the command surface the actions drive.** An existing or hand-written
-  CLI does NOT automatically gain the lifecycle commands. Before adopting, confirm
-  your CLI dispatches all of these (the scaffolded template already does):
-  - upgrade `edgezero-cli` to a version that provides `run_active_version`,
-    `run_healthcheck`, and `run_rollback` (alongside `run_build` / `run_deploy` /
-    the typed `config` handlers);
-  - add `Build`, `Deploy`, `ActiveVersion`, `Healthcheck`, `Rollback`, and
-    `Config` variants to your `Cmd` enum and dispatch each to its `edgezero_cli::run_*`
-    handler.
-    A production deploy runs `active-version` to capture the rollback target and
-    fails fast (before any provider mutation) if it is missing; a staged deploy
-    that lacks `healthcheck`/`rollback` can otherwise fail only AFTER creating
-    provider state.
-  - initialise the CLI logger — call `edgezero_cli::init_cli_logger()` in `main`
-    (or provide equivalent UNPREFIXED stdout). The `run_*` handlers emit their
-    machine-readable contract lines (`version=<N>`, `pushed-key=<key>`,
-    `pushed-store=<id>`, `rolled-back-to=<N>`) via `log::info!`; without an
-    initialised logger they are
-    swallowed, so the provider mutation can SUCCEED and the wrapper then fail to
-    parse the version — leaving no captured rollback target. The scaffolded
-    template already calls it.
-- Provide typed provider credentials through wrapper inputs, not caller `env:`.
-- **Trust the app you deploy.** Deploying runs the application's code with your
-  provider token — the deploy executes the built CLI and (for Fastly's default
-  `build-mode`) recompiles the checked-out source, both with the credential in
-  scope. No layout makes it safe to deploy code you do not trust (dependencies
-  included). Building + deploying your own app in one job is fine; if you want the
-  credential kept out of the compile-heavy build phase, run `build-app-cli` in a
-  **separate job** with no secrets and hand the artifact to the deploy job
-  (`needs:` + a literal `app-cli-artifact` name). See the deploy guide's "Keeping
-  the credential out of the build phase" and its security boundary.
-- Ensure the deployed ref has committed source (no dirty working tree) and a
-  `Cargo.lock` at your app's **Cargo workspace root** (the workspace that owns
-  `app-cli-package` — in a nested-workspace monorepo this may be your app
-  subdirectory, not the repo root). `build-app-cli` requires it, and caching keys on
-  it.
-- Pin action references to readable released tags, or full SHAs for production
-  reproducibility.
-- Use least-privilege permissions (`contents: read`), protected environments,
-  `timeout-minutes`, and appropriate concurrency.
-- **Run on ephemeral runners** (GitHub-hosted, or self-hosted one-job-per-VM). The
-  lifecycle log and any inline config are removed by a best-effort `EXIT` trap; a
-  `SIGKILL`, runner shutdown, or hard timeout bypasses it, so on a persistent
-  self-hosted runner a hard kill can leave a mode-`600` credential-bearing file
-  behind. On such runners, post-kill temp hygiene is your responsibility.
-
-## 4. Fastly staging lifecycle
-
-For Fastly, staging deploy, health checks, and rollback are supported as a
-provider-specific trio, scaffolded into the CLI and exposed through your app CLI:
-
-- `deploy-fastly` with `deploy-to: staging` — deploy to a **staged** draft version
-  (Fastly `service-version stage`) instead of activating production; outputs
-  `fastly-version`.
-- `healthcheck-fastly` — verify a version; for staging it resolves the Fastly
-  staging IP and probes the staged version specifically.
-- `rollback-fastly` — production: activate the previous version; staging:
-  deactivate the staged version.
-
-You wire the trio; the actions carry no orchestration policy (see the spec §5.4
-for a worked staging workflow).
-
-## 5. What the actions intentionally do not do
-
-The deploy actions do not perform: internal application checkout; config
-expansion or JSON→provider config conversion. Config push and provisioning are
-never deploy side effects — they are separate, explicit steps a consumer runs on
-their own schedule. Config push has its own action, `config-push-fastly`
-(including `deploy-to: staging`, which writes the derived
-`<logical-store-id>_staging` variant in the store selected by the staging
-environment — an explicit `key` is production-only and rejected with
-`staging`); provisioning is a CLI subcommand (`<your-app>-cli provision`). The
-generic engine stays provider-neutral — staging/health/rollback exist only as
-Fastly-specific actions (§4), not engine behavior.
-
-> **Run config push through your own app CLI, not the bundled `edgezero`
-> binary.** `edgezero config push` is a stub that exits non-zero by design:
-> pushing typed config requires the app-config struct, which only your generated
-> CLI has. Use the `config-push-fastly` action (it drives the `build-app-cli`
-> artifact), or invoke `<your-app>-cli config push` directly. When you invoke it
-> directly in CI, pass `--yes`: with no TTY the push has no confirmation prompt to
-> answer and fails closed without it (the action adds `--yes` for you).
-
-## 6. Worked example — Trusted Server deployer migration
-
-### 6.1 Current behavior
-
-The Trusted Server deployer orchestrates Fastly deploys with:
-
-- `.github/workflows/deploy.yml` (manual) and `daily-deploy.yml` (scheduled);
-- `stackpop/trusted-server-actions/fastly/deploy@v2`;
-- `stackpop/trusted-server-actions/fastly/healthcheck@v2`; and
-- `stackpop/trusted-server-actions/fastly/rollback@v2`.
-
-The old deploy action checks out Trusted Server internally, accepts
-`trusted-server-ref`, expands `trusted-server-config`, supports Fastly staging,
-and returns `fastly-version`.
-
-### 6.2 Compatibility with the EdgeZero actions
-
-The EdgeZero actions now cover Fastly **staging, health checks, rollback, and the
-`fastly-version` output**, so the Trusted Server deployer can move off the legacy
-`fastly/deploy|healthcheck|rollback@v2` actions. The remaining differences the
-deployer must handle itself are: internal checkout, `trusted-server-ref`,
-`trusted-server-config` expansion, and legacy JSON→Config Store TOML conversion.
-
-### 6.3 Recommended migration
-
-Map the legacy trio onto the EdgeZero staging trio:
-
-| Legacy action                              | EdgeZero replacement                                     |
-| ------------------------------------------ | -------------------------------------------------------- |
-| `fastly/deploy@v2` (with `fastly-staging`) | `build-app-cli` + `deploy-fastly` (`deploy-to: staging`) |
-| `fastly/healthcheck@v2`                    | `healthcheck-fastly`                                     |
-| `fastly/rollback@v2`                       | `rollback-fastly`                                        |
-
-Workflow shape:
-
-1. check out `trusted-server-deployer` with `persist-credentials: false`;
-2. check out Trusted Server source separately at the selected ref into
-   `trusted-server`;
-3. run `build-app-cli` with `app-cli-package: <trusted-server-cli-crate>` and
-   `working-directory: trusted-server` (Trusted Server's own CLI package, whose
-   `Cargo.toml` already pins the Fastly adapter);
-4. run `deploy-fastly` (set `deploy-to: staging` for a staged draft) with the CLI artifact,
-   `working-directory: trusted-server`, typed Fastly credentials, and optional
-   `deploy-args: ["--comment", …]`; capture `fastly-version` and, for a
-   production deploy, `previous-version` (the rollback target). If the deploy step
-   FAILS but its `mutation-attempted` output is `true`, treat the service as
-   possibly mutated rather than assume nothing deployed — a lost/malformed
-   `fastly-version` line fails the step even though the deploy may have happened.
-   Read `mutation-attempted` under a `failure() || cancelled()` guard (plain
-   `failure()` does not fire on a cancel/timeout). `mutation-attempted` is a
-   best-effort POSITIVE signal only — it lives in the runner-local `$GITHUB_OUTPUT`,
-   so a runner loss can drop it; its ABSENCE is not proof of no mutation. The
-   operator contract is to reconcile provider state unconditionally whenever the
-   outcome is indeterminate, whether or not the signal is readable. **Production:**
-   since you
-   then lack the version to roll back _from_, recover it — download the CLI artifact
-   and run its `active-version` subcommand, which prints the live version; if that
-   differs from the pre-deploy `previous-version`, call `rollback-fastly` with it as
-   `fastly-version` and `previous-version` as `rollback-to` (the deploy guide has a
-   runnable snippet). This assumes deploys to the service are serialized (§3, via a
-   `concurrency` group) — with a concurrent deploy, "the live version" may be
-   another run's, so do not auto-roll-back without that guarantee.
-   The first-ever deploy is the exception — with no `previous-version` there is
-   nothing to roll back to, so undo it manually. **Staging:** `active-version`
-   reports the production-active version, so it cannot identify a staged version;
-   and because the CLI stages the version before emitting it, a lost-version failure
-   may leave a version **already staged (serving staging traffic)**, not merely an
-   inactive draft — there is no automated staged recovery, so list the service's
-   versions and un-stage the stray one manually;
-5. run `healthcheck-fastly` with the CLI artifact, `fastly-service-id`,
-   `deploy-to`, `domain`, an optional `path` (default `/`; e.g. `/health` — it
-   covers production and a staged version alike), and the captured
-   `fastly-version`. Pass `fastly-api-token` ONLY for `deploy-to: staging` (it
-   resolves the staged version's IP); a production probe curls the public domain
-   and needs no token, so omitting it avoids exposing a production secret;
-6. on failure, run `rollback-fastly` with the CLI artifact, typed Fastly
-   credentials (`fastly-api-token`, `fastly-service-id`), the same `deploy-to` /
-   `fastly-version`, and — for a **production** rollback — `rollback-to` set to
-   the captured `previous-version` (Fastly cannot infer it; staging ignores it).
-   Rollback also emits `mutation-attempted`, so a rollback step that fails after
-   activating the previous version is still recognisable as a state change; and
-7. write a summary from the action outputs (including `provider-cli-version`,
-   which `deploy-fastly` and `config-push-fastly` now surface).
-
-### 6.4 Required deployer changes
-
-- Add explicit Trusted Server checkout; the EdgeZero actions do not call
-  `actions/checkout`.
-- Replace the legacy `fastly/*@v2` trio with `build-app-cli` + `deploy-fastly` +
-  `healthcheck-fastly` + `rollback-fastly`.
-- Pin action references to readable released tags, or full SHAs for production.
-- Read the version from `steps.<deploy>.outputs.fastly-version` (same concept as
-  the legacy `fastly-version`).
-- Audit `TRUSTED_SERVER_CONFIG`; if still needed, keep config expansion in the
-  deployer workflow, or push config as its own explicit step before/after deploy
-  with the `config-push-fastly` action (or `<your-app>-cli config push`). Not the
-  bundled `edgezero config push` — that stub exits non-zero by design (§5).
-- Confirm the canonical Trusted Server repository/ref has a `Cargo.lock` at the
-  CLI package's Cargo workspace root, plus `Cargo.toml`, `fastly.toml`, and
-  preferably `edgezero.toml`.
-
-### 6.5 Gotchas
-
-- `daily-deploy.yml` appears to stage but health-check/rollback production by
-  default. Decide whether the scheduled workflow is production or staging and set
-  `deploy-to` consistently (one verb across deploy/config-push/healthcheck/rollback)
-  before migration.
-- The old action targets `IABTechLab/trusted-server`; verify the actual
-  deployment refs before switching.
+- Produce and publish one strict application release without provider credentials.
+- Resolve its trusted source revision and SHA-256 outside publisher Environments.
+- Download and verify the archive; do not checkout application source in deploy.
+- Pass the same archive and digest to deploy, config push, healthcheck, and
+  rollback.
+- Keep runtime variables and credentials in protected publisher Environments.
+- Validate that `FASTLY_SERVICE_ID` contains ASCII letters and digits only.
+- Thread `deploy-to` consistently through deploy, healthcheck, and rollback.
+- Record `package-digest`, `fastly-version`, and `previous-version` for recovery.
+- Pin action references and serialize deployments per service.

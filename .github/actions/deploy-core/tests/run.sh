@@ -930,8 +930,8 @@ printf 'FASTLY_API_TOKEN=%s\n' "${FASTLY_API_TOKEN:-ABSENT}"
 printf 'EDGEZERO__PROVIDER__ENV=%s\n' "${EDGEZERO__PROVIDER__ENV:-ABSENT}"
 printf 'EDGEZERO__FASTLY__API_TOKEN=%s\n' "${EDGEZERO__FASTLY__API_TOKEN:-ABSENT}"
 printf 'EDGEZERO__DEPLOY__ARGS_FILE=%s\n' "${EDGEZERO__DEPLOY__ARGS_FILE:-ABSENT}"
-printf 'EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=%s\n' "${EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME:-ABSENT}"
-printf 'EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=%s\n' "${EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY:-ABSENT}"
+printf 'EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=%s\n' "${EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME:-ABSENT}"
+printf 'EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=%s\n' "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-ABSENT}"
 printf 'EDGEZERO__STORES__SECRETS____NAME=%s\n' "${EDGEZERO__STORES__SECRETS____NAME:-ABSENT}"
 printf 'EDGEZERO__ADAPTER__HOST=%s\n' "${EDGEZERO__ADAPTER__HOST:-ABSENT}"
 printf 'EDGEZERO__ADAPTER__PORT=%s\n' "${EDGEZERO__ADAPTER__PORT:-ABSENT}"
@@ -952,8 +952,8 @@ CLI
       EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
       EDGEZERO__PROVIDER__ENV='{"FASTLY_API_TOKEN":"s3cret"}' \
       EDGEZERO__FASTLY__API_TOKEN='s3cret' \
-      EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME='ts-secrets-staging' \
-      EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY='trusted_server_config_staging' \
+      EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME='credentials-staging' \
+      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY='app_config_staging' \
       EDGEZERO__STORES__SECRETS____NAME='must-not-survive' \
       EDGEZERO__ADAPTER__HOST='127.0.0.1' EDGEZERO__ADAPTER__PORT='7676' \
       EDGEZERO__LOGGING__ENDPOINT='https://logs.example.test' EDGEZERO__LOGGING__LEVEL='debug' \
@@ -967,11 +967,11 @@ CLI
   assert_equals "EDGEZERO_MANIFEST is delivered" \
     "EDGEZERO_MANIFEST=$dir/edgezero.toml" "$(grep '^EDGEZERO_MANIFEST=' <<<"$out")"
   assert_equals "the selected secret-store name is delivered" \
-    "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts-secrets-staging" \
-    "$(grep '^EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=' <<<"$out")"
+    "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=credentials-staging" \
+    "$(grep '^EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=' <<<"$out")"
   assert_equals "the selected config-store key is delivered" \
-    "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=trusted_server_config_staging" \
-    "$(grep '^EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=' <<<"$out")"
+    "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging" \
+    "$(grep '^EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=' <<<"$out")"
   assert_equals "the fixed adapter host is delivered" "EDGEZERO__ADAPTER__HOST=127.0.0.1" \
     "$(grep '^EDGEZERO__ADAPTER__HOST=' <<<"$out")"
   assert_equals "the fixed adapter port is delivered" "EDGEZERO__ADAPTER__PORT=7676" \
@@ -2655,6 +2655,234 @@ test_fastly_smoke_assertion_strictness() {
     run_production_deploy_assertion "$store_free" store-free
 }
 
+test_fastly_version_scoped_documentation() {
+  section "Fastly version-scoped deployment documentation"
+  local deploy="$REPO_ROOT/docs/guide/deploy-github-actions.md"
+  local fastly="$REPO_ROOT/docs/guide/adapters/fastly.md"
+  local cli="$REPO_ROOT/docs/guide/cli-reference.md"
+  local manifest="$REPO_ROOT/docs/guide/manifest-store-migration.md"
+  local blob="$REPO_ROOT/docs/guide/blob-app-config-migration.md"
+  local adoption="$REPO_ROOT/docs/guide/deploy-action-adoption.md"
+  local corpus="$WORK_DIR/fastly-version-scoped-docs.md"
+  local example_workflow="$WORK_DIR/application-deploy-workflow.yml"
+  local example_deploy="$WORK_DIR/application-deploy-job.yml"
+  local fastly_deployment="$WORK_DIR/fastly-deployment.md"
+  local fastly_deployment_flat="$WORK_DIR/fastly-deployment-flat.md"
+  local managed_args="$WORK_DIR/managed-fastly-arguments.md"
+  local deploy_flat="$WORK_DIR/deploy-github-actions-flat.md"
+  local adoption_flat="$WORK_DIR/deploy-action-adoption-flat.md"
+  local descriptor_block="$WORK_DIR/canonical-descriptor-exact.md"
+  cat "$deploy" "$fastly" "$cli" "$manifest" "$blob" "$adoption" >"$corpus"
+
+  awk '
+    /^```yaml$/ { fence = 1; next }
+    fence && /^name: Deploy Application$/ { capture = 1 }
+    capture && /^```$/ { exit }
+    capture { print }
+  ' "$adoption" >"$example_workflow"
+  awk '
+    /^  deploy:$/ { capture = 1 }
+    capture { print }
+  ' "$example_workflow" >"$example_deploy"
+  awk '
+    /^## Deployment$/ { capture = 1 }
+    capture && /^## Backends$/ { exit }
+    capture { print }
+  ' "$fastly" >"$fastly_deployment"
+  tr '\n' ' ' <"$fastly_deployment" >"$fastly_deployment_flat"
+  tr '\n' ' ' <"$deploy" >"$deploy_flat"
+  tr '\n' ' ' <"$adoption" >"$adoption_flat"
+  awk '
+    /^### Managed Fastly argument contract$/ { capture = 1 }
+    capture && /^::: warning$/ { exit }
+    capture { print }
+  ' "$cli" >"$managed_args"
+  awk '
+    /canonical-descriptor-exact:start/ { capture = 1; next }
+    /canonical-descriptor-exact:end/ { exit }
+    capture && NF { print }
+  ' "$fastly" >"$descriptor_block"
+
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "docs name the one physical runtime Config Store" \
+    grep -Fq 'one physical `edgezero_runtime_env`' "$corpus"
+  assert_succeeds "docs name the exact internal version descriptor key" \
+    grep -Fq 'EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1' "$corpus"
+  assert_equals "docs preserve the canonical descriptor as exact compact bytes" \
+    $'```text\n{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"debug","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config_staging","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-stage","EDGEZERO__STORES__KV__CACHE__NAME":"cache-stage","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-stage"}}\n```' \
+    "$(cat "$descriptor_block")"
+  assert_succeeds "docs require descriptor and exact links before publication" \
+    grep -Fq 'descriptor and exact resource links before staging or activation' "$corpus"
+  assert_succeeds "docs explain fail-closed runtime descriptor loading" \
+    grep -Eq 'fail(s)? closed' "$fastly"
+  assert_succeeds "docs describe clean cutover without legacy lookup" \
+    grep -Fq 'does not inspect any legacy' "$corpus"
+  assert_succeeds "docs mark PR 344 data inert and separately removable" \
+    grep -Fq 'PR #344' "$corpus"
+  assert_succeeds "docs state canonical environment precedence" \
+    grep -Fq 'parent value > manifest variable default > logical default' "$manifest"
+  assert_succeeds "docs retain an optional Secret Store name-only example" \
+    grep -Fq 'EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME' "$manifest"
+  assert_fails "docs never place secret values in runtime selectors" \
+    grep -Eq 'EDGEZERO__STORES__SECRETS__[^[:space:]`]*__(KEY|VALUE)' "$corpus"
+
+  # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+  assert_succeeds "example deploy uses the validated GitHub Environment output" \
+    grep -Fq 'environment: ${{ needs.preflight.outputs.environment }}' "$example_deploy"
+  # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+  assert_succeeds "example uses the requested domain as the real hostname" \
+    grep -Fq 'domain: ${{ inputs.domain }}' "$example_deploy"
+  # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+  assert_fails "example never treats a hostname as a GitHub Environment name" \
+    grep -Fq 'environment: ${{ inputs.domain }}' "$example_workflow"
+  assert_succeeds "example preflight maps the production hostname" \
+    grep -Fq 'app.example.com) environment=production' "$adoption"
+  assert_succeeds "example preflight maps the staging hostname" \
+    grep -Fq 'staging.app.example.com) environment=staging' "$adoption"
+  assert_succeeds "release identity is selected before the publisher environment" \
+    grep -Fq 'Select the source revision and release digest' "$adoption"
+  assert_succeeds "deployer never checks out or rebuilds application source" \
+    grep -Fq 'never checks out or rebuilds application source' "$adoption"
+  assert_succeeds "publisher environments cannot choose release identity" \
+    grep -Fq 'cannot come from a publisher GitHub Environment' "$adoption"
+  assert_succeeds "one release fixes CLI package and both manifests for every publisher and target" \
+    grep -Fq 'byte-identical application CLI, Fastly package' "$adoption"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "one release fixes both recorded manifest bytes" \
+    grep -Fq '`edgezero.toml`, and `fastly.toml` to every publisher' "$adoption"
+
+  assert_succeeds "application example is extracted as a workflow" \
+    grep -Fxq 'name: Deploy Application' "$example_workflow"
+  assert_succeeds "example preflight waits for immutable release selection" \
+    grep -Fxq '    needs: release' "$example_workflow"
+  assert_succeeds "example preflight threads the selected release reference" \
+    grep -Fq "release-ref: \${{ needs.release.outputs['release-ref'] }}" "$example_workflow"
+  # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+  assert_succeeds "example preflight threads the selected release digest" \
+    grep -Fq 'sha256: ${{ needs.release.outputs.sha256 }}' "$example_workflow"
+  assert_succeeds "example deploy depends literally on preflight" \
+    grep -Fxq '    needs: preflight' "$example_deploy"
+  assert_succeeds "deployer checkout remains allowed" \
+    grep -Fq 'uses: actions/checkout@v4' "$example_deploy"
+  assert_succeeds "example downloads the selected immutable release" \
+    grep -Fq 'Download the selected application release' "$example_deploy"
+  assert_succeeds "example invokes the release downloader" \
+    grep -Fq './scripts/download-application-release' "$example_deploy"
+  assert_succeeds "each lifecycle action verifies the same downloaded release" \
+    grep -Fq 'each lifecycle action independently verifies the same archive and digest' "$adoption_flat"
+  assert_fails "example deploy never selects application source checkout repository or ref" \
+    grep -Eq '^[[:space:]]+(repository|ref):' "$example_deploy"
+  assert_fails "example deploy never runs an application build" \
+    grep -Eiq 'cargo build|fastly compute build|build-app-cli|app-cli-artifact' "$example_deploy"
+  assert_fails "example deploy has no alternate manifest CLI or build selectors" \
+    grep -Eq '^[[:space:]]+(manifest|app-cli-bin|build-mode|build-args):' "$example_deploy"
+
+  local action
+  for action in deploy-fastly config-push-fastly healthcheck-fastly rollback-fastly; do
+    assert_equals "example invokes $action exactly once" \
+      1 "$(grep -Fc "/$action@<ref>" "$example_deploy")"
+  done
+  # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
+  assert_equals "all four example lifecycle actions use one local release archive" \
+    4 "$(grep -Fc 'app-release-archive: ${{ github.workspace }}/app-release.tar.gz' "$example_deploy")"
+  # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
+  assert_equals "all four example lifecycle actions use one release digest" \
+    4 "$(grep -Fc 'app-release-sha256: ${{ needs.preflight.outputs.sha256 }}' "$example_deploy")"
+  local runtime_name
+  for runtime_name in \
+    EDGEZERO__LOGGING__LEVEL \
+    EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME \
+    EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY \
+    EDGEZERO__STORES__KV__CACHE__NAME \
+    EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME; do
+    # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
+    assert_succeeds "example maps canonical runtime variable $runtime_name from vars" \
+      grep -Fq "$runtime_name: \${{ vars.$runtime_name }}" "$example_deploy"
+  done
+  assert_fails "example never maps a Secret Store value or key" \
+    grep -Eq 'EDGEZERO__STORES__SECRETS__[^[:space:]]+__(KEY|VALUE)' "$example_workflow"
+
+  assert_succeeds "CLI docs explain provider-neutral managed deployment ownership" \
+    grep -Fq 'provider-neutral deployment ownership' "$cli"
+  assert_succeeds "CLI docs preserve unregistered manifest-command adapters" \
+    grep -Fq 'adapters keep their manifest command' "$cli"
+  assert_succeeds "CLI docs name the immutable application release flag" \
+    grep -Fq -- '--application-release' "$cli"
+  local flag
+  for flag in --service-id -s --service-name --version --autoclone --token -t --package/-p; do
+    assert_succeeds "CLI docs list reserved managed Fastly flag $flag" \
+      grep -Fq -- "$flag" "$managed_args"
+  done
+  for flag in --comment --accept-defaults -d --auto-yes -y --debug-mode --non-interactive -i --quiet -q --verbose -v; do
+    assert_succeeds "CLI docs list allowed managed Fastly argument $flag" \
+      grep -Fq -- "$flag" "$managed_args"
+  done
+  assert_succeeds "CLI docs use the adapter package digest output name" \
+    grep -Fq 'package-sha256=<SHA256>' "$managed_args"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "CLI docs explain the deploy action package output mapping" \
+    grep -Fq 'maps `package-sha256` to its public `package-digest` output' "$managed_args"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_fails "CLI docs do not claim the adapter emits the action output name" \
+    grep -Fq 'emits `package-digest=<SHA256>`' "$managed_args"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "action wrapper deploy args are restricted to comment" \
+    grep -Fq 'action wrapper accepts only `--comment`' "$deploy"
+  assert_succeeds "docs state the shared alphanumeric Fastly service-ID rule" \
+    grep -Fq 'ASCII letters and digits only' "$corpus"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "deploy docs expose the verified package digest" \
+    grep -Fq '`package-digest`' "$deploy"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "deploy docs retain failed-version recovery output" \
+    grep -Fq 'emits `fastly-version` before later preparation failures' "$deploy_flat"
+  # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
+  assert_succeeds "deploy docs scope package digest to adapter output timing" \
+    grep -Fq 'only after the deploy step emits adapter `package-sha256`' "$deploy_flat"
+  assert_succeeds "deploy docs allow package digest to be absent on preflight failure" \
+    grep -Fq 'may be absent when preflight fails' "$deploy"
+
+  # shellcheck disable=SC2016 # Shell variables are literal documentation contracts.
+  assert_succeeds "Fastly primary deployment uses a verified application release" \
+    grep -Fq -- '--application-release "$RELEASE_ROOT"' "$fastly_deployment"
+  # shellcheck disable=SC2016 # Shell variables are literal documentation contracts.
+  assert_succeeds "Fastly primary deployment names the destination service" \
+    grep -Fq -- '--service-id "$FASTLY_SERVICE_ID"' "$fastly_deployment"
+  assert_fails "Fastly managed deployment does not recommend direct provider deployment" \
+    grep -Fq 'fastly compute deploy' "$fastly_deployment"
+  assert_succeeds "bare Fastly deploy is explicitly store-free production compatibility" \
+    grep -Fq 'store-free production compatibility' "$fastly_deployment_flat"
+
+  # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+  assert_fails "lifecycle examples do not reference a cross-job archive path output" \
+    grep -Fq '${{ needs.release.outputs.archive }}' "$deploy"
+  # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+  assert_succeeds "lifecycle examples use the downloaded runner-local archive" \
+    test "$(grep -Fc 'app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz' "$deploy")" -ge 5
+  # shellcheck disable=SC2016 # Awk program must remain single quoted.
+  assert_fails "config-push table has no duplicate Markdown separator" \
+    awk 'previous && /^\|[ :|-]+\|$/ { found = 1 } { previous = ($0 ~ /^\|[ :|-]+\|$/) } END { exit !found }' "$deploy"
+  assert_fails "recovery never recommends removing an exact inactive version" \
+    grep -Eiq '(remove|delete).{0,32}(exact|inactive).{0,32}version|(exact|inactive).{0,32}version.{0,32}(remove|delete)' "$deploy" "$adoption"
+  assert_succeeds "recovery tells operators to inspect and reuse inactive drafts" \
+    grep -Fq 'inspect and reuse that exact inactive draft' "$adoption"
+  assert_succeeds "recovery limits deactivation to staged versions" \
+    grep -Fq 'deactivate it only when it is staged' "$adoption"
+
+  assert_fails "docs contain no staging runtime-store physical name" \
+    grep -Fq 'edgezero_runtime_env_staging_' "$corpus"
+  assert_fails "docs contain no one-service owner guidance" \
+    grep -Fq 'owned by one Fastly' "$corpus"
+  assert_fails "docs contain no operational staging-twin instruction" \
+    grep -Eq '(creates|writes|links|applies).{0,80}(staging twin|staging-twin)' "$corpus"
+  assert_fails "docs contain no manual unscoped selector write" \
+    grep -Fq -- '--key=EDGEZERO__STORES__' "$corpus"
+  assert_fails "lifecycle docs contain no obsolete separate CLI artifact input" \
+    grep -Fq 'app-cli-artifact' "$deploy" "$adoption"
+  assert_fails "lifecycle docs contain no deployer build controls" \
+    grep -Eq 'build-mode|build-args' "$deploy" "$adoption"
+}
+
 workflow_duplicate_env_keys() {
   local workflow="$1"
   awk '
@@ -3455,6 +3683,7 @@ main() {
   test_smoke_release_uses_application_revision
   test_fastly_fake_rejects_inexact_commands
   test_fastly_smoke_assertion_strictness
+  test_fastly_version_scoped_documentation
   test_workflow_duplicate_env_keys
   test_action_pin_gate
 

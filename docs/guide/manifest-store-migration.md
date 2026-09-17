@@ -81,8 +81,12 @@ the spec, §6.6):
 
 ### Runtime environment variables
 
-`__` (double underscore) separates segments. Absent variables fall
-back to their listed defaults.
+`__` (double underscore) separates segments. Resolution uses this exact
+precedence: parent value > manifest variable default > logical default. A parent
+environment or GitHub Environment value wins; otherwise a default declared for
+the manifest variable is used; otherwise a store selector resolves to its logical
+ID. Fastly records the resolved result in a version descriptor. It does not add a
+service ID to any canonical variable name.
 
 | Variable                                   | Role                                                                                                                   | Default         |
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | --------------- |
@@ -98,10 +102,35 @@ id. The literal `__KEY` selector is config-only — it swaps which blob
 the `AppConfig<C>` extractor loads (see
 [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
 
-These are also the exact keys Fastly stores in `edgezero_runtime_env`. The
-EdgeZero Fastly deploy flow copies the selected deployment environment's
-declared selectors into that store; no service ID is embedded in a variable
-name. See the [Fastly adapter guide](./adapters/fastly.md#config-store).
+For example, an application can declare all three store kinds while keeping the
+Secret Store optional:
+
+```toml
+[stores.config]
+ids = ["app_config"]
+
+[stores.kv]
+ids = ["cache"]
+
+[stores.secrets]
+ids = ["credentials"]
+```
+
+```text
+EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
+EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config
+EDGEZERO__STORES__KV__CACHE__NAME=cache-prod
+EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=credentials-prod
+```
+
+The Secret selector names a physical store. Secret values never belong in these
+variables or in the Fastly descriptor.
+
+Fastly writes all resolved entries as canonical JSON under
+`EDGEZERO__SERVICES__<SERVICE_ID>__VERSIONS__<VERSION>__ENV_V1` in the one
+physical `edgezero_runtime_env` Config Store. The public variables remain
+portable and contain no service ID. See the
+[Fastly adapter guide](./adapters/fastly.md#runtime-descriptor).
 
 ## What this means for handler code
 

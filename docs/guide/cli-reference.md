@@ -157,22 +157,29 @@ edgezero deploy --adapter <name>
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`)
 - `--service-id <id>` - Platform service id the deploy targets (Fastly). Passed
   through to the provider; adapters that don't need one ignore it.
+- `--application-release <path>` - Extracted, verified immutable application
+  release root. The generic CLI confines this path and records its exact
+  application manifest; only the selected adapter interprets provider package
+  metadata.
 - `--staging` - Deploy to a **staged** draft version instead of activating
   production (Fastly staging lifecycle). Non-Fastly adapters reject it. This is the
   same `--staging` verb `healthcheck`/`rollback`/`config push` use.
-- `-- <passthrough...>` - Args after `--` are forwarded verbatim to the adapter
-  deploy command (e.g. `-- --comment "ci build"`). A hyphenated token before `--`
-  is rejected, so a mistyped flag can never silently route a staging deploy to
-  production.
+- `-- <passthrough...>` - Adapter arguments after `--`. A hyphenated token before
+  `--` is rejected.
 
 **Examples:**
 
 ```bash
-# Deploy to Fastly
-edgezero deploy --adapter fastly
+# Deploy a verified Fastly application release
+edgezero deploy --adapter fastly \
+  --service-id "$FASTLY_SERVICE_ID" \
+  --application-release "$RELEASE_ROOT"
 
-# Stage a Fastly draft version (no activation)
-edgezero deploy --adapter fastly --service-id "$FASTLY_SERVICE_ID" --staging
+# Stage the same release (no production activation)
+edgezero deploy --adapter fastly \
+  --service-id "$FASTLY_SERVICE_ID" \
+  --application-release "$RELEASE_ROOT" \
+  --staging
 
 # Deploy to Cloudflare
 edgezero deploy --adapter cloudflare
@@ -183,9 +190,48 @@ edgezero deploy --adapter spin
 
 **Provider behavior:**
 
-- **Fastly**: Runs `fastly compute deploy`
+- **Fastly**: Claims adapter-managed deployment whenever an application release
+  is supplied, `--staging` is selected, or the application declares a Config,
+  KV, or Secret Store. Every managed deployment requires the verified release.
+  Only a direct, store-free production call without a release retains the
+  manifest command for compatibility.
 - **Cloudflare**: Runs `wrangler deploy`
 - **Spin**: Runs `spin deploy`
+
+Deployment ownership is resolved through the adapter registry. This is
+provider-neutral deployment ownership: the generic CLI has no Fastly branch or
+hidden provider flag. Registered adapters can claim a deployment; unregistered
+adapters keep their manifest command.
+
+### Managed Fastly argument contract
+
+The managed lifecycle owns service targeting, source version, cloning, package,
+credential, and publication decisions. These passthrough flags are reserved and
+rejected in detached, attached, or `=` forms where applicable:
+
+```text
+--service-id  -s  --service-name  --version  --autoclone  --token  -t
+--package/-p
+```
+
+The complete allowlist is a single `--comment VALUE` or `--comment=VALUE`, plus
+Fastly's non-targeting global booleans `--accept-defaults` / `-d`, `--auto-yes` /
+`-y`, `--debug-mode`, `--non-interactive` / `-i`, `--quiet` / `-q`, and
+`--verbose` / `-v`. Boolean `=value` forms, duplicates, other options, and
+positional arguments fail before provider mutation.
+
+Fastly service IDs follow the same validation in deploy, healthcheck, and
+rollback: ASCII letters and digits only. The release verifier checks strict
+`release.json` metadata, confined normalized member paths, regular non-symlink
+files, exact membership, file digests, and the `edgezero.toml` to `fastly.toml`
+relationship before Fastly receives a mutation.
+
+Managed deployment uploads only the recorded package, prepares the version
+descriptor and exact resource links, verifies both, and then stages or activates.
+The adapter emits `package-sha256=<SHA256>` for the verified package and
+`version=<N>` as soon as a recoverable target draft exists, so a caller can
+recover that version when later preparation fails. The `deploy-fastly` action
+maps `package-sha256` to its public `package-digest` output.
 
 ::: warning
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.
@@ -323,10 +369,10 @@ flags and exits `2` with a pointer to the typed CLI — it cannot push (see
   the live service reads. Production and staging may select the same or different
   physical stores. The staging key is _derived_ from the logical id and is mutually exclusive with
   `--key` (an explicit staging key would be written where no staged version reads,
-  so the combination is refused). A staged deploy points the staged version's
-  `edgezero_runtime_env` link at this key via the canonical
-  `EDGEZERO__STORES__CONFIG__<ID>__KEY` entry in its
-  staging selector store (see [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
+  so the combination is refused). A staged deploy records this key in the
+  version-scoped runtime descriptor under the canonical
+  `EDGEZERO__STORES__CONFIG__<ID>__KEY` entry (see
+  [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config. By default the loader reads the overlay so the push sends the same values the runtime would.
 - `--local` — push into the adapter's local-emulator state instead of the live platform. Fastly edits `[local_server.config_stores]` in `fastly.toml` (Viceroy reads it on startup); Cloudflare runs `wrangler kv bulk put --local` so writes land in `.wrangler/state`; Spin forces SQLite-direct against `<spin.toml dir>/.spin/sqlite_key_value.db` even when the manifest's deploy command targets Fermyon Cloud (the runtime-config `[key_value_store.<label>].type` is also ignored for SQLite path resolution); Axum is local-only already so it's a no-op there.
 - `--runtime-config <path>` — adapter runtime configuration file. Currently only consumed by Spin, which reads `[key_value_store.<label>]` stanzas to dispatch per-backend (`type = "spin"` → SQLite-direct, `redis` / `azure_cosmos` / other → error pointing at the native backend CLI). Default: `runtime-config.toml` next to the adapter manifest. Ignored by the Fermyon Cloud branch — cloud pushes consult only `spin.toml`'s `[application].name`.
@@ -534,11 +580,11 @@ The `fastly` flow requires `fastly` on `PATH` and
 `[adapters.fastly.adapter].manifest` pointing at the project's
 `fastly.toml`. Re-running is safe: provision skips resource creation for any id
 whose `[setup.<kind>_stores.<id>]` block already exists and does not read or
-write runtime selectors. The production deploy path reconciles canonical mappings
-after either a built-in or manifest-declared deploy command; the staged path
-applies them to the staging twin. The deployment target therefore chooses
-runtime store names without baking them into the Wasm package, and running
-provision from a staging environment cannot redirect production.
+write runtime descriptors. Managed deploy resolves runtime values, writes the
+service/version descriptor in the one physical `edgezero_runtime_env`, and
+reconciles exact resource links on an unreachable draft. Production and staging
+therefore choose runtime store names without baking them into the Wasm package,
+and provisioning from a staging environment cannot redirect production.
 
 The `spin` flow needs no native CLI but does require
 `[adapters.spin.adapter].manifest` pointing at the project's
