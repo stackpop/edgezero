@@ -66,17 +66,24 @@ Download the selected release once and reuse it:
     name: application-release-${{ needs.release.outputs.source-revision }}
     path: app-release
     run-id: ${{ needs.release.outputs.run-id }}
-    repository: ${{ github.repository }}
-    github-token: ${{ github.token }}
+    repository: ${{ needs.release.outputs.producer-repository }}
+    github-token: ${{ secrets.APPLICATION_RELEASE_TOKEN }}
 
 - id: deploy
   uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
     app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
     app-release-sha256: ${{ needs.release.outputs.sha256 }}
+    expected-source-revision: ${{ needs.release.outputs.source-revision }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
+
+`producer-repository` is the application repository in `owner/name` form. For a
+cross-repository release, `APPLICATION_RELEASE_TOKEN` must be a fine-grained
+personal access token or GitHub App token with Actions read access to that
+repository. The built-in workflow token is sufficient only when producer and
+deployer are the same repository.
 
 Deploy, config push, healthcheck, and rollback extract the application CLI from
 that release. Deploy uploads its recorded Fastly package. Config push uses its
@@ -140,6 +147,10 @@ on:
         description: Approved application revision
         required: true
         type: string
+      producer-repository:
+        description: Repository that produced the application release (owner/name)
+        required: true
+        type: string
       release-run-id:
         description: Trusted producer workflow run containing the immutable release
         required: true
@@ -158,13 +169,16 @@ jobs:
       environment: ${{ steps.environment.outputs.environment-name }}
       concurrency-key: ${{ steps.target.outputs.concurrency-key }}
       deploy-to: ${{ steps.target.outputs.deploy-to }}
+      producer-repository: ${{ steps.release.outputs.producer-repository }}
       release-artifact: ${{ steps.release.outputs.artifact }}
       release-run-id: ${{ steps.release.outputs.run-id }}
       sha256: ${{ steps.release.outputs.sha256 }}
+      source-revision: ${{ steps.release.outputs.source-revision }}
     steps:
       - id: release
         env:
           SOURCE_REVISION: ${{ inputs.source-revision }}
+          PRODUCER_REPOSITORY: ${{ inputs.producer-repository }}
           RELEASE_RUN_ID: ${{ inputs.release-run-id }}
           RELEASE_SHA256: ${{ inputs.release-sha256 }}
         run: |
@@ -178,9 +192,14 @@ jobs:
             [[ "$RELEASE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
               echo "::error::release-sha256 must be 64 lowercase hexadecimal characters"; exit 1;
             }
+            [[ "$PRODUCER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+              echo "::error::producer-repository must use owner/name syntax"; exit 1;
+            }
             echo "artifact=application-release-$SOURCE_REVISION"
+            echo "producer-repository=$PRODUCER_REPOSITORY"
             echo "run-id=$RELEASE_RUN_ID"
             echo "sha256=$RELEASE_SHA256"
+            echo "source-revision=$SOURCE_REVISION"
           } >>"$GITHUB_OUTPUT"
 
       - id: target
@@ -235,14 +254,15 @@ jobs:
           name: ${{ needs.preflight.outputs.release-artifact }}
           path: app-release
           run-id: ${{ needs.preflight.outputs.release-run-id }}
-          repository: ${{ github.repository }}
-          github-token: ${{ github.token }}
+          repository: ${{ needs.preflight.outputs.producer-repository }}
+          github-token: ${{ secrets.APPLICATION_RELEASE_TOKEN }}
 
       - id: config
         uses: stackpop/edgezero/.github/actions/config-push-fastly@<ref>
         with:
           app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
+          expected-source-revision: ${{ needs.preflight.outputs.source-revision }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           working-directory: publisher-config
           app-config: app.toml
@@ -263,6 +283,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
+          expected-source-revision: ${{ needs.preflight.outputs.source-revision }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
           deploy-args: '["--comment","Application release"]'
@@ -273,6 +294,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
+          expected-source-revision: ${{ needs.preflight.outputs.source-revision }}
           fastly-api-token: ${{ needs.preflight.outputs.deploy-to == 'staging' && secrets.FASTLY_API_TOKEN || '' }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
           fastly-version: ${{ steps.deploy.outputs.fastly-version }}
@@ -286,19 +308,26 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.preflight.outputs.sha256 }}
+          expected-source-revision: ${{ needs.preflight.outputs.source-revision }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
           fastly-version: ${{ steps.deploy.outputs.fastly-version }}
           rollback-to: ${{ steps.deploy.outputs.previous-version }}
           deploy-to: ${{ needs.preflight.outputs.deploy-to }}
+
+      - name: Require config reconciliation after a later failure
+        if: ${{ always() && steps.config.outcome == 'success' && (steps.deploy.outcome == 'failure' || steps.health.outcome == 'failure' || cancelled()) }}
+        run: |
+          echo "::error::Config push succeeded but deployment did not. Restore the previous config value or re-push the previous release's config to the same physical store and logical key before retrying."
+          exit 1
 ```
 
 The example pins the producer run, source revision, and archive digest outside
 both publisher Environments. `preflight` validates that identity and proves the
 derived GitHub Environment already exists. The deploy job downloads the exact
-artifact from that producer run once; each lifecycle action independently
-verifies the same archive and digest. It receives environment-scoped runtime
-values only afterward. The optional `CREDENTIALS` selector is a Secret Store
+artifact from that producer repository and run once; each lifecycle action
+independently verifies the same archive, digest, and source revision. It receives
+environment-scoped runtime values only afterward. The optional `CREDENTIALS` selector is a Secret Store
 name from `vars`, never a secret value. `inputs.domain` remains the actual
 hostname passed to healthcheck for both targets. The deployer checkout contains
 only publisher config; it never checks out or rebuilds application source.
@@ -326,6 +355,11 @@ state and refuses incompatible state. If a production version is active and
 reconcile provider state manually without guessing. If `mutation-attempted` is
 true for config push, re-run the same pinned release, logical store, payload, and
 target or verify that exact physical store and logical key before deployment.
+Config pushed before deployment must remain backward-compatible with the current
+published release until deployment and healthcheck finish. If a later step
+fails, restore the prior value or re-push the prior release's config to the same
+physical store and logical key; version the physical store when that compatibility
+cannot be guaranteed.
 
 Serialize deployments by service. Without serialization, a provider lookup after
 failure may observe another run's version.
@@ -333,7 +367,7 @@ failure may observe another run's version.
 ## Runner requirements
 
 The actions are tested on `ubuntu-latest`. A self-hosted runner must be Linux
-x86-64 and provide Bash, `jq`, Python 3, `tar`, `curl`, `git`, `base64`,
+x86-64 and provide Bash, `jq`, Python 3.11 or newer, `tar`, `curl`, `git`, `base64`,
 `realpath`, and either `sha256sum` or `shasum`. The application CLI archive must
 contain a Linux x86-64 executable.
 
@@ -341,8 +375,9 @@ contain a Linux x86-64 executable.
 
 - Produce and publish one strict application release without provider credentials.
 - Resolve its trusted source revision and SHA-256 outside publisher Environments.
-- Download and verify the archive; do not checkout application source in deploy.
-- Pass the same archive and digest to deploy, config push, healthcheck, and
+- Download from the explicit producer repository and verify the archive, digest,
+  and selected source revision; do not checkout application source in deploy.
+- Pass the same archive, digest, and source revision to deploy, config push, healthcheck, and
   rollback.
 - Keep runtime variables and credentials in protected publisher Environments.
 - Validate that `FASTLY_SERVICE_ID` contains ASCII letters and digits only.

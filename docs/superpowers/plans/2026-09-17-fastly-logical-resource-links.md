@@ -156,3 +156,21 @@
 - [x] Run docs format, lint, and build.
 - [x] Search the tracked tree for forbidden descriptor/runtime-store names and inspect every remaining historical reference.
 - [ ] Review the final diff against the accepted design, commit, push, update PR/issue text, and watch CI to completion.
+
+### Task 10: Immutable release and publication review follow-up
+
+**Files:** release packaging and verification actions, Fastly lifecycle code,
+action smokes, deployment guides, and this design.
+
+- [x] Preserve the Fastly manifest at its declared application-relative path.
+- [x] Probe every lifecycle command and action-owned flag before recording
+  lifecycle protocol 1.
+- [x] Require every lifecycle action to verify the selected source revision.
+- [x] Capture the complete source configuration before mutation, explicitly
+  clone locked sources, and verify the fresh clone before package upload.
+- [x] Reject staging rollback when multiple versions claim staging.
+- [x] Exercise one real hostname with a distinct staging GitHub Environment in
+  the executable smoke.
+- [x] Document explicit cross-repository artifact credentials and config
+  reconciliation after a later deploy or healthcheck failure.
+- [ ] Run full verification, push, update PR #381 and issue #380, and watch CI.

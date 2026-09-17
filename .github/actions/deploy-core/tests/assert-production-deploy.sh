@@ -16,7 +16,8 @@ main() {
   [[ "$previous" == 40 ]] || fail "expected captured previous-version=40, got '${previous:-<empty>}'"
   [[ "$digest" == "$expected_digest" ]] || fail "production did not report the pinned package digest"
   [[ "$(cat "$FAKE_PACKAGE_DIGEST_FILE")" == "$expected_digest" ]] || fail "production uploaded different package bytes"
-  grep -Eq '^fastly compute update --service-id=dummyservice --autoclone --version=active --package=[^[:space:]]+/package/app\.tar\.gz --non-interactive$' "$log" || fail "production did not use the exact package update command"
+  grep -Fqx 'PUT https://api.fastly.com/service/dummyservice/version/40/clone' "$log" || fail "production did not explicitly clone the verified source"
+  grep -Eq '^fastly compute update --service-id=dummyservice --version=42 --package=[^[:space:]]+/package/app\.tar\.gz --non-interactive$' "$log" || fail "production did not update the verified clone"
   grep -Eq '^fastly compute hash-files --package=[^[:space:]]+/package/app\.tar\.gz --skip-build --non-interactive --quiet$' "$log" || fail "production did not hash the pinned package"
 
   local expected_comment
@@ -46,7 +47,8 @@ main() {
   package_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n1 | cut -d: -f1)
   configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log" | tail -n1 | cut -d: -f1)
   publish_line=$(grep -n '^PUT https://api.fastly.com/service/dummyservice/version/42/activate$' "$log" | tail -n1 | cut -d: -f1)
-  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log")" -eq 2 ]] || fail "production did not capture and revalidate the complete draft configuration"
+  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/40/to/40$' "$log")" -eq 3 ]] || fail "production did not preserve and revalidate the complete source configuration"
+  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log")" -eq 3 ]] || fail "production did not verify the fresh clone and final draft configuration"
   [[ "$final_links_line" -lt "$publish_line" && "$package_line" -lt "$publish_line" && "$configuration_line" -lt "$publish_line" ]] || fail "final link, package, and complete-configuration verification did not precede activation"
   ! grep -qE 'config-store-entry (create|describe)|/resources/stores/config/.*/item/' "$log" || fail "production used the removed runtime descriptor path"
   notice "production activated version 42 with logical resource links and pinned package bytes"

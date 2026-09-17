@@ -442,10 +442,15 @@ test_fastly_application_release() {
   local prepare="$ACTIONS_DIR/fastly-common/scripts/prepare-release.sh"
   make_fastly_release_fixture "$dir"
   local out="$dir/out.txt" root="$dir/extracted"
+  local expected_revision
+  expected_revision=$(printf 'a%.0s' {1..40})
+  local EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION="$expected_revision"
+  export EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION
 
   assert_succeeds "a strict release archive verifies and extracts" \
     env EDGEZERO__APP__RELEASE__ARCHIVE="$dir/app-release.tar.gz" \
     EDGEZERO__APP__RELEASE__SHA256="$(cat "$dir/app-release.sha256")" \
+    EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION="$expected_revision" \
     EDGEZERO__APP__RELEASE__ROOT="$root" GITHUB_OUTPUT="$out" bash "$prepare"
   local root_real
   root_real=$(realpath "$root")
@@ -460,7 +465,14 @@ test_fastly_application_release() {
   assert_succeeds "release preparation emits the exact CLI archive" \
     grep -qx "app-cli-archive=$root_real/cli/app-cli.tar.gz" "$out"
   assert_succeeds "release preparation emits the pinned source revision" \
-    grep -qx "source-revision=$(printf 'a%.0s' {1..40})" "$out"
+    grep -qx "source-revision=$expected_revision" "$out"
+
+  assert_fails_with "release preparation rejects a mismatched selected source revision" \
+    "does not match expected-source-revision" \
+    env EDGEZERO__APP__RELEASE__ARCHIVE="$dir/app-release.tar.gz" \
+    EDGEZERO__APP__RELEASE__SHA256="$(cat "$dir/app-release.sha256")" \
+    EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION="$(printf 'b%.0s' {1..40})" \
+    EDGEZERO__APP__RELEASE__ROOT="$dir/wrong-revision" bash "$prepare"
 
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64 | Linux-amd64)
@@ -2219,6 +2231,7 @@ in app-release-archive true none
 in app-release-sha256 true none
 in deploy-args false "[]"
 in deploy-to false production
+in expected-source-revision true none
 in fastly-api-token true none
 in fastly-service-id true none
 out app-cli-version
@@ -2238,6 +2251,7 @@ in app-config-inline false ""
 in app-release-archive true none
 in app-release-sha256 true none
 in deploy-to false production
+in expected-source-revision true none
 in fastly-api-token true none
 in key false ""
 in no-env false "false"
@@ -2255,6 +2269,7 @@ EOF
 in app-release-archive true none
 in app-release-sha256 true none
 in deploy-to false production
+in expected-source-revision true none
 in fastly-api-token true none
 in fastly-service-id true none
 in fastly-version true none
@@ -2270,6 +2285,7 @@ in app-release-archive true none
 in app-release-sha256 true none
 in deploy-to false production
 in domain true none
+in expected-source-revision true none
 in fastly-api-token false ""
 in fastly-service-id true none
 in fastly-version true none
@@ -2372,11 +2388,11 @@ test_fastly_smoke_release_contract() {
   local lifecycle_filter
   lifecycle_filter='select(tag == "!!map" and (.uses == "./.github/actions/deploy-fastly" or .uses == "./.github/actions/config-push-fastly" or .uses == "./.github/actions/healthcheck-fastly" or .uses == "./.github/actions/rollback-fastly"))'
 
-  local missing_release stale_inputs archives store_aware_digests
+  local missing_release stale_inputs archives store_aware_digests store_aware_revisions
   missing_release=$(yq eval -r \
-    ".. | $lifecycle_filter | select(.with.\"app-release-archive\" == null or .with.\"app-release-sha256\" == null) | .name" \
+    ".. | $lifecycle_filter | select(.with.\"app-release-archive\" == null or .with.\"app-release-sha256\" == null or .with.\"expected-source-revision\" == null) | .name" \
     "$workflow")
-  assert_equals "every Fastly lifecycle action receives the immutable release archive and digest" \
+  assert_equals "every Fastly lifecycle action receives the immutable release identity" \
     "" "$missing_release"
 
   stale_inputs=$(yq eval -r \
@@ -2390,16 +2406,22 @@ test_fastly_smoke_release_contract() {
   store_aware_digests=$(yq eval -r \
     ".jobs | to_entries[] | select(.key != \"store-free-deploy-smoke\") | .value.steps[]? | $lifecycle_filter | .with.\"app-release-sha256\"" \
     "$workflow" | sort -u)
+  store_aware_revisions=$(yq eval -r \
+    ".jobs | to_entries[] | select(.key != \"store-free-deploy-smoke\") | .value.steps[]? | $lifecycle_filter | .with.\"expected-source-revision\"" \
+    "$workflow" | sort -u)
   # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
   assert_equals "every lifecycle action consumes an action-owned release archive path" \
     '${{ github.workspace }}/fixture-release/app-release.tar.gz' "$archives"
   # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
   assert_equals "all store-aware lifecycle cases consume the same pinned release digest" \
     '${{ needs.fixture-release.outputs.app-release-sha256 }}' "$store_aware_digests"
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_equals "all store-aware lifecycle cases consume the same source revision" \
+    '${{ needs.fixture-release.outputs.source-revision }}' "$store_aware_revisions"
   assert_succeeds "one fixture release is built before the deployment matrix" \
     grep -q '^  fixture-release:' "$workflow"
 
-  local store_free_deploys store_free_digest store_free_source
+  local store_free_deploys store_free_digest store_free_revision store_free_source
   store_free_deploys=$(yq eval -r \
     '[.jobs."store-free-deploy-smoke".steps[]? | select(.uses == "./.github/actions/deploy-fastly")] | length' \
     "$workflow")
@@ -2411,6 +2433,12 @@ test_fastly_smoke_release_contract() {
   # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
   assert_equals "the store-free deployment consumes its distinct immutable release" \
     '${{ needs.store-free-release.outputs.app-release-sha256 }}' "$store_free_digest"
+  store_free_revision=$(yq eval -r \
+    '.jobs."store-free-deploy-smoke".steps[]? | select(.uses == "./.github/actions/deploy-fastly") | .with."expected-source-revision"' \
+    "$workflow")
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_equals "the store-free deployment consumes its source revision" \
+    '${{ needs.store-free-release.outputs.source-revision }}' "$store_free_revision"
   store_free_source=$(yq eval -r \
     '.jobs."store-free-release".steps[]? | select(.run != null) | .run' "$workflow")
   assert_succeeds "the distinct store-free application release is actually assembled" \
@@ -2448,6 +2476,10 @@ test_fastly_smoke_release_contract() {
     grep -q 'EDGEZERO__TEST__FASTLY_VERSION' "$lost"
   assert_succeeds "failed deployment checks its verified package digest" \
     grep -q 'EDGEZERO__TEST__PACKAGE_DIGEST' "$lost"
+  assert_succeeds "the executable staging smoke uses the real Fastly domain" \
+    grep -Fq 'domain: app.example.com' "$workflow"
+  assert_succeeds "the executable staging smoke keeps a distinct GitHub Environment identifier" \
+    grep -Fq 'EDGEZERO__TEST__GITHUB_ENVIRONMENT: staging.app.example.com' "$workflow"
 
   local legacy
   for legacy in STAGESEL1 \
@@ -2598,6 +2630,9 @@ test_fastly_logical_link_documentation() {
   # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
   assert_succeeds "example preflight validates the pinned release digest" \
     grep -Fq 'RELEASE_SHA256: ${{ inputs.release-sha256 }}' "$example_workflow"
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_succeeds "example preflight validates the producer repository" \
+    grep -Fq 'PRODUCER_REPOSITORY: ${{ inputs.producer-repository }}' "$example_workflow"
   assert_succeeds "example preflight verifies the derived GitHub Environment" \
     grep -Fq '/require-github-environment@<ref>' "$example_workflow"
   assert_succeeds "example deploy depends literally on preflight" \
@@ -2611,8 +2646,14 @@ test_fastly_logical_link_documentation() {
   # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
   assert_succeeds "example pins the producer run used for artifact download" \
     grep -Fq 'run-id: ${{ needs.preflight.outputs.release-run-id }}' "$example_deploy"
+  # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
+  assert_succeeds "example downloads from the explicit producer repository" \
+    grep -Fq 'repository: ${{ needs.preflight.outputs.producer-repository }}' "$example_deploy"
+  # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
+  assert_succeeds "example uses a producer-readable token for artifact download" \
+    grep -Fq 'github-token: ${{ secrets.APPLICATION_RELEASE_TOKEN }}' "$example_deploy"
   assert_succeeds "each lifecycle action verifies the same downloaded release" \
-    grep -Fq 'each lifecycle action independently verifies the same archive and digest' "$adoption_flat"
+    grep -Fq 'each lifecycle action independently verifies the same archive, digest, and source revision' "$adoption_flat"
   assert_fails "example checkout never selects application source repository or ref" \
     awk '/uses: actions\/checkout@/{checkout=1; next} checkout && /^[[:space:]]+-/{exit} checkout && /^[[:space:]]+(repository|ref):/{found=1} END{exit !found}' "$example_deploy"
   assert_fails "example deploy never runs an application build" \
@@ -2633,6 +2674,13 @@ test_fastly_logical_link_documentation() {
   # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
   assert_equals "all four example lifecycle actions use one release digest" \
     4 "$(grep -Fc 'app-release-sha256: ${{ needs.preflight.outputs.sha256 }}' "$example_deploy")"
+  # shellcheck disable=SC2016 # GitHub expressions are literal documentation contracts.
+  assert_equals "all four example lifecycle actions verify one source revision" \
+    4 "$(grep -Fc 'expected-source-revision: ${{ needs.preflight.outputs.source-revision }}' "$example_deploy")"
+  assert_succeeds "example requires config reconciliation after a later failure" \
+    grep -Fq 'Require config reconciliation after a later failure' "$example_deploy"
+  assert_succeeds "example documents config compatibility through healthcheck" \
+    grep -Fq 'must remain backward-compatible with the current' "$adoption"
   local runtime_name
   for runtime_name in \
     EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME \
@@ -2665,6 +2713,12 @@ test_fastly_logical_link_documentation() {
       # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
       assert_equals "$action structurally uses the selected release digest" \
         '${{ needs.preflight.outputs.sha256 }}' "$action_input"
+      action_input=$(yq eval -r \
+        ".jobs.deploy.steps[] | select(.uses == \"$uses\") | .with.\"expected-source-revision\"" \
+        "$example_workflow")
+      # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
+      assert_equals "$action structurally verifies the selected source revision" \
+        '${{ needs.preflight.outputs.source-revision }}' "$action_input"
     done
     for runtime_name in \
       EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME \

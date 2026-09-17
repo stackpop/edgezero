@@ -40,7 +40,7 @@ release.json
 cli/app-cli.tar
 package/app.tar.gz
 edgezero.toml
-adapter/fastly.toml
+fastly.toml
 ```
 
 The four member paths are release metadata, so another release may arrange them
@@ -51,6 +51,9 @@ Verification rejects unknown or duplicate fields, unsafe paths,
 symlinks, extra files or directories, digest mismatches, and manifests that do
 not match the application's recorded manifest relationship. The deployer cannot
 substitute a package or manifest after verification.
+The packager preserves the Fastly manifest at the exact relative path declared
+by `edgezero.toml`. It also verifies every lifecycle command and action-owned
+flag before assigning `lifecycle_protocol: 1`.
 
 ## Production deployment
 
@@ -76,19 +79,24 @@ jobs:
           name: ${{ needs.release.outputs.artifact }}
           path: app-release
           run-id: ${{ needs.release.outputs.run-id }}
-          repository: ${{ github.repository }}
-          github-token: ${{ github.token }}
+          repository: ${{ needs.release.outputs.producer-repository }}
+          github-token: ${{ secrets.APPLICATION_RELEASE_TOKEN }}
 
       - id: deploy
         uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
           app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
           app-release-sha256: ${{ needs.release.outputs.sha256 }}
+          expected-source-revision: ${{ needs.release.outputs.source-revision }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
           deploy-args: '["--comment","production release"]'
           deploy-to: production
 ```
+
+For cross-repository downloads, the producer repository is explicit and the
+token must have Actions read access there. The built-in workflow token works
+only when the artifact was produced in the deployer repository.
 
 `FASTLY_SERVICE_ID` must contain ASCII letters and digits only. The shared
 validation used by deploy, healthcheck, and rollback rejects whitespace,
@@ -139,12 +147,16 @@ provider mutation.
 Fastly logging settings come from `[adapters.fastly.logging]` in the application
 manifest and are baked into the package.
 
-Managed deploy verifies the immutable release, resolves complete Config, KV, and
-Secret inventories, prepares an unreachable draft, and reconciles declared
+Managed deploy verifies the immutable release, including its selected source
+revision, resolves complete Config, KV, and Secret inventories, prepares an
+unreachable draft, and reconciles declared
 `(resource kind, logical ID)` links. A declared link pointing at a different
-physical resource is replaced. Undeclared inherited links are preserved. After
-all mutations, EdgeZero re-reads the exact links, source and draft state, and
-provider-visible package identity immediately before staging or activation.
+physical resource is replaced. Undeclared inherited links are preserved.
+Before mutation, EdgeZero records the source version's complete configuration.
+For a locked source, it explicitly clones and verifies that the fresh draft has
+the same complete configuration before uploading the package. After all
+mutations, EdgeZero re-reads the exact links, source and draft state, complete
+configuration, and provider-visible package identity immediately before staging or activation.
 Any lookup, malformed inventory, changed source, package mismatch, or readback
 failure stops publication.
 
@@ -164,6 +176,7 @@ archive:
   with:
     app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
     app-release-sha256: ${{ needs.release.outputs.sha256 }}
+    expected-source-revision: ${{ needs.release.outputs.source-revision }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
     deploy-args: '["--comment","staging release"]'
@@ -174,6 +187,7 @@ archive:
   with:
     app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
     app-release-sha256: ${{ needs.release.outputs.sha256 }}
+    expected-source-revision: ${{ needs.release.outputs.source-revision }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
     fastly-version: ${{ steps.stage.outputs.fastly-version }}
@@ -187,6 +201,7 @@ archive:
   with:
     app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
     app-release-sha256: ${{ needs.release.outputs.sha256 }}
+    expected-source-revision: ${{ needs.release.outputs.source-revision }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
     fastly-version: ${{ steps.stage.outputs.fastly-version }}
@@ -209,6 +224,7 @@ For production rollback, capture `previous-version` from deploy and pass it as
   with:
     app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
     app-release-sha256: ${{ needs.release.outputs.sha256 }}
+    expected-source-revision: ${{ needs.release.outputs.source-revision }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
     fastly-version: ${{ steps.deploy.outputs.fastly-version }}
@@ -235,6 +251,7 @@ config source:
   with:
     app-release-archive: ${{ github.workspace }}/app-release/app-release.tar.gz
     app-release-sha256: ${{ needs.release.outputs.sha256 }}
+    expected-source-revision: ${{ needs.release.outputs.source-revision }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     working-directory: publisher-config
     app-config: app.toml
@@ -249,50 +266,58 @@ mutation. The
 deprecated action `key` input is retained only to fail with migration guidance
 when nonempty. Config push changes typed runtime data; it does not change the
 application release, package, or manifests.
+Config pushed before deployment must remain backward-compatible with the current
+published release until deploy and healthcheck complete. If either later step
+fails, restore the prior config value or re-push the prior release's config to
+the same physical store and logical key before retrying. Use versioned physical
+stores when compatibility cannot be guaranteed.
 
 ## Action reference
 
 ### `deploy-fastly`
 
-| Input                 | Required | Default      | Meaning                                      |
-| --------------------- | -------- | ------------ | -------------------------------------------- |
-| `app-release-archive` | Yes      | —            | Local path to the immutable release archive. |
-| `app-release-sha256`  | Yes      | —            | Expected lowercase SHA-256 of the archive.   |
-| `fastly-api-token`    | Yes      | —            | Token exposed only to provider operations.   |
-| `fastly-service-id`   | Yes      | —            | Alphanumeric destination service ID.         |
-| `deploy-args`         | No       | `[]`         | At most one `--comment` in the JSON array.   |
-| `deploy-to`           | No       | `production` | `production` activates; `staging` stages.    |
+| Input                      | Required | Default      | Meaning                                      |
+| -------------------------- | -------- | ------------ | -------------------------------------------- |
+| `app-release-archive`      | Yes      | —            | Local path to the immutable release archive. |
+| `app-release-sha256`       | Yes      | —            | Expected lowercase SHA-256 of the archive.   |
+| `expected-source-revision` | Yes      | —            | Source revision selected by the deployer.    |
+| `fastly-api-token`         | Yes      | —            | Token exposed only to provider operations.   |
+| `fastly-service-id`        | Yes      | —            | Alphanumeric destination service ID.         |
+| `deploy-args`              | No       | `[]`         | At most one `--comment` in the JSON array.   |
+| `deploy-to`                | No       | `production` | `production` activates; `staging` stages.    |
 
 ### `config-push-fastly`
 
-| Input                 | Required | Default      | Meaning                                               |
-| --------------------- | -------- | ------------ | ----------------------------------------------------- |
-| `app-release-archive` | Yes      | —            | The same pinned release archive.                      |
-| `app-release-sha256`  | Yes      | —            | Expected archive SHA-256.                             |
-| `fastly-api-token`    | Yes      | —            | Token for the Config Store write.                     |
-| `working-directory`   | No       | `.`          | Publisher-owned typed-config directory.               |
-| `app-config`          | No\*     | empty        | Typed config file under `working-directory`.          |
-| `app-config-inline`   | No\*     | empty        | Inline typed config.                                  |
-| `no-env`              | No       | `false`      | Skip the typed runtime environment overlay.           |
-| `store`               | No       | manifest     | Logical Config Store ID.                              |
-| `key`                 | No       | empty        | Deprecated; any nonempty value fails before mutation. |
-| `deploy-to`           | No       | `production` | Validate the Environment key for the selected target. |
+| Input                      | Required | Default      | Meaning                                               |
+| -------------------------- | -------- | ------------ | ----------------------------------------------------- |
+| `app-release-archive`      | Yes      | —            | The same pinned release archive.                      |
+| `app-release-sha256`       | Yes      | —            | Expected archive SHA-256.                             |
+| `expected-source-revision` | Yes      | —            | Source revision selected by the deployer.             |
+| `fastly-api-token`         | Yes      | —            | Token for the Config Store write.                     |
+| `working-directory`        | No       | `.`          | Publisher-owned typed-config directory.               |
+| `app-config`               | No\*     | empty        | Typed config file under `working-directory`.          |
+| `app-config-inline`        | No\*     | empty        | Inline typed config.                                  |
+| `no-env`                   | No       | `false`      | Skip the typed runtime environment overlay.           |
+| `store`                    | No       | manifest     | Logical Config Store ID.                              |
+| `key`                      | No       | empty        | Deprecated; any nonempty value fails before mutation. |
+| `deploy-to`                | No       | `production` | Validate the Environment key for the selected target. |
 
 \* Exactly one typed config input is required.
 
 ### `healthcheck-fastly`
 
-`healthcheck-fastly` requires the release archive and digest, service ID, version,
-and real deployment `domain`. `path`, retry count, retry delay, timeout, and
-`deploy-to` are optional. Staging also requires the Fastly token to resolve the
-version's staging IP; a production probe does not receive the token.
+`healthcheck-fastly` requires the release archive, digest, expected source
+revision, service ID, version, and real deployment `domain`. `path`, retry
+count, retry delay, timeout, and `deploy-to` are optional. Staging also requires
+the Fastly token to resolve the version's staging IP; a production probe does
+not receive the token.
 
 ### `rollback-fastly`
 
-`rollback-fastly` requires the release archive and digest, Fastly token, service
-ID, failed version, and target. Production additionally requires `rollback-to`;
-staging inspects the supplied version, deactivates it only when staged, and
-no-ops when it is still an unpublished draft.
+`rollback-fastly` requires the release archive, digest, expected source revision,
+Fastly token, service ID, failed version, and target. Production additionally
+requires `rollback-to`; staging inspects the supplied version, deactivates it
+only when staged, and no-ops when it is still an unpublished draft.
 
 ## Managed deploy arguments
 
@@ -306,7 +331,7 @@ before provider mutation.
 ## Runner requirements
 
 The actions are tested on `ubuntu-latest`. A self-hosted runner must be Linux
-x86-64 and provide Bash, `jq`, Python 3, `tar`, `curl`, `git`, `base64`,
+x86-64 and provide Bash, `jq`, Python 3.11 or newer, `tar`, `curl`, `git`, `base64`,
 `realpath`, and either `sha256sum` or `shasum`. The application CLI archive must
 contain a Linux x86-64 executable.
 
@@ -318,7 +343,10 @@ contain a Linux x86-64 executable.
 - Give the application release producer no provider credential.
 - Scope Fastly credentials to lifecycle steps and use protected GitHub
   Environments for runtime configuration.
-- Serialize deployments per Fastly service. Recovery assumes another run cannot
-  publish a different version between capture and rollback.
+- Serialize every deployment and other version mutator per Fastly service,
+  including changes made outside EdgeZero. Source and draft snapshot checks
+  assume no actor can mutate the service between a successful check and the next
+  provider operation; recovery likewise assumes another run cannot publish a
+  different version between capture and rollback.
 - Use ephemeral runners. Cleanup is best effort after cancellation or process
   termination.

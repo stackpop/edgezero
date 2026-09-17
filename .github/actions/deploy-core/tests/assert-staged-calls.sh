@@ -12,6 +12,8 @@ main() {
   [[ "$version" == 42 ]] || fail "expected staged fastly-version=42, got '${version:-<empty>}'"
   [[ "$digest" == "$expected_digest" ]] || fail "staging did not report the pinned package digest"
   [[ "$(cat "$FAKE_PACKAGE_DIGEST_FILE")" == "$expected_digest" ]] || fail "staging uploaded different package bytes"
+  grep -Fqx 'PUT https://api.fastly.com/service/dummyservice/version/40/clone' "$log" || fail "staging did not explicitly clone the verified source"
+  grep -Eq '^fastly compute update --service-id=dummyservice --version=42 --package=[^[:space:]]+/package/app\.tar\.gz --non-interactive$' "$log" || fail "staging did not update the verified clone"
 
   jq -Rn '
     [inputs | split("\t") | {alias: .[1], resource: .[2], type: .[3]}] |
@@ -42,7 +44,8 @@ MUTATIONS
   package_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n1 | cut -d: -f1)
   configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log" | tail -n1 | cut -d: -f1)
   stage_line=$(grep -n '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" | tail -n1 | cut -d: -f1)
-  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log")" -eq 2 ]] || fail "staging did not capture and revalidate the complete draft configuration"
+  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/40/to/40$' "$log")" -eq 3 ]] || fail "staging did not preserve and revalidate the complete source configuration"
+  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log")" -eq 3 ]] || fail "staging did not verify the fresh clone and final draft configuration"
   [[ "$last_create" -lt "$final_links" && "$final_links" -lt "$stage_line" && "$package_line" -lt "$stage_line" && "$configuration_line" -lt "$stage_line" ]] || fail "final link, package, and complete-configuration verification did not follow reconciliation and precede staging"
   ! grep -qE 'config-store-entry (create|describe)|/resources/stores/config/.*/item/' "$log" || fail "staging used the removed runtime descriptor path"
   notice "staged version 42 uses logical resource links and pinned package bytes"

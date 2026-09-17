@@ -84,25 +84,34 @@ Links whose identities are not declared by the current manifest are preserved.
 EdgeZero does not infer ownership from account inventories and does not delete
 undeclared Config, KV, or Secret Store links.
 
+During preflight, EdgeZero records the source version's complete Fastly
+self-diff snapshot. Immediately before the first mutation it revalidates that
+snapshot. A locked source is cloned explicitly; before package upload, the
+fresh clone's complete configuration and resource links must exactly match the
+preflight source. An initial editable draft must still match its preflight
+snapshot immediately before package upload.
+
 After every EdgeZero draft mutation is complete, EdgeZero performs one final
 publication barrier immediately before staging or activation. The barrier
 reads the exact draft links, provider-visible package identity, source version
-state, draft version state, and Fastly's complete self-diff snapshot. EdgeZero
-captures the self-diff after its last intended mutation and requires the
-immediate final read to match byte for byte, covering domains, backends,
-logging, headers, VCL and snippets, conditions, health checks, and other
-version-scoped configuration. EdgeZero performs no mutation between this
-barrier and the publication call. Deployments for one service must be serialized
-by the caller. Fastly does not expose a compare-and-swap token for publication,
-so an external actor can still create a time-of-check/time-of-use race after the
-final read; the barrier detects earlier interference but cannot make the
-provider API atomic. Any observed mismatch fails without publication.
+state, draft version state, and complete self-diff snapshot. EdgeZero captures
+the post-mutation self-diff and requires the immediate final read to match byte
+for byte, covering domains, backends, logging, headers, VCL and snippets,
+conditions, health checks, and other version-scoped configuration. EdgeZero
+performs no mutation between this barrier and the publication call.
+
+The caller must serialize every deployment and other version mutator for one
+service, including changes outside EdgeZero. Fastly exposes no compare-and-swap
+token for publication, so an external actor can still create a
+time-of-check/time-of-use race after a successful read. The source and clone
+checks prevent an earlier foreign mutation from becoming the accepted baseline;
+the final barrier detects later observed interference. Any mismatch fails
+without publication.
 
 Staging and production use different service versions of the same Fastly
-service. A staging deploy clones the active version, replaces declared logical
-links with staging selections, verifies the draft, and stages it. A production
-deploy creates a new draft and reconciles production selections before
-activation. It never activates a staging-configured version directly.
+service. A deployment clones its selected locked source, replaces declared
+logical links with the target's selections, verifies the draft, and stages or
+activates it. It never activates a staging-configured version directly.
 Version-state decisions use exact `environments` records. Fastly's `deployed`
 and `staging` version fields are unused and do not control source selection or
 rollback; `locked` only determines whether a draft can be edited.
@@ -189,6 +198,18 @@ Deployment fails before publication when:
 A failed reconciliation leaves only an unpublished draft. Existing active and
 staged versions retain their frozen packages and resource links.
 
+The immutable application release preserves the Fastly manifest at the exact
+relative path declared by `edgezero.toml`. `lifecycle_protocol: 1` is assigned
+only after the packager verifies every lifecycle command and action-owned flag.
+Every lifecycle consumer verifies that `release.json.source_revision` equals
+the source revision selected before entering a publisher Environment.
+
+Config push is a separate mutable operation. Config used by the current release
+must remain backward-compatible until deployment and healthcheck complete. A
+later failure requires restoring the prior value or re-pushing the prior
+release's config to the same physical store and logical key; deployments that
+cannot provide compatibility must use versioned physical stores.
+
 ## Verification requirements
 
 Tests must prove:
@@ -209,8 +230,13 @@ Tests must prove:
 - Fastly logging is sourced from baked application-manifest metadata and does
   not vary by publisher;
 - failure before staging makes rollback a no-op, while failure after staging
-  deactivates the exact version;
+  deactivates the exact version, and duplicate staging records anywhere in the
+  service fail closed;
 - deprecated `key` input fails before mutation;
-- the immediate final barrier re-reads exact links, provider-visible package
-  identity, source state, draft state, and a complete self-diff snapshot before
-  stage or activation.
+- the packager preserves the manifest path and verifies the complete lifecycle
+  command surface;
+- every consumer binds the release to the selected source revision;
+- preflight source snapshots and fresh-clone verification precede draft
+  mutation, and the immediate final barrier re-reads exact links,
+  provider-visible package identity, source state, draft state, and a complete
+  self-diff snapshot before stage or activation.

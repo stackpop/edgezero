@@ -8,6 +8,9 @@ inputs:
   app-release-sha256:
     description: Expected lowercase SHA-256 digest of the application release archive.
     required: true
+  expected-source-revision:
+    description: Full source revision that release.json must record.
+    required: true
   fastly-api-token:
     description: Fastly API token, scoped only to rollback.
     required: true
@@ -95,6 +98,7 @@ runs:
         ENV: ""
         EDGEZERO__APP__RELEASE__ARCHIVE: ${{ inputs['app-release-archive'] }}
         EDGEZERO__APP__RELEASE__SHA256: ${{ inputs['app-release-sha256'] }}
+        EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION: ${{ inputs['expected-source-revision'] }}
         EDGEZERO__APP__RELEASE__ROOT: ${{ steps.ws.outputs.root }}/release
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""

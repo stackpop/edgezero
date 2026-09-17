@@ -121,6 +121,7 @@ jobs:
     outputs:
       app-release-sha256: ${{ steps.release.outputs.app-release-sha256 }}
       package-digest: ${{ steps.release.outputs.package-digest }}
+      source-revision: ${{ steps.release.outputs.source-revision }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -163,6 +164,7 @@ jobs:
     outputs:
       app-release-sha256: ${{ steps.release.outputs.app-release-sha256 }}
       package-digest: ${{ steps.release.outputs.package-digest }}
+      source-revision: ${{ steps.release.outputs.source-revision }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -224,6 +226,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           fastly-api-token: dummy-token
           fastly-service-id: dummyservice
           deploy-args: '["--comment","production smoke"]'
@@ -240,8 +243,9 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: production
-          domain: staging.example.com
+          domain: app.example.com
           fastly-version: ${{ steps.deploy.outputs.fastly-version }}
           fastly-service-id: dummyservice
           retry: "1"
@@ -253,6 +257,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           fastly-api-token: dummy-token
           fastly-service-id: dummyservice
           fastly-version: ${{ steps.deploy.outputs.fastly-version }}
@@ -284,6 +289,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.store-free-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.store-free-release.outputs.source-revision }}
           fastly-api-token: dummy-token
           fastly-service-id: dummyservice
           deploy-args: '["--comment","store-free managed smoke"]'
@@ -321,6 +327,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           fastly-api-token: dummy-token
           fastly-service-id: dummyservice
           deploy-args: '["--comment","staged smoke"]'
@@ -338,8 +345,9 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: staging
-          domain: staging.example.com
+          domain: app.example.com
           fastly-version: ${{ steps.stage.outputs.fastly-version }}
           fastly-api-token: dummy-token
           fastly-service-id: dummyservice
@@ -348,6 +356,7 @@ jobs:
 
       - name: Assert the staged IP was probed
         env:
+          EDGEZERO__TEST__GITHUB_ENVIRONMENT: staging.app.example.com
           EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs.fastly-version }}
           EDGEZERO__TEST__HEALTHY: ${{ steps.health.outputs.healthy }}
           EDGEZERO__TEST__STATUS_CODE: ${{ steps.health.outputs.status-code }}
@@ -362,8 +371,9 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: staging
-          domain: staging.example.com
+          domain: app.example.com
           fastly-version: ${{ steps.stage.outputs.fastly-version }}
           fastly-api-token: dummy-token
           fastly-service-id: dummyservice
@@ -386,8 +396,9 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: production
-          domain: staging.example.com
+          domain: app.example.com
           fastly-version: ${{ steps.stage.outputs.fastly-version }}
           fastly-service-id: dummyservice
           retry: "1"
@@ -406,8 +417,9 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: staging
-          domain: staging.example.com
+          domain: app.example.com
           fastly-version: ${{ steps.stage.outputs.fastly-version }}
           fastly-service-id: dummyservice
           retry: "1"
@@ -427,6 +439,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: staging
           fastly-version: ${{ steps.stage.outputs.fastly-version }}
           fastly-api-token: dummy-token
@@ -441,6 +454,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: production
           fastly-version: "40"
           rollback-to: "39"
@@ -460,6 +474,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: production
           fastly-version: "39"
           fastly-api-token: dummy-token
@@ -486,6 +501,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           deploy-to: production
           fastly-version: "39"
           rollback-to: "38"
@@ -520,6 +536,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           app-config-inline: 'greeting = "publisher B"'
           fastly-api-token: dummy-token
           deploy-to: staging
@@ -543,6 +560,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           app-config-inline: 'greeting = "publisher A"'
           fastly-api-token: dummy-token
 
@@ -580,6 +598,7 @@ jobs:
         with:
           app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
           app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
           fastly-api-token: dummy-token
           fastly-service-id: dummyservice
 

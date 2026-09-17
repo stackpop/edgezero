@@ -101,11 +101,14 @@ add_parent_dirs() {
 main() {
   local archive="${EDGEZERO__APP__RELEASE__ARCHIVE:-}"
   local expected_digest="${EDGEZERO__APP__RELEASE__SHA256:-}"
+  local expected_revision="${EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION:-}"
   local release_root="${EDGEZERO__APP__RELEASE__ROOT:-}"
   require_input app-release-archive "$archive"
   require_input app-release-sha256 "$expected_digest"
+  require_input expected-source-revision "$expected_revision"
   require_input application-release-root "$release_root"
   [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || fail "app-release-sha256 must be 64 lowercase hexadecimal characters"
+  [[ "$expected_revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "expected-source-revision must be 40 or 64 lowercase hexadecimal characters"
   [[ -f "$archive" && ! -L "$archive" ]] || fail "application release archive is missing or is not a regular file"
   require_cmd jq
   require_cmd python3
@@ -150,6 +153,7 @@ main() {
   local revision
   revision=$(jq -er '.source_revision | select(type == "string")' "$release_json") || fail "release.json has an invalid source_revision"
   [[ "$revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "release.json source_revision must be 40 or 64 lowercase hexadecimal characters"
+  [[ "$revision" == "$expected_revision" ]] || fail "release.json source_revision does not match expected-source-revision"
 
   local cli_path package_path edgezero_path adapter_path
   local cli_digest package_digest edgezero_digest adapter_digest

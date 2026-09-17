@@ -197,6 +197,7 @@ package_release() {
   printf '%s\n' "$package_digest" >"$output_dir/package.sha256"
   append_output app-release-sha256 "$release_digest"
   append_output package-digest "$package_digest"
+  append_output source-revision "$revision"
 }
 
 main() {

@@ -44,7 +44,7 @@ JSON
     [[ "\$#" -eq 5 && "\$3" == --service-id=dummyservice &&
       ("\$4" == --version=40 || "\$4" == --version=42) && "\$5" == --json ]] || exit 91
     target=\$(arg_value --version= "\$@") || exit 91
-    if [[ "\$target" == 42 && -n "\${FAKE_FAIL_AFTER_VERSION:-}" ]]; then
+    if [[ "\$target" == 42 && -n "\${FAKE_FAIL_AFTER_VERSION:-}" && -s "\$FAKE_PACKAGE_DIGEST_FILE" ]]; then
       echo 'simulated post-upload resource-link readback failure' >&2
       exit 77
     fi
@@ -59,13 +59,11 @@ JSON
     printf '%0128d\n' 0
     ;;
   'compute update')
-    [[ "\$#" -eq 7 && "\$3" == --service-id=dummyservice && "\$4" == --autoclone &&
-      "\$5" == --version=active && "\$6" == --package=* && "\$7" == --non-interactive ]] || exit 92
-    package=\${6#--package=}
+    [[ "\$#" -eq 6 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 &&
+      "\$5" == --package=* && "\$6" == --non-interactive ]] || exit 92
+    package=\${5#--package=}
     [[ -f "\$package" && ! -L "\$package" ]] || exit 92
-    grep -qx 40 "\$FAKE_VERSION_FILE" || exit 92
-    grep -qx 42 "\$FAKE_VERSION_FILE" || printf '42\n' >>"\$FAKE_VERSION_FILE"
-    cp "\$(links_file 40)" "\$(links_file 42)"
+    grep -qx 42 "\$FAKE_VERSION_FILE" || exit 92
     digest=\$(sha256sum "\$package" | awk '{print \$1}')
     printf '%s\n' "\$digest" >"\$FAKE_PACKAGE_DIGEST_FILE"
     printf 'PACKAGE-SHA256 %s\n' "\$digest" >>"\$FAKE_CALL_LOG"
@@ -179,6 +177,13 @@ if [[ "$*" == *--config* ]]; then
   printf '%s %s\n' "$request" "$url" >>"$FAKE_CALL_LOG"
   if [[ "$request" == PUT ]]; then
     case "$url" in
+      */service/dummyservice/version/40/clone)
+        grep -qx 40 "$FAKE_VERSION_FILE" || { printf 'source version not prepared\n400'; exit 0; }
+        ! grep -qx 42 "$FAKE_VERSION_FILE" || { printf 'target version already exists\n409'; exit 0; }
+        printf '42\n' >>"$FAKE_VERSION_FILE"
+        cp "$FAKE_LINK_DIR/version-40.tsv" "$FAKE_LINK_DIR/version-42.tsv"
+        printf '{"service_id":"dummyservice","number":42}\n200'
+        exit 0 ;;
       */service/dummyservice/version/42/activate)
         [[ -s "$FAKE_PACKAGE_DIGEST_FILE" && -f "$FAKE_LINK_DIR/version-42.tsv" ]] || { printf 'version not prepared\n400'; exit 0; }
         printf '42\n' >"$FAKE_ACTIVE_VERSION_FILE" ;;
@@ -206,8 +211,10 @@ if [[ "$*" == *--config* ]]; then
       printf '{"service_id":"dummyservice","version":42,"metadata":{"files_hash":"%0128d"}}\n200' 0 ;;
     */service/dummyservice/diff/from/42/to/42)
       printf '{"from":42,"to":42,"format":"text","diff":"complete fixture configuration"}\n200' ;;
+    */service/dummyservice/diff/from/40/to/40)
+      printf '{"from":40,"to":40,"format":"text","diff":"complete fixture configuration"}\n200' ;;
     */service/dummyservice/version/*/domain\?include=staging_ips)
-      printf '[{"name":"other.example.com","staging_ip":"151.101.1.10"},{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n200' ;;
+      printf '[{"name":"other.example.com","staging_ip":"151.101.1.10"},{"name":"app.example.com","staging_ip":"151.101.2.10"}]\n200' ;;
     */resources/stores/config/*/item/*) printf 'unexpected Config Store item read\n400' ;;
     *) printf 'unexpected fake API read\n404';;
   esac

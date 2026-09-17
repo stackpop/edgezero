@@ -24,12 +24,15 @@ main() {
   local staged="${EDGEZERO__TEST__STAGED_VERSION:?EDGEZERO__TEST__STAGED_VERSION is required}"
   local healthy="${EDGEZERO__TEST__HEALTHY:-}"
   local status_code="${EDGEZERO__TEST__STATUS_CODE:-}"
+  local environment="${EDGEZERO__TEST__GITHUB_ENVIRONMENT:-}"
 
   grep -qE "^GET https://api\.fastly\.com/service/dummyservice/version/$staged/domain\?include=staging_ips\$" "$log" ||
     fail "the staging-IP lookup was never performed for version $staged"
 
-  grep -qE '^PROBE .*--connect-to ::151\.101\.2\.10:443 .*https://staging\.example\.com/' "$log" ||
+  grep -qE '^PROBE .*--connect-to ::151\.101\.2\.10:443 .*https://app\.example\.com/' "$log" ||
     fail "the probe was not rerouted to the staging IP (was the singular staging_ip read?)"
+  [[ "$environment" == staging.app.example.com ]] ||
+    fail "the smoke did not distinguish the GitHub Environment from the real Fastly domain"
 
   # The public outputs must reflect a healthy probe: the fake curl returns 200,
   # so a passing staged healthcheck must thread healthy=true and status-code=200.

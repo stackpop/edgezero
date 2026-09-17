@@ -324,6 +324,7 @@ struct ManagedDeployPlan {
     package_sha256: String,
     release: VerifiedApplicationRelease,
     service_id: String,
+    source_configuration: String,
     source_links: Vec<ExistingResourceLink>,
     target: PublishTarget,
     token: FastlyApiToken,
@@ -811,6 +812,8 @@ fn build_managed_deploy_plan(
         cwd,
     )?;
     let (source_links, links_snapshot) = parse_resource_links(&links_raw)?;
+    let source_configuration =
+        read_version_configuration_snapshot_for(&service_id, token.as_str(), source_version)?;
 
     let links = plan_link_reconciliation(&desired_links, &source_links, &inventories)?;
 
@@ -874,6 +877,7 @@ fn build_managed_deploy_plan(
         package_sha256,
         release,
         service_id,
+        source_configuration,
         source_links,
         target,
         token,
@@ -1001,32 +1005,30 @@ fn prepare_managed_version(
         "verified Fastly package path is not valid UTF-8 and cannot be passed to the Fastly CLI"
             .to_owned()
     })?;
-    let mut update = vec![
-        "compute".to_owned(),
-        "update".to_owned(),
-        format!("--service-id={}", plan.service_id),
-    ];
-    let known_initial = match &plan.version_source {
-        EditableVersionSource::CloneActive { .. } => {
-            update.push("--autoclone".to_owned());
-            update.push("--version=active".to_owned());
-            None
+    let version = match &plan.version_source {
+        EditableVersionSource::CloneActive { active_version } => {
+            revalidate_active_source(plan, *active_version, cwd, None)?;
+            clone_managed_source(plan, *active_version, cwd, emit)?
         }
         EditableVersionSource::CloneRetired(snapshot)
         | EditableVersionSource::CloneStaged(snapshot) => {
             revalidate_inactive_source(plan, snapshot, cwd, None)?;
-            update.push("--autoclone".to_owned());
-            update.push(format!("--version={}", snapshot.version.number));
-            None
+            require_source_configuration(plan, snapshot.version.number)?;
+            clone_managed_source(plan, snapshot.version.number, cwd, emit)?
         }
         EditableVersionSource::InitialDraft(snapshot) => {
             revalidate_initial_draft_before_update(plan, snapshot, cwd)?;
             let version = snapshot.version.number;
             emit(&format!("version={version}"));
-            update.push(format!("--version={version}"));
-            Some(version)
+            version
         }
     };
+    let mut update = vec![
+        "compute".to_owned(),
+        "update".to_owned(),
+        format!("--service-id={}", plan.service_id),
+        format!("--version={version}"),
+    ];
     update.push(format!("--package={package}"));
     update.extend(plan.arguments.globals.iter().cloned());
     if !has_non_interactive(&plan.arguments.globals) {
@@ -1035,19 +1037,6 @@ fn prepare_managed_version(
 
     let outcome = run_fastly_capture_outcome(&update, cwd)?;
     let reported_version = parse_fastly_version(&outcome.combined);
-    let cloned_source_version = match &plan.version_source {
-        EditableVersionSource::CloneActive { active_version } => Some(*active_version),
-        EditableVersionSource::CloneRetired(snapshot)
-        | EditableVersionSource::CloneStaged(snapshot) => Some(snapshot.version.number),
-        EditableVersionSource::InitialDraft(_) => None,
-    };
-    let recoverable_version = match (cloned_source_version, reported_version) {
-        (Some(source_version), Some(version)) if version != source_version => Some(version),
-        _ => None,
-    };
-    if let Some(version) = recoverable_version {
-        emit(&format!("version={version}"));
-    }
     if !outcome.success {
         let redacted_output = outcome.combined.replace(plan.token.as_str(), "[REDACTED]");
         return Err(format!(
@@ -1058,29 +1047,92 @@ fn prepare_managed_version(
         ));
     }
 
-    if let Some(version) = known_initial {
-        if let Some(reported) = reported_version
-            && reported != version
-        {
-            return Err(format!(
-                "Fastly updated version {reported}, but the revalidated initial draft was version {version}"
-            ));
-        }
-        Ok(version)
-    } else {
-        let version = reported_version.ok_or_else(|| {
-            "could not determine the cloned Fastly draft version from compute update output"
-                .to_owned()
-        })?;
-        let source_version = cloned_source_version
-            .ok_or_else(|| "internal managed deploy source mismatch".to_owned())?;
-        if version == source_version {
-            return Err(format!(
-                "Fastly compute update reported source version {source_version} instead of a new draft"
-            ));
-        }
-        Ok(version)
+    if let Some(reported) = reported_version
+        && reported != version
+    {
+        return Err(format!(
+            "Fastly updated version {reported}, but the verified draft was version {version}"
+        ));
     }
+    Ok(version)
+}
+
+fn clone_managed_source(
+    plan: &ManagedDeployPlan,
+    source_version: u64,
+    cwd: &Path,
+    emit: &mut dyn FnMut(&str),
+) -> Result<u64, String> {
+    let raw = fastly_api_put_capture(
+        &format!(
+            "/service/{}/version/{source_version}/clone",
+            plan.service_id
+        ),
+        plan.token.as_str(),
+    )?;
+    let version = parse_cloned_version(&raw, &plan.service_id, source_version)?;
+    emit(&format!("version={version}"));
+
+    match &plan.version_source {
+        EditableVersionSource::CloneActive { active_version } => {
+            revalidate_active_source(plan, *active_version, cwd, Some(version))?;
+        }
+        EditableVersionSource::CloneRetired(snapshot)
+        | EditableVersionSource::CloneStaged(snapshot) => {
+            revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
+            require_source_configuration(plan, snapshot.version.number)?;
+        }
+        EditableVersionSource::InitialDraft(_) => {
+            return Err("internal managed deploy clone source mismatch".to_owned());
+        }
+    }
+
+    let versions_raw = fastly_api_get(
+        &format!("/service/{}/version", plan.service_id),
+        plan.token.as_str(),
+    )?;
+    let versions = parse_service_versions(&versions_raw)?;
+    let draft = versions
+        .iter()
+        .find(|candidate| candidate.number == version)
+        .ok_or_else(|| format!("cloned Fastly draft version {version} is absent"))?;
+    if draft.active || draft.locked || !draft.environments.is_empty() {
+        return Err(format!(
+            "cloned Fastly version {version} is not an unpublished editable draft"
+        ));
+    }
+    let cloned_links = read_version_links(&plan.service_id, version, cwd)?;
+    require_same_link_resources(&plan.source_links, &cloned_links, "fresh clone")?;
+    let cloned_configuration = read_version_configuration_snapshot(plan, version)?;
+    if cloned_configuration != plan.source_configuration {
+        return Err(format!(
+            "cloned Fastly version {version} does not match the preflight source configuration"
+        ));
+    }
+    Ok(version)
+}
+
+fn parse_cloned_version(raw: &str, service_id: &str, source_version: u64) -> Result<u64, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_error| "Fastly clone response is malformed".to_owned())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Fastly clone response must be one JSON object".to_owned())?;
+    let cloned_service = object
+        .get("service_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Fastly clone response has no service_id".to_owned())?;
+    let version = object
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Fastly clone response has no numeric version".to_owned())?;
+    if cloned_service != service_id || version == source_version {
+        return Err(
+            "Fastly clone response does not identify a new version for the requested service"
+                .to_owned(),
+        );
+    }
+    Ok(version)
 }
 
 fn run_fastly_capture_outcome(
@@ -1344,7 +1396,53 @@ fn revalidate_initial_draft_before_update(
         return Err("Fastly initial draft links changed after preflight".to_owned());
     }
     require_protected_initial_snapshot(plan, snapshot)?;
+    require_source_configuration(plan, version)?;
     Ok(())
+}
+
+fn revalidate_active_source(
+    plan: &ManagedDeployPlan,
+    active_version: u64,
+    cwd: &Path,
+    excluded_target: Option<u64>,
+) -> Result<(), String> {
+    let versions_raw = fastly_api_get(
+        &format!("/service/{}/version", plan.service_id),
+        plan.token.as_str(),
+    )?;
+    let versions = parse_service_versions(&versions_raw)?;
+    let source_versions = versions
+        .iter()
+        .filter(|version| Some(version.number) != excluded_target)
+        .cloned()
+        .collect::<Vec<_>>();
+    if select_version_source(&source_versions)? != VersionSource::Active(active_version) {
+        return Err("Fastly active source selection changed after preflight".to_owned());
+    }
+    let source = source_versions
+        .iter()
+        .find(|version| version.number == active_version)
+        .ok_or_else(|| "Fastly active source disappeared after preflight".to_owned())?;
+    if !source.locked {
+        return Err("Fastly active source is unexpectedly editable".to_owned());
+    }
+    let current_links = read_version_links(&plan.service_id, active_version, cwd)?;
+    require_same_link_resources(&plan.source_links, &current_links, "active source")?;
+    require_source_configuration(plan, active_version)
+}
+
+fn require_source_configuration(
+    plan: &ManagedDeployPlan,
+    source_version: u64,
+) -> Result<(), String> {
+    let current = read_version_configuration_snapshot(plan, source_version)?;
+    if current == plan.source_configuration {
+        Ok(())
+    } else {
+        Err(format!(
+            "Fastly source version {source_version} complete configuration changed after preflight"
+        ))
+    }
 }
 
 fn revalidate_inactive_source(
@@ -1506,12 +1604,17 @@ fn read_version_configuration_snapshot(
     plan: &ManagedDeployPlan,
     version: u64,
 ) -> Result<String, String> {
+    read_version_configuration_snapshot_for(&plan.service_id, plan.token.as_str(), version)
+}
+
+fn read_version_configuration_snapshot_for(
+    service_id: &str,
+    token: &str,
+    version: u64,
+) -> Result<String, String> {
     let raw = fastly_api_get(
-        &format!(
-            "/service/{}/diff/from/{version}/to/{version}",
-            plan.service_id
-        ),
-        plan.token.as_str(),
+        &format!("/service/{service_id}/diff/from/{version}/to/{version}"),
+        token,
     )?;
     parse_version_configuration_snapshot(&raw, version)
 }
@@ -5832,6 +5935,21 @@ fn staging_rollback_decision(
     requested_version: u64,
     service_id: &str,
 ) -> Result<StagingRollbackDecision, String> {
+    let staging_records = versions
+        .iter()
+        .flat_map(|version| {
+            version
+                .environments
+                .iter()
+                .filter(|environment| environment.name == "staging")
+                .map(move |environment| (version.number, environment))
+        })
+        .collect::<Vec<_>>();
+    if staging_records.len() > 1 {
+        return Err(format!(
+            "Fastly service {service_id} reports more than one staging environment record; refusing staging rollback"
+        ));
+    }
     let version = versions
         .iter()
         .find(|candidate| candidate.number == requested_version)
@@ -5840,18 +5958,13 @@ fn staging_rollback_decision(
                 "Fastly version {requested_version} is absent from service {service_id}; refusing staging rollback"
             )
         })?;
-    let staged = {
-        let mut staging_records = version
-            .environments
-            .iter()
-            .filter(|environment| environment.name == "staging");
-        matches!(
-            (staging_records.next(), staging_records.next()),
-            (Some(environment), None)
-                if environment.service_id == service_id
-                    && environment.active_version == requested_version
-        )
-    };
+    let staged = matches!(
+        staging_records.as_slice(),
+        [(record_version, environment)]
+            if *record_version == requested_version
+                && environment.service_id == service_id
+                && environment.active_version == requested_version
+    );
     if staged {
         return Ok(StagingRollbackDecision::Deactivate);
     }
@@ -6225,6 +6338,34 @@ fn fastly_api_put(path: &str, token: &str) -> Result<u16, String> {
     } else {
         Err(format!("Fastly API PUT {path} returned HTTP {code}"))
     }
+}
+
+/// `PUT https://api.fastly.com<path>` and return a non-empty response body.
+/// This is used for mutations, such as cloning a version, whose response
+/// identifies the newly-created provider object needed for recovery.
+fn fastly_api_put_capture(path: &str, token: &str) -> Result<String, String> {
+    let header = curl_quote(&format!("Fastly-Key: {token}"));
+    let url = curl_quote(&format!("https://api.fastly.com{path}"));
+    let config = format!(
+        "request = \"PUT\"\nheader = {header}\nurl = {url}\nwrite-out = \"\\n%{{http_code}}\"\n"
+    );
+    let out = curl_config_capture(&config)?;
+    let (body, status_line) = out
+        .rsplit_once('\n')
+        .ok_or_else(|| format!("Fastly API PUT {path}: no HTTP status in the curl output"))?;
+    let code: u16 = status_line.trim().parse().map_err(|error| {
+        format!(
+            "Fastly API PUT {path}: could not parse the HTTP status {:?}: {error}",
+            status_line.trim()
+        )
+    })?;
+    if !(200..300).contains(&code) {
+        return Err(format!("Fastly API PUT {path} returned HTTP {code}"));
+    }
+    if body.trim().is_empty() {
+        return Err(format!("Fastly API PUT {path} returned an empty response"));
+    }
+    Ok(body.to_owned())
 }
 
 fn legacy_deploy_context(args: &[String], staging: bool) -> AdapterDeployContext {
@@ -7559,6 +7700,24 @@ mod tests {
     }
 
     #[test]
+    fn cloned_version_requires_a_new_version_for_the_exact_service() {
+        assert_eq!(
+            parse_cloned_version(r#"{"service_id":"svc","number":42}"#, "svc", 40),
+            Ok(42)
+        );
+        for invalid in [
+            r#"{"service_id":"other","number":42}"#,
+            r#"{"service_id":"svc","number":40}"#,
+            r#"{"service_id":"svc","number":"42"}"#,
+            "[]",
+            "not json",
+        ] {
+            parse_cloned_version(invalid, "svc", 40)
+                .expect_err("an ambiguous clone response must fail closed");
+        }
+    }
+
+    #[test]
     fn parse_active_version_finds_active_entry() {
         let json = r#"[
             {"number":1,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[]},
@@ -8117,6 +8276,13 @@ mod tests {
         .expect("version list");
         staging_rollback_decision(&duplicate, 7, "svc")
             .expect_err("duplicate staging environment records must fail closed");
+
+        let cross_version_duplicate = parse_service_versions(
+            r#"[{"active":false,"number":7,"locked":true,"environments":[{"active_version":7,"name":"staging","service_id":"svc"}]},{"active":false,"number":8,"locked":true,"environments":[{"active_version":8,"name":"staging","service_id":"svc"}]}]"#,
+        )
+        .expect("version list");
+        staging_rollback_decision(&cross_version_duplicate, 7, "svc")
+            .expect_err("staging records on multiple versions must fail closed");
     }
 
     #[test]
