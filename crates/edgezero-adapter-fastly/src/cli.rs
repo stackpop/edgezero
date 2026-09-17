@@ -810,6 +810,7 @@ fn build_managed_deploy_plan(
         &stores.config,
         &stores.kv,
         &stores.secrets,
+        target == PublishTarget::Staging,
     )
     .map_err(|error| format!("invalid Fastly runtime descriptor: {error}"))?;
     let descriptor_json = descriptor
@@ -9028,6 +9029,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9089,6 +9091,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9137,6 +9140,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9199,6 +9203,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9274,6 +9279,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9322,6 +9328,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9372,6 +9379,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9430,6 +9438,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9501,6 +9510,7 @@ esac
                 &context.stores.config,
                 &context.stores.kv,
                 &context.stores.secrets,
+                context.staging,
             )
             .expect("descriptor")
             .canonical_json()
@@ -9712,6 +9722,7 @@ esac
                 &context.stores.config,
                 &context.stores.kv,
                 &context.stores.secrets,
+                context.staging,
             )
             .expect("descriptor")
             .canonical_json()
@@ -9918,6 +9929,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -9968,6 +9980,7 @@ esac
                 &context.stores.config,
                 &context.stores.kv,
                 &context.stores.secrets,
+                context.staging,
             )
             .expect("descriptor")
             .canonical_json()
@@ -10025,6 +10038,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -10075,6 +10089,7 @@ esac
             &context.stores.config,
             &context.stores.kv,
             &context.stores.secrets,
+            context.staging,
         )
         .expect("descriptor")
         .canonical_json()
@@ -10121,6 +10136,7 @@ esac
                 &context.stores.config,
                 &context.stores.kv,
                 &context.stores.secrets,
+                context.staging,
             )
             .expect("descriptor")
             .canonical_json()
@@ -10222,6 +10238,7 @@ esac
                 &context.stores.config,
                 &context.stores.kv,
                 &context.stores.secrets,
+                context.staging,
             )
             .expect("descriptor")
             .canonical_json()

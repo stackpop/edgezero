@@ -1472,7 +1472,7 @@ test_toolchain_boundary() {
 }
 
 # ---------------------------------------------------------------------------
-# config-push.sh — the staging key is a different key, driven by --staging
+# config-push.sh — canonical KEY wins, with target-specific fallback
 # ---------------------------------------------------------------------------
 # Runs config-push.sh against a fake app CLI that records its argv and emits the
 # canonical pushed-key line. Returns the recorded argv (one arg per line).
@@ -1488,11 +1488,18 @@ printf '%s\n' "$@" >"$FAKE_ARGV_OUT"
 # Capture the --app-config file's content while it still exists (the wrapper
 # removes an inline temp file on exit), so a test can verify what was pushed.
 prev=""
+staging=false
 for a in "$@"; do
   if [[ "$prev" == "--app-config" ]]; then cp -f "$a" "$FAKE_ARGV_OUT.appconfig" 2>/dev/null || true; fi
+  if [[ "$a" == "--staging" ]]; then staging=true; fi
   prev="$a"
 done
-echo "pushed-key=app_config_staging"
+runtime_key="${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}"
+printf '%s' "$runtime_key" >"$FAKE_ARGV_OUT.runtime-key"
+if [[ -z "$runtime_key" ]]; then
+  if [[ "$staging" == true ]]; then runtime_key=app_config_staging; else runtime_key=app_config; fi
+fi
+echo "pushed-key=$runtime_key"
 echo "pushed-store=app_config"
 CLI
   chmod +x "$dir/bin/fake-cli"
@@ -1509,8 +1516,10 @@ CLI
   git -C "$dir/app" add -A
   git -C "$dir/app" commit -qm fixture
 
-  PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" \
+  : >"$dir/ghout"
+  PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" GITHUB_OUTPUT="$dir/ghout" \
     EDGEZERO__APP__CLI__BIN=fake-cli \
+    EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="${CP_RUNTIME_KEY:-}" \
     FASTLY_API_TOKEN=tok \
     GITHUB_WORKSPACE="$dir" \
     EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
@@ -1551,11 +1560,23 @@ test_config_push_argv() {
   assert_succeeds "config push always passes one explicit typed config file" \
     grep -qx -- '--app-config' <<<"$prod"
 
-  # Staging: same argv plus --staging (the CLI then writes <key>_staging).
+  # Staging: same argv plus --staging. With no canonical KEY, the application
+  # CLI uses the target-specific fallback.
   local staged
   staged=$(CP_DEPLOY_TO=staging run_config_push_argv)
   assert_succeeds "staging appends --staging" grep -qx -- '--staging' <<<"$staged"
+  assert_succeeds "staging without canonical KEY reports the staging fallback" \
+    grep -qx 'pushed-key=app_config_staging' "$WORK_DIR/config-push/ghout"
   assert_fails "production does NOT pass --staging" grep -qx -- '--staging' <<<"$prod"
+
+  local selected_staged
+  selected_staged=$(CP_RUNTIME_KEY=publisher-selected CP_DEPLOY_TO=staging run_config_push_argv)
+  assert_succeeds "staging with canonical KEY still appends --staging" \
+    grep -qx -- '--staging' <<<"$selected_staged"
+  assert_equals "config-push wrapper preserves the canonical runtime KEY" \
+    publisher-selected "$(cat "$WORK_DIR/config-push/argv.txt.runtime-key")"
+  assert_succeeds "action pushed-key reports the canonical runtime KEY" \
+    grep -qx 'pushed-key=publisher-selected' "$WORK_DIR/config-push/ghout"
 
   # Typed --store / --key are threaded through when supplied.
   local with_store

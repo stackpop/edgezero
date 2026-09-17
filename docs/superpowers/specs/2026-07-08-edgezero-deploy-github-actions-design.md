@@ -520,12 +520,14 @@ means the **selected config store, under a different key**. The production and
 staging deployment environments may select the same physical store or different
 stores through `EDGEZERO__STORES__CONFIG__<ID>__NAME`:
 
-- **Production** writes the config blob under the resolved key (the logical store
-  id, or an explicit `--key`).
-- **Staging** writes under the staging variant of the logical store id —
-  `<logical-store-id>_staging` — in the store selected by the staging
-  environment. The staging key is _derived_, so `--key` is mutually exclusive
-  with `--staging`.
+- **Production** writes under the valid canonical
+  `EDGEZERO__STORES__CONFIG__<ID>__KEY` value when present, then falls back to the
+  logical store id. An explicit `--key` remains a production-only CLI override.
+- **Staging** also honors the valid canonical KEY first, then falls back to
+  `<logical-store-id>_staging` in the store selected by the staging environment.
+  `--key` remains mutually exclusive with `--staging`; an explicit staging key
+  belongs in the canonical environment variable so config push and deployment
+  descriptors cannot diverge.
 
 The CLI gains a `config push --staging` flag (the same `--staging` verb
 `deploy`/`healthcheck`/`rollback` already use); the
@@ -580,11 +582,11 @@ than a service-ID suffix, selects production or staging values.
 | `app-config-inline` | No       | empty         | Raw typed-config (TOML) inline — for config in a GitHub variable with no file on disk. Exclusive with `app-config`. |
 | `no-env`            | No       | `false`       | `true` passes `--no-env` (skip the `<APP_NAME>__…__<KEY>` env overlay before pushing).                              |
 | `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).                                                      |
-| `key`               | No       | empty         | Explicit base key for a production push (default: the logical store id). Not allowed with `deploy-to: staging`.     |
-| `deploy-to`         | No       | `production`  | `staging` writes the `<logical-store-id>_staging` variant in the store selected by the staging environment.         |
+| `key`               | No       | empty         | Explicit base key for a production push. Not allowed with `deploy-to: staging`.                                     |
+| `deploy-to`         | No       | `production`  | Selects canonical `__KEY` when present; otherwise production uses `<logical-id>` and staging uses `<logical-id>_staging`. |
 
-Outputs: `pushed-key` (the key that was written — the base key, or the derived
-`_staging` variant), `store` (the resolved logical store id),
+Outputs: `pushed-key` (the canonical environment key, or its target fallback),
+`store` (the resolved logical store id),
 `provider-cli-version` (the installed Fastly CLI version), and
 `mutation-attempted` (`true`, emitted immediately BEFORE the push CLI runs;
 readable via `if: always()` on failure so a caller can reconcile the config store

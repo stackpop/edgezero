@@ -10,11 +10,12 @@ set -euo pipefail
 # wrapper blanks every other FASTLY_* alias, so an inherited FASTLY_ENDPOINT or
 # FASTLY_TOKEN can never redirect or re-auth the push.
 #
-# Staging: `deploy-to: staging` passes `--staging` to the CLI, which writes the
-# `<logical-store-id>_staging` variant in the environment-selected store — the
-# key the staged version's runtime descriptor selects, never the production key
-# the live service reads. Production and staging may select the same or different
-# physical stores. `key` is production-only (the wrapper rejects key + staging).
+# Staging: `deploy-to: staging` passes `--staging` to the CLI. The canonical
+# `EDGEZERO__STORES__CONFIG__<ID>__KEY` selected by the caller's environment wins;
+# when absent, both config push and the managed runtime descriptor fall back to
+# `<logical-store-id>_staging`. Production and staging may select the same or
+# different physical stores. `key` is production-only (the wrapper rejects key +
+# staging).
 #
 # The manifest is an absolute verified member of the immutable application
 # release. Publisher-owned app-config files remain confined beneath the selected
@@ -36,7 +37,7 @@ set -euo pipefail
 #   RUNNER_TEMP                           optional  scratch root for the inline-config temp file (default: /tmp)
 # Writes (outputs):
 #   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
-#   pushed-key                            the key written (base, or its _staging variant)
+#   pushed-key                            canonical environment key, or the target fallback
 #   store                                 the logical store id the CLI resolved
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -150,7 +151,8 @@ main() {
   fi
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the
-  # push non-interactive in CI; --staging selects the `<logical>_staging` variant.
+  # push non-interactive in CI; --staging selects the canonical environment key
+  # or its `<logical>_staging` fallback.
   local argv=("$cli_bin" config push --adapter fastly --manifest "$manifest" --app-config "$app_config")
   if [[ -n "$store" ]]; then argv+=(--store "$store"); fi
   if [[ -n "$key" ]]; then argv+=(--key "$key"); fi

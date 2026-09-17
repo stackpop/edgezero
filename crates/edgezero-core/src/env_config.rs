@@ -110,15 +110,38 @@ impl EnvConfig {
         self.get(&["logging", "level"])
     }
 
-    /// Key for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__KEY` —
-    /// falling back to `id` itself when unset, blank, whitespace-only, or
-    /// containing control characters. Mirrors [`store_name`]'s filter exactly.
+    /// Production key for a logical store —
+    /// `EDGEZERO__STORES__<KIND>__<ID>__KEY` — falling back to `id` itself.
+    ///
+    /// Use [`Self::store_key_for_target`] when staging needs its distinct
+    /// fallback.
     #[must_use]
     #[inline]
     pub fn store_key(&self, kind: &str, id: &str) -> String {
+        self.store_key_for_target(kind, id, false)
+    }
+
+    /// Key for a logical store and publication target.
+    ///
+    /// A valid canonical `EDGEZERO__STORES__<KIND>__<ID>__KEY` value always
+    /// wins. Otherwise production falls back to `id`, while staging falls back
+    /// to `<id>_staging`. Keeping this rule here lets config push, config diff,
+    /// and deployment descriptors resolve the same key.
+    #[must_use]
+    #[inline]
+    pub fn store_key_for_target(&self, kind: &str, id: &str, staging: bool) -> String {
         self.get(&["stores", kind, id, "key"])
             .filter(|value| !is_blank_or_control(value))
-            .map_or_else(|| id.to_owned(), str::to_owned)
+            .map_or_else(
+                || {
+                    if staging {
+                        format!("{id}_staging")
+                    } else {
+                        id.to_owned()
+                    }
+                },
+                str::to_owned,
+            )
     }
 
     /// Platform name for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__NAME`
@@ -277,6 +300,35 @@ mod tests {
         let cfg =
             EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "bad\x01key")]);
         assert_eq!(cfg.store_key("config", "app_config"), "app_config");
+    }
+
+    #[test]
+    fn store_key_for_target_uses_production_and_staging_defaults() {
+        let cfg = EnvConfig::default();
+        assert_eq!(
+            cfg.store_key_for_target("config", "app_config", false),
+            "app_config"
+        );
+        assert_eq!(
+            cfg.store_key_for_target("config", "app_config", true),
+            "app_config_staging"
+        );
+    }
+
+    #[test]
+    fn store_key_for_target_canonical_override_wins_for_both_targets() {
+        let cfg = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "publisher-selected",
+        )]);
+        assert_eq!(
+            cfg.store_key_for_target("config", "app_config", false),
+            "publisher-selected"
+        );
+        assert_eq!(
+            cfg.store_key_for_target("config", "app_config", true),
+            "publisher-selected"
+        );
     }
 
     #[test]

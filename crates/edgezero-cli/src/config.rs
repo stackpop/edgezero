@@ -72,6 +72,9 @@ struct PushContext {
     /// helper borrows from this to build the `AdapterPushContext<'_>`
     /// it hands the adapter trait method.
     adapter_push_ctx: ResolvedAdapterPushContext,
+    /// Canonical config entry key selected from the runtime environment, with
+    /// the publication target fallback applied by `EnvConfig`.
+    runtime_key: String,
     /// Resolved config store id (`--store` or the manifest
     /// default), paired with its env-resolved platform name. The
     /// platform name is what the adapter writes / pushes into
@@ -469,10 +472,9 @@ where
         push_ctx: &push_ctx,
     };
 
-    // Build envelope. `--key` overrides the manifest's resolved logical store id;
-    // `--staging` instead targets the `<logical>_staging` variant the staging
-    // selector points at. The two are mutually exclusive.
-    let key = resolve_config_key(args.key.as_deref(), &ctx.store.logical, args.staging)?;
+    // Build envelope. Without `--key`, use the same canonical environment key
+    // and target fallback as the deployed runtime descriptor.
+    let key = resolve_config_key(args.key.as_deref(), &ctx.runtime_key, args.staging)?;
     let body = build_config_envelope::<C>(&typed)?;
     let local_envelope: BlobEnvelope =
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
@@ -644,8 +646,10 @@ where
     let env_config = EnvConfig::from_env();
     let platform = env_config.store_name("config", &logical);
     let store = ResolvedStoreId::new(logical.clone(), platform);
-    // Diff exactly what `config push` would write, `--staging` included.
-    let key = resolve_config_key(args.key.as_deref(), &logical, args.staging)?;
+    // Diff exactly what `config push` would write, including the canonical
+    // environment override and target fallback.
+    let runtime_key = env_config.store_key_for_target("config", &logical, args.staging);
+    let key = resolve_config_key(args.key.as_deref(), &runtime_key, args.staging)?;
 
     // Resolve adapter paths for the read call.
     let manifest_root = ctx
@@ -1353,11 +1357,13 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     let logical = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
     let env_config = EnvConfig::from_env();
     let platform = env_config.store_name("config", &logical);
+    let runtime_key = env_config.store_key_for_target("config", &logical, args.staging);
     let adapter_push_ctx =
         resolve_adapter_push_ctx(args, &env_config, validation.manifest(), &args.adapter);
     Ok(PushContext {
         adapter,
         adapter_push_ctx,
+        runtime_key,
         store: ResolvedStoreId::new(logical, platform),
         validation,
     })
@@ -1379,30 +1385,23 @@ fn resolve_adapter_push_ctx(
     }
 }
 
-/// Derive the config-store key a push or diff targets.
+/// Resolve the config-store key a push or diff targets after [`EnvConfig`] has
+/// applied the canonical environment override and production/staging fallback.
 ///
-/// `--staging` writes (or diffs) the `<logical>_staging` variant in the SAME
-/// store — never the production key the live service reads. Fastly config stores
-/// are not versioned like staged service versions, so a different key is what
-/// isolates staged config.
-///
-/// `--key` and `--staging` are mutually exclusive, and that is not a style
-/// choice. The staging key is not merely a name we write: a staged deploy puts
-/// `<logical>_staging` into the staging selector store, and that selector is what
-/// a staged version READS. An explicit key would be written to a key nothing
-/// selects — a push that silently goes nowhere. Refuse instead.
+/// `--key` keeps its production override behavior. It remains incompatible with
+/// `--staging`, because the staged runtime reads the canonical
+/// `EDGEZERO__STORES__CONFIG__<ID>__KEY` selection recorded at deploy time.
 fn resolve_config_key(
     explicit: Option<&str>,
-    logical: &str,
+    runtime_key: &str,
     staging: bool,
 ) -> Result<String, String> {
     match (explicit, staging) {
         (Some(key), true) => Err(format!(
-            "`--key {key}` cannot be combined with `--staging`. The staging key is derived from the store's logical id (`{logical}_staging`) because that is what the staging selector store — created and linked by a staged deploy — points a staged version at. An explicit key would be written to a key nothing reads.\n  Push the staged config without `--key`, or push to `--key {key}` without `--staging` and point the selector at it yourself."
+            "`--key {key}` cannot be combined with `--staging`. A staged push must use the canonical `EDGEZERO__STORES__CONFIG__<ID>__KEY` selected by its runtime environment (currently `{runtime_key}`), so the pushed entry and deployed runtime cannot diverge.\n  Set that canonical KEY in the staging environment and push without `--key`, or push to `--key {key}` without `--staging`."
         )),
         (Some(key), false) => Ok(key.to_owned()),
-        (None, false) => Ok(logical.to_owned()),
-        (None, true) => Ok(format!("{logical}_staging")),
+        (None, _) => Ok(runtime_key.to_owned()),
     }
 }
 
@@ -2442,28 +2441,53 @@ source = "target/wasm32-wasip2/release/demo.wasm"
 
     #[test]
     fn resolve_config_key_covers_key_and_staging_combinations() {
+        let defaults = EnvConfig::default();
+        let production_default = defaults.store_key_for_target("config", "app_config", false);
+        let staging_default = defaults.store_key_for_target("config", "app_config", true);
         // Production: the logical id, or an explicit --key verbatim.
         assert_eq!(
-            resolve_config_key(None, "app_config", false).unwrap(),
+            resolve_config_key(None, &production_default, false).unwrap(),
             "app_config"
         );
         assert_eq!(
-            resolve_config_key(Some("custom"), "app_config", false).unwrap(),
+            resolve_config_key(Some("custom"), &production_default, false).unwrap(),
             "custom"
         );
-        // Staging: the `<logical>_staging` variant the selector store points at.
+        // Staging uses the same provider-neutral canonical runtime key resolver
+        // as the deployment descriptor. With no override, both fall back to the
+        // documented staging suffix.
         assert_eq!(
-            resolve_config_key(None, "app_config", true).unwrap(),
-            "app_config_staging"
+            resolve_config_key(None, &staging_default, true).unwrap(),
+            staging_default
         );
-        // --key + --staging is REFUSED: an explicit staging key would be written
-        // to a key the staging selector never points at, so nothing would read
-        // it. A silent no-op is worse than an error.
-        let err = resolve_config_key(Some("custom"), "app_config", true)
+
+        let selected = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "publisher-staging",
+        )]);
+        let selected_production_key = selected.store_key_for_target("config", "app_config", false);
+        assert_eq!(
+            resolve_config_key(None, &selected_production_key, false).unwrap(),
+            selected_production_key,
+            "production push and runtime selection must use the same explicit canonical KEY"
+        );
+        let selected_runtime_key = selected.store_key_for_target("config", "app_config", true);
+        assert_eq!(
+            resolve_config_key(None, &selected_runtime_key, true).unwrap(),
+            selected_runtime_key,
+            "staging push and runtime descriptor must select the same explicit canonical KEY"
+        );
+
+        // --key + --staging is refused because only the canonical runtime KEY
+        // can guarantee that the pushed entry is the one the deployed runtime
+        // reads.
+        let err = resolve_config_key(Some("custom"), &selected_runtime_key, true)
             .expect_err("--key with --staging must be rejected");
         assert!(
-            err.contains("--staging") && err.contains("app_config_staging"),
-            "the error must explain the derivation: {err}"
+            err.contains("--staging")
+                && err.contains("EDGEZERO__STORES__CONFIG__<ID>__KEY")
+                && !err.contains("selector store"),
+            "the error must explain canonical runtime-key selection without legacy selectors: {err}"
         );
     }
 

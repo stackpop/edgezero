@@ -123,6 +123,7 @@ impl RuntimeDescriptor {
         config_ids: &[String],
         kv_ids: &[String],
         secret_ids: &[String],
+        staging: bool,
     ) -> Result<Self, RuntimeDescriptorError> {
         let mut entries = BTreeMap::new();
         for (key, segments) in [
@@ -157,7 +158,7 @@ impl RuntimeDescriptor {
                 if kind == "CONFIG" {
                     entries.insert(
                         format!("EDGEZERO__STORES__CONFIG__{canonical_id}__KEY"),
-                        environment.store_key("config", id),
+                        environment.store_key_for_target("config", id, staging),
                     );
                 }
             }
@@ -881,6 +882,7 @@ mod tests {
             &["app".to_owned()],
             &["cache".to_owned()],
             &["token".to_owned()],
+            false,
         )
         .expect("descriptor");
         assert_eq!(
@@ -905,6 +907,37 @@ mod tests {
                     "token-prod".to_owned(),
                 ),
             ])
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn deploy_plan_descriptor_uses_shared_target_config_key_resolution() {
+        let config_ids = ["app_config".to_owned()];
+        let defaults =
+            RuntimeDescriptor::from_environment(&EnvConfig::default(), &config_ids, &[], &[], true)
+                .expect("staging descriptor with default key");
+        assert_eq!(
+            defaults
+                .entries
+                .get("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY")
+                .map(String::as_str),
+            Some("app_config_staging")
+        );
+
+        let selected = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "publisher-selected",
+        )]);
+        let overridden =
+            RuntimeDescriptor::from_environment(&selected, &config_ids, &[], &[], true)
+                .expect("staging descriptor with canonical key override");
+        assert_eq!(
+            overridden
+                .entries
+                .get("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY")
+                .map(String::as_str),
+            Some("publisher-selected")
         );
     }
 

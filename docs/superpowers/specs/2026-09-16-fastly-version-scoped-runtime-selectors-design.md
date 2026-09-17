@@ -183,6 +183,13 @@ The GitHub Environment supplies identical canonical variable names for
 production and staging. It may give them equal values to share a physical store
 or different values to isolate the environments.
 
+Config entry keys use one shared target-aware rule across `config push`,
+`config diff`, and managed descriptor construction. A valid canonical
+`EDGEZERO__STORES__CONFIG__<ID>__KEY` value wins for either target. When it is
+absent, production falls back to `<logical-id>` and staging falls back to
+`<logical-id>_staging`. A present invalid value fails managed deployment before
+provider mutation; it is never silently recorded in a descriptor.
+
 These values are deployment inputs only. They are captured after the immutable
 application release has been selected and must never be inherited by a compiler,
 build script, package command, or manifest-selection step.

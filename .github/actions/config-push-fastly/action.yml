@@ -36,7 +36,7 @@ inputs:
     required: false
     default: ""
   deploy-to:
-    description: "'production' writes the base key; 'staging' writes the derived staging key."
+    description: "Select the canonical environment key, with production/staging fallback when absent."
     required: false
     default: production
 

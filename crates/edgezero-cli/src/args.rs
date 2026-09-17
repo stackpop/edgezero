@@ -473,10 +473,10 @@ pub struct ConfigDiffArgs {
     /// Path to the adapter's runtime configuration file.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
-    /// Diff against the staging key (`<logical-id>_staging`) in the
-    /// environment-selected store, so a staged diff compares exactly what
-    /// `config push --staging` would write. Mutually exclusive with `--key`, for
-    /// the same reason as on push.
+    /// Diff against the canonical runtime key selected by
+    /// `EDGEZERO__STORES__CONFIG__<ID>__KEY`, falling back to
+    /// `<logical-id>_staging` when that variable is absent. Mutually exclusive
+    /// with `--key`, for the same reason as on push.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to diff against. Defaults to the
@@ -566,14 +566,12 @@ pub struct ConfigPushArgs {
     /// `runtime-config.toml` next to the adapter manifest.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
-    /// Push to staging: write the config under the `<logical-id>_staging` key
-    /// in the environment-selected store, so it never overwrites the production
-    /// key the live service reads. Production and staging may select the same or
-    /// different physical stores. The same `--staging` verb
-    /// `deploy`/`healthcheck`/`rollback` use. Mutually exclusive with `--key`: the
-    /// staging key is derived from the store's logical id so the staged
-    /// deployment descriptor and the pushed entry select the same key; an
-    /// explicit key would be written where nothing reads it.
+    /// Push to the staging runtime key in the environment-selected store.
+    /// `EDGEZERO__STORES__CONFIG__<ID>__KEY` wins when present; otherwise the
+    /// key falls back to `<logical-id>_staging`. Production and staging may
+    /// select the same or different physical stores. The same `--staging` verb
+    /// `deploy`/`healthcheck`/`rollback` use. Mutually exclusive with `--key` so
+    /// the deployed descriptor and pushed entry cannot diverge.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to push to. Defaults to the

@@ -30,12 +30,11 @@ main() {
     production | staging) ;;
     *) fail "input 'deploy-to' must be 'production' or 'staging' (got '${EDGEZERO__DEPLOY__TO:-}')" ;;
   esac
-  # A staging push derives its key from the store's logical id (`<id>_staging`),
-  # which is the key selected by the staged version's runtime descriptor. An
-  # explicit `key` would be written to a key nothing reads, so the CLI refuses
-  # the combination — reject it here with a clearer, earlier message.
+  # A staging push uses the canonical environment KEY, with `<id>_staging` only
+  # as its fallback. An action-level `key` input would bypass that shared
+  # resolution and could diverge from the deployed descriptor, so reject it here.
   if [[ "$deploy_to" == "staging" && "${EDGEZERO__CONFIG_PUSH__KEY_PRESENT:-}" == "true" ]]; then
-    fail "input 'key' cannot be combined with deploy-to: staging; the staging key is derived from the store's logical id (<id>_staging). Push to production with 'key', or push staging without it."
+    fail "input 'key' cannot be combined with deploy-to: staging; set EDGEZERO__STORES__CONFIG__<ID>__KEY in the staging environment and push without 'key', or push to production with 'key'."
   fi
 }
 
