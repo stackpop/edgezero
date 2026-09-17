@@ -7896,10 +7896,7 @@ mod tests {
             let environment = EnvConfig::from_vars([(variable, RUNTIME_ENV_STORE_NAME)]);
             let error = desired_resource_links(&stores, &environment, &inventories)
                 .expect_err("the runtime descriptor alias is reserved");
-            assert!(
-                error.contains(RUNTIME_ENV_STORE_NAME) && error.contains(kind.runtime_name()),
-                "{error}"
-            );
+            assert!(error.contains(RUNTIME_ENV_STORE_NAME) && error.contains(kind.runtime_name()));
         }
     }
 
@@ -8048,7 +8045,7 @@ mod tests {
             &aliases,
         )
         .expect_err("same alias for different kinds is ambiguous");
-        assert!(error.contains("shared"), "{error}");
+        assert!(error.contains("shared"));
 
         let resource_id_error = ResourceInventories::from_json(
             r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"SAME","name":"config"}]"#,
