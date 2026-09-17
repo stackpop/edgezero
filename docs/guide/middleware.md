@@ -220,9 +220,13 @@ impl Middleware for RateLimiter {
 
 EdgeZero provides these middleware out of the box:
 
-| Middleware      | Purpose                                        |
-| --------------- | ---------------------------------------------- |
-| `RequestLogger` | Logs request method, path, and response status |
+| Middleware      | Purpose                                                                              |
+| --------------- | ------------------------------------------------------------------------------------ |
+| `RequestLogger` | Logs request method, path, and response status                                       |
+| `FnMiddleware`  | Wraps an `async Fn(RequestContext, Next<'_>) -> Result<Response, EdgeError>` closure |
+
+If you already hold an `Arc<dyn Middleware>` (`BoxMiddleware`), register it with
+`.middleware_arc(...)` instead of `.middleware(...)`.
 
 ## Next Steps
 

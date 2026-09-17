@@ -912,8 +912,9 @@ pub trait KvStore: Send + Sync {
     /// should be treated as expired. Eviction timing is backend-specific:
     /// - **Axum (`PersistentKvStore`)**: lazy eviction — expired keys are removed
     ///   on the next `get_bytes` call for that key. Keys never accessed after
-    ///   expiration remain in the database until deleted, so `.edgezero/kv.redb`
-    ///   grows without bound on long-running dev servers.
+    ///   expiration remain in the database until deleted, so the store's
+    ///   `.edgezero/kv-<slug>-<hash>.redb` file grows without bound on
+    ///   long-running dev servers.
     /// - **Fastly/Cloudflare**: eviction is managed by the platform and is not
     ///   guaranteed to be immediate.
     async fn put_bytes_with_ttl(

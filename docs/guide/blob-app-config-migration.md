@@ -105,8 +105,10 @@ is no `--local` flag because Axum's push IS always local.
 ### Cloudflare
 
 The push shells out to `wrangler kv bulk put --namespace-id=<id> --remote`
-with one entry: `(<key>, <envelope_json>)`. With `--local`, the same
-command runs against `.wrangler/state` instead.
+with one entry: `(<key>, <envelope_json>)`. With `--local`, the push runs
+`wrangler kv bulk put <file> --binding <BINDING> --local` against
+`.wrangler/state`, selecting the namespace by binding name rather than by
+namespace id.
 
 The bundled `edgezero` binary calls `wrangler` from your shell; your
 project's `wrangler.toml` selects the namespace.
@@ -187,7 +189,7 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
 
    ```sh
    # Cloudflare (per spec §10.2)
-   wrangler secret put demo_api_token --binding APP_SECRETS
+   wrangler secret put demo_api_token
 
    # Fastly
    fastly secret-store-entry create --store-id=<id> --name=demo_api_token --value=<value>
@@ -196,7 +198,7 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
    echo demo_api_token=<value> >> .env
 
    # Axum local
-   EDGEZERO_SECRET_demo_api_token=<value> cargo run -p <app-cli> -- serve --adapter axum
+   demo_api_token=<value> cargo run -p <app-cli> -- serve --adapter axum
    ```
 
 3. Push the typed config:
@@ -214,12 +216,30 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
 ### Per-environment key override
 
 Spec 5.4 + 12.7: a single `<app-name>.toml` covers dev / staging /
-production. To swap which blob the runtime reads:
+production. Two mechanisms swap which blob the runtime reads.
+
+For staging, use `--staging`. It writes the config under the
+`<logical-id>_staging` key in the same store, so it never overwrites the
+production key the live service reads:
 
 ```sh
-# Push BOTH variants. Each lands at its own key.
+<app-cli> config push --adapter <name> --staging
+<app-cli> config diff --adapter <name> --staging
+```
+
+`--staging` is mutually exclusive with `--key`, because the staging key is
+derived from the store's logical id. On Fastly a staged deploy provisions a
+per-service `edgezero_runtime_env_staging_<service-id>` selector store and
+links it automatically, so a staged version reads staged config without any
+manual key override. Do not hand-set a `_staging` key in the production
+`edgezero_runtime_env` store; that would make production serve staged config.
+
+For any other environment, `--key` is the general per-environment mechanism.
+Each push lands at its own key:
+
+```sh
 <app-cli> config push --adapter <name> --key app_config
-<app-cli> config push --adapter <name> --key app_config_staging
+<app-cli> config push --adapter <name> --key app_config_canary
 ```
 
 The override variable is `EDGEZERO__STORES__CONFIG__<ID>__KEY` --
@@ -228,12 +248,12 @@ packs `default_key` into the `ConfigStoreBinding` at adapter init.
 **Where you set the override depends on the platform's variable
 mechanism.**
 
-| Adapter        | Where to set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`                                                                                                                     |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging <app-cli> serve --adapter axum`                                                                   |
-| **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                           |
-| **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging spin up` for a per-invocation override |
-| **Fastly**     | A dedicated `edgezero_runtime_env` Config Store (Compute@Edge has no process env). See below.                                                                                |
+| Adapter        | Where to set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`                                                                                                                    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_canary <app-cli> serve --adapter axum`                                                                   |
+| **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                          |
+| **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_canary spin up` for a per-invocation override |
+| **Fastly**     | A dedicated `edgezero_runtime_env` Config Store (Compute@Edge has no process env). See below.                                                                               |
 
 #### Fastly specifically
 
@@ -250,9 +270,14 @@ fastly config-store list --json | jq -r '.[] | select(.name=="edgezero_runtime_e
 fastly config-store-entry update \
   --store-id=<STORE-ID> \
   --key=EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__APP_CONFIG__KEY \
-  --value=app_config_staging \
+  --value=app_config_canary \
   --upsert
 ```
+
+This store is the one the ACTIVE (production) version reads, so never point
+it at a `_staging` key. Staged config is isolated by the per-service
+`edgezero_runtime_env_staging_<service-id>` store that a staged deploy
+creates and links for you.
 
 Fastly runtime overrides are service-scoped because the Config Store can be
 linked to multiple services. Legacy unscoped `EDGEZERO__STORES__...` entries are
@@ -421,5 +446,6 @@ after push B reconstructs envelope B, not A.
 - Implementation plan: [`docs/superpowers/plans/2026-06-17-blob-app-config.md`](https://github.com/stackpop/edgezero)
 - Extractor source: `crates/edgezero-core/src/extractor.rs`
 - CLI push entry point: `crates/edgezero-cli/src/config.rs::run_config_push_typed`
-- CLI diff entry point: `crates/edgezero-cli/src/diff.rs::run_config_diff_typed`
+- CLI diff entry point: `crates/edgezero-cli/src/config.rs::run_config_diff_typed`
+  (`diff.rs` holds only the format renderers)
 - Fastly chunk-pointer helper: `crates/edgezero-adapter-fastly/src/chunked_config.rs`

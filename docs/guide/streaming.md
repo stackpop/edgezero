@@ -33,12 +33,24 @@ async fn stream_data() -> Response {
 
 ## How Streaming Works
 
-The router keeps streams intact through the adapter layer:
+The core router passes `Body::Stream` through untouched; whether the client sees
+chunks progressively depends on the adapter:
 
 1. Your handler returns `Body::stream(...)` with a `Stream` of chunks
-2. The adapter writes chunks sequentially to the provider's output API
-3. Fastly uses `stream_to_client`, Cloudflare uses `ReadableStream`
-4. The client receives data as it becomes available
+2. Cloudflare wraps the stream in a `ReadableStream` (`Response::from_stream`), so
+   chunks reach the client as they are produced
+3. Fastly, Spin, and Axum drain the stream into a buffer before writing the
+   provider response (Spin rejects streamed bodies over 16 MiB), so the client
+   receives the whole body at once
+
+On Cloudflare, streaming also keeps memory flat, because each chunk is forwarded as
+it is produced. On the buffering adapters a streamed body is collected in full
+before the response goes out: Axum into an unbounded buffer, Spin into a buffer
+capped at 16 MiB (larger bodies fail), and Fastly into a host-side body that is
+only sent once complete. There `Body::stream` is an API-composability convenience,
+not a memory saving, and a very large streamed response can exhaust memory or be
+rejected. Only rely on progressive delivery (SSE, long-lived chunked responses) on
+Cloudflare today.
 
 ## Server-Sent Events
 
