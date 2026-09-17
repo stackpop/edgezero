@@ -139,6 +139,6 @@ Expected: formatting, strict Clippy, native tests, all WASM targets, documentati
 
 Confirm no selection failure is represented as `Cutoff`, no old collector signature remains, demo/template output matches, and no unrelated lower-priority review item was included.
 
-- [ ] **Step 3: Mark this plan complete, commit, and push**
+- [x] **Step 3: Mark this plan complete, commit, and push**
 
 Commit the focused implementation and synchronized documentation, push `docs/outbound-http-spec`, and confirm PR #275 checks are green.
