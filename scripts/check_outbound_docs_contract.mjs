@@ -196,12 +196,12 @@ const expectedLimitRows = [
   ],
   [
     'max_response_header_bytes',
-    'Cumulative guest-visible header name/value bytes, including `x-edgezero-proxy`',
+    'Adapter-visible upstream header name/value bytes before normalization, plus `x-edgezero-proxy`',
     'Unset',
   ],
   [
     'max_response_header_count',
-    'Cumulative guest-visible header fields, including `x-edgezero-proxy`',
+    'Adapter-visible upstream header fields before normalization, plus `x-edgezero-proxy`',
     'Unset',
   ],
   [
@@ -463,6 +463,7 @@ for (const staleFragment of [
   'OutboundBatch::from_stream',
   'Result<OutboundBatchResults, EdgeError>',
   'let Ok((selection, metadata)) = select_pending_slot(&mut pending) else',
+  'private failure event',
 ]) {
   if (outboundSpecSource.includes(staleFragment)) {
     fail(
@@ -471,9 +472,13 @@ for (const staleFragment of [
   }
 }
 for (const requiredFragment of [
+  'pub enum OutboundBatchDriverEvent',
   'pub enum OutboundBatchTermination',
   'pub enum OutboundBatchNext',
   'pub struct OutboundBatchFailure',
+  'pub fn cutoff(slot_count: usize) -> Self',
+  'pub fn finish_batch_item(',
+  'pub fn from_driver<StreamValue>',
   'Result<OutboundBatchResults, OutboundBatchFailure>',
   'premature driver EOF',
   'duplicate or out-of-range',
@@ -481,6 +486,15 @@ for (const requiredFragment of [
   if (!outboundSpecSource.includes(requiredFragment)) {
     fail(`outbound specification is missing typed batch contract: ${requiredFragment}`)
   }
+}
+if (
+  !/terminal samples follow\s+poll-observation order in the shared monotonic clock domain/u.test(
+    outboundSpecSource,
+  )
+) {
+  fail(
+    'outbound specification is missing the monotonic terminal-observation ordering proof',
+  )
 }
 
 const cloudflareExactDeadlineRecommendation =
@@ -554,6 +568,11 @@ if (outboundBatchTerminationPlanSource.includes('send_all_until(...).await?')) {
     `${outboundBatchTerminationPlanPath} contains the stale batch collector error conversion`,
   )
 }
+if (outboundBatchTerminationPlanSource.includes('doc-hidden adapter driver event')) {
+  fail(
+    `${outboundBatchTerminationPlanPath} still describes the public adapter driver protocol as doc-hidden`,
+  )
+}
 
 const cloudflarePhaseSource = currentDocumentation[2][1]
 for (const staleFragment of [
@@ -566,6 +585,16 @@ for (const staleFragment of [
     fail(
       `${cloudflarePhasePath} contains stale Cloudflare capability text: ${staleFragment}`,
     )
+  }
+}
+
+for (const [path, source] of [
+  [cloudflarePhasePath, currentDocumentation[2][1]],
+  [spinPhasePath, currentDocumentation[3][1]],
+  [fastlyPhasePath, currentDocumentation[4][1]],
+]) {
+  if (!source.includes('**Superseded batch/lifecycle API:**')) {
+    fail(`${path} does not mark its removed batch API as superseded`)
   }
 }
 
@@ -593,7 +622,7 @@ for (const dependency of [
 }
 if (
   !outboundSpecSource.includes(
-    "including EdgeZero's synthetic `x-edgezero-proxy` marker",
+    "plus EdgeZero's synthetic `x-edgezero-proxy` marker",
   )
 ) {
   fail('outbound specification does not include the proxy header in response caps')
@@ -654,12 +683,29 @@ if (JSON.stringify(actualLimitRows) !== JSON.stringify(expectedLimitRows)) {
     `outbound limits mismatch\nexpected=${JSON.stringify(expectedLimitRows)}\nactual=${JSON.stringify(actualLimitRows)}`,
   )
 }
+for (const requiredFragment of [
+  'including fields later stripped',
+  "charge EdgeZero's synthetic proxy marker",
+]) {
+  if (!capabilitySource.includes(requiredFragment)) {
+    fail(
+      `${capabilityPath} is missing the response-header accounting rule: ${requiredFragment}`,
+    )
+  }
+}
 
 let outboundCoreSource
 try {
   outboundCoreSource = readFileSync(outboundCorePath, 'utf8')
 } catch (error) {
   fail(`cannot read ${outboundCorePath}: ${error.message}`)
+}
+if (
+  !/#\[non_exhaustive\]\s*pub enum OutboundBatchDriverEvent\s*\{/u.test(
+    outboundCoreSource,
+  )
+) {
+  fail('OutboundBatchDriverEvent must remain non-exhaustive')
 }
 const documentedDefaults = new Map(
   actualLimitRows.map((row) => [row[0], row[2]]),

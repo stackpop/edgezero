@@ -3,6 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **Status:** Implemented on PR 275 with the repository-pinned WASI SDK-resource runner. Provider teardown remains `BestEffort`; the unchecked steps below are retained as the original implementation record.
+> **Superseded batch/lifecycle API:** The 2026-09-15 consumer-alignment plan replaces this
+> plan's `send_all` API and test sentinels. Retain the text only as implementation history.
 
 **Goal:** Implement Spin outbound HTTP with owned WASI resources, exact request/response completion, typed error classification, cooperative fairness, and a real executable SDK-resource test gate.
 
@@ -136,7 +138,7 @@ CARGO_TARGET_WASM32_WASIP2_RUNNER='wasmtime run -W component-model-async=y -S p3
 - Modify: `crates/edgezero-adapter-spin/Cargo.toml`
 - Modify: `crates/edgezero-adapter-spin/tests/contract.rs`
 
-- [ ] Add failing cases for cumulative guest-visible header limits, repeated request fields, repeated response `Set-Cookie`, raw malformed response nomination/encoding, 3xx returned without a follow-up request, HEAD/1xx/204/304, every 205 branch, encoded bytes, decoded output, Brotli window/decoder-state charge, independent final Buffered limits, gzip members, Brotli trailing data, typed source/completion errors, and timeout precedence. Unequal decoded/final caps prove raw passthrough bypasses only decoded accounting; `max_chunk_bytes` is tested only as emitted-item shaping.
+- [ ] Add failing cases for cumulative adapter-visible upstream header limits before normalization plus the synthetic proxy marker, repeated request fields, repeated response `Set-Cookie`, raw malformed response nomination/encoding, 3xx returned without a follow-up request, HEAD/1xx/204/304, every 205 branch, encoded bytes, decoded output, Brotli window/decoder-state charge, independent final Buffered limits, gzip members, Brotli trailing data, typed source/completion errors, and timeout precedence. Unequal decoded/final caps prove raw passthrough bypasses only decoded accounting; `max_chunk_bytes` is tested only as emitted-item shaping.
 - [ ] Add identity/compressed/passthrough `Content-Length` cases proving malformed/conflicting values and encoded/effective-identity decoded overages reject before reading the WASI response body; include exactly one bare `Content-Encoding: identity`. Effective identity compares encoded, decoded, and final Buffered caps; raw passthrough compares encoded plus final Buffered but never decoded; compressed-to-decode compares only encoded.
 - [ ] In both Buffered and Streamed modes, stall gzip and Brotli before decoded output, midstream, and after codec EOF but before native EOF. Assert attributed 504, no early caller-result success, and preservation of a late typed source/completion error when it wins before expiry.
 - [ ] Add the joined send-plus-immediate-body-consumption regression used by Axum/Cloudflare; a fast body must complete while sibling headers remain pending.

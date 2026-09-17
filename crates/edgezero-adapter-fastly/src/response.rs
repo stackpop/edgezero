@@ -94,6 +94,7 @@ trait EgressCommitter {
         &mut self,
         status: StatusCode,
         headers: &HeaderMap,
+        transmits_body: bool,
     ) -> Result<Self::Prepared, Self::Error>;
 }
 
@@ -136,7 +137,11 @@ mod platform {
             Ok(FastlyBodySink(body))
         }
 
-        fn new(status: StatusCode, headers: &HeaderMap) -> Result<Self, FastlyAbiError> {
+        fn new(
+            status: StatusCode,
+            headers: &HeaderMap,
+            transmits_body: bool,
+        ) -> Result<Self, FastlyAbiError> {
             let response = fastly_abi::new_response()?;
             let mut prepared = Self {
                 body: INVALID_BODY_HANDLE,
@@ -151,7 +156,7 @@ mod platform {
                     value.as_bytes(),
                 )?;
             }
-            if headers.contains_key(CONTENT_LENGTH) {
+            if transmits_body && headers.contains_key(CONTENT_LENGTH) {
                 fastly_abi::set_manual_framing(prepared.response)?;
             }
             Ok(prepared)
@@ -224,8 +229,9 @@ mod platform {
             &mut self,
             status: StatusCode,
             headers: &HeaderMap,
+            transmits_body: bool,
         ) -> Result<Self::Prepared, Self::Error> {
-            FastlyPrepared::new(status, headers)
+            FastlyPrepared::new(status, headers, transmits_body)
         }
     }
 
@@ -356,9 +362,9 @@ where
         );
     }
 
-    let response = prepared.into_response();
-    let (parts, body) = response.into_parts();
-    let prepared_head = match committer.prepare(parts.status, &parts.headers) {
+    let transmits_body = prepared.transmits_body();
+    let (parts, body) = prepared.into_response().into_parts();
+    let prepared_head = match committer.prepare(parts.status, &parts.headers, transmits_body) {
         Ok(prepared_head) => prepared_head,
         Err(_error) => {
             log::error!("response-egress Fastly head preparation failed");
@@ -646,7 +652,7 @@ mod tests {
     struct SinkState {
         abandon: MockTerminal,
         accepted: Vec<u8>,
-        commits: Vec<(StatusCode, HeaderMap)>,
+        commits: Vec<(StatusCode, HeaderMap, bool)>,
         events: Vec<&'static str>,
         finish: MockTerminal,
         write_plan: VecDeque<Result<usize, ()>>,
@@ -718,7 +724,7 @@ mod tests {
 
     impl EgressCommitter for MockCommitter {
         type Error = ();
-        type Prepared = (StatusCode, HeaderMap);
+        type Prepared = (StatusCode, HeaderMap, bool);
         type Sink = MockSink;
 
         fn commit(&mut self, prepared: Self::Prepared) -> Result<Self::Sink, Self::Error> {
@@ -733,9 +739,10 @@ mod tests {
             &mut self,
             status: StatusCode,
             headers: &HeaderMap,
+            transmits_body: bool,
         ) -> Result<Self::Prepared, Self::Error> {
             self.prepare_plan.pop_front().unwrap_or(Ok(()))?;
-            Ok((status, headers.clone()))
+            Ok((status, headers.clone(), transmits_body))
         }
     }
 
@@ -830,7 +837,7 @@ mod tests {
         headers.append("set-cookie", "b=2".parse().expect("header"));
         let mut committer = platform::FastlyCommitter;
         let prepared = committer
-            .prepare(StatusCode::OK, &headers)
+            .prepare(StatusCode::OK, &headers, true)
             .expect("prepare raw response");
         let mut sink = committer.commit(prepared).expect("commit raw response");
         assert_eq!(sink.write(b"raw-egress"), Ok(10));
@@ -1176,6 +1183,76 @@ mod tests {
         assert_eq!(drops.get(), 1);
         assert!(state.borrow().accepted.is_empty());
         assert_eq!(observer.reports()[0].bytes_written, 0);
+    }
+
+    #[test]
+    fn body_suppressed_response_disables_manual_framing() {
+        for (method, status) in [
+            (Method::HEAD, StatusCode::OK),
+            (Method::GET, StatusCode::NOT_MODIFIED),
+        ] {
+            let response = response_builder()
+                .status(status)
+                .header("content-length", "99")
+                .body(Body::from("suppressed"))
+                .expect("response");
+            let prepared = prepare_response_egress(&method, response).expect("prepared");
+            let now = MonotonicInstant::now();
+            let clock = stable_clock(now);
+            let observer = RecordingObserver::default();
+            let mut attempt = attempt(&observer, now);
+            let state = Rc::new(RefCell::new(SinkState::default()));
+            let mut committer = MockCommitter::new(Rc::clone(&state));
+
+            let result = transmit_prepared(
+                prepared,
+                future_policy(now),
+                &mut attempt,
+                &clock,
+                TransmitKind::Application,
+                &mut committer,
+            );
+
+            assert_eq!(result, Ok(()));
+            let observed_state = state.borrow();
+            let (committed_status, headers, transmits_body) = &observed_state.commits[0];
+            assert_eq!(*committed_status, status);
+            assert_eq!(headers.get("content-length").expect("length"), "99");
+            assert!(!transmits_body);
+            assert!(observed_state.accepted.is_empty());
+        }
+    }
+
+    #[test]
+    fn payload_response_allows_manual_framing() {
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .header("content-length", "3")
+            .body(Body::from("abc"))
+            .expect("response");
+        let prepared = prepare_response_egress(&Method::GET, response).expect("prepared");
+        let now = MonotonicInstant::now();
+        let clock = stable_clock(now);
+        let observer = RecordingObserver::default();
+        let mut attempt = attempt(&observer, now);
+        let state = Rc::new(RefCell::new(SinkState::default()));
+        let mut committer = MockCommitter::new(Rc::clone(&state));
+
+        let result = transmit_prepared(
+            prepared,
+            future_policy(now),
+            &mut attempt,
+            &clock,
+            TransmitKind::Application,
+            &mut committer,
+        );
+
+        assert_eq!(result, Ok(()));
+        let observed_state = state.borrow();
+        let (_, headers, transmits_body) = &observed_state.commits[0];
+        assert_eq!(headers.get("content-length").expect("length"), "3");
+        assert!(*transmits_body);
+        assert_eq!(observed_state.accepted, b"abc");
     }
 
     #[test]

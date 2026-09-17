@@ -103,14 +103,16 @@ mod worker_impl {
     use edgezero_core::compression::{
         ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
     };
-    use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
+    #[cfg(feature = "test-utils")]
+    use edgezero_core::error::BudgetSource;
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
     use edgezero_core::outbound::{
-        OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundCachePolicy,
-        OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
-        OutboundSlotResult, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
-        collect_response_stream, enforce_payload_content_length, insert_proxy_header,
+        OutboundBatch, OutboundBatchDriverEvent, OutboundCachePolicy, OutboundHttpClient,
+        OutboundRequest, OutboundRequestParts, OutboundResponse, ResponseBodyDisposition,
+        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
+        enforce_payload_content_length, finish_batch_item, insert_proxy_header,
         limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
@@ -521,36 +523,6 @@ mod worker_impl {
             }
         }
         .boxed_local()
-    }
-
-    fn finish_batch_item(
-        index: usize,
-        started_at: MonotonicInstant,
-        completed_at: MonotonicInstant,
-        cutoff: Deadline,
-        outcome: Result<OutboundResponse, EdgeError>,
-    ) -> Option<OutboundBatchItem> {
-        if cutoff.is_expired_at(completed_at)
-            || matches!(
-                outcome,
-                Err(EdgeError::GatewayTimeout {
-                    cause: BudgetSource::BatchCutoff,
-                    ..
-                })
-            )
-        {
-            return None;
-        }
-        let result = match completed_at.checked_duration_since(started_at) {
-            Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
-            None => OutboundSlotResult::new(
-                Duration::ZERO,
-                Err(EdgeError::internal(anyhow::anyhow!(
-                    "monotonic clock moved backwards during outbound dispatch"
-                ))),
-            ),
-        };
-        Some(OutboundBatchItem::new(index, result))
     }
 
     #[expect(

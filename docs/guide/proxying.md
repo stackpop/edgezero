@@ -154,6 +154,12 @@ batch method-entry snapshot through its own terminal observation, including pref
 buffering. It is not pure network RTT. Bound the request count and every per-request body limit;
 EdgeZero intentionally has no global batch-concurrency or memory cap.
 
+On Axum, Cloudflare, and Spin, each child samples its terminal instant synchronously when it is
+observed ready. Those samples follow poll-observation order in the shared monotonic clock domain,
+so after one observation reaches the cutoff a later observation cannot be on time unless an
+injected clock moves backwards. Fastly's provider-selected completion path remains BestEffort as
+documented in the capability matrix.
+
 ## Platform Behavior
 
 The API is portable, but not every runtime can provide identical timing, header, or lazy-stream

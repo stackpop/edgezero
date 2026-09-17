@@ -12,12 +12,11 @@ use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
 use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
 use edgezero_core::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use edgezero_core::outbound::{
-    OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundHttpClient,
-    OutboundRequest, OutboundRequestParts, OutboundResponse, OutboundSlotResult,
-    ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-    enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
-    limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
-    validate_for_dispatch,
+    OutboundBatch, OutboundBatchDriverEvent, OutboundHttpClient, OutboundRequest,
+    OutboundRequestParts, OutboundResponse, ResponseBodyDisposition, ResponseHeaderLimiter,
+    ResponseMode, collect_response_stream, enforce_payload_content_length, finish_batch_item,
+    insert_proxy_header, limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
+    normalize_response_headers, rechunk_stream, validate_for_dispatch,
 };
 use edgezero_core::time::{
     Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
@@ -341,36 +340,6 @@ fn deadline_stream(
         }
     }
     .boxed_local()
-}
-
-fn finish_batch_item(
-    index: usize,
-    started_at: MonotonicInstant,
-    completed_at: MonotonicInstant,
-    cutoff: Deadline,
-    outcome: Result<OutboundResponse, EdgeError>,
-) -> Option<OutboundBatchItem> {
-    if cutoff.is_expired_at(completed_at)
-        || matches!(
-            outcome,
-            Err(EdgeError::GatewayTimeout {
-                cause: BudgetSource::BatchCutoff,
-                ..
-            })
-        )
-    {
-        return None;
-    }
-    let result = match completed_at.checked_duration_since(started_at) {
-        Some(elapsed) => OutboundSlotResult::new(elapsed, outcome),
-        None => OutboundSlotResult::new(
-            Duration::ZERO,
-            Err(EdgeError::internal(anyhow::anyhow!(
-                "monotonic clock moved backwards during outbound dispatch"
-            ))),
-        ),
-    };
-    Some(OutboundBatchItem::new(index, result))
 }
 
 #[expect(

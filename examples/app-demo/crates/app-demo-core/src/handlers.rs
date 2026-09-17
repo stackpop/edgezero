@@ -519,8 +519,8 @@ mod tests {
     use edgezero_core::http::{request_builder, HeaderMap, Method, StatusCode, Uri};
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::outbound::{
-        HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundHttpClient,
-        OutboundRequestParts, OutboundResponse, OutboundSlotResult, ResponseMode,
+        HttpClient, OutboundBatch, OutboundBatchItem, OutboundHttpClient, OutboundRequestParts,
+        OutboundResponse, OutboundSlotResult, ResponseMode,
     };
     use edgezero_core::params::PathParams;
     use edgezero_core::response::IntoResponse as _;
@@ -528,7 +528,7 @@ mod tests {
     use edgezero_core::store_registry::{
         ConfigRegistry, ConfigStoreBinding, KvRegistry, StoreRegistry,
     };
-    use edgezero_core::BudgetSource;
+    use edgezero_core::{BudgetSource, OutboundBatchDriverEvent};
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};

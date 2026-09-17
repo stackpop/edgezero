@@ -1592,6 +1592,7 @@ mod tests {
             "OutboundBatchTermination::Cutoff",
             "OutboundBatch::from_driver",
             "OutboundBatchDriverEvent::Item",
+            "use edgezero_core::{BudgetSource, OutboundBatchDriverEvent};",
             "FanoutSlotOutcome::Unresolved",
             "OutboundCachePolicy::Bypass",
             "slot.elapsed",
