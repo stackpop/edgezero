@@ -24,6 +24,8 @@ main() {
     fail "staging must issue exactly one compute update"
   grep -Eq '^fastly compute update --service-id=dummyservice --autoclone --version=active --package=[^[:space:]]+/package/app\.tar\.gz --non-interactive$' "$log" ||
     fail "staging compute update did not use the exact active-source package command"
+  grep -Eq '^fastly compute hash-files --package=[^[:space:]]+/package/app\.tar\.gz --skip-build --non-interactive --quiet$' "$log" ||
+    fail "staging did not hash the pinned package with the exact command"
   [[ "$(grep -Ec '^fastly service-version update ' "$log" || true)" -eq 1 ]] ||
     fail "staging must issue exactly one version comment update"
   grep -Fqx 'fastly service-version update --service-id=dummyservice --version=42 --comment staged smoke' "$log" ||
@@ -67,15 +69,18 @@ EOF
   grep -q '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" ||
     fail "prepared version 42 was not staged"
 
-  local create_line descriptor_read_line final_links_line stage_line
+  local create_line descriptor_read_line final_links_line package_read_line stage_line
   local last_delete_line first_create_line last_create_line
   create_line=$(grep -n "config-store-entry create --store-id=ENVSEL1 --key=$key" "$log" | tail -n 1 | cut -d: -f1)
   descriptor_read_line=$(grep -n "GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/$key" "$log" | tail -n 1 | cut -d: -f1)
   final_links_line=$(grep -n '^fastly resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n 1 | cut -d: -f1)
+  package_read_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n 1 | cut -d: -f1)
   stage_line=$(grep -n '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" | cut -d: -f1)
   [[ "$create_line" -lt "$descriptor_read_line" && "$descriptor_read_line" -lt "$stage_line" ]] ||
     fail "descriptor create/readback/final verification did not precede staging"
   [[ "$final_links_line" -lt "$stage_line" ]] || fail "final link verification did not precede staging"
+  [[ "$package_read_line" -lt "$stage_line" ]] ||
+    fail "final package identity verification did not precede staging"
   last_delete_line=$(grep -n '^fastly resource-link delete ' "$log" | tail -n 1 | cut -d: -f1)
   first_create_line=$(grep -n '^fastly resource-link create ' "$log" | head -n 1 | cut -d: -f1)
   last_create_line=$(grep -n '^fastly resource-link create ' "$log" | tail -n 1 | cut -d: -f1)

@@ -50,6 +50,13 @@ JSON
     [[ -f "\$(links_file "\$target")" ]] || exit 91
     links_json "\$target"
     ;;
+  'compute hash-files')
+    [[ "\$#" -eq 6 && "\$3" == --package=* && "\$4" == --skip-build &&
+      "\$5" == --non-interactive && "\$6" == --quiet ]] || exit 92
+    package=\${3#--package=}
+    [[ -f "\$package" && ! -L "\$package" ]] || exit 92
+    printf '%0128d\n' 0
+    ;;
   'compute update')
     [[ "\$#" -eq 7 && "\$3" == --service-id=dummyservice && "\$4" == --autoclone &&
       "\$5" == --version=active && "\$6" == --package=* && "\$7" == --non-interactive ]] || exit 92
@@ -223,6 +230,9 @@ if [[ "$*" == *--config* ]]; then
       ;;
     */service/dummyservice/version)
       printf '%s\n200' "$(version_list)"
+      ;;
+    */service/dummyservice/version/42/package)
+      printf '{"service_id":"dummyservice","version":42,"metadata":{"files_hash":"%0128d"}}\n200' 0
       ;;
     */resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__40__ENV_V1 | \
     */resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1)

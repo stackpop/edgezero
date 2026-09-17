@@ -603,13 +603,17 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 #[cfg(feature = "cli")]
 mod tests {
     use super::*;
-    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
+    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard, path_mutation_guard};
     use edgezero_adapter::registry::{
         self as adapter_registry, Adapter, AdapterAction, DeployOwnership,
     };
     use edgezero_core::manifest::ManifestLoader;
+    #[cfg(unix)]
+    use edgezero_core::test_env::PathPrepend;
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex};
@@ -753,7 +757,20 @@ mod tests {
         // The EdgeZero-internal `--manifest-path` must NOT: the shell
         // command's own CLI has no such flag.
         let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+
         let temp = TempDir::new().expect("temp dir");
+        let curl = temp.path().join("curl");
+        fs::write(
+            &curl,
+            "#!/bin/sh\ncat >/dev/null\nprintf '[{\"number\":42,\"active\":true,\"locked\":true,\"staging\":false,\"deployed\":true,\"environments\":[]}]\\n200'\n",
+        )
+        .expect("write curl fake");
+        let mut permissions = fs::metadata(&curl).expect("curl metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&curl, permissions).expect("make curl fake executable");
+        let _path = PathPrepend::new(temp.path());
+        let _token = EnvOverride::set("FASTLY_API_TOKEN", "test-token");
         let args_file = temp.path().join("argv.txt");
         let script = temp.path().join("record.sh");
         fs::write(

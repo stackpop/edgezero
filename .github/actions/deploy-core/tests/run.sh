@@ -932,6 +932,8 @@ printf 'EDGEZERO__ADAPTER__HOST=%s\n' "${EDGEZERO__ADAPTER__HOST:-ABSENT}"
 printf 'EDGEZERO__ADAPTER__PORT=%s\n' "${EDGEZERO__ADAPTER__PORT:-ABSENT}"
 printf 'EDGEZERO__LOGGING__ENDPOINT=%s\n' "${EDGEZERO__LOGGING__ENDPOINT:-ABSENT}"
 printf 'EDGEZERO__LOGGING__LEVEL=%s\n' "${EDGEZERO__LOGGING__LEVEL:-ABSENT}"
+printf 'EDGEZERO__LOGGING__USE_FASTLY_LOGGER=%s\n' "${EDGEZERO__LOGGING__USE_FASTLY_LOGGER:-ABSENT}"
+printf 'EDGEZERO__LOGGING__ECHO_STDOUT=%s\n' "${EDGEZERO__LOGGING__ECHO_STDOUT:-ABSENT}"
 printf 'EDGEZERO__ADAPTER__HOST__EXTRA=%s\n' "${EDGEZERO__ADAPTER__HOST__EXTRA:-ABSENT}"
 printf 'EDGEZERO__UNDECLARED=%s\n' "${EDGEZERO__UNDECLARED:-ABSENT}"
 printf 'EDGEZERO_MANIFEST=%s\n' "${EDGEZERO_MANIFEST:-ABSENT}"
@@ -952,6 +954,7 @@ CLI
       EDGEZERO__STORES__SECRETS____NAME='must-not-survive' \
       EDGEZERO__ADAPTER__HOST='127.0.0.1' EDGEZERO__ADAPTER__PORT='7676' \
       EDGEZERO__LOGGING__ENDPOINT='https://logs.example.test' EDGEZERO__LOGGING__LEVEL='debug' \
+      EDGEZERO__LOGGING__USE_FASTLY_LOGGER='true' EDGEZERO__LOGGING__ECHO_STDOUT='false' \
       EDGEZERO__ADAPTER__HOST__EXTRA='must-not-survive' EDGEZERO__UNDECLARED='must-not-survive' \
       "$CORE_SCRIPTS/run-app-cli.sh" deploy 2>/dev/null
   )
@@ -976,6 +979,12 @@ CLI
     "$(grep '^EDGEZERO__LOGGING__ENDPOINT=' <<<"$out")"
   assert_equals "the fixed logging level is delivered" "EDGEZERO__LOGGING__LEVEL=debug" \
     "$(grep '^EDGEZERO__LOGGING__LEVEL=' <<<"$out")"
+  assert_equals "the Fastly logger selector is delivered" \
+    "EDGEZERO__LOGGING__USE_FASTLY_LOGGER=true" \
+    "$(grep '^EDGEZERO__LOGGING__USE_FASTLY_LOGGER=' <<<"$out")"
+  assert_equals "the stdout echo selector is delivered" \
+    "EDGEZERO__LOGGING__ECHO_STDOUT=false" \
+    "$(grep '^EDGEZERO__LOGGING__ECHO_STDOUT=' <<<"$out")"
 
   # What it must NEVER see: the same secret under names we never promised.
   assert_equals "the provider-env JSON blob does not survive" \
@@ -2480,9 +2489,14 @@ test_fastly_fake_rejects_inexact_commands() {
     run_generated_fastly "$root" service-version update --service-id=dummyservice --version=42
   assert_fails "compute update rejects missing autoclone and non-interactive flags" \
     run_generated_fastly "$root" compute update --service-id=dummyservice --version=active --package="$root/package.tar.gz"
+  assert_fails "compute hash-files rejects an incomplete package identity command" \
+    run_generated_fastly "$root" compute hash-files --package="$root/package.tar.gz" --skip-build --non-interactive
   assert_equals "activation rejects v42 before compute update prepares it" 400 \
     "$(generated_fastly_api_status "$root" 'https://api.fastly.com/service/dummyservice/version/42/activate')"
 
+  assert_succeeds "the exact package identity command is accepted" \
+    run_generated_fastly "$root" compute hash-files --package="$root/package.tar.gz" \
+      --skip-build --non-interactive --quiet
   assert_succeeds "the exact active-source compute update is accepted" \
     run_generated_fastly "$root" compute update --service-id=dummyservice --autoclone \
       --version=active --package="$root/package.tar.gz" --non-interactive
@@ -2551,6 +2565,7 @@ write_deploy_assertion_state() {
   : >"$root/calls.log"
   if [[ "$commands" != missing ]]; then
     printf '%s\n' \
+      'fastly compute hash-files --package=/release/package/app.tar.gz --skip-build --non-interactive --quiet' \
       'fastly compute update --service-id=dummyservice --autoclone --version=active --package=/release/package/app.tar.gz --non-interactive' \
       "fastly service-version update --service-id=dummyservice --version=42 --comment $comment" \
       >>"$root/calls.log"
@@ -2571,8 +2586,8 @@ write_deploy_assertion_state() {
       >>"$root/calls.log"
   fi
   case "$order" in
-    valid) printf '%s\n%s\n%s\n%s\n' "$create" "$read" "$links" "$publish" >>"$root/calls.log" ;;
-    publish-first) printf '%s\n%s\n%s\n%s\n' "$publish" "$create" "$read" "$links" >>"$root/calls.log" ;;
+    valid) printf '%s\n%s\n%s\n%s\n%s\n' "$create" "$read" "$links" 'GET https://api.fastly.com/service/dummyservice/version/42/package' "$publish" >>"$root/calls.log" ;;
+    publish-first) printf '%s\n%s\n%s\n%s\n%s\n' "$publish" "$create" "$read" "$links" 'GET https://api.fastly.com/service/dummyservice/version/42/package' >>"$root/calls.log" ;;
   esac
 }
 
@@ -2776,10 +2791,12 @@ test_fastly_version_scoped_documentation() {
   # shellcheck disable=SC2016 # GitHub expression is the literal documentation contract.
   assert_fails "example never treats a hostname as a GitHub Environment name" \
     grep -Fq 'environment: ${{ inputs.domain }}' "$example_workflow"
-  assert_succeeds "example preflight maps the production hostname" \
-    grep -Fq 'app.example.com) environment=production' "$adoption"
-  assert_succeeds "example preflight maps the staging hostname" \
-    grep -Fq 'staging.app.example.com) environment=staging' "$adoption"
+  assert_succeeds "example preflight derives the production Environment from the real hostname" \
+    grep -Fq 'production) environment="$DOMAIN"' "$adoption"
+  assert_succeeds "example preflight prefixes only the staging Environment identifier" \
+    grep -Fq 'staging) environment="staging.$DOMAIN"' "$adoption"
+  assert_succeeds "example keeps one real application domain across both targets" \
+    grep -Fq 'hostname passed to healthcheck for both targets' "$adoption"
   assert_succeeds "release identity is selected before the publisher environment" \
     grep -Fq 'Select the source revision and release digest' "$adoption"
   assert_succeeds "deployer never checks out or rebuilds application source" \
@@ -3640,6 +3657,8 @@ CLI
   assert_fails "conflicting version values fail closed" run_deploy conflict-cli
   assert_fails "no fastly-version is threaded on a conflicting deploy" \
     grep -q '^fastly-version=' "$dir/out"
+  assert_succeeds "a valid package digest survives a conflicting version contract" \
+    grep -qx "package-digest=$package_digest" "$dir/out"
 
   # A malformed `version=` line must fail closed even BESIDE a valid one — the
   # malformed line must be rejected before the valid values are deduplicated.
@@ -3649,6 +3668,27 @@ CLI
   assert_fails "a malformed version line fails closed even beside a valid one" run_deploy malformed-cli
   assert_fails "no fastly-version is threaded when any version line is malformed" \
     grep -q '^fastly-version=' "$dir/out"
+  assert_succeeds "a valid package digest survives a malformed version contract" \
+    grep -qx "package-digest=$package_digest" "$dir/out"
+
+  cat >"$dir/bin/missing-package-cli" <<'CLI'
+#!/usr/bin/env bash
+echo "version=42"
+CLI
+  cat >"$dir/bin/mismatched-package-cli" <<'CLI'
+#!/usr/bin/env bash
+echo "package-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+echo "version=42"
+CLI
+  chmod +x "$dir/bin/missing-package-cli" "$dir/bin/mismatched-package-cli"
+  for cli in missing-package-cli mismatched-package-cli; do
+    : >"$dir/out"
+    assert_fails "$cli fails its successful-deploy package contract" run_deploy "$cli"
+    assert_succeeds "$cli retains the independently valid recovery version" \
+      grep -qx 'fastly-version=42' "$dir/out"
+    assert_fails "$cli emits no unverified package digest" \
+      grep -q '^package-digest=' "$dir/out"
+  done
 
   # A managed deploy can create a recoverable draft and emit its version before a
   # later operation fails. The wrapper must retain that exact version while

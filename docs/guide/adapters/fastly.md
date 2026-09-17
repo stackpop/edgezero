@@ -243,8 +243,10 @@ Fastly's managed lifecycle. Before any new code can receive traffic, EdgeZero:
 5. removes inherited managed links that are no longer desired;
 6. creates each desired link under the exact physical store name;
 7. creates or verifies the immutable version descriptor;
-8. reads back the descriptor and exact links and revalidates both versions; and
-9. stages or activates the prepared version.
+8. reads back the descriptor and exact links and revalidates both versions;
+9. compares the target version's provider-visible package `files_hash` with the
+   verified local package; and
+10. stages or activates the prepared version.
 
 This prepares the descriptor and exact resource links before staging or
 activation. Any ambiguous resource, alias collision, malformed provider record,
@@ -256,11 +258,13 @@ still link the same physical `edgezero_runtime_env`, with separate immutable key
 for their service versions. Multiple services can safely share that physical
 store because their descriptor keys cannot collide.
 
-When a source version predates descriptors, clean cutover uses complete provider
-resource-ID inventories to classify inherited Config/KV/Secret links. It deletes
-every classified managed link absent from the desired set and preserves links
-whose IDs are outside all managed inventories. It does not inspect any legacy
-selector entry.
+When a source version predates descriptors, EdgeZero refuses to infer link
+ownership from complete provider inventories. An inherited Config/KV/Secret
+link absent from the desired set stops publication until it is declared or an
+operator removes it after review. Links whose IDs are outside all store
+inventories remain untouched. A prior descriptor is trusted only when the
+source version links `edgezero_runtime_env` to the exact resolved runtime store.
+EdgeZero does not inspect any legacy selector entry.
 
 PR #344 service-scoped selectors, unscoped canonical entries, and old staging
 twin stores are unsupported and are never read or written. They are inert under

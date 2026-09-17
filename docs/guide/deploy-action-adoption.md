@@ -65,6 +65,8 @@ Publisher GitHub Environments can set canonical runtime variables such as:
 
 ```text
 EDGEZERO__LOGGING__LEVEL
+EDGEZERO__LOGGING__USE_FASTLY_LOGGER
+EDGEZERO__LOGGING__ECHO_STDOUT
 EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME
 EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
 EDGEZERO__STORES__KV__CACHE__NAME
@@ -82,14 +84,12 @@ descriptor format and clean-cutover behavior.
 
 ## Example application deployer
 
-The example application has two hostnames:
-
-- `app.example.com` selects the `production` GitHub Environment;
-- `staging.app.example.com` selects the `staging` GitHub Environment.
-
-The hostname remains the real Fastly and healthcheck domain. It is not itself a
-GitHub Environment name. Validate and map it in a credential-free preflight job,
-then use the preflight output on the deploy job.
+The example application has one real hostname, `app.example.com`, and two
+publication targets. Production selects the `app.example.com` GitHub
+Environment; staging selects `staging.app.example.com`. Both targets still pass
+`app.example.com` to Fastly health checks. Validate the domain and target in a
+credential-free preflight job, derive the Environment identifier there, and use
+that output on the deploy job.
 
 ```yaml
 name: Deploy Application
@@ -100,10 +100,15 @@ on:
       domain:
         description: Application hostname
         required: true
+        type: string
+        default: app.example.com
+      deploy-to:
+        description: Publication target
+        required: true
         type: choice
         options:
-          - app.example.com
-          - staging.app.example.com
+          - staging
+          - production
       source-revision:
         description: Approved application revision
         required: true
@@ -140,14 +145,19 @@ jobs:
       - id: target
         env:
           DOMAIN: ${{ inputs.domain }}
+          DEPLOY_TO: ${{ inputs.deploy-to }}
         run: |
           case "$DOMAIN" in
-            app.example.com) environment=production ; deploy_to=production ;;
-            staging.app.example.com) environment=staging ; deploy_to=staging ;;
+            app.example.com) ;;
             *) echo "::error::unsupported application domain"; exit 1 ;;
           esac
+          case "$DEPLOY_TO" in
+            production) environment="$DOMAIN" ;;
+            staging) environment="staging.$DOMAIN" ;;
+            *) echo "::error::unsupported publication target"; exit 1 ;;
+          esac
           echo "environment=$environment" >>"$GITHUB_OUTPUT"
-          echo "deploy-to=$deploy_to" >>"$GITHUB_OUTPUT"
+          echo "deploy-to=$DEPLOY_TO" >>"$GITHUB_OUTPUT"
 
   deploy:
     needs: preflight
@@ -231,7 +241,7 @@ downloads the release once; each lifecycle action independently verifies the
 same archive and digest. It receives environment-scoped runtime values only
 after release selection. The optional `CREDENTIALS` selector is a Secret Store
 name from `vars`, never a secret value. `inputs.domain` remains the actual
-hostname passed to healthcheck. The deployer checkout is only the deployment
+hostname passed to healthcheck for both targets. The deployer checkout is only the deployment
 repository; it never checks out or rebuilds application source.
 
 For a staging rollback, omit `rollback-to`; for production, skip rollback when

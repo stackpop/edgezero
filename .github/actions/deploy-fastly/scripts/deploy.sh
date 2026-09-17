@@ -80,10 +80,14 @@ main() {
     set -e
     fail_with "$rc" "deploy failed (CLI exit $rc or setup error before invocation)"
   fi
+
+  # Publish every independently valid recovery value before checking the other
+  # post-invocation contract. A package-output defect must not hide a version
+  # that may already identify a mutated provider draft, and vice versa.
+  [[ "$version_status" -ne 0 ]] || append_output fastly-version "$version"
+  [[ "$package_status" -ne 0 ]] || append_output package-digest "$package_digest"
   [[ "$version_status" -eq 0 ]] || fail "deploy reported success without one unambiguous canonical 'version=<digits>' line"
   [[ "$package_status" -eq 0 ]] || fail "deploy reported success without the verified canonical package digest"
-  append_output fastly-version "$version"
-  append_output package-digest "$package_digest"
 }
 
 main "$@"

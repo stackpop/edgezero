@@ -205,6 +205,8 @@ capture_public_runtime_env() {
       [[ "$name" == "EDGEZERO__ADAPTER__PORT" ]] ||
       [[ "$name" == "EDGEZERO__LOGGING__ENDPOINT" ]] ||
       [[ "$name" == "EDGEZERO__LOGGING__LEVEL" ]] ||
+      [[ "$name" == "EDGEZERO__LOGGING__USE_FASTLY_LOGGER" ]] ||
+      [[ "$name" == "EDGEZERO__LOGGING__ECHO_STDOUT" ]] ||
       [[ "$name" =~ ^EDGEZERO__STORES__CONFIG__[A-Z0-9_]+__(NAME|KEY)$ ]] ||
       [[ "$name" =~ ^EDGEZERO__STORES__(KV|SECRETS)__[A-Z0-9_]+__NAME$ ]]; then
       PUBLIC_RUNTIME_ENV_NAMES+=("$name")

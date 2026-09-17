@@ -124,6 +124,8 @@ contain the service ID:
 
 ```text
 EDGEZERO__LOGGING__LEVEL
+EDGEZERO__LOGGING__USE_FASTLY_LOGGER
+EDGEZERO__LOGGING__ECHO_STDOUT
 EDGEZERO__STORES__CONFIG__<ID>__NAME
 EDGEZERO__STORES__CONFIG__<ID>__KEY
 EDGEZERO__STORES__KV__<ID>__NAME
@@ -138,15 +140,17 @@ For a managed deployment, EdgeZero verifies the release and resolves the complet
 Config, KV, and Secret inventories before mutation. It uploads the verified
 package to an unreachable draft, reconciles the descriptor and exact resource
 links, reads them back, revalidates the source and target, and prepares the
-descriptor and exact resource links before staging or activation. A lookup,
-collision, malformed inventory, changed source, descriptor mismatch, or readback
-failure stops publication.
+descriptor and exact resource links before staging or activation. It also
+compares Fastly's final package `files_hash` with the verified local package. A
+lookup, collision, malformed inventory, changed source, descriptor mismatch,
+package mismatch, or readback failure stops publication.
 
-When the active source has no version descriptor, clean cutover classifies its
-inherited links by the complete physical resource inventories. It removes every
-inherited Config/KV/Secret link that is not desired and preserves links whose
-resource IDs are outside those inventories. It does not inspect any legacy
-selector entry.
+When the source has no version descriptor, EdgeZero does not infer ownership
+from the account-wide resource inventories. Any inherited Config/KV/Secret link
+outside the desired manifest stops the first managed deployment. Declare every
+store the application needs or remove an audited stale link before retrying.
+Provider resources outside those inventories remain untouched. EdgeZero does
+not inspect any legacy selector entry.
 
 PR #344 service-scoped and unscoped selector entries and old physical staging
 twin stores are unsupported. Current deploys never read or write them. They are
@@ -178,7 +182,7 @@ archive:
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
     fastly-version: ${{ steps.stage.outputs.fastly-version }}
-    domain: staging.example.com
+    domain: app.example.com
     path: /health
     deploy-to: staging
 
@@ -197,7 +201,9 @@ archive:
 Staging and production can select different physical stores and runtime values,
 but both use the exact release package and manifests. Staging publication uses a
 version-scoped descriptor in the same physical runtime store; it does not create
-another runtime Config Store.
+another runtime Config Store. The `domain` remains the application's real Fastly
+hostname for both targets; a workflow may use a separate value such as
+`staging.app.example.com` only as its GitHub Environment identifier.
 
 For production rollback, capture `previous-version` from deploy and pass it as
 `rollback-to`:

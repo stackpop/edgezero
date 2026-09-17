@@ -262,6 +262,18 @@ struct ServiceEnvironmentRecord {
     service_id: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ComputePackageRecord {
+    metadata: ComputePackageMetadata,
+    service_id: String,
+    version: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ComputePackageMetadata {
+    files_hash: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VersionSource {
     Active(u64),
@@ -321,6 +333,7 @@ struct ManagedDeployPlan {
     environment: EnvConfig,
     inventories: ResourceInventories,
     links: LinkReconciliation,
+    package_files_hash: String,
     package_sha256: String,
     prior_descriptor: Option<RuntimeDescriptor>,
     release: VerifiedApplicationRelease,
@@ -727,13 +740,25 @@ fn plan_link_reconciliation(
         }
     }
 
+    if prior_managed_aliases.is_none() {
+        let mut undeclared = existing
+            .iter()
+            .filter(|link| !desired_by_alias.contains_key(link.alias.as_str()))
+            .filter(|link| inventories.contains_resource_id(&link.resource_id))
+            .map(|link| link.alias.as_str())
+            .collect::<Vec<_>>();
+        undeclared.sort_unstable();
+        if let Some(alias) = undeclared.first() {
+            return Err(format!(
+                "first managed Fastly deployment found inherited store link `{alias}` without prior descriptor ownership; declare the required store in edgezero.toml or remove the stale link before retrying"
+            ));
+        }
+    }
+
     let mut delete_link_ids = existing
         .iter()
         .filter(|link| !desired_by_alias.contains_key(link.alias.as_str()))
-        .filter(|link| match prior_managed_aliases {
-            Some(aliases) => aliases.contains(&link.alias),
-            None => inventories.contains_resource_id(&link.resource_id),
-        })
+        .filter(|link| prior_managed_aliases.is_some_and(|aliases| aliases.contains(&link.alias)))
         .map(|link| link.link_id.clone())
         .collect::<Vec<_>>();
     delete_link_ids.sort();
@@ -742,6 +767,26 @@ fn plan_link_reconciliation(
         create,
         delete_link_ids,
     })
+}
+
+fn require_descriptor_source_link(
+    source_links: &[ExistingResourceLink],
+    runtime_store_id: &str,
+) -> Result<(), String> {
+    let Some(link) = source_links
+        .iter()
+        .find(|link| link.alias == RUNTIME_ENV_STORE_NAME)
+    else {
+        return Err(format!(
+            "Fastly source version has a runtime descriptor but no `{RUNTIME_ENV_STORE_NAME}` resource link; refusing an orphan descriptor"
+        ));
+    };
+    if link.resource_id != runtime_store_id {
+        return Err(format!(
+            "Fastly source version `{RUNTIME_ENV_STORE_NAME}` link does not match the resolved runtime descriptor store"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_reusable_initial_draft_links(
@@ -820,6 +865,7 @@ fn build_managed_deploy_plan(
         .adapter_manifest()
         .parent()
         .ok_or_else(|| "verified Fastly manifest has no parent directory".to_owned())?;
+    let package_files_hash = compute_package_files_hash(release.package(), cwd, token.as_str())?;
 
     let raw_config_inventory = run_fastly_json_capture(&["config-store", "list", "--json"], cwd)?;
     let config_inventory = parse_store_inventory(ResourceKind::Config, &raw_config_inventory)?;
@@ -861,6 +907,9 @@ fn build_managed_deploy_plan(
     let descriptor_key = runtime_descriptor_key(&service_id, source_version);
     let prior_descriptor_raw =
         read_exact_config_store_item_value(&runtime_store_id, &descriptor_key, token.as_str())?;
+    if prior_descriptor_raw.is_some() {
+        require_descriptor_source_link(&source_links, &runtime_store_id)?;
+    }
     if matches!(selected_source, VersionSource::InitialDraft(_))
         && prior_descriptor_raw
             .as_deref()
@@ -947,6 +996,7 @@ fn build_managed_deploy_plan(
         environment,
         inventories,
         links,
+        package_files_hash,
         package_sha256,
         prior_descriptor,
         release,
@@ -1172,6 +1222,75 @@ fn run_fastly_capture_outcome(
         status: output.status.to_string(),
         success: output.status.success(),
     })
+}
+
+fn is_canonical_sha512_hex(value: &str) -> bool {
+    value.len() == 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_package_files_hash_output(output: &str) -> Result<String, String> {
+    let hashes = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_canonical_sha512_hex(line))
+        .collect::<BTreeSet<_>>();
+    if hashes.len() != 1 {
+        return Err(
+            "Fastly package hash command did not return one unambiguous SHA-512 files hash"
+                .to_owned(),
+        );
+    }
+    hashes.into_iter().next().map(str::to_owned).ok_or_else(|| {
+        "Fastly package hash command did not return one unambiguous SHA-512 files hash".to_owned()
+    })
+}
+
+fn compute_package_files_hash(package: &Path, cwd: &Path, token: &str) -> Result<String, String> {
+    let package_path = package.to_str().ok_or_else(|| {
+        "verified Fastly package path is not valid UTF-8 and cannot be hashed by the Fastly CLI"
+            .to_owned()
+    })?;
+    let outcome = run_fastly_capture_outcome(
+        &[
+            "compute".to_owned(),
+            "hash-files".to_owned(),
+            format!("--package={package_path}"),
+            "--skip-build".to_owned(),
+            "--non-interactive".to_owned(),
+            "--quiet".to_owned(),
+        ],
+        cwd,
+    )?;
+    if !outcome.success {
+        let redacted = outcome.combined.replace(token, "[REDACTED]");
+        return Err(format!(
+            "Fastly package hash command exited with status {}\n{}",
+            outcome.status,
+            redacted.trim()
+        ));
+    }
+    parse_package_files_hash_output(&outcome.combined)
+}
+
+fn parse_package_metadata_files_hash(
+    raw: &str,
+    expected_service_id: &str,
+    expected_version: u64,
+) -> Result<String, String> {
+    let package: ComputePackageRecord = serde_json::from_str(raw)
+        .map_err(|_error| "Fastly package metadata response is malformed".to_owned())?;
+    if package.service_id != expected_service_id || package.version != expected_version {
+        return Err(
+            "Fastly package metadata does not identify the requested service version".to_owned(),
+        );
+    }
+    if !is_canonical_sha512_hex(&package.metadata.files_hash) {
+        return Err("Fastly package metadata contains an invalid files hash".to_owned());
+    }
+    Ok(package.metadata.files_hash)
 }
 
 fn read_version_links(
@@ -1499,6 +1618,17 @@ fn revalidate_managed_draft(
     if descriptor != plan.descriptor_json {
         return Err(format!(
             "Fastly version descriptor `{key}` changed before publication"
+        ));
+    }
+    let package_raw = fastly_api_get(
+        &format!("/service/{}/version/{version}/package", plan.service_id),
+        plan.token.as_str(),
+    )?;
+    let package_files_hash =
+        parse_package_metadata_files_hash(&package_raw, &plan.service_id, version)?;
+    if package_files_hash != plan.package_files_hash {
+        return Err(format!(
+            "Fastly version {version} package identity changed before publication"
         ));
     }
     Ok(())
@@ -1953,6 +2083,13 @@ impl Adapter for FastlyCliAdapter {
         };
         validate_service_id(service_id)?;
         if let Some(version) = command_output.and_then(parse_fastly_version) {
+            let token = require_token()?;
+            verify_version_active(
+                service_id,
+                version,
+                &token,
+                "after manifest-command deployment",
+            )?;
             log::info!("version={version}");
             return Ok(());
         }
@@ -5496,8 +5633,12 @@ fn scan_reserved_deploy_args(args: &[String]) -> Result<(), String> {
             value if value.starts_with("--version=") => Some("--version"),
             value if value.starts_with("--autoclone=") => Some("--autoclone"),
             value if value.starts_with("--token=") => Some("--token"),
-            value if value.starts_with("-s") && value.len() > 2 => Some("-s"),
-            value if value.starts_with("-t") && value.len() > 2 => Some("-t"),
+            value if value.starts_with("-s") && !value.starts_with("--") && value.len() > 2 => {
+                Some("-s")
+            }
+            value if value.starts_with("-t") && !value.starts_with("--") && value.len() > 2 => {
+                Some("-t")
+            }
             _ => None,
         };
         if let Some(flag) = reserved_flag {
@@ -6593,10 +6734,13 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     #[cfg(unix)]
     use std::iter::once;
-
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::tempdir;
+
+    const TEST_PACKAGE_FILES_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     // Shared fixture names. Pinning these as consts (instead of
     // inline `"sessions"` / `"app_config"` per call site) keeps the
@@ -6759,6 +6903,46 @@ mod tests {
     }
 
     #[test]
+    fn deploy_arg_scan_allows_unrelated_long_flags_beginning_with_s_or_t() {
+        scan_reserved_deploy_args(&owned(&[
+            "--skip-build",
+            "--status",
+            "--timeout=30",
+            "--trace",
+        ]))
+        .expect("long flags must not be mistaken for attached -s or -t values");
+    }
+
+    #[test]
+    fn package_files_hash_parsers_require_exact_provider_identity() {
+        let hash = "a".repeat(128);
+        assert_eq!(
+            parse_package_files_hash_output(&format!("notice\n{hash}\n"))
+                .expect("canonical Fastly CLI hash"),
+            hash
+        );
+        parse_package_files_hash_output("abc").expect_err("short hash must fail");
+        parse_package_files_hash_output(&format!("{}\n{}", "a".repeat(128), "b".repeat(128)))
+            .expect_err("conflicting hashes must fail");
+
+        let response = serde_json::json!({
+            "service_id": "SVC1",
+            "version": 8_u64,
+            "metadata": { "files_hash": "a".repeat(128) }
+        })
+        .to_string();
+        assert_eq!(
+            parse_package_metadata_files_hash(&response, "SVC1", 8)
+                .expect("matching package metadata"),
+            "a".repeat(128)
+        );
+        parse_package_metadata_files_hash(&response, "OTHER", 8)
+            .expect_err("wrong service must fail");
+        parse_package_metadata_files_hash(&response, "SVC1", 9)
+            .expect_err("wrong version must fail");
+    }
+
+    #[test]
     fn deploy_arg_preflight_scans_store_free_manifest_deploys() {
         let context = AdapterDeployContext {
             service_id: Some("SVC1".to_owned()),
@@ -6843,27 +7027,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn managed_deploy_finalization_never_writes_runtime_selectors() {
+    fn manifest_command_finalization_binds_reported_version_to_active_service_version() {
         let _lock = path_mutation_guard().lock().expect("guard");
-        let marker_directory = tempdir().expect("marker directory");
-        let marker = marker_directory.path().join("provider.log");
-        let fake = fake_provider_invocation_marker(&marker);
+
+        let fake = tempdir().expect("provider fake");
+        let marker = fake.path().join("provider.log");
+        let curl = fake.path().join("curl");
+        fs::write(
+            &curl,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'called\\n' >> '{}'\nprintf '[{{\"number\":8,\"active\":true,\"locked\":true,\"staging\":false,\"deployed\":true,\"environments\":[{{\"active_version\":8,\"name\":\"production\",\"service_id\":\"SVC1\"}}]}}]\\n200'\n",
+                marker.display()
+            ),
+        )
+        .expect("curl fake");
+        let mut permissions = fs::metadata(&curl).expect("curl metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&curl, permissions).expect("curl executable");
         let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
         let context = AdapterDeployContext {
             service_id: Some("SVC1".to_owned()),
-            stores: DeployStoreIds {
-                config: vec!["config".to_owned()],
-                kv: vec!["kv".to_owned()],
-                secrets: vec!["secret".to_owned()],
-            },
             ..AdapterDeployContext::default()
         };
 
         FastlyCliAdapter
             .finalize_deploy(&context, Some("version=8"))
-            .expect("version-only finalization");
+            .expect("active version finalization");
+        assert!(
+            marker.exists(),
+            "finalization must consult the exact service"
+        );
 
-        assert_provider_not_invoked(&marker);
+        let error = FastlyCliAdapter
+            .finalize_deploy(&context, Some("version=9"))
+            .expect_err("a version from another service or deployment must fail closed");
+        assert!(error.contains('8') && error.contains('9'), "{error}");
     }
 
     #[test]
@@ -7987,7 +8186,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_cutover_removes_all_undesired_store_kinds_and_preserves_unrelated_links() {
+    fn clean_cutover_rejects_undeclared_inherited_stores_without_prior_descriptor() {
         let inventories = deploy_plan_inventories();
         let desired = deploy_plan_desired_links();
         let existing = vec![
@@ -8012,14 +8211,40 @@ mod tests {
                 resource_id: "NOT_A_STORE".to_owned(),
             },
         ];
-        let plan = plan_link_reconciliation(&desired, &existing, None, &inventories)
-            .expect("clean cutover plan");
-        assert_eq!(plan.delete_link_ids, ["OLD_CONFIG", "OLD_KV", "OLD_SECRET"]);
+        let error = plan_link_reconciliation(&desired, &existing, None, &inventories)
+            .expect_err("first managed cutover must not infer ownership from account inventory");
+        assert!(error.contains("old-config"), "{error}");
         assert!(
-            !plan
-                .delete_link_ids
-                .iter()
-                .any(|id| id == "BACKEND_RESOURCE")
+            error.contains("declare") || error.contains("remove"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn prior_descriptor_requires_exact_runtime_store_link_on_source_version() {
+        let matching = vec![ExistingResourceLink {
+            link_id: "RUNTIME_LINK".to_owned(),
+            alias: RUNTIME_ENV_STORE_NAME.to_owned(),
+            resource_id: "RUNTIME".to_owned(),
+        }];
+        require_descriptor_source_link(&matching, "RUNTIME")
+            .expect("the exact source link proves descriptor reachability");
+
+        let missing = Vec::new();
+        let error = require_descriptor_source_link(&missing, "RUNTIME")
+            .expect_err("an orphan descriptor must not establish ownership");
+        assert!(error.contains(RUNTIME_ENV_STORE_NAME), "{error}");
+
+        let wrong = vec![ExistingResourceLink {
+            link_id: "OTHER_RUNTIME_LINK".to_owned(),
+            alias: RUNTIME_ENV_STORE_NAME.to_owned(),
+            resource_id: "OTHER_RUNTIME".to_owned(),
+        }];
+        let wrong_store_error = require_descriptor_source_link(&wrong, "RUNTIME")
+            .expect_err("a descriptor in a different physical store is not authoritative");
+        assert!(
+            wrong_store_error.contains("does not match"),
+            "{wrong_store_error}"
         );
     }
 
@@ -8411,12 +8636,14 @@ mod tests {
 printf '%s\n' "$*" >> '{log}'
 if [ "$1 $2" = "config-store list" ]; then cat '{config}'; exit 0; fi
 if [ "$1 $2" = "resource-link list" ]; then cat '{links}'; exit 0; fi
+if [ "$1 $2" = "compute hash-files" ]; then printf '%s\n' '{package_files_hash}'; exit 0; fi
 echo 'unexpected provider command' >&2
 exit 1
 "#,
             log = operation_log.display(),
             config = fake.path().join("config.json").display(),
             links = fake.path().join("links.json").display(),
+            package_files_hash = TEST_PACKAGE_FILES_HASH,
         );
         let fastly = fake.path().join("fastly");
         fs::write(&fastly, script).expect("fastly fake");
@@ -8648,13 +8875,16 @@ esac
             spec.selection,
             selection_upper
         );
-        let source_links = if matches!(spec.source, ManagedFakeSource::Staged) {
-            final_links.replace("DRAFT_", "SRC_")
-        } else {
-            format!(
+        let source_links = match spec.source {
+            ManagedFakeSource::Staged => final_links.replace("DRAFT_", "SRC_"),
+            ManagedFakeSource::InitialDraft => format!(
+                r#"[{{"id":"SRC_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME","created_at":"2026-09-16T00:00:00Z"}},{{"id":"SRC_CONFIG","name":"config-{}","resource_id":"CONFIG_{}"}},{{"id":"SRC_OTHER","name":"backend-resource","resource_id":"NOT_A_STORE"}}]"#,
+                spec.selection, selection_upper
+            ),
+            ManagedFakeSource::Active => format!(
                 r#"[{{"id":"SRC_RUNTIME","name":"edgezero_runtime_env","resource_id":"RUNTIME","created_at":"2026-09-16T00:00:00Z"}},{{"id":"SRC_CONFIG","name":"config-{}","resource_id":"CONFIG_{}"}},{{"id":"SRC_OLD","name":"kv-old","resource_id":"KV_OLD"}},{{"id":"SRC_OTHER","name":"backend-resource","resource_id":"NOT_A_STORE"}}]"#,
                 spec.selection, selection_upper
-            )
+            ),
         };
         let draft_links = if matches!(spec.source, ManagedFakeSource::Staged) {
             final_links.clone()
@@ -8740,11 +8970,12 @@ fail_at=''
 [ -f '{fail_at}' ] && fail_at=$(cat '{fail_at}')
 case "$1 $2" in
   'config-store list') cat '{config}'; exit 0;;
+  'compute hash-files') printf '%s\n' '{package_files_hash}'; exit 0;;
   'resource-link list')
     target_links() {{
       if [ -f '{final_version_read}' ]; then
         if [ "$fail_at" = 'final-link-revalidation' ]; then cat '{draft_links}'; else cat '{final_links}'; fi
-      elif [ -f '{deleted}' ] && [ -f '{created_kv}' ] && [ -f '{created_secret}' ]; then
+      elif {{ [ '{delete_required}' = no ] || [ -f '{deleted}' ]; }} && [ -f '{created_kv}' ] && [ -f '{created_secret}' ]; then
         if [ "$fail_at" = 'reconciled-link-verification' ]; then cat '{draft_links}'; else cat '{final_links}'; fi
       else
         [ "$fail_at" = 'inherited-link-lookup' ] && return 60
@@ -8865,6 +9096,12 @@ exit 40
                     ManagedFakeSource::Active => "DRAFT_OLD",
                     ManagedFakeSource::InitialDraft | ManagedFakeSource::Staged => "SRC_OLD",
                 },
+                delete_required = if matches!(spec.source, ManagedFakeSource::Active) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                package_files_hash = TEST_PACKAGE_FILES_HASH,
             ),
         )
         .expect("stateful fastly fake");
@@ -8927,6 +9164,10 @@ case "$config" in
   *'/service/{service_id}/version/{source_version}/settings"'*)
     if [ "$fail_at" = 'final-protected-state-drift' ] && [ -f '{final_version_read}' ]; then printf '{{"general.default_host":"changed.example.com"}}\n200'
     else printf '{{"general.default_host":"origin.example.com"}}\n200'; fi;;
+  *'/service/{service_id}/version/{target_version}/package"'*)
+    if [ "$fail_at" = 'final-package-revalidation' ]; then package_hash='{changed_package_files_hash}'
+    else package_hash='{package_files_hash}'; fi
+    printf '{{"service_id":"{service_id}","version":{target_version},"metadata":{{"files_hash":"%s"}}}}\n200' "$package_hash";;
   *'/service/{service_id}/version/{target_version}/activate'*) if [ "$fail_at" = 'activate' ]; then printf '500'; else printf 'activate\n' >> '{log}'; touch '{activated}'; printf '200'; fi;;
   *) printf '{{"error":"unexpected"}}\n500';;
 esac
@@ -8971,6 +9212,8 @@ esac
                 } else {
                     "no"
                 },
+                package_files_hash = TEST_PACKAGE_FILES_HASH,
+                changed_package_files_hash = "b".repeat(128),
             ),
         )
         .expect("stateful curl fake");
@@ -10163,7 +10406,6 @@ esac
             assert!(error.contains("protected configuration"), "{error}");
             for mutation in [
                 "draft",
-                "deleted",
                 "created-kv",
                 "created-secret",
                 "descriptor-readback-done",
@@ -10174,6 +10416,10 @@ esac
                     "{mutation} must precede the final protected-state barrier"
                 );
             }
+            assert!(
+                !fake.path().join("deleted").exists(),
+                "a first managed deployment must not infer a stale link to delete"
+            );
             assert_eq!(
                 fs::read(
                     fake.path()
@@ -10224,6 +10470,7 @@ esac
             ("final-version-revalidation", false, Some(8_u64), None),
             ("final-link-revalidation", false, Some(8_u64), None),
             ("final-descriptor-revalidation", false, Some(8_u64), None),
+            ("final-package-revalidation", false, Some(8_u64), None),
             ("activate", false, Some(8_u64), None),
             ("stage", true, Some(8_u64), None),
         ] {
@@ -10323,7 +10570,8 @@ esac
                 | "descriptor-readback"
                 | "final-version-revalidation"
                 | "final-link-revalidation"
-                | "final-descriptor-revalidation" => &["activate"],
+                | "final-descriptor-revalidation"
+                | "final-package-revalidation" => &["activate"],
                 _ => &[],
             };
             for forbidden in forbidden_after_failure {
@@ -10472,6 +10720,31 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn deploy_plan_rejects_orphan_source_descriptor_without_runtime_store_link() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fixture = deploy_plan_release_fixture();
+        let log = fixture.root.path().join("orphan-descriptor.log");
+        let prior = RuntimeDescriptor::from_entries(BTreeMap::new())
+            .expect("prior descriptor")
+            .canonical_json()
+            .expect("prior descriptor JSON");
+        let fake = fake_managed_plan_provider(
+            r#"[{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]}]"#,
+            r#"[{"id":"LINK_CONFIG","name":"config-a","resource_id":"CONFIG_A"}]"#,
+            Some(&prior),
+            r#"[{"id":"RUNTIME","name":"edgezero_runtime_env"},{"id":"CONFIG_A","name":"config-a"}]"#,
+            &log,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+
+        let error = build_managed_deploy_plan(&managed_plan_context(&fixture), &[])
+            .expect_err("an account-wide descriptor is not authoritative without its source link");
+        assert!(error.contains("orphan descriptor"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deploy_plan_runtime_configuration_cannot_select_different_release_members() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let fixture = deploy_plan_release_fixture();
@@ -10568,7 +10841,7 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn deploy_plan_store_free_kv_selection_still_classifies_inherited_kv_from_all_pages() {
+    fn deploy_plan_store_free_cutover_rejects_inherited_kv_found_on_later_page() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let fixture = deploy_plan_release_fixture();
         let log_directory = tempdir().expect("provider log directory");
@@ -10594,13 +10867,9 @@ esac
             .variable_defaults
             .remove("EDGEZERO__STORES__KV__CACHE__NAME");
 
-        let plan = build_managed_deploy_plan(&context, &[]).expect("plan without declared KV");
-        assert_eq!(plan.links.delete_link_ids, ["LINK_OLD_KV"]);
-        assert!(
-            plan.desired_links
-                .iter()
-                .all(|link| link.kind != ResourceKind::Kv)
-        );
+        let error = build_managed_deploy_plan(&context, &[])
+            .expect_err("descriptor-less cutover must not delete an inherited KV store");
+        assert!(error.contains("kv-old"), "{error}");
         let operations = fs::read_to_string(&log).expect("provider command log");
         assert!(
             operations.contains("/resources/stores/kv?limit=100&cursor=page-two"),
