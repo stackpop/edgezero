@@ -178,6 +178,37 @@ impl EnvConfig {
     }
 }
 
+/// Merge manifest environment-variable defaults with parent-process values.
+///
+/// Entries from `parent` are applied last and therefore override defaults with
+/// the same exact environment-variable name. The returned map is intentionally
+/// provider-neutral; callers may validate it or pass it to [`EnvConfig::from_vars`].
+#[must_use]
+#[inline]
+pub fn merge_env_defaults<DI, DK, DV, PI, PK, PV>(
+    defaults: DI,
+    parent: PI,
+) -> BTreeMap<String, String>
+where
+    DI: IntoIterator<Item = (DK, DV)>,
+    DK: AsRef<str>,
+    DV: AsRef<str>,
+    PI: IntoIterator<Item = (PK, PV)>,
+    PK: AsRef<str>,
+    PV: AsRef<str>,
+{
+    let mut merged = defaults
+        .into_iter()
+        .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    merged.extend(
+        parent
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned())),
+    );
+    merged
+}
+
 /// `true` if `value` is empty, made entirely of whitespace, or
 /// contains any ASCII / Unicode control character. Used to reject
 /// platform-name overrides that would otherwise flow as empty
@@ -191,6 +222,32 @@ fn is_blank_or_control(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_env_defaults_applies_parent_values_last() {
+        let merged = merge_env_defaults(
+            [
+                (
+                    "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+                    "manifest-name",
+                ),
+                ("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "manifest-key"),
+            ],
+            [
+                ("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "parent-name"),
+                ("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "parent-key"),
+            ],
+        );
+
+        assert_eq!(
+            merged.get("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"),
+            Some(&"parent-name".to_owned())
+        );
+        assert_eq!(
+            merged.get("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"),
+            Some(&"parent-key".to_owned())
+        );
+    }
 
     fn sample() -> EnvConfig {
         EnvConfig::from_vars([

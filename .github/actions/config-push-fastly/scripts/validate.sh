@@ -9,7 +9,6 @@ set -euo pipefail
 #   EDGEZERO__APP__RELEASE__SHA256_PRESENT  required  release digest presence flag
 #   EDGEZERO__FASTLY__API_TOKEN_PRESENT   required  "true" when fastly-api-token is non-empty
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
-#   EDGEZERO__CONFIG_PUSH__KEY_PRESENT    optional  "true" when an explicit key was supplied
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../deploy-core/scripts/common.sh
@@ -30,12 +29,6 @@ main() {
     production | staging) ;;
     *) fail "input 'deploy-to' must be 'production' or 'staging' (got '${EDGEZERO__DEPLOY__TO:-}')" ;;
   esac
-  # A staging push uses the canonical environment KEY, with `<id>_staging` only
-  # as its fallback. An action-level `key` input would bypass that shared
-  # resolution and could diverge from the deployed descriptor, so reject it here.
-  if [[ "$deploy_to" == "staging" && "${EDGEZERO__CONFIG_PUSH__KEY_PRESENT:-}" == "true" ]]; then
-    fail "input 'key' cannot be combined with deploy-to: staging; set EDGEZERO__STORES__CONFIG__<ID>__KEY in the staging environment and push without 'key', or push to production with 'key'."
-  fi
 }
 
 main "$@"

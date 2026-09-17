@@ -31,10 +31,6 @@ inputs:
     description: Optional logical Config Store ID declared by the bundled application manifest.
     required: false
     default: ""
-  key:
-    description: Optional production config key; unavailable for staging pushes.
-    required: false
-    default: ""
   deploy-to:
     description: "Select the canonical environment key, with production/staging fallback when absent."
     required: false
@@ -90,7 +86,6 @@ runs:
         EDGEZERO__APP__RELEASE__SHA256_PRESENT: ${{ inputs['app-release-sha256'] != '' && 'true' || 'false' }}
         EDGEZERO__FASTLY__API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
-        EDGEZERO__CONFIG_PUSH__KEY_PRESENT: ${{ inputs.key != '' && 'true' || 'false' }}
         EDGEZERO__CONFIG_PUSH__APP_CONFIG_PRESENT: ${{ inputs['app-config'] != '' && 'true' || 'false' }}
         EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE_PRESENT: ${{ inputs['app-config-inline'] != '' && 'true' || 'false' }}
         FASTLY_API_TOKEN: ""
@@ -201,7 +196,6 @@ runs:
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
         EDGEZERO__CONFIG_PUSH__STORE: ${{ inputs.store }}
-        EDGEZERO__CONFIG_PUSH__KEY: ${{ inputs.key }}
         EDGEZERO__CONFIG_PUSH__MANIFEST: ${{ steps.release.outputs['application-manifest'] }}
         EDGEZERO__CONFIG_PUSH__APP_CONFIG: ${{ inputs['app-config'] }}
         EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE: ${{ inputs['app-config-inline'] }}

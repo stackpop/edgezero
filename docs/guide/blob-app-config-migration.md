@@ -254,10 +254,11 @@ staging or activation.
 
 A staged config push uses the staging GitHub Environment's canonical
 `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` value when present. If it is absent,
-the push and managed deployment descriptor both fall back to
+an applicable `[environment.variables]` manifest default is used next. When
+both are absent, the push and managed deployment descriptor fall back to
 `app_config_staging`. Production and staging can select the same physical store
-or different stores. Those runtime choices do not change the application
-release or Fastly package.
+or different stores. Those runtime choices do not change the application release
+or Fastly package.
 
 For local Viceroy testing, seed one complete descriptor under an explicit test
 service/version key rather than setting an unscoped selector:

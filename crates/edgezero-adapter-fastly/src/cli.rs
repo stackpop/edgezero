@@ -39,7 +39,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
-use edgezero_core::env_config::EnvConfig;
+use edgezero_core::env_config::{EnvConfig, merge_env_defaults};
 use walkdir::WalkDir;
 
 static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
@@ -5627,8 +5627,7 @@ fn validate_deploy_service_id_for_manifest(
 }
 
 fn effective_deploy_environment(context: &AdapterDeployContext) -> Result<EnvConfig, String> {
-    let mut variables = context.variable_defaults.clone();
-    variables.extend(env::vars());
+    let variables = merge_env_defaults(context.variable_defaults.iter(), env::vars());
     validated_deploy_env(
         variables,
         &context.stores.config,
@@ -6934,7 +6933,7 @@ mod tests {
         let legacy_feature_name = "EDGEZERO__SERVICES__SVC1__STORES__CONFIG__FEATURE_FLAGS__NAME";
         let _parent = EnvOverride::set(config_name, "parent_config");
         let _no_parent_kv = EnvOverride::remove(kv_name);
-        let _no_parent_key = EnvOverride::remove(config_key);
+        let _parent_key = EnvOverride::set(config_key, "parent_key");
         let _legacy = EnvOverride::set(legacy_name, "legacy_config");
         let _legacy_feature = EnvOverride::set(legacy_feature_name, "legacy_feature_flags");
         let context = AdapterDeployContext {
@@ -6945,6 +6944,7 @@ mod tests {
             },
             variable_defaults: BTreeMap::from([
                 (config_name.to_owned(), "manifest_config".to_owned()),
+                (config_key.to_owned(), "manifest_key".to_owned()),
                 (kv_name.to_owned(), "manifest_sessions".to_owned()),
                 (legacy_name.to_owned(), "legacy_manifest_config".to_owned()),
                 (
@@ -6969,8 +6969,8 @@ mod tests {
         );
         assert_eq!(
             environment.store_key("config", "app_config"),
-            "app_config",
-            "the logical id must fill an absent config selector"
+            "parent_key",
+            "the parent config key must override the manifest default"
         );
         assert_eq!(
             environment.store_name("config", "feature_flags"),

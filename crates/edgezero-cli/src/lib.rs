@@ -61,7 +61,9 @@ use args::{
 #[cfg(feature = "cli")]
 use edgezero_adapter::registry::{AdapterDeployContext, DeployStoreIds};
 #[cfg(feature = "cli")]
-use edgezero_core::manifest::{ManifestLoader, StoreDeclaration};
+use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
+#[cfg(feature = "cli")]
+use std::collections::BTreeMap;
 #[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
@@ -198,11 +200,8 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     };
     let variable_defaults = manifest
         .as_ref()
-        .map(|loader| loader.manifest().environment_for(&args.adapter))
-        .into_iter()
-        .flat_map(|environment| environment.variables)
-        .filter_map(|binding| binding.value.map(|value| (binding.env, value)))
-        .collect();
+        .map(|loader| manifest_variable_defaults(loader.manifest(), &args.adapter))
+        .unwrap_or_default();
     let (adapter_manifest_path, adapter_manifest_path_error) =
         match resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter) {
             Ok(path) => (path.map(PathBuf::from), None),
@@ -230,6 +229,16 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         manifest.as_ref(),
         &args.adapter_args,
     )
+}
+
+#[cfg(feature = "cli")]
+fn manifest_variable_defaults(manifest: &Manifest, adapter: &str) -> BTreeMap<String, String> {
+    manifest
+        .environment_for(adapter)
+        .variables
+        .into_iter()
+        .filter_map(|binding| binding.value.map(|value| (binding.env, value)))
+        .collect()
 }
 
 #[cfg(feature = "cli")]

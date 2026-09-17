@@ -185,8 +185,9 @@ or different values to isolate the environments.
 
 Config entry keys use one shared target-aware rule across `config push`,
 `config diff`, and managed descriptor construction. A valid canonical
-`EDGEZERO__STORES__CONFIG__<ID>__KEY` value wins for either target. When it is
-absent, production falls back to `<logical-id>` and staging falls back to
+`EDGEZERO__STORES__CONFIG__<ID>__KEY` value from the parent process wins for
+either target, followed by an applicable manifest default. When both are absent,
+production falls back to `<logical-id>` and staging falls back to
 `<logical-id>_staging`. A present invalid value fails managed deployment before
 provider mutation; it is never silently recorded in a descriptor.
 

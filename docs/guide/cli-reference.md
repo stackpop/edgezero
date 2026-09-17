@@ -365,8 +365,9 @@ flags and exits `2` with a pointer to the typed CLI — it cannot push (see
 - `--store <id>` — logical config-store id to push to. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
 - `--key <key>` — override the config-store key the blob is written under (spec §5.4).
 - `--staging` — write the key selected by the staging environment's canonical
-  `EDGEZERO__STORES__CONFIG__<ID>__KEY` variable. When that variable is absent,
-  the key falls back to `<logical-store-id>_staging`.
+  `EDGEZERO__STORES__CONFIG__<ID>__KEY` variable. The parent process value wins,
+  followed by an applicable `[environment.variables]` manifest default. When
+  both are absent, the key falls back to `<logical-store-id>_staging`.
   Production and staging may select the same or different physical stores. The
   flag remains mutually exclusive with `--key`; set the canonical environment
   variable when staging needs an explicit key so config push and the
@@ -437,7 +438,8 @@ stub that absorbs its flags and exits `2` with a pointer to the typed CLI.
 - `--key <key>` — override the config-store key to diff against (spec §5.4). Defaults to the logical store id; matches `config push --key`.
 - `--staging` — diff against the staging environment's canonical
   `EDGEZERO__STORES__CONFIG__<ID>__KEY` selection, falling back to
-  `<logical-store-id>_staging` when absent. This matches what
+  `<logical-store-id>_staging` when absent from both the parent process and
+  applicable manifest defaults. This matches what
   `config push --staging` writes and remains mutually exclusive with `--key`.
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config.
 - `--local` — diff against the adapter's local-emulator state instead of the live platform (same resolution as `config push --local`).

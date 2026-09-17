@@ -23,7 +23,7 @@ use crate::args::{
     parse_duration_secs,
 };
 use crate::diff::{collect_changes, render_json, render_structured};
-use crate::ensure_adapter_defined;
+use crate::{ensure_adapter_defined, manifest_variable_defaults};
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
@@ -32,12 +32,13 @@ use edgezero_core::app_config::{
     SecretPathSegment,
 };
 use edgezero_core::blob_envelope::{BlobEnvelope, BlobEnvelopeError, ENVELOPE_VERSION_V1};
-use edgezero_core::env_config::EnvConfig;
+use edgezero_core::env_config::{EnvConfig, merge_env_defaults};
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use similar::TextDiff;
 use std::collections::BTreeMap;
+use std::env;
 use std::io::{Error as IoError, IsTerminal as _, Write, stdin};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -643,7 +644,7 @@ where
         )
     })?;
     let logical = resolve_config_store_id(args.store.as_deref(), ctx.manifest())?;
-    let env_config = EnvConfig::from_env();
+    let env_config = effective_manifest_environment(ctx.manifest(), &args.adapter, env::vars());
     let platform = env_config.store_name("config", &logical);
     let store = ResolvedStoreId::new(logical.clone(), platform);
     // Diff exactly what `config push` would write, including the canonical
@@ -1355,7 +1356,8 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
         )
     })?;
     let logical = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
-    let env_config = EnvConfig::from_env();
+    let env_config =
+        effective_manifest_environment(validation.manifest(), &args.adapter, env::vars());
     let platform = env_config.store_name("config", &logical);
     let runtime_key = env_config.store_key_for_target("config", &logical, args.staging);
     let adapter_push_ctx =
@@ -1367,6 +1369,22 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
         store: ResolvedStoreId::new(logical, platform),
         validation,
     })
+}
+
+fn effective_manifest_environment<I, K, V>(
+    manifest: &Manifest,
+    adapter: &str,
+    parent: I,
+) -> EnvConfig
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    EnvConfig::from_vars(merge_env_defaults(
+        manifest_variable_defaults(manifest, adapter),
+        parent,
+    ))
 }
 
 /// Resolve the push-time overlay values: `--local` flag (passed
@@ -1553,12 +1571,17 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
     let flattened = flatten_keys(raw_table);
     let key_refs: Vec<&str> = flattened.iter().map(String::as_str).collect();
     let manifest_root = ctx.manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    let env_config = EnvConfig::from_env();
+    let parent_variables = env::vars().collect::<Vec<_>>();
 
     for (name, adapter_cfg) in &ctx.manifest().adapters {
         let Some(adapter) = adapter_registry::get_adapter(name) else {
             continue;
         };
+        let env_config = effective_manifest_environment(
+            ctx.manifest(),
+            name,
+            parent_variables.iter().map(|(key, value)| (key, value)),
+        );
         adapter.validate_app_config_keys(&key_refs)?;
         adapter.validate_adapter_manifest(
             manifest_root,
@@ -2488,6 +2511,92 @@ source = "target/wasm32-wasip2/release/demo.wasm"
                 && err.contains("EDGEZERO__STORES__CONFIG__<ID>__KEY")
                 && !err.contains("selector store"),
             "the error must explain canonical runtime-key selection without legacy selectors: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_defaults_and_parent_select_the_same_store_and_key_as_deploy() {
+        let manifest = ManifestLoader::load_from_str(
+            r#"
+[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "CONFIG_NAME"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "manifest-name"
+adapters = ["fastly"]
+
+[[environment.variables]]
+name = "CONFIG_KEY"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+value = "manifest-key"
+adapters = ["fastly"]
+
+[[environment.variables]]
+name = "OTHER_ADAPTER"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "must-not-apply"
+adapters = ["cloudflare"]
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+
+[stores.config]
+ids = ["app_config"]
+"#,
+        );
+        let defaults = effective_manifest_environment(
+            manifest.manifest(),
+            "fastly",
+            iter::empty::<(&str, &str)>(),
+        );
+        assert_eq!(defaults.store_name("config", "app_config"), "manifest-name");
+        assert_eq!(
+            defaults.store_key_for_target("config", "app_config", true),
+            "manifest-key"
+        );
+
+        let parent = effective_manifest_environment(
+            manifest.manifest(),
+            "fastly",
+            [
+                ("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "parent-name"),
+                ("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "parent-key"),
+            ],
+        );
+        assert_eq!(parent.store_name("config", "app_config"), "parent-name");
+        assert_eq!(
+            parent.store_key_for_target("config", "app_config", true),
+            "parent-key"
+        );
+
+        let no_key = ManifestLoader::load_from_str(
+            r#"
+[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "CONFIG_NAME"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "manifest-name"
+adapters = ["fastly"]
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+
+[stores.config]
+ids = ["app_config"]
+"#,
+        );
+        let staging_fallback = effective_manifest_environment(
+            no_key.manifest(),
+            "fastly",
+            iter::empty::<(&str, &str)>(),
+        );
+        assert_eq!(
+            staging_fallback.store_key_for_target("config", "app_config", true),
+            "app_config_staging"
         );
     }
 

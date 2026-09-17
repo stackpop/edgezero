@@ -244,10 +244,12 @@ config source:
 
 `app-config` and `app-config-inline` are mutually exclusive. With
 `deploy-to: staging`, the selected GitHub Environment's canonical
-`EDGEZERO__STORES__CONFIG__<ID>__KEY` value wins; when absent, the key falls back
-to `<logical-id>_staging`. An explicit action `key` input remains production-only.
-Config push changes typed runtime data; it does not change the application
-release, package, or manifests.
+`EDGEZERO__STORES__CONFIG__<ID>__KEY` value wins, followed by an applicable
+`[environment.variables]` manifest default. When both are absent, the key falls
+back to `<logical-id>_staging`. Production falls back to `<logical-id>`. The
+managed action has no separate key input, so config push and deploy cannot select
+different runtime keys. Config push changes typed runtime data; it does not change
+the application release, package, or manifests.
 
 ## Action reference
 
@@ -264,18 +266,17 @@ release, package, or manifests.
 
 ### `config-push-fastly`
 
-| Input                 | Required | Default      | Meaning                                                                      |
-| --------------------- | -------- | ------------ | ---------------------------------------------------------------------------- |
-| `app-release-archive` | Yes      | —            | The same pinned release archive.                                             |
-| `app-release-sha256`  | Yes      | —            | Expected archive SHA-256.                                                    |
-| `fastly-api-token`    | Yes      | —            | Token for the Config Store write.                                            |
-| `working-directory`   | No       | `.`          | Publisher-owned typed-config directory.                                      |
-| `app-config`          | No\*     | empty        | Typed config file under `working-directory`.                                 |
-| `app-config-inline`   | No\*     | empty        | Inline typed config.                                                         |
-| `no-env`              | No       | `false`      | Skip the typed runtime environment overlay.                                  |
-| `store`               | No       | manifest     | Logical Config Store ID.                                                     |
-| `key`                 | No       | empty        | Explicit production key; otherwise use the canonical key or target fallback. |
-| `deploy-to`           | No       | `production` | Select the canonical environment key, then the production/staging fallback.  |
+| Input                 | Required | Default      | Meaning                                                                     |
+| --------------------- | -------- | ------------ | --------------------------------------------------------------------------- |
+| `app-release-archive` | Yes      | —            | The same pinned release archive.                                            |
+| `app-release-sha256`  | Yes      | —            | Expected archive SHA-256.                                                   |
+| `fastly-api-token`    | Yes      | —            | Token for the Config Store write.                                           |
+| `working-directory`   | No       | `.`          | Publisher-owned typed-config directory.                                     |
+| `app-config`          | No\*     | empty        | Typed config file under `working-directory`.                                |
+| `app-config-inline`   | No\*     | empty        | Inline typed config.                                                        |
+| `no-env`              | No       | `false`      | Skip the typed runtime environment overlay.                                 |
+| `store`               | No       | manifest     | Logical Config Store ID.                                                    |
+| `deploy-to`           | No       | `production` | Select the canonical environment key, then the production/staging fallback. |
 
 \* Exactly one typed config input is required.
 

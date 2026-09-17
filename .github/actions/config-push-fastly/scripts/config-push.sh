@@ -14,8 +14,8 @@ set -euo pipefail
 # `EDGEZERO__STORES__CONFIG__<ID>__KEY` selected by the caller's environment wins;
 # when absent, both config push and the managed runtime descriptor fall back to
 # `<logical-store-id>_staging`. Production and staging may select the same or
-# different physical stores. `key` is production-only (the wrapper rejects key +
-# staging).
+# different physical stores. The managed action does not accept a separate key;
+# config push and deploy therefore use the same canonical resolution.
 #
 # The manifest is an absolute verified member of the immutable application
 # release. Publisher-owned app-config files remain confined beneath the selected
@@ -29,7 +29,6 @@ set -euo pipefail
 #   GITHUB_WORKSPACE                      required  confinement root
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__CONFIG_PUSH__STORE          optional  logical config-store id
-#   EDGEZERO__CONFIG_PUSH__KEY            optional  explicit base key
 #   EDGEZERO__CONFIG_PUSH__MANIFEST       required  verified absolute release manifest
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG     optional  typed config file path (relative to the app dir)
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE optional  raw inline typed-config content (exclusive with APP_CONFIG)
@@ -66,7 +65,6 @@ main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local deploy_to="${EDGEZERO__DEPLOY__TO:-production}"
   local store="${EDGEZERO__CONFIG_PUSH__STORE:-}"
-  local key="${EDGEZERO__CONFIG_PUSH__KEY:-}"
   local manifest="${EDGEZERO__CONFIG_PUSH__MANIFEST:-}"
   local app_config="${EDGEZERO__CONFIG_PUSH__APP_CONFIG:-}"
   local app_config_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE:-}"
@@ -155,7 +153,6 @@ main() {
   # or its `<logical>_staging` fallback.
   local argv=("$cli_bin" config push --adapter fastly --manifest "$manifest" --app-config "$app_config")
   if [[ -n "$store" ]]; then argv+=(--store "$store"); fi
-  if [[ -n "$key" ]]; then argv+=(--key "$key"); fi
   if [[ "$deploy_to" == "staging" ]]; then argv+=(--staging); fi
   if [[ "$no_env" == "true" ]]; then argv+=(--no-env); fi
   argv+=(--yes --no-diff)

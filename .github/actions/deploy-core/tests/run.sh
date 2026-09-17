@@ -662,7 +662,6 @@ test_wrapper_validate() {
       EDGEZERO__APP__RELEASE__SHA256_PRESENT="${H:-true}" \
       EDGEZERO__FASTLY__API_TOKEN_PRESENT="${T:-true}" \
       EDGEZERO__DEPLOY__TO="${D:-production}" \
-      EDGEZERO__CONFIG_PUSH__KEY_PRESENT="${K:-false}" \
       EDGEZERO__CONFIG_PUSH__APP_CONFIG_PRESENT="${C:-true}" \
       EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE_PRESENT="${I:-false}" bash "$cpf"
   }
@@ -673,10 +672,6 @@ test_wrapper_validate() {
   H=false assert_fails "config-push: missing release digest is rejected" run_cpf
   C=false I=false assert_fails "config-push: neither typed config input is rejected" run_cpf
   C=true I=true assert_fails "config-push: both typed config inputs are rejected" run_cpf
-  # A staging key is derived, so an explicit key with staging is refused early.
-  D=production K=true assert_succeeds "config-push: an explicit key is fine for production" run_cpf
-  D=staging K=true assert_fails "config-push: key + staging is rejected up front" run_cpf
-
   # Healthcheck + rollback require the same immutable release and alphanumeric ID.
   local hc="$ACTIONS_DIR/healthcheck-fastly/scripts/validate.sh"
   assert_succeeds "healthcheck: release and mixed alphanumeric ID pass" \
@@ -1578,11 +1573,13 @@ test_config_push_argv() {
   assert_succeeds "action pushed-key reports the canonical runtime KEY" \
     grep -qx 'pushed-key=publisher-selected' "$WORK_DIR/config-push/ghout"
 
-  # Typed --store / --key are threaded through when supplied.
+  # The managed action may select a logical store, but it never accepts an
+  # action-specific key that could diverge from the deployed descriptor.
   local with_store
   with_store=$(CP_STORE=cfg CP_KEY=mykey run_config_push_argv)
   assert_succeeds "--store is threaded" grep -qx -- 'cfg' <<<"$with_store"
-  assert_succeeds "--key is threaded" grep -qx -- 'mykey' <<<"$with_store"
+  assert_fails "an ambient action key cannot override canonical key resolution" \
+    grep -qx -- 'mykey' <<<"$with_store"
 
   # Inline config: threaded as --app-config pointing at an action-owned temp file
   # that holds exactly the supplied content (no checkout file required).
@@ -2190,7 +2187,6 @@ in app-release-archive true none
 in app-release-sha256 true none
 in deploy-to false production
 in fastly-api-token true none
-in key false ""
 in no-env false "false"
 in store false ""
 in working-directory false .
