@@ -1,114 +1,97 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Asserts the exact Fastly call sequence a STAGED deploy through the
-# deploy-fastly wrapper must produce, and that the staged version threaded out
-# of the action:
-#   * `--comment` must NOT reach `fastly compute update` (it has no such flag);
-#     it is applied via `fastly service-version update --comment` BEFORE the
-#     version is staged.
-#   * `--non-interactive` is supplied as an action-owned passthrough arg, so a
-#     manifest-command deploy cannot block on a TTY prompt in CI.
-#   * The staged upload clones the active version.
-#
-# Reads (env):
-#   FAKE_CALL_LOG                         required  the fake fastly/curl call log
-#   EDGEZERO__TEST__STAGED_VERSION        required  the version the staged deploy produced
-
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
 source "$SCRIPT_DIR/../scripts/common.sh"
 
-assert_update_flags() {
-  local update="$1" flag
-  for flag in --autoclone --version=active --non-interactive --service-id; do
-    [[ "$update" == *"$flag"* ]] ||
-      fail "'compute update' is missing $flag (got: $update)"
-  done
-}
-
-assert_no_comment_on_update() {
-  local log="$1"
-  if grep -qE '^fastly compute update .*--comment' "$log"; then
-    fail "--comment was forwarded to 'compute update', which does not support it"
-  fi
-}
-
-assert_comment_precedes_stage() {
-  local log="$1" comment_line stage_line
-  comment_line=$(grep -nE '^fastly service-version update .*--comment' "$log" | head -n 1 | cut -d: -f1)
-  stage_line=$(grep -nE '^fastly service-version stage ' "$log" | head -n 1 | cut -d: -f1)
-
-  [[ -n "$comment_line" ]] || fail "the comment was never applied via 'service-version update'"
-  [[ -n "$stage_line" ]] || fail "the version was never staged"
-  [[ "$comment_line" -lt "$stage_line" ]] ||
-    fail "the comment was applied after staging; it must precede it"
-}
-
-# The staging twin must MIRROR this service's production runtime overrides: the
-# scoped logging level is copied verbatim and the scoped config selector is
-# redirected to `<logical>_staging`, both written into the twin (STAGESEL1)
-# before the relink. Without the mirror the staged version would lose its
-# production logging override.
-assert_twin_mirrors_production() {
-  local log="$1"
-  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__LOGGING__LEVEL' "$log" ||
-    fail "production's non-config override was not mirrored into the staging twin"
-  grep -qE '^fastly config-store-entry update .*--store-id=STAGESEL1 .*--key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY' "$log" ||
-    fail "the config selector was not written into the staging twin"
-
-  # The mirror must land before the relink points the draft at the twin.
-  local mirror_line create_line
-  mirror_line=$(grep -nE '^fastly config-store-entry update .*--store-id=STAGESEL1' "$log" | head -n 1 | cut -d: -f1)
-  create_line=$(grep -n '^fastly resource-link create ' "$log" | head -n 1 | cut -d: -f1)
-  if [[ -n "$mirror_line" && -n "$create_line" ]] && ((mirror_line >= create_line)); then
-    fail "the twin must be mirrored BEFORE the draft is relinked to it"
-  fi
-}
-
-# The staged draft must be re-pointed at the STAGING selector store, or it reads
-# production config and `config push --staging` writes a key nothing reads. The
-# link name stays `edgezero_runtime_env` (what the runtime opens); only the store
-# behind it changes.
-assert_relinked_to_staging_selector() {
-  local log="$1"
-  grep -qE '^fastly resource-link delete .*--id=LINK_ENV( |$)' "$log" ||
-    fail "the staged deploy never dropped the inherited 'edgezero_runtime_env' link"
-  grep -qE '^fastly resource-link create .*--resource-id=STAGESEL1 .*--name=edgezero_runtime_env( |$)' "$log" ||
-    fail "the staged deploy never linked the staging selector store as 'edgezero_runtime_env'"
-
-  # Both must land while the version is still an editable draft.
-  local create_line stage_line
-  create_line=$(grep -n '^fastly resource-link create ' "$log" | head -n 1 | cut -d: -f1)
-  stage_line=$(grep -n '^fastly service-version stage ' "$log" | head -n 1 | cut -d: -f1)
-  if [[ -n "$create_line" && -n "$stage_line" ]] && ((create_line >= stage_line)); then
-    fail "the staging relink must happen BEFORE the version is staged"
-  fi
-}
-
 main() {
   local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
-  local staged_version="${EDGEZERO__TEST__STAGED_VERSION:-}"
+  local descriptor_dir="${FAKE_DESCRIPTOR_DIR:?FAKE_DESCRIPTOR_DIR is required}"
+  local link_dir="${FAKE_LINK_DIR:?FAKE_LINK_DIR is required}"
+  local version="${EDGEZERO__TEST__STAGED_VERSION:-}"
+  local digest="${EDGEZERO__TEST__PACKAGE_DIGEST:-}"
+  local expected_digest="${FAKE_EXPECTED_PACKAGE_DIGEST:?FAKE_EXPECTED_PACKAGE_DIGEST is required}"
+  local key='EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1'
+  local descriptor="$descriptor_dir/$key"
 
-  echo "--- recorded fastly/curl calls:"
-  cat "$log"
+  [[ "$version" == 42 ]] || fail "expected staged fastly-version=42, got '${version:-<empty>}'"
+  [[ "$digest" == "$expected_digest" ]] || fail "staging did not report the pinned package digest"
+  [[ "$(cat "$FAKE_PACKAGE_DIGEST_FILE")" == "$expected_digest" ]] ||
+    fail "staging did not upload the pinned package bytes"
 
-  local update
-  update=$(grep -E '^fastly compute update ' "$log" | head -n 1 || true)
-  [[ -n "$update" ]] || fail "the staged deploy never ran 'fastly compute update'"
+  [[ "$(grep -Ec '^fastly compute update ' "$log" || true)" -eq 1 ]] ||
+    fail "staging must issue exactly one compute update"
+  grep -Eq '^fastly compute update --service-id=dummyservice --autoclone --version=active --package=[^[:space:]]+/package/app\.tar\.gz --non-interactive$' "$log" ||
+    fail "staging compute update did not use the exact active-source package command"
+  [[ "$(grep -Ec '^fastly service-version update ' "$log" || true)" -eq 1 ]] ||
+    fail "staging must issue exactly one version comment update"
+  grep -Fqx 'fastly service-version update --service-id=dummyservice --version=42 --comment staged smoke' "$log" ||
+    fail "the staged comment was not applied to version 42"
 
-  assert_update_flags "$update"
-  assert_no_comment_on_update "$log"
-  assert_comment_precedes_stage "$log"
-  assert_twin_mirrors_production "$log"
-  assert_relinked_to_staging_selector "$log"
+  [[ -f "$descriptor" ]] || fail "the exact version descriptor was not created"
+  local expected_descriptor
+  expected_descriptor='{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"debug","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config_staging","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-stage","EDGEZERO__STORES__KV__CACHE__NAME":"cache-stage","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-stage"}}'
+  cmp -s "$descriptor" <(printf '%s' "$expected_descriptor") ||
+    fail "the staging descriptor bytes are not the exact canonical runtime descriptor"
 
-  # The staged version must thread out of deploy-fastly, or the healthcheck and
-  # rollback that follow have nothing to act on.
-  [[ "$staged_version" == "42" ]] ||
-    fail "expected fastly-version=42 out of the staged deploy, got '${staged_version:-<empty>}'"
+  jq -Rn '
+    [inputs | split("\t") | {alias: .[1], resource: .[2]}] |
+    sort_by(.alias) == ([
+      {alias:"cache-stage", resource:"KVSTAGE"},
+      {alias:"config-stage", resource:"CONFIGSTAGE"},
+      {alias:"credentials-stage", resource:"SECRETSTAGE"},
+      {alias:"edgezero_runtime_env", resource:"ENVSEL1"}
+    ] | sort_by(.alias))
+  ' <"$link_dir/version-42.tsv" | grep -qx true || fail "staging links are not the exact selected resources"
 
-  notice "staged call sequence is correct and fastly-version=$staged_version threaded out"
+  local resource_mutations expected_mutations
+  resource_mutations=$(grep -E '^fastly resource-link (create|delete) ' "$log" || true)
+  expected_mutations=$(cat <<'EOF'
+fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
+fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD
+fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD
+fastly resource-link create --service-id=dummyservice --version=42 --resource-id=KVSTAGE --name=cache-stage
+fastly resource-link create --service-id=dummyservice --version=42 --resource-id=CONFIGSTAGE --name=config-stage
+fastly resource-link create --service-id=dummyservice --version=42 --resource-id=SECRETSTAGE --name=credentials-stage
+EOF
+)
+  [[ "$resource_mutations" == "$expected_mutations" ]] ||
+    fail "staging did not replace exactly the inherited production links with staging links"
+
+  grep -q "config-store-entry create --store-id=ENVSEL1 --key=$key --stdin" "$log" ||
+    fail "the descriptor was not written under the exact version key"
+  grep -q '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" ||
+    fail "prepared version 42 was not staged"
+
+  local create_line descriptor_read_line final_links_line stage_line
+  local last_delete_line first_create_line last_create_line
+  create_line=$(grep -n "config-store-entry create --store-id=ENVSEL1 --key=$key" "$log" | tail -n 1 | cut -d: -f1)
+  descriptor_read_line=$(grep -n "GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/$key" "$log" | tail -n 1 | cut -d: -f1)
+  final_links_line=$(grep -n '^fastly resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n 1 | cut -d: -f1)
+  stage_line=$(grep -n '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" | cut -d: -f1)
+  [[ "$create_line" -lt "$descriptor_read_line" && "$descriptor_read_line" -lt "$stage_line" ]] ||
+    fail "descriptor create/readback/final verification did not precede staging"
+  [[ "$final_links_line" -lt "$stage_line" ]] || fail "final link verification did not precede staging"
+  last_delete_line=$(grep -n '^fastly resource-link delete ' "$log" | tail -n 1 | cut -d: -f1)
+  first_create_line=$(grep -n '^fastly resource-link create ' "$log" | head -n 1 | cut -d: -f1)
+  last_create_line=$(grep -n '^fastly resource-link create ' "$log" | tail -n 1 | cut -d: -f1)
+  [[ "$last_delete_line" -lt "$first_create_line" && "$last_create_line" -lt "$final_links_line" ]] ||
+    fail "production-link deletion, staging-link creation, and final verification were out of order"
+
+  if grep -qE '^fastly config-store-entry describe ' "$log"; then
+    fail "staging issued a legacy Config Store exact-key describe"
+  fi
+  local unexpected_gets
+  unexpected_gets=$(grep -E '^GET https://api\.fastly\.com/resources/stores/config/[^/]+/item/' "$log" |
+    grep -Fvx \
+      -e 'GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__40__ENV_V1' \
+      -e "GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/$key" || true)
+  [[ -z "$unexpected_gets" ]] || fail "staging issued a legacy scoped or unscoped exact-key read"
+  if grep -Eq '^fastly config-store-entry (update|delete) ' "$log"; then
+    fail "a legacy selector or staging-twin command was issued"
+  fi
+  notice "staged version 42 uses the pinned package and version-scoped descriptor"
 }
 
 main "$@"

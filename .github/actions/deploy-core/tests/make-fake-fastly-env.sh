@@ -1,34 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Installs fake `fastly` and `curl` binaries for the lifecycle smoke test, plus a
-# call log the assertions read back.
-#
-# The fakes mirror the REAL contracts the adapter depends on, so the smoke test
-# exercises the exact call shapes that matter:
-#   * `fastly compute update` must NOT receive --comment (it has no such flag);
-#     the comment goes through `fastly service-version update` BEFORE
-#     `service-version stage`.
-#   * `compute update` output must be a realistic success line, because the
-#     version parser is fail-closed and refuses to guess.
-#   * The Fastly domain API returns a SINGULAR `staging_ip` string.
-#   * activate/deactivate are PUT, and staging deactivate is /deactivate/staging.
-#
-# The fake `fastly` is packaged as a tar.gz at install-fastly.sh's cache path and
-# the checked-out `versions.json` is repointed at it with a matching SHA-256, so
-# install-fastly.sh VERIFIES and extracts the fake through its real
-# download+checksum+extract path — never adopting a planted binary. That lets the
-# staged path be exercised through the real deploy-fastly wrapper while keeping
-# the installer's provenance guarantee intact. The fake `curl` goes on PATH,
-# which nothing reinstalls.
-#
-# The fake binaries write their call log to FAKE_CALL_LOG and read FORCE_UNHEALTHY.
-# These are deliberately OUTSIDE the EDGEZERO__ namespace: the app CLI scrubs
-# every EDGEZERO__* var before exec, and these must survive that scrub because
-# the fake fastly/curl are spawned BY the app CLI and read them there.
-#
-# Reads (env): GITHUB_WORKSPACE, GITHUB_PATH, GITHUB_ENV, RUNNER_TEMP.
-# Writes (env): FAKE_CALL_LOG (the call-log path).
+# Installs stateful fake Fastly CLI/API surfaces for the hosted lifecycle smoke.
+# The state models one canonical runtime Config Store, version-scoped descriptor
+# entries, cloned links, exact selected Config/KV/Secret resources, and publish.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
@@ -38,56 +13,127 @@ write_fake_fastly() {
   local path="$1" version="$2"
   cat >"$path" <<SHIM
 #!/usr/bin/env bash
+set -euo pipefail
 printf 'fastly %s\n' "\$*" >>"\$FAKE_CALL_LOG"
+
+arg_value() {
+  local prefix="\$1" arg
+  shift
+  for arg in "\$@"; do
+    case "\$arg" in "\$prefix"*) printf '%s' "\${arg#"\$prefix"}"; return 0;; esac
+  done
+  return 1
+}
+
+links_file() {
+  printf '%s/version-%s.tsv' "\$FAKE_LINK_DIR" "\$1"
+}
+
+links_json() {
+  local file
+  file=\$(links_file "\$1")
+  if [[ ! -s "\$file" ]]; then printf '[]\n'; return; fi
+  jq -Rn '[inputs | split("\\t") | {id: .[0], name: .[1], resource_id: .[2]}]' <"\$file"
+}
+
 case "\${1:-} \${2:-}" in
-  "version ") echo "Fastly CLI version v$version (fake)" ;;
-  "compute build") echo "Built package (fixture)" ;;
-  "compute update")
-    # A realistic success line: the version parser is fail-closed and will
-    # refuse to stage if it cannot read a version out of this output.
-    echo "SUCCESS: Updated package (service dummyservice, version 42)"
+  'version ' | '--version ') echo 'Fastly CLI version v$version (fake)' ;;
+  'config-store list')
+    cat <<'JSON'
+[{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"CONFIGPROD","name":"config-prod"},{"id":"CONFIGSTAGE","name":"config-stage"}]
+JSON
     ;;
-  "compute deploy") echo "SUCCESS: Deployed package (service dummyservice, version 43)" ;;
-  "service-version update") echo "Updated version comment" ;;
-  "service-version stage") echo "Staged version" ;;
-  # An app WITH config selection: the app config store, the production selector
-  # store edgezero_runtime_env (so a staged deploy relinks rather than skipping),
-  # and its staging twin (the store the relink points at). config push resolves a
-  # store id by name from this list, reads the current entry to diff, then upserts.
-  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"ENVSEL1","name":"edgezero_runtime_env"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging_dummyservice"}]' ;;
-  # A cloned draft inherits the active version's links; the staged deploy drops
-  # this one and re-links the staging store under the same name.
-  "resource-link list") echo '[{"id":"LINK_ENV","name":"edgezero_runtime_env","resource_id":"ENVSEL1"}]' ;;
-  "resource-link delete") echo "SUCCESS: Deleted resource link" ;;
-  "resource-link create") echo "SUCCESS: Created resource link" ;;
-  "config-store-entry describe")
-    # Report the key as absent so the push proceeds to a first write. The real
-    # CLI distinguishes "missing" from "unparseable" — returning nothing at all
-    # is a parse error, not an absent key.
-    echo "Error: config store entry not found" >&2
-    exit 1
+  'resource-link list')
+    [[ "\$#" -eq 5 && "\$3" == --service-id=dummyservice &&
+      ("\$4" == --version=40 || "\$4" == --version=42) && "\$5" == --json ]] || exit 91
+    target=\$(arg_value --version= "\$@") || exit 91
+    [[ -f "\$(links_file "\$target")" ]] || exit 91
+    links_json "\$target"
     ;;
-  "config-store-entry list")
-    # A staged deploy MIRRORS the production selector store into the staging twin.
-    # Production (ENVSEL1) carries a logging override, which the twin must copy
-    # verbatim; the twin (STAGESEL1) starts empty.
-    case "\$*" in
-      *--store-id=ENVSEL1*) echo '[{"item_key":"EDGEZERO__LOGGING__LEVEL","item_value":"debug"}]' ;;
-      *) echo '[]' ;;
+  'compute update')
+    [[ "\$#" -eq 7 && "\$3" == --service-id=dummyservice && "\$4" == --autoclone &&
+      "\$5" == --version=active && "\$6" == --package=* && "\$7" == --non-interactive ]] || exit 92
+    package=\${6#--package=}
+    [[ -f "\$package" && ! -L "\$package" ]] || exit 92
+    grep -qx 40 "\$FAKE_VERSION_FILE" || exit 92
+    grep -qx 42 "\$FAKE_VERSION_FILE" || printf '42\n' >>"\$FAKE_VERSION_FILE"
+    cp "\$(links_file 40)" "\$(links_file 42)"
+    digest=\$(sha256sum "\$package" | awk '{print \$1}')
+    printf '%s\n' "\$digest" >"\$FAKE_PACKAGE_DIGEST_FILE"
+    printf 'PACKAGE-SHA256 %s\n' "\$digest" >>"\$FAKE_CALL_LOG"
+    if [[ -n "\${FAKE_EXPECTED_PACKAGE_DIGEST:-}" && "\$digest" != "\$FAKE_EXPECTED_PACKAGE_DIGEST" ]]; then
+      echo 'fake fastly: immutable package digest changed' >&2
+      exit 93
+    fi
+    echo 'SUCCESS: Updated package (service dummyservice, version 42)'
+    ;;
+  'service-version update')
+    [[ "\$#" -eq 6 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 &&
+      "\$5" == --comment ]] || exit 94
+    case "\$6" in
+      'production smoke' | 'staged smoke' | 'store-free managed smoke') ;;
+      *) exit 94;;
     esac
+    echo 'Updated version comment'
     ;;
-  "config-store-entry update") echo "SUCCESS: Updated config store entry" ;;
-  "config-store-entry delete") echo "SUCCESS: Deleted config store entry" ;;
-  *)
-    case "\${1:-}" in
-      version | --version) echo "Fastly CLI version v$version (fake)" ;;
-      # An UNHANDLED command must fail: an unexpected provider call (a new command
-      # the code started issuing) should break the smoke, not pass silently.
-      *) echo "fake fastly: unhandled command: \$*" >&2; exit 90 ;;
+  'service-version stage')
+    [[ "\$*" == 'service-version stage --service-id=dummyservice --version=42' ]] || exit 94
+    grep -qx 42 "\$FAKE_VERSION_FILE" || exit 94
+    [[ -f "\$FAKE_DESCRIPTOR_DIR/EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1" ]] || exit 94
+    printf '42\n' >"\$FAKE_STAGED_VERSION_FILE"
+    echo 'Staged version'
+    ;;
+  'resource-link delete')
+    [[ "\$#" -eq 5 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 &&
+      ("\$5" == --id=LINK_CONFIG_PROD || "\$5" == --id=LINK_KV_PROD ||
+        "\$5" == --id=LINK_SECRET_PROD) ]] || exit 91
+    target=\$(arg_value --version= "\$@") || exit 91
+    id=\$(arg_value --id= "\$@") || exit 91
+    file=\$(links_file "\$target")
+    grep -q "^\$id"$'\\t' "\$file" || exit 91
+    awk -F '\\t' -v id="\$id" '\$1 != id' "\$file" >"\$file.tmp"
+    mv "\$file.tmp" "\$file"
+    echo 'SUCCESS: Deleted resource link'
+    ;;
+  'resource-link create')
+    [[ "\$#" -eq 6 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 ]] || exit 91
+    target=\$(arg_value --version= "\$@") || exit 91
+    resource=\$(arg_value --resource-id= "\$@") || exit 91
+    alias=\$(arg_value --name= "\$@") || exit 91
+    case "\$resource/\$alias" in
+      KVSTAGE/cache-stage | CONFIGSTAGE/config-stage | SECRETSTAGE/credentials-stage) ;;
+      *) exit 91;;
     esac
+    file=\$(links_file "\$target")
+    ! awk -F '\t' -v alias="\$alias" '\$2 == alias { found = 1 } END { exit !found }' "\$file" || exit 91
+    printf 'LINK_%s\t%s\t%s\n' "\$alias" "\$alias" "\$resource" >>"\$file"
+    echo 'SUCCESS: Created resource link'
     ;;
+  'config-store-entry create')
+    [[ "\$#" -eq 5 && "\$5" == --stdin ]] || exit 95
+    store=\$(arg_value --store-id= "\$@") || exit 91
+    key=\$(arg_value --key= "\$@") || exit 91
+    [[ "\$store" == ENVSEL1 && "\$key" == EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1 ]] || exit 95
+    if [[ -n "\${FAKE_FAIL_AFTER_VERSION:-}" ]]; then
+      cat >/dev/null
+      echo 'simulated descriptor create failure' >&2
+      exit 77
+    fi
+    cat >"\$FAKE_DESCRIPTOR_DIR/\$key"
+    echo 'SUCCESS: Created config store entry'
+    ;;
+  'config-store-entry describe')
+    echo 'fake fastly: legacy Config Store exact-key describe rejected' >&2
+    exit 96
+    ;;
+  'config-store-entry update')
+    key=\$(arg_value --key= "\$@") || exit 91
+    cat >"\$FAKE_CONFIG_PUSH_DIR/\$key"
+    echo 'SUCCESS: Updated config store entry'
+    ;;
+  'config-store-entry list') echo '[]' ;;
+  *) echo "fake fastly: unhandled command: \$*" >&2; exit 90 ;;
 esac
-exit 0
 SHIM
   chmod +x "$path"
 }
@@ -96,124 +142,113 @@ write_fake_curl() {
   local path="$1"
   cat >"$path" <<'SHIM'
 #!/usr/bin/env bash
-# install-fastly.sh downloads the (fake) archive with
-# `curl … <file://…> --output <path>`. Each invocation now uses a UNIQUE per-run
-# tool root (mktemp -d), so the archive is not pre-placed there — serve the
-# download by copying the file:// source to the output path, keeping the real
-# download+checksum+extract path intact.
-_out=""
-_url=""
-_prev=""
-for _a in "$@"; do
-  [ "$_prev" = "--output" ] && _out="$_a"
-  case "$_a" in file://*) _url="$_a" ;; esac
-  _prev="$_a"
+set -euo pipefail
+
+out=''
+url=''
+previous=''
+for arg in "$@"; do
+  [[ "$previous" == --output ]] && out="$arg"
+  case "$arg" in file://*) url="$arg";; esac
+  previous="$arg"
 done
-if [ -n "$_out" ]; then
-  cp "${_url#file://}" "$_out"
+if [[ -n "$out" ]]; then
+  cp "${url#file://}" "$out"
   exit 0
 fi
 
-# The versions this fake service has. The ACTIVE one is tracked separately (in
-# FAKE_ACTIVE_VERSION_FILE) and is always considered to exist.
-FAKE_KNOWN_VERSIONS="1 38 39 40 41 42"
-
-fake_active_version() {
+active_version() {
   local active
-  active=$(cat "${FAKE_ACTIVE_VERSION_FILE:-/dev/null}" 2>/dev/null || true)
+  active=$(cat "$FAKE_ACTIVE_VERSION_FILE" 2>/dev/null || true)
   printf '%s' "${active:-40}"
 }
 
-fake_version_exists() {
-  local want="$1" active
-  active=$(fake_active_version)
-  case " $FAKE_KNOWN_VERSIONS $active " in
-    *" $want "*) return 0 ;;
-    *) return 1 ;;
-  esac
+version_list() {
+  local active target=false
+  active=$(active_version)
+  [[ -f "$FAKE_VERSION_FILE" ]] && grep -qx 42 "$FAKE_VERSION_FILE" && target=true
+  printf '[{"number":40,"active":%s,"locked":true,"staging":false,"deployed":true,"environments":[]}' "$([[ "$active" == 40 ]] && echo true || echo false)"
+  if [[ "$target" == true ]]; then
+    printf ',{"number":42,"active":%s,"locked":false,"staging":false,"deployed":false,"environments":[]}' "$([[ "$active" == 42 ]] && echo true || echo false)"
+  fi
+  if [[ "$active" != 40 && "$active" != 42 ]]; then
+    printf ',{"number":%s,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]}' "$active"
+  fi
+  printf ']'
 }
 
-# Render the version list the Fastly API would return: every known version, with
-# `active: true` on exactly the current one.
-fake_version_list_json() {
-  local active out="" sep="" n flag
-  active=$(fake_active_version)
-  local all="$FAKE_KNOWN_VERSIONS"
-  case " $all " in *" $active "*) ;; *) all="$all $active" ;; esac
-  for n in $all; do
-    if [ "$n" = "$active" ]; then flag=true; else flag=false; fi
-    out="$out$sep{\"number\":$n,\"active\":$flag}"
-    sep=","
-  done
-  printf '[%s]' "$out"
-}
-
-# Two shapes: a Fastly API call via `--config -` (config on stdin), or a probe.
-if [[ "$*" == *"--config"* ]]; then
+if [[ "$*" == *--config* ]]; then
   config=$(cat)
   url=$(printf '%s\n' "$config" | sed -nE 's/^url = "(.*)"$/\1/p')
-  if printf '%s\n' "$config" | grep -q '^request = "PUT"$'; then
-    printf 'PUT %s\n' "$url" >>"$FAKE_CALL_LOG"
+  request=$(printf '%s\n' "$config" | sed -nE 's/^request = "(.*)"$/\1/p')
+  request=${request:-GET}
+  printf '%s %s\n' "$request" "$url" >>"$FAKE_CALL_LOG"
+
+  if [[ "$request" == PUT ]]; then
     case "$url" in
-      */version/*/activate)
-        activated="${url##*/version/}"
-        activated="${activated%%/activate}"
-        # A real API rejects activating a version the service does not have, so
-        # the fixture must too — otherwise a smoke could "succeed" against a
-        # version that never existed.
-        if ! fake_version_exists "$activated"; then
-          printf 'PUT-REJECTED %s (no such version)\n' "$url" >>"$FAKE_CALL_LOG"
-          echo 404
-          exit 0
+      */service/dummyservice/version/42/activate)
+        if ! grep -qx 42 "$FAKE_VERSION_FILE" ||
+          [[ ! -f "$FAKE_DESCRIPTOR_DIR/EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1" ]] ||
+          [[ ! -f "$FAKE_LINK_DIR/version-42.tsv" ]]; then
+          printf 'version not prepared\n400'; exit 0
         fi
-        # Model reality: activating version N makes N the active version, so a
-        # later read (e.g. another rollback's staleness check) sees the mutation.
-        if [ -n "${FAKE_ACTIVE_VERSION_FILE:-}" ]; then
-          printf '%s\n' "$activated" >"$FAKE_ACTIVE_VERSION_FILE"
-        fi
+        printf '42\n' >"$FAKE_ACTIVE_VERSION_FILE"
         ;;
+      */service/dummyservice/version/40/activate)
+        grep -qx 40 "$FAKE_VERSION_FILE" || { printf 'version not prepared\n400'; exit 0; }
+        printf '40\n' >"$FAKE_ACTIVE_VERSION_FILE"
+        ;;
+      */service/dummyservice/version/39/activate)
+        grep -qx 39 "$FAKE_VERSION_FILE" || { printf 'version not prepared\n400'; exit 0; }
+        printf '39\n' >"$FAKE_ACTIVE_VERSION_FILE"
+        ;;
+      */service/dummyservice/version/42/deactivate/staging)
+        [[ "$(cat "$FAKE_STAGED_VERSION_FILE" 2>/dev/null || true)" == 42 ]] || {
+          printf 'version not staged\n400'; exit 0;
+        }
+        : >"$FAKE_STAGED_VERSION_FILE"
+        ;;
+      *) printf 'unexpected mutation\n400'; exit 0;;
     esac
-    echo 200
+    printf '200'
     exit 0
   fi
-  printf 'GET %s\n' "$url" >>"$FAKE_CALL_LOG"
-  # fastly_api_get appends `write-out = "\n%{http_code}"`, so the real curl emits
-  # `<body>\n<status>` and the caller requires a 2xx. Mirror that: body, then a
-  # trailing `\n200`, with NO trailing newline after the code.
-  #
-  # The service-version list. The ACTIVE version is read from a state file so the
-  # smoke can model reality: it is 40 before the production deploy (rollback-target
-  # capture), and a deploy (or a test step) updates it. The production-rollback
-  # best-effort staleness guard requires the active version to equal the `--version`
-  # being rolled back from. Every version the fixture may activate is listed, so a
-  # rollback target is a version the service actually has.
-  if [[ "$url" == */version ]]; then
-    # Recovery smoke: a broken-API sentinel makes active-version resolution fail, so
-    # a lost-version deploy cannot recover the version. Absent otherwise, so this is
-    # inert for every other smoke.
-    if [[ -n "${FAKE_API_BREAK_FILE:-}" && -f "$FAKE_API_BREAK_FILE" ]]; then
-      printf 'simulated Fastly API failure\n500'
-      exit 0
-    fi
-    printf '%s\n200' "$(fake_version_list_json)"
-    exit 0
-  fi
-  # Domain lookup: Fastly returns a SINGULAR `staging_ip` string per domain.
-  printf '[{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n200'
+
+  case "$url" in
+    */resources/stores/kv\?limit=100)
+      printf '{"data":[{"id":"KVPROD","name":"cache-prod"},{"id":"KVSTAGE","name":"cache-stage"}],"meta":{"next_cursor":null}}\n200'
+      ;;
+    */resources/stores/secret\?limit=100)
+      printf '{"data":[{"id":"SECRETPROD","name":"credentials-prod"},{"id":"SECRETSTAGE","name":"credentials-stage"}],"meta":{"next_cursor":null}}\n200'
+      ;;
+    */service/dummyservice/version)
+      printf '%s\n200' "$(version_list)"
+      ;;
+    */resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__40__ENV_V1 | \
+    */resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1)
+      key=${url##*/item/}
+      file="$FAKE_DESCRIPTOR_DIR/$key"
+      if [[ -f "$file" ]]; then
+        jq -Rs '{item_value: .}' <"$file"
+        printf '200'
+      else
+        printf '{"msg":"not found"}\n404'
+      fi
+      ;;
+    */resources/stores/config/*/item/*)
+      printf 'legacy Config Store exact-key read rejected\n400'
+      ;;
+    */service/dummyservice/version/*/domain\?include=staging_ips)
+      printf '[{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n200'
+      ;;
+    *) printf 'unexpected fake API read\n404';;
+  esac
   exit 0
 fi
+
 printf 'PROBE %s\n' "$*" >>"$FAKE_CALL_LOG"
-# Record whether a provider token was in scope for this probe. A PRODUCTION
-# healthcheck just curls the public domain and must receive NO token, even when
-# one is inherited from the job env; a staging probe needs one (staging-IP
-# resolution). The assertions read this back.
 printf 'PROBE-TOKEN=%s\n' "${FASTLY_API_TOKEN:+set}" >>"$FAKE_CALL_LOG"
-if [[ -n "${FORCE_UNHEALTHY:-}" ]]; then
-  echo 503
-else
-  echo 200
-fi
-exit 0
+if [[ -n "${FORCE_UNHEALTHY:-}" ]]; then echo 503; else echo 200; fi
 SHIM
   chmod +x "$path"
 }
@@ -221,69 +256,52 @@ SHIM
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local runner_temp="${RUNNER_TEMP:?RUNNER_TEMP is required}"
-  local action_dir
+  local action_dir path_dir downloads log state pinned stage archive sha expected_digest
   action_dir=$(cd -- "$SCRIPT_DIR/../../deploy-fastly" && pwd)
-  local path_dir="$workspace/fake-bin"
-  # install-fastly.sh extracts the provider CLI from a checksum-verified archive
-  # into `<tool root>/provider-bin`, caching the archive under `downloads/`.
-  # Deliver the fake THROUGH that verified path (not by planting a binary), so the
-  # smoke exercises the real download+verify+extract and never relies on a bypass.
-  local downloads="$runner_temp/edgezero-action-tools/downloads"
-  local log="$workspace/fake-calls.log"
+  path_dir="$workspace/fake-bin"
+  downloads="$runner_temp/edgezero-action-tools/downloads"
+  log="$workspace/fake-calls.log"
+  state="$workspace/fake-fastly-state"
 
-  mkdir -p "$path_dir" "$downloads"
+  mkdir -p "$path_dir" "$downloads" "$state/descriptors" "$state/links" "$state/config-push"
   : >"$log"
+  printf '40\n' >"$state/active-version"
+  printf '39\n40\n' >"$state/versions"
+  printf 'LINK_RUNTIME\tedgezero_runtime_env\tENVSEL1\nLINK_CONFIG_PROD\tconfig-prod\tCONFIGPROD\nLINK_KV_PROD\tcache-prod\tKVPROD\nLINK_SECRET_PROD\tcredentials-prod\tSECRETPROD\n' \
+    >"$state/links/version-40.tsv"
+  printf '%s' '{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"info","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-prod","EDGEZERO__STORES__KV__CACHE__NAME":"cache-prod","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-prod"}}' \
+    >"$state/descriptors/EDGEZERO__SERVICES__dummyservice__VERSIONS__40__ENV_V1"
+  : >"$state/staged-version"
+  : >"$state/package-digest"
 
-  local pinned
   pinned=$(json_get "$action_dir/versions.json" fastly.version)
-
-  # NOTE: the installer's "always re-extract, never adopt a pre-existing binary"
-  # provenance guard is no longer exercised by planting a binary here. Each action
-  # invocation now installs into a UNIQUE mktemp workspace, so its provider-bin is
-  # always fresh — there is nothing to adopt, and this fixture cannot predict the
-  # path to plant into. The guarantee still holds structurally: install-fastly.sh
-  # extracts from the checksum-verified archive on every run (see it there).
-
-  # Package a fake `fastly` as the checksum-verified archive install-fastly.sh
-  # downloads. It lives at the fixed downloads path and is served to each
-  # invocation's unique tool root by the fake `curl`'s file:// copy above.
-  local stage archive sha
   stage=$(mktemp -d)
   write_fake_fastly "$stage/fastly" "$pinned"
   archive="$downloads/fastly-$pinned-linux-amd64.tar.gz"
   tar -C "$stage" -czf "$archive" fastly
   sha=$(sha256_file "$archive")
 
-  # Repoint the CHECKED-OUT versions.json (what the local action reads) at the
-  # fake archive with its real checksum, so install-fastly.sh verifies and
-  # extracts the fake. The version stays pinned, so the `.tool-versions`
-  # agreement check still holds. This modifies only the job's checkout, never a
-  # committed file — production reads the real, pinned versions.json.
   local patched
   patched=$(mktemp)
   jq --arg url "file://$archive" --arg sha "$sha" \
     '.fastly.linux_amd64.url = $url | .fastly.linux_amd64.sha256 = $sha' \
     "$action_dir/versions.json" >"$patched"
   mv "$patched" "$action_dir/versions.json"
-
   write_fake_curl "$path_dir/curl"
 
-  # The active version the fake Fastly API reports, in a file so a deploy or a
-  # test step can update it (see the production-rollback guard). Starts at 40 —
-  # the version rollback-target capture sees BEFORE the first production deploy.
-  local active_state="$workspace/fake-active-version"
-  printf '40\n' >"$active_state"
-
-  printf '%s\n' "$path_dir" >>"${GITHUB_PATH:?GITHUB_PATH is required}"
-  {
-    printf 'FAKE_CALL_LOG=%s\n' "$log"
-    printf 'FAKE_ACTIVE_VERSION_FILE=%s\n' "$active_state"
-    # The recovery smoke touches this path to break active-version resolution; it is
-    # not created here, so every other smoke sees a working API.
-    printf 'FAKE_API_BREAK_FILE=%s\n' "$workspace/fake-api-break"
-  } >>"${GITHUB_ENV:?GITHUB_ENV is required}"
-
-  notice "fake fastly (v$pinned) packaged as a checksum-verified archive at $archive; fake curl on PATH"
+  expected_digest=''
+  [[ ! -f "$workspace/fixture-release/package.sha256" ]] ||
+    expected_digest=$(cat "$workspace/fixture-release/package.sha256")
+  append_env FAKE_CALL_LOG "$log"
+  append_env FAKE_ACTIVE_VERSION_FILE "$state/active-version"
+  append_env FAKE_VERSION_FILE "$state/versions"
+  append_env FAKE_STAGED_VERSION_FILE "$state/staged-version"
+  append_env FAKE_DESCRIPTOR_DIR "$state/descriptors"
+  append_env FAKE_LINK_DIR "$state/links"
+  append_env FAKE_CONFIG_PUSH_DIR "$state/config-push"
+  append_env FAKE_PACKAGE_DIGEST_FILE "$state/package-digest"
+  append_env FAKE_EXPECTED_PACKAGE_DIGEST "$expected_digest"
+  append_env PATH "$path_dir:$PATH"
 }
 
 main "$@"

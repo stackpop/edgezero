@@ -2254,6 +2254,473 @@ test_fastly_release_action_wiring() {
     "$ACTIONS_DIR/deploy-fastly/action.yml"
 }
 
+test_fastly_smoke_release_contract() {
+  section "Fastly immutable-release composite smoke"
+  if ! command -v yq >/dev/null 2>&1; then
+    skip "Fastly immutable-release composite smoke (yq not installed)"
+    return 0
+  fi
+
+  local workflow="$REPO_ROOT/.github/workflows/deploy-action.yml"
+  local fixture="$ACTIONS_DIR/deploy-core/tests/make-smoke-fixture.sh"
+  local fake="$ACTIONS_DIR/deploy-core/tests/make-fake-fastly-env.sh"
+  local staged="$ACTIONS_DIR/deploy-core/tests/assert-staged-calls.sh"
+  local production="$ACTIONS_DIR/deploy-core/tests/assert-production-deploy.sh"
+  local lost="$ACTIONS_DIR/deploy-core/tests/assert-lost-version.sh"
+  local lifecycle_filter
+  lifecycle_filter='select(tag == "!!map" and (.uses == "./.github/actions/deploy-fastly" or .uses == "./.github/actions/config-push-fastly" or .uses == "./.github/actions/healthcheck-fastly" or .uses == "./.github/actions/rollback-fastly"))'
+
+  local missing_release stale_inputs archives store_aware_digests
+  missing_release=$(yq eval -r \
+    ".. | $lifecycle_filter | select(.with.\"app-release-archive\" == null or .with.\"app-release-sha256\" == null) | .name" \
+    "$workflow")
+  assert_equals "every Fastly lifecycle action receives the immutable release archive and digest" \
+    "" "$missing_release"
+
+  stale_inputs=$(yq eval -r \
+    ".. | $lifecycle_filter | .with | keys | .[] | select(. == \"app-cli-artifact\" or . == \"manifest\" or . == \"working-directory\" or . == \"rust-toolchain\" or . == \"build-mode\" or . == \"build-args\" or . == \"cache\")" \
+    "$workflow" | sort -u)
+  assert_equals "Fastly lifecycle jobs expose no CLI, manifest, or deployer build selector" \
+    "" "$stale_inputs"
+
+  archives=$(yq eval -r ".. | $lifecycle_filter | .with.\"app-release-archive\"" \
+    "$workflow" | sort -u)
+  store_aware_digests=$(yq eval -r \
+    ".jobs | to_entries[] | select(.key != \"store-free-deploy-smoke\") | .value.steps[]? | $lifecycle_filter | .with.\"app-release-sha256\"" \
+    "$workflow" | sort -u)
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_equals "every lifecycle action consumes an action-owned release archive path" \
+    '${{ github.workspace }}/fixture-release/app-release.tar.gz' "$archives"
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_equals "all store-aware lifecycle cases consume the same pinned release digest" \
+    '${{ needs.fixture-release.outputs.app-release-sha256 }}' "$store_aware_digests"
+  assert_succeeds "one fixture release is built before the deployment matrix" \
+    grep -q '^  fixture-release:' "$workflow"
+
+  local store_free_deploys store_free_digest store_free_source
+  store_free_deploys=$(yq eval -r \
+    '[.jobs."store-free-deploy-smoke".steps[]? | select(.uses == "./.github/actions/deploy-fastly")] | length' \
+    "$workflow")
+  assert_equals "the workflow executes one release-backed store-free deployment" \
+    1 "$store_free_deploys"
+  store_free_digest=$(yq eval -r \
+    '.jobs."store-free-deploy-smoke".steps[]? | select(.uses == "./.github/actions/deploy-fastly") | .with."app-release-sha256"' \
+    "$workflow")
+  # shellcheck disable=SC2016 # GitHub expression is the literal contract under test.
+  assert_equals "the store-free deployment consumes its distinct immutable release" \
+    '${{ needs.store-free-release.outputs.app-release-sha256 }}' "$store_free_digest"
+  store_free_source=$(yq eval -r \
+    '.jobs."store-free-release".steps[]? | select(.run != null) | .run' "$workflow")
+  assert_succeeds "the distinct store-free application release is actually assembled" \
+    grep -q 'make-smoke-fixture.sh source store-free' <<<"$store_free_source"
+
+  local install_step
+  install_step=$(yq eval -r \
+    '.jobs.static-checks.steps[] | select(.name == "Install pinned validation binaries") | .run' \
+    "$workflow")
+  # shellcheck disable=SC2016 # GitHub's path file is the literal workflow contract.
+  assert_succeeds "the pinned yq directory is handed to every later workflow step" \
+    grep -Fq '>>"$GITHUB_PATH"' <<<"$install_step"
+
+  assert_succeeds "the fixture supports an explicit store-free application mode" \
+    grep -q 'store-free' "$fixture"
+  assert_succeeds "the fixture supports an explicit store-aware application mode" \
+    grep -q 'store-aware' "$fixture"
+  assert_succeeds "the fake models the one canonical runtime store" \
+    grep -q 'ENVSEL1' "$fake"
+  assert_succeeds "the fake models the exact version descriptor key" \
+    grep -q 'EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1' "$fake"
+  assert_succeeds "the fake seeds active v40 with production Config, KV, and Secret links" \
+    grep -Fq 'LINK_CONFIG_PROD\tconfig-prod\tCONFIGPROD' "$fake"
+  # shellcheck disable=SC2016 # Generated fake source must contain this literal state path.
+  assert_succeeds "the fake seeds active v40 with its exact immutable production descriptor" \
+    grep -Fq '$state/descriptors/EDGEZERO__SERVICES__dummyservice__VERSIONS__40__ENV_V1' "$fake"
+  assert_succeeds "the fake permits the exact source version descriptor API read" \
+    grep -Fq '*/resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__40__ENV_V1' "$fake"
+  assert_succeeds "the fake permits the exact target version descriptor API read" \
+    grep -Fq '*/resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1)' "$fake"
+  assert_succeeds "the fake rejects every other exact-key Config Store API read" \
+    grep -Fq '*/resources/stores/config/*/item/*)' "$fake"
+  assert_succeeds "the staged assertion checks the exact version descriptor key" \
+    grep -q 'EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1' "$staged"
+  assert_succeeds "production asserts the verified release package digest" \
+    grep -q 'EDGEZERO__TEST__PACKAGE_DIGEST' "$production"
+  assert_succeeds "failed deployment asserts its recoverable version and package digest" \
+    grep -q 'EDGEZERO__TEST__FASTLY_VERSION' "$lost"
+  assert_succeeds "failed deployment checks its verified package digest" \
+    grep -q 'EDGEZERO__TEST__PACKAGE_DIGEST' "$lost"
+
+  local legacy
+  for legacy in STAGESEL1 edgezero_runtime_env_staging_dummyservice \
+    EDGEZERO__SERVICES__dummyservice__STORES EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config_staging; do
+    assert_fails "smoke fixtures issue no legacy selector or staging-twin command ($legacy)" \
+      grep -Fq -- "$legacy" "$fake" "$staged" "$production" "$lost" "$workflow"
+  done
+}
+
+test_smoke_release_uses_application_revision() {
+  section "Fastly smoke release source revision"
+  local workspace="$WORK_DIR/revision-workspace"
+  local output="$workspace/output"
+  mkdir -p "$workspace/fixture-app/adapter"
+  git -C "$workspace" init -q
+  git -C "$workspace" config user.email test@example.com
+  git -C "$workspace" config user.name Test
+  printf 'harness checkout\n' >"$workspace/harness.txt"
+  git -C "$workspace" add harness.txt
+  git -C "$workspace" commit -q -m harness
+
+  git -C "$workspace/fixture-app" init -q
+  git -C "$workspace/fixture-app" config user.email test@example.com
+  git -C "$workspace/fixture-app" config user.name Test
+  printf '[app]\nname = "fixture"\n' >"$workspace/fixture-app/edgezero.toml"
+  printf '[package]\nname = "fixture"\n' >"$workspace/fixture-app/adapter/fastly.toml"
+  git -C "$workspace/fixture-app" add -A
+  git -C "$workspace/fixture-app" commit -q -m fixture
+  printf 'fixture CLI archive\n' >"$workspace/app-cli.tar"
+  GITHUB_WORKSPACE="$workspace" GITHUB_OUTPUT="$output" \
+    bash "$ACTIONS_DIR/deploy-core/tests/make-smoke-fixture.sh" release "$workspace/app-cli.tar"
+
+  local recorded app_revision harness_revision
+  recorded=$(tar -xOzf "$workspace/fixture-release/app-release.tar.gz" release.json |
+    jq -er '.source_revision')
+  app_revision=$(git -C "$workspace/fixture-app" rev-parse HEAD)
+  harness_revision=$(git -C "$workspace" rev-parse HEAD)
+  assert_equals "release metadata records the fixture application revision" \
+    "$app_revision" "$recorded"
+  assert_fails "release metadata never records the harness checkout revision" \
+    test "$recorded" = "$harness_revision"
+}
+
+build_generated_fastly_fakes() {
+  local root="$1"
+  sed -n '/^write_fake_fastly() {/,/^write_fake_curl() {/p' \
+    "$ACTIONS_DIR/deploy-core/tests/make-fake-fastly-env.sh" | sed '$d' >"$root/write-fastly.sh"
+  sed -n '/^write_fake_curl() {/,/^main() {/p' \
+    "$ACTIONS_DIR/deploy-core/tests/make-fake-fastly-env.sh" | sed '$d' >"$root/write-curl.sh"
+  bash -c 'source "$1"; write_fake_fastly "$2" 15.1.0' _ \
+    "$root/write-fastly.sh" "$root/fastly"
+  bash -c 'source "$1"; write_fake_curl "$2"' _ \
+    "$root/write-curl.sh" "$root/curl"
+}
+
+run_generated_fastly() {
+  local root="$1"
+  shift
+  env \
+    FAKE_CALL_LOG="$root/calls.log" \
+    FAKE_DESCRIPTOR_DIR="$root/descriptors" \
+    FAKE_FAIL_AFTER_VERSION= \
+    FAKE_LINK_DIR="$root/links" \
+    FAKE_PACKAGE_DIGEST_FILE="$root/package-digest" \
+    FAKE_EXPECTED_PACKAGE_DIGEST= \
+    FAKE_STAGED_VERSION_FILE="$root/staged-version" \
+    FAKE_VERSION_FILE="$root/versions" \
+    "$root/fastly" "$@"
+}
+
+generated_fastly_api_status() {
+  local root="$1" url="$2"
+  printf 'url = "%s"\nrequest = "PUT"\n' "$url" |
+    env \
+      FAKE_ACTIVE_VERSION_FILE="$root/active-version" \
+      FAKE_CALL_LOG="$root/calls.log" \
+      FAKE_DESCRIPTOR_DIR="$root/descriptors" \
+      FAKE_LINK_DIR="$root/links" \
+      FAKE_VERSION_FILE="$root/versions" \
+      "$root/curl" --config - | tail -n 1
+}
+
+test_fastly_fake_rejects_inexact_commands() {
+  section "Fastly smoke fake exact commands"
+  local root="$WORK_DIR/generated-fastly"
+  mkdir -p "$root/descriptors" "$root/links"
+  build_generated_fastly_fakes "$root"
+  : >"$root/calls.log"
+  : >"$root/package-digest"
+  : >"$root/staged-version"
+  printf '40\n' >"$root/active-version"
+  printf '39\n40\n' >"$root/versions"
+  printf 'package bytes\n' >"$root/package.tar.gz"
+  printf 'LINK_RUNTIME\tedgezero_runtime_env\tENVSEL1\nLINK_CONFIG_PROD\tconfig-prod\tCONFIGPROD\nLINK_KV_PROD\tcache-prod\tKVPROD\nLINK_SECRET_PROD\tcredentials-prod\tSECRETPROD\n' \
+    >"$root/links/version-40.tsv"
+  cp "$root/links/version-40.tsv" "$root/links/version-42.tsv"
+
+  assert_fails "resource-link list rejects a missing service id" \
+    run_generated_fastly "$root" resource-link list --version=42 --json
+  assert_fails "resource-link delete rejects a wrong service id" \
+    run_generated_fastly "$root" resource-link delete --service-id=WRONG --version=42 --id=LINK_KV_PROD
+  assert_fails "resource-link create rejects an unplanned resource and alias" \
+    run_generated_fastly "$root" resource-link create --service-id=dummyservice --version=42 --resource-id=OTHER --name=other
+  assert_fails "service-version update rejects an incomplete comment command" \
+    run_generated_fastly "$root" service-version update --service-id=dummyservice --version=42
+  assert_fails "compute update rejects missing autoclone and non-interactive flags" \
+    run_generated_fastly "$root" compute update --service-id=dummyservice --version=active --package="$root/package.tar.gz"
+  assert_equals "activation rejects v42 before compute update prepares it" 400 \
+    "$(generated_fastly_api_status "$root" 'https://api.fastly.com/service/dummyservice/version/42/activate')"
+
+  assert_succeeds "the exact active-source compute update is accepted" \
+    run_generated_fastly "$root" compute update --service-id=dummyservice --autoclone \
+      --version=active --package="$root/package.tar.gz" --non-interactive
+  assert_succeeds "the exact target resource-link list is accepted" \
+    run_generated_fastly "$root" resource-link list --service-id=dummyservice --version=42 --json
+  assert_succeeds "the exact version comment is accepted" \
+    run_generated_fastly "$root" service-version update --service-id=dummyservice \
+      --version=42 --comment 'staged smoke'
+  local id
+  for id in LINK_CONFIG_PROD LINK_KV_PROD LINK_SECRET_PROD; do
+    assert_succeeds "the exact inherited-link deletion is accepted ($id)" \
+      run_generated_fastly "$root" resource-link delete --service-id=dummyservice \
+        --version=42 --id="$id"
+  done
+  assert_succeeds "the exact staging KV link creation is accepted" \
+    run_generated_fastly "$root" resource-link create --service-id=dummyservice \
+      --version=42 --resource-id=KVSTAGE --name=cache-stage
+  assert_succeeds "the exact staging Config link creation is accepted" \
+    run_generated_fastly "$root" resource-link create --service-id=dummyservice \
+      --version=42 --resource-id=CONFIGSTAGE --name=config-stage
+  assert_succeeds "the exact staging Secret link creation is accepted" \
+    run_generated_fastly "$root" resource-link create --service-id=dummyservice \
+      --version=42 --resource-id=SECRETSTAGE --name=credentials-stage
+  printf '{}' >"$root/descriptors/EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1"
+  assert_equals "activation accepts prepared existing v42" 200 \
+    "$(generated_fastly_api_status "$root" 'https://api.fastly.com/service/dummyservice/version/42/activate')"
+}
+
+write_deploy_assertion_state() {
+  local root="$1" target="$2" descriptor="$3" order="$4" commands="${5:-complete}"
+  local key='EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1'
+  mkdir -p "$root/descriptors" "$root/links"
+  printf '%s' "$descriptor" >"$root/descriptors/$key"
+  printf 'digest\n' >"$root/package-digest"
+  case "$target" in
+    production-aware | staging)
+      local suffix config kv secret
+      if [[ "$target" == staging ]]; then
+        suffix=stage config=CONFIGSTAGE kv=KVSTAGE secret=SECRETSTAGE
+      else
+        suffix=prod config=CONFIGPROD kv=KVPROD secret=SECRETPROD
+      fi
+      printf 'LINK_RUNTIME\tedgezero_runtime_env\tENVSEL1\nLINK_CONFIG\tconfig-%s\t%s\nLINK_KV\tcache-%s\t%s\nLINK_SECRET\tcredentials-%s\t%s\n' \
+        "$suffix" "$config" "$suffix" "$kv" "$suffix" "$secret" \
+        >"$root/links/version-42.tsv"
+      ;;
+    production-free)
+      printf 'LINK_RUNTIME\tedgezero_runtime_env\tENVSEL1\n' >"$root/links/version-42.tsv"
+      ;;
+  esac
+
+  local create="fastly config-store-entry create --store-id=ENVSEL1 --key=$key --stdin"
+  local read="GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/$key"
+  local links='fastly resource-link list --service-id=dummyservice --version=42 --json'
+  local publish comment
+  if [[ "$target" == staging ]]; then
+    publish='fastly service-version stage --service-id=dummyservice --version=42'
+    comment='staged smoke'
+  elif [[ "$target" == production-free ]]; then
+    publish='PUT https://api.fastly.com/service/dummyservice/version/42/activate'
+    comment='store-free managed smoke'
+  else
+    publish='PUT https://api.fastly.com/service/dummyservice/version/42/activate'
+    comment='production smoke'
+  fi
+  : >"$root/calls.log"
+  if [[ "$commands" != missing ]]; then
+    printf '%s\n' \
+      'fastly compute update --service-id=dummyservice --autoclone --version=active --package=/release/package/app.tar.gz --non-interactive' \
+      "fastly service-version update --service-id=dummyservice --version=42 --comment $comment" \
+      >>"$root/calls.log"
+  fi
+  if [[ "$target" == staging && "$commands" != missing-isolation ]] ||
+    [[ "$target" == production-free ]]; then
+    printf '%s\n' \
+      'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD' \
+      'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD' \
+      'fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD' \
+      >>"$root/calls.log"
+  fi
+  if [[ "$target" == staging && "$commands" != missing-isolation ]]; then
+    printf '%s\n' \
+      'fastly resource-link create --service-id=dummyservice --version=42 --resource-id=KVSTAGE --name=cache-stage' \
+      'fastly resource-link create --service-id=dummyservice --version=42 --resource-id=CONFIGSTAGE --name=config-stage' \
+      'fastly resource-link create --service-id=dummyservice --version=42 --resource-id=SECRETSTAGE --name=credentials-stage' \
+      >>"$root/calls.log"
+  fi
+  case "$order" in
+    valid) printf '%s\n%s\n%s\n%s\n' "$create" "$read" "$links" "$publish" >>"$root/calls.log" ;;
+    publish-first) printf '%s\n%s\n%s\n%s\n' "$publish" "$create" "$read" "$links" >>"$root/calls.log" ;;
+  esac
+}
+
+run_production_deploy_assertion() {
+  local root="$1" mode="${2:-store-aware}"
+  env -i PATH="$PATH" \
+    FAKE_CALL_LOG="$root/calls.log" \
+    FAKE_DESCRIPTOR_DIR="$root/descriptors" \
+    FAKE_LINK_DIR="$root/links" \
+    FAKE_PACKAGE_DIGEST_FILE="$root/package-digest" \
+    FAKE_EXPECTED_PACKAGE_DIGEST=digest \
+    EDGEZERO__TEST__FASTLY_VERSION=42 \
+    EDGEZERO__TEST__PREVIOUS_VERSION=40 \
+    EDGEZERO__TEST__PACKAGE_DIGEST=digest \
+    EDGEZERO__TEST__FIXTURE_MODE="$mode" \
+    bash "$ACTIONS_DIR/deploy-core/tests/assert-production-deploy.sh"
+}
+
+run_staged_deploy_assertion() {
+  local root="$1"
+  env -i PATH="$PATH" \
+    FAKE_CALL_LOG="$root/calls.log" \
+    FAKE_DESCRIPTOR_DIR="$root/descriptors" \
+    FAKE_LINK_DIR="$root/links" \
+    FAKE_PACKAGE_DIGEST_FILE="$root/package-digest" \
+    FAKE_EXPECTED_PACKAGE_DIGEST=digest \
+    EDGEZERO__TEST__STAGED_VERSION=42 \
+    EDGEZERO__TEST__PACKAGE_DIGEST=digest \
+    bash "$ACTIONS_DIR/deploy-core/tests/assert-staged-calls.sh"
+}
+
+test_fastly_smoke_assertion_strictness() {
+  section "Fastly descriptor assertion strictness"
+  local production staging store_free key
+  production="$WORK_DIR/production-assertion"
+  staging="$WORK_DIR/staging-assertion"
+  store_free="$WORK_DIR/store-free-assertion"
+  key='EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1'
+
+  local production_descriptor staging_descriptor store_free_descriptor
+  production_descriptor='{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"info","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-prod","EDGEZERO__STORES__KV__CACHE__NAME":"cache-prod","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-prod"}}'
+  staging_descriptor='{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"debug","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config_staging","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-stage","EDGEZERO__STORES__KV__CACHE__NAME":"cache-stage","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-stage"}}'
+  store_free_descriptor='{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"warn"}}'
+
+  write_deploy_assertion_state "$production" production-aware "$production_descriptor" valid
+  assert_succeeds "production accepts the exact canonical descriptor and publish order" \
+    run_production_deploy_assertion "$production"
+  local production_missing_commands="$WORK_DIR/production-missing-commands"
+  write_deploy_assertion_state \
+    "$production_missing_commands" production-aware "$production_descriptor" valid missing
+  assert_fails "production requires exact compute-update and comment commands" \
+    run_production_deploy_assertion "$production_missing_commands"
+  printf '%s' \
+    '{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"info","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-prod","EDGEZERO__STORES__KV__CACHE__NAME":"cache-prod","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-prod","EXTRA":"not-canonical"}}' \
+    >"$production/descriptors/$key"
+  assert_fails "production rejects a descriptor superset rather than checking a jq subset" \
+    run_production_deploy_assertion "$production"
+
+  write_deploy_assertion_state "$staging" staging "$staging_descriptor" valid
+  assert_succeeds "staging accepts the exact canonical descriptor and publish order" \
+    run_staged_deploy_assertion "$staging"
+  local staging_missing_isolation="$WORK_DIR/staging-missing-isolation"
+  write_deploy_assertion_state \
+    "$staging_missing_isolation" staging "$staging_descriptor" valid missing-isolation
+  assert_fails "staging requires inherited production deletes before staging creates" \
+    run_staged_deploy_assertion "$staging_missing_isolation"
+  local staging_bad_order="$WORK_DIR/staging-isolation-after-verification"
+  write_deploy_assertion_state "$staging_bad_order" staging "$staging_descriptor" valid
+  local reordered="$staging_bad_order/calls.reordered"
+  grep -Ev '^fastly (resource-link (create|delete)|service-version stage) ' \
+    "$staging_bad_order/calls.log" >"$reordered"
+  grep -E '^fastly resource-link (create|delete) ' \
+    "$staging_bad_order/calls.log" >>"$reordered"
+  grep -E '^fastly service-version stage ' "$staging_bad_order/calls.log" >>"$reordered"
+  mv "$reordered" "$staging_bad_order/calls.log"
+  assert_fails "staging rejects link isolation after final verification" \
+    run_staged_deploy_assertion "$staging_bad_order"
+  printf '%s' \
+    '{"format":1,"entries":{"EDGEZERO__LOGGING__LEVEL":"debug","EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY":"app_config_staging","EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME":"config-stage","EDGEZERO__STORES__KV__CACHE__NAME":"cache-stage","EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME":"credentials-stage","EXTRA":"not-canonical"}}' \
+    >"$staging/descriptors/$key"
+  assert_fails "staging rejects a descriptor superset rather than checking a jq subset" \
+    run_staged_deploy_assertion "$staging"
+
+  write_deploy_assertion_state "$production" production-aware "$production_descriptor" publish-first
+  assert_fails "production rejects activation before descriptor and final-link verification" \
+    run_production_deploy_assertion "$production"
+
+  write_deploy_assertion_state "$production" production-aware "$production_descriptor" valid
+  printf '%s\n' \
+    'fastly config-store-entry describe --store-id=ENVSEL1 --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME' \
+    >>"$production/calls.log"
+  assert_fails "production rejects any legacy config-store-entry describe read" \
+    run_production_deploy_assertion "$production"
+
+  write_deploy_assertion_state "$staging" staging "$staging_descriptor" valid
+  printf '%s\n' \
+    'GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__STORES' \
+    >>"$staging/calls.log"
+  assert_fails "staging rejects any legacy scoped or unscoped exact-key API read" \
+    run_staged_deploy_assertion "$staging"
+
+  write_deploy_assertion_state "$store_free" production-free "$store_free_descriptor" valid
+  assert_succeeds "release-backed store-free deployment is asserted as adapter-managed" \
+    run_production_deploy_assertion "$store_free" store-free
+}
+
+workflow_duplicate_env_keys() {
+  local workflow="$1"
+  awk '
+    function indentation(line) {
+      match(line, /^ */)
+      return RLENGTH
+    }
+
+    /^[[:space:]]*($|#)/ { next }
+
+    {
+      indent = indentation($0)
+      if (in_env && indent <= env_indent) {
+        in_env = 0
+        delete seen
+      }
+
+      if (!in_env && $0 ~ /^[ ]*env:[ ]*(#.*)?$/) {
+        in_env = 1
+        env_indent = indent
+        delete seen
+        next
+      }
+
+      if (in_env && indent == env_indent + 2 &&
+          $0 ~ /^[ ]*[A-Za-z_][A-Za-z0-9_]*:/) {
+        key = $0
+        sub(/^[ ]*/, "", key)
+        sub(/:.*/, "", key)
+        if (key in seen) print key
+        seen[key] = 1
+      }
+    }
+  ' "$workflow" | sort -u
+}
+
+workflow_has_no_duplicate_env_keys() {
+  local workflow="$1" duplicates
+  duplicates=$(workflow_duplicate_env_keys "$workflow")
+  if [[ -n "$duplicates" ]]; then
+    echo "duplicate workflow env keys: $(tr '\n' ' ' <<<"$duplicates")" >&2
+    return 1
+  fi
+}
+
+test_workflow_duplicate_env_keys() {
+  section "workflow duplicate environment keys"
+  local duplicate="$WORK_DIR/duplicate-workflow-env.yml"
+  cat >"$duplicate" <<'YAML'
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      STORE_NAME: first
+      STORE_NAME: second
+    steps: []
+YAML
+
+  assert_equals "duplicate workflow env key is identified" \
+    STORE_NAME "$(workflow_duplicate_env_keys "$duplicate")"
+  assert_fails "duplicate keys in one workflow env mapping are rejected" \
+    workflow_has_no_duplicate_env_keys "$duplicate"
+  assert_succeeds "deploy-action workflow has no duplicate env mapping keys" \
+    workflow_has_no_duplicate_env_keys "$REPO_ROOT/.github/workflows/deploy-action.yml"
+}
+
 test_action_pin_gate() {
   section "action pin gate (structural; branch/floating refs, every YAML form)"
   # The gate parses YAML structurally with yq, so it needs yq to run. Skip locally
@@ -2984,6 +3451,11 @@ main() {
   test_action_output_contracts
   test_action_public_surface
   test_fastly_release_action_wiring
+  test_fastly_smoke_release_contract
+  test_smoke_release_uses_application_revision
+  test_fastly_fake_rejects_inexact_commands
+  test_fastly_smoke_assertion_strictness
+  test_workflow_duplicate_env_keys
   test_action_pin_gate
 
   printf '\nPassed: %d  Failed: %d  Skipped: %d\n' "$tests_passed" "$tests_failed" "$tests_skipped"

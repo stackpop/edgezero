@@ -1,42 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The lost-version deploy must FAIL (no version to thread) yet still signal that a
-# mutation may have occurred, so an operator knows to reconcile. It must also have
-# actually reached the provider deploy command (the fixture records that).
-#
-# Reads (env):
-#   GITHUB_WORKSPACE
-#   EDGEZERO__TEST__DEPLOY_OUTCOME       the deploy step's outcome
-#   EDGEZERO__TEST__MUTATION_ATTEMPTED   the deploy's mutation-attempted output
-#   EDGEZERO__TEST__PREVIOUS_VERSION     the deploy's previous-version output
-
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
 source "$SCRIPT_DIR/../scripts/common.sh"
 
 main() {
-  local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local outcome="${EDGEZERO__TEST__DEPLOY_OUTCOME:-}"
   local mutation="${EDGEZERO__TEST__MUTATION_ATTEMPTED:-}"
   local previous="${EDGEZERO__TEST__PREVIOUS_VERSION:-}"
+  local version="${EDGEZERO__TEST__FASTLY_VERSION:-}"
+  local digest="${EDGEZERO__TEST__PACKAGE_DIGEST:-}"
+  local expected_digest="${FAKE_EXPECTED_PACKAGE_DIGEST:?FAKE_EXPECTED_PACKAGE_DIGEST is required}"
 
-  [[ "$outcome" == "failure" ]] ||
-    fail "the lost-version deploy should have FAILED, but its outcome was '$outcome'"
+  [[ "$outcome" == failure ]] || fail "the post-upload provider failure unexpectedly succeeded"
+  [[ "$mutation" == true ]] || fail "the failed deploy did not retain mutation-attempted=true"
+  [[ "$previous" == 40 ]] || fail "the failed deploy did not retain previous-version=40"
+  [[ "$version" == 42 ]] || fail "the failed deploy did not retain recoverable fastly-version=42"
+  [[ "$digest" == "$expected_digest" ]] || fail "the failed deploy did not retain its package digest"
+  [[ "$(cat "$FAKE_PACKAGE_DIGEST_FILE")" == "$expected_digest" ]] ||
+    fail "the failed deployment uploaded different package bytes"
 
-  [[ "$mutation" == "true" ]] ||
-    fail "a failed-but-mutating deploy must still emit mutation-attempted=true, got '$mutation'"
-
-  # The rollback target captured before the deploy must survive the failure so
-  # recovery can thread it — the smoke rolls back to exactly this value.
-  [[ "$previous" == "40" ]] ||
-    fail "the failed deploy must still expose previous-version=40 (the captured rollback target), got '${previous:-<empty>}'"
-
-  # The deploy really reached the provider command (which recorded the env it saw).
-  [[ -f "$workspace/fixture-app/env-seen.txt" ]] ||
-    fail "the deploy never reached the app CLI's Fastly deploy command"
-
-  notice "lost-version deploy failed as expected, with mutation-attempted=true"
+  grep -q '^fastly compute update ' "$FAKE_CALL_LOG" || fail "failure occurred before package upload"
+  if grep -Eq 'service-version stage|/version/42/activate' "$FAKE_CALL_LOG"; then
+    fail "the failed deployment published version 42"
+  fi
+  if grep -qE '^fastly config-store-entry describe ' "$FAKE_CALL_LOG"; then
+    fail "the failed deployment issued a legacy Config Store exact-key describe"
+  fi
+  local unexpected_gets
+  unexpected_gets=$(grep -E '^GET https://api\.fastly\.com/resources/stores/config/[^/]+/item/' "$FAKE_CALL_LOG" |
+    grep -Fvx \
+      -e 'GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__40__ENV_V1' \
+      -e 'GET https://api.fastly.com/resources/stores/config/ENVSEL1/item/EDGEZERO__SERVICES__dummyservice__VERSIONS__42__ENV_V1' || true)
+  [[ -z "$unexpected_gets" ]] ||
+    fail "the failed deployment issued a legacy scoped or unscoped exact-key read"
+  notice "failed deploy retained version 42 and the verified package digest"
 }
 
 main "$@"
