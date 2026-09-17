@@ -67,4 +67,4 @@
 
 - [x] Run repository formatting, clippy, workspace tests, feature checks, WASM checks, action smoke tests, and docs checks.
 - [x] Self-review the diff against all nine findings.
-- [ ] Commit, push, update the issue/PR description if needed, and inspect PR checks.
+- [x] Commit, push, update the issue/PR description if needed, and inspect PR checks.

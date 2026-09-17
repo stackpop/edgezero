@@ -6740,6 +6740,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
     const TEST_PACKAGE_FILES_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     // Shared fixture names. Pinning these as consts (instead of
