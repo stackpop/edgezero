@@ -16,9 +16,7 @@ use url::Url;
 
 use crate::body::{Body, BodyStream};
 use crate::compression::ContentEncoding;
-use crate::error::{
-    BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
-};
+use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError, ResponseLimitReason};
 use crate::http::header::{
     CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, PROXY_AUTHENTICATE,
     PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
@@ -1088,10 +1086,10 @@ impl OutboundRequest {
 
 /// Converts one adapter-observed terminal batch outcome into its indexed public result.
 ///
-/// Adapters must pass samples from the batch's shared monotonic clock. `None` means the
-/// method-level cutoff won, either by observation time or by an attributed cutoff timeout.
-/// A backward terminal sample remains a terminal item with zero elapsed time and an internal
-/// invariant error so it cannot enlarge or bypass the batch budget.
+/// Adapters must pass samples from the batch's shared monotonic clock. `None` means the terminal
+/// observation was at or past the method-level cutoff. Timeout provenance alone never terminates
+/// the batch. A backward terminal sample remains a terminal item with zero elapsed time and an
+/// internal invariant error so it cannot enlarge or bypass the batch budget.
 #[must_use]
 #[inline]
 pub fn finish_batch_item(
@@ -1101,15 +1099,7 @@ pub fn finish_batch_item(
     cutoff: Deadline,
     outcome: Result<OutboundResponse, EdgeError>,
 ) -> Option<OutboundBatchItem> {
-    if cutoff.is_expired_at(completed_at)
-        || matches!(
-            outcome,
-            Err(EdgeError::GatewayTimeout {
-                cause: BudgetSource::BatchCutoff,
-                ..
-            })
-        )
-    {
+    if cutoff.is_expired_at(completed_at) {
         return None;
     }
     let result = match completed_at.checked_duration_since(started_at) {
@@ -1841,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_batch_item_rejects_an_attributed_batch_cutoff() {
+    fn finish_batch_item_preserves_an_early_batch_cutoff_attributed_timeout() {
         let started_at = MonotonicInstant::now();
         let completed_at = started_at
             .checked_add(Duration::from_millis(1))
@@ -1861,9 +1851,17 @@ mod tests {
                 "batch cutoff",
                 BudgetSource::BatchCutoff,
             )),
-        );
+        )
+        .expect("early phase timeout is a terminal slot result");
 
-        assert!(item.is_none());
+        assert_eq!(item.result.elapsed, Duration::from_millis(1));
+        assert!(matches!(
+            item.result.outcome,
+            Err(EdgeError::GatewayTimeout {
+                cause: BudgetSource::BatchCutoff,
+                ..
+            })
+        ));
     }
 
     #[test]
