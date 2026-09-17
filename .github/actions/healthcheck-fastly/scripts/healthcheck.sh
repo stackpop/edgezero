@@ -25,14 +25,14 @@ set -euo pipefail
 # Exits non-zero when the deployment is not provably healthy (the rollback gate).
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 validate_inputs() {
   require_linux_x86_64
   # `required: true` in action metadata does not fail an omitted input, so the
   # only real guard against probing with an empty service/version is this one.
-  require_input_matching fastly-service-id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}" '^[A-Za-z0-9]+$'
+  require_fastly_service_id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}"
   require_input_matching fastly-version "${EDGEZERO__LIFECYCLE__VERSION:-}" '^[0-9]+$'
   require_input_matching domain "${EDGEZERO__LIFECYCLE__DOMAIN:-}" '^[A-Za-z0-9._-]+$'
   # The path is appended to https://<domain> as one curl argument (the CLI

@@ -201,7 +201,11 @@ PUBLIC_RUNTIME_ENV_VALUES=()
 capture_public_runtime_env() {
   local name
   while IFS= read -r name; do
-    if [[ "$name" =~ ^EDGEZERO__STORES__CONFIG__[A-Z0-9_]+__(NAME|KEY)$ ]] ||
+    if [[ "$name" == "EDGEZERO__ADAPTER__HOST" ]] ||
+      [[ "$name" == "EDGEZERO__ADAPTER__PORT" ]] ||
+      [[ "$name" == "EDGEZERO__LOGGING__ENDPOINT" ]] ||
+      [[ "$name" == "EDGEZERO__LOGGING__LEVEL" ]] ||
+      [[ "$name" =~ ^EDGEZERO__STORES__CONFIG__[A-Z0-9_]+__(NAME|KEY)$ ]] ||
       [[ "$name" =~ ^EDGEZERO__STORES__(KV|SECRETS)__[A-Z0-9_]+__NAME$ ]]; then
       PUBLIC_RUNTIME_ENV_NAMES+=("$name")
       PUBLIC_RUNTIME_ENV_VALUES+=("${!name}")

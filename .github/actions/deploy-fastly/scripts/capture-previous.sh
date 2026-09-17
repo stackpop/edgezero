@@ -33,13 +33,14 @@ set -euo pipefail
 #   previous-version                       the active version before this deploy (may be empty)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 main() {
   local cli_bin service_id
   cli_bin=$(resolve_app_cli)
   service_id="${EDGEZERO__FASTLY__SERVICE_ID:?EDGEZERO__FASTLY__SERVICE_ID is required}"
+  require_fastly_service_id "$service_id"
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   require_cmd "$cli_bin"
 

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Validates the healthcheck-fastly wrapper's inputs before downloading the artifact. In a script
+# Validates the healthcheck-fastly wrapper's inputs before verifying the release. In a script
 # (not inline action.yml run: ) so it is linted and contract-tested.
 #
 # Reads (env):
-#   EDGEZERO__APP__CLI__ARTIFACT_PRESENT  required  "true" when app-cli-artifact is non-empty
+#   EDGEZERO__APP__RELEASE__ARCHIVE_PRESENT required  release archive presence flag
+#   EDGEZERO__APP__RELEASE__SHA256_PRESENT  required  release digest presence flag
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
-# An empty artifact name makes actions/download-artifact fetch EVERY artifact in
-# the run, so the CLI we then execute would be arbitrary.
-require_present app-cli-artifact "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT:-}"
+# The release must be pinned before its CLI can be extracted.
+require_present app-release-archive "${EDGEZERO__APP__RELEASE__ARCHIVE_PRESENT:-}"
+require_present app-release-sha256 "${EDGEZERO__APP__RELEASE__SHA256_PRESENT:-}"
+require_fastly_service_id "${EDGEZERO__FASTLY__SERVICE_ID:-}"

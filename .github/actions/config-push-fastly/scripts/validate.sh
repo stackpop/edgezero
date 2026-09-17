@@ -5,7 +5,8 @@ set -euo pipefail
 # action.yml `run:`) so it is shellcheck'd and contract-tested.
 #
 # Reads (env):
-#   EDGEZERO__APP__CLI__ARTIFACT_PRESENT  required  "true" when app-cli-artifact is non-empty
+#   EDGEZERO__APP__RELEASE__ARCHIVE_PRESENT required  release archive presence flag
+#   EDGEZERO__APP__RELEASE__SHA256_PRESENT  required  release digest presence flag
 #   EDGEZERO__FASTLY__API_TOKEN_PRESENT   required  "true" when fastly-api-token is non-empty
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__CONFIG_PUSH__KEY_PRESENT    optional  "true" when an explicit key was supplied
@@ -15,8 +16,14 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
 
 main() {
-  require_present app-cli-artifact "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT:-}"
+  require_present app-release-archive "${EDGEZERO__APP__RELEASE__ARCHIVE_PRESENT:-}"
+  require_present app-release-sha256 "${EDGEZERO__APP__RELEASE__SHA256_PRESENT:-}"
   require_present fastly-api-token "${EDGEZERO__FASTLY__API_TOKEN_PRESENT:-}"
+  local has_file="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_PRESENT:-false}"
+  local has_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE_PRESENT:-false}"
+  if [[ "$has_file" == "$has_inline" ]]; then
+    fail "exactly one of 'app-config' or 'app-config-inline' is required"
+  fi
   local deploy_to="${EDGEZERO__DEPLOY__TO:-production}"
   # A typo in deploy-to must never silently push to production.
   case "$deploy_to" in
@@ -24,7 +31,7 @@ main() {
     *) fail "input 'deploy-to' must be 'production' or 'staging' (got '${EDGEZERO__DEPLOY__TO:-}')" ;;
   esac
   # A staging push derives its key from the store's logical id (`<id>_staging`),
-  # which is what the staging selector store points a staged version at. An
+  # which is the key selected by the staged version's runtime descriptor. An
   # explicit `key` would be written to a key nothing reads, so the CLI refuses
   # the combination — reject it here with a clearer, earlier message.
   if [[ "$deploy_to" == "staging" && "${EDGEZERO__CONFIG_PUSH__KEY_PRESENT:-}" == "true" ]]; then

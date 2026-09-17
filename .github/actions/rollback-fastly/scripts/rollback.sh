@@ -20,12 +20,12 @@ set -euo pipefail
 #   rolled-back-to                        the activated version (production only)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 validate_inputs() {
   require_linux_x86_64
-  require_input_matching fastly-service-id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}" '^[A-Za-z0-9]+$'
+  require_fastly_service_id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}"
   require_input_matching fastly-version "${EDGEZERO__LIFECYCLE__VERSION:-}" '^[0-9]+$'
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
   # A typo in deploy-to must never silently roll back production.

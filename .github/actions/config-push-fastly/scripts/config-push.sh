@@ -12,15 +12,13 @@ set -euo pipefail
 #
 # Staging: `deploy-to: staging` passes `--staging` to the CLI, which writes the
 # `<logical-store-id>_staging` variant in the environment-selected store — the
-# key the staging selector points a staged version at, never the production key
+# key the staged version's runtime descriptor selects, never the production key
 # the live service reads. Production and staging may select the same or different
 # physical stores. `key` is production-only (the wrapper rejects key + staging).
 #
-# Path confinement: working-directory, manifest, and app-config are
-# caller strings handed to a credential-bearing CLI, so each is canonicalized
-# (resolving symlinks) and required to stay inside the application directory
-# beneath github.workspace. Absolute paths, `..` traversal, and symlink escapes
-# are rejected rather than read.
+# The manifest is an absolute verified member of the immutable application
+# release. Publisher-owned app-config files remain confined beneath the selected
+# working directory; inline config is written to an action-owned temporary file.
 #
 # Reads (env):
 #   EDGEZERO__APP__CLI__PATH              optional  absolute path to the app CLI (preferred; avoids PATH shadowing)
@@ -31,7 +29,7 @@ set -euo pipefail
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__CONFIG_PUSH__STORE          optional  logical config-store id
 #   EDGEZERO__CONFIG_PUSH__KEY            optional  explicit base key
-#   EDGEZERO__CONFIG_PUSH__MANIFEST       optional  edgezero.toml path (relative to the app dir)
+#   EDGEZERO__CONFIG_PUSH__MANIFEST       required  verified absolute release manifest
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG     optional  typed config file path (relative to the app dir)
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE optional  raw inline typed-config content (exclusive with APP_CONFIG)
 #   EDGEZERO__CONFIG_PUSH__NO_ENV         optional  'true' to pass --no-env (skip the env overlay); default false
@@ -75,6 +73,9 @@ main() {
   local inline_file=""
 
   require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
+  require_input application-manifest "$manifest"
+  [[ "$manifest" == /* && -f "$manifest" && ! -L "$manifest" ]] ||
+    fail "the bundled application manifest must be an absolute regular file"
   require_cmd "$cli_bin"
   require_cmd git
   # A typo in deploy-to must never silently push to production.
@@ -90,8 +91,9 @@ main() {
   esac
   # A file path and inline content name the same thing two ways; requiring
   # exactly one avoids a silent precedence surprise.
-  if [[ -n "$app_config" && -n "$app_config_inline" ]]; then
-    fail "inputs 'app-config' and 'app-config-inline' are mutually exclusive"
+  if [[ -z "$app_config" && -z "$app_config_inline" ]] ||
+    [[ -n "$app_config" && -n "$app_config_inline" ]]; then
+    fail "exactly one of 'app-config' or 'app-config-inline' is required"
   fi
 
   # Confine the app directory to github.workspace, then every path to the app.
@@ -102,19 +104,8 @@ main() {
   app_dir=$(canonical_path "$workspace/$working_directory")
   is_under "$workspace_real" "$app_dir" ||
     fail "input 'working-directory' must resolve inside github.workspace"
-  if [[ -n "$manifest" ]]; then
-    manifest=$(confine_to_app "$manifest" "$app_dir" manifest)
-  elif [[ -e "$app_dir/edgezero.toml" ]]; then
-    # Default discovery is confined too: the CLI reads `edgezero.toml` from the
-    # app dir, and a committed symlink there could point its deploy/store config
-    # outside the app while this step holds provider credentials.
-    local default_manifest
-    default_manifest=$(canonical_path "$app_dir/edgezero.toml")
-    is_under "$app_dir" "$default_manifest" ||
-      fail "the default 'edgezero.toml' resolves outside the application directory — refusing to read a manifest that escapes it"
-  fi
-  # Committed-source guard: config pushed from the CHECKED-OUT tree (a manifest or an
-  # app-config FILE) must come from committed source, so the store the live service
+  # Committed-source guard: config pushed from a checked-out app-config FILE must
+  # come from committed source, so the store the live service
   # reads always corresponds to a revision that can be reconciled later — the same
   # guarantee deploy gets from resolve-project.sh. Inline config is caller-supplied
   # CONTENT (a workflow variable), not the tree, so it is exempt.
@@ -160,9 +151,7 @@ main() {
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the
   # push non-interactive in CI; --staging selects the `<logical>_staging` variant.
-  local argv=("$cli_bin" config push --adapter fastly)
-  if [[ -n "$manifest" ]]; then argv+=(--manifest "$manifest"); fi
-  if [[ -n "$app_config" ]]; then argv+=(--app-config "$app_config"); fi
+  local argv=("$cli_bin" config push --adapter fastly --manifest "$manifest" --app-config "$app_config")
   if [[ -n "$store" ]]; then argv+=(--store "$store"); fi
   if [[ -n "$key" ]]; then argv+=(--key "$key"); fi
   if [[ "$deploy_to" == "staging" ]]; then argv+=(--staging); fi
