@@ -25,7 +25,11 @@
 
 - [x] **Step 1: Add red core tests for the shared terminal-slot classifier**
 
-Add tests covering an on-time outcome, an observation at cutoff, an attributed `BatchCutoff` timeout, and a terminal sample before the batch start. The first three pin `Some` versus `None`; the backward sample pins zero elapsed plus the existing internal invariant outcome.
+Add tests covering an on-time outcome, an observation at cutoff, an attributed `BatchCutoff`
+timeout, and a terminal sample before the batch start. At this point in the plan, the attributed
+timeout characterization records the inherited `None` behavior; Task 5 supersedes that expectation
+after confirming timeout provenance is not a batch-abandonment signal. The backward sample pins
+zero elapsed plus the existing internal invariant outcome.
 
 - [x] **Step 2: Run the focused tests and verify RED**
 
@@ -39,7 +43,10 @@ Expected: compilation fails because the shared core helper does not exist.
 
 - [x] **Step 3: Move the duplicated helper into core and update all adapters**
 
-Implement one documented `edgezero_core::outbound::finish_batch_item` adapter-support function using the existing behavior. Delete all four adapter-local copies and their now-unused imports. Do not add completion-group buffering or alter cutoff ordering.
+Implement one documented `edgezero_core::outbound::finish_batch_item` adapter-support function
+using the then-existing behavior. Delete all four adapter-local copies and their now-unused imports.
+Do not add completion-group buffering or alter cutoff ordering. Task 5 later narrows cutoff
+termination to an actual absolute-cutoff clock observation.
 
 - [x] **Step 4: Run affected core and adapter tests and verify GREEN**
 
@@ -239,3 +246,35 @@ Expected: all pass after the final plan-file edits.
 - [x] **Step 6: Commit and push**
 
 Commit the implementation and documentation together with a focused message, push `docs/outbound-http-spec`, and confirm PR 275 checks start against the pushed SHA.
+
+### Task 5: Preserve early Fastly phase timeouts as slot results
+
+**Files:**
+- Modify: `crates/edgezero-core/src/outbound.rs`
+- Modify: `crates/edgezero-adapter-fastly/src/outbound.rs`
+- Modify: `docs/superpowers/specs/2026-05-21-outbound-http-design.md`
+- Modify: `scripts/check_outbound_docs_contract.mjs`
+
+- [x] **Step 1: Add and run the red classifier regression**
+
+Change the attributed-timeout characterization so a `BatchCutoff` timeout observed before the
+absolute cutoff must produce a terminal item. Run the focused test and require one failing test,
+not a zero-test filter.
+
+- [x] **Step 2: Make absolute clock expiry the only cutoff signal**
+
+Remove provenance inspection from `finish_batch_item`. Keep equality expired and preserve the
+existing backward-clock fail-closed behavior. Add a Fastly batch-level regression proving an early
+timeout remains terminal while a later sibling is retained. Update the normative spec and
+executable docs contract so `BudgetSource::BatchCutoff` cannot be interpreted as batch
+abandonment.
+
+- [x] **Step 3: Run focused and complete verification**
+
+Run the focused regression, core tests, strict workspace gates, every adapter feature/WASM matrix,
+generated-project and app-demo verification, and documentation checks.
+
+- [x] **Step 4: Commit and push the follow-up**
+
+Commit the regression and contract correction together, push `docs/outbound-http-spec`, and verify
+PR 275 points at the pushed SHA.

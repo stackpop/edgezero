@@ -20,10 +20,12 @@ use edgezero_core::error::EdgeError;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::error::{BadGatewayReason, BudgetSource};
 #[cfg(any(feature = "fastly", test))]
-use edgezero_core::outbound::OutboundBatchDriverEvent;
+use edgezero_core::outbound::{
+    OutboundBatchDriverEvent, OutboundBatchItem, OutboundResponse, finish_batch_item,
+};
 #[cfg(any(feature = "fastly", feature = "test-utils"))]
 use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
-#[cfg(test)]
+#[cfg(any(feature = "fastly", test))]
 use edgezero_core::time::Deadline;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::time::{DispatchBudget, MonotonicInstant};
@@ -136,6 +138,26 @@ fn assert_send_failure_error(failure: SendFailure, error: &EdgeError, selected: 
     }
 }
 
+#[cfg(any(feature = "fastly", test))]
+enum FastlyBatchObservation {
+    Continue(OutboundBatchItem),
+    Cutoff,
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn finish_fastly_batch_observation(
+    index: usize,
+    started_at: MonotonicInstant,
+    completed_at: MonotonicInstant,
+    cutoff: Deadline,
+    outcome: Result<OutboundResponse, EdgeError>,
+) -> FastlyBatchObservation {
+    match finish_batch_item(index, started_at, completed_at, cutoff, outcome) {
+        Some(item) => FastlyBatchObservation::Continue(item),
+        None => FastlyBatchObservation::Cutoff,
+    }
+}
+
 #[cfg(feature = "fastly")]
 mod fastly_impl {
     #[cfg(feature = "test-utils")]
@@ -160,9 +182,9 @@ mod fastly_impl {
         OutboundBatch, OutboundBatchDriverEvent, OutboundCachePolicy, OutboundHttpClient,
         OutboundRequest, OutboundRequestParts, OutboundResponse, ResponseBodyDisposition,
         ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-        enforce_payload_content_length, finish_batch_item, insert_proxy_header,
-        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
-        normalize_response_headers, rechunk_stream, validate_for_dispatch,
+        enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
+        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
+        validate_for_dispatch,
     };
     use edgezero_core::time::{
         BATCH_DISPATCH_SLACK_MAX, Deadline, DispatchBudget, MonotonicClock, MonotonicInstant,
@@ -179,7 +201,8 @@ mod fastly_impl {
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        driver_selection_failure, reassociate_selection, timeout_error, validate_batch_request,
+        FastlyBatchObservation, driver_selection_failure, finish_fastly_batch_observation,
+        reassociate_selection, timeout_error, validate_batch_request,
     };
 
     pub const DYNAMIC_BACKENDS_DISABLED_MESSAGE: &str = "Fastly dynamic backends are not enabled on this service; enable them in the service configuration";
@@ -545,17 +568,19 @@ mod fastly_impl {
                     Ok(slot) => pending.push(slot),
                     Err(error) => {
                         let completed_at = self.clock.now();
-                        let Some(item) = finish_batch_item(
+                        match finish_fastly_batch_observation(
                             index,
                             batch_started_at,
                             completed_at,
                             cutoff,
                             Err(error),
-                        ) else {
-                            cutoff_reached = true;
-                            break;
-                        };
-                        completed.push(item);
+                        ) {
+                            FastlyBatchObservation::Continue(item) => completed.push(item),
+                            FastlyBatchObservation::Cutoff => {
+                                cutoff_reached = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -582,17 +607,21 @@ mod fastly_impl {
                     let index = metadata.index;
                     let outcome = finish_selected(selection, metadata, &clock).await;
                     let completed_at = clock.now();
-                    let Some(item) = finish_batch_item(
+                    match finish_fastly_batch_observation(
                         index,
                         batch_started_at,
                         completed_at,
                         cutoff,
                         outcome,
-                    ) else {
-                        yield OutboundBatchDriverEvent::Cutoff;
-                        return;
-                    };
-                    yield OutboundBatchDriverEvent::Item(item);
+                    ) {
+                        FastlyBatchObservation::Continue(item) => {
+                            yield OutboundBatchDriverEvent::Item(item);
+                        }
+                        FastlyBatchObservation::Cutoff => {
+                            yield OutboundBatchDriverEvent::Cutoff;
+                            return;
+                        }
+                    }
                 }
 
                 if !pending.is_empty() {
@@ -2424,7 +2453,10 @@ fn timeout_error(cause: BudgetSource) -> EdgeError {
 
 #[cfg(test)]
 mod send_failure_policy_tests {
-    use edgezero_core::outbound::{OutboundBatch, OutboundBatchItem, OutboundSlotResult};
+    use edgezero_core::outbound::{
+        OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundBatchTermination,
+        OutboundSlotResult,
+    };
     use futures::executor::block_on;
     use futures_util::stream;
 
@@ -2528,6 +2560,60 @@ mod send_failure_policy_tests {
         );
         assert!(matches!(failure.slots.first(), Some(Some(_))));
         assert!(matches!(failure.slots.get(1), Some(None)));
+    }
+
+    #[test]
+    fn early_batch_cutoff_timeout_preserves_a_later_sibling() {
+        let started_at = MonotonicInstant::now();
+        let cutoff = Deadline::at_instant(
+            started_at
+                .checked_add(Duration::from_millis(10))
+                .expect("cutoff instant"),
+        );
+        let early_timeout = finish_fastly_batch_observation(
+            0,
+            started_at,
+            started_at
+                .checked_add(Duration::from_millis(1))
+                .expect("early completion"),
+            cutoff,
+            Err(timeout_error(BudgetSource::BatchCutoff)),
+        );
+        let sibling = finish_fastly_batch_observation(
+            1,
+            started_at,
+            started_at
+                .checked_add(Duration::from_millis(2))
+                .expect("sibling completion"),
+            cutoff,
+            Err(EdgeError::bad_gateway("sibling completed")),
+        );
+        let events = [early_timeout, sibling].map(|observation| match observation {
+            FastlyBatchObservation::Continue(item) => OutboundBatchDriverEvent::Item(item),
+            FastlyBatchObservation::Cutoff => OutboundBatchDriverEvent::Cutoff,
+        });
+        let batch = OutboundBatch::from_driver(2, stream::iter(events));
+
+        let results = block_on(batch.collect()).expect("valid Fastly batch driver");
+
+        assert_eq!(results.termination, OutboundBatchTermination::Completed);
+        assert!(matches!(
+            results.slots.first(),
+            Some(Some(OutboundSlotResult {
+                outcome: Err(EdgeError::GatewayTimeout {
+                    cause: BudgetSource::BatchCutoff,
+                    ..
+                }),
+                ..
+            }))
+        ));
+        assert!(matches!(
+            results.slots.get(1),
+            Some(Some(OutboundSlotResult {
+                outcome: Err(EdgeError::BadGateway { .. }),
+                ..
+            }))
+        ));
     }
 
     fn failures() -> [SendFailure; 8] {

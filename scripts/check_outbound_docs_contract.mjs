@@ -472,6 +472,9 @@ for (const staleFragment of [
   }
 }
 for (const requiredFragment of [
+  '`BudgetSource::BatchCutoff` attribution alone never emits `OutboundBatchDriverEvent::Cutoff`',
+  "monotonic clock shows that the method-level absolute cutoff has expired; equality is expired",
+  "An earlier Fastly phase timeout remains that slot's terminal `GatewayTimeout` item",
   'pub enum OutboundBatchDriverEvent',
   'pub enum OutboundBatchTermination',
   'pub enum OutboundBatchNext',

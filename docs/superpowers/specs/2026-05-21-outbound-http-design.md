@@ -2015,6 +2015,11 @@ is `Unspecified`. `dispatch_budget` selects provenance before its zero-duration 
 an already-expired request deadline is `RequestDeadline` unless a per-call zero timeout has
 the same absolute instant; the documented equality rule then selects `PerCallTimeout`.
 The zero-effective-budget timeout carries that selected cause.
+`BudgetSource::BatchCutoff` attribution alone never emits `OutboundBatchDriverEvent::Cutoff`;
+`OutboundBatchDriverEvent::Cutoff` may be emitted only when an observation from the batch's
+monotonic clock shows that the method-level absolute cutoff has expired; equality is expired.
+An earlier Fastly phase timeout remains that slot's terminal `GatewayTimeout` item and does not
+discard siblings.
 
 **This is NORMATIVE for EVERY adapter, not just Fastly.** Every EdgeZero-owned budget timer
 that expires — the `reqwest` timeout on **Axum**, the `worker::Delay` expiry on
