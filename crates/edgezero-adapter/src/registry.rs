@@ -471,8 +471,8 @@ pub trait Adapter: Sync + Send {
         Ok(())
     }
 
-    /// Validate the final config key selected by CLI, environment, and target
-    /// fallback precedence before config push or diff performs provider I/O.
+    /// Validate the final config key selected by CLI and environment precedence
+    /// before config push or diff performs provider I/O.
     ///
     /// `logical_store_id` is the portable manifest ID. `key` is the final key
     /// the operation would read or write. `staging` identifies the requested

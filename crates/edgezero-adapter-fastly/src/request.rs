@@ -315,15 +315,13 @@ where
 /// store wiring [`run_app`](crate::run_app) uses.
 ///
 /// Fastly is `Multi` for all three kinds. Each declared ID is the stable
-/// resource-link alias opened by the runtime. Config uses the logical ID as the
-/// production entry key and appends `_staging` when Fastly reports a staged
-/// request. A custom entry point gets full parity with `run_app` by passing the
-/// provider target state:
+/// resource-link alias opened by the runtime. Config always uses the logical ID
+/// as its entry key. A custom entry point gets full parity with `run_app` by
+/// passing the baked store metadata:
 ///
 /// ```rust,ignore
 /// let stores = MyHooks::stores();
-/// let staging = fastly::compute_runtime::is_staging();
-/// dispatch_with_registries(&app, req, stores, staging, |_req, _extensions| {})
+/// dispatch_with_registries(&app, req, stores, |_req, _extensions| {})
 /// ```
 ///
 /// [`FastlyService`]'s bare-handle path binds `default_key: "default"` and
@@ -340,14 +338,13 @@ pub fn dispatch_with_registries<F>(
     app: &App,
     req: FastlyRequest,
     stores: StoresMetadata,
-    staging: bool,
     extend: F,
 ) -> Result<FastlyResponse, FastlyError>
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
     let kv_registry = build_kv_registry(stores.kv)?;
-    let config_registry = build_config_registry(stores.config, staging);
+    let config_registry = build_config_registry(stores.config);
     let secret_registry = build_secret_registry(stores.secrets);
     dispatch_with_handles(
         app,
@@ -428,10 +425,7 @@ fn build_kv_registry(kv_meta: Option<StoreMetadata>) -> Result<Option<KvRegistry
     Ok(StoreRegistry::from_parts(by_id, default_id))
 }
 
-fn build_config_registry(
-    config_meta: Option<StoreMetadata>,
-    staging: bool,
-) -> Option<ConfigRegistry> {
+fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
     let meta = config_meta?;
     let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
@@ -441,7 +435,7 @@ fn build_config_registry(
                     (*id).to_owned(),
                     ConfigStoreBinding {
                         handle: ConfigStoreHandle::new(Arc::new(store)),
-                        default_key: crate::config_entry_key(id, staging),
+                        default_key: (*id).to_owned(),
                     },
                 );
             }
@@ -770,14 +764,5 @@ mod synthesis_tests {
     #[test]
     fn resolve_secret_handle_builds_handle_when_required_true_matches_require_secrets() {
         let _handle = resolve_secret_handle(true);
-    }
-
-    #[test]
-    fn config_default_key_comes_from_logical_id_and_target() {
-        assert_eq!(crate::config_entry_key("app_config", false), "app_config");
-        assert_eq!(
-            crate::config_entry_key("app_config", true),
-            "app_config_staging"
-        );
     }
 }

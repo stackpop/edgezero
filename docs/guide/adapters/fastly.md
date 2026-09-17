@@ -206,10 +206,11 @@ blank or invalid value fails before provider mutation. The same logical ID can b
 used independently by Config, KV, and Secret Stores because link identity is the
 pair `(resource kind, logical ID)`.
 
-Config keys are deterministic on Fastly: production reads `<ID>`, staging reads
-`<ID>_staging`, and local Viceroy reads `<ID>`. A conflicting
-`EDGEZERO__STORES__CONFIG__<ID>__KEY` or `--key` fails before a write. Logging is
-resolved from `[adapters.fastly.logging]` when the package is built.
+Config keys are deterministic on Fastly: production, staging, and local Viceroy
+all read `<ID>`. The selected Environment chooses the physical store through
+`__NAME`; the same name shares config and different names isolate it. A
+conflicting `__KEY` or `--key` fails before a write. Logging is resolved from
+`[adapters.fastly.logging]` when the package is built.
 
 Before publication, EdgeZero:
 

@@ -10,10 +10,9 @@ set -euo pipefail
 # wrapper blanks every other FASTLY_* alias, so an inherited FASTLY_ENDPOINT or
 # FASTLY_TOKEN can never redirect or re-auth the push.
 #
-# Staging: `deploy-to: staging` passes `--staging` to the CLI, which writes
-# `<logical-store-id>_staging`; production writes `<logical-store-id>`. Fastly
-# rejects a conflicting canonical `__KEY`. Production and staging may select
-# the same or different physical stores through their `__NAME` selectors.
+# Every target uses `<logical-store-id>` as the config entry key. The selected
+# environment chooses the physical store through `__NAME`; using the same name
+# shares config, while different names isolate it.
 #
 # The manifest is an absolute verified member of the immutable application
 # release. Publisher-owned app-config files remain confined beneath the selected
@@ -35,7 +34,7 @@ set -euo pipefail
 #   RUNNER_TEMP                           optional  scratch root for the inline-config temp file (default: /tmp)
 # Writes (outputs):
 #   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
-#   pushed-key                            canonical environment key, or the target fallback
+#   pushed-key                            canonical environment key, or the logical ID fallback
 #   store                                 the logical store id the CLI resolved
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -152,8 +151,8 @@ main() {
   fi
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the
-  # push non-interactive in CI; --staging selects the canonical environment key
-  # or its `<logical>_staging` fallback.
+  # push non-interactive in CI. --staging selects the Fastly lifecycle target;
+  # it does not change the runtime config key.
   local argv=("$cli_bin" config push --adapter fastly --manifest "$manifest" --app-config "$app_config")
   if [[ -n "$store" ]]; then argv+=(--store "$store"); fi
   if [[ "$deploy_to" == "staging" ]]; then argv+=(--staging); fi

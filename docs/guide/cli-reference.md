@@ -363,14 +363,11 @@ flags and exits `2` with a pointer to the typed CLI — it cannot push (see
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to push to. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
-- `--key <key>` — override the config-store key the blob is written under (spec §5.4). Fastly accepts only its deterministic target key: `<logical-id>` for production and local Viceroy, or `<logical-id>_staging` for staging.
-- `--staging` — write the key selected by the staging environment's canonical
-  `EDGEZERO__STORES__CONFIG__<ID>__KEY` variable. The parent process value wins,
-  followed by an applicable `[environment.variables]` manifest default. When
-  both are absent, the key falls back to `<logical-store-id>_staging`.
-  Production and staging may select the same or different physical stores. The
-  flag remains mutually exclusive with `--key`. Fastly rejects a conflicting
-  canonical key; other adapters retain explicit key selection (see
+- `--key <key>` — override the config-store key the blob is written under (spec §5.4). Fastly accepts only the logical store ID for every target.
+- `--staging` — target the staging publication flow. It does not change the
+  config entry key. The selected environment's `__NAME` chooses the physical
+  store, so production and staging may share or isolate config. The flag remains
+  mutually exclusive with `--key`; other adapters retain explicit key selection (see
   [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config. By default the loader reads the overlay so the push sends the same values the runtime would.
 - `--local` — push into the adapter's local-emulator state instead of the live platform. Fastly edits `[local_server.config_stores]` in `fastly.toml` (Viceroy reads it on startup); Cloudflare runs `wrangler kv bulk put --local` so writes land in `.wrangler/state`; Spin forces SQLite-direct against `<spin.toml dir>/.spin/sqlite_key_value.db` even when the manifest's deploy command targets Fermyon Cloud (the runtime-config `[key_value_store.<label>].type` is also ignored for SQLite path resolution); Axum is local-only already so it's a no-op there.
@@ -435,11 +432,9 @@ stub that absorbs its flags and exits `2` with a pointer to the typed CLI.
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to diff against. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
 - `--key <key>` — override the config-store key to diff against (spec §5.4). Defaults to the logical store id; matches `config push --key`.
-- `--staging` — diff against the staging environment's canonical
-  `EDGEZERO__STORES__CONFIG__<ID>__KEY` selection, falling back to
-  `<logical-store-id>_staging` when absent from both the parent process and
-  applicable manifest defaults. This matches what
-  `config push --staging` writes and remains mutually exclusive with `--key`.
+- `--staging` — diff against the physical Config Store selected by the staging
+  environment. The entry key remains the logical store ID, matching
+  `config push --staging`, and the flag remains mutually exclusive with `--key`.
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config.
 - `--local` — diff against the adapter's local-emulator state instead of the live platform (same resolution as `config push --local`).
 - `--runtime-config <path>` — adapter runtime configuration file (Spin only; same semantics as `config push`).

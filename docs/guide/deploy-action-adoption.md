@@ -72,8 +72,10 @@ EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME
 They may choose different values and physical resources for each publisher and
 for production/staging. The variable names contain no service ID. Secret Store
 selectors contain only a store name, never a secret value. Fastly logging comes
-from the immutable application manifest. Config keys are fixed by target:
-`<logical-id>` in production and `<logical-id>_staging` in staging.
+from the immutable application manifest. Every target uses `<logical-id>` as
+the config key. The selected Environment chooses the physical
+store with `__NAME`; using the same value shares config and using different
+values isolates it.
 
 Fastly resolves each selected physical store and attaches it to the target
 version under the manifest's logical ID before staging or activation. Failed

@@ -110,43 +110,20 @@ impl EnvConfig {
         self.get(&["logging", "level"])
     }
 
-    /// Production key for a logical store —
-    /// `EDGEZERO__STORES__<KIND>__<ID>__KEY` — falling back to `id` itself.
-    ///
-    /// Use [`Self::store_key_for_target`] when staging needs its distinct
-    /// fallback.
+    /// Key for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__KEY` —
+    /// falling back to `id` itself when unset, blank, whitespace-only, or
+    /// containing control characters.
     #[must_use]
     #[inline]
     pub fn store_key(&self, kind: &str, id: &str) -> String {
-        self.store_key_for_target(kind, id, false)
-    }
-
-    /// Key for a logical store and publication target.
-    ///
-    /// A valid canonical `EDGEZERO__STORES__<KIND>__<ID>__KEY` value always
-    /// wins. Otherwise production falls back to `id`, while staging falls back
-    /// to `<id>_staging`. Keeping this rule here lets config push, config diff,
-    /// and deployment planning resolve the same key.
-    #[must_use]
-    #[inline]
-    pub fn store_key_for_target(&self, kind: &str, id: &str, staging: bool) -> String {
         self.get(&["stores", kind, id, "key"])
             .filter(|value| !is_blank_or_control(value))
-            .map_or_else(
-                || {
-                    if staging {
-                        format!("{id}_staging")
-                    } else {
-                        id.to_owned()
-                    }
-                },
-                str::to_owned,
-            )
+            .map_or_else(|| id.to_owned(), str::to_owned)
     }
 
-    /// Checked key for a logical store and publication target.
+    /// Checked key for a logical store.
     ///
-    /// An absent selector uses the target default. A present blank value or a
+    /// An absent selector uses the logical ID. A present blank value or a
     /// value containing control characters is rejected so callers cannot
     /// mutate the fallback key and later fail stricter deployment validation.
     /// The error names the canonical variable without including its value.
@@ -155,22 +132,9 @@ impl EnvConfig {
     /// Returns an error when the canonical `__KEY` selector is present but
     /// invalid.
     #[inline]
-    pub fn store_key_for_target_checked(
-        &self,
-        kind: &str,
-        id: &str,
-        staging: bool,
-    ) -> Result<String, String> {
-        self.store_selector_checked(kind, id, "key")?.map_or_else(
-            || {
-                Ok(if staging {
-                    format!("{id}_staging")
-                } else {
-                    id.to_owned()
-                })
-            },
-            |value| Ok(value.to_owned()),
-        )
+    pub fn store_key_checked(&self, kind: &str, id: &str) -> Result<String, String> {
+        self.store_selector_checked(kind, id, "key")?
+            .map_or_else(|| Ok(id.to_owned()), |value| Ok(value.to_owned()))
     }
 
     /// Platform name for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__NAME`
@@ -454,7 +418,7 @@ mod tests {
             let cfg =
                 EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", invalid)]);
             let error = cfg
-                .store_key_for_target_checked("config", "app_config", true)
+                .store_key_checked("config", "app_config")
                 .expect_err("a present invalid selector must not fall back");
             assert!(
                 error.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"),
@@ -468,44 +432,23 @@ mod tests {
     }
 
     #[test]
-    fn checked_store_key_uses_target_default_only_when_selector_is_absent() {
+    fn checked_store_key_defaults_to_logical_id_only_when_selector_is_absent() {
         let cfg = EnvConfig::default();
         assert_eq!(
-            cfg.store_key_for_target_checked("config", "app_config", false),
+            cfg.store_key_checked("config", "app_config"),
             Ok("app_config".to_owned())
         );
-        assert_eq!(
-            cfg.store_key_for_target_checked("config", "app_config", true),
-            Ok("app_config_staging".to_owned())
-        );
     }
 
     #[test]
-    fn store_key_for_target_uses_production_and_staging_defaults() {
-        let cfg = EnvConfig::default();
-        assert_eq!(
-            cfg.store_key_for_target("config", "app_config", false),
-            "app_config"
-        );
-        assert_eq!(
-            cfg.store_key_for_target("config", "app_config", true),
-            "app_config_staging"
-        );
-    }
-
-    #[test]
-    fn store_key_for_target_canonical_override_wins_for_both_targets() {
+    fn checked_store_key_uses_canonical_environment_value() {
         let cfg = EnvConfig::from_vars([(
             "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
             "publisher-selected",
         )]);
         assert_eq!(
-            cfg.store_key_for_target("config", "app_config", false),
-            "publisher-selected"
-        );
-        assert_eq!(
-            cfg.store_key_for_target("config", "app_config", true),
-            "publisher-selected"
+            cfg.store_key_checked("config", "app_config"),
+            Ok("publisher-selected".to_owned())
         );
     }
 

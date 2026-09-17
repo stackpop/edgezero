@@ -73,8 +73,8 @@ struct PushContext {
     /// helper borrows from this to build the `AdapterPushContext<'_>`
     /// it hands the adapter trait method.
     adapter_push_ctx: ResolvedAdapterPushContext,
-    /// Final config entry key after CLI, environment, target fallback, and
-    /// adapter policy validation.
+    /// Final config entry key after CLI/environment resolution and adapter
+    /// policy validation.
     key: String,
     /// Resolved config store id (`--store` or the manifest
     /// default), paired with its env-resolved platform name. The
@@ -1439,7 +1439,7 @@ fn resolve_config_store_and_key(
     local: bool,
 ) -> Result<(ResolvedStoreId, String), String> {
     let platform = env_config.store_name_checked("config", logical)?;
-    let runtime_key = env_config.store_key_for_target_checked("config", logical, staging)?;
+    let runtime_key = env_config.store_key_checked("config", logical)?;
     let key = resolve_config_key(explicit_key, &runtime_key, staging)?;
     adapter.validate_config_key_for_target(logical, &key, staging, local)?;
     Ok((ResolvedStoreId::new(logical, platform), key))
@@ -2523,8 +2523,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     #[test]
     fn resolve_config_key_covers_key_and_staging_combinations() {
         let defaults = EnvConfig::default();
-        let production_default = defaults.store_key_for_target("config", "app_config", false);
-        let staging_default = defaults.store_key_for_target("config", "app_config", true);
+        let production_default = defaults.store_key("config", "app_config");
         // Production: the logical id, or an explicit --key verbatim.
         assert_eq!(
             resolve_config_key(None, &production_default, false).unwrap(),
@@ -2534,32 +2533,22 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             resolve_config_key(Some("custom"), &production_default, false).unwrap(),
             "custom"
         );
-        // Staging uses the same provider-neutral canonical target-key resolver
-        // as deployment planning. With no override, both fall back to the
-        // documented staging suffix.
-        assert_eq!(
-            resolve_config_key(None, &staging_default, true).unwrap(),
-            staging_default
-        );
-
-        let selected = EnvConfig::from_vars([(
-            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
-            "publisher-staging",
-        )]);
-        let selected_production_key = selected.store_key_for_target("config", "app_config", false);
+        let selected =
+            EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "app_config")]);
+        let selected_production_key = selected.store_key("config", "app_config");
         assert_eq!(
             resolve_config_key(None, &selected_production_key, false).unwrap(),
             selected_production_key,
             "production push and runtime selection must use the same explicit canonical KEY"
         );
-        let selected_runtime_key = selected.store_key_for_target("config", "app_config", true);
+        let selected_runtime_key = selected.store_key("config", "app_config");
         assert_eq!(
             resolve_config_key(None, &selected_runtime_key, true).unwrap(),
             selected_runtime_key,
             "staging push and runtime must select the same explicit canonical KEY"
         );
 
-        // --key + --staging is refused because only the canonical runtime KEY
+        // --key + --staging is refused because only the canonical environment KEY
         // can guarantee that the pushed entry is the one the deployed runtime
         // reads.
         let err = resolve_config_key(Some("custom"), &selected_runtime_key, true)
@@ -2622,6 +2611,32 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         )
         .expect_err("adapter validation must see the explicit final key");
         assert_eq!(error, "fixed key required");
+
+        let (_, key) = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &env,
+            "app_config",
+            None,
+            true,
+            false,
+        )
+        .expect("staging uses the same logical key without target derivation");
+        assert_eq!(key, "app_config");
+
+        let staging_env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        let error = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &staging_env,
+            "app_config",
+            None,
+            true,
+            false,
+        )
+        .expect_err("target-specific keys must not change runtime behavior");
+        assert_eq!(error, "fixed key required");
     }
 
     #[test]
@@ -2662,10 +2677,7 @@ ids = ["app_config"]
             iter::empty::<(&str, &str)>(),
         );
         assert_eq!(defaults.store_name("config", "app_config"), "manifest-name");
-        assert_eq!(
-            defaults.store_key_for_target("config", "app_config", true),
-            "manifest-key"
-        );
+        assert_eq!(defaults.store_key("config", "app_config"), "manifest-key");
 
         let parent = effective_manifest_environment(
             manifest.manifest(),
@@ -2676,10 +2688,7 @@ ids = ["app_config"]
             ],
         );
         assert_eq!(parent.store_name("config", "app_config"), "parent-name");
-        assert_eq!(
-            parent.store_key_for_target("config", "app_config", true),
-            "parent-key"
-        );
+        assert_eq!(parent.store_key("config", "app_config"), "parent-key");
 
         let no_key = ManifestLoader::load_from_str(
             r#"
@@ -2699,14 +2708,14 @@ crate = "crates/demo-app-adapter-fastly"
 ids = ["app_config"]
 "#,
         );
-        let staging_fallback = effective_manifest_environment(
+        let staging_without_key = effective_manifest_environment(
             no_key.manifest(),
             "fastly",
             iter::empty::<(&str, &str)>(),
         );
         assert_eq!(
-            staging_fallback.store_key_for_target("config", "app_config", true),
-            "app_config_staging"
+            staging_without_key.store_key("config", "app_config"),
+            "app_config"
         );
     }
 

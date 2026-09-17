@@ -31,8 +31,6 @@ use edgezero_core::app::Hooks;
 use edgezero_core::http::Extensions;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::manifest::ResolvedLoggingConfig;
-#[cfg(feature = "fastly")]
-use fastly::compute_runtime;
 
 #[cfg(any(feature = "fastly", test))]
 #[derive(Debug, Clone)]
@@ -54,17 +52,6 @@ impl From<ResolvedLoggingConfig> for FastlyLogging {
             level: config.level.into(),
             use_fastly_logger,
         }
-    }
-}
-
-#[cfg(any(feature = "cli", feature = "fastly", test))]
-#[must_use]
-#[inline]
-pub(crate) fn config_entry_key(logical_id: &str, staging: bool) -> String {
-    if staging {
-        format!("{logical_id}_staging")
-    } else {
-        logical_id.to_owned()
     }
 }
 
@@ -134,7 +121,7 @@ where
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
     let app = A::build_app();
-    request::dispatch_with_registries(&app, req, stores, compute_runtime::is_staging(), extend)
+    request::dispatch_with_registries(&app, req, stores, extend)
 }
 
 /// Dispatch with a config store wired explicitly. Its name and default key are
@@ -181,12 +168,6 @@ mod fastly_logging_tests {
         assert_eq!(logging.level, log::LevelFilter::Debug);
         assert!(!logging.echo_stdout);
         assert!(logging.use_fastly_logger);
-    }
-
-    #[test]
-    fn config_entry_key_is_deterministic_for_each_fastly_target() {
-        assert_eq!(config_entry_key("app_config", false), "app_config");
-        assert_eq!(config_entry_key("app_config", true), "app_config_staging");
     }
 
     #[test]

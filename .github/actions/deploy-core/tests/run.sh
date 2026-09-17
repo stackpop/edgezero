@@ -952,7 +952,7 @@ CLI
       EDGEZERO__PROVIDER__ENV='{"FASTLY_API_TOKEN":"s3cret"}' \
       EDGEZERO__FASTLY__API_TOKEN='s3cret' \
       EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME='credentials-staging' \
-      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY='app_config_staging' \
+      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY='app_config' \
       EDGEZERO__STORES__SECRETS____NAME='must-not-survive' \
       EDGEZERO__ADAPTER__HOST='127.0.0.1' EDGEZERO__ADAPTER__PORT='7676' \
       EDGEZERO__LOGGING__ENDPOINT='https://logs.example.test' EDGEZERO__LOGGING__LEVEL='debug' \
@@ -970,7 +970,7 @@ CLI
     "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=credentials-staging" \
     "$(grep '^EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=' <<<"$out")"
   assert_equals "the selected config-store key is delivered" \
-    "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging" \
+    "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config" \
     "$(grep '^EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=' <<<"$out")"
   assert_equals "the fixed adapter host is delivered" "EDGEZERO__ADAPTER__HOST=127.0.0.1" \
     "$(grep '^EDGEZERO__ADAPTER__HOST=' <<<"$out")"
@@ -1478,7 +1478,7 @@ test_toolchain_boundary() {
 }
 
 # ---------------------------------------------------------------------------
-# config-push.sh — canonical KEY wins, with target-specific fallback
+# config-push.sh — canonical KEY is selected by the deployment environment
 # ---------------------------------------------------------------------------
 # Runs config-push.sh against a fake app CLI that records its argv and emits the
 # canonical pushed-key line. Returns the recorded argv (one arg per line).
@@ -1494,17 +1494,14 @@ printf '%s\n' "$@" >"$FAKE_ARGV_OUT"
 # Capture the --app-config file's content while it still exists (the wrapper
 # removes an inline temp file on exit), so a test can verify what was pushed.
 prev=""
-staging=false
 for a in "$@"; do
   if [[ "$prev" == "--app-config" ]]; then cp -f "$a" "$FAKE_ARGV_OUT.appconfig" 2>/dev/null || true; fi
-  if [[ "$a" == "--staging" ]]; then staging=true; fi
   prev="$a"
 done
 runtime_key="${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}"
 printf '%s' "$runtime_key" >"$FAKE_ARGV_OUT.runtime-key"
-if [[ -z "$runtime_key" ]]; then
-  if [[ "$staging" == true ]]; then runtime_key=app_config_staging; else runtime_key=app_config; fi
-fi
+[[ -z "$runtime_key" || "$runtime_key" == app_config ]] || exit 2
+runtime_key=app_config
 echo "pushed-key=$runtime_key"
 echo "pushed-store=app_config"
 CLI
@@ -1523,9 +1520,13 @@ CLI
   git -C "$dir/app" commit -qm fixture
 
   : >"$dir/ghout"
-  PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" GITHUB_OUTPUT="$dir/ghout" \
+  local -a key_env=(env -u EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY)
+  if [[ ${CP_RUNTIME_KEY+x} == x ]]; then
+    key_env=(env "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=$CP_RUNTIME_KEY")
+  fi
+  local rc=0
+  "${key_env[@]}" PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" GITHUB_OUTPUT="$dir/ghout" \
     EDGEZERO__APP__CLI__BIN=fake-cli \
-    EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="${CP_RUNTIME_KEY:-}" \
     FASTLY_API_TOKEN=tok \
     GITHUB_WORKSPACE="$dir" \
     EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
@@ -1536,8 +1537,9 @@ CLI
     EDGEZERO__CONFIG_PUSH__APP_CONFIG="${CP_APP_CONFIG:-}" \
     EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE="${CP_APP_CONFIG_INLINE-greeting = \"default\"}" \
     EDGEZERO__CONFIG_PUSH__NO_ENV="${CP_NO_ENV:-false}" \
-    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1 || rc=$?
   cat "$dir/argv.txt" 2>/dev/null
+  return "$rc"
 }
 
 # Run config-push.sh with a caller-supplied path; used for confinement checks.
@@ -1566,23 +1568,16 @@ test_config_push_argv() {
   assert_succeeds "config push always passes one explicit typed config file" \
     grep -qx -- '--app-config' <<<"$prod"
 
-  # Staging: same argv plus --staging. With no canonical KEY, the application
-  # CLI uses the target-specific fallback.
+  # Staging changes the publication target, not the config entry key.
   local staged
   staged=$(CP_DEPLOY_TO=staging run_config_push_argv)
   assert_succeeds "staging appends --staging" grep -qx -- '--staging' <<<"$staged"
-  assert_succeeds "staging without canonical KEY reports the staging fallback" \
-    grep -qx 'pushed-key=app_config_staging' "$WORK_DIR/config-push/ghout"
+  assert_succeeds "staging reports the same logical key" \
+    grep -qx 'pushed-key=app_config' "$WORK_DIR/config-push/ghout"
   assert_fails "production does NOT pass --staging" grep -qx -- '--staging' <<<"$prod"
 
-  local selected_staged
-  selected_staged=$(CP_RUNTIME_KEY=publisher-selected CP_DEPLOY_TO=staging run_config_push_argv)
-  assert_succeeds "staging with canonical KEY still appends --staging" \
-    grep -qx -- '--staging' <<<"$selected_staged"
-  assert_equals "config-push wrapper preserves the canonical runtime KEY" \
-    publisher-selected "$(cat "$WORK_DIR/config-push/argv.txt.runtime-key")"
-  assert_succeeds "action pushed-key reports the canonical runtime KEY" \
-    grep -qx 'pushed-key=publisher-selected' "$WORK_DIR/config-push/ghout"
+  CP_RUNTIME_KEY=publisher-selected CP_DEPLOY_TO=staging \
+    assert_fails "Fastly rejects a conflicting environment KEY" run_config_push_argv
 
   # The managed action may select a logical store. Its deprecated key input
   # fails before the application CLI can mutate a provider store.
@@ -2474,9 +2469,9 @@ test_fastly_logical_link_documentation() {
     grep -Fq 'Fastly version resource links bind each' "$corpus"
   # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
   assert_succeeds "docs state the production Config Store key" \
-    grep -Fq 'production reads `<ID>`' "$corpus"
+    grep -Fq 'production, staging, and local Viceroy' "$corpus"
   assert_succeeds "docs state the staging Config Store key" \
-    grep -Fq 'staging reads' "$corpus"
+    grep -Fq 'all read `<ID>`' "$corpus"
   assert_succeeds "docs mark PR 344 runtime selectors unsupported" \
     grep -Fq 'PR #344 runtime descriptor and service-scoped selector keys are unsupported' "$corpus"
   assert_fails "docs contain no service-scoped runtime selector key" \

@@ -129,8 +129,9 @@ For each declared store, managed deploy links the selected physical resource to
 the unpublished Fastly version under the stable logical ID. The runtime opens
 that logical alias, so production and staging may select the same or different
 physical stores without changing package bytes. Config data uses the logical ID
-as the production key and `<ID>_staging` as the staging key. Conflicting
-`EDGEZERO__STORES__CONFIG__<ID>__KEY` values fail; omit them for Fastly.
+as the key for every target. Selecting the same physical store shares config;
+selecting a different `__NAME` isolates it. A conflicting `__KEY` fails before
+provider mutation.
 Fastly logging settings come from `[adapters.fastly.logging]` in the application
 manifest and are baked into the package.
 
@@ -240,8 +241,9 @@ config source:
 ```
 
 `app-config` and `app-config-inline` are mutually exclusive. With
-`deploy-to: staging`, Fastly writes `<logical-id>_staging`; production writes
-`<logical-id>`. A conflicting canonical `__KEY` fails before mutation. The
+`deploy-to: staging`, Fastly still writes `<logical-id>` to the physical store
+selected by that Environment. A conflicting canonical `__KEY` fails before
+mutation. The
 deprecated action `key` input is retained only to fail with migration guidance
 when nonempty. Config push changes typed runtime data; it does not change the
 application release, package, or manifests.
@@ -272,7 +274,7 @@ application release, package, or manifests.
 | `no-env`              | No       | `false`      | Skip the typed runtime environment overlay.           |
 | `store`               | No       | manifest     | Logical Config Store ID.                              |
 | `key`                 | No       | empty        | Deprecated; any nonempty value fails before mutation. |
-| `deploy-to`           | No       | `production` | Select `<logical-id>` or `<logical-id>_staging`.      |
+| `deploy-to`           | No       | `production` | Validate the Environment key for the selected target. |
 
 \* Exactly one typed config input is required.
 

@@ -47,16 +47,16 @@ Fastly config entry keys are deterministic:
 
 ```text
 production: <logical-id>
-staging:    <logical-id>_staging
+staging:    <logical-id>
 ```
 
-An absent Fastly `EDGEZERO__STORES__CONFIG__<ID>__KEY` resolves to this
-deterministic target key. Fastly rejects a `__KEY` selection or a CLI `--key`
-whose final value differs from the target key. Validation runs after the usual
-CLI, environment, and fallback precedence is resolved, and before config push
-or diff performs provider I/O. Other adapters retain their existing `__KEY`
-behavior. The adapter registry owns this difference; generic CLI and action
-code must not branch on the adapter name.
+Fastly rejects a `__KEY` selection or CLI `--key` whose value differs from the
+logical ID. Validation runs before config push, diff, or deploy performs
+provider I/O. The selected deployment environment chooses the physical store
+with `__NAME`; selecting the same store shares config, while selecting different
+stores isolates it. Other adapters retain their existing `__KEY` behavior. The
+adapter registry owns this difference; generic CLI and action code must not
+branch on the adapter name.
 
 A declared Secret Store remains optional at the application-data level: typed
 optional secret references may be absent. When `[stores.secrets]` is omitted,
@@ -114,15 +114,13 @@ The Fastly runtime opens stores by the stable logical IDs baked into the
 application release. It never reads a physical store name, service ID, version,
 deployment environment name, or runtime descriptor.
 
-For Config Stores, `fastly::compute_runtime::is_staging()` selects the entry
-key. Production reads the logical ID; staging reads the logical ID plus
-`_staging`. KV and Secret Stores require no target-specific runtime selector
-because the resource link chooses the physical store.
+Config, KV, and Secret Stores require no target-specific runtime selector. The
+resource link chooses the physical store, and Config Stores always read the
+logical ID as the entry key.
 
 Local Viceroy config push, diff, and runtime lookup use the logical aliases and
-production logical key. Remote config operations still resolve the selected
-physical `__NAME`. Tests exercise staging key derivation through a pure helper
-that accepts a Boolean target instead of relying on a provider runtime.
+logical key. Remote config operations resolve the selected physical `__NAME`.
+Tests prove the Fastly runtime does not branch on the publication target.
 
 ## Logging
 
@@ -166,7 +164,7 @@ This makes a recovery step safe both before and after staging publication.
 `config-push-fastly` retains the old `key` input only as a deprecated guard. A
 non-empty value fails during input validation before release extraction or any
 provider mutation. The diagnostic directs callers to the canonical selector
-contract and Fastly's deterministic target keys.
+contract and Fastly's fixed logical key.
 
 `build-app-cli` describes its artifact as an input to application-release
 assembly. Lifecycle actions consume the verified immutable application release,
@@ -197,7 +195,7 @@ Tests must prove:
 - no runtime or deployment path constructs a service/version `EDGEZERO__*`
   key;
 - production and staging deploy identical package bytes;
-- the same physical Config Store uses base and `_staging` keys;
+- the same physical Config Store and logical alias use the same config entry;
 - different physical Config, KV, and Secret Stores are linked under the same
   stable logical aliases on their respective versions;
 - the same logical ID can be reconciled independently for Config, KV, and

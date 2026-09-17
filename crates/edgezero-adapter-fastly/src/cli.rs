@@ -784,11 +784,7 @@ fn build_managed_deploy_plan(
     let stores = RuntimeStoreIds::from(&context.stores);
     for logical_id in &stores.config {
         let key = environment
-            .store_key_for_target_checked(
-                ResourceKind::Config.runtime_name(),
-                logical_id,
-                target == PublishTarget::Staging,
-            )
+            .store_key_checked(ResourceKind::Config.runtime_name(), logical_id)
             .map_err(|error| format!("invalid Fastly deploy environment: {error}"))?;
         validate_fastly_config_key(logical_id, &key, target == PublishTarget::Staging, false)?;
     }
@@ -5523,7 +5519,7 @@ fn effective_deploy_environment(context: &AdapterDeployContext) -> Result<EnvCon
                 .map_err(|error| format!("invalid Fastly deploy environment: {error}"))?;
             if kind == ResourceKind::Config {
                 environment
-                    .store_key_for_target_checked(kind.runtime_name(), logical_id, context.staging)
+                    .store_key_checked(kind.runtime_name(), logical_id)
                     .map_err(|error| format!("invalid Fastly deploy environment: {error}"))?;
             }
         }
@@ -5534,26 +5530,15 @@ fn effective_deploy_environment(context: &AdapterDeployContext) -> Result<EnvCon
 fn validate_fastly_config_key(
     logical_store_id: &str,
     key: &str,
-    staging: bool,
-    local: bool,
+    _staging: bool,
+    _local: bool,
 ) -> Result<(), String> {
-    let expected = if local {
-        logical_store_id.to_owned()
-    } else {
-        crate::config_entry_key(logical_store_id, staging)
-    };
+    let expected = logical_store_id;
     if key == expected {
         Ok(())
     } else {
-        let target = if local {
-            "local Viceroy"
-        } else if staging {
-            "Fastly staging"
-        } else {
-            "Fastly production"
-        };
         Err(format!(
-            "Fastly {target} uses deterministic config key `{expected}` for logical store `{logical_store_id}`; remove the conflicting --key or EDGEZERO__STORES__CONFIG__{}__KEY override",
+            "Fastly uses logical config key `{expected}` for every target; remove the conflicting --key or EDGEZERO__STORES__CONFIG__{}__KEY override and select the environment's physical store with __NAME",
             logical_store_id.to_ascii_uppercase()
         ))
     }
@@ -7955,21 +7940,20 @@ mod tests {
     }
 
     #[test]
-    fn fastly_config_keys_are_deterministic_for_each_target() {
+    fn fastly_config_keys_use_the_logical_id_for_every_target() {
         validate_fastly_config_key("app_config", "app_config", false, false)
             .expect("production key");
-        validate_fastly_config_key("app_config", "app_config_staging", true, false)
-            .expect("staging key");
+        validate_fastly_config_key("app_config", "app_config", true, false).expect("staging key");
         validate_fastly_config_key("app_config", "app_config", false, true).expect("local key");
 
         for (key, staging, local) in [
             ("custom", false, false),
-            ("app_config", true, false),
+            ("app_config_staging", true, false),
             ("app_config_staging", false, true),
         ] {
             let error = validate_fastly_config_key("app_config", key, staging, local)
                 .expect_err("conflicting key must fail");
-            assert!(error.contains("deterministic config key"), "{error}");
+            assert!(error.contains("logical config key"), "{error}");
         }
     }
 

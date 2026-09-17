@@ -4,7 +4,7 @@
 
 **Goal:** Remove Fastly runtime descriptors and select deployment-specific stores through version-scoped logical resource links while preserving identical application package bytes.
 
-**Architecture:** Deployment resolves physical stores from canonical `__NAME` variables and attaches them to an unpublished Fastly version under stable manifest IDs. The Fastly runtime opens those aliases and derives only the config entry key from `is_staging()`. Shared checked selector resolution and an adapter-owned config-key policy keep push, diff, and deploy aligned without adapter-name branching.
+**Architecture:** Deployment resolves physical stores from canonical `__NAME` variables and attaches them to an unpublished Fastly version under stable manifest IDs. The Fastly runtime opens those aliases and always reads the logical ID as the config entry key. Shared checked selector resolution and an adapter-owned config-key policy keep push, diff, and deploy aligned without adapter-name branching.
 
 **Tech Stack:** Rust 2024 workspace, Fastly Rust SDK 0.12, Fastly CLI 15.1, Bash composite actions, VitePress documentation.
 
@@ -36,9 +36,9 @@
 - Test: colocated Fastly adapter unit tests
 
 - [x] Replace descriptor tests with failing tests for logical store aliases and production/staging config keys.
-- [x] Add a pure target-key helper and make the Fastly adapter hook reject a configured key that differs from `<id>` or `<id>_staging`.
+- [x] Make the Fastly adapter hook reject a configured key that differs from `<id>`.
 - [x] Remove descriptor modules, constants, errors, Config Store lookup, service ID lookup, and version lookup from request dispatch.
-- [x] Use `fastly::compute_runtime::is_staging()` only to select config keys; keep store aliases logical.
+- [x] Keep store aliases and config entry keys logical for every target.
 - [x] Bake `[adapters.fastly.logging]` into `Hooks` metadata, use it from `run_app`, and preserve explicit logging ownership and optional Secret Store behavior without deployment-time logging variables.
 - [x] Run `cargo test -p edgezero-adapter-fastly --features cli -- --test-threads=1` and the no-default-features library check.
 
@@ -136,7 +136,7 @@
 - Delete: `docs/superpowers/plans/2026-09-17-fastly-runtime-review-followup.md`
 
 - [x] Remove every live reference to runtime descriptors, service/version selector keys, and staging selector twins; retain only the documented exact legacy-link cleanup for `edgezero_runtime_env`.
-- [x] Document deploy-time `__NAME` selection, logical aliases, deterministic target keys, and identical release bytes.
+- [x] Document deploy-time `__NAME` selection, logical aliases and keys, and identical release bytes.
 - [x] Document state-aware rollback and separate real domain, deployment target, and GitHub Environment identifier.
 - [x] Document manifest-baked Fastly logging and the caller's per-service deployment serialization requirement.
 - [x] Update documentation assertions in the action suite.
