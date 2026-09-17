@@ -6,7 +6,7 @@
 //!
 //! ## Storage Location
 //!
-//! The development server stores each declared KV id in its own file,
+//! The development server stores each declared KV store in its own file,
 //! `.edgezero/kv-<slug>-<hash>.redb`, derived from the resolved store name
 //! (see `kv_store_path` in `dev_server.rs`). Add this path to your `.gitignore`:
 //!

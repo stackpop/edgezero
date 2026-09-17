@@ -269,7 +269,7 @@ A typical development workflow:
 | Concurrency | Multi-threaded | Single-threaded   |
 
 ::: tip Development Parity
-While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Some edge-specific features (geolocation) aren't available in the Axum adapter.
+While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Provider-specific behaviour such as store backends and request context differs on the real targets.
 :::
 
 ## Next Steps

@@ -37,9 +37,11 @@ authors = ["you@example.com"]
 ```
 
 `edgezero provision --adapter fastly` writes `[setup.kv_stores]`,
-`[setup.secret_stores]` and `[setup.config_stores]` entries into `fastly.toml`
-for the declared store ids; the `[local_server.*]` tables are the Viceroy-only
-mirror of those stores.
+`[setup.secret_stores]` and `[setup.config_stores]` entries into `fastly.toml`,
+keyed by each store's env-resolved platform name. It deliberately leaves the
+Viceroy-only `[local_server.*]` tables alone: the config-store stanzas there are
+written by `edgezero config push --adapter fastly --local`, and KV / secret
+local-server seeding is hand-edited.
 
 ### Entrypoint
 
@@ -142,12 +144,12 @@ fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
     let stores = App::stores();
     let env = runtime_env_config(stores);
     let logging = FastlyLogging::from(&env);
-    if logging.use_fastly_logger {
+    if logging.use_fastly_logger && !App::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout).expect("init logger");
     }
     let app = App::build_app();
-    Ok(dispatch_with_registries(&app, req, stores, &env, |_req, _ext| {})?)
+    dispatch_with_registries(&app, req, stores, &env, |_req, _ext| {})
 }
 ```
 

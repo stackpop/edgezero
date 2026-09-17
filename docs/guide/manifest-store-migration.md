@@ -179,7 +179,7 @@ binding = "app_config"
 id      = "abc123…"
 ```
 
-Populate the namespace via `wrangler kv:key put`. The binding name
+Populate the namespace via `wrangler kv key put`. The binding name
 becomes the platform name resolved by
 `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME` (with the default being
 the literal id `app_config`).

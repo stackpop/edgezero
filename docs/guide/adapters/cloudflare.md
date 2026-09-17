@@ -5,7 +5,7 @@ Deploy EdgeZero applications to Cloudflare Workers using WebAssembly.
 ## Prerequisites
 
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
-- worker-builder: `cargo install worker-builder`
+- worker-build: `cargo install worker-build`
 - Rust `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
 
 ## Project Setup
@@ -82,8 +82,9 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
 This path takes bindings verbatim and does not resolve `EDGEZERO__STORES__*`
 selectors, so prefer `run_app` unless you are mocking a backend.
-`dispatch_with_registries` is the registry-based dispatcher `run_app` itself
-calls.
+`run_app` dispatches through an internal registry-based path; unlike Fastly's
+`dispatch_with_registries`, it is not part of the Cloudflare adapter's public
+API.
 
 ## Building
 
