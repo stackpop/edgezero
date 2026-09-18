@@ -170,7 +170,7 @@ const MANAGED_DEPLOY_GLOBAL_BOOL_FLAGS: &[&str] = &[
     "-v",
 ];
 
-/// Version-scoped logging endpoint collections exposed by Fastly CLI 15.1.
+/// Version-scoped logging endpoint collections exposed by the Fastly API.
 /// `service logging debug` streams endpoint errors and is not a collection.
 const FASTLY_LOGGING_PROVIDER_KINDS: &[&str] = &[
     "azureblob",
@@ -181,13 +181,14 @@ const FASTLY_LOGGING_PROVIDER_KINDS: &[&str] = &[
     "elasticsearch",
     "ftp",
     "gcs",
-    "googlepubsub",
+    "pubsub",
     "grafanacloudlogs",
     "heroku",
     "honeycomb",
     "https",
     "kafka",
     "kinesis",
+    "logentries",
     "loggly",
     "logshuttle",
     "newrelic",
@@ -8129,6 +8130,14 @@ mod tests {
                 r#"{"general.default_ttl":3600,"service_id":"SVC","version":42}"#,
             )
         );
+    }
+
+    #[test]
+    fn logging_snapshot_uses_fastly_api_provider_paths() {
+        assert!(FASTLY_LOGGING_PROVIDER_KINDS.contains(&"pubsub"));
+        assert!(FASTLY_LOGGING_PROVIDER_KINDS.contains(&"logentries"));
+        assert!(FASTLY_LOGGING_PROVIDER_KINDS.contains(&"s3"));
+        assert!(!FASTLY_LOGGING_PROVIDER_KINDS.contains(&"googlepubsub"));
     }
 
     #[test]

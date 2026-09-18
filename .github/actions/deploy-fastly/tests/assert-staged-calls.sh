@@ -57,7 +57,11 @@ MUTATIONS
     for collection in domain backend healthcheck settings; do
       [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/$collection$" "$log")" -eq 3 ]] || fail "staging did not preserve and revalidate version $version $collection configuration"
     done
-    [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/logging/" "$log")" -eq 81 ]] || fail "staging did not preserve and revalidate version $version logging configuration"
+    [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/logging/" "$log")" -eq 84 ]] || fail "staging did not preserve and revalidate version $version logging configuration"
+    for provider in pubsub logentries s3; do
+      [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/logging/$provider$" "$log")" -eq 3 ]] || fail "staging did not preserve and revalidate version $version $provider logging configuration"
+    done
+    ! grep -q "^GET https://api.fastly.com/service/dummyservice/version/$version/logging/googlepubsub$" "$log" || fail "staging used the invalid googlepubsub API path"
   done
   ! grep -q '/diff/from/' "$log" || fail "staging used the unsupported Fastly Compute diff endpoint"
   [[ "$last_create" -lt "$final_links" && "$final_links" -lt "$stage_line" && "$package_line" -lt "$stage_line" && "$configuration_line" -lt "$stage_line" ]] || fail "final link, package, and protected-configuration verification did not follow reconciliation and precede staging"

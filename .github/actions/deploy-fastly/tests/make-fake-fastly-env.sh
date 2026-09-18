@@ -215,6 +215,8 @@ if [[ "$*" == *--config* ]]; then
       printf '[{"name":"origin","hostname":"origin.example.com","service_id":"dummyservice","version":40}]\n200' ;;
     */service/dummyservice/version/*/healthcheck)
       printf '[]\n200' ;;
+    */service/dummyservice/version/*/logging/googlepubsub)
+      printf 'unknown logging provider\n404' ;;
     */service/dummyservice/version/*/logging/*)
       printf '[]\n200' ;;
     */service/dummyservice/version/*/settings)
