@@ -12,12 +12,12 @@
 
 ## File structure
 
-New provider-neutral files:
+New or refactored provider-neutral files:
 
 - `.github/actions/release-core/scripts/prepare-release.sh` — verify the outer digest, exact archive members, format-1 metadata, expected adapter/protocol/revision, inner digests, manifest relationship, and extraction confinement.
 - `.github/actions/release-core/scripts/package-release.sh` — validate generic inputs and lifecycle capabilities, preserve the selected adapter manifest path, construct format-1 metadata, create the archive, and verify it before publishing paths/digests.
 - `.github/actions/release-core/tests/run.sh` — synthetic-adapter producer/consumer tests with no provider tool or provider deployment implementation.
-- `.github/actions/deploy-core/scripts/invoke-app-cli.sh` — resolve the verified application CLI, import typed credentials, preserve allowed public environment variables, scrub action-private state, emit the mutation signal, and execute an exact NUL-delimited argument vector.
+- `.github/actions/deploy-core/scripts/run-app-cli.sh` — resolve the verified application CLI, import typed credentials, preserve allowed public environment variables, scrub action-private state, emit the mutation signal, and execute an exact NUL-delimited argument vector.
 - `crates/edgezero-adapter/src/release.rs` — format-level immutable-release verifier available only with the `cli` feature.
 
 Fastly wrapper files:
@@ -39,7 +39,6 @@ Modified consumers:
 Deleted after all callers migrate:
 
 - `.github/actions/fastly-common/scripts/prepare-release.sh`
-- `.github/actions/deploy-core/scripts/run-app-cli.sh`
 - `crates/edgezero-adapter-fastly/src/release.rs`
 - `.github/actions/package-fastly-application-release/`
 
@@ -423,11 +422,11 @@ git add Cargo.lock crates/edgezero-adapter crates/edgezero-adapter-fastly
 git commit -m "refactor(adapter): share application release verification"
 ```
 
-### Task 5: Add the generic application-CLI invocation core
+### Task 5: Refactor the application-CLI runner into a generic core
 
 **Files:**
 
-- Create: `.github/actions/deploy-core/scripts/invoke-app-cli.sh`
+- Modify: `.github/actions/deploy-core/scripts/run-app-cli.sh`
 - Modify: `.github/actions/deploy-core/scripts/common.sh:220-280`
 - Modify: `.github/actions/deploy-core/tests/run.sh:217-345,988-1210,1155-1220,1777-1808`
 
@@ -480,11 +479,12 @@ Run:
 .github/actions/deploy-core/tests/run.sh
 ```
 
-Expected: FAIL because `invoke-app-cli.sh` and the generic parsing helpers do not exist.
+Expected: FAIL because the existing mode-based runner does not implement the
+exact-argv contract and the generic parsing helpers do not exist.
 
 - [ ] **Step 4: Implement the exact invocation contract**
 
-The new script reads:
+The refactored script reads:
 
 ```text
 EDGEZERO__APP__CLI__PATH
@@ -526,13 +526,14 @@ Run:
 cargo test --workspace --all-targets
 ```
 
-Expected: PASS. Existing callers still use `run-app-cli.sh`; the new core is independently covered by synthetic tests.
+Expected: PASS. Existing callers retain the `run-app-cli.sh` path while the
+refactored core is independently covered by synthetic tests.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add .github/actions/deploy-core
-git commit -m "refactor(actions): add generic CLI invocation core"
+git commit -m "refactor(actions): generalize application CLI runner"
 ```
 
 ### Task 6: Migrate Fastly deploy and active-version wrappers
@@ -548,7 +549,7 @@ git commit -m "refactor(actions): add generic CLI invocation core"
 - [ ] **Step 1: Make tests require core delegation**
 
 Update deploy/capture tests to fail unless each wrapper calls
-`deploy-core/scripts/invoke-app-cli.sh`. Retain all existing assertions for
+`deploy-core/scripts/run-app-cli.sh`. Retain all existing assertions for
 deploy argument ordering, passthrough after `--`, source revision,
 `--application-release`, staging, package digest, recovery outputs, exact-one
 active-version parsing, mutation timing, credential scrubbing, and original exit
@@ -629,13 +630,12 @@ git commit -m "refactor(fastly): delegate deploy lifecycle invocation"
 - Modify: `.github/actions/rollback-fastly/scripts/rollback.sh`
 - Modify: `.github/actions/rollback-fastly/action.yml`
 - Modify: `.github/actions/deploy-core/tests/run.sh:1289-1448,1627-1776,3170-3293,3443-3469`
-- Delete: `.github/actions/deploy-core/scripts/run-app-cli.sh`
 
 - [ ] **Step 1: Make every lifecycle test require generic invocation**
 
 Add a static contract assertion that all lifecycle application CLI executions in
 deploy, active-version, config push, healthcheck, and rollback delegate to
-`invoke-app-cli.sh`; capability probes in release-core and the separate
+`run-app-cli.sh`; capability probes in release-core and the separate
 `build-app-cli` action are the exceptions. Retain the current command-specific
 argv, environment, log cleanup, output, rollback, and mutation tests.
 
@@ -675,7 +675,10 @@ In each action file, pass the public secret input only to a private `EDGEZERO__F
 
 - [ ] **Step 5: Remove transitional code**
 
-Delete `run-app-cli.sh`, remove its tests and delegating parser shims only after `rg --hidden 'run-app-cli\.sh' .github/actions` returns no callers. Ensure provider-neutral deploy-core scripts contain no Fastly credential names, flags, or policy branches.
+Remove the obsolete mode-based branches from `run-app-cli.sh` and remove the
+delegating parser shims after every wrapper uses the exact-argv contract. Ensure
+provider-neutral deploy-core scripts contain no Fastly credential names, flags,
+or policy branches.
 
 - [ ] **Step 6: Run lifecycle, release, and repository tests**
 
@@ -785,7 +788,7 @@ rg --hidden 'package-fastly-application-release' \
   --glob '!docs/node_modules/**' \
   --glob '!docs/superpowers/specs/**' \
   --glob '!docs/superpowers/plans/**'
-rg --hidden 'run-app-cli\.sh|fastly-common/scripts/prepare-release\.sh' \
+rg --hidden 'fastly-common/scripts/prepare-release\.sh' \
   --glob '!target/**' .github/actions
 rg --hidden 'edgezero-cli\.tar' \
   --glob '!target/**' \

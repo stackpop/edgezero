@@ -16,8 +16,6 @@ pub mod key_value_store;
 pub mod logger;
 #[cfg(feature = "fastly")]
 pub mod proxy;
-#[cfg(feature = "cli")]
-pub(crate) mod release;
 #[cfg(feature = "fastly")]
 pub mod request;
 #[cfg(feature = "fastly")]

@@ -24,7 +24,6 @@ use crate::chunked_config::{
     prior_chunk_keys, resolve_fastly_config_value_typed, sha256_hex, value_announces_our_kind,
     value_is_future_format, value_is_inert_foreign, verify_writer_split_layout,
 };
-use crate::release::{VerifiedApplicationRelease, verify_application_release};
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
@@ -33,6 +32,7 @@ use edgezero_adapter::registry::{
     Adapter, AdapterAction, AdapterDeployContext, AdapterPushContext, DeployOwnership,
     DeployStoreIds, ProvisionStores, ReadConfigEntry, ResolvedStoreId, register_adapter,
 };
+use edgezero_adapter::release::{VerifiedApplicationRelease, verify_application_release};
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
@@ -754,7 +754,13 @@ fn build_managed_deploy_plan(
     let adapter_manifest = context.adapter_manifest_path.as_deref().ok_or_else(|| {
         "managed Fastly deployment requires the exact referenced Fastly manifest path".to_owned()
     })?;
-    let release = verify_application_release(release_root, application_manifest, adapter_manifest)?;
+    let release = verify_application_release(
+        release_root,
+        application_manifest,
+        adapter_manifest,
+        "fastly",
+        1,
+    )?;
     let service_id = resolve_managed_plan_service_id(context, &release)?;
     let token = FastlyApiToken(require_token()?);
     if token.as_str().is_empty() {

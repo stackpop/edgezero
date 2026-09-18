@@ -214,128 +214,85 @@ test_cli_bin_confinement() {
 }
 
 # ---------------------------------------------------------------------------
-# run-app-cli.sh — provider-env credential boundary
+# run-app-cli.sh — provider-neutral invocation and trust boundary
 # ---------------------------------------------------------------------------
-# A fake CLI records the FASTLY_* it actually saw; run-cli must clear inherited
-# aliases and export only the declared, typed values.
-test_provider_env_boundary() {
-  section "run-cli provider-env boundary"
-
-  local bin_dir="$WORK_DIR/pe-bin" app_dir="$WORK_DIR/pe-app"
-  local seen="$WORK_DIR/pe-seen.txt" clear="$WORK_DIR/pe-clear.nul"
-  mkdir -p "$bin_dir" "$app_dir"
-  cat >"$bin_dir/fakecli" <<EOF
+test_invoke_app_cli() {
+  section "provider-neutral application CLI invocation"
+  local dir="$WORK_DIR/invoke-core" cli="$WORK_DIR/invoke-core/app-cli"
+  local args="$dir/args.nul" clear="$dir/clear.nul" allow="$dir/allow.nul"
+  local actual="$dir/actual.nul" seen="$dir/seen.txt" output="$dir/output"
+  mkdir -p "$dir/work"
+  cat >"$cli" <<'CLI'
 #!/usr/bin/env bash
+printf '%s\0' "$@" >"$ACTUAL_ARGV"
 {
-  printf 'TOKEN=%s\n' "\${FASTLY_API_TOKEN-unset}"
-  printf 'ENDPOINT=%s\n' "\${FASTLY_ENDPOINT-unset}"
-} >"$seen"
-EOF
-  chmod +x "$bin_dir/fakecli"
-  printf 'FASTLY_API_TOKEN\0FASTLY_ENDPOINT\0' >"$clear"
+  printf 'token=%s\n' "${SYNTHETIC_TOKEN:-ABSENT}"
+  printf 'endpoint=%s\n' "${SYNTHETIC_ENDPOINT:-ABSENT}"
+  printf 'manifest=%s\n' "${EDGEZERO_MANIFEST:-ABSENT}"
+  printf 'selector=%s\n' "${EDGEZERO__STORES__KV__CACHE__NAME:-ABSENT}"
+  printf 'adapter-extra=%s\n' "${EDGEZERO__LOGGING__SYNTHETIC_MODE:-ABSENT}"
+  printf 'private=%s\n' "${EDGEZERO__PRIVATE:-ABSENT}"
+  printf 'pwd=%s\n' "$PWD"
+  if grep -qx 'mutation-attempted=true' "$GITHUB_OUTPUT"; then
+    printf 'mutation-before-cli=yes\n'
+  else
+    printf 'mutation-before-cli=no\n'
+  fi
+} >"$SEEN_ENV"
+exit "${SYNTHETIC_EXIT:-0}"
+CLI
+  chmod +x "$cli"
+  printf '%s\0' deploy --adapter synthetic '' $'line one\nline two' '*' >"$args"
+  printf '%s\0' SYNTHETIC_TOKEN SYNTHETIC_ENDPOINT >"$clear"
+  printf '%s\0' EDGEZERO__LOGGING__SYNTHETIC_MODE >"$allow"
+  : >"$output"
 
-  run_deploy_pe() {
-    env -i PATH="$bin_dir:$PATH" \
-      EDGEZERO__APP__CLI__BIN=fakecli EDGEZERO__ADAPTER=fastly \
-      EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
+  run_invoke() {
+    local provider_json="${1:-}"
+    [[ -n "$provider_json" ]] || provider_json='{"SYNTHETIC_TOKEN":"typed token"}'
+    ACTUAL_ARGV="$actual" SEEN_ENV="$seen" GITHUB_OUTPUT="$output" \
+      EDGEZERO__ACTION__WORKSPACE="$dir" \
+      EDGEZERO__APP__CLI__PATH="$cli" EDGEZERO__APP__CLI__ARGS_FILE="$args" \
+      EDGEZERO__APP__CLI__MUTATES=true EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/work" \
+      EDGEZERO__PROJECT__MANIFEST_PATH="$dir/work/edgezero.toml" \
       EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$clear" \
-      EDGEZERO__PROVIDER__ENV="$1" \
-      FASTLY_API_TOKEN=inherited-BAD FASTLY_ENDPOINT=https://inherited.invalid \
-      bash "$CORE_SCRIPTS/run-app-cli.sh" deploy
+      EDGEZERO__PUBLIC_RUNTIME_ENV_ALLOW_FILE="$allow" \
+      EDGEZERO__PROVIDER__ENV="$provider_json" \
+      SYNTHETIC_TOKEN=inherited SYNTHETIC_ENDPOINT=https://inherited.invalid \
+      EDGEZERO__STORES__KV__CACHE__NAME=physical-cache \
+      EDGEZERO__LOGGING__SYNTHETIC_MODE=enabled EDGEZERO__PRIVATE=hidden \
+      SYNTHETIC_EXIT="${2:-0}" "$CORE_SCRIPTS/run-app-cli.sh" >/dev/null 2>&1
   }
 
-  if run_deploy_pe '{"FASTLY_API_TOKEN":"typed-tok"}' >/dev/null 2>&1; then
-    assert_equals "typed token wins; inherited endpoint cleared" \
-      $'TOKEN=typed-tok\nENDPOINT=unset' "$(cat "$seen")"
-  else
-    fail "run-cli deploy (provider-env) failed to execute"
-  fi
+  assert_succeeds "invokes a synthetic adapter CLI" run_invoke
+  assert_succeeds "preserves the exact NUL-delimited argv" cmp -s "$args" "$actual"
+  assert_succeeds "imports only the typed provider credential" grep -qx 'token=typed token' "$seen"
+  assert_succeeds "clears inherited provider aliases" grep -qx 'endpoint=ABSENT' "$seen"
+  assert_succeeds "exports the selected manifest" grep -qx "manifest=$dir/work/edgezero.toml" "$seen"
+  assert_succeeds "preserves canonical store selectors" grep -qx 'selector=physical-cache' "$seen"
+  assert_succeeds "preserves provider-declared public runtime names" grep -qx 'adapter-extra=enabled' "$seen"
+  assert_succeeds "scrubs action-private EDGEZERO variables" grep -qx 'private=ABSENT' "$seen"
+  assert_succeeds "runs from the requested working directory" grep -qx "pwd=$dir/work" "$seen"
+  assert_succeeds "publishes mutation-attempted before invoking the CLI" grep -qx 'mutation-before-cli=yes' "$seen"
 
-  # A provider-env name not declared in provider-env-clear is rejected.
-  assert_fails "rejects an undeclared provider-env name" \
-    run_deploy_pe '{"FASTLY_TOKEN":"x"}'
-}
+  assert_fails "rejects a provider name outside the provider clear-list" \
+    run_invoke '{"UNDECLARED_TOKEN":"x"}'
+  assert_fails "rejects a provider value containing LF" \
+    run_invoke "$(jq -nc '{SYNTHETIC_TOKEN:"a\nb"}')"
+  printf '%s' unterminated >"$args"
+  assert_fails "rejects an unterminated argv file" run_invoke
+  printf '%s\0' deploy >"$args"
+  local rc=0
+  run_invoke '{"SYNTHETIC_TOKEN":"ok"}' 42 || rc=$?
+  assert_equals "propagates the application CLI exit status" 42 "$rc"
 
-# ---------------------------------------------------------------------------
-# run-app-cli.sh — CLI argv construction
-# ---------------------------------------------------------------------------
-# Installs a fake CLI that records its argv, then asserts run-cli places typed
-# deploy-flags before `--` and caller passthrough after `--`.
-test_run_cli_argv() {
-  section "run-cli argv"
-
-  local bin_dir="$WORK_DIR/bin"
-  local argv_file="$WORK_DIR/recorded-argv.txt"
-  local app_dir="$WORK_DIR/app"
-  mkdir -p "$bin_dir" "$app_dir"
-
-  cat >"$bin_dir/fakecli" <<EOF
-#!/usr/bin/env bash
-printf '%s\n' "\$@" >"$argv_file"
-EOF
-  chmod +x "$bin_dir/fakecli"
-
-  # NUL-delimited argument files, exactly as validate-inputs would emit them.
-  printf -- '--service-id\0abc\0--staging\0' >"$WORK_DIR/deploy-flags.nul"
-  printf -- '--comment\0hello\0' >"$WORK_DIR/deploy-args.nul"
-
-  if env -i PATH="$bin_dir:$PATH" \
-    EDGEZERO__APP__CLI__BIN=fakecli \
-    EDGEZERO__ADAPTER=fastly \
-    EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
-    EDGEZERO__DEPLOY__FLAGS_FILE="$WORK_DIR/deploy-flags.nul" \
-    EDGEZERO__DEPLOY__ARGS_FILE="$WORK_DIR/deploy-args.nul" \
-    bash "$CORE_SCRIPTS/run-app-cli.sh" deploy >/dev/null 2>&1; then
-    local expected
-    expected=$'deploy\n--adapter\nfastly\n--service-id\nabc\n--staging\n--\n--comment\nhello'
-    assert_equals "flags precede --, passthrough follows --" "$expected" "$(cat "$argv_file")"
-  else
-    fail "run-cli deploy failed to execute"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# run-app-cli.sh — build mode isolates the untrusted build from the job's
-# GitHub file-command channels, so a build.rs cannot append to $GITHUB_PATH /
-# $GITHUB_ENV and reach a later token-bearing step in the same job.
-# ---------------------------------------------------------------------------
-test_run_cli_build_isolation() {
-  section "run-cli build-mode isolation"
-
-  local bin_dir="$WORK_DIR/bin-iso"
-  local app_dir="$WORK_DIR/app-iso"
-  local seen="$WORK_DIR/build-channels-seen.txt"
-  mkdir -p "$bin_dir" "$app_dir"
-
-  # Stands in for `<cli> build`: records which GitHub file-command channels are
-  # still visible to the (untrusted) build's environment.
-  cat >"$bin_dir/fakecli" <<EOF
-#!/usr/bin/env bash
-{
-  printf 'GITHUB_ENV=%s\n' "\${GITHUB_ENV:-<unset>}"
-  printf 'GITHUB_PATH=%s\n' "\${GITHUB_PATH:-<unset>}"
-  printf 'GITHUB_OUTPUT=%s\n' "\${GITHUB_OUTPUT:-<unset>}"
-} >"$seen"
-EOF
-  chmod +x "$bin_dir/fakecli"
-
-  if env -i PATH="$bin_dir:$PATH" \
-    EDGEZERO__APP__CLI__BIN=fakecli \
-    EDGEZERO__ADAPTER=fastly \
-    EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
-    GITHUB_ENV="$WORK_DIR/gh-env" \
-    GITHUB_PATH="$WORK_DIR/gh-path" \
-    GITHUB_OUTPUT="$WORK_DIR/gh-output" \
-    bash "$CORE_SCRIPTS/run-app-cli.sh" build >/dev/null 2>&1; then
-    assert_equals "build strips GITHUB_ENV from the build's environment" \
-      "GITHUB_ENV=<unset>" "$(grep '^GITHUB_ENV=' "$seen")"
-    assert_equals "build strips GITHUB_PATH from the build's environment" \
-      "GITHUB_PATH=<unset>" "$(grep '^GITHUB_PATH=' "$seen")"
-    assert_equals "build strips GITHUB_OUTPUT from the build's environment" \
-      "GITHUB_OUTPUT=<unset>" "$(grep '^GITHUB_OUTPUT=' "$seen")"
-  else
-    fail "run-cli build failed to execute"
-  fi
+  local outside="$WORK_DIR/outside-cli"
+  cp "$cli" "$outside"
+  chmod +x "$outside"
+  assert_fails "rejects a CLI outside the action workspace" \
+    env EDGEZERO__ACTION__WORKSPACE="$dir" EDGEZERO__APP__CLI__PATH="$outside" \
+    EDGEZERO__APP__CLI__ARGS_FILE="$args" EDGEZERO__APP__CLI__MUTATES=false \
+    "$CORE_SCRIPTS/run-app-cli.sh"
 }
 
 # ---------------------------------------------------------------------------
@@ -439,13 +396,17 @@ CLI
 test_fastly_application_release() {
   section "Fastly immutable application release"
   local dir="$WORK_DIR/fastly-release"
-  local prepare="$ACTIONS_DIR/fastly-common/scripts/prepare-release.sh"
+  local prepare="$ACTIONS_DIR/release-core/scripts/prepare-release.sh"
   make_fastly_release_fixture "$dir"
   local out="$dir/out.txt" root="$dir/extracted"
   local expected_revision
   expected_revision=$(printf 'a%.0s' {1..40})
   local EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION="$expected_revision"
+  local EDGEZERO__APP__RELEASE__EXPECTED_ADAPTER=fastly
+  local EDGEZERO__APP__RELEASE__EXPECTED_LIFECYCLE_PROTOCOL=1
   export EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION
+  export EDGEZERO__APP__RELEASE__EXPECTED_ADAPTER
+  export EDGEZERO__APP__RELEASE__EXPECTED_LIFECYCLE_PROTOCOL
 
   assert_succeeds "a strict release archive verifies and extracts" \
     env EDGEZERO__APP__RELEASE__ARCHIVE="$dir/app-release.tar.gz" \
@@ -851,7 +812,7 @@ test_workspace_step_scrub() {
   # could otherwise run code with a provider token in scope.
   local a p missing
   for a in build-app-cli deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly \
-    package-fastly-application-release require-github-environment; do
+    package-application-release-fastly require-github-environment; do
     p="$ACTIONS_DIR/$a/action.yml"
     missing=$(run_steps_missing_env_scrub "$p")
     assert_equals "$a: every run: step blanks BASH_ENV and ENV" "" "$missing"
@@ -862,7 +823,7 @@ test_workspace_step_scrub() {
   # in every shell step. Typed credentials are installed only in the step that
   # needs them; ambient service IDs, endpoints, profiles, and tokens stay inert.
   for a in deploy-fastly healthcheck-fastly rollback-fastly config-push-fastly \
-    package-fastly-application-release require-github-environment; do
+    package-application-release-fastly require-github-environment; do
     p="$ACTIONS_DIR/$a/action.yml"
     missing=$(run_steps_missing_fastly_env_boundary "$p")
     assert_equals "$a: every run: step replaces all Fastly environment aliases" "" "$missing"
@@ -985,97 +946,6 @@ test_cleanup_confinement() {
 }
 
 # ---------------------------------------------------------------------------
-# run-app-cli.sh — the action's private env must not survive into the app CLI
-# ---------------------------------------------------------------------------
-test_action_env_scrub() {
-  section "action-private env scrub"
-  local dir="$WORK_DIR/scrub"
-  mkdir -p "$dir/bin"
-  # A stand-in CLI that reports the environment it was handed.
-  cat >"$dir/bin/scrub-cli" <<'CLI'
-#!/usr/bin/env bash
-printf 'FASTLY_API_TOKEN=%s\n' "${FASTLY_API_TOKEN:-ABSENT}"
-printf 'EDGEZERO__PROVIDER__ENV=%s\n' "${EDGEZERO__PROVIDER__ENV:-ABSENT}"
-printf 'EDGEZERO__FASTLY__API_TOKEN=%s\n' "${EDGEZERO__FASTLY__API_TOKEN:-ABSENT}"
-printf 'EDGEZERO__DEPLOY__ARGS_FILE=%s\n' "${EDGEZERO__DEPLOY__ARGS_FILE:-ABSENT}"
-printf 'EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=%s\n' "${EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME:-ABSENT}"
-printf 'EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=%s\n' "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-ABSENT}"
-printf 'EDGEZERO__STORES__SECRETS____NAME=%s\n' "${EDGEZERO__STORES__SECRETS____NAME:-ABSENT}"
-printf 'EDGEZERO__ADAPTER__HOST=%s\n' "${EDGEZERO__ADAPTER__HOST:-ABSENT}"
-printf 'EDGEZERO__ADAPTER__PORT=%s\n' "${EDGEZERO__ADAPTER__PORT:-ABSENT}"
-printf 'EDGEZERO__LOGGING__ENDPOINT=%s\n' "${EDGEZERO__LOGGING__ENDPOINT:-ABSENT}"
-printf 'EDGEZERO__LOGGING__LEVEL=%s\n' "${EDGEZERO__LOGGING__LEVEL:-ABSENT}"
-printf 'EDGEZERO__LOGGING__USE_FASTLY_LOGGER=%s\n' "${EDGEZERO__LOGGING__USE_FASTLY_LOGGER:-ABSENT}"
-printf 'EDGEZERO__LOGGING__ECHO_STDOUT=%s\n' "${EDGEZERO__LOGGING__ECHO_STDOUT:-ABSENT}"
-printf 'EDGEZERO__ADAPTER__HOST__EXTRA=%s\n' "${EDGEZERO__ADAPTER__HOST__EXTRA:-ABSENT}"
-printf 'EDGEZERO__UNDECLARED=%s\n' "${EDGEZERO__UNDECLARED:-ABSENT}"
-printf 'EDGEZERO_MANIFEST=%s\n' "${EDGEZERO_MANIFEST:-ABSENT}"
-CLI
-  chmod +x "$dir/bin/scrub-cli"
-  printf 'FASTLY_API_TOKEN\0' >"$dir/clear.nul"
-
-  local out
-  out=$(
-    PATH="$dir/bin:$PATH" \
-      EDGEZERO__APP__CLI__BIN=scrub-cli EDGEZERO__ADAPTER=fastly EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir" \
-      EDGEZERO__PROJECT__MANIFEST_PATH="$dir/edgezero.toml" \
-      EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
-      EDGEZERO__PROVIDER__ENV='{"FASTLY_API_TOKEN":"s3cret"}' \
-      EDGEZERO__FASTLY__API_TOKEN='s3cret' \
-      EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME='credentials-staging' \
-      EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY='app_config' \
-      EDGEZERO__STORES__SECRETS____NAME='must-not-survive' \
-      EDGEZERO__ADAPTER__HOST='127.0.0.1' EDGEZERO__ADAPTER__PORT='7676' \
-      EDGEZERO__LOGGING__ENDPOINT='https://logs.example.test' EDGEZERO__LOGGING__LEVEL='debug' \
-      EDGEZERO__LOGGING__USE_FASTLY_LOGGER='true' EDGEZERO__LOGGING__ECHO_STDOUT='false' \
-      EDGEZERO__ADAPTER__HOST__EXTRA='must-not-survive' EDGEZERO__UNDECLARED='must-not-survive' \
-      "$CORE_SCRIPTS/run-app-cli.sh" deploy 2>/dev/null
-  )
-
-  # What the CLI IS promised.
-  assert_equals "the typed provider alias is delivered" \
-    "FASTLY_API_TOKEN=s3cret" "$(grep '^FASTLY_API_TOKEN=' <<<"$out")"
-  assert_equals "EDGEZERO_MANIFEST is delivered" \
-    "EDGEZERO_MANIFEST=$dir/edgezero.toml" "$(grep '^EDGEZERO_MANIFEST=' <<<"$out")"
-  assert_equals "the selected secret-store name is delivered" \
-    "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=credentials-staging" \
-    "$(grep '^EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=' <<<"$out")"
-  assert_equals "the selected config-store key is delivered" \
-    "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config" \
-    "$(grep '^EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=' <<<"$out")"
-  assert_equals "the fixed adapter host is delivered" "EDGEZERO__ADAPTER__HOST=127.0.0.1" \
-    "$(grep '^EDGEZERO__ADAPTER__HOST=' <<<"$out")"
-  assert_equals "the fixed adapter port is delivered" "EDGEZERO__ADAPTER__PORT=7676" \
-    "$(grep '^EDGEZERO__ADAPTER__PORT=' <<<"$out")"
-  assert_equals "the fixed logging endpoint is delivered" \
-    "EDGEZERO__LOGGING__ENDPOINT=https://logs.example.test" \
-    "$(grep '^EDGEZERO__LOGGING__ENDPOINT=' <<<"$out")"
-  assert_equals "the fixed logging level is delivered" "EDGEZERO__LOGGING__LEVEL=debug" \
-    "$(grep '^EDGEZERO__LOGGING__LEVEL=' <<<"$out")"
-  assert_equals "the Fastly logger selector is delivered" \
-    "EDGEZERO__LOGGING__USE_FASTLY_LOGGER=true" \
-    "$(grep '^EDGEZERO__LOGGING__USE_FASTLY_LOGGER=' <<<"$out")"
-  assert_equals "the stdout echo selector is delivered" \
-    "EDGEZERO__LOGGING__ECHO_STDOUT=false" \
-    "$(grep '^EDGEZERO__LOGGING__ECHO_STDOUT=' <<<"$out")"
-
-  # What it must NEVER see: the same secret under names we never promised.
-  assert_equals "the provider-env JSON blob does not survive" \
-    "EDGEZERO__PROVIDER__ENV=ABSENT" "$(grep '^EDGEZERO__PROVIDER__ENV=' <<<"$out")"
-  assert_equals "the action's token carrier does not survive" \
-    "EDGEZERO__FASTLY__API_TOKEN=ABSENT" "$(grep '^EDGEZERO__FASTLY__API_TOKEN=' <<<"$out")"
-  assert_equals "action-private file handles do not survive" \
-    "EDGEZERO__DEPLOY__ARGS_FILE=ABSENT" "$(grep '^EDGEZERO__DEPLOY__ARGS_FILE=' <<<"$out")"
-  assert_equals "malformed selector names do not survive" \
-    "EDGEZERO__STORES__SECRETS____NAME=ABSENT" \
-    "$(grep '^EDGEZERO__STORES__SECRETS____NAME=' <<<"$out")"
-  assert_equals "near-match fixed names do not survive" "EDGEZERO__ADAPTER__HOST__EXTRA=ABSENT" \
-    "$(grep '^EDGEZERO__ADAPTER__HOST__EXTRA=' <<<"$out")"
-  assert_equals "arbitrary EDGEZERO names do not survive" "EDGEZERO__UNDECLARED=ABSENT" \
-    "$(grep '^EDGEZERO__UNDECLARED=' <<<"$out")"
-}
-
-# ---------------------------------------------------------------------------
 # validate-inputs.sh — action-owned passthrough bypasses the caller allowlist
 # ---------------------------------------------------------------------------
 test_deploy_args_prepend() {
@@ -1107,51 +977,6 @@ test_deploy_args_prepend() {
 # ---------------------------------------------------------------------------
 # common.sh — anchored version parsing, required inputs, private logs
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# run-app-cli.sh — provider values must survive the Bash boundary intact
-# ---------------------------------------------------------------------------
-# `export NAME=value` truncates at the first NUL, so a NUL-bearing credential
-# would be silently altered rather than rejected. The guard must reject NUL and
-# still accept ordinary values — a NUL check that also rejects spaces would break
-# every real token.
-test_provider_env_nul() {
-  section "provider-env NUL rejection"
-  local dir="$WORK_DIR/nul"
-  mkdir -p "$dir/bin" "$dir/app"
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/bin/nul-cli"
-  chmod +x "$dir/bin/nul-cli"
-  printf 'FASTLY_API_TOKEN\0' >"$dir/clear.nul"
-
-  run_with_env() {
-    PATH="$dir/bin:$PATH" \
-      EDGEZERO__APP__CLI__BIN=nul-cli EDGEZERO__ADAPTER=fastly \
-      EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
-      EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
-      EDGEZERO__PROVIDER__ENV="$1" \
-      "$CORE_SCRIPTS/run-app-cli.sh" deploy >/dev/null 2>&1
-  }
-
-  # jq builds the NUL: a raw NUL cannot survive argv, which is the whole point.
-  local nul_json
-  nul_json=$(jq -nc '{FASTLY_API_TOKEN: "abc\u0000def"}')
-  assert_fails "a NUL-bearing provider value is rejected" run_with_env "$nul_json"
-
-  # A NUL check must not become a space check.
-  assert_succeeds "an ordinary value containing spaces is accepted" \
-    run_with_env '{"FASTLY_API_TOKEN":"tok with spaces"}'
-  assert_succeeds "a plain token is accepted" \
-    run_with_env '{"FASTLY_API_TOKEN":"abc123"}'
-
-  # CR/LF are rejected too: the `$(base64 --decode)` step strips trailing newlines,
-  # so a value ending in one would be silently truncated to a wrong credential.
-  assert_fails "an LF-bearing provider value is rejected" \
-    run_with_env "$(jq -nc '{FASTLY_API_TOKEN: "abc\ndef"}')"
-  assert_fails "a trailing-newline provider value is rejected" \
-    run_with_env "$(jq -nc '{FASTLY_API_TOKEN: "abc\n"}')"
-  assert_fails "a CR-bearing provider value is rejected" \
-    run_with_env "$(jq -nc '{FASTLY_API_TOKEN: "abc\rdef"}')"
-}
-
 test_lifecycle_helpers() {
   section "lifecycle helpers"
   # NB: sourced in subshells only — common.sh defines its own `fail`, which would
@@ -1598,7 +1423,7 @@ CLI
   local rc=0
   "${key_env[@]}" PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" GITHUB_OUTPUT="$dir/ghout" \
     EDGEZERO__APP__CLI__BIN=fake-cli \
-    FASTLY_API_TOKEN=tok \
+    EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$dir" \
     EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__DEPLOY__TO="${CP_DEPLOY_TO:-production}" \
@@ -1618,7 +1443,7 @@ config_push_rejects_path() {
   local var="$1" value="$2"
   local dir="$WORK_DIR/config-push"
   env "$var=$value" PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" \
-    EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$dir" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__CONFIG_PUSH__MANIFEST="$dir/release/edgezero.toml" \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
@@ -1672,7 +1497,7 @@ test_config_push_argv() {
   printf '#!/usr/bin/env bash\necho "pushed-key=release/canary"\necho "pushed-store=app_config"\n' >"$cpdir/bin/fake-cli"
   chmod +x "$cpdir/bin/fake-cli"
   : >"$cpdir/ghout"
-  env PATH="$cpdir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+  env PATH="$cpdir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$cpdir" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     RUNNER_TEMP="$cpdir" GITHUB_OUTPUT="$cpdir/ghout" \
     EDGEZERO__CONFIG_PUSH__MANIFEST="$cpdir/release/edgezero.toml" \
@@ -1683,8 +1508,9 @@ test_config_push_argv() {
 
   # cd into the app dir must precede the mutation-attempted signal: a directory-
   # entry failure means the CLI was never invoked, so it must not falsely signal.
-  local cp="$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" cd_line sig_line
-  cd_line=$(grep -n 'could not enter working-directory' "$cp" | head -1 | cut -d: -f1)
+  local cp="$ACTIONS_DIR/deploy-core/scripts/run-app-cli.sh" cd_line sig_line
+  # shellcheck disable=SC2016 # Match the literal variable reference in the launcher.
+  cd_line=$(grep -n 'cd "$working_directory"' "$cp" | head -1 | cut -d: -f1)
   sig_line=$(grep -n 'append_output mutation-attempted' "$cp" | head -1 | cut -d: -f1)
   assert_succeeds "config-push cd precedes the mutation-attempted signal" \
     test "$cd_line" -lt "$sig_line"
@@ -1699,21 +1525,21 @@ test_config_push_argv() {
   # boolean — both fail closed with a named diagnostic (never a silent default).
   assert_fails_with "app-config and app-config-inline are mutually exclusive" \
     "exactly one" \
-    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__CONFIG_PUSH__MANIFEST="$WORK_DIR/config-push/release/edgezero.toml" \
     EDGEZERO__CONFIG_PUSH__APP_CONFIG=real.toml EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE='x = 1' \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
   assert_fails_with "one typed config input is required" \
     "exactly one" \
-    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__CONFIG_PUSH__MANIFEST="$WORK_DIR/config-push/release/edgezero.toml" \
     EDGEZERO__CONFIG_PUSH__APP_CONFIG='' EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE='' \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
   assert_fails_with "an invalid no-env value is rejected" \
     "input 'no-env' must be" \
-    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    env PATH="$WORK_DIR/config-push/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__CONFIG_PUSH__MANIFEST="$WORK_DIR/config-push/release/edgezero.toml" \
     EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE='x = 1' \
@@ -1734,7 +1560,7 @@ test_config_push_argv() {
       chmod +x "$cli"
     fi
     env PATH="$WORK_DIR/config-push/bin:$PATH" FAKE_ARGV_OUT="$rt/argv.txt" \
-      EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+      EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
       GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
       RUNNER_TEMP="$rt" EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE='a = 1' \
       "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1 || true
@@ -1744,7 +1570,7 @@ test_config_push_argv() {
 
   # A bad deploy-to must fail closed, never silently push to production.
   assert_fails "a non-{production,staging} deploy-to is rejected" \
-    env EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    env EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__DEPLOY__TO=Staging \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
@@ -1767,38 +1593,6 @@ test_config_push_argv() {
   ok=$(CP_APP_CONFIG=real.toml CP_APP_CONFIG_INLINE='' run_config_push_argv || true)
   assert_succeeds "an in-app config path is accepted and threaded" \
     grep -qx -- 'real.toml' <<<"$ok"
-}
-
-# ---------------------------------------------------------------------------
-# run-app-cli.sh — the CLI's exit status is the step's exit status
-# ---------------------------------------------------------------------------
-# A deploy that fails must fail the step. If the engine swallowed the exit code,
-# a broken deploy would report success and the caller would never roll back.
-test_exit_propagation() {
-  section "exit propagation"
-  local dir="$WORK_DIR/exit-prop"
-  mkdir -p "$dir/bin" "$dir/app"
-  cat >"$dir/bin/exit-cli" <<'CLI'
-#!/usr/bin/env bash
-exit "${FAKE_EXIT_CODE:-0}"
-CLI
-  chmod +x "$dir/bin/exit-cli"
-
-  run_with_exit() {
-    PATH="$dir/bin:$PATH" FAKE_EXIT_CODE="$1" \
-      EDGEZERO__APP__CLI__BIN=exit-cli EDGEZERO__ADAPTER=fastly \
-      EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
-      "$CORE_SCRIPTS/run-app-cli.sh" build >/dev/null 2>&1
-  }
-
-  # NB: capture with `|| rc=$?` — a trailing `|| true` would reset $? to 0 and
-  # make this test vacuously pass.
-  local rc=0
-  run_with_exit 0 || rc=$?
-  assert_equals "a succeeding CLI exits 0" "0" "$rc"
-  rc=0
-  run_with_exit 42 || rc=$?
-  assert_equals "a failing CLI's exit code reaches the step (42, not 1)" "42" "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -2158,13 +1952,14 @@ test_action_output_contracts() {
         missing=$((missing + 1))
         continue
       fi
-      # The named step's OWN script must emit it — not merely some other action.
-      # Exception: a script may DELEGATE the run to the shared run-app-cli.sh
-      # launcher (which emits `mutation-attempted` itself, right before it invokes
-      # the CLI); if the step's script calls it, that counts as emitting.
+      # The named step's own script must emit it, or delegate to a shared core
+      # script that emits it as part of the same invocation.
       emitted=$(grep -oE "append_output ${out_name}( |\$)" "$script" || true)
       if [[ -z "$emitted" ]] && grep -q 'run-app-cli\.sh' "$script"; then
         emitted=$(grep -oE "append_output ${out_name}( |\$)" "$CORE_SCRIPTS/run-app-cli.sh" || true)
+      fi
+      if [[ -z "$emitted" ]] && grep -q 'release-core/scripts/package-release\.sh' "$script"; then
+        emitted=$(grep -oE "append_output ${out_name}( |\$)" "$ACTIONS_DIR/release-core/scripts/package-release.sh" || true)
       fi
       if [[ -z "$emitted" ]]; then
         fail "$name_of output '$out_name' claims step '$step_id' ($(basename "$script")) emits it, but that script does not"
@@ -2311,7 +2106,7 @@ out status-code
 EOF
   )" "$(parse_action_surface "$ACTIONS_DIR/healthcheck-fastly/action.yml")"
 
-  assert_equals "package-fastly-application-release public surface" "$(
+  assert_equals "package-application-release-fastly public surface" "$(
     cat <<'EOF'
 in adapter-manifest true none
 in app-cli-archive true none
@@ -2324,7 +2119,7 @@ out artifact-name
 out package-sha256
 out source-revision
 EOF
-  )" "$(parse_action_surface "$ACTIONS_DIR/package-fastly-application-release/action.yml")"
+  )" "$(parse_action_surface "$ACTIONS_DIR/package-application-release-fastly/action.yml")"
 
   assert_equals "require-github-environment public surface" "$(
     cat <<'EOF'
@@ -2342,17 +2137,21 @@ test_fastly_release_action_wiring() {
   for action in deploy-fastly config-push-fastly healthcheck-fastly rollback-fastly; do
     local file="$ACTIONS_DIR/$action/action.yml"
     assert_succeeds "$action prepares the pinned application release" \
-      grep -q 'fastly-common/scripts/prepare-release.sh' "$file"
+      grep -q 'release-core/scripts/prepare-release.sh' "$file"
     assert_fails "$action never downloads a separately rebuilt CLI artifact" \
       grep -q 'actions/download-artifact' "$file"
     assert_succeeds "$action extracts the CLI archive recorded by the release" \
       grep -q 'EDGEZERO__APP__CLI__ARCHIVE:' "$file"
     local release_line cli_line release_step
-    release_line=$(grep -n 'fastly-common/scripts/prepare-release.sh' "$file" | cut -d: -f1)
+    release_line=$(grep -n 'release-core/scripts/prepare-release.sh' "$file" | cut -d: -f1)
     cli_line=$(grep -n 'EDGEZERO__APP__CLI__ARCHIVE:' "$file" | cut -d: -f1)
     assert_succeeds "$action verifies release metadata before extracting or invoking the app CLI" \
       test "$release_line" -lt "$cli_line"
     release_step=$(step_block "$file" "Verify application release")
+    assert_succeeds "$action supplies the Fastly release adapter policy" \
+      grep -qF 'EDGEZERO__APP__RELEASE__EXPECTED_ADAPTER: fastly' <<<"$release_step"
+    assert_succeeds "$action supplies lifecycle protocol 1" \
+      grep -qF 'EDGEZERO__APP__RELEASE__EXPECTED_LIFECYCLE_PROTOCOL: "1"' <<<"$release_step"
     assert_fails "$action cannot continue after release verification failure" \
       grep -qE '^[[:space:]]*continue-on-error:' <<<"$release_step"
   done
@@ -2367,6 +2166,16 @@ test_fastly_release_action_wiring() {
     assert_succeeds "$script calls the shared Fastly service-ID helper" \
       grep -q 'require_fastly_service_id' "$ACTIONS_DIR/$script"
   done
+  for script in \
+    deploy-fastly/scripts/deploy.sh deploy-fastly/scripts/capture-previous.sh \
+    config-push-fastly/scripts/config-push.sh healthcheck-fastly/scripts/healthcheck.sh \
+    rollback-fastly/scripts/rollback.sh; do
+    assert_succeeds "$script delegates application CLI execution to the provider-neutral core" \
+      grep -q 'deploy-core/scripts/run-app-cli.sh' "$ACTIONS_DIR/$script"
+  done
+  assert_fails "provider-neutral action cores contain no provider policy" \
+    grep -REiq 'fastly|cloudflare|spin|axum' \
+    "$ACTIONS_DIR/deploy-core/scripts" "$ACTIONS_DIR/release-core/scripts"
   assert_succeeds "deploy passes the action-owned release root through the typed flag" \
     grep -q -- '--application-release' "$ACTIONS_DIR/deploy-fastly/action.yml"
   assert_succeeds "config push pins the bundled application manifest" \
@@ -2381,8 +2190,10 @@ test_release_producer_and_environment_preflight() {
   section "release producer and GitHub Environment preflight"
   assert_succeeds "GitHub Environment preflight rejects missing and invalid environments" \
     bash "$ACTIONS_DIR/require-github-environment/tests/run.sh"
+  assert_succeeds "provider-neutral release verification enforces adapter and protocol identity" \
+    bash "$ACTIONS_DIR/release-core/tests/run.sh"
   assert_succeeds "Fastly application release packager verifies its lifecycle protocol" \
-    bash "$ACTIONS_DIR/package-fastly-application-release/tests/run.sh"
+    bash "$ACTIONS_DIR/package-application-release-fastly/tests/run.sh"
 }
 
 test_fastly_smoke_release_contract() {
@@ -2393,11 +2204,11 @@ test_fastly_smoke_release_contract() {
   fi
 
   local workflow="$REPO_ROOT/.github/workflows/deploy-action.yml"
-  local fixture="$ACTIONS_DIR/deploy-core/tests/make-smoke-fixture.sh"
-  local fake="$ACTIONS_DIR/deploy-core/tests/make-fake-fastly-env.sh"
-  local staged="$ACTIONS_DIR/deploy-core/tests/assert-staged-calls.sh"
-  local production="$ACTIONS_DIR/deploy-core/tests/assert-production-deploy.sh"
-  local lost="$ACTIONS_DIR/deploy-core/tests/assert-lost-version.sh"
+  local fixture="$ACTIONS_DIR/deploy-fastly/tests/make-smoke-fixture.sh"
+  local fake="$ACTIONS_DIR/deploy-fastly/tests/make-fake-fastly-env.sh"
+  local staged="$ACTIONS_DIR/deploy-fastly/tests/assert-staged-calls.sh"
+  local production="$ACTIONS_DIR/deploy-fastly/tests/assert-production-deploy.sh"
+  local lost="$ACTIONS_DIR/deploy-fastly/tests/assert-lost-version.sh"
   local lifecycle_filter
   lifecycle_filter='select(tag == "!!map" and (.uses == "./.github/actions/deploy-fastly" or .uses == "./.github/actions/config-push-fastly" or .uses == "./.github/actions/healthcheck-fastly" or .uses == "./.github/actions/rollback-fastly"))'
 
@@ -2535,7 +2346,7 @@ test_smoke_release_uses_application_revision() {
   git -C "$workspace/fixture-app" commit -q -m fixture
   printf 'fixture CLI archive\n' >"$workspace/app-cli.tar"
   GITHUB_WORKSPACE="$workspace" GITHUB_OUTPUT="$output" \
-    bash "$ACTIONS_DIR/deploy-core/tests/make-smoke-fixture.sh" release "$workspace/app-cli.tar"
+    bash "$ACTIONS_DIR/deploy-fastly/tests/make-smoke-fixture.sh" release "$workspace/app-cli.tar"
 
   local recorded protocol app_revision harness_revision
   recorded=$(tar -xOzf "$workspace/fixture-release/app-release.tar.gz" release.json |
@@ -3095,7 +2906,7 @@ CLI
     PATH="$dir/bin:$PATH" \
       EDGEZERO__APP__CLI__BIN=fake-cli \
       EDGEZERO__FASTLY__SERVICE_ID=svc \
-      FASTLY_API_TOKEN=tok \
+      EDGEZERO__FASTLY__API_TOKEN=tok \
       GITHUB_OUTPUT="$dir/out.txt" \
       FAKE_VERSION_LINE="${FVL-version=}" FAKE_EXIT="${FE:-0}" FAKE_SILENT="${FS:-}" \
       FAKE_EXTRA_LINE="${FXL:-}" \
@@ -3235,7 +3046,7 @@ test_mutation_attempted_signal() {
   # mutation-attempted=true is already written to GITHUB_OUTPUT.
   local out="$dir/cp-out.txt" rc=0
   : >"$out"
-  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     GITHUB_WORKSPACE="$dir" EDGEZERO__PROJECT__WORKING_DIRECTORY=app GITHUB_OUTPUT="$out" \
     EDGEZERO__CONFIG_PUSH__MANIFEST="$dir/release/edgezero.toml" \
     EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE='x = 1' \
@@ -3255,7 +3066,7 @@ test_mutation_attempted_signal() {
   local rout="$dir/rb-out.txt"
   rc=0
   : >"$rout"
-  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=9 \
     EDGEZERO__LIFECYCLE__ROLLBACK_TO=8 EDGEZERO__DEPLOY__TO=production GITHUB_OUTPUT="$rout" \
     "$ACTIONS_DIR/rollback-fastly/scripts/rollback.sh" >/dev/null 2>&1 || rc=$?
@@ -3266,7 +3077,7 @@ test_mutation_attempted_signal() {
   # A missing CLI must NOT signal a mutation — require_cmd fails before the emit.
   : >"$rout"
   rc=0
-  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=nonexistent-cli FASTLY_API_TOKEN=tok \
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=nonexistent-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=9 \
     EDGEZERO__LIFECYCLE__ROLLBACK_TO=8 EDGEZERO__DEPLOY__TO=production GITHUB_OUTPUT="$rout" \
     "$ACTIONS_DIR/rollback-fastly/scripts/rollback.sh" >/dev/null 2>&1 || rc=$?
@@ -3280,7 +3091,7 @@ test_mutation_attempted_signal() {
   chmod +x "$dir/bin/fake-cli"
   : >"$rout"
   rc=0
-  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+  env PATH="$dir/bin:$PATH" EDGEZERO__APP__CLI__BIN=fake-cli EDGEZERO__FASTLY__API_TOKEN=tok \
     EDGEZERO__LIFECYCLE__SERVICE_ID=svc123 EDGEZERO__LIFECYCLE__VERSION=9 \
     EDGEZERO__LIFECYCLE__ROLLBACK_TO=8 EDGEZERO__DEPLOY__TO=production GITHUB_OUTPUT="$rout" \
     "$ACTIONS_DIR/rollback-fastly/scripts/rollback.sh" >/dev/null 2>&1 || rc=$?
@@ -3752,15 +3563,22 @@ sed -n "s/^version=//p" <<<"$out"'
     test "$rc" -ne 0
 }
 
+test_package_action_name() {
+  section "Fastly package action name"
+  local obsolete="$ACTIONS_DIR/package-fastly"'-application-release'
+  assert_succeeds "the package action uses operation/object/provider order" \
+    test -f "$ACTIONS_DIR/package-application-release-fastly/action.yml"
+  assert_fails "the obsolete provider-first package action path is absent" \
+    test -e "$obsolete"
+}
+
 # ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
   test_owned_dir_confinement
   test_cli_bin_confinement
-  test_run_cli_argv
-  test_run_cli_build_isolation
-  test_provider_env_boundary
+  test_invoke_app_cli
   test_download_cli_metadata
   test_fastly_application_release
   test_wrapper_validate
@@ -3770,9 +3588,7 @@ main() {
   test_workspace_isolation
   test_workspace_step_scrub
   test_no_inline_action_scripts
-  test_action_env_scrub
   test_deploy_args_prepend
-  test_provider_env_nul
   test_lifecycle_helpers
   test_capture_previous
   test_versions_json_pins_official_release
@@ -3787,7 +3603,7 @@ main() {
   test_cleanup_sensitive_temps
   test_deploy_signal_timing
   test_recovery_version_parse
-  test_exit_propagation
+  test_package_action_name
   test_dirty_source_guard
   test_cache_key
   test_app_repo_boundary

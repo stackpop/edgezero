@@ -26,7 +26,7 @@ built in the credential-free producer job:
 
 ```yaml
 - id: release
-  uses: stackpop/edgezero/.github/actions/package-fastly-application-release@<ref>
+  uses: stackpop/edgezero/.github/actions/package-application-release-fastly@<ref>
   with:
     app-cli-archive: release-inputs/app-cli.tar
     fastly-package: pkg/app.tar.gz

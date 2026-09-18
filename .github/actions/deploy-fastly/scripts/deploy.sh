@@ -48,10 +48,31 @@ main() {
   [[ "$expected_package_digest" =~ ^[0-9a-f]{64}$ ]] ||
     fail "the verified application release package digest is missing or invalid"
   require_cmd jq
+  local cli_bin
+  cli_bin=$(resolve_app_cli)
+  cli_bin=$(command -v "$cli_bin") || fail "application CLI is unavailable"
+  export EDGEZERO__APP__CLI__PATH="$cli_bin"
 
   EDGEZERO__PROVIDER__ENV=$(jq -n --arg t "$token" --arg s "$service_id" \
     '{FASTLY_API_TOKEN: $t, FASTLY_SERVICE_ID: $s}')
   export EDGEZERO__PROVIDER__ENV
+
+  local workspace="${EDGEZERO__ACTION__WORKSPACE:-$(dirname -- "${EDGEZERO__DEPLOY__FLAGS_FILE:?EDGEZERO__DEPLOY__FLAGS_FILE is required}")}"
+  export EDGEZERO__ACTION__WORKSPACE="$workspace"
+  local args_file="$workspace/deploy-argv.nul"
+  local allow_file="$workspace/fastly-public-runtime.nul"
+  printf '%s\0' deploy --adapter fastly >"$args_file"
+  if [[ -s "${EDGEZERO__DEPLOY__FLAGS_FILE:-/dev/null}" ]]; then
+    cat "$EDGEZERO__DEPLOY__FLAGS_FILE" >>"$args_file"
+  fi
+  if [[ -s "${EDGEZERO__DEPLOY__ARGS_FILE:-/dev/null}" ]]; then
+    printf '%s\0' -- >>"$args_file"
+    cat "$EDGEZERO__DEPLOY__ARGS_FILE" >>"$args_file"
+  fi
+  write_fastly_public_runtime_file "$allow_file"
+  export EDGEZERO__APP__CLI__ARGS_FILE="$args_file"
+  export EDGEZERO__APP__CLI__MUTATES=true
+  export EDGEZERO__PUBLIC_RUNTIME_ENV_ALLOW_FILE="$allow_file"
 
   new_private_log
   # run-app-cli.sh publishes `mutation-attempted=true` itself, immediately before
@@ -60,7 +81,7 @@ main() {
   # cancel/timeout; a hard runner loss can still drop it). This wrapper only threads
   # the resulting version out.
   local rc=0
-  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
 
   local version="" version_status=0 package_digest="" package_status=0
   parse_contract_value version '[0-9]+' || version_status=$?

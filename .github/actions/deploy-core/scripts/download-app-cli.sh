@@ -6,7 +6,7 @@ set -euo pipefail
 # self-describing app-cli-meta.json. A wrapper-supplied EDGEZERO__APP__CLI__BIN
 # overrides the metadata's binary name. The binary's ABSOLUTE path is emitted as
 # `app-cli-path`; the dir is deliberately NOT added to PATH, so an app CLI named
-# after a tool the action shells out to (jq, fastly, …) cannot shadow it.
+# after a tool the action shells out to (jq, provider-cli, …) cannot shadow it.
 #
 # Reads (env):
 #   EDGEZERO__APP__CLI__ARCHIVE           preferred exact verified release member
@@ -85,7 +85,7 @@ main() {
   chmod +x "$cli_path"
 
   # Smoke-check with a scrubbed environment: no inherited provider credential
-  # (FASTLY_KEY, FASTLY_AUTH_TOKEN, ...) may reach the app CLI here.
+  # may reach the app CLI here.
   env -i PATH="/usr/bin:/bin" HOME="${HOME:-/tmp}" "$cli_path" --help >/dev/null 2>&1 ||
     fail "downloaded CLI '$cli_bin' did not run '--help'"
 

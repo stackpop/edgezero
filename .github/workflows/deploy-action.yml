@@ -91,7 +91,7 @@ jobs:
             .github/actions/healthcheck-fastly/action.yml \
             .github/actions/rollback-fastly/action.yml \
             .github/actions/config-push-fastly/action.yml \
-            .github/actions/package-fastly-application-release/action.yml \
+            .github/actions/package-application-release-fastly/action.yml \
             .github/actions/require-github-environment/action.yml
 
       - name: ShellCheck action scripts
@@ -128,7 +128,7 @@ jobs:
           persist-credentials: false
 
       - name: Create the store-aware fixture application
-        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh source store-aware
+        run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh source store-aware
 
       - name: Build the application-owned CLI once
         uses: ./.github/actions/build-app-cli
@@ -145,7 +145,7 @@ jobs:
 
       - name: Assemble the immutable application release
         id: release
-        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
+        run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
 
       - name: Upload the immutable application release
         uses: actions/upload-artifact@v7
@@ -171,7 +171,7 @@ jobs:
           persist-credentials: false
 
       - name: Create the store-free fixture application
-        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh source store-free
+        run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh source store-free
 
       - name: Build the store-free application CLI once
         uses: ./.github/actions/build-app-cli
@@ -188,7 +188,7 @@ jobs:
 
       - name: Assemble the immutable store-free application release
         id: release
-        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
+        run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
 
       - name: Upload the immutable store-free application release
         uses: actions/upload-artifact@v7
@@ -218,7 +218,7 @@ jobs:
           name: edgezero-fastly-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
-        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+        run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Deploy the immutable release to production
         id: deploy
@@ -236,7 +236,7 @@ jobs:
           EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs.fastly-version }}
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs.previous-version }}
           EDGEZERO__TEST__PACKAGE_DIGEST: ${{ steps.deploy.outputs.package-digest }}
-        run: .github/actions/deploy-core/tests/assert-production-deploy.sh
+        run: .github/actions/deploy-fastly/tests/assert-production-deploy.sh
 
       - name: Probe production using the same immutable release
         uses: ./.github/actions/healthcheck-fastly
@@ -267,7 +267,7 @@ jobs:
         env:
           EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.rollback.outputs.rolled-back-to }}
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs.previous-version }}
-        run: .github/actions/deploy-core/tests/assert-rollback-threaded.sh
+        run: .github/actions/deploy-fastly/tests/assert-rollback-threaded.sh
 
   store-free-deploy-smoke:
     needs: store-free-release
@@ -281,7 +281,7 @@ jobs:
           name: edgezero-fastly-store-free-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
-        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+        run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Deploy the immutable store-free release through the adapter
         id: deploy
@@ -300,7 +300,7 @@ jobs:
           EDGEZERO__TEST__FIXTURE_MODE: store-free
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs.previous-version }}
           EDGEZERO__TEST__PACKAGE_DIGEST: ${{ steps.deploy.outputs.package-digest }}
-        run: .github/actions/deploy-core/tests/assert-production-deploy.sh
+        run: .github/actions/deploy-fastly/tests/assert-production-deploy.sh
 
   staging-smoke:
     needs: fixture-release
@@ -319,7 +319,7 @@ jobs:
           name: edgezero-fastly-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
-        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+        run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Deploy the same immutable release to staging
         id: stage
@@ -337,7 +337,7 @@ jobs:
         env:
           EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs.fastly-version }}
           EDGEZERO__TEST__PACKAGE_DIGEST: ${{ steps.stage.outputs.package-digest }}
-        run: .github/actions/deploy-core/tests/assert-staged-calls.sh
+        run: .github/actions/deploy-fastly/tests/assert-staged-calls.sh
 
       - name: Probe staging using the same immutable release
         id: health
@@ -360,7 +360,7 @@ jobs:
           EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs.fastly-version }}
           EDGEZERO__TEST__HEALTHY: ${{ steps.health.outputs.healthy }}
           EDGEZERO__TEST__STATUS_CODE: ${{ steps.health.outputs.status-code }}
-        run: .github/actions/deploy-core/tests/assert-staging-probe.sh
+        run: .github/actions/deploy-fastly/tests/assert-staging-probe.sh
 
       - name: Unhealthy staging probe fails
         id: unhealthy
@@ -385,7 +385,7 @@ jobs:
           EDGEZERO__TEST__OUTCOME: ${{ steps.unhealthy.outcome }}
           EDGEZERO__TEST__HEALTHY: ${{ steps.unhealthy.outputs.healthy }}
           EDGEZERO__TEST__STATUS_CODE: ${{ steps.unhealthy.outputs.status-code }}
-        run: .github/actions/deploy-core/tests/assert-unhealthy-failed.sh
+        run: .github/actions/deploy-fastly/tests/assert-unhealthy-failed.sh
 
       - name: Snapshot calls before tokenless production probe
         run: printf 'PROD_PROBE_SNAPSHOT=%s\n' "$(wc -l <"$FAKE_CALL_LOG")" >>"$GITHUB_ENV"
@@ -408,7 +408,7 @@ jobs:
         env:
           EDGEZERO__TEST__LOG_SNAPSHOT: ${{ env.PROD_PROBE_SNAPSHOT }}
           EDGEZERO__TEST__HEALTHY: ${{ steps.production-health.outputs.healthy }}
-        run: .github/actions/deploy-core/tests/assert-production-probe-tokenless.sh
+        run: .github/actions/deploy-fastly/tests/assert-production-probe-tokenless.sh
 
       - name: Refuse staging probe without a provider token
         id: staging-no-token
@@ -465,7 +465,7 @@ jobs:
         env:
           EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs.fastly-version }}
           EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.production-rollback.outputs.rolled-back-to }}
-        run: .github/actions/deploy-core/tests/assert-rollback-calls.sh
+        run: .github/actions/deploy-fastly/tests/assert-rollback-calls.sh
 
       - name: Refuse a production rollback without a target
         id: rollback-no-target
@@ -512,7 +512,7 @@ jobs:
         env:
           EDGEZERO__TEST__OUTCOME: ${{ steps.stale-rollback.outcome }}
           EDGEZERO__TEST__LOG_SNAPSHOT: ${{ env.STALE_LOG_SNAPSHOT }}
-        run: .github/actions/deploy-core/tests/assert-stale-rollback-refused.sh
+        run: .github/actions/deploy-fastly/tests/assert-stale-rollback-refused.sh
 
   config-push-smoke:
     needs: fixture-release
@@ -526,7 +526,7 @@ jobs:
           name: edgezero-fastly-release
           path: fixture-release
       - name: Install fake Fastly for publisher B
-        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+        run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Push publisher B staging config from the bundled manifest
         id: staged
@@ -547,10 +547,10 @@ jobs:
           EDGEZERO__TEST__REJECT_KEY: app_config_staging
           EDGEZERO__TEST__PUSHED_KEY: ${{ steps.staged.outputs.pushed-key }}
           EDGEZERO__TEST__PUSHED_STORE: ${{ steps.staged.outputs.store }}
-        run: .github/actions/deploy-core/tests/assert-config-push.sh
+        run: .github/actions/deploy-fastly/tests/assert-config-push.sh
 
       - name: Reset fake Fastly for publisher A
-        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+        run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Push publisher A production config from the bundled manifest
         id: production
@@ -570,7 +570,7 @@ jobs:
           EDGEZERO__TEST__REJECT_KEY: app_config_staging
           EDGEZERO__TEST__PUSHED_KEY: ${{ steps.production.outputs.pushed-key }}
           EDGEZERO__TEST__PUSHED_STORE: ${{ steps.production.outputs.store }}
-        run: .github/actions/deploy-core/tests/assert-config-push.sh
+        run: .github/actions/deploy-fastly/tests/assert-config-push.sh
 
   recovery-smoke:
     needs: fixture-release
@@ -589,7 +589,7 @@ jobs:
           name: edgezero-fastly-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
-        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+        run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Fail after Fastly returns the recoverable draft version
         id: deploy
@@ -609,4 +609,4 @@ jobs:
           EDGEZERO__TEST__PREVIOUS_VERSION: ${{ steps.deploy.outputs.previous-version }}
           EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs.fastly-version }}
           EDGEZERO__TEST__PACKAGE_DIGEST: ${{ steps.deploy.outputs.package-digest }}
-        run: .github/actions/deploy-core/tests/assert-lost-version.sh
+        run: .github/actions/deploy-fastly/tests/assert-lost-version.sh

@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Verifies and extracts an immutable application release before any provider
+# operation. It validates the outer digest, exact archive members, member types,
+# path confinement, recorded member digests, adapter/protocol identity, source
+# revision, and the selected adapter-manifest reference in edgezero.toml.
+#
+# Reads (env):
+#   EDGEZERO__APP__RELEASE__ARCHIVE                     required  release archive
+#   EDGEZERO__APP__RELEASE__SHA256                      required  expected archive digest
+#   EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION    required  selected source revision
+#   EDGEZERO__APP__RELEASE__EXPECTED_ADAPTER            required  wrapper-owned adapter identity
+#   EDGEZERO__APP__RELEASE__EXPECTED_LIFECYCLE_PROTOCOL required  wrapper-owned protocol version
+#   EDGEZERO__APP__RELEASE__ROOT                        required  new extraction root
+# Writes (outputs):
+#   release-root, app-cli-archive, application-manifest, adapter-manifest,
+#   package, package-digest, source-revision
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=common.sh
-source "$SCRIPT_DIR/common.sh"
+# shellcheck source=../../deploy-core/scripts/common.sh
+source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
 
 validate_member_path() {
   local path="$1" label="$2" part
@@ -24,7 +40,7 @@ assert_exact_keys() {
 }
 
 validate_release_json_syntax() {
-  local file="$1" format_tag format_value protocol_tag protocol_value
+  local file="$1" expected_protocol="$2" format_tag format_value protocol_tag protocol_value
   jq -e '.' "$file" >/dev/null 2>&1 || fail "release.json is not valid JSON"
   yq -p json -o json -I=0 '.' "$file" >/dev/null 2>&1 ||
     fail "release.json is not valid JSON"
@@ -49,29 +65,29 @@ validate_release_json_syntax() {
     fail "release.json has an invalid lifecycle_protocol"
   [[ "$protocol_tag" == '!!int' ]] ||
     fail "release.json has an invalid lifecycle_protocol"
-  [[ "$protocol_value" == 1 ]] ||
+  [[ "$protocol_value" == "$expected_protocol" ]] ||
     fail "release.json has an unsupported lifecycle protocol"
 }
 
 validate_manifest_reference() {
-  local release_json="$1" application_manifest="$2" parsed status=0
+  local release_json="$1" application_manifest="$2" expected_adapter="$3" parsed status=0
   parsed="$release_json.application.json"
   if ! yq -p toml -o json -I=0 '.' "$application_manifest" >"$parsed" 2>/dev/null; then
     rm -f "$parsed"
     return 1
   fi
-  jq -e --slurpfile application "$parsed" '
+  jq -e --arg adapter "$expected_adapter" --slurpfile application "$parsed" '
     $application[0] as $app
     | ($app.adapters | type == "object")
       and ([$app.adapters | keys[] | ascii_downcase] as $names
         | ($names | length) == ($names | unique | length))
       and ([$app.adapters | to_entries[]
-        | select((.key | ascii_downcase) == "fastly")] as $fastly
-        | ($fastly | length) == 1
-          and ($fastly[0].value | type == "object")
-          and ($fastly[0].value.adapter | type == "object")
-          and ($fastly[0].value.adapter.manifest | type == "string" and length > 0)
-          and ($fastly[0].value.adapter.manifest == .manifests.adapter.path))
+        | select((.key | ascii_downcase) == $adapter)] as $selected
+        | ($selected | length) == 1
+          and ($selected[0].value | type == "object")
+          and ($selected[0].value.adapter | type == "object")
+          and ($selected[0].value.adapter.manifest | type == "string" and length > 0)
+          and ($selected[0].value.adapter.manifest == .manifests.adapter.path))
   ' "$release_json" >/dev/null 2>&1 || status=$?
   rm -f "$parsed"
   return "$status"
@@ -95,13 +111,19 @@ main() {
   local archive="${EDGEZERO__APP__RELEASE__ARCHIVE:-}"
   local expected_digest="${EDGEZERO__APP__RELEASE__SHA256:-}"
   local expected_revision="${EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION:-}"
+  local expected_adapter="${EDGEZERO__APP__RELEASE__EXPECTED_ADAPTER:-}"
+  local expected_protocol="${EDGEZERO__APP__RELEASE__EXPECTED_LIFECYCLE_PROTOCOL:-}"
   local release_root="${EDGEZERO__APP__RELEASE__ROOT:-}"
   require_input app-release-archive "$archive"
   require_input app-release-sha256 "$expected_digest"
   require_input expected-source-revision "$expected_revision"
+  require_input expected-adapter "$expected_adapter"
+  require_input expected-lifecycle-protocol "$expected_protocol"
   require_input application-release-root "$release_root"
   [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || fail "app-release-sha256 must be 64 lowercase hexadecimal characters"
   [[ "$expected_revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "expected-source-revision must be 40 or 64 lowercase hexadecimal characters"
+  [[ "$expected_adapter" =~ ^[a-z][a-z0-9_-]*$ ]] || fail "expected-adapter is invalid"
+  [[ "$expected_protocol" =~ ^[1-9][0-9]*$ ]] || fail "expected-lifecycle-protocol must be a positive integer"
   [[ -f "$archive" && ! -L "$archive" ]] || fail "application release archive is missing or is not a regular file"
   require_cmd jq
   require_cmd tar
@@ -133,7 +155,7 @@ main() {
 
   local release_json="$scratch/release.json"
   tar -xOzf "$archive" release.json >"$release_json" 2>/dev/null || fail "application release archive is missing release.json"
-  validate_release_json_syntax "$release_json"
+  validate_release_json_syntax "$release_json" "$expected_protocol"
 
   assert_exact_keys "$release_json" 'type == "object" and (keys == ["adapter","app_cli","format","lifecycle_protocol","manifests","package","source_revision"])' root
   assert_exact_keys "$release_json" '.app_cli | type == "object" and (keys == ["path","sha256"])' app_cli
@@ -141,7 +163,10 @@ main() {
   assert_exact_keys "$release_json" '.manifests | type == "object" and (keys == ["adapter","edgezero"])' manifests
   assert_exact_keys "$release_json" '.manifests.edgezero | type == "object" and (keys == ["path","sha256"])' manifests.edgezero
   assert_exact_keys "$release_json" '.manifests.adapter | type == "object" and (keys == ["path","sha256"])' manifests.adapter
-  jq -e '.format == 1 and .lifecycle_protocol == 1 and .adapter == "fastly"' "$release_json" >/dev/null 2>&1 || fail "release.json has an unsupported format, lifecycle protocol, or adapter"
+  jq -e --arg adapter "$expected_adapter" --argjson protocol "$expected_protocol" \
+    '.format == 1 and .lifecycle_protocol == $protocol and .adapter == $adapter' \
+    "$release_json" >/dev/null 2>&1 ||
+    fail "release.json has an unsupported format, lifecycle protocol, or adapter"
 
   local revision
   revision=$(jq -er '.source_revision | select(type == "string")' "$release_json") || fail "release.json has an invalid source_revision"
@@ -218,21 +243,22 @@ main() {
     is_under "$scratch_real" "$target_real" || fail "release member '$expected_file' escapes its root"
   done
   [[ "$(sha256_file "$scratch/$cli_path")" == "$cli_digest" ]] || fail "application CLI digest mismatch"
-  [[ "$(sha256_file "$scratch/$package_path")" == "$package_digest" ]] || fail "Fastly package digest mismatch"
+  [[ "$(sha256_file "$scratch/$package_path")" == "$package_digest" ]] || fail "adapter package digest mismatch"
   [[ "$(sha256_file "$scratch/$edgezero_path")" == "$edgezero_digest" ]] || fail "edgezero manifest digest mismatch"
-  [[ "$(sha256_file "$scratch/$adapter_path")" == "$adapter_digest" ]] || fail "Fastly manifest digest mismatch"
-  validate_manifest_reference "$scratch/release.json" "$scratch/$edgezero_path" ||
-    fail "release.json Fastly manifest does not match edgezero.toml"
+  [[ "$(sha256_file "$scratch/$adapter_path")" == "$adapter_digest" ]] || fail "adapter manifest digest mismatch"
+  validate_manifest_reference "$scratch/release.json" "$scratch/$edgezero_path" "$expected_adapter" ||
+    fail "release.json adapter manifest does not match edgezero.toml"
 
   mv "$scratch" "$release_root"
   trap - EXIT
   local root_real
   root_real=$(canonical_path "$release_root")
-  notice "verified immutable Fastly application release"
+  notice "verified immutable application release for adapter '$expected_adapter'"
   append_output release-root "$root_real"
   append_output app-cli-archive "$root_real/$cli_path"
   append_output application-manifest "$root_real/$edgezero_path"
   append_output adapter-manifest "$root_real/$adapter_path"
+  append_output package "$root_real/$package_path"
   append_output package-digest "$package_digest"
   append_output source-revision "$revision"
 }

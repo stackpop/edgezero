@@ -126,6 +126,8 @@ runs:
         EDGEZERO__APP__RELEASE__ARCHIVE: ${{ inputs['app-release-archive'] }}
         EDGEZERO__APP__RELEASE__SHA256: ${{ inputs['app-release-sha256'] }}
         EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION: ${{ inputs['expected-source-revision'] }}
+        EDGEZERO__APP__RELEASE__EXPECTED_ADAPTER: fastly
+        EDGEZERO__APP__RELEASE__EXPECTED_LIFECYCLE_PROTOCOL: "1"
         EDGEZERO__APP__RELEASE__ROOT: ${{ steps.ws.outputs.root }}/release
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
@@ -143,7 +145,7 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
-      run: exec "$GITHUB_ACTION_PATH/../fastly-common/scripts/prepare-release.sh"
+      run: exec "$GITHUB_ACTION_PATH/../release-core/scripts/prepare-release.sh"
 
     - name: Extract application CLI
       id: cli
@@ -207,7 +209,8 @@ runs:
         EDGEZERO__ACTION__WORKSPACE: ${{ steps.ws.outputs.root }}
         EDGEZERO__APP__CLI__PATH: ${{ steps.cli.outputs['app-cli-path'] }}
         EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
-        FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        EDGEZERO__FASTLY__API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
         FASTLY_KEY: ""

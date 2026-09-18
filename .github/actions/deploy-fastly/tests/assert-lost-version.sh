@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Asserts a failed deploy preserves every independently valid recovery output
+# after Fastly accepted the package but a later provider read failed.
+#
+# Reads (env):
+#   EDGEZERO__TEST__DEPLOY_OUTCOME, EDGEZERO__TEST__MUTATION_ATTEMPTED
+#   EDGEZERO__TEST__PREVIOUS_VERSION, EDGEZERO__TEST__FASTLY_VERSION
+#   EDGEZERO__TEST__PACKAGE_DIGEST, FAKE_EXPECTED_PACKAGE_DIGEST
+#   FAKE_PACKAGE_DIGEST_FILE, FAKE_ACTIVE_VERSION_FILE
+# Writes: none
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 main() {
   local outcome="${EDGEZERO__TEST__DEPLOY_OUTCOME:-}"

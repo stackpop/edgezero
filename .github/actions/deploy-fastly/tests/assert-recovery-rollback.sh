@@ -11,8 +11,8 @@ set -euo pipefail
 #   EDGEZERO__TEST__ROLLED_BACK_TO     rollback-fastly's rolled-back-to output
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 main() {
   local rolled_back_to="${EDGEZERO__TEST__ROLLED_BACK_TO:-}"

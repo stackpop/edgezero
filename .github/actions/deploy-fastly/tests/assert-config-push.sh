@@ -16,8 +16,8 @@ set -euo pipefail
 #   EDGEZERO__TEST__REJECT_KEY    optional  a key that must NOT appear in the log
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
 expect_key="${EDGEZERO__TEST__EXPECT_KEY:?EDGEZERO__TEST__EXPECT_KEY is required}"

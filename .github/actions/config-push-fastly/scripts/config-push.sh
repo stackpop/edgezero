@@ -4,11 +4,10 @@ set -euo pipefail
 # Pushes the application's typed config to a Fastly config store, and emits the
 # key that was written.
 #
-# Like healthcheck.sh and rollback.sh (its sibling lifecycle actions), this calls
-# the app CLI directly with FASTLY_API_TOKEN in the step env — the adapter's own
-# convention, which `fastly config-store-entry update` reads to authenticate. The
-# wrapper blanks every other FASTLY_* alias, so an inherited FASTLY_ENDPOINT or
-# FASTLY_TOKEN can never redirect or re-auth the push.
+# Like its sibling lifecycle actions, this passes the token to the shared runner
+# as typed data. The runner clears every Fastly alias before importing only the
+# validated token, so inherited endpoint or token aliases cannot redirect or
+# re-authenticate the push.
 #
 # Every target uses `<logical-store-id>` as the config entry key. The selected
 # environment chooses the physical store through `__NAME`; using the same name
@@ -21,7 +20,7 @@ set -euo pipefail
 # Reads (env):
 #   EDGEZERO__APP__CLI__PATH              optional  absolute path to the app CLI (preferred; avoids PATH shadowing)
 #   EDGEZERO__APP__CLI__BIN               optional  app CLI name, used when __PATH is unset
-#   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
+#   EDGEZERO__FASTLY__API_TOKEN           required  action-private Fastly API token
 #   EDGEZERO__PROJECT__WORKING_DIRECTORY  required  app dir, relative to github.workspace
 #   GITHUB_WORKSPACE                      required  confinement root
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
@@ -38,8 +37,8 @@ set -euo pipefail
 #   store                                 the logical store id the CLI resolved
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 # Resolve a caller-supplied file path relative to the app dir and prove it stays
 # inside it. Echoes the path relative to the app dir (what the CLI is given).
@@ -69,16 +68,20 @@ main() {
   local app_config_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE:-}"
   local no_env="${EDGEZERO__CONFIG_PUSH__NO_ENV:-false}"
   local inline_file=""
+  local token="${EDGEZERO__FASTLY__API_TOKEN:-}"
 
   if [[ -n "$deprecated_key" ]]; then
     fail "input 'key' is deprecated and unsupported; use EDGEZERO__STORES__CONFIG__<ID>__KEY"
   fi
-  require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
+  require_input fastly-api-token "$token"
   require_input application-manifest "$manifest"
   [[ "$manifest" == /* && -f "$manifest" && ! -L "$manifest" ]] ||
     fail "the bundled application manifest must be an absolute regular file"
   require_cmd "$cli_bin"
+  cli_bin=$(command -v "$cli_bin") || fail "application CLI is unavailable"
+  export EDGEZERO__APP__CLI__PATH="$cli_bin"
   require_cmd git
+  require_cmd jq
   # A typo in deploy-to must never silently push to production.
   case "$deploy_to" in
     production | staging) ;;
@@ -153,23 +156,28 @@ main() {
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the
   # push non-interactive in CI. --staging selects the Fastly lifecycle target;
   # it does not change the runtime config key.
-  local argv=("$cli_bin" config push --adapter fastly --manifest "$manifest" --app-config "$app_config")
+  local argv=(config push --adapter fastly --manifest "$manifest" --app-config "$app_config")
   if [[ -n "$store" ]]; then argv+=(--store "$store"); fi
   if [[ "$deploy_to" == "staging" ]]; then argv+=(--staging); fi
   if [[ "$no_env" == "true" ]]; then argv+=(--no-env); fi
   argv+=(--yes --no-diff)
 
-  # Enter the app dir BEFORE signalling: a directory-entry failure here means the
-  # CLI was never invoked, so it must NOT falsely claim a mutation was attempted.
-  cd "$app_dir" || fail "could not enter working-directory '$app_dir'"
-  # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
-  # signal survives a failed step (readable via `if: always()`). If the push
-  # succeeds but its canonical `pushed-key=`/`pushed-store=` lines are missing
-  # below, the caller can still reconcile the config store rather than assume the
-  # store is unchanged.
-  append_output mutation-attempted true
+  local action_workspace="${EDGEZERO__ACTION__WORKSPACE:-$(dirname -- "$cli_bin")}"
+  mkdir -p "$action_workspace"
+  export EDGEZERO__ACTION__WORKSPACE="$action_workspace"
+  local args_file="$action_workspace/config-push-argv.nul"
+  local clear_file="$action_workspace/fastly-provider-clear.nul"
+  printf '%s\0' "${argv[@]}" >"$args_file"
+  write_fastly_provider_clear_file "$clear_file"
+  EDGEZERO__PROVIDER__ENV=$(jq -n --arg token "$token" '{FASTLY_API_TOKEN:$token}')
+  export EDGEZERO__PROVIDER__ENV
+  export EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$clear_file"
+  export EDGEZERO__APP__CLI__ARGS_FILE="$args_file"
+  export EDGEZERO__APP__CLI__MUTATES=true
+  export EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir"
+  export EDGEZERO__PROJECT__MANIFEST_PATH="$manifest"
   local rc=0
-  "${argv[@]}" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail_with "$rc" "config push failed (CLI exit $rc)"
   fi

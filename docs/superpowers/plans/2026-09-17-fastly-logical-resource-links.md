@@ -61,7 +61,7 @@
 **Files:**
 - Modify: `crates/edgezero-adapter-fastly/src/cli.rs`
 - Modify: `.github/actions/rollback-fastly/scripts/rollback.sh` only if output semantics require clarification
-- Modify: `.github/actions/deploy-core/tests/make-fake-fastly-env.sh`
+- Modify: `.github/actions/deploy-fastly/tests/make-fake-fastly-env.sh`
 - Modify: `.github/actions/deploy-core/tests/run.sh`
 - Test: Fastly adapter and action smoke tests
 
@@ -89,11 +89,11 @@
 ### Task 6: Rewrite managed-deploy fixtures
 
 **Files:**
-- Modify: `.github/actions/deploy-core/tests/make-fake-fastly-env.sh`
-- Modify: `.github/actions/deploy-core/tests/assert-production-deploy.sh`
-- Modify: `.github/actions/deploy-core/tests/assert-staged-calls.sh`
-- Modify: `.github/actions/deploy-core/tests/assert-lost-version.sh`
-- Modify: `.github/actions/deploy-core/tests/make-smoke-fixture.sh`
+- Modify: `.github/actions/deploy-fastly/tests/make-fake-fastly-env.sh`
+- Modify: `.github/actions/deploy-fastly/tests/assert-production-deploy.sh`
+- Modify: `.github/actions/deploy-fastly/tests/assert-staged-calls.sh`
+- Modify: `.github/actions/deploy-fastly/tests/assert-lost-version.sh`
+- Modify: `.github/actions/deploy-fastly/tests/make-smoke-fixture.sh`
 - Modify: `.github/actions/deploy-core/tests/run.sh`
 - Modify: `scripts/smoke_test_config_key_override.sh`
 

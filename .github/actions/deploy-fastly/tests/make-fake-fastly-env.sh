@@ -6,8 +6,8 @@ set -euo pipefail
 # Config/KV/Secret resources, provider-visible package identity, and publication.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 write_fake_fastly() {
   local path="$1" version="$2"
@@ -232,7 +232,7 @@ main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local runner_temp="${RUNNER_TEMP:?RUNNER_TEMP is required}"
   local action_dir path_dir downloads log state pinned stage archive sha expected_digest
-  action_dir=$(cd -- "$SCRIPT_DIR/../../deploy-fastly" && pwd)
+  action_dir=$(cd -- "$SCRIPT_DIR/.." && pwd)
   path_dir="$workspace/fake-bin"
   downloads="$runner_temp/edgezero-action-tools/downloads"
   log="$workspace/fake-calls.log"

@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Asserts a staging deployment cloned the intended source, reconciled the
+# selected resource links, uploaded the expected package, and staged the draft.
+#
+# Reads (env):
+#   FAKE_CALL_LOG, FAKE_EXPECTED_PACKAGE_DIGEST, FAKE_PACKAGE_DIGEST_FILE
+#   EDGEZERO__TEST__STAGED_VERSION, EDGEZERO__TEST__PACKAGE_DIGEST
+# Writes: none
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 main() {
   local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"

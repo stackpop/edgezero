@@ -6,7 +6,6 @@ use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 const RELEASE_METADATA_NAME: &str = "release.json";
-const LIFECYCLE_PROTOCOL: u64 = 1;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +41,7 @@ struct ReleaseMember {
         reason = "release verification records every member; host-only tests audit their exact bytes"
     )
 )]
-pub(crate) struct VerifiedApplicationRelease {
+pub struct VerifiedApplicationRelease {
     adapter_manifest: PathBuf,
     application_cli: PathBuf,
     application_manifest: PathBuf,
@@ -53,23 +52,40 @@ pub(crate) struct VerifiedApplicationRelease {
 }
 
 impl VerifiedApplicationRelease {
-    pub(crate) fn adapter_manifest(&self) -> &Path {
+    #[must_use]
+    #[inline]
+    pub fn adapter_manifest(&self) -> &Path {
         &self.adapter_manifest
     }
 
-    pub(crate) fn package(&self) -> &Path {
+    #[must_use]
+    #[inline]
+    pub fn package(&self) -> &Path {
         &self.package
     }
 
-    pub(crate) fn package_sha256(&self) -> &str {
+    #[must_use]
+    #[inline]
+    pub fn package_sha256(&self) -> &str {
         &self.package_sha256
     }
 }
 
-pub(crate) fn verify_application_release(
+/// Verifies an extracted immutable application release and returns its trusted
+/// member paths and package identity.
+///
+/// # Errors
+///
+/// Returns an error when the release metadata, adapter or lifecycle identity,
+/// recorded paths, member digests, loaded manifests, or exact member set does
+/// not match the immutable release contract.
+#[inline]
+pub fn verify_application_release(
     root: &Path,
     loaded_application_manifest: &Path,
     referenced_adapter_manifest: &Path,
+    expected_adapter: &str,
+    expected_lifecycle_protocol: u64,
 ) -> Result<VerifiedApplicationRelease, String> {
     let canonical_root = root.canonicalize().map_err(|error| {
         format!(
@@ -90,7 +106,7 @@ pub(crate) fn verify_application_release(
     })?;
     let metadata: ApplicationReleaseMetadata = serde_json::from_slice(&metadata_bytes)
         .map_err(|error| format!("invalid application release release.json: {error}"))?;
-    validate_metadata(&metadata)?;
+    validate_metadata(&metadata, expected_adapter, expected_lifecycle_protocol)?;
 
     let app_cli_relative = validate_release_path(&metadata.app_cli.path)?;
     let package_relative = validate_release_path(&metadata.package.path)?;
@@ -165,23 +181,27 @@ pub(crate) fn verify_application_release(
     })
 }
 
-fn validate_metadata(metadata: &ApplicationReleaseMetadata) -> Result<(), String> {
+fn validate_metadata(
+    metadata: &ApplicationReleaseMetadata,
+    expected_adapter: &str,
+    expected_lifecycle_protocol: u64,
+) -> Result<(), String> {
     if metadata.format != 1 {
         return Err(format!(
             "unsupported application release format {}; expected format 1",
             metadata.format
         ));
     }
-    if metadata.lifecycle_protocol != LIFECYCLE_PROTOCOL {
+    if metadata.lifecycle_protocol != expected_lifecycle_protocol {
         return Err(format!(
             "unsupported application release lifecycle protocol {}; expected {}",
-            metadata.lifecycle_protocol, LIFECYCLE_PROTOCOL
+            metadata.lifecycle_protocol, expected_lifecycle_protocol
         ));
     }
-    if metadata.adapter != "fastly" {
+    if metadata.adapter != expected_adapter {
         return Err(format!(
-            "application release adapter {:?} is unsupported; expected `fastly`",
-            metadata.adapter
+            "application release adapter {:?} is unsupported; expected {expected_adapter:?}",
+            metadata.adapter,
         ));
     }
     if !matches!(metadata.source_revision.len(), 40 | 64)
@@ -405,13 +425,13 @@ mod tests {
                 fs::create_dir_all(root.path().join(directory)).expect("release directory");
             }
             let application_manifest = root.path().join("edgezero.toml");
-            let adapter_manifest = root.path().join("adapter/fastly.toml");
+            let adapter_manifest = root.path().join("adapter/synthetic.toml");
             fs::write(root.path().join("cli/app-cli.tar.gz"), b"immutable cli")
                 .expect("application cli");
             fs::write(root.path().join("pkg/app.tar.gz"), b"immutable package").expect("package");
             fs::write(
                 &application_manifest,
-                b"[app]\nname = \"demo\"\n[adapters.fastly.adapter]\nmanifest = \"adapter/fastly.toml\"\n[adapters.spin.adapter]\nmanifest = \"adapter/spin.toml\"\n",
+                b"[app]\nname = \"demo\"\n[adapters.synthetic.adapter]\nmanifest = \"adapter/synthetic.toml\"\n[adapters.spin.adapter]\nmanifest = \"adapter/spin.toml\"\n",
             )
             .expect("application manifest");
             fs::write(
@@ -438,7 +458,7 @@ mod tests {
                 "format": 1,
                 "lifecycle_protocol": 1,
                 "source_revision": "a".repeat(40),
-                "adapter": "fastly",
+                "adapter": "synthetic",
                 "app_cli": {
                     "path": "cli/app-cli.tar.gz",
                     "sha256": Self::digest(&self.root.path().join("cli/app-cli.tar.gz")),
@@ -453,7 +473,7 @@ mod tests {
                         "sha256": Self::digest(&self.application_manifest),
                     },
                     "adapter": {
-                        "path": "adapter/fastly.toml",
+                        "path": "adapter/synthetic.toml",
                         "sha256": Self::digest(&self.adapter_manifest),
                     }
                 }
@@ -475,6 +495,8 @@ mod tests {
                 self.root.path(),
                 &self.application_manifest,
                 &self.adapter_manifest,
+                "synthetic",
+                1,
             )
         }
     }
@@ -484,7 +506,7 @@ mod tests {
         let fixture = ReleaseFixture::new();
         assert!(
             !fixture.root.path().join("adapter/spin.toml").exists(),
-            "a Fastly release must not include an unselected adapter manifest"
+            "an adapter release must not include an unselected adapter manifest"
         );
         let verified = fixture.verify().expect("valid release");
 
@@ -715,7 +737,7 @@ mod tests {
             "cli/app-cli.tar.gz",
             "pkg/app.tar.gz",
             "edgezero.toml",
-            "adapter/fastly.toml",
+            "adapter/synthetic.toml",
         ] {
             let fixture = ReleaseFixture::new();
             fs::write(fixture.root.path().join(member), b"tampered").unwrap();
@@ -734,6 +756,8 @@ mod tests {
             fixture.root.path(),
             &other_application,
             &fixture.adapter_manifest,
+            "synthetic",
+            1,
         )
         .unwrap_err();
         assert!(
@@ -741,12 +765,14 @@ mod tests {
             "{application_error}"
         );
 
-        let other_adapter = fixture.root.path().join("adapter/other-fastly.toml");
+        let other_adapter = fixture.root.path().join("adapter/other-synthetic.toml");
         fs::write(&other_adapter, b"manifest_version = 3\n").unwrap();
         let adapter_error = verify_application_release(
             fixture.root.path(),
             &fixture.application_manifest,
             &other_adapter,
+            "synthetic",
+            1,
         )
         .unwrap_err();
         assert!(

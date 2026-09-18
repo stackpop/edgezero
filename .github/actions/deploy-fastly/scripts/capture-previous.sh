@@ -28,7 +28,7 @@ set -euo pipefail
 # Reads (env):
 #   EDGEZERO__APP__CLI__PATH / _BIN        required  the app CLI (via resolve_app_cli)
 #   EDGEZERO__FASTLY__SERVICE_ID           required  the Fastly service id
-#   FASTLY_API_TOKEN                       required  provider token (Fastly's own convention)
+#   EDGEZERO__FASTLY__API_TOKEN           required  action-private Fastly API token
 # Writes (outputs):
 #   previous-version                       the active version before this deploy (may be empty)
 
@@ -37,29 +37,35 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 main() {
-  local cli_bin service_id
+  local service_id cli_bin
   cli_bin=$(resolve_app_cli)
+  cli_bin=$(command -v "$cli_bin") || fail "application CLI is unavailable"
+  export EDGEZERO__APP__CLI__PATH="$cli_bin"
   service_id="${EDGEZERO__FASTLY__SERVICE_ID:?EDGEZERO__FASTLY__SERVICE_ID is required}"
   require_fastly_service_id "$service_id"
-  require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
-  require_cmd "$cli_bin"
+  local token="${EDGEZERO__FASTLY__API_TOKEN:-}"
+  require_input fastly-api-token "$token"
+  require_cmd jq
 
-  # Credential-free preflight: confirm the app CLI actually exposes
-  # `active-version` BEFORE invoking it with the token. A missing subcommand here
-  # means the CLI was built without the lifecycle commands wired — fail with a
-  # clear, actionable message instead of a bare clap "unrecognized subcommand".
-  # The token is UNSET for this probe so it truly never reaches a `--help` call;
-  # only the real API invocation below sees it.
-  if ! env -u FASTLY_API_TOKEN "$cli_bin" active-version --help >/dev/null 2>&1; then
-    fail "the app CLI does not expose the \`active-version\` command, which a production deploy needs to capture the rollback target. Wire \`edgezero_cli::run_active_version\` (and \`run_healthcheck\` / \`run_rollback\`) into your CLI -- see the 'Deploying from GitHub Actions' guide's required command surface."
-  fi
+  local workspace="${EDGEZERO__ACTION__WORKSPACE:-$(dirname -- "$cli_bin")}"
+  mkdir -p "$workspace"
+  export EDGEZERO__ACTION__WORKSPACE="$workspace"
+  local args_file="$workspace/active-version-argv.nul"
+  local clear_file="$workspace/fastly-provider-clear.nul"
+  printf '%s\0' active-version --adapter fastly --service-id "$service_id" >"$args_file"
+  write_fastly_provider_clear_file "$clear_file"
+  EDGEZERO__PROVIDER__ENV=$(jq -n --arg token "$token" '{FASTLY_API_TOKEN:$token}')
+  export EDGEZERO__PROVIDER__ENV
+  export EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$clear_file"
+  export EDGEZERO__APP__CLI__ARGS_FILE="$args_file"
+  export EDGEZERO__APP__CLI__MUTATES=false
 
   new_private_log
   # Fail CLOSED on an operational failure: the CLI exits 0 for "no active version"
   # (first deploy) and non-zero only for a real failure. Capture the CLI's exit
   # (pipefail makes it the pipeline status; tee exits 0).
   local rc=0
-  "$cli_bin" active-version --adapter fastly --service-id "$service_id" \
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" \
     2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail_with "$rc" "could not determine the active version (CLI exit $rc); refusing to deploy without a captured rollback target. A first-ever deploy (no active version) exits 0 with an empty target — a non-zero exit means an API/auth/parse failure."

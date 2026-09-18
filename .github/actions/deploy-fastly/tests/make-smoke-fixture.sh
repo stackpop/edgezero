@@ -6,8 +6,8 @@ set -euo pipefail
 # release. Runtime publisher/environment choices are deliberately absent here.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 write_source_fixture() {
   local mode="$1"

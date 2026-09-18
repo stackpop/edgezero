@@ -204,12 +204,12 @@ require_present() {
   [[ "$present" == "true" ]] || fail "missing required input '$name'"
 }
 
-# The Fastly provider tooling and its pinned release binary are Linux x86-64
-# only. Fail with a clear message rather than a confusing exec error later.
+# The published application CLI artifact currently targets Linux x86-64.
+# Fail with a clear message rather than a confusing exec error later.
 require_linux_x86_64() {
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64 | Linux-amd64) ;;
-    *) fail "the Fastly wrapper supports only Linux x86-64 runners" ;;
+    *) fail "the application CLI artifact supports only Linux x86-64 runners" ;;
   esac
 }
 
@@ -285,9 +285,8 @@ assert_committed_source() {
 # The app CLI to invoke — the ABSOLUTE path the download step resolved, when
 # available, else the bare name.
 #
-# Bare-name resolution goes through PATH, and the provider CLI install prepends
-# its own directory: an app CLI legitimately named `fastly` would then resolve to
-# the provider's `fastly`, not the app's. Invoking the absolute path is immune to
+# Bare-name resolution goes through PATH, where provider tooling can shadow an
+# application CLI with the same name. Invoking the absolute path is immune to
 # PATH ordering. `EDGEZERO__APP__CLI__PATH` comes from download-app-cli.sh's
 # `app-cli-path` output.
 resolve_app_cli() {
