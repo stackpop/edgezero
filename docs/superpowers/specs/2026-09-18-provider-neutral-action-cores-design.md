@@ -110,7 +110,7 @@ appear in the application CLI's help output. The core assigns lifecycle protocol
 - an optional provider-supplied allowlist for additional public runtime
   variables;
 - working-directory and manifest selection;
-- private lifecycle logs and cleanup;
+- private lifecycle-log creation and cleanup primitives;
 - provider exit-status preservation;
 - `mutation-attempted` publication immediately before mutating CLI execution;
   and
@@ -120,6 +120,52 @@ The invocation core receives an exact CLI argument vector. It does not construct
 provider flags or interpret provider output values. A mutating/non-mutating
 input controls mutation reporting. Provider wrappers remain responsible for
 deciding whether an operation can mutate.
+
+### Lifecycle capability declaration
+
+Release-core receives one JSON capability declaration with this exact shape:
+
+```json
+{
+  "lifecycle_protocol": 1,
+  "probes": [
+    {
+      "command": ["deploy"],
+      "required_flags": ["--adapter"]
+    }
+  ]
+}
+```
+
+The declaration must be an object with exactly `lifecycle_protocol` and
+`probes`. The protocol must be a positive integer. `probes` must be a non-empty
+array. Each probe must contain exactly `command` and `required_flags`;
+`command` must be a non-empty array of non-empty printable tokens, and
+`required_flags` must be a non-empty array of unique printable tokens beginning
+with `-`. Duplicate command arrays are invalid. The command array does not
+contain `--help`; release-core appends it, requires a successful exit, and
+requires every declared flag to appear as an exact help token or in
+`--flag=<value>` form.
+
+Release-core writes the declaration's `lifecycle_protocol` into `release.json`
+only after the declaration and every probe pass. Consumer verification receives
+the expected protocol from the provider wrapper and requires an exact match.
+
+The generic core validates structure and executes every declared probe. The
+provider wrapper owns semantic completeness because different providers can
+have different lifecycle commands. The Fastly wrapper's protocol-1 declaration
+is fixed to these probes and is locked by a static contract test:
+
+| Command         | Required flags                                                                                   |
+| --------------- | ------------------------------------------------------------------------------------------------ |
+| `deploy`        | `--adapter`, `--service-id`, `--application-release`, `--staging`                             |
+| `config push`   | `--adapter`, `--manifest`, `--app-config`, `--store`, `--staging`, `--no-env`, `--yes`, `--no-diff` |
+| `healthcheck`   | `--adapter`, `--service-id`, `--version`, `--domain`, `--path`, `--retry`, `--retry-delay`, `--timeout`, `--staging` |
+| `rollback`      | `--adapter`, `--service-id`, `--version`, `--rollback-to`, `--staging`                       |
+| `active-version` | `--adapter`, `--service-id`                                                                       |
+
+Removing a Fastly probe or required flag is therefore a public protocol change,
+not an internal refactor.
 
 ### Fastly wrappers
 
@@ -198,13 +244,19 @@ part of this change.
 3. Deploy-core removes inherited aliases, imports only declared typed values,
    preserves allowed public runtime variables, scrubs private carriers, and
    resolves the verified application CLI.
-4. For a mutating command, deploy-core publishes `mutation-attempted=true`
+4. The Fastly wrapper creates a private lifecycle log through the deploy-core
+   helper and installs its cleanup trap.
+5. For a mutating command, deploy-core publishes `mutation-attempted=true`
    immediately before execution.
-5. Deploy-core executes the argument vector without `eval`, records output in a
-   private lifecycle log, and preserves the CLI exit status.
-6. The Fastly wrapper validates and publishes the Fastly-specific outputs. Every
+6. The wrapper pipes deploy-core's unmodified output through `tee` into the
+   private log and captures deploy-core's exit status separately from `tee`.
+7. While the log still exists, the Fastly wrapper validates and publishes the
+   Fastly-specific outputs. Every
    independently valid recovery output is published before another output
    contract can fail.
+8. The wrapper exits with the application CLI's status when it failed. The
+   cleanup trap removes the private log after output parsing on success and
+   failure; cleanup failure can only replace a successful status.
 
 ## Security boundaries
 
@@ -271,7 +323,10 @@ Tests must prove:
   files, names, credentials, tools, or deployment implementation;
 - release-core rejects an adapter mismatch, unsafe path, symlink, extra member,
   missing member, duplicate member, digest mismatch, source-revision mismatch,
-  and incomplete lifecycle capability declaration;
+  structurally incomplete lifecycle capability declaration, or failed declared
+  probe;
+- the Fastly package wrapper supplies exactly the five protocol-1 probes and
+  required flags defined by this design;
 - the shared Rust verifier accepts a synthetic adapter release and the Fastly
   adapter consumes it with expected adapter `fastly`;
 - deploy-core invokes a synthetic application CLI with exact argument boundaries,
@@ -279,6 +334,8 @@ Tests must prove:
   public runtime variables, and scrubs action-private carriers;
 - mutation reporting happens after setup and immediately before execution;
 - provider exit codes and independently valid recovery outputs are preserved;
+- lifecycle output remains available until the provider wrapper finishes
+  recovery parsing, then its private log is removed;
 - provider-neutral core files contain no Fastly, Cloudflare, Spin, or Axum
   policy branches;
 - all existing Fastly config-push, production, staging, healthcheck, rollback,
