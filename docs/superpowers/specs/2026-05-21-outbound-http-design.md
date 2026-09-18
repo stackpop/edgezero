@@ -185,6 +185,10 @@ pub enum OutboundBatchTermination {
     Cutoff,
 }
 
+/// One observable step from an outbound batch.
+///
+/// After the final `Item`, callers poll once more to receive `Finished(Completed)`;
+/// completion is not inferred from the number of items observed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OutboundBatchNext {
@@ -206,6 +210,8 @@ pub struct OutboundBatch { /* private */ }
 
 impl OutboundBatch {
     /// Stops observation, applies strongest-available teardown, and returns unresolved indices.
+    /// The caller still owes every returned slot an outcome because `EdgeZero` observed no
+    /// terminal result for those indices.
     pub fn cancel(self) -> Vec<usize>;
 
     /// Collects terminal items into the original input order until completion/cutoff.
