@@ -114,7 +114,8 @@ appear in the application CLI's help output. The core assigns lifecycle protocol
 - provider exit-status preservation;
 - `mutation-attempted` publication immediately before mutating CLI execution;
   and
-- unambiguous output-contract parsing helpers.
+- output-contract parsing helpers that accept repeated identical canonical
+  values while rejecting malformed lines or multiple distinct values.
 
 The invocation core receives an exact CLI argument vector. It does not construct
 provider flags or interpret provider output values. A mutating/non-mutating
@@ -186,7 +187,7 @@ Fastly actions own only Fastly policy and translation:
 The wrappers call `release-core` and `deploy-core` through documented environment
 and file contracts. They must not duplicate archive extraction, release schema
 validation, provider-environment import, application CLI resolution, or generic
-output uniqueness checks.
+output canonicalization checks.
 
 `fastly-common` remains only for shared Fastly policy such as service-ID
 validation. It does not contain generic release or CLI-execution machinery.
@@ -290,9 +291,10 @@ name provider-specific inputs and state.
 The original application or provider CLI exit status wins over wrapper cleanup
 or output errors. When the provider may already have mutated state, the wrapper
 publishes each independently validated recovery value before rejecting a missing,
-malformed, duplicate, or conflicting output. An absent `mutation-attempted`
-remains insufficient proof that no provider mutation occurred after a hard
-runner loss.
+malformed, or conflicting output. Repeated identical canonical lines remain
+valid; two distinct canonical values for one output are conflicting. An absent
+`mutation-attempted` remains insufficient proof that no provider mutation
+occurred after a hard runner loss.
 
 ## Extensibility rule
 
@@ -334,6 +336,8 @@ Tests must prove:
   public runtime variables, and scrubs action-private carriers;
 - mutation reporting happens after setup and immediately before execution;
 - provider exit codes and independently valid recovery outputs are preserved;
+- repeated identical canonical output lines remain accepted, while malformed
+  lines and multiple distinct values fail;
 - lifecycle output remains available until the provider wrapper finishes
   recovery parsing, then its private log is removed;
 - provider-neutral core files contain no Fastly, Cloudflare, Spin, or Axum
