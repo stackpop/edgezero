@@ -44,6 +44,12 @@ enum SendFailure {
 }
 
 #[cfg(any(feature = "fastly", test))]
+enum FastlyBatchObservation {
+    Continue(OutboundBatchItem),
+    Cutoff,
+}
+
+#[cfg(any(feature = "fastly", test))]
 fn classify_send_failure(
     failure: SendFailure,
     budget: DispatchBudget,
@@ -136,12 +142,6 @@ fn assert_send_failure_error(failure: SendFailure, error: &EdgeError, selected: 
             }
         )),
     }
-}
-
-#[cfg(any(feature = "fastly", test))]
-enum FastlyBatchObservation {
-    Continue(OutboundBatchItem),
-    Cutoff,
 }
 
 #[cfg(any(feature = "fastly", test))]
