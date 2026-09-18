@@ -143,6 +143,9 @@ pub enum OutboundBatchTermination {
 }
 
 /// One observable step from an outbound batch.
+///
+/// After the final [`Self::Item`], callers must poll once more to receive
+/// `Finished(Completed)`; completion is not inferred from the number of items observed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OutboundBatchNext {
@@ -179,6 +182,9 @@ pub struct OutboundBatch {
 
 impl OutboundBatch {
     /// Stops observation, drops adapter-owned pending work, and returns unresolved indices.
+    ///
+    /// A caller mapping cancellation into its own fan-out result still owes every returned slot
+    /// an outcome because `EdgeZero` observed no terminal result for those indices.
     #[must_use]
     #[inline]
     pub fn cancel(self) -> Vec<usize> {
