@@ -36,11 +36,13 @@ and output contracts.
 
 - No Cloudflare, Spin, Axum, or synthetic public deployment action is added.
 - No generic public `deploy` action is introduced.
+- No public `release-core` or `deploy-core` action is introduced; both remain
+  repository-internal script libraries.
 - No provider-neutral staging, healthcheck, or rollback semantics are invented.
 - No application CLI, Rust package, `edgezero.toml`, or public environment
   variable is renamed.
 - No Fastly action input, output, default, archive member, or runtime behavior
-  changes.
+  changes. The package action path is the single deliberate action-name change.
 
 ## Compatibility contract
 
@@ -48,12 +50,18 @@ The following public actions retain their names and complete input/output
 surfaces:
 
 - `build-app-cli`
-- `package-fastly-application-release`
 - `config-push-fastly`
 - `deploy-fastly`
 - `healthcheck-fastly`
 - `rollback-fastly`
 - `require-github-environment`
+
+The package wrapper is renamed from `package-fastly-application-release` to
+`package-application-release-fastly`, following the same
+operation/object/provider naming order as the other Fastly actions. The old path
+is removed rather than retained as a compatibility alias. Coordinated consumers,
+including the deployer workflow, must update their action reference in the same
+rollout. Its complete input/output surface remains unchanged.
 
 The configurable `app-cli-artifact` value remains a GitHub artifact name. The
 archive produced by `build-app-cli` remains `app-cli.tar`. The immutable Fastly
@@ -91,6 +99,11 @@ The action stack has three layers.
   rejection; and
 - verified release outputs used by lifecycle actions.
 
+`release-core` is a private collection of scripts and tests under
+`.github/actions/release-core`; it has no `action.yml` and is not a callable
+GitHub Action. Provider package actions invoke its scripts with fixed,
+wrapper-owned policy data.
+
 The core takes an expected adapter name and a provider-supplied lifecycle
 capability declaration. It does not contain provider names, provider CLI names,
 credential names, service identifiers, staging rules, or provider output names.
@@ -118,11 +131,38 @@ selects the protocol value.
 - provider-neutral output parsing primitives for last-canonical,
   unique-canonical, and exact-one-canonical policies.
 
-The invocation core receives an exact CLI argument vector. It does not construct
-provider flags or interpret provider output values. A mutating/non-mutating
-input controls mutation reporting. Provider wrappers remain responsible for
-deciding whether an operation can mutate and which parsing policy each output
-uses.
+`deploy-core` likewise remains an internal script library with no public
+`action.yml`. The invocation core resolves the verified application CLI itself
+and receives one NUL-delimited file containing every argument after the
+executable. The first entry is therefore the application CLI subcommand, followed
+by its exact flags and values. Empty arguments are preserved. Newline-delimited
+transport and shell command strings are rejected; the core never uses `eval`.
+The executable comes only from the separately verified application CLI result
+and cannot be replaced through the argument file.
+
+The invocation core does not add a command, construct provider flags, or
+interpret provider output values. A validated boolean controls mutation
+reporting. Provider wrappers remain responsible for constructing the complete
+argument file, deciding whether an operation can mutate, and choosing the
+parsing policy for each output.
+
+The parsing primitives have fixed provider-neutral semantics. Each receives a
+literal key, an anchored value pattern, and a lifecycle log:
+
+- **last-canonical** returns the value from the last line that exactly matches
+  the key and pattern. Missing or malformed same-key lines do not themselves
+  make the primitive fail; the provider wrapper decides whether an empty result
+  is valid.
+- **unique-canonical** requires at least one same-key line, rejects any same-key
+  line that does not exactly match, accepts repeated identical values, and
+  rejects more than one distinct value.
+- **exact-one-canonical** requires exactly one same-key line and requires that
+  line to match exactly. Repeated lines are rejected even when their values are
+  identical.
+
+Keys are treated as literals rather than regular-expression source. Value
+patterns are fixed in provider wrapper code and cannot come from public action
+inputs.
 
 ### Lifecycle capability declaration
 
@@ -189,9 +229,13 @@ Fastly actions own only Fastly policy and translation:
   rollback outputs.
 
 The wrappers call `release-core` and `deploy-core` through documented environment
-and file contracts. They must not duplicate archive extraction, release schema
-validation, provider-environment import, application CLI resolution, or generic
-output parsing primitives.
+and file contracts. Provider policy data, argument vectors, credential-clear
+lists, and public-variable allowlists cross those boundaries through confined
+files. Credential values remain opaque JSON data in an action-private environment
+carrier and are never interpolated into shell source or command arguments.
+Wrappers must not duplicate archive extraction, release schema validation,
+provider-environment import, application CLI resolution, or generic output
+parsing primitives.
 
 `fastly-common` remains only for shared Fastly policy such as service-ID
 validation. It does not contain generic release or CLI-execution machinery.
@@ -217,8 +261,9 @@ part of this change.
 
 ### Packaging
 
-1. The Fastly package action maps its existing inputs to the release-core
-   contract and supplies adapter `fastly` plus the Fastly lifecycle capabilities.
+1. `package-application-release-fastly` maps its existing inputs to the
+   release-core contract and supplies adapter `fastly` plus the Fastly lifecycle
+   capabilities.
 2. Release-core validates confined inputs and extracts the application CLI.
 3. Release-core probes the declared lifecycle commands and flags.
 4. Release-core reads the Fastly manifest path from the complete
@@ -243,7 +288,8 @@ part of this change.
 ### CLI invocation
 
 1. The Fastly wrapper validates provider-specific inputs and creates the exact
-   application CLI argument vector in an action-owned NUL-delimited file.
+   post-executable application CLI argument vector in an action-owned
+   NUL-delimited file.
 2. It supplies the Fastly credential-clear list and typed credential JSON to
    deploy-core.
 3. Deploy-core removes inherited aliases, imports only declared typed values,
@@ -324,7 +370,10 @@ core.
 
 Tests must prove:
 
-- every existing Fastly action retains its exact public input/output surface;
+- every Fastly action retains its exact public input/output surface;
+- `package-application-release-fastly` replaces
+  `package-fastly-application-release`, the old path is absent, and repository
+  product-contract references use the new path;
 - the format-1 `release.json` schema and archive member paths are unchanged;
 - `app-cli.tar`, configurable artifact naming, application CLI binary naming,
   and selected-manifest path preservation are unchanged;
@@ -339,8 +388,9 @@ Tests must prove:
 - the shared Rust verifier accepts a synthetic adapter release and the Fastly
   adapter consumes it with expected adapter `fastly`;
 - deploy-core invokes a synthetic application CLI with exact argument boundaries,
-  clears inherited aliases, imports only typed credentials, preserves allowed
-  public runtime variables, and scrubs action-private carriers;
+  including empty arguments, clears inherited aliases, imports only typed
+  credentials, preserves allowed public runtime variables, and scrubs
+  action-private carriers;
 - mutation reporting happens after setup and immediately before execution;
 - provider exit codes and independently valid recovery outputs are preserved;
 - deploy accepts repeated identical canonical values but rejects malformed or
