@@ -3578,6 +3578,37 @@ test_package_action_name() {
     test -e "$obsolete"
 }
 
+yaml_step_has_retention() {
+  awk -v want="$2" '
+    /^[[:space:]]*- name:/ {
+      label = $0
+      sub(/^[[:space:]]*- name:[[:space:]]*/, "", label)
+      if (in_step) exit
+      in_step = (label == want)
+    }
+    in_step && /^[[:space:]]+retention-days:[[:space:]]*14[[:space:]]*$/ {
+      found = 1
+    }
+    END {
+      if (!in_step || !found) exit 1
+    }
+  ' "$1"
+}
+
+test_artifact_retention_policy() {
+  section "artifact retention policy"
+  local action step
+  while IFS='|' read -r action step; do
+    assert_succeeds "$step retains its artifact for 14 days" \
+      yaml_step_has_retention "$action" "$step"
+  done <<EOF
+$ACTIONS_DIR/build-app-cli/action.yml|Upload CLI artifact
+$ACTIONS_DIR/package-application-release-fastly/action.yml|Upload immutable application release
+$REPO_ROOT/.github/workflows/deploy-action.yml|Upload the immutable application release
+$REPO_ROOT/.github/workflows/deploy-action.yml|Upload the immutable store-free application release
+EOF
+}
+
 # ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
@@ -3610,6 +3641,7 @@ main() {
   test_deploy_signal_timing
   test_recovery_version_parse
   test_package_action_name
+  test_artifact_retention_policy
   test_dirty_source_guard
   test_cache_key
   test_app_repo_boundary

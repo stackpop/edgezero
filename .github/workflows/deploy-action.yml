@@ -156,6 +156,7 @@ jobs:
             fixture-release/app-release.sha256
             fixture-release/package.sha256
           if-no-files-found: error
+          retention-days: 14
 
   # This is a separate application release because its bundled edgezero.toml
   # declares no stores. It is built once and is never varied by a deployer.
@@ -199,6 +200,7 @@ jobs:
             fixture-release/app-release.sha256
             fixture-release/package.sha256
           if-no-files-found: error
+          retention-days: 14
 
   production-smoke:
     needs: fixture-release

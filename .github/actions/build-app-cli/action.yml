@@ -276,9 +276,7 @@ runs:
         name: ${{ steps.build.outputs['app-cli-artifact'] }}
         path: ${{ steps.build.outputs['tarball-path'] }}
         if-no-files-found: error
-        # No forced retention: the repository/org default applies, so the artifact
-        # survives an environment-approval gate that delays the deploy job past a day
-        # (a forced `retention-days: 1` would expire the CLI before it downloads).
+        retention-days: 14
 
     # Remove the per-invocation workspace (build/stage dirs, the outputs handoff)
     # now that the artifact is uploaded. Runs no application code.

@@ -112,6 +112,7 @@ runs:
         name: ${{ steps.package.outputs.artifact-name }}
         path: ${{ steps.package.outputs.archive-path }}
         if-no-files-found: error
+        retention-days: 14
 
     - name: Cleanup release workspace
       if: ${{ always() }}
