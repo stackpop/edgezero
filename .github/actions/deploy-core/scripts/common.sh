@@ -49,6 +49,12 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "required command '$1' was not found"
 }
 
+require_yq_v4() {
+  require_cmd yq
+  yq --version 2>&1 | grep -qE 'mikefarah/yq.*version v?4\.' ||
+    fail "Mike Farah yq v4 is required"
+}
+
 append_output() {
   local name="$1"
   local value="$2"

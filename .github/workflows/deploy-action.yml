@@ -145,7 +145,7 @@ jobs:
 
       - name: Assemble the immutable application release
         id: release
-        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh release fixture-cli/edgezero-cli.tar
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
 
       - name: Upload the immutable application release
         uses: actions/upload-artifact@v7
@@ -188,7 +188,7 @@ jobs:
 
       - name: Assemble the immutable store-free application release
         id: release
-        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh release fixture-cli/edgezero-cli.tar
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
 
       - name: Upload the immutable store-free application release
         uses: actions/upload-artifact@v7

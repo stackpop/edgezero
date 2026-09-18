@@ -9,7 +9,7 @@ inputs:
     description: Path beneath github.workspace to the prebuilt Fastly package tarball.
     required: true
   application-manifest:
-    description: Path beneath github.workspace to edgezero.toml.
+    description: Path beneath github.workspace to edgezero.toml; every referenced adapter manifest is included automatically.
     required: true
   adapter-manifest:
     description: Path beneath github.workspace to the referenced fastly.toml.

@@ -11,20 +11,21 @@ The release archive contains all application-owned deploy inputs:
 - the application CLI used by deploy, config push, healthcheck, and rollback;
 - the prebuilt Fastly package;
 - the application's exact `edgezero.toml`; and
-- the exact Fastly manifest referenced by that application manifest.
+- every adapter manifest referenced by that application manifest.
 
-For one release, those four members are byte-identical across every publisher,
-deployer, production deployment, and staging deployment. A later application
-release may change them. Runtime variables, selected physical Config/KV/Secret
-stores, destination service, credentials, and publication target may vary without
-changing the release.
+For one release, those application-owned members are byte-identical across every
+publisher, deployer, production deployment, and staging deployment. A later
+application release may change them. Runtime variables, selected physical
+Config/KV/Secret stores, destination service, credentials, and publication target
+may vary without changing the release.
 
 ## Producer and deployer boundary
 
 The application release pipeline is the sole producer. It checks out an approved
 source revision, builds the application CLI and Fastly package without a GitHub
-Environment or provider credential, records their digests and both manifests in
-`release.json`, archives the result, and publishes the archive plus its SHA-256.
+Environment or provider credential, records their digests and all referenced
+adapter manifests in `release.json`, archives the result, and publishes the
+archive plus its SHA-256.
 
 The deployer is a consumer. It resolves the application source revision and
 release digest before selecting a publisher GitHub Environment. It downloads the
@@ -40,10 +41,11 @@ release.json
 cli/app-cli.tar
 package/app.tar.gz
 edgezero.toml
-fastly.toml
+adapters/fastly/fastly.toml
+adapters/spin/spin.toml
 ```
 
-The four member paths are release metadata, so another release may arrange them
+The member paths are release metadata, so another release may arrange them
 differently. `release.json` records `format: 1`, the 40- or 64-character lowercase
 hexadecimal source revision, adapter `fastly`, required
 `lifecycle_protocol: 1`, and the relative path and SHA-256 for each file.
@@ -51,9 +53,9 @@ Verification rejects unknown or duplicate fields, unsafe paths,
 symlinks, extra files or directories, digest mismatches, and manifests that do
 not match the application's recorded manifest relationship. The deployer cannot
 substitute a package or manifest after verification.
-The packager preserves the Fastly manifest at the exact relative path declared
-by `edgezero.toml`. It also verifies every lifecycle command and action-owned
-flag before assigning `lifecycle_protocol: 1`.
+The packager preserves every referenced adapter manifest at the exact relative
+path declared by `edgezero.toml`. It also verifies every lifecycle command and
+action-owned flag before assigning `lifecycle_protocol: 1`.
 
 ## Production deployment
 
@@ -331,7 +333,7 @@ before provider mutation.
 ## Runner requirements
 
 The actions are tested on `ubuntu-latest`. A self-hosted runner must be Linux
-x86-64 and provide Bash, `jq`, Python 3.11 or newer, `tar`, `curl`, `git`, `base64`,
+x86-64 and provide Bash, `jq`, Mike Farah `yq` v4, `tar`, `curl`, `git`, `base64`,
 `realpath`, and either `sha256sum` or `shasum`. The application CLI archive must
 contain a Linux x86-64 executable.
 

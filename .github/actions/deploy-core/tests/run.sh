@@ -367,7 +367,7 @@ EOF
   chmod +x "$stage_dir/myapp-cli"
   printf '{"app-cli-bin":"myapp-cli","app-cli-version":"1.2.3","app-cli-package":"myapp-cli"}\n' \
     >"$stage_dir/app-cli-meta.json"
-  tar -C "$stage_dir" -cf "$artifact_dir/edgezero-cli.tar" myapp-cli app-cli-meta.json
+  tar -C "$stage_dir" -cf "$artifact_dir/app-cli.tar" myapp-cli app-cli-meta.json
 
   local output_file="$WORK_DIR/download-output.txt"
   if env -i PATH="$PATH" \
@@ -429,7 +429,7 @@ CLI
     --arg package "$(hash_file "$dir/release/package/app.tar.gz")" \
     --arg edgezero "$(hash_file "$dir/release/edgezero.toml")" \
     --arg adapter "$(hash_file "$dir/release/adapter/fastly.toml")" \
-    '{format:1,lifecycle_protocol:1,source_revision:$revision,adapter:"fastly",app_cli:{path:"cli/app-cli.tar.gz",sha256:$cli},package:{path:"package/app.tar.gz",sha256:$package},manifests:{edgezero:{path:"edgezero.toml",sha256:$edgezero},adapter:{path:"adapter/fastly.toml",sha256:$adapter}}}' \
+    '{format:1,lifecycle_protocol:1,source_revision:$revision,adapter:"fastly",app_cli:{path:"cli/app-cli.tar.gz",sha256:$cli},package:{path:"package/app.tar.gz",sha256:$package},manifests:{edgezero:{path:"edgezero.toml",sha256:$edgezero},adapters:[{name:"fastly",path:"adapter/fastly.toml",sha256:$adapter}]}}' \
     >"$dir/release/release.json"
   tar -C "$dir/release" -czf "$dir/app-release.tar.gz" \
     release.json cli/app-cli.tar.gz package/app.tar.gz edgezero.toml adapter/fastly.toml
@@ -943,6 +943,11 @@ test_no_inline_action_scripts() {
     bad=$(grep -nE '^[[:space:]]*run:' "$p" | grep -vF '.sh' || true)
     assert_equals "$(basename "$(dirname "$p")"): every run: invokes a .sh script" "" "$bad"
   done
+
+  local embedded_language=py"thon" heredoc_marker=P"Y"
+  local embedded_python_pattern="${embedded_language}3 .*<<|${embedded_language} .*<<|<<'?${heredoc_marker}'?"
+  bad=$(grep -REn --include='*.sh' -E "$embedded_python_pattern" "$ACTIONS_DIR" || true)
+  assert_equals "action shell scripts contain no embedded Python programs" "" "$bad"
 }
 
 test_cleanup_confinement() {
@@ -2456,6 +2461,12 @@ test_fastly_smoke_release_contract() {
     grep -q 'store-free' "$fixture"
   assert_succeeds "the fixture supports an explicit store-aware application mode" \
     grep -q 'store-aware' "$fixture"
+  assert_succeeds "the executable config-push smoke registers the Spin validator" \
+    grep -Fq '"edgezero-adapter-spin"' "$fixture"
+  assert_succeeds "the smoke application references its Spin manifest" \
+    grep -Fq 'manifest = "adapter/spin.toml"' "$fixture"
+  assert_succeeds "the smoke release packages its referenced Spin manifest" \
+    grep -Fq 'adapter/fastly.toml adapter/spin.toml' "$fixture"
   assert_succeeds "the fake seeds active v40 with logical Config, KV, and Secret aliases" \
     grep -Fq 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig-store' "$fake"
   assert_succeeds "the staged assertion checks staging resources under logical aliases" \
@@ -2504,8 +2515,11 @@ test_smoke_release_uses_application_revision() {
   git -C "$workspace/fixture-app" init -q
   git -C "$workspace/fixture-app" config user.email test@example.com
   git -C "$workspace/fixture-app" config user.name Test
-  printf '[app]\nname = "fixture"\n' >"$workspace/fixture-app/edgezero.toml"
+  printf '[app]\nname = "fixture"\n[adapters.fastly.adapter]\nmanifest = "adapter/fastly.toml"\n[adapters.spin.adapter]\nmanifest = "adapter/spin.toml"\n' \
+    >"$workspace/fixture-app/edgezero.toml"
   printf '[package]\nname = "fixture"\n' >"$workspace/fixture-app/adapter/fastly.toml"
+  printf 'spin_manifest_version = 2\n[component.fixture]\nsource = "fixture.wasm"\n' \
+    >"$workspace/fixture-app/adapter/spin.toml"
   git -C "$workspace/fixture-app" add -A
   git -C "$workspace/fixture-app" commit -q -m fixture
   printf 'fixture CLI archive\n' >"$workspace/app-cli.tar"
@@ -2616,11 +2630,11 @@ test_fastly_logical_link_documentation() {
     grep -Fq 'never checks out or rebuilds application source' "$adoption"
   assert_succeeds "publisher environments cannot choose release identity" \
     grep -Fq 'cannot come from a publisher GitHub Environment' "$adoption"
-  assert_succeeds "one release fixes CLI package and both manifests for every publisher and target" \
+  assert_succeeds "one release fixes CLI, package, and manifests for every publisher and target" \
     grep -Fq 'byte-identical application CLI, Fastly package' "$adoption"
   # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
-  assert_succeeds "one release fixes both recorded manifest bytes" \
-    grep -Fq '`edgezero.toml`, and `fastly.toml` to every publisher' "$adoption"
+  assert_succeeds "one release fixes the complete referenced adapter-manifest set" \
+    grep -Fq '`edgezero.toml`, and complete referenced adapter-manifest set' "$adoption"
 
   assert_succeeds "application example is extracted as a workflow" \
     grep -Fxq 'name: Deploy Application' "$example_workflow"
@@ -3264,21 +3278,99 @@ test_mutation_attempted_signal() {
     grep -qx 'rolled-back-to=8' "$rout"
 }
 
+test_build_app_cli_archive() {
+  section "build-app-cli archive contract"
+  local dir="$WORK_DIR/build-app-cli-archive"
+  local app_dir="$dir/workspace/app"
+  local action_ws="$dir/runner/invocation"
+  mkdir -p "$app_dir" "$dir/bin" "$action_ws"
+  printf '[package]\nname = "fixture-cli"\nversion = "1.2.3"\nedition = "2021"\n' \
+    >"$app_dir/Cargo.toml"
+  printf 'version = 3\n' >"$app_dir/Cargo.lock"
+
+  cat >"$dir/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) printf 'Linux\n' ;;
+  -m) printf 'x86_64\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+  cat >"$dir/bin/rustup" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  cat >"$dir/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *" metadata "*)
+    jq -n --arg root "$FAKE_APP_DIR" \
+      '{workspace_root:$root,packages:[{name:"fixture-cli",version:"1.2.3",manifest_path:($root + "/Cargo.toml"),targets:[{kind:["bin"],name:"fixture-cli"}]}]}'
+    ;;
+  *" build "*)
+    mkdir -p "$CARGO_TARGET_DIR/release"
+    cat >"$CARGO_TARGET_DIR/release/fixture-cli" <<'CLI'
+#!/usr/bin/env bash
+test "${1:-}" = --help
+CLI
+    chmod +x "$CARGO_TARGET_DIR/release/fixture-cli"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod +x "$dir/bin/uname" "$dir/bin/rustup" "$dir/bin/cargo"
+
+  local handoff="$dir/build-outputs" published="$dir/published-outputs"
+  assert_succeeds "build-app-cli produces its archive with a fake toolchain" \
+    env PATH="$dir/bin:$PATH" FAKE_APP_DIR="$app_dir" \
+    GITHUB_WORKSPACE="$dir/workspace" RUNNER_TEMP="$dir/runner" \
+    EDGEZERO__ACTION__ROOT="$REPO_ROOT" \
+    EDGEZERO__ACTION__WORKSPACE="$action_ws" \
+    EDGEZERO__ACTION__OUTPUT_FILE="$handoff" \
+    EDGEZERO__APP__CLI__PACKAGE=fixture-cli \
+    EDGEZERO__APP__CLI__ARTIFACT=fixture-upload-name \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    EDGEZERO__PROVIDER__ENV_CLEAR='[]' \
+    bash "$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh"
+
+  EDGEZERO__BUILD__OUTPUTS_FILE="$handoff" \
+    EDGEZERO__ACTION__WORKSPACE="$action_ws" GITHUB_OUTPUT="$published" \
+    bash "$ACTIONS_DIR/build-app-cli/scripts/publish-outputs.sh" >/dev/null
+
+  local tarball
+  tarball=$(sed -n 's/^tarball-path=//p' "$published")
+  assert_equals "published tarball-path resolves to app-cli.tar" \
+    "$(realpath "$action_ws/app-cli.tar")" "$tarball"
+  assert_succeeds "the published app-cli.tar exists" test -f "$tarball"
+  assert_equals "the uploaded archive keeps the application CLI and metadata" \
+    $'app-cli-meta.json\nfixture-cli' "$(tar -tf "$tarball" | sort)"
+  assert_succeeds "the configurable GitHub artifact name is preserved" \
+    grep -qx 'app-cli-artifact=fixture-upload-name' "$published"
+  assert_succeeds "the upload step consumes the published tarball-path" \
+    grep -Fq "path: \${{ steps.build.outputs['tarball-path'] }}" \
+    "$ACTIONS_DIR/build-app-cli/action.yml"
+}
+
 # ---------------------------------------------------------------------------
 # publish-outputs.sh — the trusted output boundary of the two-step build.
 # ---------------------------------------------------------------------------
 test_publish_outputs() {
   section "publish-outputs (trusted output boundary)"
+  assert_succeeds "build-app-cli stages the uploaded archive as app-cli.tar" \
+    grep -Fq "local tarball=\"\$stage_root/../app-cli.tar\"" \
+    "$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh"
+
   local dir="$WORK_DIR/publish"
   rm -rf "$dir"
   mkdir -p "$dir/rt/ws" "$dir/rt/sibling"
   local pub="$ACTIONS_DIR/build-app-cli/scripts/publish-outputs.sh"
   local ws="$dir/rt/ws"
-  touch "$ws/edgezero-cli.tar"
+  touch "$ws/app-cli.tar"
   touch "$dir/rt/sibling/cli.tar" # a SIBLING invocation's file: under RUNNER_TEMP, not our workspace
   # The canonical path publish-outputs must emit (computed with its own helper).
   local expected
-  expected=$(bash -c "source '$ACTIONS_DIR/build-app-cli/scripts/common.sh'; canonical_path '$ws/edgezero-cli.tar'")
+  expected=$(bash -c "source '$ACTIONS_DIR/build-app-cli/scripts/common.sh'; canonical_path '$ws/app-cli.tar'")
 
   # A valid handoff, with a TAMPERED trailing duplicate tarball-path: first wins.
   {
@@ -3286,7 +3378,7 @@ test_publish_outputs() {
     printf 'app-cli-package=my-cli\n'
     printf 'app-cli-bin=my-cli\n'
     printf 'app-cli-artifact=edgezero-cli\n'
-    printf 'tarball-path=%s\n' "$ws/edgezero-cli.tar"
+    printf 'tarball-path=%s\n' "$ws/app-cli.tar"
     printf 'tarball-path=/evil/hijack.tar\n'
   } >"$dir/outputs.env"
   local out="$dir/gh-output"
@@ -3677,6 +3769,7 @@ main() {
   test_config_push_argv
   test_healthcheck_path
   test_mutation_attempted_signal
+  test_build_app_cli_archive
   test_publish_outputs
   test_cleanup_sensitive_temps
   test_deploy_signal_timing

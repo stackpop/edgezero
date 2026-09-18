@@ -278,7 +278,7 @@ main() {
     >"$stage_root/app-cli-meta.json"
 
   # Fixed tarball name — never derive a path component from caller input.
-  local tarball="$stage_root/../edgezero-cli.tar"
+  local tarball="$stage_root/../app-cli.tar"
   tar -C "$stage_root" -cf "$tarball" "$cli_bin" app-cli-meta.json
   tarball=$(canonical_path "$tarball")
 

@@ -10,16 +10,16 @@ Each application owns a release pipeline that:
 
 1. checks out one approved source revision;
 2. builds the application CLI and Fastly package without provider credentials;
-3. bundles that CLI, package, `edgezero.toml`, its referenced `fastly.toml`, and
-   strict `release.json` metadata;
+3. bundles that CLI, package, `edgezero.toml`, every adapter manifest it
+   references, and strict `release.json` metadata;
 4. publishes the archive under an immutable reference; and
 5. publishes the archive's lowercase SHA-256 digest.
 
 The producer does not select a publisher GitHub Environment. One application
 release supplies a byte-identical application CLI, Fastly package,
-`edgezero.toml`, and `fastly.toml` to every publisher and to both production and
-staging. Different applications or later releases can have different manifests.
-A deployer or runtime environment cannot replace them.
+`edgezero.toml`, and complete referenced adapter-manifest set to every publisher
+and to both production and staging. Different applications or later releases can
+have different manifests. A deployer or runtime environment cannot replace them.
 
 Use the release packager after the application CLI and Fastly package have been
 built in the credential-free producer job:
@@ -28,7 +28,7 @@ built in the credential-free producer job:
 - id: release
   uses: stackpop/edgezero/.github/actions/package-fastly-application-release@<ref>
   with:
-    app-cli-archive: release-inputs/edgezero-cli.tar
+    app-cli-archive: release-inputs/app-cli.tar
     fastly-package: pkg/app.tar.gz
     application-manifest: edgezero.toml
     adapter-manifest: adapters/fastly/fastly.toml
@@ -40,7 +40,10 @@ The action verifies the application CLI's lifecycle command surface, writes
 strict metadata with `format: 1` and `lifecycle_protocol: 1`, verifies the
 assembled archive through the same consumer validator, uploads
 `app-release.tar.gz`, and returns its SHA-256. It accepts only prebuilt inputs
-beneath `github.workspace` and receives no provider credentials.
+beneath `github.workspace` and receives no provider credentials. The explicit
+`adapter-manifest` input identifies the Fastly manifest; the packager follows
+`edgezero.toml` and includes every other referenced adapter manifest at its
+declared relative path.
 
 ## Deployment consumer
 
@@ -367,7 +370,7 @@ failure may observe another run's version.
 ## Runner requirements
 
 The actions are tested on `ubuntu-latest`. A self-hosted runner must be Linux
-x86-64 and provide Bash, `jq`, Python 3.11 or newer, `tar`, `curl`, `git`, `base64`,
+x86-64 and provide Bash, `jq`, Mike Farah `yq` v4, `tar`, `curl`, `git`, `base64`,
 `realpath`, and either `sha256sum` or `shasum`. The application CLI archive must
 contain a Linux x86-64 executable.
 

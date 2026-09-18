@@ -19,17 +19,12 @@ api_url="${EDGEZERO__GITHUB__API_URL:-https://api.github.com}"
 [[ "$api_url" =~ ^https://[^/]+(/[^[:space:]]*)?$ ]] ||
   fail "api-url must be an https URL"
 
-for command in curl jq python3; do
+for command in curl jq; do
   command -v "$command" >/dev/null 2>&1 || fail "required command '$command' was not found"
 done
 
-encoded_name=$(python3 - "$environment_name" <<'PY'
-import sys
-import urllib.parse
-
-print(urllib.parse.quote(sys.argv[1], safe=""))
-PY
-)
+encoded_name=$(jq -rn --arg name "$environment_name" '$name | @uri') ||
+  fail "could not encode environment-name"
 
 response_file=$(mktemp "${RUNNER_TEMP:-/tmp}/edgezero-github-environment.XXXXXX")
 trap 'rm -f -- "$response_file"' EXIT

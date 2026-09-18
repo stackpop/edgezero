@@ -24,64 +24,68 @@ assert_exact_keys() {
 }
 
 validate_release_json_syntax() {
-  local file="$1" status=0
-  python3 - "$file" 2>/dev/null <<'PY' || status=$?
-import json
-import sys
+  local file="$1" format_tag format_value protocol_tag protocol_value
+  jq -e '.' "$file" >/dev/null 2>&1 || fail "release.json is not valid JSON"
+  yq -p json -o json -I=0 '.' "$file" >/dev/null 2>&1 ||
+    fail "release.json is not valid JSON"
+  # shellcheck disable=SC2016 # $keys is a yq variable, not a shell variable
+  yq -p yaml -o json -I=0 '
+    [.. | select(tag == "!!map")
+      | (keys as $keys | ($keys | length) == ($keys | unique | length))]
+    | all
+  ' "$file" 2>/dev/null | grep -qx true ||
+    fail "release.json contains a duplicate field"
 
+  format_tag=$(yq -p yaml -o yaml -r '.format | tag' "$file" 2>/dev/null) ||
+    fail "release.json has an unsupported format"
+  format_value=$(yq -p yaml -o yaml -r '.format | to_string' "$file" 2>/dev/null) ||
+    fail "release.json has an unsupported format"
+  [[ "$format_tag" == '!!int' && "$format_value" == 1 ]] ||
+    fail "release.json has an unsupported format"
 
-class DuplicateField(ValueError):
-    pass
+  protocol_tag=$(yq -p yaml -o yaml -r '.lifecycle_protocol | tag' "$file" 2>/dev/null) ||
+    fail "release.json has an invalid lifecycle_protocol"
+  protocol_value=$(yq -p yaml -o yaml -r '.lifecycle_protocol | to_string' "$file" 2>/dev/null) ||
+    fail "release.json has an invalid lifecycle_protocol"
+  [[ "$protocol_tag" == '!!int' ]] ||
+    fail "release.json has an invalid lifecycle_protocol"
+  [[ "$protocol_value" == 1 ]] ||
+    fail "release.json has an unsupported lifecycle protocol"
+}
 
-
-class InvalidConstant(ValueError):
-    pass
-
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise DuplicateField
-        result[key] = value
-    return result
-
-
-def reject_constant(_value):
-    raise InvalidConstant
-
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as source:
-        document = json.load(
-            source,
-            object_pairs_hook=unique_object,
-            parse_constant=reject_constant,
-        )
-except DuplicateField:
-    sys.exit(20)
-except (InvalidConstant, json.JSONDecodeError, OSError, UnicodeError):
-    sys.exit(21)
-
-if isinstance(document, dict) and "format" in document:
-    if type(document["format"]) is not int or document["format"] != 1:
-        sys.exit(22)
-if isinstance(document, dict):
-    if "lifecycle_protocol" not in document or type(document["lifecycle_protocol"]) is not int:
-        sys.exit(23)
-    if document["lifecycle_protocol"] != 1:
-        sys.exit(24)
-PY
-
-  case "$status" in
-    0) ;;
-    20) fail "release.json contains a duplicate field" ;;
-    21) fail "release.json is not valid JSON" ;;
-    22) fail "release.json has an unsupported format" ;;
-    23) fail "release.json has an invalid lifecycle_protocol" ;;
-    24) fail "release.json has an unsupported lifecycle protocol" ;;
-    *) fail "release.json validation failed" ;;
-  esac
+validate_manifest_references() {
+  local release_json="$1" application_manifest="$2" parsed status=0
+  parsed="$release_json.application.json"
+  if ! yq -p toml -o json -I=0 '.' "$application_manifest" >"$parsed" 2>/dev/null; then
+    rm -f "$parsed"
+    return 1
+  fi
+  jq -e --slurpfile application "$parsed" '
+    $application[0] as $app
+    | ($app.adapters | type == "object")
+      and ($app.adapters | to_entries | all(.[].key;
+        length > 0 and (explode | all(.[]; . >= 32 and . != 127))))
+      and ([$app.adapters | keys[] | ascii_downcase] as $names
+        | ($names | length) == ($names | unique | length))
+      and ($app.adapters | to_entries | all(.[].value;
+        type == "object"
+        and ((has("adapter") | not) or (.adapter | type == "object"))
+        and ((has("adapter") | not) or (.adapter | has("manifest") | not)
+          or (.adapter.manifest | type == "string" and length > 0))))
+      and (
+        [$app.adapters | to_entries[]
+          | select(.value.adapter.manifest? != null)
+          | {name: .key, path: .value.adapter.manifest}]
+        | sort_by([(.name | ascii_downcase), .name])
+      ) == (
+        [.manifests.adapters[] | {name, path}]
+        | sort_by([(.name | ascii_downcase), .name])
+      )
+      and ([.manifests.adapters[] | select((.name | ascii_downcase) == "fastly")]
+        | length == 1)
+  ' "$release_json" >/dev/null 2>&1 || status=$?
+  rm -f "$parsed"
+  return "$status"
 }
 
 add_parent_dirs() {
@@ -111,8 +115,8 @@ main() {
   [[ "$expected_revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "expected-source-revision must be 40 or 64 lowercase hexadecimal characters"
   [[ -f "$archive" && ! -L "$archive" ]] || fail "application release archive is missing or is not a regular file"
   require_cmd jq
-  require_cmd python3
   require_cmd tar
+  require_yq_v4
 
   local actual_digest
   actual_digest=$(sha256_file "$archive")
@@ -145,9 +149,19 @@ main() {
   assert_exact_keys "$release_json" 'type == "object" and (keys == ["adapter","app_cli","format","lifecycle_protocol","manifests","package","source_revision"])' root
   assert_exact_keys "$release_json" '.app_cli | type == "object" and (keys == ["path","sha256"])' app_cli
   assert_exact_keys "$release_json" '.package | type == "object" and (keys == ["path","sha256"])' package
-  assert_exact_keys "$release_json" '.manifests | type == "object" and (keys == ["adapter","edgezero"])' manifests
+  assert_exact_keys "$release_json" '.manifests | type == "object" and (keys == ["adapters","edgezero"])' manifests
   assert_exact_keys "$release_json" '.manifests.edgezero | type == "object" and (keys == ["path","sha256"])' manifests.edgezero
-  assert_exact_keys "$release_json" '.manifests.adapter | type == "object" and (keys == ["path","sha256"])' manifests.adapter
+  assert_exact_keys "$release_json" '.manifests.adapters
+    | type == "array" and length > 0
+      and all(.[]; type == "object" and (keys == ["name","path","sha256"]))' manifests.adapters
+  jq -e '
+    (.manifests.adapters | all(.[].name;
+      type == "string" and length > 0
+        and (explode | all(.[]; . >= 32 and . != 127))))
+    and ([.manifests.adapters[].name | ascii_downcase] as $names
+      | ($names | length) == ($names | unique | length))
+    and ([.manifests.adapters[] | select((.name | ascii_downcase) == "fastly")] | length == 1)
+  ' "$release_json" >/dev/null 2>&1 || fail "release.json has invalid or duplicate adapter manifest names"
   jq -e '.format == 1 and .lifecycle_protocol == 1 and .adapter == "fastly"' "$release_json" >/dev/null 2>&1 || fail "release.json has an unsupported format, lifecycle protocol, or adapter"
 
   local revision
@@ -155,35 +169,59 @@ main() {
   [[ "$revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "release.json source_revision must be 40 or 64 lowercase hexadecimal characters"
   [[ "$revision" == "$expected_revision" ]] || fail "release.json source_revision does not match expected-source-revision"
 
-  local cli_path package_path edgezero_path adapter_path
-  local cli_digest package_digest edgezero_digest adapter_digest
+  local cli_path package_path edgezero_path adapter_name_folded adapter_path fastly_path
+  local cli_digest package_digest edgezero_digest adapter_digest fastly_digest
   cli_path=$(jq -er '.app_cli.path | select(type == "string")' "$release_json") || fail "release.json app_cli.path is invalid"
   package_path=$(jq -er '.package.path | select(type == "string")' "$release_json") || fail "release.json package.path is invalid"
   edgezero_path=$(jq -er '.manifests.edgezero.path | select(type == "string")' "$release_json") || fail "release.json manifests.edgezero.path is invalid"
-  adapter_path=$(jq -er '.manifests.adapter.path | select(type == "string")' "$release_json") || fail "release.json manifests.adapter.path is invalid"
   cli_digest=$(jq -er '.app_cli.sha256 | select(type == "string")' "$release_json") || fail "release.json app_cli.sha256 is invalid"
   package_digest=$(jq -er '.package.sha256 | select(type == "string")' "$release_json") || fail "release.json package.sha256 is invalid"
   edgezero_digest=$(jq -er '.manifests.edgezero.sha256 | select(type == "string")' "$release_json") || fail "release.json manifests.edgezero.sha256 is invalid"
-  adapter_digest=$(jq -er '.manifests.adapter.sha256 | select(type == "string")' "$release_json") || fail "release.json manifests.adapter.sha256 is invalid"
 
   validate_member_path "$cli_path" app_cli.path
   validate_member_path "$package_path" package.path
   validate_member_path "$edgezero_path" manifests.edgezero.path
-  validate_member_path "$adapter_path" manifests.adapter.path
   local digest
-  for digest in "$cli_digest" "$package_digest" "$edgezero_digest" "$adapter_digest"; do
+  for digest in "$cli_digest" "$package_digest" "$edgezero_digest"; do
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || fail "release.json contains an invalid sha256"
   done
+  local -a adapter_paths=() adapter_digests=()
+  while IFS= read -r -d '' adapter_name &&
+    IFS= read -r -d '' adapter_path &&
+    IFS= read -r -d '' adapter_digest; do
+    validate_member_path "$adapter_path" "manifests.adapters[$adapter_name].path"
+    [[ "$adapter_digest" =~ ^[0-9a-f]{64}$ ]] || fail "release.json contains an invalid adapter manifest sha256"
+    adapter_paths+=("$adapter_path")
+    adapter_digests+=("$adapter_digest")
+    adapter_name_folded=$(printf '%s' "$adapter_name" | tr '[:upper:]' '[:lower:]')
+    if [[ "$adapter_name_folded" == fastly ]]; then
+      fastly_path="$adapter_path"
+      fastly_digest="$adapter_digest"
+    fi
+  done < <(jq -j '.manifests.adapters[] | (.name, "\u0000", .path, "\u0000", .sha256, "\u0000")' "$release_json")
+  [[ -n "${fastly_path:-}" && -n "${fastly_digest:-}" ]] || fail "release.json records no Fastly manifest"
   local unique_paths
-  unique_paths=$(printf '%s\n' "$cli_path" "$package_path" "$edgezero_path" "$adapter_path" | sort -u | wc -l | tr -d ' ')
-  [[ "$unique_paths" == 4 ]] || fail "release.json records duplicate member paths"
+  unique_paths=$(printf '%s\n' "$cli_path" "$package_path" "$edgezero_path" | sort -u | wc -l | tr -d ' ')
+  [[ "$unique_paths" == 3 ]] || fail "release.json records duplicate core member paths"
+  for adapter_path in "${adapter_paths[@]}"; do
+    [[ "$adapter_path" != "$cli_path" && "$adapter_path" != "$package_path" && "$adapter_path" != "$edgezero_path" ]] ||
+      fail "release.json adapter manifest path collides with a core member path"
+  done
 
-  local -a ALLOWED_FILES=(release.json "$cli_path" "$package_path" "$edgezero_path" "$adapter_path")
+  local -a ALLOWED_FILES=(release.json "$cli_path" "$package_path" "$edgezero_path")
   local -a ALLOWED_DIRS=()
   add_parent_dirs "$cli_path"
   add_parent_dirs "$package_path"
   add_parent_dirs "$edgezero_path"
-  add_parent_dirs "$adapter_path"
+  local existing seen
+  for adapter_path in "${adapter_paths[@]}"; do
+    seen=false
+    for existing in "${ALLOWED_FILES[@]}"; do
+      [[ "$existing" == "$adapter_path" ]] && seen=true
+    done
+    [[ "$seen" == true ]] || ALLOWED_FILES+=("$adapter_path")
+    add_parent_dirs "$adapter_path"
+  done
   local member verbose kind allowed
   while IFS= read -r member; do
     allowed="file"
@@ -211,7 +249,7 @@ main() {
     fi
   done <<<"$listing"
   local expected_file
-  for expected_file in release.json "$cli_path" "$package_path" "$edgezero_path" "$adapter_path"; do
+  for expected_file in "${ALLOWED_FILES[@]}"; do
     [[ $(printf '%s\n' "$listing" | grep -Fxc "$expected_file") == 1 ]] || fail "application release archive is missing '$expected_file'"
   done
 
@@ -219,7 +257,7 @@ main() {
   tar -xzf "$archive" -C "$scratch" || fail "could not extract application release archive"
   local scratch_real target_real
   scratch_real=$(canonical_path "$scratch")
-  for expected_file in release.json "$cli_path" "$package_path" "$edgezero_path" "$adapter_path"; do
+  for expected_file in "${ALLOWED_FILES[@]}"; do
     [[ -f "$scratch/$expected_file" && ! -L "$scratch/$expected_file" ]] || fail "release member '$expected_file' is not a regular file"
     target_real=$(canonical_path "$scratch/$expected_file")
     is_under "$scratch_real" "$target_real" || fail "release member '$expected_file' escapes its root"
@@ -227,7 +265,13 @@ main() {
   [[ "$(sha256_file "$scratch/$cli_path")" == "$cli_digest" ]] || fail "application CLI digest mismatch"
   [[ "$(sha256_file "$scratch/$package_path")" == "$package_digest" ]] || fail "Fastly package digest mismatch"
   [[ "$(sha256_file "$scratch/$edgezero_path")" == "$edgezero_digest" ]] || fail "edgezero manifest digest mismatch"
-  [[ "$(sha256_file "$scratch/$adapter_path")" == "$adapter_digest" ]] || fail "Fastly manifest digest mismatch"
+  local index
+  for ((index = 0; index < ${#adapter_paths[@]}; index++)); do
+    [[ "$(sha256_file "$scratch/${adapter_paths[$index]}")" == "${adapter_digests[$index]}" ]] ||
+      fail "adapter manifest digest mismatch"
+  done
+  validate_manifest_references "$scratch/release.json" "$scratch/$edgezero_path" ||
+    fail "release.json adapter manifests do not match edgezero.toml"
 
   mv "$scratch" "$release_root"
   trap - EXIT
@@ -237,7 +281,7 @@ main() {
   append_output release-root "$root_real"
   append_output app-cli-archive "$root_real/$cli_path"
   append_output application-manifest "$root_real/$edgezero_path"
-  append_output adapter-manifest "$root_real/$adapter_path"
+  append_output adapter-manifest "$root_real/$fastly_path"
   append_output package-digest "$package_digest"
   append_output source-revision "$revision"
 }

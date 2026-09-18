@@ -46,6 +46,7 @@ path = "src/main.rs"
 edgezero-cli = { path = "../../../crates/edgezero-cli", default-features = false, features = [
   "cli",
   "edgezero-adapter-fastly",
+  "edgezero-adapter-spin",
 ] }
 clap = { version = "4", features = ["derive"] }
 edgezero-core = { path = "../../../crates/edgezero-core" }
@@ -115,6 +116,9 @@ name = "fixture-app"
 
 [adapters.fastly.adapter]
 manifest = "adapter/fastly.toml"
+
+[adapters.spin.adapter]
+manifest = "adapter/spin.toml"
 TOML
   if [[ "$mode" == store-aware ]]; then
     cat >>edgezero.toml <<'TOML'
@@ -139,6 +143,16 @@ manifest_version = 3
 name = "fixture-app"
 language = "rust"
 TOML
+  cat >adapter/spin.toml <<'TOML'
+spin_manifest_version = 2
+
+[application]
+name = "fixture-app"
+version = "0.1.0"
+
+[component.fixture]
+source = "fixture.wasm"
+TOML
 
   cargo generate-lockfile
   git add -A
@@ -154,20 +168,22 @@ package_release() {
 
   [[ -f "$cli_archive" && ! -L "$cli_archive" ]] ||
     fail "application CLI archive is missing or is not a regular file"
-  [[ -f "$app_dir/edgezero.toml" && -f "$app_dir/adapter/fastly.toml" ]] ||
+  [[ -f "$app_dir/edgezero.toml" && -f "$app_dir/adapter/fastly.toml" && -f "$app_dir/adapter/spin.toml" ]] ||
     fail "run the source fixture mode before packaging its release"
 
   mkdir -p "$stage/cli" "$stage/package" "$stage/adapter"
   cp "$cli_archive" "$stage/cli/app-cli.tar"
   cp "$app_dir/edgezero.toml" "$stage/edgezero.toml"
   cp "$app_dir/adapter/fastly.toml" "$stage/adapter/fastly.toml"
+  cp "$app_dir/adapter/spin.toml" "$stage/adapter/spin.toml"
   printf 'immutable fixture Fastly package\n' >"$stage/package/app.tar.gz"
 
-  local cli_digest package_digest edgezero_digest adapter_digest revision
+  local cli_digest package_digest edgezero_digest fastly_digest spin_digest revision
   cli_digest=$(sha256_file "$stage/cli/app-cli.tar")
   package_digest=$(sha256_file "$stage/package/app.tar.gz")
   edgezero_digest=$(sha256_file "$stage/edgezero.toml")
-  adapter_digest=$(sha256_file "$stage/adapter/fastly.toml")
+  fastly_digest=$(sha256_file "$stage/adapter/fastly.toml")
+  spin_digest=$(sha256_file "$stage/adapter/spin.toml")
   revision=$(git -C "$app_dir" rev-parse HEAD)
 
   jq -n \
@@ -175,7 +191,8 @@ package_release() {
     --arg cli "$cli_digest" \
     --arg package "$package_digest" \
     --arg edgezero "$edgezero_digest" \
-    --arg adapter "$adapter_digest" \
+    --arg fastly "$fastly_digest" \
+    --arg spin "$spin_digest" \
     '{
       format: 1,
       lifecycle_protocol: 1,
@@ -185,12 +202,16 @@ package_release() {
       package: {path: "package/app.tar.gz", sha256: $package},
       manifests: {
         edgezero: {path: "edgezero.toml", sha256: $edgezero},
-        adapter: {path: "adapter/fastly.toml", sha256: $adapter}
+        adapters: [
+          {name: "fastly", path: "adapter/fastly.toml", sha256: $fastly},
+          {name: "spin", path: "adapter/spin.toml", sha256: $spin}
+        ]
       }
     }' >"$stage/release.json"
 
   tar -C "$stage" -czf "$output_dir/app-release.tar.gz" \
-    release.json cli/app-cli.tar package/app.tar.gz edgezero.toml adapter/fastly.toml
+    release.json cli/app-cli.tar package/app.tar.gz edgezero.toml \
+    adapter/fastly.toml adapter/spin.toml
   local release_digest
   release_digest=$(sha256_file "$output_dir/app-release.tar.gz")
   printf '%s\n' "$release_digest" >"$output_dir/app-release.sha256"

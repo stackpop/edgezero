@@ -143,11 +143,12 @@ edgezero deploy --adapter fastly \
   --application-release "$RELEASE_ROOT"
 ```
 
-The release fixes the package and both manifests before runtime configuration is
-selected. A bare `edgezero deploy --adapter fastly` remains only as store-free
-production compatibility for an existing manifest command. Staging and any
-deployment that declares a Config, KV, or Secret Store require the verified
-release-backed managed command above.
+The release fixes the package, `edgezero.toml`, and every adapter manifest it
+references before runtime configuration is selected. A bare
+`edgezero deploy --adapter fastly` remains only as store-free production
+compatibility for an existing manifest command. Staging and any deployment that
+declares a Config, KV, or Secret Store require the verified release-backed
+managed command above.
 
 ## Backends
 

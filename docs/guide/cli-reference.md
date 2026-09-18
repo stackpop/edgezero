@@ -223,8 +223,8 @@ positional arguments fail before provider mutation.
 Fastly service IDs follow the same validation in deploy, healthcheck, and
 rollback: ASCII letters and digits only. The release verifier checks strict
 `release.json` metadata, confined normalized member paths, regular non-symlink
-files, exact membership, file digests, and the `edgezero.toml` to `fastly.toml`
-relationship before Fastly receives a mutation.
+files, exact membership, file digests, and the complete set of adapter-manifest
+references in `edgezero.toml` before Fastly receives a mutation.
 
 Managed deployment uploads only the recorded package, prepares exact logical
 resource links, verifies the links and package, and then stages or activates.
