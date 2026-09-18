@@ -67,8 +67,8 @@ For every declared store, EdgeZero resolves the selected physical name against
 the complete Fastly inventory. It creates a resource link on the unpublished
 target draft whose alias is the stable logical ID and whose resource ID is the
 selected physical store. Resource-link identity is `(resource kind, logical
-alias)`, not alias alone. EdgeZero parses and validates Fastly's hyphenated
-provider `resource_type` values (`config-store`, `object-store`, and
+alias)`, not alias alone. EdgeZero parses and validates Fastly's provider
+`resource_type` values (`config`, `kv-store`, and
 `secret-store`); duplicate links for the same identity, an unknown resource
 type, or a resource ID that conflicts with its reported type fails preflight.
 The same logical ID may be used independently by Config, KV, and Secret Store
@@ -84,21 +84,23 @@ Links whose identities are not declared by the current manifest are preserved.
 EdgeZero does not infer ownership from account inventories and does not delete
 undeclared Config, KV, or Secret Store links.
 
-During preflight, EdgeZero records the source version's complete Fastly
-self-diff snapshot. Immediately before the first mutation it revalidates that
+During preflight, EdgeZero records the source version's Compute configuration
+from the versioned domain, backend, health-check, logging, and settings
+collections. Immediately before the first mutation it revalidates that
 snapshot. A locked source is cloned explicitly; before package upload, the
-fresh clone's complete configuration and resource links must exactly match the
-preflight source. An initial editable draft must still match its preflight
+fresh clone's protected configuration and resource links must exactly match
+the preflight source. An initial editable draft must still match its preflight
 snapshot immediately before package upload.
 
 After every EdgeZero draft mutation is complete, EdgeZero performs one final
 publication barrier immediately before staging or activation. The barrier
 reads the exact draft links, provider-visible package identity, source version
-state, draft version state, and complete self-diff snapshot. EdgeZero captures
-the post-mutation self-diff and requires the immediate final read to match byte
-for byte, covering domains, backends, logging, headers, VCL and snippets,
-conditions, health checks, and other version-scoped configuration. EdgeZero
-performs no mutation between this barrier and the publication call.
+state, draft version state, and the same protected Compute configuration.
+EdgeZero captures the post-mutation collection snapshot and requires the
+immediate final read to match after normalizing provider-owned version and
+timestamp metadata. EdgeZero performs no mutation between this barrier and the
+publication call. It does not use Fastly's version-diff endpoint because that
+endpoint fails for Compute services.
 
 The caller must serialize every deployment and other version mutator for one
 service, including changes outside EdgeZero. Fastly exposes no compare-and-swap
@@ -238,5 +240,5 @@ Tests must prove:
 - every consumer binds the release to the selected source revision;
 - preflight source snapshots and fresh-clone verification precede draft
   mutation, and the immediate final barrier re-reads exact links,
-  provider-visible package identity, source state, draft state, and a complete
-  self-diff snapshot before stage or activation.
+  provider-visible package identity, source state, draft state, and the
+  protected Compute configuration before stage or activation.

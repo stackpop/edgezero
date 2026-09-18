@@ -55,11 +55,16 @@ main() {
   local final_links_line package_line configuration_line publish_line
   final_links_line=$(grep -n '^fastly resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n1 | cut -d: -f1)
   package_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n1 | cut -d: -f1)
-  configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log" | tail -n1 | cut -d: -f1)
+  configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/settings$' "$log" | tail -n1 | cut -d: -f1)
   publish_line=$(grep -n '^PUT https://api.fastly.com/service/dummyservice/version/42/activate$' "$log" | tail -n1 | cut -d: -f1)
-  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/40/to/40$' "$log")" -eq 3 ]] || fail "production did not preserve and revalidate the complete source configuration"
-  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log")" -eq 3 ]] || fail "production did not verify the fresh clone and final draft configuration"
-  [[ "$final_links_line" -lt "$publish_line" && "$package_line" -lt "$publish_line" && "$configuration_line" -lt "$publish_line" ]] || fail "final link, package, and complete-configuration verification did not precede activation"
+  for version in 40 42; do
+    for collection in domain backend healthcheck settings; do
+      [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/$collection$" "$log")" -eq 3 ]] || fail "production did not preserve and revalidate version $version $collection configuration"
+    done
+    [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/logging/" "$log")" -eq 81 ]] || fail "production did not preserve and revalidate version $version logging configuration"
+  done
+  ! grep -q '/diff/from/' "$log" || fail "production used the unsupported Fastly Compute diff endpoint"
+  [[ "$final_links_line" -lt "$publish_line" && "$package_line" -lt "$publish_line" && "$configuration_line" -lt "$publish_line" ]] || fail "final link, package, and protected-configuration verification did not precede activation"
   ! grep -qE 'config-store-entry (create|describe)|/resources/stores/config/.*/item/' "$log" || fail "production used the removed runtime descriptor path"
   notice "production activated version 42 with logical resource links and pinned package bytes"
 }

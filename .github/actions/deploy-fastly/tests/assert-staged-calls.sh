@@ -51,11 +51,16 @@ MUTATIONS
   last_create=$(grep -n '^fastly resource-link create ' "$log" | tail -n1 | cut -d: -f1)
   final_links=$(grep -n '^fastly resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n1 | cut -d: -f1)
   package_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n1 | cut -d: -f1)
-  configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log" | tail -n1 | cut -d: -f1)
+  configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/settings$' "$log" | tail -n1 | cut -d: -f1)
   stage_line=$(grep -n '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" | tail -n1 | cut -d: -f1)
-  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/40/to/40$' "$log")" -eq 3 ]] || fail "staging did not preserve and revalidate the complete source configuration"
-  [[ "$(grep -c '^GET https://api.fastly.com/service/dummyservice/diff/from/42/to/42$' "$log")" -eq 3 ]] || fail "staging did not verify the fresh clone and final draft configuration"
-  [[ "$last_create" -lt "$final_links" && "$final_links" -lt "$stage_line" && "$package_line" -lt "$stage_line" && "$configuration_line" -lt "$stage_line" ]] || fail "final link, package, and complete-configuration verification did not follow reconciliation and precede staging"
+  for version in 40 42; do
+    for collection in domain backend healthcheck settings; do
+      [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/$collection$" "$log")" -eq 3 ]] || fail "staging did not preserve and revalidate version $version $collection configuration"
+    done
+    [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/logging/" "$log")" -eq 81 ]] || fail "staging did not preserve and revalidate version $version logging configuration"
+  done
+  ! grep -q '/diff/from/' "$log" || fail "staging used the unsupported Fastly Compute diff endpoint"
+  [[ "$last_create" -lt "$final_links" && "$final_links" -lt "$stage_line" && "$package_line" -lt "$stage_line" && "$configuration_line" -lt "$stage_line" ]] || fail "final link, package, and protected-configuration verification did not follow reconciliation and precede staging"
   ! grep -qE 'config-store-entry (create|describe)|/resources/stores/config/.*/item/' "$log" || fail "staging used the removed runtime descriptor path"
   notice "staged version 42 uses logical resource links and pinned package bytes"
 }

@@ -158,7 +158,7 @@ version_list() {
     if [[ "$active" == 42 ]]; then
       printf ',{"number":42,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]}'
     elif [[ "$staged" == 42 ]]; then
-      printf ',{"number":42,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":42,"name":"staging","service_id":"dummyservice"}]}'
+      printf ',{"number":42,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":42,"name":"staging","service_id":"dummy-staging-service"}]}'
     else
       printf ',{"number":42,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[]}'
     fi
@@ -209,10 +209,18 @@ if [[ "$*" == *--config* ]]; then
     */service/dummyservice/version) printf '%s\n200' "$(version_list)" ;;
     */service/dummyservice/version/42/package)
       printf '{"service_id":"dummyservice","version":42,"metadata":{"files_hash":"%0128d"}}\n200' 0 ;;
-    */service/dummyservice/diff/from/42/to/42)
-      printf '{"from":42,"to":42,"format":"text","diff":"complete fixture configuration"}\n200' ;;
-    */service/dummyservice/diff/from/40/to/40)
-      printf '{"from":40,"to":40,"format":"text","diff":"complete fixture configuration"}\n200' ;;
+    */service/dummyservice/version/*/domain)
+      printf '[{"name":"app.example.com","service_id":"dummyservice","version":40}]\n200' ;;
+    */service/dummyservice/version/*/backend)
+      printf '[{"name":"origin","hostname":"origin.example.com","service_id":"dummyservice","version":40}]\n200' ;;
+    */service/dummyservice/version/*/healthcheck)
+      printf '[]\n200' ;;
+    */service/dummyservice/version/*/logging/*)
+      printf '[]\n200' ;;
+    */service/dummyservice/version/*/settings)
+      printf '{"general.default_ttl":3600,"service_id":"dummyservice","version":40}\n200' ;;
+    */service/dummyservice/diff/from/*/to/*)
+      printf 'diff unavailable for Compute services\n500' ;;
     */service/dummyservice/version/*/domain\?include=staging_ips)
       printf '[{"name":"other.example.com","staging_ip":"151.101.1.10"},{"name":"app.example.com","staging_ip":"151.101.2.10"}]\n200' ;;
     */resources/stores/config/*/item/*) printf 'unexpected Config Store item read\n400' ;;

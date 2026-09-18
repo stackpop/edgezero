@@ -155,10 +155,11 @@ revision, resolves complete Config, KV, and Secret inventories, prepares an
 unreachable draft, and reconciles declared
 `(resource kind, logical ID)` links. A declared link pointing at a different
 physical resource is replaced. Undeclared inherited links are preserved.
-Before mutation, EdgeZero records the source version's complete configuration.
-For a locked source, it explicitly clones and verifies that the fresh draft has
-the same complete configuration before uploading the package. After all
-mutations, EdgeZero re-reads the exact links, source and draft state, complete
+Before mutation, EdgeZero records the source version's protected Compute
+configuration: domains, backends, health checks, logging endpoints, and
+settings. For a locked source, it explicitly clones and verifies that the fresh
+draft has the same configuration before uploading the package. After all
+mutations, EdgeZero re-reads the exact links, source and draft state, protected
 configuration, and provider-visible package identity immediately before staging or activation.
 Any lookup, malformed inventory, changed source, package mismatch, or readback
 failure stops publication.

@@ -286,12 +286,9 @@ enum StagingRollbackDecision {
 
 #[derive(Debug)]
 struct InitialDraftSnapshot {
-    backends: serde_json::Value,
-    domains: serde_json::Value,
+    configuration: VersionConfigurationSnapshot,
     links: serde_json::Value,
-    logging: Vec<LoggingProviderSnapshot>,
     metadata: serde_json::Value,
-    settings: serde_json::Value,
     version: ServiceVersionRecord,
 }
 
@@ -302,10 +299,19 @@ struct InactiveSourceSnapshot {
     version: ServiceVersionRecord,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct LoggingProviderSnapshot {
     endpoints: serde_json::Value,
     kind: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct VersionConfigurationSnapshot {
+    backends: serde_json::Value,
+    domains: serde_json::Value,
+    healthchecks: serde_json::Value,
+    logging: Vec<LoggingProviderSnapshot>,
+    settings: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -324,7 +330,7 @@ struct ManagedDeployPlan {
     package_sha256: String,
     release: VerifiedApplicationRelease,
     service_id: String,
-    source_configuration: String,
+    source_configuration: VersionConfigurationSnapshot,
     source_links: Vec<ExistingResourceLink>,
     target: PublishTarget,
     token: FastlyApiToken,
@@ -837,12 +843,11 @@ fn build_managed_deploy_plan(
                 })?;
             let metadata = exact_version_metadata(&versions_raw, draft_version)?;
             EditableVersionSource::InitialDraft(Box::new(snapshot_initial_draft(
-                &service_id,
                 version,
                 metadata,
                 links_snapshot,
-                token.as_str(),
-            )?))
+                source_configuration.clone(),
+            )))
         }
         VersionSource::Retired(inactive_version) | VersionSource::Staged(inactive_version) => {
             let version = versions
@@ -852,15 +857,6 @@ fn build_managed_deploy_plan(
                 .ok_or_else(|| {
                     format!("selected inactive version {inactive_version} disappeared")
                 })?;
-            if version
-                .environments
-                .iter()
-                .any(|record| record.service_id != service_id)
-            {
-                return Err(format!(
-                    "inactive Fastly version {inactive_version} belongs to a different service environment"
-                ));
-            }
             let metadata = exact_version_metadata(&versions_raw, inactive_version)?;
             let snapshot = Box::new(InactiveSourceSnapshot {
                 links: links_snapshot,
@@ -969,12 +965,16 @@ fn execute_managed_deploy_plan_with_emit(
     let reconciled = read_version_links(&plan.service_id, version, cwd)?;
     require_exact_link_resources(&expected_links, &reconciled, "reconciled draft")?;
 
-    // Fastly's self-diff returns the complete version configuration. Capture it
-    // only after EdgeZero has finished every intended mutation, then compare it
-    // again in the immediate publication barrier below. This covers versioned
-    // configuration outside the package and resource-link APIs (domains,
-    // backends, logging endpoints, headers, snippets, conditions, and so on).
+    // Capture the versioned Compute configuration only after EdgeZero has
+    // finished every intended mutation, then compare it again in the immediate
+    // publication barrier below. Package identity and resource links have
+    // dedicated checks alongside this snapshot.
     let expected_configuration = read_version_configuration_snapshot(plan, version)?;
+    if expected_configuration != plan.source_configuration {
+        return Err(format!(
+            "Fastly version {version} protected Compute configuration no longer matches its source"
+        ));
+    }
 
     revalidate_managed_draft(plan, version, &expected_links, &expected_configuration, cwd)?;
 
@@ -1402,7 +1402,6 @@ fn revalidate_initial_draft_before_update(
         return Err("Fastly initial draft links changed after preflight".to_owned());
     }
     require_protected_initial_snapshot(plan, snapshot)?;
-    require_source_configuration(plan, version)?;
     Ok(())
 }
 
@@ -1446,7 +1445,7 @@ fn require_source_configuration(
         Ok(())
     } else {
         Err(format!(
-            "Fastly source version {source_version} complete configuration changed after preflight"
+            "Fastly source version {source_version} protected Compute configuration changed after preflight"
         ))
     }
 }
@@ -1498,28 +1497,8 @@ fn require_protected_initial_snapshot(
     plan: &ManagedDeployPlan,
     snapshot: &InitialDraftSnapshot,
 ) -> Result<(), String> {
-    let base = format!(
-        "/service/{}/version/{}",
-        plan.service_id, snapshot.version.number
-    );
-    let domains = parse_snapshot_array(
-        "domains",
-        &fastly_api_get(&format!("{base}/domain"), plan.token.as_str())?,
-    )?;
-    let backends = parse_snapshot_array(
-        "backends",
-        &fastly_api_get(&format!("{base}/backend"), plan.token.as_str())?,
-    )?;
-    let logging = snapshot_logging_providers(&base, plan.token.as_str())?;
-    let settings = parse_snapshot_object(
-        "settings",
-        &fastly_api_get(&format!("{base}/settings"), plan.token.as_str())?,
-    )?;
-    if domains == snapshot.domains
-        && backends == snapshot.backends
-        && logging == snapshot.logging
-        && settings == snapshot.settings
-    {
+    let current = read_version_configuration_snapshot(plan, snapshot.version.number)?;
+    if current == snapshot.configuration {
         Ok(())
     } else {
         Err("Fastly initial draft protected configuration changed after preflight".to_owned())
@@ -1530,7 +1509,7 @@ fn revalidate_managed_draft(
     plan: &ManagedDeployPlan,
     version: u64,
     expected_links: &BTreeMap<ResourceLinkIdentity, String>,
-    expected_configuration: &str,
+    expected_configuration: &VersionConfigurationSnapshot,
     cwd: &Path,
 ) -> Result<(), String> {
     let versions_raw = fastly_api_get(
@@ -1581,7 +1560,6 @@ fn revalidate_managed_draft(
             if version != snapshot.version.number {
                 return Err("managed Fastly initial draft version changed".to_owned());
             }
-            require_protected_initial_snapshot(plan, snapshot)?;
         }
     }
     let links = read_version_links(&plan.service_id, version, cwd)?;
@@ -1598,9 +1576,9 @@ fn revalidate_managed_draft(
         ));
     }
     let current_configuration = read_version_configuration_snapshot(plan, version)?;
-    if current_configuration != expected_configuration {
+    if &current_configuration != expected_configuration {
         return Err(format!(
-            "Fastly version {version} complete configuration changed before publication"
+            "Fastly version {version} protected Compute configuration changed before publication"
         ));
     }
     Ok(())
@@ -1609,7 +1587,7 @@ fn revalidate_managed_draft(
 fn read_version_configuration_snapshot(
     plan: &ManagedDeployPlan,
     version: u64,
-) -> Result<String, String> {
+) -> Result<VersionConfigurationSnapshot, String> {
     read_version_configuration_snapshot_for(&plan.service_id, plan.token.as_str(), version)
 }
 
@@ -1617,34 +1595,32 @@ fn read_version_configuration_snapshot_for(
     service_id: &str,
     token: &str,
     version: u64,
-) -> Result<String, String> {
-    let raw = fastly_api_get(
-        &format!("/service/{service_id}/diff/from/{version}/to/{version}"),
-        token,
+) -> Result<VersionConfigurationSnapshot, String> {
+    let base = format!("/service/{service_id}/version/{version}");
+    let domains = parse_snapshot_array(
+        "domains",
+        &fastly_api_get(&format!("{base}/domain"), token)?,
     )?;
-    parse_version_configuration_snapshot(&raw, version)
-}
-
-fn parse_version_configuration_snapshot(raw: &str, version: u64) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_error| {
-        "Fastly complete version configuration response is malformed".to_owned()
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        "Fastly complete version configuration response must be an object".to_owned()
-    })?;
-    let from = object.get("from").and_then(serde_json::Value::as_u64);
-    let to = object.get("to").and_then(serde_json::Value::as_u64);
-    let format = object.get("format").and_then(serde_json::Value::as_str);
-    let diff = object.get("diff").and_then(serde_json::Value::as_str);
-    if from != Some(version) || to != Some(version) || format != Some("text") {
-        return Err(
-            "Fastly complete version configuration response does not identify the requested self-diff"
-                .to_owned(),
-        );
-    }
-    diff.filter(|snapshot| !snapshot.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| "Fastly complete version configuration snapshot is empty".to_owned())
+    let backends = parse_snapshot_array(
+        "backends",
+        &fastly_api_get(&format!("{base}/backend"), token)?,
+    )?;
+    let healthchecks = parse_snapshot_array(
+        "health checks",
+        &fastly_api_get(&format!("{base}/healthcheck"), token)?,
+    )?;
+    let logging = snapshot_logging_providers(&base, token)?;
+    let settings = parse_snapshot_object(
+        "settings",
+        &fastly_api_get(&format!("{base}/settings"), token)?,
+    )?;
+    Ok(VersionConfigurationSnapshot {
+        backends,
+        domains,
+        healthchecks,
+        logging,
+        settings,
+    })
 }
 
 fn resolve_managed_plan_service_id(
@@ -1734,35 +1710,17 @@ fn parse_resource_links(
 }
 
 fn snapshot_initial_draft(
-    service_id: &str,
     version: ServiceVersionRecord,
     metadata: serde_json::Value,
     links: serde_json::Value,
-    token: &str,
-) -> Result<InitialDraftSnapshot, String> {
-    let base = format!("/service/{service_id}/version/{}", version.number);
-    let domains = parse_snapshot_array(
-        "domains",
-        &fastly_api_get(&format!("{base}/domain"), token)?,
-    )?;
-    let backends = parse_snapshot_array(
-        "backends",
-        &fastly_api_get(&format!("{base}/backend"), token)?,
-    )?;
-    let logging = snapshot_logging_providers(&base, token)?;
-    let settings = parse_snapshot_object(
-        "settings",
-        &fastly_api_get(&format!("{base}/settings"), token)?,
-    )?;
-    Ok(InitialDraftSnapshot {
-        backends,
-        domains,
+    configuration: VersionConfigurationSnapshot,
+) -> InitialDraftSnapshot {
+    InitialDraftSnapshot {
+        configuration,
         links,
-        logging,
         metadata,
-        settings,
         version,
-    })
+    }
 }
 
 fn snapshot_logging_providers(
@@ -1796,24 +1754,40 @@ fn exact_version_metadata(raw: &str, number: u64) -> Result<serde_json::Value, S
 }
 
 fn parse_snapshot_array(label: &str, raw: &str) -> Result<serde_json::Value, String> {
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|error| format!("failed to parse initial draft {label} snapshot: {error}"))?;
-    if !value.is_array() {
-        return Err(format!(
-            "initial draft {label} snapshot must be a complete JSON array"
-        ));
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to parse Fastly {label} snapshot: {error}"))?;
+    let rows = value
+        .as_array_mut()
+        .ok_or_else(|| format!("Fastly {label} snapshot must be a complete JSON array"))?;
+    for (index, row) in rows.iter_mut().enumerate() {
+        let object = row
+            .as_object_mut()
+            .ok_or_else(|| format!("Fastly {label} snapshot record #{index} must be an object"))?;
+        remove_snapshot_metadata(object);
     }
+    rows.sort_by_cached_key(ToString::to_string);
     Ok(value)
 }
 
-fn parse_snapshot_object(label: &str, raw: &str) -> Result<serde_json::Value, String> {
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|error| format!("failed to parse initial draft {label} snapshot: {error}"))?;
-    if !value.is_object() {
-        return Err(format!(
-            "initial draft {label} snapshot must be a complete JSON object"
-        ));
+fn remove_snapshot_metadata(object: &mut serde_json::Map<String, serde_json::Value>) {
+    for field in [
+        "created_at",
+        "locked",
+        "service_id",
+        "updated_at",
+        "version",
+    ] {
+        object.remove(field);
     }
+}
+
+fn parse_snapshot_object(label: &str, raw: &str) -> Result<serde_json::Value, String> {
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to parse Fastly {label} snapshot: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("Fastly {label} snapshot must be a complete JSON object"))?;
+    remove_snapshot_metadata(object);
     Ok(value)
 }
 
@@ -5878,7 +5852,7 @@ fn select_version_source(versions: &[ServiceVersionRecord]) -> Result<VersionSou
         .filter(|version| !version.active && version.locked && version.environments.is_empty())
         .collect::<Vec<_>>();
     match (drafts.as_slice(), staged.as_slice()) {
-        ([draft], [] | [_]) if draft.number == highest => {
+        ([draft], []) if draft.number == highest => {
             return Ok(VersionSource::InitialDraft(draft.number));
         }
         ([], [staged_version]) => return Ok(VersionSource::Staged(staged_version.number)),
@@ -5968,7 +5942,6 @@ fn staging_rollback_decision(
         staging_records.as_slice(),
         [(record_version, environment)]
             if *record_version == requested_version
-                && environment.service_id == service_id
                 && environment.active_version == requested_version
     );
     if staged {
@@ -7849,9 +7822,9 @@ mod tests {
     }
 
     #[test]
-    fn deploy_plan_version_source_selects_unique_staged_source_without_active() {
+    fn deploy_plan_version_source_selects_unique_shadow_staged_source_without_active() {
         let versions = parse_service_versions(
-            r#"[{"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":3,"name":"staging","service_id":"SVC1"}]}]"#,
+            r#"[{"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":3,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
         )
         .expect("staged version list");
         assert_eq!(
@@ -7873,25 +7846,23 @@ mod tests {
     }
 
     #[test]
-    fn deploy_plan_version_source_reuses_highest_retry_draft_beside_staging() {
+    fn deploy_plan_version_source_rejects_retry_draft_beside_staging() {
         let versions = parse_service_versions(
             r#"[
-                {"number":1,"active":false,"locked":true,"environments":[{"active_version":1,"name":"staging","service_id":"SVC1"}]},
+                {"number":1,"active":false,"locked":true,"environments":[{"active_version":1,"name":"staging","service_id":"shadow-staging-service"}]},
                 {"number":2,"active":false,"locked":false,"environments":[]}
             ]"#,
         )
         .expect("staged source and one retry draft");
-        assert_eq!(
-            select_version_source(&versions),
-            Ok(VersionSource::InitialDraft(2))
-        );
+        select_version_source(&versions)
+            .expect_err("a retry draft must not replace the real staged source");
     }
 
     #[test]
     fn deploy_plan_version_source_rejects_missing_duplicate_or_ambiguous_staged_source() {
         for invalid in [
-            r#"[{"number":2,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":2,"name":"staging","service_id":"SVC1"}]},{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":3,"name":"staging","service_id":"SVC1"}]}]"#,
-            r#"[{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":2,"name":"staging","service_id":"SVC1"}]}]"#,
+            r#"[{"number":2,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":2,"name":"staging","service_id":"shadow-staging-service"}]},{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":3,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
+            r#"[{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":2,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
             r#"[{"number":3,"active":false,"locked":true,"staging":true,"deployed":true,"environments":[{"active_version":3,"name":"production","service_id":"SVC1"}]}]"#,
         ] {
             let versions = parse_service_versions(invalid).expect("well-formed version list");
@@ -8124,26 +8095,40 @@ mod tests {
     }
 
     #[test]
-    fn version_configuration_snapshot_requires_an_exact_nonempty_self_diff() {
+    fn version_configuration_snapshot_normalizes_clone_metadata_and_order() {
         assert_eq!(
-            parse_version_configuration_snapshot(
-                r#"{"from":42,"to":42,"format":"text","diff":"complete configuration"}"#,
-                42,
-            ),
-            Ok("complete configuration".to_owned())
+            parse_snapshot_array(
+                "backends",
+                r#"[
+                    {"name":"origin-b","hostname":"b.example","service_id":"SVC","version":40,"created_at":"old"},
+                    {"name":"origin-a","hostname":"a.example","locked":true,"updated_at":"old"}
+                ]"#,
+            )
+            .expect("source snapshot"),
+            parse_snapshot_array(
+                "backends",
+                r#"[
+                    {"name":"origin-a","hostname":"a.example","locked":false,"updated_at":"new"},
+                    {"name":"origin-b","hostname":"b.example","service_id":"SVC","version":42,"created_at":"new"}
+                ]"#,
+            )
+            .expect("clone snapshot")
         );
 
-        for invalid in [
-            r#"{"from":41,"to":42,"format":"text","diff":"configuration"}"#,
-            r#"{"from":42,"to":42,"format":"html","diff":"configuration"}"#,
-            r#"{"from":42,"to":42,"format":"text","diff":""}"#,
-            r#"{"from":42,"to":42,"format":"text"}"#,
-            "[]",
-            "not json",
-        ] {
-            parse_version_configuration_snapshot(invalid, 42)
-                .expect_err("malformed or mismatched self-diff must fail closed");
-        }
+        parse_snapshot_array("backends", r#"[{"name":"origin"}, null]"#)
+            .expect_err("non-object collection entries must fail closed");
+        parse_snapshot_array("backends", "{}").expect_err("objects are not collections");
+        parse_snapshot_object("settings", "[]").expect_err("arrays are not settings objects");
+        assert_eq!(
+            parse_snapshot_object(
+                "settings",
+                r#"{"general.default_ttl":3600,"service_id":"SVC","version":40}"#,
+            ),
+            parse_snapshot_object(
+                "settings",
+                r#"{"general.default_ttl":3600,"service_id":"SVC","version":42}"#,
+            )
+        );
     }
 
     #[test]
@@ -8252,7 +8237,7 @@ mod tests {
     #[test]
     fn staging_rollback_after_failure_after_stage_deactivates_exact_version() {
         let versions = parse_service_versions(
-            r#"[{"active":false,"number":7,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
+            r#"[{"active":false,"number":7,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":7,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
         )
         .expect("version list");
         assert_eq!(
@@ -8261,14 +8246,12 @@ mod tests {
         );
         staging_rollback_decision(&versions, 8, "svc")
             .expect_err("an absent version must fail closed");
-        staging_rollback_decision(&versions, 7, "other-service")
-            .expect_err("a staged version for another service must fail closed");
     }
 
     #[test]
     fn staging_rollback_uses_the_exact_staging_environment_record() {
         let versions = parse_service_versions(
-            r#"[{"active":true,"number":7,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":7,"name":"production","service_id":"svc"},{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
+            r#"[{"active":true,"number":7,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":7,"name":"production","service_id":"production-service"},{"active_version":7,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
         )
         .expect("version list");
         assert_eq!(
@@ -8277,14 +8260,14 @@ mod tests {
         );
 
         let duplicate = parse_service_versions(
-            r#"[{"active":false,"number":7,"locked":true,"environments":[{"active_version":7,"name":"staging","service_id":"svc"},{"active_version":7,"name":"staging","service_id":"svc"}]}]"#,
+            r#"[{"active":false,"number":7,"locked":true,"environments":[{"active_version":7,"name":"staging","service_id":"shadow-staging-service"},{"active_version":7,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
         )
         .expect("version list");
         staging_rollback_decision(&duplicate, 7, "svc")
             .expect_err("duplicate staging environment records must fail closed");
 
         let cross_version_duplicate = parse_service_versions(
-            r#"[{"active":false,"number":7,"locked":true,"environments":[{"active_version":7,"name":"staging","service_id":"svc"}]},{"active":false,"number":8,"locked":true,"environments":[{"active_version":8,"name":"staging","service_id":"svc"}]}]"#,
+            r#"[{"active":false,"number":7,"locked":true,"environments":[{"active_version":7,"name":"staging","service_id":"shadow-staging-service"}]},{"active":false,"number":8,"locked":true,"environments":[{"active_version":8,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
         )
         .expect("version list");
         staging_rollback_decision(&cross_version_duplicate, 7, "svc")
