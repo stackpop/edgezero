@@ -2133,6 +2133,12 @@ EOF
 
 test_fastly_release_action_wiring() {
   section "Fastly release action wiring"
+  local caller_script_dir
+  caller_script_dir=$(bash -c 'SCRIPT_DIR=caller-owned; source "$1"; printf "%s" "$SCRIPT_DIR"' \
+    _ "$ACTIONS_DIR/fastly-common/scripts/common.sh")
+  assert_equals "Fastly common helpers preserve the caller's SCRIPT_DIR" \
+    "caller-owned" "$caller_script_dir"
+
   local action
   for action in deploy-fastly config-push-fastly healthcheck-fastly rollback-fastly; do
     local file="$ACTIONS_DIR/$action/action.yml"

@@ -13,9 +13,10 @@ set -euo pipefail
 #   no environment values or outputs at source time; helper arguments identify
 #   action-owned files written as NUL-delimited name lists.
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+FASTLY_COMMON_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly FASTLY_COMMON_DIR
 # shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+source "$FASTLY_COMMON_DIR/../../deploy-core/scripts/common.sh"
 
 require_fastly_service_id() {
   require_input_matching fastly-service-id "$1" '^[A-Za-z0-9]+$'
