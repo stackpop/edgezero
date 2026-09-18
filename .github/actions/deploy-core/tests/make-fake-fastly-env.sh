@@ -102,8 +102,8 @@ JSON
     resource=\$(arg_value --resource-id= "\$@") || exit 91
     alias=\$(arg_value --name= "\$@") || exit 91
     case "\$resource/\$alias" in
-      CONFIGSTAGE/app_config) type=config-store ;;
-      KVSTAGE/cache) type=object-store ;;
+      CONFIGSTAGE/app_config) type=config ;;
+      KVSTAGE/cache) type=kv-store ;;
       SECRETSTAGE/credentials) type=secret-store ;;
       *) exit 91;;
     esac
@@ -242,7 +242,7 @@ main() {
   : >"$log"
   printf '40\n' >"$state/active-version"
   printf '39\n40\n' >"$state/versions"
-  printf 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig-store\nLINK_KV_PROD\tcache\tKVPROD\tobject-store\nLINK_SECRET_PROD\tcredentials\tSECRETPROD\tsecret-store\n' >"$state/links/version-40.tsv"
+  printf 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig\nLINK_KV_PROD\tcache\tKVPROD\tkv-store\nLINK_SECRET_PROD\tcredentials\tSECRETPROD\tsecret-store\n' >"$state/links/version-40.tsv"
   : >"$state/staged-version"
   : >"$state/package-digest"
 

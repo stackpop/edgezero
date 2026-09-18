@@ -31,8 +31,8 @@ main() {
   jq -Rn '
     [inputs | split("\t") | {alias: .[1], resource: .[2], type: .[3]}] |
     sort_by(.type, .alias) == ([
-      {alias:"app_config", resource:"CONFIGPROD", type:"config-store"},
-      {alias:"cache", resource:"KVPROD", type:"object-store"},
+      {alias:"app_config", resource:"CONFIGPROD", type:"config"},
+      {alias:"cache", resource:"KVPROD", type:"kv-store"},
       {alias:"credentials", resource:"SECRETPROD", type:"secret-store"}
     ] | sort_by(.type, .alias))
   ' <"$FAKE_LINK_DIR/version-42.tsv" | grep -qx true || fail "production links do not expose the selected resources under logical aliases"

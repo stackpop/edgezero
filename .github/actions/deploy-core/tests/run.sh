@@ -2479,7 +2479,7 @@ test_fastly_smoke_release_contract() {
   assert_fails "the Fastly smoke release omits the unselected Spin manifest" \
     grep -Fq 'adapter/fastly.toml adapter/spin.toml' "$fixture"
   assert_succeeds "the fake seeds active v40 with logical Config, KV, and Secret aliases" \
-    grep -Fq 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig-store' "$fake"
+    grep -Fq 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig\nLINK_KV_PROD\tcache\tKVPROD\tkv-store\nLINK_SECRET_PROD\tcredentials\tSECRETPROD\tsecret-store' "$fake"
   assert_succeeds "the staged assertion checks staging resources under logical aliases" \
     grep -Fq 'alias:"app_config", resource:"CONFIGSTAGE"' "$staged"
   assert_succeeds "production checks selected resources under logical aliases" \

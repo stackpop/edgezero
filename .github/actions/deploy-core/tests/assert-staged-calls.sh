@@ -18,8 +18,8 @@ main() {
   jq -Rn '
     [inputs | split("\t") | {alias: .[1], resource: .[2], type: .[3]}] |
     sort_by(.type, .alias) == ([
-      {alias:"app_config", resource:"CONFIGSTAGE", type:"config-store"},
-      {alias:"cache", resource:"KVSTAGE", type:"object-store"},
+      {alias:"app_config", resource:"CONFIGSTAGE", type:"config"},
+      {alias:"cache", resource:"KVSTAGE", type:"kv-store"},
       {alias:"credentials", resource:"SECRETSTAGE", type:"secret-store"}
     ] | sort_by(.type, .alias))
   ' <"$FAKE_LINK_DIR/version-42.tsv" | grep -qx true || fail "staging links do not expose staging resources under logical aliases"

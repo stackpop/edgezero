@@ -1708,8 +1708,8 @@ fn parse_resource_links(
         };
         let resource_type = required("resource_type")?;
         let kind = match resource_type.as_str() {
-            "config-store" => ResourceKind::Config,
-            "object-store" => ResourceKind::Kv,
+            "config" => ResourceKind::Config,
+            "kv-store" => ResourceKind::Kv,
             "secret-store" => ResourceKind::Secret,
             _ => {
                 return Err(format!(
@@ -8102,8 +8102,8 @@ mod tests {
     #[test]
     fn resource_link_parser_requires_known_resource_type() {
         let raw = r#"[
-            {"id":"CONFIG_LINK","name":"shared","resource_id":"CONFIG_A","resource_type":"config-store"},
-            {"id":"KV_LINK","name":"shared","resource_id":"KV_A","resource_type":"object-store"},
+            {"id":"CONFIG_LINK","name":"shared","resource_id":"CONFIG_A","resource_type":"config"},
+            {"id":"KV_LINK","name":"shared","resource_id":"KV_A","resource_type":"kv-store"},
             {"id":"SECRET_LINK","name":"credentials","resource_id":"SECRET_A","resource_type":"secret-store"}
         ]"#;
         let (links, _) = parse_resource_links(raw).expect("typed links");
