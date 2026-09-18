@@ -439,6 +439,12 @@ if (outboundSpecSource.includes("Today's Fastly client")) {
     'outbound specification still describes the historical Fastly client as current',
   )
 }
+const budgetSourceDefinitions = outboundSpecSource.match(
+  /pub enum BudgetSource\s*\{/gu,
+)
+if (budgetSourceDefinitions?.length !== 1) {
+  fail('outbound specification must define BudgetSource exactly once')
+}
 for (const staleFragment of [
   'So the collapse today is',
   'The current adapter maps',
