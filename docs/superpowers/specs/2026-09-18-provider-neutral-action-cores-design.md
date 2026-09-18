@@ -1,0 +1,287 @@
+# Provider-Neutral Action Cores Design
+
+## Status
+
+Accepted on 2026-09-18. This design modularizes the existing Fastly GitHub
+Actions without adding deployment support for another adapter.
+
+## Problem
+
+EdgeZero's application CLI and adapter registry are provider-neutral, but the
+GitHub Action implementation is only partly separated. `build-app-cli`, GitHub
+Environment validation, workspace isolation, and part of CLI execution are
+shared. Immutable-release packaging and verification are under Fastly-named
+paths, while config push, deploy, healthcheck, and rollback each implement some
+of their own CLI invocation, credential handling, logging, and output parsing.
+
+Adding another provider action in this shape would require copying security and
+release-validation logic. Copies would drift in archive safety, credential
+scrubbing, mutation reporting, source-revision checks, and application CLI
+handling. A single public action with a generic `adapter` input would avoid some
+copying but would erase meaningful provider differences from the action input
+and output contracts.
+
+## Goals
+
+- Separate provider-neutral release and lifecycle machinery from Fastly policy.
+- Keep Fastly actions as thin provider wrappers with explicit typed inputs.
+- Make a future provider action reuse the core without changing the core.
+- Preserve the exact existing Fastly public and immutable-release contracts.
+- Keep one application CLI binary usable by every publisher and target.
+- Preserve the current credential, archive-safety, digest, lifecycle-protocol,
+  mutation-reporting, and recovery checks.
+- Keep action shell and CI tooling free of Python and pip commands.
+
+## Non-goals
+
+- No Cloudflare, Spin, Axum, or synthetic public deployment action is added.
+- No generic public `deploy` action is introduced.
+- No provider-neutral staging, healthcheck, or rollback semantics are invented.
+- No application CLI, Rust package, `edgezero.toml`, or public environment
+  variable is renamed.
+- No Fastly action input, output, default, archive member, or runtime behavior
+  changes.
+
+## Compatibility contract
+
+The following public actions retain their names and complete input/output
+surfaces:
+
+- `build-app-cli`
+- `package-fastly-application-release`
+- `config-push-fastly`
+- `deploy-fastly`
+- `healthcheck-fastly`
+- `rollback-fastly`
+- `require-github-environment`
+
+The configurable `app-cli-artifact` value remains a GitHub artifact name. The
+archive produced by `build-app-cli` remains `app-cli.tar`. The immutable Fastly
+release keeps these exact members:
+
+```text
+release.json
+cli/app-cli.tar
+package/app.tar.gz
+edgezero.toml
+<declared Fastly manifest path>
+```
+
+`release.json` retains format 1, lifecycle protocol 1, and its existing exact
+schema. The `adapter` value remains `fastly` for a Fastly release. The complete
+`edgezero.toml` is unchanged and can declare multiple adapters; a provider
+release includes only the selected adapter manifest.
+
+## Architecture
+
+The action stack has three layers.
+
+### Provider-neutral cores
+
+`release-core` owns the immutable application-release protocol:
+
+- confined input-file resolution;
+- selected-adapter lookup in `edgezero.toml`;
+- exact preservation of the selected adapter manifest path;
+- application CLI extraction and metadata validation;
+- declarative lifecycle capability probing;
+- archive construction and exact-member validation;
+- `release.json` syntax, schema, adapter, source-revision, and digest checks;
+- path normalization, traversal rejection, duplicate rejection, and symlink
+  rejection; and
+- verified release outputs used by lifecycle actions.
+
+The core takes an expected adapter name and a provider-supplied lifecycle
+capability declaration. It does not contain provider names, provider CLI names,
+credential names, service identifiers, staging rules, or provider output names.
+Capability declarations are data: command token arrays and flags that must
+appear in the application CLI's help output. The core assigns lifecycle protocol
+1 only after every declared capability succeeds.
+
+`deploy-core` owns secure application CLI execution:
+
+- isolated per-invocation workspaces;
+- application CLI archive download and extraction;
+- exact argument transport through NUL-delimited files and Bash arrays;
+- inherited provider-credential removal;
+- typed provider-credential import from data rather than interpolated shell;
+- action-private environment scrubbing;
+- preservation of canonical public runtime store selectors;
+- an optional provider-supplied allowlist for additional public runtime
+  variables;
+- working-directory and manifest selection;
+- private lifecycle logs and cleanup;
+- provider exit-status preservation;
+- `mutation-attempted` publication immediately before mutating CLI execution;
+  and
+- unambiguous output-contract parsing helpers.
+
+The invocation core receives an exact CLI argument vector. It does not construct
+provider flags or interpret provider output values. A mutating/non-mutating
+input controls mutation reporting. Provider wrappers remain responsible for
+deciding whether an operation can mutate.
+
+### Fastly wrappers
+
+Fastly actions own only Fastly policy and translation:
+
+- public Fastly action inputs and validation;
+- Fastly credential aliases and typed credential values;
+- pinned Fastly CLI installation;
+- alphanumeric Fastly service-ID validation;
+- construction of Fastly deploy, staging, healthcheck, and rollback arguments;
+- the Fastly lifecycle capability declaration used by the release packager;
+- Fastly-specific public runtime environment allowances retained for
+  compatibility;
+- Fastly provider-state reads and rollback-target capture; and
+- interpretation and validation of Fastly version, package digest, health, and
+  rollback outputs.
+
+The wrappers call `release-core` and `deploy-core` through documented environment
+and file contracts. They must not duplicate archive extraction, release schema
+validation, provider-environment import, application CLI resolution, or generic
+output uniqueness checks.
+
+`fastly-common` remains only for shared Fastly policy such as service-ID
+validation. It does not contain generic release or CLI-execution machinery.
+
+### Shared Rust release verifier
+
+The immutable-release verifier currently under `edgezero-adapter-fastly` is
+format-level logic. It moves behind the host-only `cli` feature of
+`edgezero-adapter`, where every registered adapter can use it without introducing
+runtime dependencies into adapter WASM builds.
+
+The verifier accepts the expected adapter name and lifecycle protocol. It
+returns confined paths and verified metadata for the selected adapter manifest,
+application manifest, application CLI, and provider package. It owns exact
+schema, normalized paths, exact members, regular-file enforcement, digest
+verification, and loaded-manifest identity.
+
+The Fastly adapter supplies `fastly` and protocol 1, then applies Fastly managed
+deployment policy to the verified package. No other adapter consumes this API as
+part of this change.
+
+## Lifecycle data flow
+
+### Packaging
+
+1. The Fastly package action maps its existing inputs to the release-core
+   contract and supplies adapter `fastly` plus the Fastly lifecycle capabilities.
+2. Release-core validates confined inputs and extracts the application CLI.
+3. Release-core probes the declared lifecycle commands and flags.
+4. Release-core reads the Fastly manifest path from the complete
+   `edgezero.toml`, confirms the explicit manifest input identifies that file,
+   and preserves the declared path.
+5. Release-core writes the unchanged format-1 metadata and archive.
+6. Release-core invokes the same generic verifier used by consumers before
+   publishing outputs.
+
+### Consumer preparation
+
+1. A Fastly lifecycle action maps its existing archive, digest, and expected
+   source-revision inputs to release-core and supplies expected adapter `fastly`.
+2. Release-core verifies the outer digest, archive safety, exact membership,
+   metadata, inner digests, selected manifest relationship, and source revision.
+3. Release-core publishes confined paths for the application CLI archive,
+   application manifest, selected adapter manifest, package, package digest, and
+   source revision.
+4. The action extracts the recorded application CLI with the existing generic
+   CLI archive verifier.
+
+### CLI invocation
+
+1. The Fastly wrapper validates provider-specific inputs and creates the exact
+   application CLI argument vector in an action-owned NUL-delimited file.
+2. It supplies the Fastly credential-clear list and typed credential JSON to
+   deploy-core.
+3. Deploy-core removes inherited aliases, imports only declared typed values,
+   preserves allowed public runtime variables, scrubs private carriers, and
+   resolves the verified application CLI.
+4. For a mutating command, deploy-core publishes `mutation-attempted=true`
+   immediately before execution.
+5. Deploy-core executes the argument vector without `eval`, records output in a
+   private lifecycle log, and preserves the CLI exit status.
+6. The Fastly wrapper validates and publishes the Fastly-specific outputs. Every
+   independently valid recovery output is published before another output
+   contract can fail.
+
+## Security boundaries
+
+Provider credentials never become generic public action inputs. A provider
+wrapper maps its typed secret input into a JSON object and supplies the complete
+alias-clear list. Deploy-core rejects a credential name absent from that list,
+clears inherited aliases before importing values, and removes all action-private
+`EDGEZERO__*` carriers before invoking application code.
+
+Canonical store-selection variables remain public runtime inputs. Additional
+provider-specific public variables require an explicit wrapper-owned allowlist;
+deploy-core does not know their names.
+
+`build-app-cli` and `require-github-environment` continue statically blanking the
+credential aliases for every shipped provider. GitHub composite-action step
+environments cannot dynamically remove unknown names before shell startup, so
+this explicit security list is intentionally product-wide rather than a deploy
+provider abstraction.
+
+All arguments cross the core boundary as array elements. No core or provider
+wrapper uses `eval`, shell command strings, or interpolated secrets. Temporary
+logs, inline configuration, and extracted releases stay under the invocation's
+confined workspace and are removed on every normal or error exit.
+
+## Error and output behavior
+
+Core failures use provider-neutral diagnostics that identify the violated
+contract without printing credentials or configuration values. Provider wrappers
+name provider-specific inputs and state.
+
+The original application or provider CLI exit status wins over wrapper cleanup
+or output errors. When the provider may already have mutated state, the wrapper
+publishes each independently validated recovery value before rejecting a missing,
+malformed, duplicate, or conflicting output. An absent `mutation-attempted`
+remains insufficient proof that no provider mutation occurred after a hard
+runner loss.
+
+## Extensibility rule
+
+A future provider adds public provider actions and thin wrapper scripts. It
+supplies:
+
+- its typed credentials and alias-clear list;
+- its provider CLI installer, if any;
+- its lifecycle capability declaration;
+- its exact CLI argument vectors;
+- its public runtime variable additions, if any; and
+- its provider-specific output and recovery semantics.
+
+It reuses release-core and deploy-core unchanged. If a proposed provider needs a
+core change, that change must express a provider-neutral capability and include a
+synthetic-adapter test. Provider names and special cases are not accepted in a
+core.
+
+## Verification requirements
+
+Tests must prove:
+
+- every existing Fastly action retains its exact public input/output surface;
+- the format-1 `release.json` schema and archive member paths are unchanged;
+- `app-cli.tar`, configurable artifact naming, application CLI binary naming,
+  and selected-manifest path preservation are unchanged;
+- release-core packages and verifies a synthetic adapter without any Fastly
+  files, names, credentials, tools, or deployment implementation;
+- release-core rejects an adapter mismatch, unsafe path, symlink, extra member,
+  missing member, duplicate member, digest mismatch, source-revision mismatch,
+  and incomplete lifecycle capability declaration;
+- the shared Rust verifier accepts a synthetic adapter release and the Fastly
+  adapter consumes it with expected adapter `fastly`;
+- deploy-core invokes a synthetic application CLI with exact argument boundaries,
+  clears inherited aliases, imports only typed credentials, preserves allowed
+  public runtime variables, and scrubs action-private carriers;
+- mutation reporting happens after setup and immediately before execution;
+- provider exit codes and independently valid recovery outputs are preserved;
+- provider-neutral core files contain no Fastly, Cloudflare, Spin, or Axum
+  policy branches;
+- all existing Fastly config-push, production, staging, healthcheck, rollback,
+  recovery, and store-free smoke tests pass without changed expectations; and
+- ShellCheck, actionlint, archive contract tests, Rust workspace tests, adapter
+  WASM checks, formatting, Clippy, and documentation checks remain green.
