@@ -35,24 +35,24 @@ main() {
 
   local expected mutations
   expected=$(cat <<'MUTATIONS'
-fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
-fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD
-fastly resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD
-fastly resource-link create --service-id=dummyservice --version=42 --resource-id=CONFIGSTAGE --name=app_config
-fastly resource-link create --service-id=dummyservice --version=42 --resource-id=KVSTAGE --name=cache
-fastly resource-link create --service-id=dummyservice --version=42 --resource-id=SECRETSTAGE --name=credentials
+fastly service resource-link delete --service-id=dummyservice --version=42 --id=LINK_CONFIG_PROD
+fastly service resource-link delete --service-id=dummyservice --version=42 --id=LINK_KV_PROD
+fastly service resource-link delete --service-id=dummyservice --version=42 --id=LINK_SECRET_PROD
+fastly service resource-link create --service-id=dummyservice --version=42 --resource-id=CONFIGSTAGE --name=app_config
+fastly service resource-link create --service-id=dummyservice --version=42 --resource-id=KVSTAGE --name=cache
+fastly service resource-link create --service-id=dummyservice --version=42 --resource-id=SECRETSTAGE --name=credentials
 MUTATIONS
 )
-  mutations=$(grep -E '^fastly resource-link (create|delete) ' "$log" || true)
+  mutations=$(grep -E '^fastly service resource-link (create|delete) ' "$log" || true)
   [[ "$mutations" == "$expected" ]] || { printf 'expected resource mutations:\n%s\nactual resource mutations:\n%s\n' "$expected" "${mutations:-<none>}" >&2; fail "staging reconciliation differed"; }
-  grep -q '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" || fail "version 42 was not staged"
+  grep -q '^fastly service version stage --service-id=dummyservice --version=42$' "$log" || fail "version 42 was not staged"
 
   local last_create final_links package_line configuration_line stage_line
-  last_create=$(grep -n '^fastly resource-link create ' "$log" | tail -n1 | cut -d: -f1)
-  final_links=$(grep -n '^fastly resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n1 | cut -d: -f1)
+  last_create=$(grep -n '^fastly service resource-link create ' "$log" | tail -n1 | cut -d: -f1)
+  final_links=$(grep -n '^fastly service resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n1 | cut -d: -f1)
   package_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n1 | cut -d: -f1)
   configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/settings$' "$log" | tail -n1 | cut -d: -f1)
-  stage_line=$(grep -n '^fastly service-version stage --service-id=dummyservice --version=42$' "$log" | tail -n1 | cut -d: -f1)
+  stage_line=$(grep -n '^fastly service version stage --service-id=dummyservice --version=42$' "$log" | tail -n1 | cut -d: -f1)
   for version in 40 42; do
     for collection in domain backend healthcheck settings; do
       [[ "$(grep -c "^GET https://api.fastly.com/service/dummyservice/version/$version/$collection$" "$log")" -eq 3 ]] || fail "staging did not preserve and revalidate version $version $collection configuration"

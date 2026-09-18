@@ -36,7 +36,7 @@ main() {
     store-free) expected_comment='store-free managed smoke' ;;
     *) fail "unknown production fixture mode '$fixture_mode'" ;;
   esac
-  grep -Fqx "fastly service-version update --service-id=dummyservice --version=42 --comment $expected_comment" "$log" || fail "production did not apply the exact version comment"
+  grep -Fqx "fastly service version update --service-id=dummyservice --version=42 --comment $expected_comment" "$log" || fail "production did not apply the exact version comment"
 
   jq -Rn '
     [inputs | split("\t") | {alias: .[1], resource: .[2], type: .[3]}] |
@@ -48,12 +48,12 @@ main() {
   ' <"$FAKE_LINK_DIR/version-42.tsv" | grep -qx true || fail "production links do not expose the selected resources under logical aliases"
 
   local mutations
-  mutations=$(grep -E '^fastly resource-link (create|delete) ' "$log" || true)
+  mutations=$(grep -E '^fastly service resource-link (create|delete) ' "$log" || true)
   [[ -z "$mutations" ]] || fail "production must retain already-correct resource links; got: $mutations"
   grep -q '^PUT https://api.fastly.com/service/dummyservice/version/42/activate$' "$log" || fail "production did not activate version 42"
 
   local final_links_line package_line configuration_line publish_line
-  final_links_line=$(grep -n '^fastly resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n1 | cut -d: -f1)
+  final_links_line=$(grep -n '^fastly service resource-link list --service-id=dummyservice --version=42 --json$' "$log" | tail -n1 | cut -d: -f1)
   package_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/package$' "$log" | tail -n1 | cut -d: -f1)
   configuration_line=$(grep -n '^GET https://api.fastly.com/service/dummyservice/version/42/settings$' "$log" | tail -n1 | cut -d: -f1)
   publish_line=$(grep -n '^PUT https://api.fastly.com/service/dummyservice/version/42/activate$' "$log" | tail -n1 | cut -d: -f1)

@@ -286,7 +286,7 @@ reference to port from. Most transfer with light changes:
      `cargo metadata` (authoritative, flag-independent) and smoke-checks with `--help`.
    - Fastly staging deploy: extend the Fastly adapter `deploy` path with
      `--staging` → `fastly compute update --autoclone --version=active` +
-     `fastly service-version stage`; emit the service version in a parseable form.
+     `fastly service version stage`; emit the service version in a parseable form.
    - Add `active-version`, `healthcheck`, and `rollback` CLI subcommands with a
      Fastly adapter implementation (`active-version` resolves the currently-active
      version via the Fastly API for rollback-target capture; staging-IP resolution

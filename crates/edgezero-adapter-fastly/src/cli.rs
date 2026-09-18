@@ -816,6 +816,7 @@ fn build_managed_deploy_plan(
     };
     let links_raw = run_fastly_json_capture(
         &[
+            "service",
             "resource-link",
             "list",
             &format!("--service-id={service_id}"),
@@ -915,7 +916,8 @@ fn execute_managed_deploy_plan_with_emit(
     if let Some(comment) = plan.arguments.comment.as_deref() {
         run_fastly_status(
             &[
-                "service-version".to_owned(),
+                "service".to_owned(),
+                "version".to_owned(),
                 "update".to_owned(),
                 format!("--service-id={}", plan.service_id),
                 format!("--version={version}"),
@@ -941,6 +943,7 @@ fn execute_managed_deploy_plan_with_emit(
         })?;
         run_fastly_status(
             &[
+                "service".to_owned(),
                 "resource-link".to_owned(),
                 "delete".to_owned(),
                 format!("--service-id={}", plan.service_id),
@@ -953,6 +956,7 @@ fn execute_managed_deploy_plan_with_emit(
     for link in &plan.links.create {
         run_fastly_status(
             &[
+                "service".to_owned(),
                 "resource-link".to_owned(),
                 "create".to_owned(),
                 format!("--service-id={}", plan.service_id),
@@ -982,7 +986,8 @@ fn execute_managed_deploy_plan_with_emit(
     match plan.target {
         PublishTarget::Staging => run_fastly_status(
             &[
-                "service-version".to_owned(),
+                "service".to_owned(),
+                "version".to_owned(),
                 "stage".to_owned(),
                 format!("--service-id={}", plan.service_id),
                 format!("--version={version}"),
@@ -1252,6 +1257,7 @@ fn read_version_links_with_snapshot(
     let version_arg = format!("--version={version}");
     let raw = run_fastly_json_capture(
         &[
+            "service",
             "resource-link",
             "list",
             &service_arg,
@@ -3234,7 +3240,7 @@ fn resource_link_note(
             }
         };
         format!(
-            "  {selection}, so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
+            "  {selection}, so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly service resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service version activate`)."
         )
     })
 }
@@ -5753,7 +5759,7 @@ fn parse_canonical_version_line(lower: &str) -> Option<u64> {
     })
 }
 
-/// Parse `fastly service-version list --json` (or the Fastly API
+/// Parse `fastly service version list --json` (or the Fastly API
 /// `/service/<id>/version` array) for the `number` of the `active`
 /// version.
 /// Resolve the active version from a Fastly version-list JSON.
@@ -8753,7 +8759,7 @@ mod tests {
         // The earlier wider heuristic swallowed ANY stderr
         // containing "conflict" or "already exists", which would
         // misread an unrelated 409 from a different fastly
-        // subcommand (e.g. a service-version conflict during a
+        // subcommand (e.g. a service version conflict during a
         // parallel deploy) as idempotent store-create success.
         // Now we require the kind context too, so unrelated
         // conflicts surface as failures.
@@ -8762,7 +8768,7 @@ mod tests {
                 "Error: 409 Conflict on /service/abc/version/42 -- already exists",
                 "kv",
             ),
-            "service-version conflict must NOT be misread as kv-store idempotency"
+            "service version conflict must NOT be misread as kv-store idempotency"
         );
         assert!(
             !looks_like_already_exists(
@@ -9250,7 +9256,7 @@ build = \"cargo build --release\"
 
     /// When `fastly.toml` declares `service_id`, the next
     /// `fastly compute deploy` skips `[setup]` entirely. provision
-    /// must emit the `fastly resource-link create` remediation for
+    /// must emit the `fastly service resource-link create` remediation for
     /// every declared store it creates.
     #[test]
     fn provision_emits_resource_link_note_for_declared_store_on_existing_service() {
@@ -9275,7 +9281,7 @@ build = \"cargo build --release\"
         );
         assert!(
             note.contains(
-                "fastly resource-link create --service-id=abc123svc --resource-id=<STORE-ID> --version=latest --autoclone --name=app_config"
+                "fastly service resource-link create --service-id=abc123svc --resource-id=<STORE-ID> --version=latest --autoclone --name=app_config"
             ),
             "note carries the full resource-link command: {note}"
         );

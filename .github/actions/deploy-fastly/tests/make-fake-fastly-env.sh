@@ -40,16 +40,45 @@ case "\${1:-} \${2:-}" in
 [{"id":"CONFIGPROD","name":"config-prod"},{"id":"CONFIGSTAGE","name":"config-stage"}]
 JSON
     ;;
-  'resource-link list')
-    [[ "\$#" -eq 5 && "\$3" == --service-id=dummyservice &&
-      ("\$4" == --version=40 || "\$4" == --version=42) && "\$5" == --json ]] || exit 91
-    target=\$(arg_value --version= "\$@") || exit 91
-    if [[ "\$target" == 42 && -n "\${FAKE_FAIL_AFTER_VERSION:-}" && -s "\$FAKE_PACKAGE_DIGEST_FILE" ]]; then
-      echo 'simulated post-upload resource-link readback failure' >&2
-      exit 77
-    fi
-    [[ -f "\$(links_file "\$target")" ]] || exit 91
-    links_json "\$target"
+  'service resource-link')
+    case "\${3:-}" in
+      list)
+        [[ "\$#" -eq 6 && "\$4" == --service-id=dummyservice &&
+          ("\$5" == --version=40 || "\$5" == --version=42) && "\$6" == --json ]] || exit 91
+        target=\$(arg_value --version= "\$@") || exit 91
+        if [[ "\$target" == 42 && -n "\${FAKE_FAIL_AFTER_VERSION:-}" && -s "\$FAKE_PACKAGE_DIGEST_FILE" ]]; then
+          echo 'simulated post-upload resource-link readback failure' >&2
+          exit 77
+        fi
+        [[ -f "\$(links_file "\$target")" ]] || exit 91
+        links_json "\$target"
+        ;;
+      delete)
+        [[ "\$#" -eq 6 && "\$4" == --service-id=dummyservice && "\$5" == --version=42 ]] || exit 91
+        target=\$(arg_value --version= "\$@") || exit 91
+        id=\$(arg_value --id= "\$@") || exit 91
+        file=\$(links_file "\$target")
+        grep -q "^\$id"$'\\t' "\$file" || exit 91
+        awk -F '\\t' -v id="\$id" '\$1 != id' "\$file" >"\$file.tmp"
+        mv "\$file.tmp" "\$file"
+        ;;
+      create)
+        [[ "\$#" -eq 7 && "\$4" == --service-id=dummyservice && "\$5" == --version=42 ]] || exit 91
+        target=\$(arg_value --version= "\$@") || exit 91
+        resource=\$(arg_value --resource-id= "\$@") || exit 91
+        alias=\$(arg_value --name= "\$@") || exit 91
+        case "\$resource/\$alias" in
+          CONFIGSTAGE/app_config) type=config ;;
+          KVSTAGE/cache) type=kv-store ;;
+          SECRETSTAGE/credentials) type=secret-store ;;
+          *) exit 91;;
+        esac
+        file=\$(links_file "\$target")
+        ! awk -F '\t' -v alias="\$alias" -v type="\$type" '\$2 == alias && \$4 == type { found = 1 } END { exit !found }' "\$file" || exit 91
+        printf 'LINK_%s\t%s\t%s\t%s\n' "\$alias" "\$alias" "\$resource" "\$type" >>"\$file"
+        ;;
+      *) exit 90 ;;
+    esac
     ;;
   'compute hash-files')
     [[ "\$#" -eq 6 && "\$3" == --package=* && "\$4" == --skip-build &&
@@ -73,43 +102,24 @@ JSON
     fi
     echo 'SUCCESS: Updated package (service dummyservice, version 42)'
     ;;
-  'service-version update')
-    [[ "\$#" -eq 6 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 &&
-      "\$5" == --comment ]] || exit 94
-    case "\$6" in
-      'production smoke' | 'staged smoke' | 'store-free managed smoke') ;;
-      *) exit 94;;
+  'service version')
+    case "\${3:-}" in
+      update)
+        [[ "\$#" -eq 7 && "\$4" == --service-id=dummyservice && "\$5" == --version=42 &&
+          "\$6" == --comment ]] || exit 94
+        case "\$7" in
+          'production smoke' | 'staged smoke' | 'store-free managed smoke') ;;
+          *) exit 94;;
+        esac
+        ;;
+      stage)
+        [[ "\$*" == 'service version stage --service-id=dummyservice --version=42' ]] || exit 94
+        grep -qx 42 "\$FAKE_VERSION_FILE" || exit 94
+        [[ -s "\$FAKE_PACKAGE_DIGEST_FILE" && -f "\$FAKE_LINK_DIR/version-42.tsv" ]] || exit 94
+        printf '42\n' >"\$FAKE_STAGED_VERSION_FILE"
+        ;;
+      *) exit 90 ;;
     esac
-    ;;
-  'service-version stage')
-    [[ "\$*" == 'service-version stage --service-id=dummyservice --version=42' ]] || exit 94
-    grep -qx 42 "\$FAKE_VERSION_FILE" || exit 94
-    [[ -s "\$FAKE_PACKAGE_DIGEST_FILE" && -f "\$FAKE_LINK_DIR/version-42.tsv" ]] || exit 94
-    printf '42\n' >"\$FAKE_STAGED_VERSION_FILE"
-    ;;
-  'resource-link delete')
-    [[ "\$#" -eq 5 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 ]] || exit 91
-    target=\$(arg_value --version= "\$@") || exit 91
-    id=\$(arg_value --id= "\$@") || exit 91
-    file=\$(links_file "\$target")
-    grep -q "^\$id"$'\\t' "\$file" || exit 91
-    awk -F '\\t' -v id="\$id" '\$1 != id' "\$file" >"\$file.tmp"
-    mv "\$file.tmp" "\$file"
-    ;;
-  'resource-link create')
-    [[ "\$#" -eq 6 && "\$3" == --service-id=dummyservice && "\$4" == --version=42 ]] || exit 91
-    target=\$(arg_value --version= "\$@") || exit 91
-    resource=\$(arg_value --resource-id= "\$@") || exit 91
-    alias=\$(arg_value --name= "\$@") || exit 91
-    case "\$resource/\$alias" in
-      CONFIGSTAGE/app_config) type=config ;;
-      KVSTAGE/cache) type=kv-store ;;
-      SECRETSTAGE/credentials) type=secret-store ;;
-      *) exit 91;;
-    esac
-    file=\$(links_file "\$target")
-    ! awk -F '\t' -v alias="\$alias" -v type="\$type" '\$2 == alias && \$4 == type { found = 1 } END { exit !found }' "\$file" || exit 91
-    printf 'LINK_%s\t%s\t%s\t%s\n' "\$alias" "\$alias" "\$resource" "\$type" >>"\$file"
     ;;
   'config-store-entry describe')
     echo 'fake fastly: unexpected Config Store describe' >&2
