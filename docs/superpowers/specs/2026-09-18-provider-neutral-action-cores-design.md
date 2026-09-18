@@ -96,7 +96,8 @@ capability declaration. It does not contain provider names, provider CLI names,
 credential names, service identifiers, staging rules, or provider output names.
 Capability declarations are data: command token arrays and flags that must
 appear in the application CLI's help output. The core assigns lifecycle protocol
-1 only after every declared capability succeeds.
+metadata only after every declared capability succeeds; the provider wrapper
+selects the protocol value.
 
 `deploy-core` owns secure application CLI execution:
 
@@ -114,13 +115,14 @@ appear in the application CLI's help output. The core assigns lifecycle protocol
 - provider exit-status preservation;
 - `mutation-attempted` publication immediately before mutating CLI execution;
   and
-- output-contract parsing helpers that accept repeated identical canonical
-  values while rejecting malformed lines or multiple distinct values.
+- provider-neutral output parsing primitives for last-canonical,
+  unique-canonical, and exact-one-canonical policies.
 
 The invocation core receives an exact CLI argument vector. It does not construct
 provider flags or interpret provider output values. A mutating/non-mutating
 input controls mutation reporting. Provider wrappers remain responsible for
-deciding whether an operation can mutate.
+deciding whether an operation can mutate and which parsing policy each output
+uses.
 
 ### Lifecycle capability declaration
 
@@ -151,6 +153,8 @@ requires every declared flag to appear as an exact help token or in
 Release-core writes the declaration's `lifecycle_protocol` into `release.json`
 only after the declaration and every probe pass. Consumer verification receives
 the expected protocol from the provider wrapper and requires an exact match.
+Release-core is protocol-neutral: it validates a positive integer and matching
+producer/consumer expectations, while Fastly selects protocol 1.
 
 The generic core validates structure and executes every declared probe. The
 provider wrapper owns semantic completeness because different providers can
@@ -187,7 +191,7 @@ Fastly actions own only Fastly policy and translation:
 The wrappers call `release-core` and `deploy-core` through documented environment
 and file contracts. They must not duplicate archive extraction, release schema
 validation, provider-environment import, application CLI resolution, or generic
-output canonicalization checks.
+output parsing primitives.
 
 `fastly-common` remains only for shared Fastly policy such as service-ID
 validation. It does not contain generic release or CLI-execution machinery.
@@ -291,9 +295,12 @@ name provider-specific inputs and state.
 The original application or provider CLI exit status wins over wrapper cleanup
 or output errors. When the provider may already have mutated state, the wrapper
 publishes each independently validated recovery value before rejecting a missing,
-malformed, or conflicting output. Repeated identical canonical lines remain
-valid; two distinct canonical values for one output are conflicting. An absent
-`mutation-attempted` remains insufficient proof that no provider mutation
+malformed, or conflicting output according to that action's existing contract.
+Deploy requires every same-key line to be canonical, accepts repeated identical
+values, and rejects multiple distinct values. Healthcheck, rollback, and config
+push retain their last-canonical-value behavior. Exact-one parsing remains
+available for Fastly state reads that require exactly one contract line. An
+absent `mutation-attempted` remains insufficient proof that no provider mutation
 occurred after a hard runner loss.
 
 ## Extensibility rule
@@ -336,8 +343,10 @@ Tests must prove:
   public runtime variables, and scrubs action-private carriers;
 - mutation reporting happens after setup and immediately before execution;
 - provider exit codes and independently valid recovery outputs are preserved;
-- repeated identical canonical output lines remain accepted, while malformed
-  lines and multiple distinct values fail;
+- deploy accepts repeated identical canonical values but rejects malformed or
+  distinct same-key values;
+- healthcheck, rollback, and config push retain last-canonical-value parsing;
+- exact-one parsing remains available to Fastly state reads that require it;
 - lifecycle output remains available until the provider wrapper finishes
   recovery parsing, then its private log is removed;
 - provider-neutral core files contain no Fastly, Cloudflare, Spin, or Axum
