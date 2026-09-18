@@ -11,7 +11,7 @@ The release archive contains all application-owned deploy inputs:
 - the application CLI used by deploy, config push, healthcheck, and rollback;
 - the prebuilt Fastly package;
 - the application's exact `edgezero.toml`; and
-- every adapter manifest referenced by that application manifest.
+- the exact Fastly manifest referenced by that application manifest.
 
 For one release, those application-owned members are byte-identical across every
 publisher, deployer, production deployment, and staging deployment. A later
@@ -23,9 +23,9 @@ may vary without changing the release.
 
 The application release pipeline is the sole producer. It checks out an approved
 source revision, builds the application CLI and Fastly package without a GitHub
-Environment or provider credential, records their digests and all referenced
-adapter manifests in `release.json`, archives the result, and publishes the
-archive plus its SHA-256.
+Environment or provider credential, records their digests and the selected
+Fastly manifest in `release.json`, archives the result, and publishes the archive
+plus its SHA-256.
 
 The deployer is a consumer. It resolves the application source revision and
 release digest before selecting a publisher GitHub Environment. It downloads the
@@ -42,7 +42,6 @@ cli/app-cli.tar
 package/app.tar.gz
 edgezero.toml
 adapters/fastly/fastly.toml
-adapters/spin/spin.toml
 ```
 
 The member paths are release metadata, so another release may arrange them
@@ -53,9 +52,11 @@ Verification rejects unknown or duplicate fields, unsafe paths,
 symlinks, extra files or directories, digest mismatches, and manifests that do
 not match the application's recorded manifest relationship. The deployer cannot
 substitute a package or manifest after verification.
-The packager preserves every referenced adapter manifest at the exact relative
-path declared by `edgezero.toml`. It also verifies every lifecycle command and
-action-owned flag before assigning `lifecycle_protocol: 1`.
+The packager preserves the selected Fastly manifest at the exact relative path
+declared by `edgezero.toml`. Other adapters can remain declared in the unchanged
+application manifest, but their manifests are not Fastly deployment inputs. The
+packager also verifies every lifecycle command and action-owned flag before
+assigning `lifecycle_protocol: 1`.
 
 ## Production deployment
 

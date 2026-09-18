@@ -420,7 +420,7 @@ CLI
     >"$dir/cli/app-cli-meta.json"
   tar -C "$dir/cli" -czf "$dir/release/cli/app-cli.tar.gz" app-cli app-cli-meta.json
   printf 'immutable-fastly-package\n' >"$dir/release/package/app.tar.gz"
-  printf '[app]\nname = "demo"\n[adapters.fastly.adapter]\nmanifest = "adapter/fastly.toml"\n' \
+  printf '[app]\nname = "demo"\n[adapters.fastly.adapter]\nmanifest = "adapter/fastly.toml"\n[adapters.spin.adapter]\nmanifest = "adapter/spin.toml"\n' \
     >"$dir/release/edgezero.toml"
   printf 'manifest_version = 3\nname = "demo"\n' >"$dir/release/adapter/fastly.toml"
   jq -n \
@@ -429,7 +429,7 @@ CLI
     --arg package "$(hash_file "$dir/release/package/app.tar.gz")" \
     --arg edgezero "$(hash_file "$dir/release/edgezero.toml")" \
     --arg adapter "$(hash_file "$dir/release/adapter/fastly.toml")" \
-    '{format:1,lifecycle_protocol:1,source_revision:$revision,adapter:"fastly",app_cli:{path:"cli/app-cli.tar.gz",sha256:$cli},package:{path:"package/app.tar.gz",sha256:$package},manifests:{edgezero:{path:"edgezero.toml",sha256:$edgezero},adapters:[{name:"fastly",path:"adapter/fastly.toml",sha256:$adapter}]}}' \
+    '{format:1,lifecycle_protocol:1,source_revision:$revision,adapter:"fastly",app_cli:{path:"cli/app-cli.tar.gz",sha256:$cli},package:{path:"package/app.tar.gz",sha256:$package},manifests:{edgezero:{path:"edgezero.toml",sha256:$edgezero},adapter:{path:"adapter/fastly.toml",sha256:$adapter}}}' \
     >"$dir/release/release.json"
   tar -C "$dir/release" -czf "$dir/app-release.tar.gz" \
     release.json cli/app-cli.tar.gz package/app.tar.gz edgezero.toml adapter/fastly.toml
@@ -948,6 +948,14 @@ test_no_inline_action_scripts() {
   local embedded_python_pattern="${embedded_language}3 .*<<|${embedded_language} .*<<|<<'?${heredoc_marker}'?"
   bad=$(grep -REn --include='*.sh' -E "$embedded_python_pattern" "$ACTIONS_DIR" || true)
   assert_equals "action shell scripts contain no embedded Python programs" "" "$bad"
+
+  local command_pattern="(^|[[:space:]|;&])(${embedded_language}3?|pip3?|pipx)([[:space:]]|$)"
+  bad=$(
+    grep -REn --include='*.sh' --include='*.yml' -E "$command_pattern" \
+      "$ACTIONS_DIR" "$REPO_ROOT/.github/workflows" "$REPO_ROOT/scripts/run_coverage.sh" |
+      grep -vE ':[0-9]+:[[:space:]]*#' || true
+  )
+  assert_equals "action and CI tooling use only approved shell tools" "" "$bad"
 }
 
 test_cleanup_confinement() {
@@ -2465,7 +2473,10 @@ test_fastly_smoke_release_contract() {
     grep -Fq '"edgezero-adapter-spin"' "$fixture"
   assert_succeeds "the smoke application references its Spin manifest" \
     grep -Fq 'manifest = "adapter/spin.toml"' "$fixture"
-  assert_succeeds "the smoke release packages its referenced Spin manifest" \
+  # shellcheck disable=SC2016 # jq source contains a literal shell variable name.
+  assert_succeeds "the Fastly smoke release records one selected adapter manifest" \
+    grep -Fq 'adapter: {path: "adapter/fastly.toml", sha256: $fastly}' "$fixture"
+  assert_fails "the Fastly smoke release omits the unselected Spin manifest" \
     grep -Fq 'adapter/fastly.toml adapter/spin.toml' "$fixture"
   assert_succeeds "the fake seeds active v40 with logical Config, KV, and Secret aliases" \
     grep -Fq 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig-store' "$fake"
@@ -2633,8 +2644,10 @@ test_fastly_logical_link_documentation() {
   assert_succeeds "one release fixes CLI, package, and manifests for every publisher and target" \
     grep -Fq 'byte-identical application CLI, Fastly package' "$adoption"
   # shellcheck disable=SC2016 # Documentation contract contains literal Markdown backticks.
-  assert_succeeds "one release fixes the complete referenced adapter-manifest set" \
-    grep -Fq '`edgezero.toml`, and complete referenced adapter-manifest set' "$adoption"
+  assert_succeeds "one release fixes the selected Fastly manifest" \
+    grep -Fq '`edgezero.toml`, and Fastly manifest to every publisher' "$adoption"
+  assert_succeeds "Fastly releases exclude other adapter manifests" \
+    grep -Fq 'adapter manifests are not part of a Fastly application release' "$adoption"
 
   assert_succeeds "application example is extracted as a workflow" \
     grep -Fxq 'name: Deploy Application' "$example_workflow"

@@ -10,16 +10,16 @@ Each application owns a release pipeline that:
 
 1. checks out one approved source revision;
 2. builds the application CLI and Fastly package without provider credentials;
-3. bundles that CLI, package, `edgezero.toml`, every adapter manifest it
-   references, and strict `release.json` metadata;
+3. bundles that CLI, package, `edgezero.toml`, its referenced Fastly manifest,
+   and strict `release.json` metadata;
 4. publishes the archive under an immutable reference; and
 5. publishes the archive's lowercase SHA-256 digest.
 
 The producer does not select a publisher GitHub Environment. One application
 release supplies a byte-identical application CLI, Fastly package,
-`edgezero.toml`, and complete referenced adapter-manifest set to every publisher
-and to both production and staging. Different applications or later releases can
-have different manifests. A deployer or runtime environment cannot replace them.
+`edgezero.toml`, and Fastly manifest to every publisher and to both production
+and staging. Different applications or later releases can have different
+manifests. A deployer or runtime environment cannot replace them.
 
 Use the release packager after the application CLI and Fastly package have been
 built in the credential-free producer job:
@@ -41,9 +41,9 @@ strict metadata with `format: 1` and `lifecycle_protocol: 1`, verifies the
 assembled archive through the same consumer validator, uploads
 `app-release.tar.gz`, and returns its SHA-256. It accepts only prebuilt inputs
 beneath `github.workspace` and receives no provider credentials. The explicit
-`adapter-manifest` input identifies the Fastly manifest; the packager follows
-`edgezero.toml` and includes every other referenced adapter manifest at its
-declared relative path.
+`adapter-manifest` input must be the Fastly manifest referenced by
+`edgezero.toml`; the packager stores it at that declared relative path. Other
+adapter manifests are not part of a Fastly application release.
 
 ## Deployment consumer
 

@@ -18,40 +18,29 @@ OUTPUT_DIR="target/coverage"
 mkdir -p "$OUTPUT_DIR"
 
 discover_packages() {
-  local python_bin
-  python_bin="$(command -v python3 || command -v python || true)"
-  if [ -z "${python_bin}" ]; then
-    echo "python3 is required to auto-discover workspace packages. Set EDGEZERO_COVERAGE_PACKAGES to skip discovery." >&2
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required to auto-discover workspace packages. Set EDGEZERO_COVERAGE_PACKAGES to skip discovery." >&2
     exit 1
   fi
 
-  EDGEZERO_COVERAGE_INCLUDE_BINS="${EDGEZERO_COVERAGE_INCLUDE_BINS:-0}" \
-    cargo metadata --format-version 1 --no-deps | "${python_bin}" -c '
-import json
-import os
-import sys
+  local include_bins=false
+  case "${EDGEZERO_COVERAGE_INCLUDE_BINS:-0}" in
+    "" | 0 | false | False) ;;
+    *) include_bins=true ;;
+  esac
 
-data = json.load(sys.stdin)
-workspace = set(data.get("workspace_members", []))
-include_bins = os.environ.get("EDGEZERO_COVERAGE_INCLUDE_BINS", "0") not in ("0", "", "false", "False")
-
-packages = []
-for pkg in data.get("packages", []):
-    if pkg.get("id") not in workspace:
-        continue
-    if include_bins:
-        packages.append(pkg.get("name"))
-        continue
-    targets = pkg.get("targets", [])
-    has_lib = any(
-        "lib" in target.get("kind", []) or "proc-macro" in target.get("kind", [])
-        for target in targets
-    )
-    if has_lib:
-        packages.append(pkg.get("name"))
-
-print(" ".join(packages))
-'
+  cargo metadata --format-version 1 --no-deps |
+    jq -r --argjson include_bins "$include_bins" '
+      .workspace_members as $workspace
+      | [.packages[]
+          | select(.id as $id | $workspace | index($id))
+          | select(
+              $include_bins
+              or any(.targets[]?; any(.kind[]?; . == "lib" or . == "proc-macro"))
+            )
+          | .name]
+      | join(" ")
+    '
 }
 
 if [ -n "${EDGEZERO_COVERAGE_PACKAGES:-}" ]; then

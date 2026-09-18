@@ -33,7 +33,7 @@ use edgezero_core::app_config::{
 };
 use edgezero_core::blob_envelope::{BlobEnvelope, BlobEnvelopeError, ENVELOPE_VERSION_V1};
 use edgezero_core::env_config::{EnvConfig, merge_env_defaults};
-use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
+use edgezero_core::manifest::{Manifest, ManifestAdapter, ManifestLoader, StoreDeclaration};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use similar::TextDiff;
@@ -118,6 +118,12 @@ struct ValidationContext {
     /// overlay setting the typed flow will use, so the same
     /// flattened key set drives every adapter's `validate_*` call.
     raw_config: Value,
+}
+
+#[derive(Clone, Copy)]
+enum AdapterValidationScope {
+    All,
+    Selected(&'static dyn adapter_registry::Adapter),
 }
 
 impl ValidationContext {
@@ -222,7 +228,7 @@ struct ResolvedTomlLeaf<'raw> {
 #[inline]
 pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
     let ctx = load_validation_context(args)?;
-    run_shared_checks(&ctx)?;
+    run_shared_checks(&ctx, AdapterValidationScope::All)?;
     log::info!(
         "[edgezero] config validate (raw): {} OK{}",
         args.manifest.display(),
@@ -241,7 +247,7 @@ where
     C: DeserializeOwned + Validate + AppConfigMeta,
 {
     let ctx = load_validation_context(args)?;
-    run_shared_checks(&ctx)?;
+    run_shared_checks(&ctx, AdapterValidationScope::All)?;
 
     // Typed deserialise + validate_excluding_secrets (push,
     // diff, AND typed validate all use deserialize-only +
@@ -259,7 +265,7 @@ where
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
 
     typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_adapter_typed_checks::<C>(&ctx, AdapterValidationScope::All)?;
 
     log::info!(
         "[edgezero] config validate (typed): {} + {} OK{}",
@@ -449,7 +455,8 @@ where
 {
     // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
-    run_shared_checks(&ctx.validation)?;
+    let validation_scope = AdapterValidationScope::Selected(ctx.adapter);
+    run_shared_checks(&ctx.validation, validation_scope)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let typed: C = app_config::deserialize_app_config_with_options::<C>(
@@ -461,7 +468,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
     typed_secret_checks(&typed, &ctx.validation)?;
-    run_adapter_typed_checks::<C>(&ctx.validation)?;
+    run_adapter_typed_checks::<C>(&ctx.validation, validation_scope)?;
 
     // Resolve adapter paths.
     let (manifest_root, adapter_manifest_path, component_selector, push_ctx) =
@@ -613,7 +620,16 @@ where
         strict: false,
     };
     let ctx = load_validation_context(&validate_args)?;
-    run_shared_checks(&ctx)?;
+    ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
+    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
+        format!(
+            "adapter `{}` is declared in {} but not registered in this build",
+            args.adapter,
+            args.manifest.display()
+        )
+    })?;
+    let validation_scope = AdapterValidationScope::Selected(adapter);
+    run_shared_checks(&ctx, validation_scope)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let typed: C = app_config::deserialize_app_config_with_options::<C>(
@@ -625,7 +641,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("local validation failed: {err}"))?;
     typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_adapter_typed_checks::<C>(&ctx, validation_scope)?;
 
     // Build the local envelope.
     let local_data: serde_json::Value = serde_json::to_value(&typed)
@@ -634,14 +650,6 @@ where
     let local_sha = local_envelope.sha256.clone();
 
     // Resolve adapter + store + key (mirrors the push flow).
-    ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
-    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
-        format!(
-            "adapter `{}` is declared in {} but not registered in this build",
-            args.adapter,
-            args.manifest.display()
-        )
-    })?;
     let logical = resolve_config_store_id(args.store.as_deref(), ctx.manifest())?;
     let env_config = effective_manifest_environment(ctx.manifest(), &args.adapter, env::vars());
     let (store, key) = resolve_config_store_and_key(
@@ -1565,10 +1573,18 @@ fn resolve_app_config_path(
     )
 }
 
-fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
-    run_adapter_shared_checks(ctx)?;
+fn run_shared_checks(
+    ctx: &ValidationContext,
+    adapter_scope: AdapterValidationScope,
+) -> Result<(), String> {
+    run_adapter_shared_checks(ctx, adapter_scope)?;
     if ctx.args_strict {
-        strict_capability_completeness(ctx.manifest())?;
+        match adapter_scope {
+            AdapterValidationScope::All => strict_capability_completeness(ctx.manifest())?,
+            AdapterValidationScope::Selected(adapter) => {
+                enforce_single_store_capability(ctx.manifest(), adapter.name())?;
+            }
+        }
         strict_handler_paths(ctx.manifest())?;
     }
     Ok(())
@@ -1579,13 +1595,13 @@ fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
 // `Adapter` trait impl. No `if adapter == "spin"` branches here.
 // -------------------------------------------------------------------
 
-/// Run the adapter-agnostic shared checks: for every adapter
-/// declared in the manifest, look up its `Adapter` impl in the
-/// registry and invoke `validate_app_config_keys` +
-/// `validate_adapter_manifest`. Adapters not in the registry (e.g.
-/// a feature-gated build that omitted some) are silently skipped —
-/// they can't validate what they don't link.
-fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
+/// Run adapter-specific shared checks for the requested scope. Whole-project
+/// validation checks every registered adapter declared in the manifest;
+/// targeted lifecycle commands check only their selected adapter.
+fn run_adapter_shared_checks(
+    ctx: &ValidationContext,
+    adapter_scope: AdapterValidationScope,
+) -> Result<(), String> {
     let raw_table = ctx
         .raw_config
         .as_table()
@@ -1595,10 +1611,10 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
     let manifest_root = ctx.manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let parent_variables = env::vars().collect::<Vec<_>>();
 
-    for (name, adapter_cfg) in &ctx.manifest().adapters {
-        let Some(adapter) = adapter_registry::get_adapter(name) else {
-            continue;
-        };
+    let validate = |name: &str,
+                    adapter_cfg: &ManifestAdapter,
+                    adapter: &'static dyn adapter_registry::Adapter|
+     -> Result<(), String> {
         let env_config = effective_manifest_environment(
             ctx.manifest(),
             name,
@@ -1611,6 +1627,31 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
             adapter_cfg.adapter.component.as_deref(),
         )?;
         reject_merged_id_collisions(name, adapter, ctx.manifest(), &env_config)?;
+        Ok(())
+    };
+
+    match adapter_scope {
+        AdapterValidationScope::All => {
+            for (name, adapter_cfg) in &ctx.manifest().adapters {
+                let Some(adapter) = adapter_registry::get_adapter(name) else {
+                    continue;
+                };
+                validate(name, adapter_cfg, adapter)?;
+            }
+        }
+        AdapterValidationScope::Selected(adapter) => {
+            let (name, adapter_cfg) =
+                ctx.manifest()
+                    .adapter_entry(adapter.name())
+                    .ok_or_else(|| {
+                        format!(
+                            "adapter `{}` has no `[adapters.{}]` block",
+                            adapter.name(),
+                            adapter.name()
+                        )
+                    })?;
+            validate(name, adapter_cfg, adapter)?;
+        }
     }
     Ok(())
 }
@@ -1789,12 +1830,15 @@ fn collect_secret_leaves<'raw>(
     Ok(out)
 }
 
-/// Typed-only adapter dispatch: feed each adapter the `#[secret]`
+/// Typed-only adapter dispatch: feed each adapter in the requested scope the `#[secret]`
 /// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
 /// runtime store ids, not flat-namespace candidates) so adapters
 /// whose secret store has a flat-namespace constraint (Spin) can
 /// detect within-secrets collisions.
-fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+fn run_adapter_typed_checks<C: AppConfigMeta>(
+    ctx: &ValidationContext,
+    adapter_scope: AdapterValidationScope,
+) -> Result<(), String> {
     let default_store_id = ctx
         .manifest()
         .stores
@@ -1824,8 +1868,16 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
         }
     }
 
-    for name in ctx.manifest().adapters.keys() {
-        if let Some(adapter) = adapter_registry::get_adapter(name) {
+    match adapter_scope {
+        AdapterValidationScope::All => {
+            for name in ctx.manifest().adapters.keys() {
+                let Some(adapter) = adapter_registry::get_adapter(name) else {
+                    continue;
+                };
+                adapter.validate_typed_secrets(&entries)?;
+            }
+        }
+        AdapterValidationScope::Selected(adapter) => {
             adapter.validate_typed_secrets(&entries)?;
         }
     }
@@ -3768,6 +3820,60 @@ ids = ["default"]
                 panic!("a local dry-run over {label} must reach the writer, not be rejected: {err}")
             });
         }
+    }
+
+    /// A targeted Fastly push validates the selected adapter only. The
+    /// application manifest may declare Spin for a different publisher without
+    /// making `spin.toml` part of the Fastly deployment input.
+    #[test]
+    fn fastly_push_does_not_require_unselected_spin_manifest() {
+        const MULTI_ADAPTER_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.spin.adapter]
+crate = "crates/demo-app-adapter-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(MULTI_ADAPTER_MANIFEST, FIXTURE_APP_CONFIG);
+        fs::write(
+            dir.path().join("fastly.toml"),
+            "manifest_version = 3\nname = \"demo-app\"\nlanguage = \"rust\"\n",
+        )
+        .expect("write fastly.toml");
+        assert!(
+            !dir.path().join("spin.toml").exists(),
+            "the unselected adapter manifest must be absent for this regression"
+        );
+
+        let mut args = push_args(&manifest, "fastly");
+        args.local = true;
+        args.dry_run = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect("a Fastly push must not load the unselected Spin manifest");
     }
 
     /// The dry-run degradation does NOT weaken the real push: a real

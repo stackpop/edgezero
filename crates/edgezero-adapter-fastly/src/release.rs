@@ -1,14 +1,12 @@
-use edgezero_core::manifest::ManifestLoader;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 const RELEASE_METADATA_NAME: &str = "release.json";
 const LIFECYCLE_PROTOCOL: u64 = 1;
-type RecordedAdapterManifests<'metadata> = BTreeMap<String, (&'metadata str, PathBuf, PathBuf)>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,16 +23,8 @@ struct ApplicationReleaseMetadata {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseManifests {
-    adapters: Vec<ReleaseAdapterManifest>,
+    adapter: ReleaseMember,
     edgezero: ReleaseMember,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReleaseAdapterManifest {
-    name: String,
-    path: String,
-    sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,13 +95,14 @@ pub(crate) fn verify_application_release(
     let app_cli_relative = validate_release_path(&metadata.app_cli.path)?;
     let package_relative = validate_release_path(&metadata.package.path)?;
     let application_manifest_relative = validate_release_path(&metadata.manifests.edgezero.path)?;
+    let adapter_manifest_relative = validate_release_path(&metadata.manifests.adapter.path)?;
     let mut recorded_relative_paths = BTreeSet::new();
-    let core_relative_paths = [
+    for relative in [
         &app_cli_relative,
         &package_relative,
         &application_manifest_relative,
-    ];
-    for relative in core_relative_paths {
+        &adapter_manifest_relative,
+    ] {
         if !recorded_relative_paths.insert(relative.clone()) {
             return Err(format!(
                 "application release contains duplicate recorded path {}",
@@ -137,11 +128,11 @@ pub(crate) fn verify_application_release(
         &metadata.manifests.edgezero.sha256,
         "application manifest",
     )?;
-    let recorded_adapter_manifests = verify_recorded_adapter_manifests(
+    let recorded_adapter_manifest = verify_member(
         &canonical_root,
-        &metadata.manifests,
-        &core_relative_paths,
-        &mut recorded_relative_paths,
+        &adapter_manifest_relative,
+        &metadata.manifests.adapter.sha256,
+        "adapter manifest",
     )?;
 
     let canonical_loaded_manifest =
@@ -152,18 +143,9 @@ pub(crate) fn verify_application_release(
             canonical_loaded_manifest.display()
         ));
     }
-    verify_manifest_references(&recorded_application_manifest, &recorded_adapter_manifests)?;
-    let (_, _, recorded_adapter_manifest) = recorded_adapter_manifests
-        .get(&metadata.adapter)
-        .ok_or_else(|| {
-            format!(
-                "application release records no manifest for selected adapter {:?}",
-                metadata.adapter
-            )
-        })?;
     let canonical_referenced_adapter_manifest =
         canonical_regular_file(referenced_adapter_manifest, "referenced adapter manifest")?;
-    if canonical_referenced_adapter_manifest != *recorded_adapter_manifest {
+    if canonical_referenced_adapter_manifest != recorded_adapter_manifest {
         return Err(format!(
             "referenced adapter manifest {} is not the adapter manifest recorded by the immutable release",
             canonical_referenced_adapter_manifest.display()
@@ -173,7 +155,7 @@ pub(crate) fn verify_application_release(
     verify_exact_members(&canonical_root, &recorded_relative_paths)?;
 
     Ok(VerifiedApplicationRelease {
-        adapter_manifest: recorded_adapter_manifest.clone(),
+        adapter_manifest: recorded_adapter_manifest,
         application_cli,
         application_manifest: recorded_application_manifest,
         package,
@@ -181,42 +163,6 @@ pub(crate) fn verify_application_release(
         root: canonical_root,
         source_revision: metadata.source_revision,
     })
-}
-
-fn verify_recorded_adapter_manifests<'metadata>(
-    root: &Path,
-    manifests: &'metadata ReleaseManifests,
-    core_relative_paths: &[&PathBuf],
-    recorded_relative_paths: &mut BTreeSet<PathBuf>,
-) -> Result<RecordedAdapterManifests<'metadata>, String> {
-    let mut recorded_adapter_manifests = BTreeMap::new();
-    for adapter in &manifests.adapters {
-        let relative = validate_release_path(&adapter.path)?;
-        if core_relative_paths.contains(&&relative) {
-            return Err(format!(
-                "application release adapter manifest path {} duplicates a core member path",
-                relative.display()
-            ));
-        }
-        let recorded = verify_member(
-            root,
-            &relative,
-            &adapter.sha256,
-            &format!("adapter {:?} manifest", adapter.name),
-        )?;
-        recorded_relative_paths.insert(relative.clone());
-        let folded = adapter.name.to_ascii_lowercase();
-        if recorded_adapter_manifests
-            .insert(folded, (adapter.name.as_str(), relative, recorded))
-            .is_some()
-        {
-            return Err(format!(
-                "application release records duplicate adapter manifest name {:?}",
-                adapter.name
-            ));
-        }
-    }
-    Ok(recorded_adapter_manifests)
 }
 
 fn validate_metadata(metadata: &ApplicationReleaseMetadata) -> Result<(), String> {
@@ -250,83 +196,13 @@ fn validate_metadata(metadata: &ApplicationReleaseMetadata) -> Result<(), String
         ("app_cli", &metadata.app_cli),
         ("package", &metadata.package),
         ("manifests.edgezero", &metadata.manifests.edgezero),
+        ("manifests.adapter", &metadata.manifests.adapter),
     ] {
         if member.sha256.len() != 64 || !is_lower_hex(&member.sha256) {
             return Err(format!(
                 "application release {label}.sha256 must be exactly 64 lowercase hexadecimal characters"
             ));
         }
-    }
-    if metadata.manifests.adapters.is_empty() {
-        return Err("application release must record at least one adapter manifest".to_owned());
-    }
-    for adapter in &metadata.manifests.adapters {
-        if !valid_adapter_name(&adapter.name) {
-            return Err(format!(
-                "application release adapter manifest name {:?} is invalid",
-                adapter.name
-            ));
-        }
-        if adapter.sha256.len() != 64 || !is_lower_hex(&adapter.sha256) {
-            return Err(format!(
-                "application release adapter {:?} manifest sha256 must be exactly 64 lowercase hexadecimal characters",
-                adapter.name
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn valid_adapter_name(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|character| !character.is_ascii_control())
-}
-
-fn verify_manifest_references(
-    application_manifest: &Path,
-    recorded: &RecordedAdapterManifests<'_>,
-) -> Result<(), String> {
-    let loader = ManifestLoader::from_path(application_manifest).map_err(|error| {
-        format!(
-            "could not load recorded application manifest {}: {error}",
-            application_manifest.display()
-        )
-    })?;
-    let mut declared = BTreeSet::new();
-    for (name, config) in &loader.manifest().adapters {
-        let Some(raw_path) = config.adapter.manifest.as_deref() else {
-            continue;
-        };
-        if !valid_adapter_name(name) {
-            return Err(format!(
-                "recorded application manifest contains invalid adapter name {name:?}"
-            ));
-        }
-        let relative = validate_release_path(raw_path)?;
-        let folded = name.to_ascii_lowercase();
-        let Some((recorded_name, recorded_path, _)) = recorded.get(&folded) else {
-            return Err(format!(
-                "application release omits adapter {name:?} manifest {} referenced by edgezero.toml",
-                relative.display()
-            ));
-        };
-        if *recorded_name != name || *recorded_path != relative {
-            return Err(format!(
-                "application release adapter manifest record for {name:?} does not match edgezero.toml path {}",
-                relative.display()
-            ));
-        }
-        declared.insert(folded);
-    }
-    if let Some(extra) = recorded.keys().find(|name| !declared.contains(*name)) {
-        return Err(format!(
-            "application release records adapter manifest {extra:?} that edgezero.toml does not reference"
-        ));
-    }
-    if declared.len() != recorded.len() {
-        return Err(
-            "application release adapter manifests do not match edgezero.toml references"
-                .to_owned(),
-        );
     }
     Ok(())
 }
@@ -520,7 +396,6 @@ mod tests {
         root: TempDir,
         application_manifest: PathBuf,
         adapter_manifest: PathBuf,
-        spin_manifest: PathBuf,
     }
 
     impl ReleaseFixture {
@@ -531,7 +406,6 @@ mod tests {
             }
             let application_manifest = root.path().join("edgezero.toml");
             let adapter_manifest = root.path().join("adapter/fastly.toml");
-            let spin_manifest = root.path().join("adapter/spin.toml");
             fs::write(root.path().join("cli/app-cli.tar.gz"), b"immutable cli")
                 .expect("application cli");
             fs::write(root.path().join("pkg/app.tar.gz"), b"immutable package").expect("package");
@@ -545,16 +419,10 @@ mod tests {
                 b"manifest_version = 3\nname = \"demo\"\n",
             )
             .expect("adapter manifest");
-            fs::write(
-                &spin_manifest,
-                b"spin_manifest_version = 2\n[component.demo]\nsource = \"demo.wasm\"\n",
-            )
-            .expect("Spin manifest");
             let fixture = Self {
                 root,
                 application_manifest,
                 adapter_manifest,
-                spin_manifest,
             };
             fixture.write_metadata_with(|_| {});
             fixture
@@ -584,18 +452,10 @@ mod tests {
                         "path": "edgezero.toml",
                         "sha256": Self::digest(&self.application_manifest),
                     },
-                    "adapters": [
-                        {
-                            "name": "fastly",
-                            "path": "adapter/fastly.toml",
-                            "sha256": Self::digest(&self.adapter_manifest),
-                        },
-                        {
-                            "name": "spin",
-                            "path": "adapter/spin.toml",
-                            "sha256": Self::digest(&self.spin_manifest),
-                        }
-                    ]
+                    "adapter": {
+                        "path": "adapter/fastly.toml",
+                        "sha256": Self::digest(&self.adapter_manifest),
+                    }
                 }
             })
         }
@@ -622,6 +482,10 @@ mod tests {
     #[test]
     fn application_release_verifies_exact_members_and_returns_confined_paths() {
         let fixture = ReleaseFixture::new();
+        assert!(
+            !fixture.root.path().join("adapter/spin.toml").exists(),
+            "a Fastly release must not include an unselected adapter manifest"
+        );
         let verified = fixture.verify().expect("valid release");
 
         assert_eq!(verified.root, fixture.root.path().canonicalize().unwrap());
@@ -692,44 +556,12 @@ mod tests {
         assert!(fixture.verify().unwrap_err().contains("unknown"));
 
         fixture.write_metadata_with(|metadata| {
-            metadata["manifests"]["adapters"][0]["unexpected"] = serde_json::json!(true);
-        });
-        assert!(fixture.verify().unwrap_err().contains("unknown"));
-
-        fixture.write_metadata_with(|metadata| {
             metadata
                 .as_object_mut()
                 .expect("release metadata object")
                 .remove("package");
         });
         assert!(fixture.verify().unwrap_err().contains("missing field"));
-    }
-
-    #[test]
-    fn application_release_requires_every_referenced_adapter_manifest() {
-        let missing = ReleaseFixture::new();
-        missing.write_metadata_with(|metadata| {
-            metadata["manifests"]["adapters"]
-                .as_array_mut()
-                .expect("adapter manifest records")
-                .truncate(1);
-        });
-        fs::remove_file(&missing.spin_manifest).expect("remove omitted Spin manifest");
-        let missing_error = missing.verify().unwrap_err();
-        assert!(
-            missing_error.contains("omits adapter \"spin\" manifest"),
-            "{missing_error}"
-        );
-
-        let duplicate = ReleaseFixture::new();
-        duplicate.write_metadata_with(|metadata| {
-            metadata["manifests"]["adapters"][1]["name"] = serde_json::json!("FASTLY");
-        });
-        let duplicate_error = duplicate.verify().unwrap_err();
-        assert!(
-            duplicate_error.contains("duplicate adapter manifest name"),
-            "{duplicate_error}"
-        );
     }
 
     #[test]
@@ -884,7 +716,6 @@ mod tests {
             "pkg/app.tar.gz",
             "edgezero.toml",
             "adapter/fastly.toml",
-            "adapter/spin.toml",
         ] {
             let fixture = ReleaseFixture::new();
             fs::write(fixture.root.path().join(member), b"tampered").unwrap();
