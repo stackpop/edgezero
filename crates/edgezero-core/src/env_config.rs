@@ -113,6 +113,10 @@ impl EnvConfig {
     /// Key for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__KEY` —
     /// falling back to `id` itself when unset, blank, whitespace-only, or
     /// containing control characters.
+    ///
+    /// This fallback form is intended for runtime registry construction. Code
+    /// that may mutate provider state must use [`Self::store_key_checked`] so a
+    /// present invalid selector fails before mutation.
     #[must_use]
     #[inline]
     pub fn store_key(&self, kind: &str, id: &str) -> String {
@@ -155,6 +159,10 @@ impl EnvConfig {
     /// Control characters are similarly rejected because no
     /// platform (cloudflare bindings, fastly store names, spin
     /// labels) accepts them as resource identifiers.
+    ///
+    /// This fallback form is intended for runtime registry construction. Code
+    /// that may mutate provider state must use [`Self::store_name_checked`] so
+    /// a present invalid selector fails before mutation.
     #[must_use]
     #[inline]
     pub fn store_name(&self, kind: &str, id: &str) -> String {

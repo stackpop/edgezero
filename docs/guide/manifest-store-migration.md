@@ -88,19 +88,20 @@ the manifest variable is used; otherwise a store selector resolves to its logica
 ID. Fastly resolves physical names during deployment and attaches them under
 logical aliases; it does not add a service ID to any canonical variable name.
 
-| Variable                                   | Role                                                                                                                   | Default         |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | --------------- |
-| `EDGEZERO__STORES__<KIND>__<ID>__NAME`     | platform name for logical store `<id>`                                                                                 | the logical id  |
-| `EDGEZERO__STORES__CONFIG__<ID>__KEY`      | config-store **key** the runtime reads the blob from — the staging/canary selector that pairs with `config push --key` | the logical id  |
-| `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                                             | —               |
-| `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                                                       | `127.0.0.1`     |
-| `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                                                       | `8787`          |
-| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                                              | adapter default |
+| Variable                                   | Role                                                                                           | Default         |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------- | --------------- |
+| `EDGEZERO__STORES__<KIND>__<ID>__NAME`     | platform name for logical store `<id>`                                                         | the logical id  |
+| `EDGEZERO__STORES__CONFIG__<ID>__KEY`      | config-store key for adapters that support runtime key selection; Fastly rejects this selector | the logical id  |
+| `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                     | —               |
+| `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                               | `127.0.0.1`     |
+| `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                               | `8787`          |
+| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                      | adapter default |
 
 `<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-case logical
-id. The literal `__KEY` selector is config-only — it swaps which blob
-the `AppConfig<C>` extractor loads (see
+id. On adapters that support runtime key selection, the config-only `__KEY`
+selector swaps which blob the `AppConfig<C>` extractor loads (see
 [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
+Fastly always uses the logical ID as the Config Store key and rejects `__KEY`.
 
 For example, an application can declare all three store kinds while keeping the
 Secret Store optional:
