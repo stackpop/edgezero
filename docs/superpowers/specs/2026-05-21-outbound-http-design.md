@@ -2847,17 +2847,9 @@ pub enum BadGatewayReason {
     Unspecified,
 }
 
-// Defined ONCE in `error.rs` (this file's crate, Phase 1a Task 1); §3.3.2's `DispatchBudget`
-// uses it from here. `dispatch_budget` sets `PerCallTimeout`/`RequestDeadline`/`Default`;
-// `Unspecified` is what `gateway_timeout(msg)` carries outside a budget context or when an
-// independently controlled provider timeout fired before the selected absolute budget
-// expired. A phase timer explicitly configured from the selected budget retains its cause.
-// Derives + ALPHABETICAL order are COMPILE-VERIFIED (§3.3.2): `Clone`/`Copy` support
-// passing provenance by value; alphabetical order satisfies the denied
-// `arbitrary_source_item_ordering`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BudgetSource { RequestDeadline, Default, PerCallTimeout, Unspecified }
+// `BudgetSource` is defined once in §3.3.2 and `error.rs`; use that canonical definition
+// here. Its variants are `BatchCutoff`, `Default`, `PerCallTimeout`, `RequestDeadline`, and
+// `Unspecified`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
